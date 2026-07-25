@@ -120783,6 +120783,7 @@ function espEnrichLeagues() {
         return espFetchLeague(sv.game, sv.id, season, '?view=mMatchupScore');
       }).then(function (j) {
         var ls = espLiveScores(j, row.standingsAll, row.rosters, espIsCats(row));
+        row._espCats = espCatBreakdown(j, row);
         if (ls) { row.liveScores = ls; _extRepaintToday(); }
       }).catch(function () { /* best-effort, same as the other providers */ });
     })(extLeagues[i]);
@@ -121338,6 +121339,7 @@ function espRefreshLive(row, force) {
     var built = espRosters(res[0], sv.game, espScoredIds(row));
     if (built) row.rosters = built;
     var ls = espLiveScores(res[1], row.standingsAll, row.rosters, espIsCats(row));
+    row._espCats = espCatBreakdown(res[1], row);
     if (ls) row.liveScores = ls;
     row._espLiveAt = Date.now();
     row._espLiveBusy = 0;
@@ -121440,12 +121442,15 @@ function _espLineupFill(row, bodyEl, headEl) {
   var accent = extProvAccent('espn');
 
   var items = myTeam.items;
-  var total = 0, scoring = 0, nS = 0, nB = 0, starters = '', bench = '', i;
+  var total = 0, scoring = 0, nS = 0, nB = 0, live = 0, starters = '', bench = '', i;
   for (i = 0; i < items.length; i++) {
     var it = items[i] || {};
     var w = (it.windows && it.windows.today) || null;
     var has = !!(w && w.total != null);
     if (has && it.starter) { total += Number(w.total); if (Number(w.total) !== 0) scoring++; }
+    if (it.starter && w && w.stats) {
+      for (var lk in w.stats) { if (w.stats.hasOwnProperty(lk)) { live++; break; } }
+    }
 
     // Same inline-labelled stat line as the roster tab, scored cats only.
     var line = '';
@@ -121460,7 +121465,10 @@ function _espLineupFill(row, bodyEl, headEl) {
       line = bits.join(' \u00b7 ');
     }
 
-    var fp = has
+    var catsMode = (typeof espIsCats === 'function') ? espIsCats(row) : false;
+    var fp = catsMode
+      ? { txt: '', color: 'rgba(255,255,255,0.28)' }
+      : has
       ? { txt: (Number(w.total) > 0 ? '+' : '') + (Math.round(Number(w.total) * 10) / 10).toFixed(1),
           color: (Number(w.total) > 0 ? '#4ade80'
                 : Number(w.total) < 0 ? '#f87171' : 'rgba(255,255,255,0.35)') }
@@ -121471,13 +121479,25 @@ function _espLineupFill(row, bodyEl, headEl) {
     if (it.starter) { starters += html; nS++; } else { bench += html; nB++; }
   }
 
-  var out = '<div style="text-align:center;padding:12px 0 14px">' +
-    '<div style="font-family:var(--sk-font-mono);font-size:30px;font-weight:800;color:' +
-      (total < 0 ? '#f87171' : accent) + ';line-height:1">' +
-      (Math.round(total * 10) / 10).toFixed(1) + '</div>' +
-    '<div style="color:rgba(255,255,255,0.42);font-size:10px;letter-spacing:0.12em;margin-top:4px">' +
-      'FP FROM ' + nS + ' STARTERS' +
-      (scoring ? ' \u00b7 ' + scoring + ' SCORING' : ' \u00b7 NO GAMES FINAL YET') + '</div></div>';
+  // A categories league has no fantasy points, so a big 0.0 would be a
+  // lie dressed as a stat. Show the roster shape instead. ESPNSLICE2L
+  var cats = (typeof espIsCats === 'function') ? espIsCats(row) : false;
+  var out;
+  if (cats) {
+    out = '<div style="text-align:center;padding:10px 0 12px">' +
+      '<div style="color:rgba(255,255,255,0.42);font-size:10px;letter-spacing:0.12em">' +
+        nS + ' STARTERS \u00b7 ' + nB + ' BENCH' +
+        (live ? ' \u00b7 ' + live + ' WITH STATS TODAY' : ' \u00b7 NO GAMES FINAL YET') +
+      '</div></div>';
+  } else {
+    out = '<div style="text-align:center;padding:12px 0 14px">' +
+      '<div style="font-family:var(--sk-font-mono);font-size:30px;font-weight:800;color:' +
+        (total < 0 ? '#f87171' : accent) + ';line-height:1">' +
+        (Math.round(total * 10) / 10).toFixed(1) + '</div>' +
+      '<div style="color:rgba(255,255,255,0.42);font-size:10px;letter-spacing:0.12em;margin-top:4px">' +
+        'FP FROM ' + nS + ' STARTERS' +
+        (scoring ? ' \u00b7 ' + scoring + ' SCORING' : ' \u00b7 NO GAMES FINAL YET') + '</div></div>';
+  }
 
   var top = espTopToday(row.rosters, (function () {
     for (var q in myIds) { if (myIds.hasOwnProperty(q)) return q; } return null;
@@ -121498,6 +121518,133 @@ function _espLineupFill(row, bodyEl, headEl) {
     'Today\u2019s fantasy points, straight from ESPN\u2019s own per-player totals. ' +
     'A dash means ESPN hasn\u2019t opened that player\u2019s day yet \u2014 usually first pitch.</div>';
   bodyEl.innerHTML = out;
+}
+
+// ── ESPN SLICE 2L (score refresh + category breakdown) ── ESPNSLICE2L ──
+
+// Scores-only refresh: mMatchupScore is 175KB against mRoster's 1.5MB, so
+// this is the cheap one to fire whenever a league is opened. Category
+// tallies move all day and were only ever refreshed as a side effect of
+// opening the Roster tab.
+function espRefreshScores(row, force) {
+  if (!row || row.provider !== 'espn' || row._espScoreBusy) return;
+  if (!force && row._espScoreAt && (Date.now() - row._espScoreAt) < 30000) return;
+  var sv = espFindSaved(row.key.slice(4));
+  if (!sv) return;
+  row._espScoreBusy = 1;
+  espCurrentSeason(sv.game).then(function (season) {
+    return espFetchLeague(sv.game, sv.id, season, '?view=mMatchupScore');
+  }).then(function (j) {
+    var ls = espLiveScores(j, row.standingsAll, row.rosters, espIsCats(row));
+    if (ls) row.liveScores = ls;
+    row._espCats = espCatBreakdown(j, row);
+    row._espScoreAt = Date.now();
+    row._espScoreBusy = 0;
+    if (typeof _extRepaintToday === 'function') _extRepaintToday();
+    var p = _espPane('matchup');
+    if (p && typeof _espCatBreakdownHtml === 'function') {
+      var pre = _espCatBreakdownHtml(row);
+      var old = p.querySelector('[data-espcats]');
+      if (pre && old) old.outerHTML = pre;
+    }
+  }).catch(function () { row._espScoreBusy = 0; });
+}
+
+// Per-category comparison, the ESPN app's matchup grid.
+//
+// cumulativeScore.scoreByStat is keyed by the same statIds everything else
+// uses. Its VALUE shape isn't confirmed, so this reads defensively: a bare
+// number, or an object carrying score/value. Win/loss shading comes from a
+// string "result" if one is present and is simply omitted otherwise —
+// direction can't be inferred, since higher is better for K but worse for
+// WHIP.
+function _espStatVal(v) {
+  if (v == null) return null;
+  if (typeof v === 'number') return v;
+  if (typeof v === 'object') {
+    if (typeof v.score === 'number') return v.score;
+    if (typeof v.value === 'number') return v.value;
+  }
+  return null;
+}
+function _espStatResult(v) {
+  if (v && typeof v === 'object' && typeof v.result === 'string') return v.result.toUpperCase();
+  return '';
+}
+
+function espCatBreakdown(j, row) {
+  if (!j || !j.schedule || !espIsCats(row)) return null;
+  var period = (j.status && j.status.currentMatchupPeriod);
+  if (period == null) return null;
+  var myIds = row.myTeamIds || {}, i;
+  for (i = 0; i < j.schedule.length; i++) {
+    var m = j.schedule[i] || {};
+    if (Number(m.matchupPeriodId) !== Number(period)) continue;
+    var a = m.away || {}, h = m.home || {};
+    var meAway = !!(a.teamId != null && myIds[String(a.teamId)]);
+    var meHome = !!(h.teamId != null && myIds[String(h.teamId)]);
+    if (!meAway && !meHome) continue;
+    var mine = meAway ? a : h, opp = meAway ? h : a;
+    var ms = (mine.cumulativeScore || {}).scoreByStat || null;
+    var os = (opp.cumulativeScore || {}).scoreByStat || null;
+    if (!ms && !os) return null;
+    var ids = {}, k;
+    for (k in (ms || {})) if (ms.hasOwnProperty(k)) ids[k] = 1;
+    for (k in (os || {})) if (os.hasOwnProperty(k)) ids[k] = 1;
+    var rows = [];
+    for (k in ids) {
+      if (!ids.hasOwnProperty(k)) continue;
+      rows.push({
+        id: k,
+        mine: _espStatVal(ms ? ms[k] : null),
+        opp: _espStatVal(os ? os[k] : null),
+        result: _espStatResult(ms ? ms[k] : null)
+      });
+    }
+    if (!rows.length) return null;
+    return { rows: rows, myName: (meAway ? m.away : m.home) && '', period: period };
+  }
+  return null;
+}
+
+function _espCatBreakdownHtml(row) {
+  var cb = row && row._espCats;
+  if (!cb || !cb.rows || !cb.rows.length) return '';
+  var game = 'flb';
+  var sp = String(row.sport || '').toLowerCase();
+  if (sp === 'nfl') game = 'ffl'; else if (sp === 'nba') game = 'fba'; else if (sp === 'nhl') game = 'fhl';
+  // Keep the league's own category order where we know it.
+  var order = espScoredIds(row), pos = {}, i;
+  for (i = 0; i < order.length; i++) pos[order[i]] = i;
+  cb.rows.sort(function (x, y) {
+    var px = (pos[x.id] != null) ? pos[x.id] : 999;
+    var py = (pos[y.id] != null) ? pos[y.id] : 999;
+    return px - py || Number(x.id) - Number(y.id);
+  });
+  var h = '<div data-espcats style="margin:0 0 14px;">' +
+    '<div style="display:flex;font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
+      'padding:0 0 4px;border-bottom:1px solid rgba(255,255,255,0.08);">' +
+      '<span style="flex:1;text-align:right;">ME</span>' +
+      '<span style="flex:0 0 62px;text-align:center;">CATEGORY</span>' +
+      '<span style="flex:1;">OPP</span></div>';
+  for (i = 0; i < cb.rows.length; i++) {
+    var r = cb.rows[i];
+    var lbl = espStatName(game, r.id) || ('#' + r.id);
+    var win = r.result === 'WIN', loss = r.result === 'LOSS';
+    h += '<div style="display:flex;align-items:center;padding:5px 0;' +
+      'border-bottom:1px solid rgba(255,255,255,0.04);font-family:var(--sk-font-mono,monospace);">' +
+      '<span style="flex:1;text-align:right;font-size:12.5px;font-weight:' + (win ? '800' : '400') +
+        ';color:' + (win ? '#4ade80' : 'rgba(255,255,255,0.72)') + ';">' +
+        (r.mine != null ? espStatFmt(r.id, r.mine) : '\u2014') + '</span>' +
+      '<span style="flex:0 0 62px;text-align:center;font-size:9.5px;letter-spacing:0.06em;' +
+        'color:rgba(255,255,255,0.4);">' + slEsc(lbl) + '</span>' +
+      '<span style="flex:1;font-size:12.5px;font-weight:' + (loss ? '800' : '400') +
+        ';color:' + (loss ? '#f87171' : 'rgba(255,255,255,0.72)') + ';">' +
+        (r.opp != null ? espStatFmt(r.id, r.opp) : '\u2014') + '</span>' +
+    '</div>';
+  }
+  h += '</div>';
+  return h;
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -124220,6 +124367,12 @@ function extOpenLeague(key) {
     if (extLeagues[i].key === key) { row = extLeagues[i]; break; }
   }
   if (!row) return;
+  // Category tallies and points both move all day, and until now the only
+  // refresh path was opening the Roster tab. Opening the league is the
+  // natural moment to re-pull the cheap 175KB scores. ESPNSLICE2L
+  if (row.provider === 'espn' && typeof espRefreshScores === 'function') {
+    espRefreshScores(row, 0);
+  }
   var accent = extProvAccent(row.provider);
   var provLabel = extProvLabel(row.provider);
   var myIds = row.myTeamIds || _fxMyTeamIds(row.raw || {});
@@ -124303,6 +124456,11 @@ function extOpenLeague(key) {
   // MATCHUP pane — live scores (current period, zeros pre-season)
   // preferred; getLeagueInfo schedule as fallback.
   var matchupHtml = '';
+  // Per-category comparison for MY matchup, above the league-wide list.
+  // ESPNSLICE2L
+  if (row.provider === 'espn' && typeof _espCatBreakdownHtml === 'function') {
+    matchupHtml += _espCatBreakdownHtml(row);
+  }
   // Avatar cascade for matchup rows — mirrors the Standings tab so team
   // logos carry over: my uploaded logo -> real Sleeper avatar (pulled
   // from the standings rows, keyed by roster/team id) -> letter circle.
