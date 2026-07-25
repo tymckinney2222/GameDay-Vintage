@@ -120802,7 +120802,7 @@ function _espSlotLabel(game, slotId, universal) {
   return '#' + slotId;
 }
 
-function espRosters(j, game) {
+function espRosters(j, game, scoredIds) {
   if (!j || !j.teams || !j.teams.length) return null;
   var universal = _espUniversalSlots(j);
   var byTeam = {}, i, k;
@@ -120823,9 +120823,12 @@ function espRosters(j, game) {
       // Points come from ESPN's own appliedTotal, never recomputed.
       var pp = (typeof espPlayerPoints === 'function')
         ? espPlayerPoints(pl, j.seasonId, j.scoringPeriodId) : {};
+      var wins = (typeof espBuildWindows === 'function')
+        ? espBuildWindows(pl, j.seasonId, j.scoringPeriodId, scoredIds || []) : null;
       items.push({
         playerId: String(e.playerId || pl.id || ''),
         pts: pp.season, today: pp.today, proj: pp.proj, last7: pp.last7,
+        windows: wins,
         name: nm,
         // _extRosterItemName reads .pos and renders it on the right, so
         // the slot goes there — it's the column the ESPN app shows too.
@@ -120873,7 +120876,7 @@ function espLoadRosters(row) {
   espCurrentSeason(sv.game).then(function (season) {
     return espFetchLeague(sv.game, sv.id, season, '?view=mRoster');
   }).then(function (j) {
-    row.rosters = espRosters(j, sv.game);
+    row.rosters = espRosters(j, sv.game, espScoredIds(row));
     row._espRosterBusy = 0;
     var p = _espRosterPane();
     if (p && typeof _extRosterPaneHtml === 'function') {
@@ -120970,9 +120973,29 @@ var _ESP_SLOT_COLOR = {
 };
 function _espRosterRowsHtml(row, myTeam) {
   var sport = String(row.sport || '').toLowerCase();
+  var game = 'flb';
+  if (sport === 'nfl') game = 'ffl'; else if (sport === 'nba') game = 'fba';
+  else if (sport === 'nhl') game = 'fhl';
   var lgKey = sport.toUpperCase();
   var items = myTeam.items || [];
+  var winKey = row._espWin || 'season';
+  var win = espWindowByKey(winKey);
   var html = '', inBench = false, i;
+
+  // Window picker. Every option is already in memory — switching windows
+  // re-renders, it never refetches. ESPNSLICE2E
+  html += '<div style="display:flex;align-items:center;gap:8px;margin:0 0 10px;">' +
+    '<span style="font-size:10px;letter-spacing:0.1em;text-transform:uppercase;' +
+      'color:rgba(255,255,255,0.35);">Stats</span>' +
+    '<select onchange="espSetWindow(\'' + _espJs(row.key) + '\', this.value)" ' +
+      'style="flex:1;min-width:0;padding:7px 8px;border-radius:7px;' +
+      'border:1px solid rgba(255,255,255,0.14);background:#0a0e17;color:#fff;font-size:12.5px;">';
+  for (i = 0; i < ESP_WINDOWS.length; i++) {
+    html += '<option value="' + ESP_WINDOWS[i].key + '"' +
+      (ESP_WINDOWS[i].key === winKey ? ' selected' : '') + '>' +
+      slEsc(ESP_WINDOWS[i].label) + '</option>';
+  }
+  html += '</select></div>';
   for (i = 0; i < items.length; i++) {
     var it = items[i] || {};
     if (!it.starter && !inBench) {
@@ -120982,6 +121005,27 @@ function _espRosterRowsHtml(row, myTeam) {
     }
     var col = _ESP_SLOT_COLOR[it.slot] || 'rgba(255,255,255,0.32)';
     var hs = espHeadshot(sport, it.playerId);
+    var wd = (it.windows && it.windows[winKey]) || null;
+    var shown = wd ? wd.total : null;
+    // Stat line, labelled inline rather than under a fixed header row:
+    // batters and pitchers score different categories, so one header
+    // can't serve both. Unmapped ids are omitted, never guessed at.
+    var statLine = '';
+    if (wd && wd.stats) {
+      var bits = [];
+      for (var sk in wd.stats) {
+        if (!wd.stats.hasOwnProperty(sk)) continue;
+        var lbl = espStatName(game, sk);
+        if (!lbl) continue;
+        bits.push('<span style="color:rgba(255,255,255,0.3);">' + lbl + '</span> ' +
+                  espStatFmt(sk, wd.stats[sk]));
+      }
+      if (bits.length) {
+        statLine = '<div style="font-size:10px;line-height:1.5;color:rgba(255,255,255,0.62);' +
+          'font-family:var(--sk-font-mono,monospace);margin-top:2px;">' +
+          bits.join('<span style="color:rgba(255,255,255,0.15);"> \u00b7 </span>') + '</div>';
+      }
+    }
     var tap = it.playerId
       ? ' onclick="seedAndOpenPlayer(\'' + _espJs(it.playerId) + '\',\'' + _espJs(lgKey) +
         '\',\'' + _espJs(it.name) + '\',\'' + _espJs(it.slot) + '\',\'\',\'\')"' +
@@ -120994,22 +121038,127 @@ function _espRosterRowsHtml(row, myTeam) {
       (hs ? '<img src="' + hs + '" alt="" loading="lazy" style="flex:0 0 30px;width:30px;' +
             'height:22px;object-fit:cover;border-radius:4px;background:rgba(255,255,255,0.05);"' +
             ' onerror="this.style.visibility=\'hidden\'">' : '') +
-      '<span style="flex:1;min-width:0;font-size:12.5px;color:#fff;overflow:hidden;' +
-        'text-overflow:ellipsis;white-space:nowrap;">' + slEsc(it.name) +
-        (it.injury ? '<span style="color:#f87171;font-size:9px;font-weight:700;' +
-                     'margin-left:5px;">IL</span>' : '') + '</span>' +
-      (it.today != null && it.today !== 0
+      '<span style="flex:1;min-width:0;">' +
+        '<span style="display:block;font-size:12.5px;color:#fff;overflow:hidden;' +
+          'text-overflow:ellipsis;white-space:nowrap;">' + slEsc(it.name) +
+          (it.injury ? '<span style="color:#f87171;font-size:9px;font-weight:700;' +
+                       'margin-left:5px;">IL</span>' : '') + '</span>' +
+        statLine +
+      '</span>' +
+      (winKey !== 'today' && it.today != null && it.today !== 0
         ? '<span style="flex:0 0 auto;font-size:10.5px;font-weight:700;color:#4ade80;">+' +
           it.today + '</span>' : '') +
       '<span style="flex:0 0 46px;text-align:right;font-size:12px;font-weight:700;' +
         'color:rgba(255,255,255,0.75);">' +
-        (it.pts != null ? it.pts : '\u2014') + '</span>' +
+        (shown != null ? shown : '\u2014') + '</span>' +
     '</div>';
   }
   html += '<div style="color:rgba(255,255,255,0.3);font-size:10px;margin-top:10px;' +
-          'line-height:1.5;">Season fantasy points \u00b7 green is today \u00b7 ' +
-          'tap a player for their card</div>';
+          'line-height:1.5;">' + slEsc(win.label) + ' fantasy points' +
+          (winKey !== 'today' ? ' \u00b7 green is today' : '') +
+          ' \u00b7 tap a player for their card' +
+          '<br>Pitching stat names aren\u2019t mapped yet, so those rows show ' +
+          'points only.</div>';
   return html;
+}
+
+// ── ESPN SLICE 2e (stat windows + stat lines) ── ESPNSLICE2E ──
+//
+// MLB stat ids, PROVEN by arithmetic rather than assumed:
+//   TB  : singles + 2*2B + 3*3B + 4*HR == statId 8  (192 for Ohtani)
+//   AVG : statId 1 / statId 0 == statId 2           (0.28571429)
+//   SLG : statId 8 / statId 0 == statId 9           (0.52747253)
+//   OPS : statId 17 + statId 9 == statId 18         (0.91967436)
+// Those equations only balance if 0=AB, 1=H, 3=2B, 4=3B, 5=HR, 8=TB,
+// 9=SLG, 17=OBP, 18=OPS.
+//
+// R and RBI came from the app itself: it shows Otto Lopez with R 62 and
+// RBI 46, and the payload has statId 20 = 62, statId 21 = 46. The reverse
+// assignment is ruled out.
+//
+// SB and K are the two remaining SCORED ids, and SB - K = -41 for Lopez,
+// which only works with 23=SB / 27=K.
+//
+// Pitching ids are NOT mapped. Nothing here labels them, because a wrong
+// label is worse than a missing one — unlabelled stats are simply omitted.
+var ESP_STAT_NAME_FLB = {
+  0: 'AB', 1: 'H', 2: 'AVG', 3: '2B', 4: '3B', 5: 'HR',
+  8: 'TB', 9: 'SLG', 10: 'BB', 17: 'OBP', 18: 'OPS',
+  20: 'R', 21: 'RBI', 23: 'SB', 27: 'K'
+};
+var ESP_STAT_NAMES = { flb: ESP_STAT_NAME_FLB };
+// Rate stats want decimals; counting stats don't.
+var ESP_STAT_RATE = { 2: 1, 9: 1, 17: 1, 18: 1 };
+
+function espStatName(game, id) {
+  var m = ESP_STAT_NAMES[game];
+  return (m && m[id]) ? m[id] : '';
+}
+function espStatFmt(id, v) {
+  if (v == null) return '\u2014';
+  var n = Number(v);
+  if (ESP_STAT_RATE[id]) return (Math.round(n * 1000) / 1000).toFixed(3).replace(/^0/, '');
+  return String(Math.round(n * 10) / 10);
+}
+
+// The seven windows, in the order the ESPN app lists them.
+var ESP_WINDOWS = [
+  { key: 'today',  label: "Today",      src: 0, split: 5, useCur: 1 },
+  { key: 'd7',     label: '7 Day',      src: 0, split: 1 },
+  { key: 'd15',    label: '15 Day',     src: 0, split: 2 },
+  { key: 'd30',    label: '30 Day',     src: 0, split: 3 },
+  { key: 'season', label: 'Season',     src: 0, split: 0 },
+  { key: 'prev',   label: 'Last Year',  src: 0, split: 0, prevSeason: 1 },
+  { key: 'proj',   label: 'Projected',  src: 1, split: 0 }
+];
+function espWindowByKey(k) {
+  for (var i = 0; i < ESP_WINDOWS.length; i++) if (ESP_WINDOWS[i].key === k) return ESP_WINDOWS[i];
+  return ESP_WINDOWS[4];
+}
+
+// Precompute every window per player, trimmed to the league's SCORED
+// stat ids. Keeping all ~80 raw stats x 7 windows x 20 players in memory
+// would be wasteful; the scored handful is what the row actually shows.
+function espBuildWindows(pl, season, period, scoredIds) {
+  var out = {}, i, w, e, k;
+  for (i = 0; i < ESP_WINDOWS.length; i++) {
+    w = ESP_WINDOWS[i];
+    var sn = w.prevSeason ? (Number(season) - 1) : season;
+    e = espStatEntry(pl, w.src, w.split, sn, w.useCur ? period : null);
+    if (!e) { out[w.key] = null; continue; }
+    var st = {};
+    if (e.stats && scoredIds) {
+      for (k = 0; k < scoredIds.length; k++) {
+        var id = scoredIds[k];
+        if (e.stats[id] != null) st[id] = e.stats[id];
+      }
+    }
+    out[w.key] = { total: espAppliedTotal(e), stats: st };
+  }
+  return out;
+}
+
+// Which stat ids this league actually scores, in the order the league
+// defines them (so the row reads the way the settings page does).
+function espScoredIds(row) {
+  var items = ((((row && row.raw) || {}).settings || {}).scoringSettings || {}).scoringItems || [];
+  var out = [];
+  for (var i = 0; i < items.length; i++) {
+    if (items[i] && items[i].statId != null) out.push(items[i].statId);
+  }
+  return out;
+}
+
+function espSetWindow(key, win) {
+  for (var i = 0; i < extLeagues.length; i++) {
+    if (extLeagues[i].key !== key) continue;
+    extLeagues[i]._espWin = win;
+    var p = _espRosterPane();
+    if (p && typeof _extRosterPaneHtml === 'function') {
+      p.innerHTML = _extRosterPaneHtml(extLeagues[i], extLeagues[i].myTeamIds || {});
+    }
+    break;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────
