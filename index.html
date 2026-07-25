@@ -120820,8 +120820,12 @@ function espRosters(j, game) {
                String(e.playerId || '?');
       var inj = (e.injuryStatus && e.injuryStatus !== 'NORMAL' &&
                  e.injuryStatus !== 'ACTIVE') ? 'IL' : '';
+      // Points come from ESPN's own appliedTotal, never recomputed.
+      var pp = (typeof espPlayerPoints === 'function')
+        ? espPlayerPoints(pl, j.seasonId, j.scoringPeriodId) : {};
       items.push({
         playerId: String(e.playerId || pl.id || ''),
+        pts: pp.season, today: pp.today, proj: pp.proj, last7: pp.last7,
         name: nm,
         // _extRosterItemName reads .pos and renders it on the right, so
         // the slot goes there — it's the column the ESPN app shows too.
@@ -120879,6 +120883,133 @@ function espLoadRosters(row) {
     row._espRosterBusy = 0;
     _espRosterMsg('Couldn\u2019t load rosters \u2014 close and reopen to retry.');
   });
+}
+
+// ── ESPN SLICE 2d (headshots, player cards, points) ── ESPNSLICE2D ──
+//
+// The player.stats array decoded, straight off the probe. Every row in the
+// app's own "Views" menu is one (statSourceId, statSplitTypeId) pair:
+//
+//   src 0 = ACTUAL          src 1 = PROJECTED
+//   split 0 = full season   split 1 = last 7      split 2 = last 15
+//   split 3 = last 30       split 5 = single scoring period (a day)
+//
+//   Today's Stats -> src 0, split 5, scoringPeriodId = league's current
+//   7 / 15 / 30   -> src 0, split 1 / 2 / 3
+//   2026 Stats    -> src 0, split 0, seasonId 2026
+//   2025 Stats    -> src 0, split 0, seasonId 2025
+//   2026 Proj     -> src 1, split 0, seasonId 2026
+var ESP_SRC_ACTUAL = 0, ESP_SRC_PROJ = 1;
+var ESP_SPLIT_SEASON = 0, ESP_SPLIT_7 = 1, ESP_SPLIT_15 = 2, ESP_SPLIT_30 = 3, ESP_SPLIT_DAY = 5;
+
+// Pull one stat entry. Passing null for period means "don't care", which
+// matters because season entries carry scoringPeriodId 0.
+function espStatEntry(pl, src, split, season, period) {
+  var st = (pl && pl.stats) || [];
+  for (var i = 0; i < st.length; i++) {
+    var e = st[i] || {};
+    if (e.statSourceId !== src) continue;
+    if (e.statSplitTypeId !== split) continue;
+    if (season != null && Number(e.seasonId) !== Number(season)) continue;
+    if (period != null && Number(e.scoringPeriodId) !== Number(period)) continue;
+    return e;
+  }
+  return null;
+}
+
+// appliedTotal is ESPN's own number and it is the ONE to trust.
+//
+// Recomputing it from stats x scoringItems matched exactly for five of six
+// players in the probe — and was wrong by 124 for Shohei Ohtani, because a
+// two-way player carries both batting and pitching stats while the league
+// only scores him on one side. appliedStats holds just the six statIds that
+// actually applied. So never re-derive; read what ESPN applied.
+function espAppliedTotal(e) {
+  if (!e) return null;
+  if (e.appliedTotal != null) return Math.round(Number(e.appliedTotal) * 10) / 10;
+  if (e.appliedStats) {
+    var sum = 0;
+    for (var k in e.appliedStats) {
+      if (e.appliedStats.hasOwnProperty(k)) sum += Number(e.appliedStats[k]) || 0;
+    }
+    return Math.round(sum * 10) / 10;
+  }
+  return null;
+}
+
+function espPlayerPoints(pl, season, period) {
+  return {
+    season: espAppliedTotal(espStatEntry(pl, ESP_SRC_ACTUAL, ESP_SPLIT_SEASON, season, null)),
+    today:  espAppliedTotal(espStatEntry(pl, ESP_SRC_ACTUAL, ESP_SPLIT_DAY, season, period)),
+    proj:   espAppliedTotal(espStatEntry(pl, ESP_SRC_PROJ, ESP_SPLIT_SEASON, season, null)),
+    last7:  espAppliedTotal(espStatEntry(pl, ESP_SRC_ACTUAL, ESP_SPLIT_7, season, null))
+  };
+}
+
+// ESPN's own headshot CDN. The fantasy playerId IS the core athlete id
+// (verified by loading one in a browser), so no id bridge is needed.
+var ESP_HS_SLUG = { mlb: 'mlb', nba: 'nba', nfl: 'nfl', nhl: 'nhl' };
+function espHeadshot(sport, playerId) {
+  var slug = ESP_HS_SLUG[String(sport || '').toLowerCase()];
+  if (!slug || !playerId) return '';
+  return 'https://a.espncdn.com/combiner/i?img=/i/headshots/' + slug +
+         '/players/full/' + playerId + '.png&w=96&h=70';
+}
+
+function _espJs(s) {
+  return String(s == null ? '' : s).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+}
+
+// ESPN's own roster rows. Deliberately NOT a change to the shared compact
+// renderer, which Fantrax also uses — adding headshots and tap targets there
+// would silently restyle Fantrax too.
+var _ESP_SLOT_COLOR = {
+  C: '#c084fc', '1B': '#38bdf8', '2B': '#38bdf8', '3B': '#38bdf8', SS: '#38bdf8',
+  OF: '#4ade80', UTIL: '#a78bfa', P: '#fb923c', SP: '#fb923c', RP: '#f472b6',
+  BE: 'rgba(255,255,255,0.32)', BN: 'rgba(255,255,255,0.32)', IL: '#f87171'
+};
+function _espRosterRowsHtml(row, myTeam) {
+  var sport = String(row.sport || '').toLowerCase();
+  var lgKey = sport.toUpperCase();
+  var items = myTeam.items || [];
+  var html = '', inBench = false, i;
+  for (i = 0; i < items.length; i++) {
+    var it = items[i] || {};
+    if (!it.starter && !inBench) {
+      inBench = true;
+      html += '<div style="color:rgba(255,255,255,0.3);font-size:9px;letter-spacing:0.14em;' +
+              'margin:12px 0 4px;">BENCH</div>';
+    }
+    var col = _ESP_SLOT_COLOR[it.slot] || 'rgba(255,255,255,0.32)';
+    var hs = espHeadshot(sport, it.playerId);
+    var tap = it.playerId
+      ? ' onclick="seedAndOpenPlayer(\'' + _espJs(it.playerId) + '\',\'' + _espJs(lgKey) +
+        '\',\'' + _espJs(it.name) + '\',\'' + _espJs(it.slot) + '\',\'\',\'\')"' +
+        ' style="cursor:pointer;'
+      : ' style="';
+    html += '<div' + tap + 'display:flex;align-items:center;gap:8px;padding:6px 0;' +
+            'border-bottom:1px solid rgba(255,255,255,0.05);">' +
+      '<span style="flex:0 0 34px;text-align:center;font-size:9.5px;font-weight:800;' +
+        'letter-spacing:0.04em;color:' + col + ';">' + slEsc(it.slot) + '</span>' +
+      (hs ? '<img src="' + hs + '" alt="" loading="lazy" style="flex:0 0 30px;width:30px;' +
+            'height:22px;object-fit:cover;border-radius:4px;background:rgba(255,255,255,0.05);"' +
+            ' onerror="this.style.visibility=\'hidden\'">' : '') +
+      '<span style="flex:1;min-width:0;font-size:12.5px;color:#fff;overflow:hidden;' +
+        'text-overflow:ellipsis;white-space:nowrap;">' + slEsc(it.name) +
+        (it.injury ? '<span style="color:#f87171;font-size:9px;font-weight:700;' +
+                     'margin-left:5px;">IL</span>' : '') + '</span>' +
+      (it.today != null && it.today !== 0
+        ? '<span style="flex:0 0 auto;font-size:10.5px;font-weight:700;color:#4ade80;">+' +
+          it.today + '</span>' : '') +
+      '<span style="flex:0 0 46px;text-align:right;font-size:12px;font-weight:700;' +
+        'color:rgba(255,255,255,0.75);">' +
+        (it.pts != null ? it.pts : '\u2014') + '</span>' +
+    '</div>';
+  }
+  html += '<div style="color:rgba(255,255,255,0.3);font-size:10px;margin-top:10px;' +
+          'line-height:1.5;">Season fantasy points \u00b7 green is today \u00b7 ' +
+          'tap a player for their card</div>';
+  return html;
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -123451,7 +123582,12 @@ function _extRosterPaneHtml(row, myIds) {
         // keeps the original compact list untouched.
         var _slpRich = !!(row.provider === 'sleeper' && myTeam.items[0] && myTeam.items[0].slot);
         if (_slpRich) html += _slpRosterRowsHtml(row, myTeam, _rsp);
-        for (var ri = 0; !_slpRich && ri < myTeam.items.length && ri < 40; ri++) {
+        // ESPN gets its OWN row builder rather than sharing the compact one,
+        // which Fantrax also renders through. ESPNSLICE2D
+        var _espRich = !!(row.provider === 'espn' && typeof _espRosterRowsHtml === 'function' &&
+                          myTeam.items[0] && myTeam.items[0].slot);
+        if (_espRich) html += _espRosterRowsHtml(row, myTeam);
+        for (var ri = 0; !_slpRich && !_espRich && ri < myTeam.items.length && ri < 40; ri++) {
           var it = myTeam.items[ri] || {};
           var res = _extRosterItemName(it, SPORT);
           var _tap = (_rTap && res.name && res.name !== '?')
