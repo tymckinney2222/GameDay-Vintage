@@ -120726,6 +120726,161 @@ function espEnrichLeagues() {
   }
 }
 
+// ── ESPN SLICE 2c (rosters) ── ESPNSLICE2C ──
+// Lazy on purpose: mRoster measured 1,547,337 bytes and returns all ten
+// rosters, so it is fetched ONCE per league per session and only when the
+// Roster tab is actually opened. It never runs during the registry load.
+//
+// Worth noting the full payload isn't waste — the detail view's byTeam map
+// wants every team's roster, which is exactly what this returns.
+//
+// ESPN inlines the player object, so unlike Sleeper there is no player
+// dictionary to fetch; names and positions arrive in the same response.
+
+// MLB slot IDs, CONFIRMED by comparing a real roster against the ESPN
+// app's own lineup screen name-for-name (0 held the catcher, 5 held the
+// three outfielders, 13 held all seven pitchers, and so on).
+var ESP_SLOT_FLB_CONFIRMED = {
+  0: 'C', 1: '1B', 2: '2B', 3: '3B', 4: 'SS', 5: 'OF',
+  12: 'UTIL', 13: 'P', 16: 'BE', 17: 'IL'
+};
+// The rest are INFERRED from eligibleSlots patterns, not app-verified:
+// every 1B/3B carried 7, every 2B/SS carried 6, starters carried 14 and
+// relievers 15. This league doesn't use them, so they'd only appear in a
+// differently-configured MLB league.
+var ESP_SLOT_FLB_INFERRED = {
+  6: '2B/SS', 7: '1B/3B', 8: 'LF', 9: 'CF', 10: 'RF',
+  11: 'DH', 14: 'SP', 15: 'RP', 19: 'IF'
+};
+var ESP_SLOTS = { flb: {} };
+(function () {
+  var k;
+  for (k in ESP_SLOT_FLB_CONFIRMED) ESP_SLOTS.flb[k] = ESP_SLOT_FLB_CONFIRMED[k];
+  for (k in ESP_SLOT_FLB_INFERRED) ESP_SLOTS.flb[k] = ESP_SLOT_FLB_INFERRED[k];
+})();
+// ffl / fba / fhl deliberately absent. Slot IDs are sport-specific and
+// nobody has mapped those yet — the bench detection below covers them
+// well enough to be useful, and guessing labels is how you end up
+// showing a starter in the bench section.
+
+// Which slots are bench/IL, WITHOUT knowing the sport's slot map.
+//
+// A player is eligible for his real positions plus bench and IL — those
+// last two are the only slots EVERY player can occupy. So intersecting
+// eligibleSlots across the whole league yields exactly the bench-ish
+// slots. Verified on the MLB payload: the intersection came out {16,17},
+// which is precisely BE and IL. This is what lets NBA and NHL rosters
+// split starters from bench before anyone maps their slot IDs.
+function _espUniversalSlots(j) {
+  var counts = {}, total = 0, out = {}, i, k, s;
+  var teams = (j && j.teams) || [];
+  for (i = 0; i < teams.length; i++) {
+    var ents = ((teams[i] || {}).roster || {}).entries || [];
+    for (k = 0; k < ents.length; k++) {
+      var el = (((ents[k] || {}).playerPoolEntry || {}).player || {}).eligibleSlots;
+      if (!el || !el.length) continue;
+      total++;
+      var seen = {};
+      for (s = 0; s < el.length; s++) {
+        if (seen[el[s]]) continue;
+        seen[el[s]] = 1;
+        counts[el[s]] = (counts[el[s]] || 0) + 1;
+      }
+    }
+  }
+  if (!total) return out;
+  for (var key in counts) {
+    if (counts.hasOwnProperty(key) && counts[key] === total) out[key] = 1;
+  }
+  return out;
+}
+
+function _espSlotLabel(game, slotId, universal) {
+  var map = ESP_SLOTS[game];
+  if (map && map[slotId]) return map[slotId];
+  if (universal && universal[slotId]) return 'BN';
+  return '#' + slotId;
+}
+
+function espRosters(j, game) {
+  if (!j || !j.teams || !j.teams.length) return null;
+  var universal = _espUniversalSlots(j);
+  var byTeam = {}, i, k;
+  for (i = 0; i < j.teams.length; i++) {
+    var t = j.teams[i] || {};
+    var ents = (t.roster && t.roster.entries) || [];
+    var items = [];
+    for (k = 0; k < ents.length; k++) {
+      var e = ents[k] || {};
+      var pl = ((e.playerPoolEntry || {}).player) || {};
+      var sid = e.lineupSlotId;
+      var lbl = _espSlotLabel(game, sid, universal);
+      var nm = pl.fullName ||
+               ((pl.firstName || '') + ' ' + (pl.lastName || '')).trim() ||
+               String(e.playerId || '?');
+      var inj = (e.injuryStatus && e.injuryStatus !== 'NORMAL' &&
+                 e.injuryStatus !== 'ACTIVE') ? 'IL' : '';
+      items.push({
+        playerId: String(e.playerId || pl.id || ''),
+        name: nm,
+        // _extRosterItemName reads .pos and renders it on the right, so
+        // the slot goes there — it's the column the ESPN app shows too.
+        pos: lbl + (inj ? ' \u00b7 ' + inj : ''),
+        slot: lbl,
+        slotId: sid,
+        starter: !universal[sid],
+        injury: inj
+      });
+    }
+    // Starters first, then slot order. For MLB that ascending slot id
+    // happens to be exactly the app's order: C, 1B, 2B, 3B, SS, OF,
+    // UTIL, P, then bench.
+    items.sort(function (a, b) {
+      var d = (b.starter ? 1 : 0) - (a.starter ? 1 : 0);
+      if (d) return d;
+      return (a.slotId || 0) - (b.slotId || 0);
+    });
+    byTeam[String(t.id)] = { teamName: espTeamName(t), items: items };
+  }
+  return { period: (j.scoringPeriodId != null) ? j.scoringPeriodId : null, byTeam: byTeam };
+}
+
+function _espRosterPane() {
+  var body = document.getElementById('skExtDetailBody');
+  if (!body) return null;
+  var panes = body.querySelectorAll('[data-extpane]');
+  for (var i = 0; i < panes.length; i++) {
+    if (panes[i].getAttribute('data-extpane') === 'roster') return panes[i];
+  }
+  return null;
+}
+function _espRosterMsg(txt) {
+  var p = _espRosterPane();
+  if (p) p.innerHTML = '<div style="color:rgba(255,255,255,0.4);font-size:12px;">' +
+    slEsc(txt) + '</div>';
+}
+
+function espLoadRosters(row) {
+  if (!row || row.rosters || row._espRosterBusy) return;
+  var sv = espFindSaved(row.key.slice(4));
+  if (!sv) return;
+  row._espRosterBusy = 1;
+  _espRosterMsg('Loading rosters\u2026');
+  espCurrentSeason(sv.game).then(function (season) {
+    return espFetchLeague(sv.game, sv.id, season, '?view=mRoster');
+  }).then(function (j) {
+    row.rosters = espRosters(j, sv.game);
+    row._espRosterBusy = 0;
+    var p = _espRosterPane();
+    if (p && typeof _extRosterPaneHtml === 'function') {
+      p.innerHTML = _extRosterPaneHtml(row, row.myTeamIds || {});
+    }
+  }).catch(function () {
+    row._espRosterBusy = 0;
+    _espRosterMsg('Couldn\u2019t load rosters \u2014 close and reopen to retry.');
+  });
+}
+
 // ─────────────────────────────────────────────────────────────────
 // EXTERNAL LEAGUES (Phase 1, slice 1) — normalized registry for
 // non-Yahoo providers. Rows use provider-prefixed keys ('slp:'/'ftx:')
@@ -123644,6 +123799,18 @@ function extSetDetailTab(id) {
   // tab is actually opened (once per sport per session).
   if (id === 'draft' && typeof extLoadAdp === 'function') {
     extLoadAdp(mast ? mast.getAttribute('data-ext-sport') : '', 'skExtAdpPane');
+  }
+  // Roster tab (ESPN): mRoster is 1.5MB, so it only fetches when the tab
+  // is opened, once per league per session. ESPNSLICE2C
+  if (id === 'roster' && typeof espLoadRosters === 'function') {
+    var lkR = mast ? mast.getAttribute('data-ext-key') : '';
+    for (var rr = 0; rr < extLeagues.length; rr++) {
+      if (extLeagues[rr].key !== lkR) continue;
+      if (extLeagues[rr].provider === 'espn' && !extLeagues[rr].rosters) {
+        espLoadRosters(extLeagues[rr]);
+      }
+      break;
+    }
   }
   // Trending tab (Sleeper): league-wide 24h add/drop momentum, lazy,
   // 10-minute cache per sport+direction inside slLoadTrending.
