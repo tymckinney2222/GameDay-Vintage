@@ -71151,6 +71151,21 @@ function skHubProviderStates() {
         '<button class="sk-hub-btn ghost" onclick="skHubDisconnectFantrax()">Disconnect</button>'
       : '<button class="sk-hub-btn primary" onclick="fxConnect()">Connect Fantrax \u2192</button>'
   });
+  // ESPN (ESPNSLICE1) — no login exists for public reads, so "connected"
+  // means at least one league has been added by hand.
+  var eOn = (typeof espState !== 'undefined') && espState &&
+            espState.leagues && espState.leagues.length > 0;
+  var eCount = eOn ? espState.leagues.length : 0;
+  out.push({
+    id: 'espn', name: 'ESPN Fantasy', accent: '#ef4444',
+    blurb: 'Add public leagues by pasting their URL \u2014 read-only, no password, no proxy.',
+    connected: eOn,
+    status: eOn ? (eCount + ' league' + (eCount === 1 ? '' : 's') + ' added') : '',
+    actions: eOn
+      ? '<button class="sk-hub-btn" style="--hub-accent:#ef4444" onclick="espConnect()">Manage</button>' +
+        '<button class="sk-hub-btn ghost" onclick="skHubDisconnectEspn()">Disconnect</button>'
+      : '<button class="sk-hub-btn primary" onclick="espConnect()">Add ESPN leagues \u2192</button>'
+  });
   return out;
 }
 
@@ -120157,6 +120172,339 @@ function fxConnect() {
 }
 
 // ─────────────────────────────────────────────────────────────────
+// ESPN FANTASY (Phase 1, slice 1) — ESPNSLICE1
+//
+// ESPN's fantasy API is undocumented but public-league reads need NO
+// auth and — confirmed by on-device probe — DO send permissive CORS
+// headers, so this talks to lm-api-reads directly. No worker, same as
+// Sleeper.
+//
+// What it can't do: public reads are anonymous, so ESPN cannot list
+// "your" leagues or say which team is yours. Both are supplied by hand
+// once per league and stored. That's the whole reason this provider has
+// an add-a-league UI where Sleeper/Fantrax have a login box.
+//
+// Registry loads deliberately request ONLY mTeam+mSettings (~32KB).
+// Adding mRoster inflates the same call to ~1.5MB because it inlines
+// every rostered player with stat splits — measured, not guessed. That
+// belongs in the lazy detail fetch (slice 2), never here.
+// ─────────────────────────────────────────────────────────────────
+var ESP_BASE = 'https://lm-api-reads.fantasy.espn.com/apis/v3/games/';
+var ESP_LEAGUES_KEY = 'sk_espn_leagues_v1';
+// ESPN game code -> Skipper's lowercase sport vocab (what Fantrax rows
+// normalize to, so downstream sport routing needs no special-casing).
+var ESP_SPORT = { flb: 'mlb', ffl: 'nfl', fba: 'nba', fhl: 'nhl' };
+// URL path word -> game code, for pasting a league link.
+var ESP_PATH_GAME = { baseball: 'flb', football: 'ffl', basketball: 'fba', hockey: 'fhl' };
+var ESP_GAME_LABEL = { flb: 'MLB', ffl: 'NFL', fba: 'NBA', fhl: 'NHL' };
+
+var espState = { leagues: [] };
+var _espSeason = {};   // game -> season string (session cache)
+var _espMeta = {};     // id -> { name, size, teams:[{id,name}], sport }
+
+function espLoadState() {
+  try {
+    var raw = localStorage.getItem(ESP_LEAGUES_KEY);
+    var arr = raw ? JSON.parse(raw) : null;
+    espState.leagues = (Object.prototype.toString.call(arr) === '[object Array]') ? arr : [];
+  } catch (e) { espState.leagues = []; }
+}
+function espSaveState() {
+  try {
+    localStorage.setItem(ESP_LEAGUES_KEY, JSON.stringify(espState.leagues || []));
+    return true;
+  } catch (e) {
+    if (typeof skToast === 'function') {
+      skToast('\u26a0 ESPN leagues NOT saved \u2014 storage full. Open Storage usage and run cleanup.');
+    }
+    return false;
+  }
+}
+espLoadState();
+
+function espEsc(s) {
+  return (typeof slEsc === 'function') ? slEsc(s) : String(s == null ? '' : s);
+}
+
+// Accept a pasted league URL or a bare numeric id. The URL carries the
+// sport in its path (/baseball/league?leagueId=...), which is why
+// pasting beats typing: one action supplies both id and game.
+function espParseLeagueUrl(str) {
+  var s = String(str || '').trim();
+  if (!s) return null;
+  if (/^\d+$/.test(s)) return { id: s, game: '' };
+  var id = '';
+  var m = s.match(/[?&]leagueId=(\d+)/i);
+  if (m) id = m[1];
+  if (!id) {
+    m = s.match(/\/leagues?\/(\d+)/i);
+    if (m) id = m[1];
+  }
+  if (!id) return null;
+  var game = '';
+  for (var word in ESP_PATH_GAME) {
+    if (!ESP_PATH_GAME.hasOwnProperty(word)) continue;
+    if (s.toLowerCase().indexOf('/' + word) !== -1) { game = ESP_PATH_GAME[word]; break; }
+  }
+  return { id: id, game: game };
+}
+
+// The season rolls over on ESPN's schedule, not the calendar's, so ask
+// rather than compute. /games/{game} answers with currentSeasonId.
+function espCurrentSeason(game) {
+  if (_espSeason[game]) return Promise.resolve(_espSeason[game]);
+  return fetch(ESP_BASE + game).then(function (r) {
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  }).then(function (j) {
+    var yr = j && (j.currentSeasonId || (j.currentSeason && j.currentSeason.id));
+    if (!yr) throw new Error('no currentSeasonId');
+    _espSeason[game] = String(yr);
+    return _espSeason[game];
+  });
+}
+
+function espLeagueUrl(game, id, season, q) {
+  return ESP_BASE + game + '/seasons/' + season + '/segments/0/leagues/' + id + (q || '');
+}
+
+function espFetchLeague(game, id, season, q) {
+  return fetch(espLeagueUrl(game, id, season, q)).then(function (r) {
+    if (r.status === 401) throw new Error('PRIVATE');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  });
+}
+
+function espTeamName(t) {
+  if (!t) return '';
+  var n = t.name || ((t.location || '') + ' ' + (t.nickname || '')).trim();
+  return n || ('Team ' + t.id);
+}
+
+// Cache the light payload's identity bits so the manage overlay can
+// show league names and a team dropdown without refetching.
+function espCacheMeta(id, game, j) {
+  var st = (j && j.settings) || {};
+  var teams = [];
+  if (j && j.teams) {
+    for (var i = 0; i < j.teams.length; i++) {
+      teams.push({ id: j.teams[i].id, name: espTeamName(j.teams[i]) });
+    }
+  }
+  _espMeta[id] = {
+    name: st.name || ('League ' + id),
+    size: (st.size != null) ? st.size : teams.length,
+    sport: ESP_SPORT[game] || '',
+    teams: teams
+  };
+  return _espMeta[id];
+}
+
+function espFindSaved(id) {
+  for (var i = 0; i < espState.leagues.length; i++) {
+    if (String(espState.leagues[i].id) === String(id)) return espState.leagues[i];
+  }
+  return null;
+}
+
+function espRemoveLeague(id) {
+  for (var i = 0; i < espState.leagues.length; i++) {
+    if (String(espState.leagues[i].id) === String(id)) { espState.leagues.splice(i, 1); break; }
+  }
+  espSaveState();
+  espRenderManageList();
+  if (typeof skRenderConnectHub === 'function') skRenderConnectHub();
+  if (typeof extLoadAll === 'function') extLoadAll(true);
+}
+
+function espSetTeam(id, teamId) {
+  var sv = espFindSaved(id);
+  if (!sv) return;
+  sv.teamId = teamId ? String(teamId) : '';
+  espSaveState();
+  if (typeof extLoadAll === 'function') extLoadAll(true);
+}
+
+function espDiag(msg, kind) {
+  var el = document.getElementById('esp-connect-diag');
+  if (!el) return;
+  var col = (kind === 'err') ? '#f87171' : (kind === 'ok' ? '#34d399' : 'rgba(255,255,255,0.55)');
+  el.innerHTML = '<div style="color:' + col + ';font-size:11.5px;line-height:1.5;">' + espEsc(msg) + '</div>';
+}
+
+// Add flow: parse, dedupe, resolve season, fetch the light payload to
+// confirm the league is actually public and to learn its name + teams.
+// Nothing is saved until that round-trip succeeds, so a typo or a
+// private league can't leave a dead row in the list.
+function espAddFromInput() {
+  var input = document.getElementById('esp-connect-url');
+  var sel = document.getElementById('esp-connect-sport');
+  if (!input) return;
+  var parsed = espParseLeagueUrl(input.value);
+  if (!parsed) { espDiag('Could not find a league ID in that. Paste the full league URL from the ESPN app or site.', 'err'); return; }
+  var game = parsed.game || (sel ? sel.value : '');
+  if (!game) { espDiag('That link had no sport in it \u2014 pick the sport above and try again.', 'err'); return; }
+  if (espFindSaved(parsed.id)) { espDiag('That league is already added.', 'err'); return; }
+
+  espDiag('Checking league ' + parsed.id + '\u2026', 'info');
+  espCurrentSeason(game).then(function (season) {
+    return espFetchLeague(game, parsed.id, season, '?view=mTeam&view=mSettings');
+  }).then(function (j) {
+    var meta = espCacheMeta(parsed.id, game, j);
+    espState.leagues.push({ id: parsed.id, game: game, teamId: '' });
+    espSaveState();
+    input.value = '';
+    espDiag('Added ' + meta.name + ' \u2014 now pick your team below.', 'ok');
+    espRenderManageList();
+    if (typeof skRenderConnectHub === 'function') skRenderConnectHub();
+    if (typeof extLoadAll === 'function') extLoadAll(true);
+  }).catch(function (e) {
+    var msg = String((e && e.message) || e);
+    if (msg === 'PRIVATE') {
+      espDiag('That league is private. In ESPN: League Settings \u2192 Make League Viewable to Public \u2192 Yes, then try again.', 'err');
+    } else {
+      espDiag('Could not read that league (' + msg + '). Check the ID and sport.', 'err');
+    }
+  });
+}
+
+// Render the saved-league rows. Any league without cached meta kicks
+// off a fetch and re-renders when it lands, so reopening the overlay
+// on a fresh session fills itself in.
+function espRenderManageList() {
+  var host = document.getElementById('esp-connect-list');
+  if (!host) return;
+  if (!espState.leagues.length) {
+    host.innerHTML = '<div style="color:rgba(255,255,255,0.35);font-size:11.5px;padding:10px 2px;">' +
+      'No ESPN leagues yet. Paste a league URL above.</div>';
+    return;
+  }
+  var html = '';
+  var pending = [];
+  for (var i = 0; i < espState.leagues.length; i++) {
+    var sv = espState.leagues[i];
+    var meta = _espMeta[sv.id];
+    if (!meta) pending.push(sv);
+    var label = meta ? meta.name : ('League ' + sv.id);
+    html += '<div style="background:#0a0e17;border:1px solid rgba(255,255,255,0.08);border-radius:9px;padding:10px;margin-bottom:8px;">' +
+      '<div style="display:flex;align-items:center;gap:8px;">' +
+        '<span style="flex:0 0 auto;font-size:9px;font-weight:800;letter-spacing:0.08em;color:#ef4444;">' +
+          espEsc(ESP_GAME_LABEL[sv.game] || sv.game) + '</span>' +
+        '<span style="flex:1;min-width:0;color:#fff;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' +
+          espEsc(label) + '</span>' +
+        '<button data-esp-rm="' + espEsc(sv.id) + '" style="flex:0 0 auto;background:rgba(248,81,73,0.12);border:1px solid rgba(248,81,73,0.35);color:#f87171;border-radius:6px;padding:5px 9px;font-size:11px;cursor:pointer;">Remove</button>' +
+      '</div>';
+    if (meta && meta.teams.length) {
+      html += '<div style="display:flex;align-items:center;gap:8px;margin-top:8px;">' +
+        '<span style="flex:0 0 auto;font-size:10px;letter-spacing:0.06em;text-transform:uppercase;color:rgba(255,255,255,0.35);">My team</span>' +
+        '<select data-esp-team="' + espEsc(sv.id) + '" style="flex:1;min-width:0;padding:7px 8px;border-radius:7px;border:1px solid rgba(255,255,255,0.14);background:#0f1420;color:#fff;font-size:12.5px;">' +
+        '<option value="">\u2014 select \u2014</option>';
+      for (var t = 0; t < meta.teams.length; t++) {
+        var tm = meta.teams[t];
+        html += '<option value="' + espEsc(tm.id) + '"' +
+          (String(sv.teamId) === String(tm.id) ? ' selected' : '') + '>' + espEsc(tm.name) + '</option>';
+      }
+      html += '</select></div>';
+    } else if (!meta) {
+      html += '<div style="margin-top:6px;color:rgba(255,255,255,0.3);font-size:11px;">loading\u2026</div>';
+    }
+    html += '</div>';
+  }
+  host.innerHTML = html;
+
+  var rmBtns = host.querySelectorAll('[data-esp-rm]');
+  for (var r = 0; r < rmBtns.length; r++) {
+    (function (btn) {
+      btn.onclick = function () { espRemoveLeague(btn.getAttribute('data-esp-rm')); };
+    })(rmBtns[r]);
+  }
+  var sels = host.querySelectorAll('[data-esp-team]');
+  for (var s = 0; s < sels.length; s++) {
+    (function (sel) {
+      sel.onchange = function () { espSetTeam(sel.getAttribute('data-esp-team'), sel.value); };
+    })(sels[s]);
+  }
+
+  for (var p = 0; p < pending.length; p++) {
+    (function (sv) {
+      espCurrentSeason(sv.game).then(function (season) {
+        return espFetchLeague(sv.game, sv.id, season, '?view=mTeam&view=mSettings');
+      }).then(function (j) {
+        espCacheMeta(sv.id, sv.game, j);
+        espRenderManageList();
+      }).catch(function () { /* leave the row as-is; Remove still works */ });
+    })(pending[p]);
+  }
+}
+
+function espConnect() {
+  var existing = document.getElementById('esp-connect-overlay');
+  if (existing) existing.parentNode.removeChild(existing);
+
+  var ov = document.createElement('div');
+  ov.id = 'esp-connect-overlay';
+  ov.style.cssText =
+    'position:fixed;inset:0;z-index:99999;background:rgba(6,8,14,0.92);' +
+    'display:flex;align-items:flex-start;justify-content:center;overflow-y:auto;' +
+    'padding:24px 16px;font-family:sans-serif;';
+
+  ov.innerHTML =
+    '<div style="width:100%;max-width:420px;background:#0f1420;border:1px solid rgba(255,255,255,0.08);border-radius:14px;padding:18px;">' +
+      '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">' +
+        '<div style="color:#ef4444;font-weight:800;font-size:15px;letter-spacing:0.02em;">\ud83d\udd34 ESPN Leagues</div>' +
+        '<button id="esp-connect-close" style="background:none;border:none;color:rgba(255,255,255,0.5);font-size:20px;cursor:pointer;">\u2715</button>' +
+      '</div>' +
+      '<div style="color:rgba(255,255,255,0.55);font-size:11px;line-height:1.5;margin-bottom:12px;">' +
+        'Paste a league URL from the ESPN app or site. Read-only, no password, no proxy. ' +
+        'The league must be set to public \u2014 League Settings \u2192 Make League Viewable to Public.' +
+      '</div>' +
+      '<input id="esp-connect-url" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" ' +
+        'placeholder="paste league URL or ID" ' +
+        'style="width:100%;box-sizing:border-box;padding:11px 12px;border-radius:8px;border:1px solid rgba(255,255,255,0.14);background:#0a0e17;color:#fff;font-size:14px;margin-bottom:8px;">' +
+      '<div style="display:flex;gap:8px;margin-bottom:10px;">' +
+        '<select id="esp-connect-sport" style="flex:0 0 96px;padding:11px 8px;border-radius:8px;border:1px solid rgba(255,255,255,0.14);background:#0a0e17;color:#fff;font-size:13px;">' +
+          '<option value="">sport</option>' +
+          '<option value="flb">MLB</option><option value="ffl">NFL</option>' +
+          '<option value="fba">NBA</option><option value="fhl">NHL</option>' +
+        '</select>' +
+        '<button id="esp-connect-go" style="flex:1;padding:11px;border-radius:8px;border:1px solid rgba(239,68,68,0.4);background:rgba(239,68,68,0.14);color:#ef4444;font-size:13px;font-weight:700;cursor:pointer;">' +
+          'Add league \u203a</button>' +
+      '</div>' +
+      '<div style="color:rgba(255,255,255,0.3);font-size:10px;line-height:1.5;margin-bottom:12px;">' +
+        'The sport dropdown is only needed if you paste a bare ID \u2014 a full URL already says which sport it is.' +
+      '</div>' +
+      '<div id="esp-connect-diag" style="margin-bottom:10px;"></div>' +
+      '<div id="esp-connect-list"></div>' +
+    '</div>';
+
+  document.body.appendChild(ov);
+
+  document.getElementById('esp-connect-close').onclick = function () {
+    ov.parentNode.removeChild(ov);
+    if (typeof skRenderConnectHub === 'function') skRenderConnectHub();
+    if (typeof extLoadAll === 'function') extLoadAll(true);
+  };
+  var goBtn = document.getElementById('esp-connect-go');
+  goBtn.onclick = espAddFromInput;
+  var input = document.getElementById('esp-connect-url');
+  input.onkeydown = function (e) { if (e.key === 'Enter') espAddFromInput(); };
+
+  espRenderManageList();
+}
+
+// Disconnect = forget the added leagues. Like Sleeper and Fantrax there
+// is no server-side session to revoke; anonymous reads leave nothing to
+// clean up remotely.
+function skHubDisconnectEspn() {
+  espState.leagues = [];
+  _espMeta = {};
+  try { localStorage.removeItem(ESP_LEAGUES_KEY); } catch (e) {}
+  if (typeof extLoadAll === 'function') extLoadAll(true);
+  if (typeof skRenderConnectHub === 'function') skRenderConnectHub();
+}
+
+// ─────────────────────────────────────────────────────────────────
 // EXTERNAL LEAGUES (Phase 1, slice 1) — normalized registry for
 // non-Yahoo providers. Rows use provider-prefixed keys ('slp:'/'ftx:')
 // and a provider field so they can NEVER collide with Yahoo league
@@ -120222,7 +120570,11 @@ function extLoadAll(force) {
   if (_extLoadedOnce && !force) return;
   var wantSleeper = (typeof slState !== 'undefined') && slState && slState.userId;
   var wantFantrax = (typeof fxState !== 'undefined') && fxState && fxState.secretId;
-  if (!wantSleeper && !wantFantrax) {
+  // ESPNSLICE1 — ESPN has no login, so "connected" just means the user
+  // has added at least one league by hand.
+  var wantEspn = (typeof espState !== 'undefined') && espState &&
+                 espState.leagues && espState.leagues.length > 0;
+  if (!wantSleeper && !wantFantrax && !wantEspn) {
     // Nothing connected (or everything just disconnected) — clear the
     // registry AND repaint so stale cards don't linger in the Today list.
     extLeagues = [];
@@ -120269,6 +120621,45 @@ function extLoadAll(force) {
         }).catch(function() { /* provider hiccup — skip quietly */ });
         jobs.push(job);
       })(SL_SPORTS[i]);
+    }
+  }
+
+  if (wantEspn) {
+    for (var ep = 0; ep < espState.leagues.length; ep++) {
+      (function (sv) {
+        // mTeam+mSettings only. mRoster on this same call measured 1.5MB
+        // against 32KB without it — rosters are a slice-2 lazy fetch.
+        var job = espCurrentSeason(sv.game).then(function (season) {
+          return espFetchLeague(sv.game, sv.id, season, '?view=mTeam&view=mSettings');
+        }).then(function (j) {
+          espCacheMeta(sv.id, sv.game, j);
+          var st = (j && j.settings) || {};
+          var row = {
+            key: 'esp:' + sv.id,
+            provider: 'espn',
+            sport: ESP_SPORT[sv.game] || '',
+            name: st.name || ('League ' + sv.id),
+            season: String((j && j.seasonId) || ''),
+            teams: (st.size != null) ? st.size : ((j && j.teams) ? j.teams.length : null),
+            status: '',
+            raw: j
+          };
+          if (sv.teamId && j && j.teams) {
+            for (var t = 0; t < j.teams.length; t++) {
+              if (String(j.teams[t].id) !== String(sv.teamId)) continue;
+              row.myTeamId = j.teams[t].id;
+              row.myTeamName = espTeamName(j.teams[t]);
+              var ovr = j.teams[t].record && j.teams[t].record.overall;
+              // Ties are real in H2H points leagues (the probe showed 5-9
+              // where ESPN says 5-9-1), so carry all three.
+              if (ovr) row.record = { w: ovr.wins || 0, l: ovr.losses || 0, t: ovr.ties || 0 };
+              break;
+            }
+          }
+          rows.push(row);
+        }).catch(function () { /* provider hiccup - skip quietly */ });
+        jobs.push(job);
+      })(espState.leagues[ep]);
     }
   }
 
