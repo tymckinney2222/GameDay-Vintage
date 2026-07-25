@@ -120685,7 +120685,7 @@ function espTodayTeamTotal(rosters, teamId) {
   return any ? Math.round(sum * 10) / 10 : null;
 }
 
-function espLiveScores(j, standingsRows, rosters, cats) {
+function espLiveScores(j, standingsRows, rosters, cats, row) {
   if (!j || !j.schedule || !j.schedule.length) return null;
   var period = (j.status && j.status.currentMatchupPeriod);
   if (period == null) return null;
@@ -120703,6 +120703,18 @@ function espLiveScores(j, standingsRows, rosters, cats) {
   // from the roster. Guarded against double counting — if ESPN ever does
   // start including today in that map, the add is skipped.
   var curPeriod = j.scoringPeriodId;
+  // Only the league's real categories count toward the tally — scoreByStat
+  // also carries AB/H/IP/BB/ER as rate components. ESPNSLICE2O
+  var catIds = null;
+  if (cats && row) {
+    var _items = ((((row.raw || {}).settings || {}).scoringSettings) || {}).scoringItems || [];
+    if (_items.length) {
+      catIds = {};
+      for (var _ci = 0; _ci < _items.length; _ci++) {
+        if (_items[_ci] && _items[_ci].statId != null) catIds[_items[_ci].statId] = 1;
+      }
+    }
+  }
   function side(x) {
     x = x || {};
     var id = (x.teamId != null) ? String(x.teamId) : null;
@@ -120746,6 +120758,34 @@ function espLiveScores(j, standingsRows, rosters, cats) {
     if (Number(m.matchupPeriodId) !== Number(period)) continue;
     var a = side(m.away), h = side(m.home);
     if (!a.id && !h.id) continue;   // bye / placeholder
+
+    // cumulativeScore's W-L-T is completed-periods-only, exactly like its
+    // stat values, so recompute the tally from the live grid. Verified
+    // against the app: 5-4-2 where the stale counter still said 6-3-2.
+    // ESPNSLICE2O
+    if (cats) {
+      var aS = (m.away && m.away.cumulativeScore) ? m.away.cumulativeScore.scoreByStat : null;
+      var hS = (m.home && m.home.cumulativeScore) ? m.home.cumulativeScore.scoreByStat : null;
+      if (aS && hS) {
+        var aL = espLiveCatValues(aS, espTodayByStat(rosters, a.id));
+        var hL = espLiveCatValues(hS, espTodayByStat(rosters, h.id));
+        var rws = [], kk;
+        for (kk in aS) {
+          if (!aS.hasOwnProperty(kk)) continue;
+          if (catIds && !catIds[kk]) continue;
+          rws.push({
+            id: kk,
+            mine: (aL[kk] != null) ? aL[kk] : _espStatVal(aS[kk]),
+            opp: (hL[kk] != null) ? hL[kk] : _espStatVal(hS[kk])
+          });
+        }
+        if (rws.length) {
+          var tl = espCatTally(rws);
+          a.rec = tl.w + '-' + tl.l + '-' + tl.t;  a.wins = tl.w;
+          h.rec = tl.l + '-' + tl.w + '-' + tl.t;  h.wins = tl.l;
+        }
+      }
+    }
     games.push({
       awayId: a.id, homeId: h.id,
       away: a.name, home: h.name,
@@ -120782,7 +120822,7 @@ function espEnrichLeagues() {
       espCurrentSeason(sv.game).then(function (season) {
         return espFetchLeague(sv.game, sv.id, season, espScoreView(row));
       }).then(function (j) {
-        var ls = espLiveScores(j, row.standingsAll, row.rosters, espIsCats(row));
+        var ls = espLiveScores(j, row.standingsAll, row.rosters, espIsCats(row), row);
         row._espCats = espCatBreakdown(j, row);
         if (ls) { row.liveScores = ls; _extRepaintToday(); }
       }).catch(function () { /* best-effort, same as the other providers */ });
@@ -121354,7 +121394,7 @@ function espRefreshLive(row, force) {
   }).then(function (res) {
     var built = espRosters(res[0], sv.game, espScoredIds(row));
     if (built) row.rosters = built;
-    var ls = espLiveScores(res[1], row.standingsAll, row.rosters, espIsCats(row));
+    var ls = espLiveScores(res[1], row.standingsAll, row.rosters, espIsCats(row), row);
     row._espCats = espCatBreakdown(res[1], row);
     row._espBox = res[1];
     if (ls) row.liveScores = ls;
@@ -121559,7 +121599,7 @@ function espRefreshScores(row, force) {
   espCurrentSeason(sv.game).then(function (season) {
     return espFetchLeague(sv.game, sv.id, season, espScoreView(row));
   }).then(function (j) {
-    var ls = espLiveScores(j, row.standingsAll, row.rosters, espIsCats(row));
+    var ls = espLiveScores(j, row.standingsAll, row.rosters, espIsCats(row), row);
     if (ls) row.liveScores = ls;
     row._espCats = espCatBreakdown(j, row);
     row._espScoreAt = Date.now();
@@ -121636,15 +121676,13 @@ function espCatBreakdown(j, row) {
     for (k in ids) {
       if (!ids.hasOwnProperty(k)) continue;
       if (items.length && !only[k]) continue;
-      rows.push({
-        id: k,
-        mine: (myLive[k] != null) ? myLive[k] : _espStatVal(ms ? ms[k] : null),
-        opp: (opLive[k] != null) ? opLive[k] : _espStatVal(os ? os[k] : null),
-        result: _espStatResult(ms ? ms[k] : null)
-      });
+      var mv = (myLive[k] != null) ? myLive[k] : _espStatVal(ms ? ms[k] : null);
+      var ov = (opLive[k] != null) ? opLive[k] : _espStatVal(os ? os[k] : null);
+      rows.push({ id: k, mine: mv, opp: ov, result: espCatResult(k, mv, ov) });
     }
     if (!rows.length) return null;
-    return { rows: rows, period: period, live: !!(myToday || opToday) };
+    return { rows: rows, period: period, live: !!(myToday || opToday),
+             tally: espCatTally(rows) };
   }
   return null;
 }
@@ -121672,16 +121710,18 @@ function _espCatBreakdownHtml(row) {
   for (i = 0; i < cb.rows.length; i++) {
     var r = cb.rows[i];
     var lbl = espStatName(game, r.id) || ('#' + r.id);
+    // Green marks the WINNER on whichever side. Red on the opponent read
+    // as "the opponent is losing", which is the opposite of the truth.
     var win = r.result === 'WIN', loss = r.result === 'LOSS';
     h += '<div style="display:flex;align-items:center;padding:5px 0;' +
       'border-bottom:1px solid rgba(255,255,255,0.04);font-family:var(--sk-font-mono,monospace);">' +
       '<span style="flex:1;text-align:right;font-size:12.5px;font-weight:' + (win ? '800' : '400') +
-        ';color:' + (win ? '#4ade80' : 'rgba(255,255,255,0.72)') + ';">' +
+        ';color:' + (win ? '#4ade80' : 'rgba(255,255,255,0.55)') + ';">' +
         (r.mine != null ? espStatFmt(r.id, r.mine) : '\u2014') + '</span>' +
       '<span style="flex:0 0 62px;text-align:center;font-size:9.5px;letter-spacing:0.06em;' +
         'color:rgba(255,255,255,0.4);">' + slEsc(lbl) + '</span>' +
       '<span style="flex:1;font-size:12.5px;font-weight:' + (loss ? '800' : '400') +
-        ';color:' + (loss ? '#f87171' : 'rgba(255,255,255,0.72)') + ';">' +
+        ';color:' + (loss ? '#4ade80' : 'rgba(255,255,255,0.55)') + ';">' +
         (r.opp != null ? espStatFmt(r.id, r.opp) : '\u2014') + '</span>' +
     '</div>';
   }
@@ -121770,6 +121810,35 @@ var ESP_RATE_RECIPE = {
 // Components needed by the recipes above. For a categories league these
 // have to survive the trim even though they aren't scored categories.
 var ESP_RATE_COMPONENTS = [0, 1, 34, 37, 39, 45];
+
+// Which categories you WANT to be lower. Everything else is higher-better.
+// Note 10 (batter walks) and 39 (walks allowed) are different ids, so
+// there's no collision between the good BB and the bad one. ESPNSLICE2O
+var ESP_LOWER_BETTER = { 27: 1, 37: 1, 39: 1, 41: 1, 45: 1, 47: 1, 54: 1 };
+
+// ESPN ships a "result" on each scoreByStat entry, but it describes the
+// last COMPLETED period — the same staleness the values had. Once today is
+// folded in it can be flatly wrong: 14 runs against 15 was still flagged
+// WIN. So the result is derived from the live numbers instead.
+function espCatResult(id, mine, opp) {
+  if (mine == null || opp == null) return '';
+  var a = Number(mine), b = Number(opp);
+  if (a === b) return 'TIE';
+  var lower = !!ESP_LOWER_BETTER[id];
+  return (lower ? (a < b) : (a > b)) ? 'WIN' : 'LOSS';
+}
+
+// Category tally straight off the live grid. Verified against the app:
+// AVG/RBI/SB/WHIP/ERA won, R/K/W/HD lost, HR/SV tied = 5-4-2, exactly what
+// ESPN displayed.
+function espCatTally(rows) {
+  var w = 0, l = 0, t = 0;
+  for (var i = 0; i < rows.length; i++) {
+    var r = espCatResult(rows[i].id, rows[i].mine, rows[i].opp);
+    if (r === 'WIN') w++; else if (r === 'LOSS') l++; else if (r === 'TIE') t++;
+  }
+  return { w: w, l: l, t: t, rec: w + '-' + l + '-' + t };
+}
 
 function _espNum(v) {
   var n = _espStatVal(v);
