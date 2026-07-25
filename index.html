@@ -120588,6 +120588,144 @@ function skHubDisconnectEspn() {
   if (typeof skRenderConnectHub === 'function') skRenderConnectHub();
 }
 
+// ── ESPN SLICE 2 (2a standings + 2b matchups) ── ESPNSLICE2 ──
+// Nothing here builds an ESPN detail view. extOpenLeague is already
+// provider-agnostic — it just needs row.standingsAll / row.liveScores in
+// the SAME shape the Sleeper and Fantrax paths produce, and it lights up.
+// Populating standingsAll is also what flips hasDetail, which is what
+// makes the Today card tappable.
+
+// 2a — the whole standings table out of the mTeam payload we ALREADY
+// fetched during the registry load. Zero extra requests.
+//
+// Ordering: ESPN's own playoffSeed is authoritative when it's live
+// (probe-confirmed: seed 6 for the team the app also shows 6th). It sits
+// at 0 before a season starts, so fall back to wins then points-for and
+// number the rows ourselves.
+function espStandingsAll(j, myTeamId) {
+  if (!j || !j.teams || !j.teams.length) return null;
+  var teams = j.teams, rows = [], myIds = {}, i;
+
+  // Season-points leagues have no meaningful W-L, and the shared detail
+  // view decides its column set by asking whether ANY row has a record.
+  // Emitting an empty record for those gets SEASON/DAY/GB instead of an
+  // all-zeros W-L-T table.
+  var sType = String((((j.settings || {}).scoringSettings) || {}).scoringType || '');
+  var isH2H = sType.indexOf('H2H') === 0;
+
+  for (i = 0; i < teams.length; i++) {
+    var t = teams[i] || {};
+    var o = (t.record && t.record.overall) || {};
+    var w = o.wins || 0, l = o.losses || 0, ti = o.ties || 0;
+    var pf = (o.pointsFor != null) ? Number(o.pointsFor)
+           : (t.points != null) ? Number(t.points) : null;
+    var logo = String(t.logo || '');
+    rows.push({
+      teamId: String(t.id),
+      teamName: espTeamName(t),
+      avatar: (/^https?:\/\//i.test(logo)) ? logo : '',
+      record: isH2H ? (w + '-' + l + '-' + ti) : '',
+      pf: (pf != null) ? Math.round(pf * 10) / 10 : null,
+      gb: (o.gamesBack != null) ? o.gamesBack : null,
+      wins: w,
+      rank: t.playoffSeed || null,
+      points: pf
+    });
+    if (myTeamId != null && String(t.id) === String(myTeamId)) myIds[String(t.id)] = 1;
+  }
+
+  var haveSeeds = true;
+  for (i = 0; i < rows.length; i++) { if (!rows[i].rank) { haveSeeds = false; break; } }
+  if (haveSeeds) {
+    rows.sort(function (a, b) { return a.rank - b.rank; });
+  } else {
+    rows.sort(function (a, b) { return (b.wins - a.wins) || ((b.pf || 0) - (a.pf || 0)); });
+    for (i = 0; i < rows.length; i++) rows[i].rank = i + 1;
+  }
+
+  var mine = null;
+  for (i = 0; i < rows.length; i++) {
+    if (!myIds[rows[i].teamId]) continue;
+    mine = { total: rows.length, rank: rows[i].rank, teamName: rows[i].teamName,
+             record: rows[i].record, pf: rows[i].pf };
+    break;
+  }
+  return { rows: rows, myIds: myIds, mine: mine };
+}
+
+// 2b — this week's games from an mMatchupScore payload.
+//
+// The current week is status.currentMatchupPeriod, NOT scoringPeriodId.
+// In MLB those were 16 and 123 on the same response: scoringPeriodId is
+// a DAY counter. Filtering on it would match nothing and the matchup row
+// would silently never appear.
+function espLiveScores(j, standingsRows) {
+  if (!j || !j.schedule || !j.schedule.length) return null;
+  var period = (j.status && j.status.currentMatchupPeriod);
+  if (period == null) return null;
+  var nameById = {}, i;
+  for (i = 0; i < (standingsRows || []).length; i++) {
+    nameById[standingsRows[i].teamId] = standingsRows[i].teamName;
+  }
+  function side(x) {
+    x = x || {};
+    var id = (x.teamId != null) ? String(x.teamId) : null;
+    return {
+      id: id,
+      name: id ? (nameById[id] || ('Team ' + id)) : '',
+      // Future periods carry totalPoints 0 with no pointsByScoringPeriod
+      // (probe-confirmed on period 21), so a scheduled-but-unplayed week
+      // reads 0.0 rather than blowing up.
+      score: (x.totalPoints != null) ? Math.round(Number(x.totalPoints) * 10) / 10 : null
+    };
+  }
+  var games = [];
+  for (i = 0; i < j.schedule.length; i++) {
+    var m = j.schedule[i] || {};
+    if (Number(m.matchupPeriodId) !== Number(period)) continue;
+    var a = side(m.away), h = side(m.home);
+    if (!a.id && !h.id) continue;   // bye / placeholder
+    games.push({
+      awayId: a.id, homeId: h.id,
+      away: a.name, home: h.name,
+      awayScore: a.score, homeScore: h.score
+    });
+  }
+  if (!games.length) return null;
+  return { period: period, games: games };
+}
+
+// Enrich every synced ESPN league. Standings are free (already on the
+// row); matchups cost exactly one request per league, and it's
+// mMatchupScore rather than mMatchup because the two were measured at
+// 175KB vs 664KB for the same schedule array.
+function espEnrichLeagues() {
+  if (typeof espState === 'undefined' || !espState ||
+      !espState.leagues || !espState.leagues.length) return;
+  for (var i = 0; i < extLeagues.length; i++) {
+    (function (row) {
+      if (row.provider !== 'espn' || row.standingsAll || !extIsSynced(row.key)) return;
+      var sv = espFindSaved(row.key.slice(4));
+      if (!sv) return;
+
+      var built = espStandingsAll(row.raw, sv.teamId);
+      if (built) {
+        row.standingsAll = built.rows;
+        row.myTeamIds = built.myIds;
+        if (built.mine) row.standings = built.mine;
+        _extRepaintToday();
+      }
+
+      espCurrentSeason(sv.game).then(function (season) {
+        return espFetchLeague(sv.game, sv.id, season, '?view=mMatchupScore');
+      }).then(function (j) {
+        var ls = espLiveScores(j, row.standingsAll);
+        if (ls) { row.liveScores = ls; _extRepaintToday(); }
+      }).catch(function () { /* best-effort, same as the other providers */ });
+    })(extLeagues[i]);
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────
 // EXTERNAL LEAGUES (Phase 1, slice 1) — normalized registry for
 // non-Yahoo providers. Rows use provider-prefixed keys ('slp:'/'ftx:')
@@ -120791,6 +120929,7 @@ function extLoadAll(force) {
     // draft date) — after the list paints, so cards upgrade in place.
     extEnrichFantrax();
     slEnrichLeagues();
+    espEnrichLeagues();   // ESPNSLICE2
     // League registry just refreshed — if the FP Projector is open, its
     // scoring dropdown may now have Sleeper/Fantrax entries to show.
     if (typeof _fppOnExtLeaguesLoaded === 'function') _fppOnExtLeaguesLoaded();
