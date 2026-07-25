@@ -120659,7 +120659,23 @@ function espStandingsAll(j, myTeamId) {
 // In MLB those were 16 and 123 on the same response: scoringPeriodId is
 // a DAY counter. Filtering on it would match nothing and the matchup row
 // would silently never appear.
-function espLiveScores(j, standingsRows) {
+// A team's in-progress points for today: the sum of its STARTERS' daily
+// entries. mRoster already carries every team's roster, so this costs
+// nothing extra. ESPNSLICE2G
+function espTodayTeamTotal(rosters, teamId) {
+  var t = rosters && rosters.byTeam && rosters.byTeam[String(teamId)];
+  if (!t || !t.items) return null;
+  var sum = 0, any = false;
+  for (var i = 0; i < t.items.length; i++) {
+    var it = t.items[i];
+    if (!it.starter) continue;
+    var w = it.windows && it.windows.today;
+    if (w && w.total != null) { sum += Number(w.total); any = true; }
+  }
+  return any ? Math.round(sum * 10) / 10 : null;
+}
+
+function espLiveScores(j, standingsRows, rosters) {
   if (!j || !j.schedule || !j.schedule.length) return null;
   var period = (j.status && j.status.currentMatchupPeriod);
   if (period == null) return null;
@@ -120667,16 +120683,41 @@ function espLiveScores(j, standingsRows) {
   for (i = 0; i < (standingsRows || []).length; i++) {
     nameById[standingsRows[i].teamId] = standingsRows[i].teamName;
   }
+  // totalPoints is the sum of COMPLETED scoring periods only. Probe-proven:
+  // pointsByScoringPeriod held {118:14, 119:14, 120:47, 121:41, 122:14} and
+  // totalPoints was exactly 130 — today's period (123) simply isn't in the
+  // map. So the card was showing yesterday's close, and a player going -1
+  // today never moved it.
+  //
+  // Fix: sum the per-period map, then add today's in-progress total derived
+  // from the roster. Guarded against double counting — if ESPN ever does
+  // start including today in that map, the add is skipped.
+  var curPeriod = j.scoringPeriodId;
   function side(x) {
     x = x || {};
     var id = (x.teamId != null) ? String(x.teamId) : null;
+    var base = null, hasToday = false, k;
+    var pbs = x.pointsByScoringPeriod;
+    if (pbs) {
+      base = 0;
+      for (k in pbs) {
+        if (!pbs.hasOwnProperty(k)) continue;
+        base += Number(pbs[k]) || 0;
+        if (curPeriod != null && Number(k) === Number(curPeriod)) hasToday = true;
+      }
+    } else if (x.totalPoints != null) {
+      // Future periods carry totalPoints 0 with no per-period map
+      // (probe-confirmed on period 21), so this stays safe.
+      base = Number(x.totalPoints);
+    }
+    if (base != null && !hasToday && id) {
+      var td = espTodayTeamTotal(rosters, id);
+      if (td != null) base += td;
+    }
     return {
       id: id,
       name: id ? (nameById[id] || ('Team ' + id)) : '',
-      // Future periods carry totalPoints 0 with no pointsByScoringPeriod
-      // (probe-confirmed on period 21), so a scheduled-but-unplayed week
-      // reads 0.0 rather than blowing up.
-      score: (x.totalPoints != null) ? Math.round(Number(x.totalPoints) * 10) / 10 : null
+      score: (base != null) ? Math.round(base * 10) / 10 : null
     };
   }
   var games = [];
@@ -120719,7 +120760,7 @@ function espEnrichLeagues() {
       espCurrentSeason(sv.game).then(function (season) {
         return espFetchLeague(sv.game, sv.id, season, '?view=mMatchupScore');
       }).then(function (j) {
-        var ls = espLiveScores(j, row.standingsAll);
+        var ls = espLiveScores(j, row.standingsAll, row.rosters);
         if (ls) { row.liveScores = ls; _extRepaintToday(); }
       }).catch(function () { /* best-effort, same as the other providers */ });
     })(extLeagues[i]);
@@ -121054,8 +121095,12 @@ function _espRosterRowsHtml(row, myTeam) {
         ? '<span style="flex:0 0 auto;font-size:10.5px;font-weight:700;color:#4ade80;">+' +
           it.today + '</span>' : '') +
       '<span style="flex:0 0 52px;text-align:right;">' +
-        '<span style="display:block;font-size:12px;font-weight:700;' +
-          'color:rgba(255,255,255,0.78);">' + (shown != null ? shown : '\u2014') + '</span>' +
+        '<span style="display:block;font-size:12px;font-weight:700;color:' +
+          (shown == null ? 'rgba(255,255,255,0.5)'
+            : shown < 0 ? '#f87171'
+            : shown > 0 ? '#4ade80'
+            : 'rgba(255,255,255,0.5)') + ';">' +
+          (shown != null ? shown : '\u2014') + '</span>' +
         (wd && wd.avg != null
           ? '<span style="display:block;font-size:9.5px;color:rgba(255,255,255,0.38);">' +
             wd.avg + '/g</span>' : '') +
@@ -121253,7 +121298,7 @@ function espRefreshLive(row, force) {
   }).then(function (res) {
     var built = espRosters(res[0], sv.game, espScoredIds(row));
     if (built) row.rosters = built;
-    var ls = espLiveScores(res[1], row.standingsAll);
+    var ls = espLiveScores(res[1], row.standingsAll, row.rosters);
     if (ls) row.liveScores = ls;
     row._espLiveAt = Date.now();
     row._espLiveBusy = 0;
