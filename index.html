@@ -121066,7 +121066,13 @@ function _espRosterRowsHtml(row, myTeam) {
           'line-height:1.5;">' + slEsc(win.label) + ' fantasy points' +
           (winKey !== 'today' ? ' \u00b7 green is today' : '') +
           ' \u00b7 tap a player for their card' +
-          '<br>IP in innings notation \u00b7 second number is points per game.</div>';
+          '<br>IP in innings notation \u00b7 second number is points per game.' +
+          (winKey === 'today'
+            ? '<br><span id="espLiveNote">' +
+              (espLiveStamp(row) ? 'live \u00b7 updated ' + slEsc(espLiveStamp(row))
+                                 : 'refreshing\u2026') + '</span>'
+            : '') +
+          '</div>';
   return html;
 }
 
@@ -121183,13 +121189,85 @@ function espScoredIds(row) {
 function espSetWindow(key, win) {
   for (var i = 0; i < extLeagues.length; i++) {
     if (extLeagues[i].key !== key) continue;
-    extLeagues[i]._espWin = win;
+    var row = extLeagues[i];
+    row._espWin = win;
+    // Repaint first so the dropdown responds instantly, then refresh in the
+    // background if the user asked for live numbers. ESPNSLICE2F
     var p = _espRosterPane();
     if (p && typeof _extRosterPaneHtml === 'function') {
-      p.innerHTML = _extRosterPaneHtml(extLeagues[i], extLeagues[i].myTeamIds || {});
+      p.innerHTML = _extRosterPaneHtml(row, row.myTeamIds || {});
     }
+    if (win === 'today' && typeof espRefreshLive === 'function') espRefreshLive(row, 0);
     break;
   }
+}
+
+// ── ESPN SLICE 2f (live refresh on Today) ── ESPNSLICE2F ──
+// Season numbers barely move, so rosters are fetched once per session and
+// held. Today is the one window where that's actively misleading: open the
+// tab at 1pm and it would still read 1pm at 9pm.
+//
+// So switching TO Today refetches, and only then. Both payloads go together
+// because they answer the same question from two directions — mRoster for
+// each player's daily points, mMatchupScore for the team totals that show
+// on the Today card.
+var _ESP_LIVE_MIN_MS = 30000;
+
+function _espPane(name) {
+  var body = document.getElementById('skExtDetailBody');
+  if (!body) return null;
+  var panes = body.querySelectorAll('[data-extpane]');
+  for (var i = 0; i < panes.length; i++) {
+    if (panes[i].getAttribute('data-extpane') === name) return panes[i];
+  }
+  return null;
+}
+
+function espLiveStamp(row) {
+  if (!row || !row._espLiveAt) return '';
+  try {
+    return new Date(row._espLiveAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  } catch (e) { return ''; }
+}
+
+function espRefreshLive(row, force) {
+  if (!row || row._espLiveBusy) return;
+  // Throttle. Flipping the dropdown back and forth shouldn't fire a 1.7MB
+  // pair of requests every time.
+  if (!force && row._espLiveAt && (Date.now() - row._espLiveAt) < _ESP_LIVE_MIN_MS) return;
+  var sv = espFindSaved(row.key.slice(4));
+  if (!sv) return;
+  row._espLiveBusy = 1;
+
+  var pane = _espPane('roster');
+  if (pane) {
+    var note = document.getElementById('espLiveNote');
+    if (note) note.textContent = 'refreshing\u2026';
+  }
+
+  espCurrentSeason(sv.game).then(function (season) {
+    return Promise.all([
+      espFetchLeague(sv.game, sv.id, season, '?view=mRoster'),
+      espFetchLeague(sv.game, sv.id, season, '?view=mMatchupScore')
+    ]);
+  }).then(function (res) {
+    var built = espRosters(res[0], sv.game, espScoredIds(row));
+    if (built) row.rosters = built;
+    var ls = espLiveScores(res[1], row.standingsAll);
+    if (ls) row.liveScores = ls;
+    row._espLiveAt = Date.now();
+    row._espLiveBusy = 0;
+    // The Today card is where the matchup score is actually watched.
+    if (typeof _extRepaintToday === 'function') _extRepaintToday();
+    var p = _espPane('roster');
+    if (p && typeof _extRosterPaneHtml === 'function') {
+      p.innerHTML = _extRosterPaneHtml(row, row.myTeamIds || {});
+    }
+  }).catch(function () {
+    row._espLiveBusy = 0;
+    var n2 = document.getElementById('espLiveNote');
+    if (n2) n2.textContent = 'refresh failed';
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────
