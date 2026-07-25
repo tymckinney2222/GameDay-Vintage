@@ -120301,6 +120301,76 @@ function espCacheMeta(id, game, j) {
   return _espMeta[id];
 }
 
+// Build the SHARED ext standings shape from an mTeam payload.
+// { teamName, rank, total, record, pf } is exactly what the Sleeper and
+// Fantrax paths produce, and what skBuildExtCardHTML reads for the big
+// team name, the record/rank in the header, and (later) hasDetail.
+//
+// Rank field names in mTeam are NOT confirmed yet — playoffSeed is the
+// likely one, so it's tried first and we fall back to computing the
+// order ourselves from wins then points-for. The probe page reports
+// which fields actually exist so this can be tightened rather than left
+// guessing forever. ESPNSLICE1
+function espStandingsRow(j, teamId) {
+  if (!j || !j.teams || !j.teams.length || teamId == null) return null;
+  var teams = j.teams, mine = null, i;
+  for (i = 0; i < teams.length; i++) {
+    if (String(teams[i].id) === String(teamId)) { mine = teams[i]; break; }
+  }
+  if (!mine) return null;
+
+  function ovrOf(t) { return (t.record && t.record.overall) || {}; }
+  function pfOf(t) {
+    var o = ovrOf(t);
+    if (o.pointsFor != null) return Number(o.pointsFor);
+    if (t.points != null) return Number(t.points);
+    if (t.pointsFor != null) return Number(t.pointsFor);
+    return 0;
+  }
+
+  var o = ovrOf(mine);
+  var w = o.wins || 0, l = o.losses || 0, t2 = o.ties || 0;
+  var pf = pfOf(mine);
+
+  var rank = mine.playoffSeed || mine.rankCalculatedFinal || mine.rankFinal || null;
+  if (!rank) {
+    // Compute it: wins desc, then points-for desc. Same ordering ESPN
+    // shows, and better than showing no rank at all.
+    var sorted = teams.slice(0);
+    sorted.sort(function (a, b) {
+      var aw = ovrOf(a).wins || 0, bw = ovrOf(b).wins || 0;
+      if (bw !== aw) return bw - aw;
+      return pfOf(b) - pfOf(a);
+    });
+    for (i = 0; i < sorted.length; i++) {
+      if (String(sorted[i].id) === String(teamId)) { rank = i + 1; break; }
+    }
+  }
+
+  var played = w + l + t2;
+  return {
+    teamName: espTeamName(mine),
+    rank: rank || null,
+    total: teams.length,
+    // Ties are real here (the 5-9-1 team is why), so always W-L-T.
+    record: played ? (w + '-' + l + '-' + t2) : '',
+    pf: pf
+  };
+}
+
+// ESPN serves a team logo URL on the team object when one is set. Only
+// trust an absolute http(s) URL — some teams carry a blank or a relative
+// placeholder, and a broken <img> looks worse than no logo.
+function espTeamLogo(j, teamId) {
+  if (!j || !j.teams || teamId == null) return '';
+  for (var i = 0; i < j.teams.length; i++) {
+    if (String(j.teams[i].id) !== String(teamId)) continue;
+    var u = j.teams[i].logo || '';
+    return (/^https?:\/\//i.test(u)) ? u : '';
+  }
+  return '';
+}
+
 function espFindSaved(id) {
   for (var i = 0; i < espState.leagues.length; i++) {
     if (String(espState.leagues[i].id) === String(id)) return espState.leagues[i];
@@ -120655,6 +120725,15 @@ function extLoadAll(force) {
               if (ovr) row.record = { w: ovr.wins || 0, l: ovr.losses || 0, t: ovr.ties || 0 };
               break;
             }
+            // Shared standings shape -> card shows MY team name big, with
+            // record and rank top-right, same anatomy as Yahoo/Sleeper.
+            var stRow = espStandingsRow(j, sv.teamId);
+            if (stRow) row.standings = stRow;
+            // Map form the card's matchup-score row expects (slice 2b).
+            row.myTeamIds = {};
+            row.myTeamIds[String(sv.teamId)] = 1;
+            var lg = espTeamLogo(j, sv.teamId);
+            if (lg) row.myLogo = lg;
           }
           rows.push(row);
         }).catch(function () { /* provider hiccup - skip quietly */ });
@@ -121981,6 +122060,7 @@ function skBuildExtCardHTML(l) {
   else if (l.status === 'complete') statusTxt = 'Season complete';
   else if (l.info && l.info.draft) statusTxt = 'Drafts ' + slEsc(l.info.draft);
   else if (l.info && l.info.startDate) statusTxt = 'Season starts ' + _extFmtDate(l.info.startDate);
+  else if (l.provider === 'espn') statusTxt = 'Synced';
   else statusTxt = 'Synced \u00b7 detail view coming soon';
   var hasDetail = (l.standingsAll && l.standingsAll.length) || (l.matchups && l.matchups.length);
   // Mirror the Yahoo card anatomy when we know MY team (from the
@@ -121990,7 +122070,10 @@ function skBuildExtCardHTML(l) {
   var myName = (l.standings && l.standings.teamName) ? String(l.standings.teamName) : '';
   var bigName = myName || l.name;
   var subLine = myName ? l.name : facts.join(' \u00b7 ');
+  // A logo the user uploaded always wins; otherwise fall back to one the
+  // provider supplied on the row (ESPN serves a team logo URL). ESPNSLICE1
   var _cardLogo = (typeof extGetMyLogo === 'function') ? extGetMyLogo(l.key) : '';
+  if (!_cardLogo && l.myLogo) _cardLogo = l.myLogo;
 
   // Card head-right (record · rank), mirroring the Yahoo card. Built from
   // MY standings row when known: "0-0-0 · 2nd of 24" or "512.4 · 3rd of 16".
