@@ -120780,7 +120780,7 @@ function espEnrichLeagues() {
       }
 
       espCurrentSeason(sv.game).then(function (season) {
-        return espFetchLeague(sv.game, sv.id, season, '?view=mMatchupScore');
+        return espFetchLeague(sv.game, sv.id, season, espScoreView(row));
       }).then(function (j) {
         var ls = espLiveScores(j, row.standingsAll, row.rosters, espIsCats(row));
         row._espCats = espCatBreakdown(j, row);
@@ -121333,7 +121333,7 @@ function espRefreshLive(row, force) {
   espCurrentSeason(sv.game).then(function (season) {
     return Promise.all([
       espFetchLeague(sv.game, sv.id, season, '?view=mRoster'),
-      espFetchLeague(sv.game, sv.id, season, '?view=mMatchupScore')
+      espFetchLeague(sv.game, sv.id, season, espScoreView(row))
     ]);
   }).then(function (res) {
     var built = espRosters(res[0], sv.game, espScoredIds(row));
@@ -121533,7 +121533,7 @@ function espRefreshScores(row, force) {
   if (!sv) return;
   row._espScoreBusy = 1;
   espCurrentSeason(sv.game).then(function (season) {
-    return espFetchLeague(sv.game, sv.id, season, '?view=mMatchupScore');
+    return espFetchLeague(sv.game, sv.id, season, espScoreView(row));
   }).then(function (j) {
     var ls = espLiveScores(j, row.standingsAll, row.rosters, espIsCats(row));
     if (ls) row.liveScores = ls;
@@ -121541,11 +121541,13 @@ function espRefreshScores(row, force) {
     row._espScoreAt = Date.now();
     row._espScoreBusy = 0;
     if (typeof _extRepaintToday === 'function') _extRepaintToday();
+    // Re-render the whole ESPN matchup pane, not just the category block —
+    // the matchup rows carry the tallies too and were staying stale.
+    // ESPNSLICE2M
     var p = _espPane('matchup');
-    if (p && typeof _espCatBreakdownHtml === 'function') {
-      var pre = _espCatBreakdownHtml(row);
-      var old = p.querySelector('[data-espcats]');
-      if (pre && old) old.outerHTML = pre;
+    if (p && typeof _espMatchupPaneHtml === 'function') {
+      var holder = p.querySelector('[data-espmatch]');
+      if (holder) holder.outerHTML = _espMatchupPaneHtml(row);
     }
   }).catch(function () { row._espScoreBusy = 0; });
 }
@@ -121642,6 +121644,61 @@ function _espCatBreakdownHtml(row) {
         ';color:' + (loss ? '#f87171' : 'rgba(255,255,255,0.72)') + ';">' +
         (r.opp != null ? espStatFmt(r.id, r.opp) : '\u2014') + '</span>' +
     '</div>';
+  }
+  h += '</div>';
+  return h;
+}
+
+// ── ESPN SLICE 2M (categories use mBoxscore) ── ESPNSLICE2M ──
+//
+// Correction to slice 2L: I read scoreByStat off the probe's mBoxscore
+// section and wired it to mMatchupScore. The two differ, confirmed:
+//
+//   mMatchupScore -> cumulativeScore { losses, statBySlot, ties, wins }
+//   mBoxscore     -> cumulativeScore { losses, scoreByStat, statBySlot,
+//                                      ties, wins }
+//
+// So a categories league has to read mBoxscore (635KB) — it is the only
+// view carrying the per-category numbers, and its W-L-T also tracks live
+// where mMatchupScore's lagged, the same way totalPoints lagged.
+// A points league still uses the cheaper 175KB mMatchupScore.
+function espScoreView(row) {
+  return espIsCats(row) ? '?view=mBoxscore' : '?view=mMatchupScore';
+}
+
+// ESPN's whole matchup pane, so a refresh can re-render it in place. The
+// shared builder composes its list inline inside extOpenLeague and can't
+// be called again from outside.
+function _espMatchupPaneHtml(row) {
+  var h = '<div data-espmatch>';
+  h += _espCatBreakdownHtml(row);
+  var ls = row && row.liveScores;
+  if (ls && ls.games && ls.games.length) {
+    var myIds = row.myTeamIds || {};
+    h += '<div style="color:rgba(255,255,255,0.3);font-size:10px;letter-spacing:0.12em;' +
+      'margin:0 0 6px;">PERIOD ' + slEsc(String(ls.period)) + '</div>';
+    for (var i = 0; i < ls.games.length; i++) {
+      var g = ls.games[i];
+      var mine = !!(myIds[g.awayId] || myIds[g.homeId]);
+      var aTxt = (g.awayRec != null) ? g.awayRec : (g.awayScore != null ? String(g.awayScore) : '\u2014');
+      var hTxt = (g.homeRec != null) ? g.homeRec : (g.homeScore != null ? String(g.homeScore) : '\u2014');
+      h += '<div style="display:flex;align-items:center;gap:8px;padding:7px 8px;border-radius:8px;' +
+        'margin:0 0 3px;font-size:12.5px;' +
+        (mine ? 'background:rgba(239,68,68,0.10);' : '') + '">' +
+        '<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' +
+          'color:' + (mine && myIds[g.awayId] ? '#ef4444;font-weight:700' : 'rgba(255,255,255,0.8)') + ';">' +
+          slEsc(g.away) + '</span>' +
+        '<span style="flex:0 0 auto;font-family:var(--sk-font-mono,monospace);font-weight:800;' +
+          'color:#fff;white-space:nowrap;">' + slEsc(aTxt) +
+          '<span style="color:rgba(255,255,255,0.3);font-weight:400;"> \u2013 </span>' +
+          slEsc(hTxt) + '</span>' +
+        '<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' +
+          'color:' + (mine && myIds[g.homeId] ? '#ef4444;font-weight:700' : 'rgba(255,255,255,0.8)') + ';">' +
+          slEsc(g.home) + '</span>' +
+      '</div>';
+    }
+  } else {
+    h += '<div style="color:rgba(255,255,255,0.35);font-size:12px;">No matchups yet.</div>';
   }
   h += '</div>';
   return h;
@@ -124456,11 +124513,10 @@ function extOpenLeague(key) {
   // MATCHUP pane — live scores (current period, zeros pre-season)
   // preferred; getLeagueInfo schedule as fallback.
   var matchupHtml = '';
-  // Per-category comparison for MY matchup, above the league-wide list.
-  // ESPNSLICE2L
-  if (row.provider === 'espn' && typeof _espCatBreakdownHtml === 'function') {
-    matchupHtml += _espCatBreakdownHtml(row);
-  }
+  // ESPN builds its own matchup pane so a background refresh can replace
+  // it wholesale. ESPNSLICE2M
+  var espOwnsMatchup = (row.provider === 'espn' && typeof _espMatchupPaneHtml === 'function');
+  if (espOwnsMatchup) matchupHtml = _espMatchupPaneHtml(row);
   // Avatar cascade for matchup rows — mirrors the Standings tab so team
   // logos carry over: my uploaded logo -> real Sleeper avatar (pulled
   // from the standings rows, keyed by roster/team id) -> letter circle.
@@ -124485,7 +124541,9 @@ function extOpenLeague(key) {
     }
     return '<span style="display:inline-flex;width:16px;height:16px;border-radius:50%;vertical-align:-3px;margin-right:5px;align-items:center;justify-content:center;font-size:9px;font-weight:800;background:' + (isMine ? accent + '33' : 'rgba(255,255,255,0.08)') + ';color:' + (isMine ? accent : 'rgba(255,255,255,0.6)') + ';">' + slEsc((teamName || '?').charAt(0).toUpperCase()) + '</span>';
   };
-  if (row.liveScores && row.liveScores.games && row.liveScores.games.length) {
+  if (espOwnsMatchup) {
+    // already built above — skip the shared loop entirely
+  } else if (row.liveScores && row.liveScores.games && row.liveScores.games.length) {
     var lp = row.liveScores;
     if (lp.period != null) {
       matchupHtml += '<div style="color:rgba(255,255,255,0.4);font-size:10px;letter-spacing:0.1em;margin-bottom:4px;">PERIOD ' + slEsc(String(lp.period)) + '</div>';
