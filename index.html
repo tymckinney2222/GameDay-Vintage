@@ -120662,6 +120662,16 @@ function espStandingsAll(j, myTeamId) {
 // A team's in-progress points for today: the sum of its STARTERS' daily
 // entries. mRoster already carries every team's roster, so this costs
 // nothing extra. ESPNSLICE2G
+// H2H CATEGORIES leagues score by category tally, not fantasy points.
+// ESPN's enum is H2H_CATEGORY; the loose test also catches any
+// ...CATEGORIES spelling. In these leagues appliedTotal is 0 across the
+// board, so anything FP-shaped has to be hidden rather than shown as 0.
+// ESPNSLICE2I
+function espIsCats(row) {
+  var st = String(((((row || {}).raw || {}).settings || {}).scoringSettings || {}).scoringType || '');
+  return /CATEGOR/i.test(st);
+}
+
 function espTodayTeamTotal(rosters, teamId) {
   var t = rosters && rosters.byTeam && rosters.byTeam[String(teamId)];
   if (!t || !t.items) return null;
@@ -120675,7 +120685,7 @@ function espTodayTeamTotal(rosters, teamId) {
   return any ? Math.round(sum * 10) / 10 : null;
 }
 
-function espLiveScores(j, standingsRows, rosters) {
+function espLiveScores(j, standingsRows, rosters, cats) {
   if (!j || !j.schedule || !j.schedule.length) return null;
   var period = (j.status && j.status.currentMatchupPeriod);
   if (period == null) return null;
@@ -120714,10 +120724,20 @@ function espLiveScores(j, standingsRows, rosters) {
       var td = espTodayTeamTotal(rosters, id);
       if (td != null) base += td;
     }
+    // Categories: the matchup "score" is cumulativeScore's W-L-T tally.
+    // Probe-confirmed shape: { wins, losses, ties, scoreByStat, statBySlot }.
+    var cs = x.cumulativeScore || null;
+    var rec = null, wins = null;
+    if (cats && cs) {
+      wins = Number(cs.wins) || 0;
+      rec = wins + '-' + (Number(cs.losses) || 0) + '-' + (Number(cs.ties) || 0);
+    }
     return {
       id: id,
       name: id ? (nameById[id] || ('Team ' + id)) : '',
-      score: (base != null) ? Math.round(base * 10) / 10 : null
+      score: (base != null) ? Math.round(base * 10) / 10 : null,
+      rec: rec,
+      wins: wins
     };
   }
   var games = [];
@@ -120729,7 +120749,9 @@ function espLiveScores(j, standingsRows, rosters) {
     games.push({
       awayId: a.id, homeId: h.id,
       away: a.name, home: h.name,
-      awayScore: a.score, homeScore: h.score
+      awayScore: a.score, homeScore: h.score,
+      awayRec: a.rec, homeRec: h.rec,
+      awayWins: a.wins, homeWins: h.wins
     });
   }
   if (!games.length) return null;
@@ -120760,7 +120782,7 @@ function espEnrichLeagues() {
       espCurrentSeason(sv.game).then(function (season) {
         return espFetchLeague(sv.game, sv.id, season, '?view=mMatchupScore');
       }).then(function (j) {
-        var ls = espLiveScores(j, row.standingsAll, row.rosters);
+        var ls = espLiveScores(j, row.standingsAll, row.rosters, espIsCats(row));
         if (ls) { row.liveScores = ls; _extRepaintToday(); }
       }).catch(function () { /* best-effort, same as the other providers */ });
     })(extLeagues[i]);
@@ -121021,6 +121043,10 @@ function _espRosterRowsHtml(row, myTeam) {
   var items = myTeam.items || [];
   var winKey = row._espWin || 'season';
   var win = espWindowByKey(winKey);
+  // Categories leagues have no fantasy points, so the FP/AVG column would
+  // be a wall of zeros and dashes. Stat lines still populate normally,
+  // including the daily window. ESPNSLICE2I
+  var cats = (typeof espIsCats === 'function') ? espIsCats(row) : false;
   var html = '', inBench = false, i;
 
   // Window picker. Every option is already in memory — switching windows
@@ -121041,7 +121067,7 @@ function _espRosterRowsHtml(row, myTeam) {
     'border-bottom:1px solid rgba(255,255,255,0.08);font-size:9px;letter-spacing:0.08em;' +
     'color:rgba(255,255,255,0.3);">' +
     '<span style="flex:1;">PLAYER</span>' +
-    '<span style="flex:0 0 52px;text-align:right;">FP / AVG</span></div>';
+    (cats ? '' : '<span style="flex:0 0 52px;text-align:right;">FP / AVG</span>') + '</div>';
   for (i = 0; i < items.length; i++) {
     var it = items[i] || {};
     if (!it.starter && !inBench) {
@@ -121091,25 +121117,26 @@ function _espRosterRowsHtml(row, myTeam) {
                        'margin-left:5px;">IL</span>' : '') + '</span>' +
         statLine +
       '</span>' +
-      (winKey !== 'today' && it.today != null && it.today !== 0
+      (!cats && winKey !== 'today' && it.today != null && it.today !== 0
         ? '<span style="flex:0 0 auto;font-size:10.5px;font-weight:700;color:#4ade80;">+' +
           it.today + '</span>' : '') +
-      '<span style="flex:0 0 52px;text-align:right;">' +
-        '<span style="display:block;font-size:12px;font-weight:700;color:' +
-          (shown == null ? 'rgba(255,255,255,0.5)'
-            : shown < 0 ? '#f87171'
-            : shown > 0 ? '#4ade80'
-            : 'rgba(255,255,255,0.5)') + ';">' +
-          (shown != null ? shown : '\u2014') + '</span>' +
-        (wd && wd.avg != null
-          ? '<span style="display:block;font-size:9.5px;color:rgba(255,255,255,0.38);">' +
-            wd.avg + '/g</span>' : '') +
-      '</span>' +
+      (cats ? ''
+        : '<span style="flex:0 0 52px;text-align:right;">' +
+          '<span style="display:block;font-size:12px;font-weight:700;color:' +
+            (shown == null ? 'rgba(255,255,255,0.5)'
+              : shown < 0 ? '#f87171'
+              : shown > 0 ? '#4ade80'
+              : 'rgba(255,255,255,0.5)') + ';">' +
+            (shown != null ? shown : '\u2014') + '</span>' +
+          (wd && wd.avg != null
+            ? '<span style="display:block;font-size:9.5px;color:rgba(255,255,255,0.38);">' +
+              wd.avg + '/g</span>' : '') +
+        '</span>') +
     '</div>';
   }
   html += '<div style="color:rgba(255,255,255,0.3);font-size:10px;margin-top:10px;' +
-          'line-height:1.5;">' + slEsc(win.label) + ' fantasy points' +
-          (winKey !== 'today' ? ' \u00b7 green is today' : '') +
+          'line-height:1.5;">' + slEsc(win.label) + (cats ? ' category stats' : ' fantasy points') +
+          (!cats && winKey !== 'today' ? ' \u00b7 green is today' : '') +
           ' \u00b7 tap a player for their card' +
           '<br>IP in innings notation \u00b7 second number is points per game.' +
           (winKey === 'today'
@@ -121298,7 +121325,7 @@ function espRefreshLive(row, force) {
   }).then(function (res) {
     var built = espRosters(res[0], sv.game, espScoredIds(row));
     if (built) row.rosters = built;
-    var ls = espLiveScores(res[1], row.standingsAll, row.rosters);
+    var ls = espLiveScores(res[1], row.standingsAll, row.rosters, espIsCats(row));
     if (ls) row.liveScores = ls;
     row._espLiveAt = Date.now();
     row._espLiveBusy = 0;
@@ -121352,6 +121379,8 @@ function espTopToday(rosters, teamId) {
 
 function _espTopTodayHtml(l, accent) {
   if (String(l.sport || '').toLowerCase() !== 'mlb') return '';
+  // Ranked by fantasy points, which a categories league doesn't have.
+  if (typeof espIsCats === 'function' && espIsCats(l)) return '';
   var myId = null;
   for (var k in (l.myTeamIds || {})) { if (l.myTeamIds.hasOwnProperty(k)) { myId = k; break; } }
   if (!myId) return '';
@@ -122993,12 +123022,26 @@ function skBuildExtCardHTML(l) {
       var opS = meAway ? mg.homeScore : mg.awayScore;
       var opN = meAway ? mg.home : mg.away;
       var myNum = (myS != null) ? Number(myS) : null, opNum = (opS != null) ? Number(opS) : null;
-      var lead = (myNum != null && opNum != null) ? (myNum - opNum) : null;
+      // Categories leagues carry a W-L-T tally instead of a point total.
+      // ESPNSLICE2I
+      var myRec = meAway ? mg.awayRec : mg.homeRec;
+      var opRec = meAway ? mg.homeRec : mg.awayRec;
+      var isCat = (myRec != null && opRec != null);
+      var myTxt = isCat ? myRec : ((myNum != null) ? myNum.toFixed(1) : '\u2014');
+      var opTxt = isCat ? opRec : ((opNum != null) ? opNum.toFixed(1) : '\u2014');
+      var lead;
+      if (isCat) {
+        var mw = meAway ? mg.awayWins : mg.homeWins;
+        var ow = meAway ? mg.homeWins : mg.awayWins;
+        lead = (mw != null && ow != null) ? (mw - ow) : null;
+      } else {
+        lead = (myNum != null && opNum != null) ? (myNum - opNum) : null;
+      }
       var leadCol = (lead == null || lead === 0) ? 'rgba(255,255,255,0.6)' : (lead > 0 ? '#4ade80' : '#f87171');
       scoreRowHtml = '<div class="sk-card-score-row">' +
-        '<span class="sk-ext-myscore" style="color:' + accent + '">' + ((myNum != null) ? myNum.toFixed(1) : '\u2014') + '</span>' +
+        '<span class="sk-ext-myscore" style="color:' + accent + '">' + slEsc(myTxt) + '</span>' +
         '<span class="sk-ext-vs"> vs </span>' +
-        '<span class="sk-ext-oppscore">' + ((opNum != null) ? opNum.toFixed(1) : '\u2014') + '</span>' +
+        '<span class="sk-ext-oppscore">' + slEsc(opTxt) + '</span>' +
         (lead != null ? '<span class="sk-ext-lead" style="color:' + leadCol + '"> ' + (lead > 0 ? '\u2191 +' : (lead < 0 ? '\u2193 ' : '')) + (lead !== 0 ? Math.abs(Math.round(lead * 10) / 10) : 'even') + '</span>' : '') +
         '<span class="sk-ext-oppname"> ' + slEsc(opN || '') + '</span>' +
       '</div>';
@@ -124170,6 +124213,11 @@ function extOpenLeague(key) {
       if (row.standingsAll[pm].record) { ptsMode = false; break; }
     }
   }
+  // Categories records run to 8 characters (99-58-8, 61-90-14) and were
+  // wrapping in a 56px column. Widen it, and drop FPTS entirely since a
+  // categories league has no fantasy points to show. ESPNSLICE2I
+  var catMode = !!(row.provider === 'espn' && typeof espIsCats === 'function' && espIsCats(row));
+  var recW = catMode ? 76 : 56;
 
   // ── Pane builders (each degrades gracefully pre-season) ──
 
@@ -124182,9 +124230,9 @@ function extOpenLeague(key) {
         ? '<span style="width:58px;text-align:right;">SEASON</span>' +
           '<span style="width:44px;text-align:right;">DAY</span>' +
           '<span style="width:38px;text-align:right;">GB</span>'
-        : '<span style="width:56px;text-align:right;">W-L-T</span>' +
+        : '<span style="width:' + recW + 'px;text-align:right;">W-L-T</span>' +
           '<span style="width:34px;text-align:right;">GB</span>' +
-          '<span style="width:56px;text-align:right;">FPTS</span>') + '</div>';
+          (catMode ? '' : '<span style="width:56px;text-align:right;">FPTS</span>')) + '</div>';
     var _dayBase = ptsMode ? _fxDayBase(row.key.slice(4), row.standingsAll) : null;
     var _myLogo = extGetMyLogo(row.key);
     for (var s = 0; s < row.standingsAll.length; s++) {
@@ -124214,9 +124262,10 @@ function extOpenLeague(key) {
                 return (dv == null) ? 'rgba(255,255,255,0.35)' : (dv > 0 ? '#4ade80' : (dv < 0 ? '#f87171' : 'rgba(255,255,255,0.55)'));
               })(_dayVal) + ';">' + ((_dayVal == null) ? '\u2014' : ((_dayVal > 0 ? '+' : '') + (Math.round(_dayVal * 10) / 10))) + '</span>' +
             '<span style="width:38px;text-align:right;color:rgba(255,255,255,0.55);font-family:monospace;">' + ((r.gb != null) ? r.gb : '\u2014') + '</span>'
-          : '<span style="width:56px;text-align:right;color:rgba(255,255,255,0.8);font-family:monospace;">' + slEsc(r.record || (r.points != null ? String(r.points) : '\u2014')) + '</span>' +
+          : '<span style="width:' + recW + 'px;text-align:right;color:rgba(255,255,255,0.8);font-family:monospace;white-space:nowrap;">' + slEsc(r.record || (r.points != null ? String(r.points) : '\u2014')) + '</span>' +
             '<span style="width:34px;text-align:right;color:rgba(255,255,255,0.55);font-family:monospace;">' + ((r.gb != null) ? r.gb : '\u2014') + '</span>' +
-            '<span style="width:56px;text-align:right;color:rgba(255,255,255,0.8);font-family:monospace;">' + ((r.pf != null) ? r.pf : '\u2014') + '</span>') +
+            (catMode ? ''
+              : '<span style="width:56px;text-align:right;color:rgba(255,255,255,0.8);font-family:monospace;">' + ((r.pf != null) ? r.pf : '\u2014') + '</span>')) +
       '</div>';
     }
   } else {
@@ -124264,9 +124313,11 @@ function extOpenLeague(key) {
         ((laMine || lhMine) ? 'background:' + accent + '14;' : '') + '">' +
         '<span style="flex:1;text-align:right;color:' + (laMine ? accent : '#fff') + ';font-weight:' + (laMine ? '800' : '400') + ';overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + _mlA + slEsc(lgm.away) + '</span>' +
         '<span style="font-family:monospace;font-weight:800;color:#fff;flex-shrink:0;">' +
-          ((lgm.awayScore != null) ? slEsc(String(lgm.awayScore)) : '\u2014') +
+          ((lgm.awayRec != null) ? slEsc(lgm.awayRec)
+            : (lgm.awayScore != null) ? slEsc(String(lgm.awayScore)) : '\u2014') +
           ' <span style="color:rgba(255,255,255,0.3);font-weight:400;">\u2013</span> ' +
-          ((lgm.homeScore != null) ? slEsc(String(lgm.homeScore)) : '\u2014') + '</span>' +
+          ((lgm.homeRec != null) ? slEsc(lgm.homeRec)
+            : (lgm.homeScore != null) ? slEsc(String(lgm.homeScore)) : '\u2014') + '</span>' +
         '<span style="flex:1;color:' + (lhMine ? accent : '#fff') + ';font-weight:' + (lhMine ? '800' : '400') + ';overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + _mlH + slEsc(lgm.home) + '</span>' +
       '</div>';
     }
