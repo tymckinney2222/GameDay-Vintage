@@ -121315,6 +121315,150 @@ function espRefreshLive(row, force) {
   });
 }
 
+// ── ESPN SLICE 2h (lineup modal + top scorers) ── ESPNSLICE2H ──
+// ESPN was falling through to the Fantrax lineup body, which resolves
+// names against ESPN's public stat API and gives up on MLB with "stats
+// aren't wired yet". Nothing needs resolving here — mRoster already
+// carries names, slots, and per-day fantasy points.
+
+// Pitchers vs batters, by lineup slot. 13/14/15 are P/SP/RP (13 confirmed
+// against the app; 14/15 from eligibleSlots patterns). Anything else is a
+// bat. Only meaningful for baseball.
+function espIsPitcherSlot(it) {
+  if (!it) return false;
+  var s = String(it.slot || '');
+  if (s === 'P' || s === 'SP' || s === 'RP') return true;
+  var n = Number(it.slotId);
+  return n === 13 || n === 14 || n === 15;
+}
+
+// Top scoring bat and arm for today, from the starters only.
+function espTopToday(rosters, teamId) {
+  var t = rosters && rosters.byTeam && rosters.byTeam[String(teamId)];
+  if (!t || !t.items) return null;
+  var bat = null, pit = null;
+  for (var i = 0; i < t.items.length; i++) {
+    var it = t.items[i];
+    if (!it.starter) continue;
+    var w = it.windows && it.windows.today;
+    if (!w || w.total == null) continue;
+    var cand = { name: it.name, pts: Number(w.total), id: it.playerId };
+    if (espIsPitcherSlot(it)) { if (!pit || cand.pts > pit.pts) pit = cand; }
+    else { if (!bat || cand.pts > bat.pts) bat = cand; }
+  }
+  if (!bat && !pit) return null;
+  return { bat: bat, pit: pit };
+}
+
+function _espTopTodayHtml(l, accent) {
+  if (String(l.sport || '').toLowerCase() !== 'mlb') return '';
+  var myId = null;
+  for (var k in (l.myTeamIds || {})) { if (l.myTeamIds.hasOwnProperty(k)) { myId = k; break; } }
+  if (!myId) return '';
+  var top = espTopToday(l.rosters, myId);
+  if (!top) return '';
+  function bit(lbl, p) {
+    if (!p) return '';
+    var short = (typeof _slShortName === 'function') ? _slShortName(p.name) : p.name;
+    var col = p.pts < 0 ? '#f87171' : (p.pts > 0 ? accent : 'var(--sk-text-3)');
+    return '<span style="font-size:9px;font-weight:700;letter-spacing:0.8px;' +
+      'color:var(--sk-text-3);text-transform:uppercase">' + lbl + '</span>' +
+      '<span style="font-family:var(--sk-font-mono);font-size:11px;color:var(--sk-text);' +
+      'font-weight:700;margin-left:5px">' + slEsc(short) + '</span>' +
+      '<span style="color:' + col + ';font-weight:700;margin-left:5px">' +
+      (p.pts > 0 ? '+' : '') + (Math.round(p.pts * 10) / 10) + '</span>';
+  }
+  var parts = [];
+  if (top.bat) parts.push(bit('BAT', top.bat));
+  if (top.pit) parts.push(bit('ARM', top.pit));
+  if (!parts.length) return '';
+  return '<div class="sk-card-status-row">' +
+    parts.join('<span style="color:var(--sk-text-4);margin:0 6px">\u00b7</span>') + '</div>';
+}
+
+// ESPN lineup modal. Today's fantasy points per player, straight from the
+// roster payload — no extra request, no name resolution.
+function _espLineupFill(row, bodyEl, headEl) {
+  var myIds = row.myTeamIds || {};
+  var myTeam = null, k;
+  if (row.rosters && row.rosters.byTeam) {
+    for (k in row.rosters.byTeam) {
+      if (row.rosters.byTeam.hasOwnProperty(k) && myIds[k]) { myTeam = row.rosters.byTeam[k]; break; }
+    }
+  }
+  if (!myTeam || !myTeam.items || !myTeam.items.length) {
+    bodyEl.innerHTML = '<div style="color:rgba(255,255,255,0.45);font-size:12px">' +
+      'Open the league\u2019s Roster tab once, then reopen this \u2014 rosters load on demand.</div>';
+    return;
+  }
+  if (headEl && row.rosters.period != null) headEl.textContent = 'PERIOD ' + row.rosters.period;
+
+  var game = 'flb';
+  var sp = String(row.sport || '').toLowerCase();
+  if (sp === 'nfl') game = 'ffl'; else if (sp === 'nba') game = 'fba'; else if (sp === 'nhl') game = 'fhl';
+  var accent = extProvAccent('espn');
+
+  var items = myTeam.items;
+  var total = 0, scoring = 0, nS = 0, nB = 0, starters = '', bench = '', i;
+  for (i = 0; i < items.length; i++) {
+    var it = items[i] || {};
+    var w = (it.windows && it.windows.today) || null;
+    var has = !!(w && w.total != null);
+    if (has && it.starter) { total += Number(w.total); if (Number(w.total) !== 0) scoring++; }
+
+    // Same inline-labelled stat line as the roster tab, scored cats only.
+    var line = '';
+    if (w && w.stats) {
+      var bits = [];
+      for (var sk in w.stats) {
+        if (!w.stats.hasOwnProperty(sk)) continue;
+        var lbl = espStatName(game, sk);
+        if (!lbl) continue;
+        bits.push(lbl + ' ' + espStatFmt(sk, w.stats[sk]));
+      }
+      line = bits.join(' \u00b7 ');
+    }
+
+    var fp = has
+      ? { txt: (Number(w.total) > 0 ? '+' : '') + (Math.round(Number(w.total) * 10) / 10).toFixed(1),
+          color: (Number(w.total) > 0 ? '#4ade80'
+                : Number(w.total) < 0 ? '#f87171' : 'rgba(255,255,255,0.35)') }
+      : { txt: '\u2014', color: 'rgba(255,255,255,0.28)' };
+
+    var html = _extLineupRowHtml(it.name || String(it.playerId), it.slot || '',
+                                 line, fp, accent, !it.starter);
+    if (it.starter) { starters += html; nS++; } else { bench += html; nB++; }
+  }
+
+  var out = '<div style="text-align:center;padding:12px 0 14px">' +
+    '<div style="font-family:var(--sk-font-mono);font-size:30px;font-weight:800;color:' +
+      (total < 0 ? '#f87171' : accent) + ';line-height:1">' +
+      (Math.round(total * 10) / 10).toFixed(1) + '</div>' +
+    '<div style="color:rgba(255,255,255,0.42);font-size:10px;letter-spacing:0.12em;margin-top:4px">' +
+      'FP FROM ' + nS + ' STARTERS' +
+      (scoring ? ' \u00b7 ' + scoring + ' SCORING' : ' \u00b7 NO GAMES FINAL YET') + '</div></div>';
+
+  var top = espTopToday(row.rosters, (function () {
+    for (var q in myIds) { if (myIds.hasOwnProperty(q)) return q; } return null;
+  })());
+  if (top && (top.bat || top.pit)) {
+    var tb = [];
+    if (top.bat) tb.push('BAT ' + top.bat.name + ' ' + (top.bat.pts > 0 ? '+' : '') + top.bat.pts);
+    if (top.pit) tb.push('ARM ' + top.pit.name + ' ' + (top.pit.pts > 0 ? '+' : '') + top.pit.pts);
+    out += '<div style="text-align:center;color:rgba(255,255,255,0.5);font-size:10px;' +
+      'letter-spacing:0.06em;margin:-6px 0 12px">' + slEsc(tb.join('   \u00b7   ')) + '</div>';
+  }
+
+  if (starters) out += '<div style="color:rgba(255,255,255,0.4);font-size:10px;letter-spacing:0.12em;' +
+    'margin:6px 0 2px">STARTERS<span style="float:right">' + nS + '</span></div>' + starters;
+  if (bench) out += '<div style="color:rgba(255,255,255,0.4);font-size:10px;letter-spacing:0.12em;' +
+    'margin:14px 0 2px">BENCH<span style="float:right">' + nB + '</span></div>' + bench;
+  out += '<div style="color:rgba(255,255,255,0.3);font-size:9.5px;line-height:1.6;margin-top:16px">' +
+    'Today\u2019s fantasy points, straight from ESPN\u2019s own per-player totals. ' +
+    'A dash means ESPN hasn\u2019t opened that player\u2019s day yet \u2014 usually first pitch.</div>';
+  bodyEl.innerHTML = out;
+}
+
 // ─────────────────────────────────────────────────────────────────
 // EXTERNAL LEAGUES (Phase 1, slice 1) — normalized registry for
 // non-Yahoo providers. Rows use provider-prefixed keys ('slp:'/'ftx:')
@@ -122723,6 +122867,10 @@ function extOpenLineup(leagueKey) {
   var headEl = document.getElementById('_extLineupPeriod');
   try {
     if (row.provider === 'sleeper') _slLineupFill(row, bodyEl, headEl);
+    // ESPN was falling into the Fantrax body, which resolves names against
+    // ESPN's public stat API and bails on MLB. It has its own now. ESPNSLICE2H
+    else if (row.provider === 'espn' && typeof _espLineupFill === 'function')
+      _espLineupFill(row, bodyEl, headEl);
     else _fxLineupFill(row, bodyEl, headEl);
   } catch (e) {
     bodyEl.innerHTML = '<div style="color:#f87171;font-size:12px">Couldn\u2019t build the lineup view.</div>';
@@ -122876,8 +123024,14 @@ function skBuildExtCardHTML(l) {
     ((l.rosters && l.rosters.byTeam)
       ? '<div class="sk-card-status-row" style="cursor:pointer" ' +
         'onclick="event.stopPropagation(); extOpenLineup(\'' + l.key + '\')">' +
-        (l.provider === 'fantrax' ? 'ROSTER STATS' : 'THIS WEEK\u2019S LINEUP') + ' \u203a</div>'
+        (l.provider === 'fantrax' ? 'ROSTER STATS'
+          : l.provider === 'espn' ? 'TODAY\u2019S LINEUP'
+          : 'THIS WEEK\u2019S LINEUP') + ' \u203a</div>'
       : '') +
+    // Top bat + arm for today, mirroring the Yahoo card's top-player line.
+    // ESPNSLICE2H
+    ((l.provider === 'espn' && typeof _espTopTodayHtml === 'function')
+      ? _espTopTodayHtml(l, accent) : '') +
     '<div class="sk-card-status-row">' + statusTxt + (hasDetail ? ' \u203a' : '') + '</div>' +
     '</div>';
 }
