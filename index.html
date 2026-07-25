@@ -121187,7 +121187,9 @@ var ESP_STAT_NAME_FLB = {
   20: 'R', 21: 'RBI', 23: 'SB', 27: 'K',
   // pitching
   34: 'IP', 37: 'H', 39: 'BB', 41: 'WHIP', 45: 'ER',
-  48: 'K', 53: 'W', 54: 'L', 57: 'SV', 60: 'HD'
+  // 47 identified by elimination against the app: it sat next to WHIP
+  // showing 1.9/3.8 where the app's ERA column read 1.48/3.66.
+  47: 'ERA', 48: 'K', 53: 'W', 54: 'L', 57: 'SV', 60: 'HD'
 };
 // PITCHING, solved not guessed. Four pitchers off the ESPN app, run through
 // the league's own point values:  outs + K - H - BB + 2W + 2HD - 2L - 2ER
@@ -121205,7 +121207,7 @@ var ESP_STAT_NAME_FLB = {
 // label. If W and L ever read backwards, swapping 53/54 here is the fix.
 var ESP_STAT_NAMES = { flb: ESP_STAT_NAME_FLB };
 // Rate stats want decimals; counting stats don't.
-var ESP_STAT_RATE = { 2: 1, 9: 1, 17: 1, 18: 1, 41: 1 };
+var ESP_STAT_RATE = { 2: 1, 9: 1, 17: 1, 18: 1, 41: 1, 47: 1 };
 
 function espStatName(game, id) {
   var m = ESP_STAT_NAMES[game];
@@ -121264,9 +121266,23 @@ function espBuildWindows(pl, season, period, scoredIds) {
 // defines them (so the row reads the way the settings page does).
 function espScoredIds(row) {
   var items = ((((row && row.raw) || {}).settings || {}).scoringSettings || {}).scoringItems || [];
-  var out = [];
-  for (var i = 0; i < items.length; i++) {
-    if (items[i] && items[i].statId != null) out.push(items[i].statId);
+  var out = [], seen = {}, i;
+  for (i = 0; i < items.length; i++) {
+    if (items[i] && items[i].statId != null && !seen[items[i].statId]) {
+      seen[items[i].statId] = 1;
+      out.push(items[i].statId);
+    }
+  }
+  // A categories league needs AB/H/IP/ER/BB kept too, or AVG, WHIP and ERA
+  // can't be rebuilt once today's numbers are folded in. ESPNSLICE2N
+  if (typeof espIsCats === 'function' && espIsCats(row) &&
+      typeof ESP_RATE_COMPONENTS !== 'undefined') {
+    for (i = 0; i < ESP_RATE_COMPONENTS.length; i++) {
+      if (!seen[ESP_RATE_COMPONENTS[i]]) {
+        seen[ESP_RATE_COMPONENTS[i]] = 1;
+        out.push(ESP_RATE_COMPONENTS[i]);
+      }
+    }
   }
   return out;
 }
@@ -121340,6 +121356,7 @@ function espRefreshLive(row, force) {
     if (built) row.rosters = built;
     var ls = espLiveScores(res[1], row.standingsAll, row.rosters, espIsCats(row));
     row._espCats = espCatBreakdown(res[1], row);
+    row._espBox = res[1];
     if (ls) row.liveScores = ls;
     row._espLiveAt = Date.now();
     row._espLiveBusy = 0;
@@ -121348,6 +121365,13 @@ function espRefreshLive(row, force) {
     var p = _espPane('roster');
     if (p && typeof _extRosterPaneHtml === 'function') {
       p.innerHTML = _extRosterPaneHtml(row, row.myTeamIds || {});
+    }
+    // Rosters just changed, so the live category math changed with them.
+    // ESPNSLICE2N
+    var mp = _espPane('matchup');
+    if (mp && typeof _espMatchupPaneHtml === 'function') {
+      var mh = mp.querySelector('[data-espmatch]');
+      if (mh) mh.outerHTML = _espMatchupPaneHtml(row);
     }
   }).catch(function () {
     row._espLiveBusy = 0;
@@ -121593,18 +121617,34 @@ function espCatBreakdown(j, row) {
     var ids = {}, k;
     for (k in (ms || {})) if (ms.hasOwnProperty(k)) ids[k] = 1;
     for (k in (os || {})) if (os.hasOwnProperty(k)) ids[k] = 1;
+    // Fold today in — scoreByStat stops at the last completed period.
+    // ESPNSLICE2N
+    var myToday = espTodayByStat(row.rosters, mine.teamId);
+    var opToday = espTodayByStat(row.rosters, opp.teamId);
+    var myLive = espLiveCatValues(ms, myToday);
+    var opLive = espLiveCatValues(os, opToday);
+
+    // Only the league's real categories. scoreByStat also carries AB / H /
+    // IP / BB / ER as rate components, which made the grid twice as long
+    // with two different rows both labelled "H".
+    var items = ((((row.raw || {}).settings || {}).scoringSettings || {}).scoringItems) || [];
+    var only = {}, ci;
+    for (ci = 0; ci < items.length; ci++) {
+      if (items[ci] && items[ci].statId != null) only[items[ci].statId] = 1;
+    }
     var rows = [];
     for (k in ids) {
       if (!ids.hasOwnProperty(k)) continue;
+      if (items.length && !only[k]) continue;
       rows.push({
         id: k,
-        mine: _espStatVal(ms ? ms[k] : null),
-        opp: _espStatVal(os ? os[k] : null),
+        mine: (myLive[k] != null) ? myLive[k] : _espStatVal(ms ? ms[k] : null),
+        opp: (opLive[k] != null) ? opLive[k] : _espStatVal(os ? os[k] : null),
         result: _espStatResult(ms ? ms[k] : null)
       });
     }
     if (!rows.length) return null;
-    return { rows: rows, myName: (meAway ? m.away : m.home) && '', period: period };
+    return { rows: rows, period: period, live: !!(myToday || opToday) };
   }
   return null;
 }
@@ -121645,6 +121685,10 @@ function _espCatBreakdownHtml(row) {
         (r.opp != null ? espStatFmt(r.id, r.opp) : '\u2014') + '</span>' +
     '</div>';
   }
+  h += '<div style="color:rgba(255,255,255,0.28);font-size:9.5px;line-height:1.5;margin:6px 0 0;">' +
+    (cb.live
+      ? 'Includes today \u00b7 AVG / WHIP / ERA rebuilt from components'
+      : 'Through the last completed day') + '</div>';
   h += '</div>';
   return h;
 }
@@ -121702,6 +121746,90 @@ function _espMatchupPaneHtml(row) {
   }
   h += '</div>';
   return h;
+}
+
+// ── ESPN SLICE 2N (live category math) ── ESPNSLICE2N ──
+//
+// cumulativeScore.scoreByStat excludes the CURRENT scoring period, exactly
+// like totalPoints did. Measured against the app: our grid read K 27 where
+// the app showed 33, AVG .230 vs .222, WHIP 1.250 vs 1.05.
+//
+// So today has to be added on. Counting stats simply sum. Rate stats can't
+// be added — .230 plus today's average is meaningless — so they get
+// recomputed from their components, which ESPN helpfully also ships inside
+// scoreByStat (that's why it holds 17 keys for an 11-category league).
+//
+//   AVG  = H / AB
+//   WHIP = (H allowed + BB) / IP
+//   ERA  = ER * 9 / IP        (IP is stored as outs, so /3)
+var ESP_RATE_RECIPE = {
+  2:  { num: [1],       den: [0],  mode: 'ratio' },
+  41: { num: [37, 39],  den: [34], mode: 'whip' },
+  47: { num: [45],      den: [34], mode: 'era'  }
+};
+// Components needed by the recipes above. For a categories league these
+// have to survive the trim even though they aren't scored categories.
+var ESP_RATE_COMPONENTS = [0, 1, 34, 37, 39, 45];
+
+function _espNum(v) {
+  var n = _espStatVal(v);
+  return (n == null) ? null : Number(n);
+}
+
+// Today's per-category totals for one team, from its STARTERS.
+function espTodayByStat(rosters, teamId) {
+  var t = rosters && rosters.byTeam && rosters.byTeam[String(teamId)];
+  if (!t || !t.items) return null;
+  var out = {}, any = false, i, k;
+  for (i = 0; i < t.items.length; i++) {
+    var it = t.items[i];
+    if (!it.starter) continue;
+    var w = it.windows && it.windows.today;
+    if (!w || !w.stats) continue;
+    for (k in w.stats) {
+      if (!w.stats.hasOwnProperty(k)) continue;
+      out[k] = (out[k] || 0) + Number(w.stats[k]);
+      any = true;
+    }
+  }
+  return any ? out : null;
+}
+
+// Merge completed-period totals with today, rebuilding rates from parts.
+function espLiveCatValues(scoreByStat, todayByStat) {
+  var out = {}, k, i;
+  for (k in (scoreByStat || {})) {
+    if (!scoreByStat.hasOwnProperty(k)) continue;
+    var n = _espNum(scoreByStat[k]);
+    if (n != null) out[k] = n;
+  }
+  if (todayByStat) {
+    for (k in todayByStat) {
+      if (!todayByStat.hasOwnProperty(k)) continue;
+      // A rate can't be summed; it gets rebuilt below from its components.
+      if (ESP_RATE_RECIPE[k]) continue;
+      out[k] = (out[k] || 0) + Number(todayByStat[k]);
+    }
+  }
+  // Nothing new to fold in means ESPN's own rate is already correct —
+  // recomputing it here would only introduce rounding drift (their .230
+  // against our 26/113 = .2301). Leave it alone. ESPNSLICE2N
+  if (!todayByStat) return out;
+  for (k in ESP_RATE_RECIPE) {
+    if (!ESP_RATE_RECIPE.hasOwnProperty(k)) continue;
+    var r = ESP_RATE_RECIPE[k];
+    var num = 0, den = 0, haveDen = false;
+    for (i = 0; i < r.num.length; i++) num += out[r.num[i]] || 0;
+    for (i = 0; i < r.den.length; i++) {
+      if (out[r.den[i]] != null) haveDen = true;
+      den += out[r.den[i]] || 0;
+    }
+    if (!haveDen || !den) continue;   // leave the completed-period value alone
+    if (r.mode === 'ratio') out[k] = num / den;
+    else if (r.mode === 'whip') out[k] = num / (den / 3);
+    else if (r.mode === 'era') out[k] = num * 9 / (den / 3);
+  }
+  return out;
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -124427,8 +124555,16 @@ function extOpenLeague(key) {
   // Category tallies and points both move all day, and until now the only
   // refresh path was opening the Roster tab. Opening the league is the
   // natural moment to re-pull the cheap 175KB scores. ESPNSLICE2L
-  if (row.provider === 'espn' && typeof espRefreshScores === 'function') {
-    espRefreshScores(row, 0);
+  if (row.provider === 'espn') {
+    // Categories need today's per-player stats to rebuild live totals, so
+    // the heavier both-payload refresh is the right one there. Points
+    // leagues stay on the cheap scores-only pull. ESPNSLICE2N
+    if (typeof espIsCats === 'function' && espIsCats(row) &&
+        typeof espRefreshLive === 'function') {
+      espRefreshLive(row, 0);
+    } else if (typeof espRefreshScores === 'function') {
+      espRefreshScores(row, 0);
+    }
   }
   var accent = extProvAccent(row.provider);
   var provLabel = extProvLabel(row.provider);
