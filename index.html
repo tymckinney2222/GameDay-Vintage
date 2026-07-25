@@ -113881,6 +113881,80 @@ function _nbrNorm(s) {
   return s.replace(/[^a-z0-9]/g, '');
 }
 
+// Tier ordinal, written as a function because starters is 0 and the obvious
+// the obvious _NBR_TIER_ORD[u] || 9 silently turns that 0 into 9 — which sorted every
+// starter to the BOTTOM of its lane.
+function _nbrTierOrd(u) {
+  var v = _NBR_TIER_ORD[u];
+  return (v == null) ? 9 : v;
+}
+
+// Team colour, reusing the app's existing NBA map and vibrant() lift. Brooklyn's
+// primary is literally 000000 and San Antonio's is near-white silver, so the
+// lift matters: vibrant() floors lightness at 0.48 so every one of the 30 reads
+// on the dark card. Cached because a full render touches all 30 pills.
+var _nbrColorCache = {};
+function _nbrTeamColor(abbr) {
+  var key = String(abbr || '').toUpperCase();
+  if (_nbrColorCache[key]) return _nbrColorCache[key];
+  var hex = '';
+  try {
+    var map = (typeof _BK_TEAM_COLORS !== 'undefined' && _BK_TEAM_COLORS.nba) ? _BK_TEAM_COLORS.nba : null;
+    if (map && map[key]) hex = '#' + map[key];
+  } catch (eC) {}
+  if (!hex) hex = '#38bdf8';
+  var lifted = hex;
+  // Pure-grey primaries (Brooklyn is 000000) have no hue, and vibrant()'s
+  // saturation boost invents one — black came out dusty rose. Send achromatic
+  // sources to a light neutral instead, which is truer to the identity anyway.
+  if (_nbrIsGrey(hex)) {
+    lifted = '#c9cdd6';
+  } else {
+    try { if (typeof vibrant === 'function') lifted = vibrant(hex); } catch (eV) {}
+    // vibrant() floors HSL *lightness*, which isn't the same as being visible:
+    // blue carries only 11% of perceived luminance, so Charlotte and Phoenix
+    // (1D1160) still landed at a murky #3f25d0. Blend toward white until the
+    // colour clears a real luminance floor.
+    lifted = _nbrLift(lifted, 0.32);
+  }
+  _nbrColorCache[key] = lifted;
+  return lifted;
+}
+function _nbrHexPart(h, i) {
+  var v = parseInt(String(h).replace('#', '').slice(i, i + 2), 16);
+  return isNaN(v) ? 0 : v;
+}
+function _nbrIsGrey(hex) {
+  var r = _nbrHexPart(hex, 0), g = _nbrHexPart(hex, 2), b = _nbrHexPart(hex, 4);
+  return Math.abs(r - g) < 10 && Math.abs(g - b) < 10 && Math.abs(r - b) < 10;
+}
+function _nbrLum(hex) {
+  return (0.299 * _nbrHexPart(hex, 0) + 0.587 * _nbrHexPart(hex, 2) +
+          0.114 * _nbrHexPart(hex, 4)) / 255;
+}
+function _nbrLift(hex, floor) {
+  var r = _nbrHexPart(hex, 0), g = _nbrHexPart(hex, 2), b = _nbrHexPart(hex, 4);
+  var guard = 0;
+  while (_nbrLum('#' + _nbrHex2(r) + _nbrHex2(g) + _nbrHex2(b)) < floor && guard < 12) {
+    r = Math.round(r + (255 - r) * 0.15);
+    g = Math.round(g + (255 - g) * 0.15);
+    b = Math.round(b + (255 - b) * 0.15);
+    guard++;
+  }
+  return '#' + _nbrHex2(r) + _nbrHex2(g) + _nbrHex2(b);
+}
+function _nbrHex2(n) {
+  var h = Math.max(0, Math.min(255, n)).toString(16);
+  return h.length < 2 ? '0' + h : h;
+}
+// Thin wrapper so this module still works if _hexToRgba ever moves.
+function _nbrRgba(hex, a) {
+  try { if (typeof _hexToRgba === 'function') return _hexToRgba(hex, a); } catch (eR) {}
+  var h = String(hex || '').replace('#', '');
+  function ch(i) { var v = parseInt(h.slice(i, i + 2), 16); return isNaN(v) ? 0 : v; }
+  return 'rgba(' + ch(0) + ',' + ch(2) + ',' + ch(4) + ',' + a + ')';
+}
+
 function openNbaRotations() {
   var ov = document.getElementById('nbrOverlay');
   if (!ov) return;
@@ -113974,7 +114048,8 @@ function _nbrTeamByAbbr(a) {
 // One player row. The MPG bar is the reason this view exists — it turns a
 // rotation into something readable at a glance. Tooltip on tap (mobile) and
 // title on hover (desktop); a tap anywhere else dismisses it.
-function _nbrRow(p, showTeam) {
+function _nbrRow(p, showTeam, abbr) {
+  var col = _nbrTeamColor(abbr || p._team || '');
   var tierN = _NBR_TIER_NUM[p.unit] || '4';
   var mpg = (p.mpg == null) ? null : p.mpg;
   var pct = (mpg == null) ? 0 : Math.round(Math.min(mpg / _NBR_MAX_MPG, 1) * 100);
@@ -113986,12 +114061,15 @@ function _nbrRow(p, showTeam) {
                  : mpg.toFixed(1) + ' MPG over ' + (p.gp == null ? '?' : p.gp) + ' games') +
     (p.pick ? ' \u00b7 rookie, pick #' + p.pick : '');
   var h = '<div class="nbr-row t' + tierN + '" data-tip="' + _nbrEsc(tip) + '" title="' + _nbrEsc(tip) + '">';
-  h += '<span class="nbr-tier">' + tierN + '</span>';
+  h += '<span class="nbr-tier"' +
+       (tierN === '1' ? ' style="background:' + _nbrRgba(col, 0.24) + ';color:' + col + '"' : '') +
+       '>' + tierN + '</span>';
   if (showTeam) h += '<span class="nbr-hit-team">' + _nbrEsc(p._team || '') + '</span>';
   h += '<span class="nbr-nm">' + _nbrEsc(p.name) +
        (p.pick ? '<span class="nbr-pk">#' + p.pick + '</span>' : '') + '</span>';
   if (posTxt) h += '<span class="nbr-pos">' + _nbrEsc(posTxt) + '</span>';
-  h += '<span class="nbr-bar"><i style="width:' + pct + '%;opacity:' + fill + '"></i></span>';
+  h += '<span class="nbr-bar"><i style="width:' + pct + '%;opacity:' + fill +
+       ';background:' + col + '"></i></span>';
   h += '<span class="nbr-mpg' + (mpg == null ? ' none' : '') + '">' +
        (mpg == null ? '\u2014' : mpg.toFixed(1)) + '</span>';
   h += '</div>';
@@ -114004,7 +114082,13 @@ function _nbrRenderTeam() {
   var h = '<div class="nbr-teams" id="nbrTeams">';
   for (i = 0; i < teams.length; i++) {
     var a = teams[i].abbr || teams[i].name;
-    h += '<button class="nbr-team' + (a === _nbrState.team ? ' active' : '') +
+    var pc = _nbrTeamColor(a);
+    var on = (a === _nbrState.team);
+    // Every pill wears its team colour; the active one just wears more of it.
+    var pst = on
+      ? 'background:' + _nbrRgba(pc, 0.20) + ';border-color:' + _nbrRgba(pc, 0.65) + ';color:' + pc
+      : 'background:' + _nbrRgba(pc, 0.07) + ';border-color:' + _nbrRgba(pc, 0.28) + ';color:' + _nbrRgba(pc, 0.72);
+    h += '<button class="nbr-team' + (on ? ' active' : '') + '" style="' + pst +
          '" onclick="_nbrSetTeam(\'' + _nbrEsc(a) + '\')">' + _nbrEsc(a) + '</button>';
   }
   h += '</div>';
@@ -114028,8 +114112,18 @@ function _nbrRenderTeam() {
   var Lk;
   for (Lk in lanes) {
     if (!lanes.hasOwnProperty(Lk)) continue;
+    // Depth tier first: 1 means starter or projected starter, and that's the
+    // thing worth seeing at the top. Sorting on minutes instead buried rookies
+    // — Caleb Wilson is the #4 overall pick and a projected starter, but he has
+    // no NBA minutes yet, so MPG order dropped him below two bench players.
+    // Minutes are only the tiebreak, which matters in the Additional overflow
+    // where every player shares tier 4.
     lanes[Lk].sort(function (x, y) {
-      return (_NBR_TIER_ORD[x.unit] || 9) - (_NBR_TIER_ORD[y.unit] || 9);
+      var d = _nbrTierOrd(x.unit) - _nbrTierOrd(y.unit);
+      if (d) return d;
+      var mx = (x.mpg == null) ? -1 : x.mpg;
+      var my = (y.mpg == null) ? -1 : y.mpg;
+      return my - mx;
     });
   }
 
@@ -114047,12 +114141,21 @@ function _nbrRenderTeam() {
     }
     if (!lbl) lbl = _NBR_LANE_FALLBACK[L2 - 1] || ('Lane ' + L2);
     h += '<div class="nbr-lane"><div class="nbr-lane-hd">' + _nbrEsc(lbl) + '</div>';
-    for (i = 0; i < grp.length; i++) h += _nbrRow(grp[i], 0);
+    for (i = 0; i < grp.length; i++) h += _nbrRow(grp[i], 0, t.abbr);
     h += '</div>';
   }
   if (extras.length) {
+    // Memphis's lane 6+ overflow skipped the per-lane sort above, so it gets
+    // the same treatment. These are all tier 4, so minutes do the real work.
+    extras.sort(function (x, y) {
+      var d = _nbrTierOrd(x.unit) - _nbrTierOrd(y.unit);
+      if (d) return d;
+      var mx = (x.mpg == null) ? -1 : x.mpg;
+      var my = (y.mpg == null) ? -1 : y.mpg;
+      return my - mx;
+    });
     h += '<div class="nbr-lane"><div class="nbr-lane-hd">Additional</div>';
-    for (i = 0; i < extras.length; i++) h += _nbrRow(extras[i], 0);
+    for (i = 0; i < extras.length; i++) h += _nbrRow(extras[i], 0, t.abbr);
     h += '</div>';
   }
 
@@ -114106,14 +114209,14 @@ function _nbrHits() {
   }
   if (!out.length) return '<div class="nbr-empty">No player matches that.</div>';
   out.sort(function (x, y) {
-    var d = (_NBR_TIER_ORD[x.unit] || 9) - (_NBR_TIER_ORD[y.unit] || 9);
+    var d = _nbrTierOrd(x.unit) - _nbrTierOrd(y.unit);
     if (d) return d;
     return (y.mpg || 0) - (x.mpg || 0);
   });
   var capped = out.length > 60;
   var list = capped ? out.slice(0, 60) : out;
   var h = '';
-  for (i = 0; i < list.length; i++) h += _nbrRow(list[i], 1);
+  for (i = 0; i < list.length; i++) h += _nbrRow(list[i], 1, list[i]._team);
   if (capped) h += '<div class="nbr-empty">' + (out.length - 60) + ' more \u2014 keep typing to narrow.</div>';
   return h;
 }
