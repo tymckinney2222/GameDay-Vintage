@@ -72550,7 +72550,7 @@ function skRenderTodayCards() {
     if (synced.length === 0 && extAll === 0) {
       listEl.innerHTML =
         '<div class="sk-empty-state">No leagues synced.<br><br>' +
-        '<button class="sk-card-cta" onclick="skOpenLeaguePicker()" style="display:inline-flex;width:auto;padding:10px 22px;margin-top:8px">Choose leagues</button></div>';
+        '<button class="sk-card-cta" onclick="skOpenConnectHub()" style="display:inline-flex;width:auto;padding:10px 22px;margin-top:8px">Connect a platform</button></div>';
     } else if (!extList.length) {
       listEl.innerHTML = '<div class="sk-empty-state">No leagues match this filter.</div>';
     } else {
@@ -73536,21 +73536,59 @@ function skNeedsFirstRunPicker() {
 }
 
 // Open the picker. Hydrates working-set from saved selection.
-function skOpenLeaguePicker() {
-  if (!fyLeagues || !fyLeagues.length) {
-    alert('Sign in with Yahoo first to see your leagues.');
+// ── PER-PROVIDER LEAGUE PICKER ── PICKSCOPE ──
+// The picker used to list Yahoo's leagues plus every external provider
+// under one "Yahoo Fantasy" heading, which mislabelled three platforms
+// and made the Yahoo API relationship look broader than it is. Each
+// provider now gets its own scoped picker.
+//
+// ESPN deliberately has none: its leagues are added by hand in the ESPN
+// Manage overlay, so "unsync" and "remove" would be the same action.
+var SK_PICKER_META = {
+  yahoo:   { eyebrow: 'Yahoo Fantasy', accent: '#7c5cff' },
+  sleeper: { eyebrow: 'Sleeper',       accent: '#fbbf24' },
+  fantrax: { eyebrow: 'Fantrax',       accent: '#34d399' },
+  espn:    { eyebrow: 'ESPN Fantasy',  accent: '#ef4444' }
+};
+var skPickerProvider = 'yahoo';
+
+// The leagues the picker is currently showing — the single source of
+// truth for the body, Select all, Clear all, the counter and the save.
+// Scoping these together is what stops one provider's Sync from
+// rewriting another's selections.
+function skPickerScopeLeagues() {
+  if (skPickerProvider === 'yahoo') return (typeof fyLeagues !== 'undefined' && fyLeagues) ? fyLeagues : [];
+  if (typeof extLeagues === 'undefined' || !extLeagues) return [];
+  var out = [];
+  for (var i = 0; i < extLeagues.length; i++) {
+    if (extLeagues[i].provider === skPickerProvider) out.push(extLeagues[i]);
+  }
+  return out;
+}
+function skPickerScopeKey(l) {
+  return (skPickerProvider === 'yahoo') ? l.league_key : l.key;
+}
+
+function skOpenLeaguePicker(provider) {
+  skPickerProvider = provider || 'yahoo';
+  var scope = skPickerScopeLeagues();
+  if (!scope.length) {
+    alert(skPickerProvider === 'yahoo'
+      ? 'Sign in with Yahoo first to see your leagues.'
+      : 'No ' + (SK_PICKER_META[skPickerProvider] || {}).eyebrow + ' leagues found yet.');
     return;
   }
-  // Initialize working set from current selection (or all-on for first run)
+  // Working set seeded from THIS provider only. PICKSCOPE
   skPickerWorking = {};
-  skSyncedLeagueKeys().forEach(function(k) { skPickerWorking[k] = true; });
-  // External providers (Sleeper/Fantrax) share the same working map —
-  // their provider-prefixed keys can't collide with Yahoo keys.
-  if (typeof extLeagues !== 'undefined' && extLeagues) {
-    for (var ei = 0; ei < extLeagues.length; ei++) {
-      skPickerWorking[extLeagues[ei].key] = extIsSynced(extLeagues[ei].key);
-    }
+  var i;
+  if (skPickerProvider === 'yahoo') {
+    skSyncedLeagueKeys().forEach(function (k) { skPickerWorking[k] = true; });
+  } else {
+    for (i = 0; i < scope.length; i++) skPickerWorking[scope[i].key] = extIsSynced(scope[i].key);
   }
+  var meta = SK_PICKER_META[skPickerProvider] || { eyebrow: skPickerProvider };
+  var eb = document.querySelector('#skPicker .sk-picker-eyebrow');
+  if (eb) eb.textContent = meta.eyebrow;
   skRenderPickerBody();
   skUpdatePickerCounter();
   document.getElementById('skPickerBackdrop').classList.add('open');
@@ -73572,6 +73610,16 @@ function skRenderPickerBody() {
   var emoji = { mlb: '⚾', nfl: '🏈', cfb: '🏈', nba: '🏀', nhl: '🏒' };
   var label = { mlb: 'Baseball', nfl: 'Football', cfb: 'College Football', nba: 'Basketball', nhl: 'Hockey' };
 
+  // Non-Yahoo providers render a single flat section. PICKSCOPE
+  if (skPickerProvider !== 'yahoo') {
+    var scoped = skPickerScopeLeagues();
+    bodyEl.innerHTML = (scoped.length
+      ? skRenderExtPickerGroup(_skProvPickerLabel(skPickerProvider),
+                               extProvAccent(skPickerProvider), scoped)
+      : '<div class="sk-empty-state">No leagues found.</div>');
+    return;
+  }
+
   // Group leagues
   var groups = {};
   fyLeagues.forEach(function(l) {
@@ -73590,36 +73638,9 @@ function skRenderPickerBody() {
     if (!keysSeen[k]) html += skRenderPickerGroup(k, k.toUpperCase(), '🏆', groups[k]);
   });
 
-  // External provider sections — same rows, same toggle, persisted to
-  // sk_ext_synced_v1 on Sync instead of the Yahoo set.
-  //
-  // This used to be "if fantrax, else sleeper", which quietly filed every
-  // ESPN league under SLEEPER. Same two-provider assumption that once put
-  // a SLEEPER label on the ESPN card and sent its lineup modal to the
-  // Fantrax builder. Grouped by provider now, so a fifth one can't repeat
-  // it. EXTPICK
-  if (typeof extLeagues !== 'undefined' && extLeagues && extLeagues.length) {
-    var byProv = {}, seenOrder = [], x, pv;
-    for (x = 0; x < extLeagues.length; x++) {
-      pv = extLeagues[x].provider || 'other';
-      if (!byProv[pv]) { byProv[pv] = []; seenOrder.push(pv); }
-      byProv[pv].push(extLeagues[x]);
-    }
-    // Familiar order first; anything unrecognised follows in arrival order.
-    var PROV_ORDER = ['sleeper', 'fantrax', 'espn'];
-    var placed = {}, ordered = [];
-    for (x = 0; x < PROV_ORDER.length; x++) {
-      if (byProv[PROV_ORDER[x]]) { ordered.push(PROV_ORDER[x]); placed[PROV_ORDER[x]] = 1; }
-    }
-    for (x = 0; x < seenOrder.length; x++) {
-      if (!placed[seenOrder[x]]) ordered.push(seenOrder[x]);
-    }
-    for (x = 0; x < ordered.length; x++) {
-      pv = ordered[x];
-      html += skRenderExtPickerGroup(_skProvPickerLabel(pv), extProvAccent(pv), byProv[pv]);
-    }
-  }
-
+  // External providers are NOT listed here any more — each has its own
+  // scoped picker, reachable from its card in Fantasy Connections.
+  // PICKSCOPE
   bodyEl.innerHTML = html + _fyStampMini();
 }
 
@@ -73712,25 +73733,29 @@ function skPickerToggle(leagueKey) {
 }
 
 function skPickerSelectAll() {
-  fyLeagues.forEach(function(l) { skPickerWorking[l.league_key] = true; });
-  if (typeof extLeagues !== 'undefined' && extLeagues) {
-    extLeagues.forEach(function(l) { skPickerWorking[l.key] = true; });
-  }
+  var _sc = skPickerScopeLeagues();
+  for (var _i = 0; _i < _sc.length; _i++) skPickerWorking[skPickerScopeKey(_sc[_i])] = true;
+
   skRenderPickerBody();
   skUpdatePickerCounter();
 }
 
 function skPickerClearAll() {
-  fyLeagues.forEach(function(l) { skPickerWorking[l.league_key] = false; });
-  if (typeof extLeagues !== 'undefined' && extLeagues) {
-    extLeagues.forEach(function(l) { skPickerWorking[l.key] = false; });
-  }
+  var _sc2 = skPickerScopeLeagues();
+  for (var _j = 0; _j < _sc2.length; _j++) skPickerWorking[skPickerScopeKey(_sc2[_j])] = false;
+
   skRenderPickerBody();
   skUpdatePickerCounter();
 }
 
 function skUpdatePickerCounter() {
-  var selected = Object.keys(skPickerWorking).filter(function(k) { return skPickerWorking[k]; }).length;
+  // Count only what's on screen — the working map used to include every
+  // provider, so "22 of 26" mixed four platforms together. PICKSCOPE
+  var _scope = skPickerScopeLeagues();
+  var selected = 0;
+  for (var _c = 0; _c < _scope.length; _c++) {
+    if (skPickerWorking[skPickerScopeKey(_scope[_c])]) selected++;
+  }
   var total = fyLeagues.length +
     ((typeof extLeagues !== 'undefined' && extLeagues) ? extLeagues.length : 0);
   document.getElementById('skPickerCounter').textContent = selected + ' of ' + total + ' selected';
@@ -73742,22 +73767,34 @@ function skUpdatePickerCounter() {
 }
 
 function skPickerSave() {
-  var allKeys = Object.keys(skPickerWorking).filter(function(k) { return skPickerWorking[k]; });
-  if (!allKeys.length) return;
-  // Split by provider: 'slp:'/'ftx:' keys persist to the external map
-  // (explicit true/false per known league), everything else is Yahoo.
-  var keys = [];
-  for (var ai = 0; ai < allKeys.length; ai++) {
-    if (allKeys[ai].indexOf('slp:') !== 0 && allKeys[ai].indexOf('ftx:') !== 0) keys.push(allKeys[ai]);
-  }
-  if (typeof extLeagues !== 'undefined' && extLeagues && typeof extSaveSyncPrefs === 'function') {
-    var extMap = extSyncPrefs();
-    for (var xi = 0; xi < extLeagues.length; xi++) {
-      var xk = extLeagues[xi].key;
-      extMap[xk] = !!skPickerWorking[xk];
+  var scope = skPickerScopeLeagues();
+  var i;
+
+  // An external provider writes only its OWN rows into the shared sync map
+  // and leaves the Yahoo set untouched.
+  //
+  // The old prefix test excluded 'slp:' and 'ftx:' but not 'esp:', so every
+  // synced ESPN key was being written into the Yahoo synced set — inert,
+  // but it polluted the set and the cache-cleanup loops that walk it.
+  // Scoping the save removes the category. PICKSCOPE
+  if (skPickerProvider !== 'yahoo') {
+    if (typeof extSaveSyncPrefs === 'function') {
+      var extMap = extSyncPrefs();
+      for (i = 0; i < scope.length; i++) extMap[scope[i].key] = !!skPickerWorking[scope[i].key];
+      extSaveSyncPrefs(extMap);
     }
-    extSaveSyncPrefs(extMap);
+    skClosePicker();
+    if (typeof extLoadAll === 'function') extLoadAll(true);
+    if (typeof skRenderConnectHub === 'function') skRenderConnectHub();
+    if (typeof skRenderTodayCards === 'function') skRenderTodayCards();
+    return;
   }
+
+  var keys = [];
+  for (i = 0; i < scope.length; i++) {
+    if (skPickerWorking[scope[i].league_key]) keys.push(scope[i].league_key);
+  }
+  if (!keys.length) return;
   skSaveSyncedSet(keys);
   skClosePicker();
   // Drop any cached league data for unsynced leagues so they don't
@@ -74928,7 +74965,7 @@ function skRenderPlanCards() {
     if (ctEl) ctEl.textContent = '·0';
     listEl.innerHTML =
       '<div class="sk-empty-state">No leagues synced.<br><br>' +
-      '<button class="sk-card-cta" onclick="skOpenLeaguePicker()" style="display:inline-flex;width:auto;padding:10px 22px;margin-top:8px">Choose leagues</button></div>';
+      '<button class="sk-card-cta" onclick="skOpenConnectHub()" style="display:inline-flex;width:auto;padding:10px 22px;margin-top:8px">Connect a platform</button></div>';
     return;
   }
 
@@ -77083,7 +77120,7 @@ function skRenderWireCards() {
     if (ctEl) ctEl.textContent = '\u00b70';
     listEl.innerHTML =
       '<div class="sk-empty-state">No leagues synced.<br><br>' +
-      '<button class="sk-card-cta" onclick="skOpenLeaguePicker()" style="display:inline-flex;width:auto;padding:10px 22px;margin-top:8px">Choose leagues</button></div>';
+      '<button class="sk-card-cta" onclick="skOpenConnectHub()" style="display:inline-flex;width:auto;padding:10px 22px;margin-top:8px">Connect a platform</button></div>';
     return;
   }
 
@@ -119956,6 +119993,12 @@ function slConnect() {
       (_slRemembered && !slState.username
         ? '<div style="text-align:right;margin-top:8px;"><a href="#" id="sl-connect-forget" style="color:rgba(255,255,255,0.35);font-size:10px;text-decoration:underline;">forget saved username</a></div>'
         : '') +
+      // Sync selection lives here now rather than in a Yahoo-headed
+      // combined picker. PICKSCOPE
+      '<button id="sl-sync-leagues" style="width:100%;margin-top:14px;padding:11px;' +
+        'border-radius:8px;border:1px solid rgba(251,191,36,0.4);background:rgba(251,191,36,0.12);' +
+        'color:#fbbf24;font-size:13px;font-weight:700;cursor:pointer;">' +
+        'Choose leagues to sync \u203a</button>' +
       '<div id="sl-connect-diag" style="margin-top:14px;"></div>' +
       '<div id="sl-connect-leagues" style="margin-top:8px;"></div>' +
     '</div>';
@@ -119970,6 +120013,13 @@ function slConnect() {
       var _in = document.getElementById('sl-connect-username');
       if (_in) _in.value = '';
       _slForget.parentNode.style.display = 'none';
+    };
+  }
+  var _slSync = document.getElementById('sl-connect-sync-leagues');
+  if (_slSync) {
+    _slSync.onclick = function () {
+      ov.parentNode.removeChild(ov);
+      skOpenLeaguePicker('sleeper');
     };
   }
   document.getElementById('sl-connect-close').onclick = function() {
@@ -120179,6 +120229,12 @@ function fxConnect() {
       (_fxRemembered && !fxState.secretId
         ? '<div style="text-align:right;margin-top:8px;"><a href="#" id="fx-connect-forget" style="color:rgba(255,255,255,0.35);font-size:10px;text-decoration:underline;">forget saved ID</a></div>'
         : '') +
+      // Sync selection lives here now rather than in a Yahoo-headed
+      // combined picker. PICKSCOPE
+      '<button id="fx-sync-leagues" style="width:100%;margin-top:14px;padding:11px;' +
+        'border-radius:8px;border:1px solid rgba(52,211,153,0.4);background:rgba(52,211,153,0.12);' +
+        'color:#34d399;font-size:13px;font-weight:700;cursor:pointer;">' +
+        'Choose leagues to sync \u203a</button>' +
       '<div id="fx-connect-diag" style="margin-top:14px;"></div>' +
       '<div id="fx-connect-leagues" style="margin-top:8px;"></div>' +
     '</div>';
@@ -120193,6 +120249,13 @@ function fxConnect() {
       var _in = document.getElementById('fx-connect-secret');
       if (_in) _in.value = '';
       _fxForget.parentNode.style.display = 'none';
+    };
+  }
+  var _fxSync = document.getElementById('fx-connect-sync-leagues');
+  if (_fxSync) {
+    _fxSync.onclick = function () {
+      ov.parentNode.removeChild(ov);
+      skOpenLeaguePicker('fantrax');
     };
   }
   document.getElementById('fx-connect-close').onclick = function() {
