@@ -115629,8 +115629,21 @@ function mrWeekResult(row) {
 // IS the matchup record: one W/L/T per week even in categories leagues
 // (unlike ESPN, where a cats record is per-category). So it's a cache
 // read. MGRREC4
+// Yahoo's season record, per format.
+//
+// I previously claimed team.record from /standings was a matchup record
+// for every Yahoo format. It isn't, and the arithmetic caught it:
+//   PTS leagues   67-29     -> matchup record, usable directly
+//   CATS leagues  364-225-51 -> PER-CATEGORY, same as ESPN's cats variant
+//   summed        431-254-51 -> exactly the wrong number that shipped
+// The true matchup record is 108-42-3, and for cats leagues the only
+// source is the per-week history walk that _mdMatchupTally performs.
+//
+// So: points leagues read standings (free, instant), cats leagues use the
+// tally. That's 3 fetches instead of 9 — the load complaint is still
+// addressed, just not by pretending one number is another. MGRREC5
 function mrYahooSeason() {
-  var out = {}, pending = 0;
+  var out = {}, pending = 0, needCats = [];
   var leagues = [];
   try {
     if (typeof _ppLeagues === 'function') {
@@ -115645,18 +115658,59 @@ function mrYahooSeason() {
     var lg = leagues[i];
     if (!lg || !lg.league_key) continue;
     var st = lg.scoring_type;
-    var isH2H = (st === 'head' || st === 'headone' || st === 'headpoint');
-    if (!isH2H) continue;   // roto / season-long have no matchup record
+    var isPts = (st === 'headpoint');
+    var isCats = (st === 'head' || st === 'headone');
+    if (!isPts && !isCats) continue;      // roto / season-long: no matchup record
     var sport = String(lg.sport || 'other').toLowerCase();
     if (!out[sport]) out[sport] = { w: 0, l: 0, t: 0, n: 0 };
-    var ld = (typeof skLeagueData === 'object' && skLeagueData)
-      ? (skLeagueData[lg.league_key] || {}) : {};
-    var rec = _mrParseRec(ld.team && ld.team.record);
-    if (!rec) { pending++; continue; }
-    out[sport].w += rec.w; out[sport].l += rec.l; out[sport].t += rec.t;
-    out[sport].n++;
+
+    if (isPts) {
+      var ld = (typeof skLeagueData === 'object' && skLeagueData)
+        ? (skLeagueData[lg.league_key] || {}) : {};
+      var rec = _mrParseRec(ld.team && ld.team.record);
+      if (!rec) { pending++; continue; }
+      out[sport].w += rec.w; out[sport].l += rec.l; out[sport].t += rec.t;
+      out[sport].n++;
+      continue;
+    }
+
+    // Categories: standings would give a per-category total, so use the
+    // weekly history instead.
+    var tally = (typeof _mdMatchupTally === 'object' && _mdMatchupTally)
+      ? _mdMatchupTally[lg.league_key] : null;
+    if (tally && !tally.missing) {
+      out[sport].w += tally.wins; out[sport].l += tally.losses; out[sport].t += tally.ties;
+      out[sport].n++;
+    } else {
+      pending++;
+      needCats.push(lg);
+    }
   }
-  return { bySport: out, pending: pending };
+  return { bySport: out, pending: pending, needCats: needCats };
+}
+
+// Fetch only the cats leagues that still lack a weekly tally. Bounded at
+// three at a time, and it repaints this dashboard as each lands. MGRREC5
+var _mrCatsInflight = 0;
+function mrHydrateCats(list) {
+  if (!list || !list.length || typeof _mdFetchAndTally !== 'function') return;
+  var queue = list.slice(0);
+  function pump() {
+    while (_mrCatsInflight < 3 && queue.length) {
+      var lg = queue.shift();
+      _mrCatsInflight++;
+      _mdFetchAndTally(lg)['catch'](function () {})
+        .then(function () {
+          _mrCatsInflight--;
+          var ov = document.getElementById('mrOverlay');
+          if (ov && ov.classList.contains('open')) {
+            try { mrRenderBody(); } catch (e) {}
+          }
+          pump();
+        });
+    }
+  }
+  pump();
 }
 
 function _mrBlank() {
@@ -115840,7 +115894,7 @@ function mrRenderBody() {
     '</div>';
   if (data.pending) {
     h += '<div style="font-size:10px;color:rgba(255,255,255,0.35);margin-top:10px;">' +
-      'Yahoo season tallies still loading (' + data.pending + ' league' +
+      'Yahoo categories history loading (' + data.pending + ' league' +
       (data.pending === 1 ? '' : 's') + ')\u2026</div>';
   }
   h += '</div>';
@@ -115995,11 +116049,14 @@ function openManagerRecord() {
     if (b) b.innerHTML = '<div style="color:#fca5a5;font-size:12px;">Error: ' +
       slEsc(e.message || String(e)) + '</div>';
   }
-  // No fetching. Everything here is a cache read now — Yahoo's season
-  // comes from standings, the rest from the ext registry. If a league
-  // hasn't hydrated yet it's reported as pending and a short poll picks
-  // it up, but nothing is requested on this dashboard's behalf. MGRREC4
-  try { if (typeof _mrPollTallies === 'function') _mrPollTallies(0); } catch (e2) {}
+  // Points leagues and every external platform are pure cache reads.
+  // Only Yahoo CATS leagues need a fetch, because their standings record
+  // is per-category rather than per-matchup. MGRREC5
+  try {
+    var need = mrYahooSeason().needCats;
+    if (need && need.length) mrHydrateCats(need);
+    if (typeof _mrPollTallies === 'function') _mrPollTallies(0);
+  } catch (e2) {}
 }
 function closeManagerRecord() {
   var ov = document.getElementById('mrOverlay');
