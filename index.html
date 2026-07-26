@@ -120805,6 +120805,7 @@ function espLiveScores(j, standingsRows, rosters, cats, row) {
 function espEnrichLeagues() {
   if (typeof espState === 'undefined' || !espState ||
       !espState.leagues || !espState.leagues.length) return;
+  var jobs = [];
   for (var i = 0; i < extLeagues.length; i++) {
     (function (row) {
       if (row.provider !== 'espn' || row.standingsAll || !extIsSynced(row.key)) return;
@@ -120819,14 +120820,50 @@ function espEnrichLeagues() {
         _extRepaintToday();
       }
 
-      espCurrentSeason(sv.game).then(function (season) {
+      jobs.push(espCurrentSeason(sv.game).then(function (season) {
         return espFetchLeague(sv.game, sv.id, season, espScoreView(row));
       }).then(function (j) {
+        row._espScoreJson = j;   // reused once rosters arrive
         var ls = espLiveScores(j, row.standingsAll, row.rosters, espIsCats(row), row);
         row._espCats = espCatBreakdown(j, row);
         if (ls) { row.liveScores = ls; _extRepaintToday(); }
-      }).catch(function () { /* best-effort, same as the other providers */ });
+      }).catch(function () { /* best-effort, same as the other providers */ }));
     })(extLeagues[i]);
+  }
+  // Once the cheap score pass is done, pull rosters in the background.
+  // Yahoo and Sleeper cards are fully populated the moment Skipper opens;
+  // ESPN's weren't, because today's totals and the lineup CTA both depend
+  // on roster data that only loaded when you opened the Roster tab.
+  // ESPNSLICE2P
+  if (jobs.length) {
+    Promise.all(jobs).then(function () { espPrefetchRosters(); });
+  } else {
+    espPrefetchRosters();
+  }
+}
+
+// Serial on purpose. mRoster is ~1.5MB per league, so three leagues firing
+// at once is a 4.5MB burst on a phone. One at a time, each repainting its
+// own card as it lands, so they fill in progressively instead of stalling
+// together.
+function espPrefetchRosters() {
+  if (typeof extLeagues === 'undefined' || !extLeagues) return;
+  var queue = [], i;
+  for (i = 0; i < extLeagues.length; i++) {
+    var r = extLeagues[i];
+    if (!r || r.provider !== 'espn') continue;
+    if (r.rosters || r._espRosterBusy) continue;
+    if (typeof extIsSynced === 'function' && !extIsSynced(r.key)) continue;
+    queue.push(r);
+  }
+  if (!queue.length) return;
+  var chain = Promise.resolve();
+  for (i = 0; i < queue.length; i++) {
+    (function (row) {
+      chain = chain.then(function () {
+        return espLoadRosters(row);
+      })['catch'](function () { /* one league failing shouldn't stop the rest */ });
+    })(queue[i]);
   }
 }
 
@@ -120972,16 +121009,25 @@ function _espRosterMsg(txt) {
 }
 
 function espLoadRosters(row) {
-  if (!row || row.rosters || row._espRosterBusy) return;
+  if (!row || row.rosters || row._espRosterBusy) return Promise.resolve();
   var sv = espFindSaved(row.key.slice(4));
-  if (!sv) return;
+  if (!sv) return Promise.resolve();
   row._espRosterBusy = 1;
   _espRosterMsg('Loading rosters\u2026');
-  espCurrentSeason(sv.game).then(function (season) {
+  return espCurrentSeason(sv.game).then(function (season) {
     return espFetchLeague(sv.game, sv.id, season, '?view=mRoster');
   }).then(function (j) {
     row.rosters = espRosters(j, sv.game, espScoredIds(row));
     row._espRosterBusy = 0;
+    // Today's team totals and the live category math both need rosters,
+    // and the score payload was fetched before they existed. Recompute off
+    // the cached payload rather than asking ESPN for it twice. ESPNSLICE2P
+    if (row._espScoreJson) {
+      var ls2 = espLiveScores(row._espScoreJson, row.standingsAll, row.rosters,
+                              espIsCats(row), row);
+      if (ls2) row.liveScores = ls2;
+      row._espCats = espCatBreakdown(row._espScoreJson, row);
+    }
     // This fetch is itself fresh live data, so stamp it — otherwise the
     // Today footer would sit on "refreshing..." until the first manual
     // window switch. ESPNSLICE2K
@@ -121394,9 +121440,9 @@ function espRefreshLive(row, force) {
   }).then(function (res) {
     var built = espRosters(res[0], sv.game, espScoredIds(row));
     if (built) row.rosters = built;
+    row._espScoreJson = res[1];
     var ls = espLiveScores(res[1], row.standingsAll, row.rosters, espIsCats(row), row);
     row._espCats = espCatBreakdown(res[1], row);
-    row._espBox = res[1];
     if (ls) row.liveScores = ls;
     row._espLiveAt = Date.now();
     row._espLiveBusy = 0;
@@ -121599,6 +121645,7 @@ function espRefreshScores(row, force) {
   espCurrentSeason(sv.game).then(function (season) {
     return espFetchLeague(sv.game, sv.id, season, espScoreView(row));
   }).then(function (j) {
+    row._espScoreJson = j;
     var ls = espLiveScores(j, row.standingsAll, row.rosters, espIsCats(row), row);
     if (ls) row.liveScores = ls;
     row._espCats = espCatBreakdown(j, row);
