@@ -72495,6 +72495,17 @@ function skRenderFormatChips(ctBySport) {
     var st = l.scoring_type || '';
     if (ct[st] != null) ct[st]++;
   });
+  // Counts were Yahoo-only, so a chip could read ·0 (and stay hidden) while
+  // ESPN or Fantrax leagues of that format sat right below it. An
+  // ESPN-only H2H Cats league now produces its own chip. EXTFMT
+  if (typeof extSyncedLeagues === 'function') {
+    extSyncedLeagues().forEach(function(l) {
+      if (skState.sport !== 'all' && (l.sport || '').toLowerCase() !== skState.sport) return;
+      ct.all++;
+      var fk = extFormatKey(l);
+      if (fk && ct[fk] != null) ct[fk]++;
+    });
+  }
 
   // Build chips — only show formats present
   var chips = [
@@ -72523,22 +72534,27 @@ function skRenderTodayCards() {
     return true;
   });
 
-  document.getElementById('sk-section-ct').textContent = '·' + leagues.length;
-  document.getElementById('sk-mode-ct-today').textContent = '·' + leagues.length;
+  // Counts covered Yahoo only, so the header read "·15" with three ESPN
+  // leagues visible underneath. EXTFMT
+  var extList = (typeof skExtVisibleLeagues === 'function') ? skExtVisibleLeagues() : [];
+  var totalVisible = leagues.length + extList.length;
+  document.getElementById('sk-section-ct').textContent = '·' + totalVisible;
+  document.getElementById('sk-mode-ct-today').textContent = '·' + totalVisible;
 
   var listEl = document.getElementById('skLeagueList');
-  // External-provider cards (Sleeper/Fantrax) render after the Yahoo
-  // cards; display-only in this slice, honoring the same sport chip.
   var extHtml = (typeof skExtTodayCardsHtml === 'function') ? skExtTodayCardsHtml() : '';
   if (!leagues.length) {
-    // Differentiate "nothing synced yet" from "filtered to nothing"
-    if (synced.length === 0) {
+    var extAll = (typeof extSyncedLeagues === 'function') ? extSyncedLeagues().length : 0;
+    // "No leagues synced" printed above a stack of ESPN cards, because the
+    // check only ever looked at the Yahoo set. EXTFMT
+    if (synced.length === 0 && extAll === 0) {
       listEl.innerHTML =
         '<div class="sk-empty-state">No leagues synced.<br><br>' +
-        '<button class="sk-card-cta" onclick="skOpenLeaguePicker()" style="display:inline-flex;width:auto;padding:10px 22px;margin-top:8px">Choose leagues</button></div>' +
-        extHtml;
+        '<button class="sk-card-cta" onclick="skOpenLeaguePicker()" style="display:inline-flex;width:auto;padding:10px 22px;margin-top:8px">Choose leagues</button></div>';
+    } else if (!extList.length) {
+      listEl.innerHTML = '<div class="sk-empty-state">No leagues match this filter.</div>';
     } else {
-      listEl.innerHTML = '<div class="sk-empty-state">No leagues match this filter.</div>' + extHtml;
+      listEl.innerHTML = extHtml;
     }
     return;
   }
@@ -125168,16 +125184,76 @@ function extSetDetailTab(id) {
 // External cards for the Today list, honoring the sport chip. Format
 // chips are Yahoo scoring-type taxonomy, so any specific format filter
 // hides external cards (they don't participate in that taxonomy yet).
+// ── EXTERNAL FORMAT MAPPING ── EXTFMT ──
+// Yahoo's scoring_type vocabulary is what the format chips speak, so every
+// other provider maps onto it:
+//   headpoint = H2H Points   head = H2H Categories
+//   headone   = H2H 1-Cat    point = Season Points
+//
+// ESPN    — decoded from mSettings: H2H_POINTS / H2H_CATEGORY / TOTAL_POINTS.
+// Fantrax — scoringSystem.type ('points') plus whether getLeagueInfo returned
+//           a matchup schedule. Probe-confirmed on Norm's Hockey League:
+//           type 'points' with 27 matchups, i.e. H2H Points. No matchups
+//           means season-long, which is what the "Total Points" league is.
+//           Both fields are already on the row from Fantrax enrichment, so
+//           this costs nothing.
+// Sleeper — H2H Points. Sleeper is a points platform; it has no categories
+//           mode to detect. Left as an explicit default rather than a guess
+//           dressed up as detection.
+function extFormatKey(row) {
+  if (!row) return '';
+  var p = row.provider;
+
+  if (p === 'espn') {
+    if (typeof espIsCats === 'function' && espIsCats(row)) return 'head';
+    if (typeof espIsSeasonPts === 'function' && espIsSeasonPts(row)) return 'point';
+    return 'headpoint';
+  }
+
+  if (p === 'fantrax') {
+    var t = String(((row.scoring || {}).type) || '').toLowerCase();
+    if (t.indexOf('cat') !== -1) return 'head';
+    var hasMatchups = !!(row.matchups && row.matchups.length);
+    if (t.indexOf('point') !== -1) return hasMatchups ? 'headpoint' : 'point';
+    // Type not recognised: fall back on the matchup signal alone.
+    return hasMatchups ? 'headpoint' : 'point';
+  }
+
+  if (p === 'sleeper') return 'headpoint';
+
+  return '';
+}
+
+// Ext leagues passing the CURRENT sport + format chips. One list so the
+// cards and the counts can never disagree. EXTFMT
+function skExtVisibleLeagues() {
+  if (typeof extSyncedLeagues !== 'function') return [];
+  var list = extSyncedLeagues(), out = [], i;
+  for (i = 0; i < list.length; i++) {
+    var l = list[i];
+    if (skState.sport !== 'all' && (l.sport || '').toLowerCase() !== skState.sport) continue;
+    if (skState.format !== 'all') {
+      var fk = extFormatKey(l);
+      // An unmapped provider stays visible under a specific format rather
+      // than silently vanishing — better to show one extra card than to
+      // hide a league the user knows they have.
+      if (fk && fk !== skState.format) continue;
+    }
+    out.push(l);
+  }
+  return out;
+}
+
 function skExtTodayCardsHtml() {
-  if (typeof extSyncedLeagues !== 'function') return '';
-  var list = extSyncedLeagues();
+  // This used to bail out entirely whenever a specific format chip was
+  // active, hiding every Sleeper, Fantrax and ESPN card rather than
+  // filtering them — no external provider had a format to compare against.
+  // They all do now. EXTFMT
+  var list = skExtVisibleLeagues();
   if (!list.length) return '';
-  if (skState.format !== 'all') return '';
   var html = '';
   for (var i = 0; i < list.length; i++) {
-    var l = list[i];
-    if (skState.sport !== 'all' && l.sport !== skState.sport) continue;
-    try { html += skBuildExtCardHTML(l); } catch (e) {}
+    try { html += skBuildExtCardHTML(list[i]); } catch (e) {}
   }
   return html;
 }
