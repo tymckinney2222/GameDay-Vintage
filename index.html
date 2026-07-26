@@ -122470,6 +122470,92 @@ function _espTopTodayHtml(l, accent) {
 
 // ESPN lineup modal. Today's fantasy points per player, straight from the
 // roster payload — no extra request, no name resolution.
+// ── Lineup group totals ── ESPN3F ──
+// A totals line above the batters and above the pitchers. Counting stats
+// sum; AVG / WHIP / ERA are rebuilt from their components rather than
+// averaged, which would be meaningless across a lineup.
+var ESP_PITCH_STAT = { 34: 1, 37: 1, 39: 1, 41: 1, 45: 1, 47: 1, 48: 1, 53: 1, 54: 1, 57: 1, 60: 1 };
+
+function _espApplyRates(sums) {
+  var out = {}, k, i;
+  for (k in sums) { if (sums.hasOwnProperty(k)) out[k] = sums[k]; }
+  if (typeof ESP_RATE_RECIPE === 'undefined') return out;
+  for (k in ESP_RATE_RECIPE) {
+    if (!ESP_RATE_RECIPE.hasOwnProperty(k)) continue;
+    var r = ESP_RATE_RECIPE[k];
+    var num = 0, den = 0, have = false;
+    for (i = 0; i < r.num.length; i++) num += out[r.num[i]] || 0;
+    for (i = 0; i < r.den.length; i++) {
+      if (out[r.den[i]] != null) have = true;
+      den += out[r.den[i]] || 0;
+    }
+    if (!have || !den) { delete out[k]; continue; }
+    if (r.mode === 'ratio') out[k] = num / den;
+    else if (r.mode === 'whip') out[k] = num / (den / 3);
+    else if (r.mode === 'era') out[k] = num * 9 / (den / 3);
+  }
+  return out;
+}
+
+// Today's totals for one half of the lineup.
+function espGroupTotals(items, wantPitchers) {
+  var sums = {}, fp = 0, hasFp = false, played = 0, i, k;
+  for (i = 0; i < items.length; i++) {
+    var it = items[i];
+    if (!it.starter) continue;
+    if (!!espIsPitcherSlot(it) !== !!wantPitchers) continue;
+    var w = it.windows && it.windows.today;
+    if (!w) continue;
+    if (w.total != null) { fp += Number(w.total); hasFp = true; }
+    if (!w.stats) continue;
+    var any = false;
+    for (k in w.stats) {
+      if (!w.stats.hasOwnProperty(k)) continue;
+      sums[k] = (sums[k] || 0) + Number(w.stats[k]);
+      any = true;
+    }
+    if (any) played++;
+  }
+  return { stats: _espApplyRates(sums), fp: hasFp ? Math.round(fp * 10) / 10 : null, played: played };
+}
+
+// The totals line, in the league's own category order.
+function _espGroupTotalsHtml(row, items, wantPitchers, game, cats, accent) {
+  var tot = espGroupTotals(items, wantPitchers);
+  var order = (typeof espScoredIds === 'function') ? espScoredIds(row) : [];
+  var bits = [], i, id;
+  for (i = 0; i < order.length; i++) {
+    id = order[i];
+    var isPitchStat = !!ESP_PITCH_STAT[id];
+    if (isPitchStat !== !!wantPitchers) continue;
+    if (tot.stats[id] == null) continue;
+    var lbl = espStatName(game, id);
+    if (!lbl) continue;
+    bits.push('<span style="color:rgba(255,255,255,0.35)">' + slEsc(lbl) + '</span> ' +
+      '<span style="color:rgba(255,255,255,0.8)">' + espStatFmt(id, tot.stats[id]) + '</span>');
+  }
+  var label = wantPitchers ? 'PITCHERS' : 'BATTERS';
+  var right = '';
+  if (!cats && tot.fp != null) {
+    right = '<span style="font-family:var(--sk-font-mono,monospace);font-size:12.5px;font-weight:700;' +
+      'color:' + (tot.fp < 0 ? '#f87171' : tot.fp > 0 ? '#4ade80' : 'rgba(255,255,255,0.35)') + ';">' +
+      (tot.fp > 0 ? '+' : '') + (Math.round(tot.fp * 10) / 10).toFixed(1) + '</span>';
+  } else if (tot.played) {
+    right = '<span style="font-size:9.5px;color:rgba(255,255,255,0.3);">' + tot.played + ' active</span>';
+  }
+  return '<div style="display:flex;align-items:baseline;gap:8px;margin:10px 0 2px;">' +
+      '<span style="font-size:9.5px;letter-spacing:0.14em;color:' + accent + ';font-weight:700;">' +
+        label + '</span>' +
+      '<span style="flex:1;"></span>' + right +
+    '</div>' +
+    (bits.length
+      ? '<div style="font-family:var(--sk-font-mono,monospace);font-size:10.5px;line-height:1.7;' +
+        'padding:4px 6px;margin:0 0 4px;border-radius:6px;background:rgba(255,255,255,0.035);">' +
+        bits.join('<span style="color:rgba(255,255,255,0.15)"> \u00b7 </span>') + '</div>'
+      : '<div style="font-size:10px;color:rgba(255,255,255,0.28);margin:0 0 4px;">' +
+        'No stats yet today.</div>');
+}
+
 function _espLineupFill(row, bodyEl, headEl) {
   var myIds = row.myTeamIds || {};
   var myTeam = null, k;
@@ -122491,7 +122577,8 @@ function _espLineupFill(row, bodyEl, headEl) {
   var accent = extProvAccent('espn');
 
   var items = myTeam.items;
-  var total = 0, scoring = 0, nS = 0, nB = 0, live = 0, idle = 0, starters = '', bench = '', i;
+  var total = 0, scoring = 0, nS = 0, nB = 0, live = 0, idle = 0, bench = '', i;
+  var bats = '', arms = '', nBat = 0, nArm = 0;   // ESPN3F
   for (i = 0; i < items.length; i++) {
     var it = items[i] || {};
     var w = (it.windows && it.windows.today) || null;
@@ -122528,7 +122615,11 @@ function _espLineupFill(row, bodyEl, headEl) {
       (it.starter && it.noGame ? '  \u2715 no game' : '');
     var html = _extLineupRowHtml(nameTxt, it.slot || '',
                                  line, fp, accent, !it.starter);
-    if (it.starter) { starters += html; nS++; } else { bench += html; nB++; }
+    if (it.starter) {
+      // Split so each half can carry its own totals line. ESPN3F
+      if (espIsPitcherSlot(it)) { arms += html; nArm++; } else { bats += html; nBat++; }
+      nS++;
+    } else { bench += html; nB++; }
   }
 
   // A categories league has no fantasy points, so a big 0.0 would be a
@@ -122564,8 +122655,13 @@ function _espLineupFill(row, bodyEl, headEl) {
       'letter-spacing:0.06em;margin:-6px 0 12px">' + slEsc(tb.join('   \u00b7   ')) + '</div>';
   }
 
-  if (starters) out += '<div style="color:rgba(255,255,255,0.4);font-size:10px;letter-spacing:0.12em;' +
-    'margin:6px 0 2px">STARTERS<span style="float:right">' + nS + '</span></div>' + starters;
+  // Batters, then pitchers, each under its own day-total line. ESPN3F
+  if (bats) {
+    out += _espGroupTotalsHtml(row, items, false, game, cats, accent) + bats;
+  }
+  if (arms) {
+    out += _espGroupTotalsHtml(row, items, true, game, cats, accent) + arms;
+  }
   if (bench) out += '<div style="color:rgba(255,255,255,0.4);font-size:10px;letter-spacing:0.12em;' +
     'margin:14px 0 2px">BENCH<span style="float:right">' + nB + '</span></div>' + bench;
   out += '<div style="color:rgba(255,255,255,0.3);font-size:9.5px;line-height:1.6;margin-top:16px">' +
