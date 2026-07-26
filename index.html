@@ -121260,6 +121260,8 @@ function espRosters(j, game, scoredIds) {
         playerId: String(e.playerId || pl.id || ''),
         pts: pp.season, today: pp.today, proj: pp.proj, last7: pp.last7,
         windows: wins,
+        // Usual batting slot, from proGamePlayerDetail. ESPN3
+        order: (typeof espLineupOrder === 'function') ? espLineupOrder(pl) : null,
         name: nm,
         // _extRosterItemName reads .pos and renders it on the right, so
         // the slot goes there — it's the column the ESPN app shows too.
@@ -121502,6 +121504,8 @@ function _espRosterRowsHtml(row, myTeam) {
       '<span style="flex:1;min-width:0;">' +
         '<span style="display:block;font-size:12.5px;color:#fff;overflow:hidden;' +
           'text-overflow:ellipsis;white-space:nowrap;">' + slEsc(it.name) +
+          (it.order ? '<span style="color:rgba(255,255,255,0.3);font-size:9px;' +
+                      'margin-left:5px;">bats ' + it.order + '</span>' : '') +
           (it.injury ? '<span style="color:#f87171;font-size:9px;font-weight:700;' +
                        'margin-left:5px;">IL</span>' : '') + '</span>' +
         statLine +
@@ -122066,6 +122070,34 @@ function _espCatBreakdownHtml(row) {
     (cb.live
       ? 'Includes today \u00b7 AVG / WHIP / ERA rebuilt from components'
       : 'Through the last completed day') + '</div>';
+  // Season-long category totals from teams[].valuesByStat, compared with
+  // the league average since there's no single opponent over a season.
+  // ESPN3
+  var seasonRows = (typeof espSeasonCatRows === 'function') ? espSeasonCatRows(row) : null;
+  if (seasonRows && seasonRows.length) {
+    h += '<div style="margin:14px 0 0;">' +
+      '<div style="display:flex;font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
+        'padding:0 0 4px;border-bottom:1px solid rgba(255,255,255,0.08);">' +
+        '<span style="flex:1;text-align:right;">SEASON</span>' +
+        '<span style="flex:0 0 62px;text-align:center;">CATEGORY</span>' +
+        '<span style="flex:1;">LG AVG</span></div>';
+    for (var si = 0; si < seasonRows.length; si++) {
+      var sr = seasonRows[si];
+      var slbl = espStatName(game, sr.id) || ('#' + sr.id);
+      var better = espCatResult(sr.id, sr.mine, sr.opp);
+      h += '<div style="display:flex;align-items:center;padding:4px 0;' +
+        'font-family:var(--sk-font-mono,monospace);">' +
+        '<span style="flex:1;text-align:right;font-size:12px;color:' +
+          (better === 'WIN' ? '#4ade80' : 'rgba(255,255,255,0.6)') + ';">' +
+          espStatFmt(sr.id, sr.mine) + '</span>' +
+        '<span style="flex:0 0 62px;text-align:center;font-size:9.5px;' +
+          'color:rgba(255,255,255,0.4);">' + slEsc(slbl) + '</span>' +
+        '<span style="flex:1;font-size:12px;color:rgba(255,255,255,0.45);">' +
+          espStatFmt(sr.id, sr.opp) + '</span>' +
+      '</div>';
+    }
+    h += '</div>';
+  }
   h += '</div>';
   return h;
 }
@@ -122092,6 +122124,7 @@ function espScoreView(row) {
 // be called again from outside.
 function _espMatchupPaneHtml(row) {
   var h = '<div data-espmatch>';
+  h += _espFlowChartHtml(row);      // points leagues only. ESPN3
   h += _espCatBreakdownHtml(row);
   var ls = row && row.liveScores;
   if (ls && ls.games && ls.games.length) {
@@ -122292,9 +122325,25 @@ function _espStandingsPaneHtml(row) {
       'margin:0 0 2px;font-size:12.5px;' + (mine ? 'background:rgba(239,68,68,0.10);' : '') + '">' +
       '<span style="flex:0 0 20px;color:rgba(255,255,255,0.35);font-family:var(--sk-font-mono,monospace);">' +
         rank + '</span>' +
-      '<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' +
-        'color:' + (mine ? accent + ';font-weight:700' : 'rgba(255,255,255,0.82)') + ';">' +
-        slEsc(r.teamName) + '</span>';
+      '<span style="flex:1;min-width:0;">' +
+        '<span style="display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' +
+          'color:' + (mine ? accent + ';font-weight:700' : 'rgba(255,255,255,0.82)') + ';">' +
+          slEsc(r.teamName) + '</span>' +
+        // Owner name and waiver order come straight off the team object in
+        // row.raw — no extra request. ESPN3
+        (function () {
+          var x = (typeof espTeamExtras === 'function') ? espTeamExtras(row, r.teamId) : null;
+          if (!x) return '';
+          var bits = [];
+          if (x.owner) bits.push(slEsc(x.owner));
+          if (x.waiver) bits.push('W' + x.waiver);
+          if (x.projRank && !seasonPts) bits.push('proj ' + x.projRank);
+          if (!bits.length) return '';
+          return '<span style="display:block;font-size:9px;letter-spacing:0.04em;' +
+            'color:rgba(255,255,255,0.32);overflow:hidden;text-overflow:ellipsis;' +
+            'white-space:nowrap;">' + bits.join(' \u00b7 ') + '</span>';
+        })() +
+      '</span>';
     if (seasonPts) {
       h += '<span style="flex:0 0 62px;text-align:right;font-family:var(--sk-font-mono,monospace);' +
           'font-weight:700;color:rgba(255,255,255,0.85);">' +
@@ -122322,6 +122371,222 @@ function _espStandingsPaneHtml(row) {
   }
   h += '</div>';
   return h;
+}
+
+// ── ESPN SLICE 3 (flow chart, owners, projections, batting order) ── ESPN3 ──
+
+// ─── Owner names ────────────────────────────────────────────────────
+// mTeam ships a top-level "members" array alongside "teams", and each team
+// carries "owners" (member ids) plus "primaryOwner". Already in row.raw, so
+// this costs nothing.
+function espOwnerName(row, teamId) {
+  var j = (row && row.raw) || null;
+  if (!j || !j.teams || !j.members) return '';
+  var i, t = null;
+  for (i = 0; i < j.teams.length; i++) {
+    if (String(j.teams[i].id) === String(teamId)) { t = j.teams[i]; break; }
+  }
+  if (!t) return '';
+  var want = t.primaryOwner || (t.owners && t.owners.length ? t.owners[0] : null);
+  if (!want) return '';
+  for (i = 0; i < j.members.length; i++) {
+    var m = j.members[i] || {};
+    if (String(m.id) !== String(want)) continue;
+    var nm = m.displayName ||
+             ((m.firstName || '') + ' ' + (m.lastName || '')).replace(/^\s+|\s+$/g, '');
+    return nm || '';
+  }
+  return '';
+}
+
+// Small facts that live on the team object and were going unused.
+function espTeamExtras(row, teamId) {
+  var j = (row && row.raw) || null;
+  if (!j || !j.teams) return null;
+  for (var i = 0; i < j.teams.length; i++) {
+    var t = j.teams[i];
+    if (String(t.id) !== String(teamId)) continue;
+    return {
+      owner: espOwnerName(row, teamId),
+      projRank: (t.currentProjectedRank && t.currentProjectedRank > 0) ? t.currentProjectedRank : null,
+      draftRank: (t.draftDayProjectedRank && t.draftDayProjectedRank > 0) ? t.draftDayProjectedRank : null,
+      waiver: (t.waiverRank && t.waiverRank > 0) ? t.waiverRank : null,
+      moves: (t.transactionCounter && t.transactionCounter.acquisitions != null)
+        ? t.transactionCounter.acquisitions : null,
+      eliminated: !!t.eliminated,
+      abbrev: t.abbrev || '',
+      valuesByStat: t.valuesByStat || null
+    };
+  }
+  return null;
+}
+
+// ─── Season-long category totals ────────────────────────────────────
+// teams[].valuesByStat holds each team's season totals keyed by the same
+// statIds as everything else, so a categories league can compare a full
+// season the same way it compares a week.
+function espSeasonCatRows(row) {
+  if (!espIsCats(row)) return null;
+  var myId = null, k;
+  for (k in (row.myTeamIds || {})) { if (row.myTeamIds.hasOwnProperty(k)) { myId = k; break; } }
+  if (!myId) return null;
+  var mine = espTeamExtras(row, myId);
+  if (!mine || !mine.valuesByStat) return null;
+
+  // Compare against the league average — there's no single "opponent" over
+  // a whole season.
+  var j = row.raw, i, id;
+  var sums = {}, counts = {};
+  for (i = 0; i < j.teams.length; i++) {
+    var vs = j.teams[i].valuesByStat;
+    if (!vs) continue;
+    for (id in vs) {
+      if (!vs.hasOwnProperty(id)) continue;
+      sums[id] = (sums[id] || 0) + Number(vs[id]);
+      counts[id] = (counts[id] || 0) + 1;
+    }
+  }
+  var items = ((((row.raw || {}).settings || {}).scoringSettings) || {}).scoringItems || [];
+  var rows = [];
+  for (i = 0; i < items.length; i++) {
+    id = items[i] && items[i].statId;
+    if (id == null || mine.valuesByStat[id] == null) continue;
+    var avg = counts[id] ? (sums[id] / counts[id]) : null;
+    rows.push({ id: id, mine: Number(mine.valuesByStat[id]), opp: avg });
+  }
+  return rows.length ? rows : null;
+}
+
+// ─── Batting order ──────────────────────────────────────────────────
+// player.proGamePlayerDetail is keyed by ESPN game id, each with
+// { lineupOrder, starterStatus }. We can't tell WHICH key is today's game
+// from the payload, so this reports the player's usual slot — the most
+// common non-null lineupOrder — rather than claiming to know today's card.
+function espLineupOrder(pl) {
+  var d = pl && pl.proGamePlayerDetail;
+  if (!d) return null;
+  var tally = {}, best = null, bestN = 0, k;
+  for (k in d) {
+    if (!d.hasOwnProperty(k)) continue;
+    var lo = d[k] && d[k].lineupOrder;
+    if (lo == null || !(lo > 0)) continue;
+    tally[lo] = (tally[lo] || 0) + 1;
+    if (tally[lo] > bestN) { bestN = tally[lo]; best = Number(lo); }
+  }
+  return best;
+}
+
+// ─── Matchup flow chart ─────────────────────────────────────────────
+// pointsByScoringPeriod gives each side's per-day totals for the matchup
+// period, so a cumulative line shows where the week turned. Points leagues
+// only: categories have no points curve, and a season-long league has no
+// matchup at all.
+function espFlowSeries(row) {
+  var ls = row && row.liveScores;
+  var j = row && row._espScoreJson;
+  if (!ls || !j || !j.schedule || espIsCats(row) || espIsSeasonPts(row)) return null;
+  var period = ls.period, myIds = row.myTeamIds || {}, i;
+  for (i = 0; i < j.schedule.length; i++) {
+    var m = j.schedule[i] || {};
+    if (Number(m.matchupPeriodId) !== Number(period)) continue;
+    var a = m.away || {}, h = m.home || {};
+    var meAway = !!(a.teamId != null && myIds[String(a.teamId)]);
+    var meHome = !!(h.teamId != null && myIds[String(h.teamId)]);
+    if (!meAway && !meHome) continue;
+    var mine = meAway ? a : h, opp = meAway ? h : a;
+    var mp = mine.pointsByScoringPeriod || null, op = opp.pointsByScoringPeriod || null;
+    if (!mp && !op) return null;
+
+    var days = {}, k;
+    for (k in (mp || {})) if (mp.hasOwnProperty(k)) days[k] = 1;
+    for (k in (op || {})) if (op.hasOwnProperty(k)) days[k] = 1;
+    var keys = [];
+    for (k in days) if (days.hasOwnProperty(k)) keys.push(Number(k));
+    if (keys.length < 2) return null;
+    keys.sort(function (x, y) { return x - y; });
+
+    // Today isn't in the map yet (it only lands once the day completes), so
+    // append the in-progress totals as a final point.
+    var todayMine = espTodayTeamTotal(row.rosters, mine.teamId);
+    var todayOpp = espTodayTeamTotal(row.rosters, opp.teamId);
+    var cur = j.scoringPeriodId;
+    var hasToday = false;
+    for (i = 0; i < keys.length; i++) if (keys[i] === Number(cur)) hasToday = true;
+
+    var pts = [], runM = 0, runO = 0;
+    for (i = 0; i < keys.length; i++) {
+      runM += Number((mp || {})[keys[i]] || 0);
+      runO += Number((op || {})[keys[i]] || 0);
+      pts.push({ day: keys[i], me: Math.round(runM * 10) / 10, opp: Math.round(runO * 10) / 10, live: false });
+    }
+    if (!hasToday && (todayMine != null || todayOpp != null)) {
+      runM += (todayMine || 0); runO += (todayOpp || 0);
+      pts.push({ day: Number(cur), me: Math.round(runM * 10) / 10,
+                 opp: Math.round(runO * 10) / 10, live: true });
+    }
+    return { points: pts, period: period };
+  }
+  return null;
+}
+
+function _espFlowChartHtml(row) {
+  var s = espFlowSeries(row);
+  if (!s || s.points.length < 2) return '';
+  var pts = s.points, n = pts.length, i;
+  var accent = extProvAccent('espn');
+  var oppCol = 'rgba(255,255,255,0.42)';
+  var maxV = 0;
+  for (i = 0; i < n; i++) { if (pts[i].me > maxV) maxV = pts[i].me; if (pts[i].opp > maxV) maxV = pts[i].opp; }
+  if (!maxV) return '';
+  var W = 320, H = 96, padL = 4, padR = 4, padT = 8, padB = 14;
+  var iw = W - padL - padR, ih = H - padT - padB;
+  function X(i2) { return padL + (n === 1 ? iw / 2 : (iw * i2) / (n - 1)); }
+  function Y(v) { return padT + ih - (ih * v) / maxV; }
+
+  var pm = '', po = '';
+  for (i = 0; i < n; i++) {
+    pm += (i ? ' ' : '') + X(i).toFixed(1) + ',' + Y(pts[i].me).toFixed(1);
+    po += (i ? ' ' : '') + X(i).toFixed(1) + ',' + Y(pts[i].opp).toFixed(1);
+  }
+
+  // Tap targets: a full-height invisible band per day, so a fingertip
+  // anywhere in the column hits it. Tooltip per the house rule.
+  var hits = '';
+  for (i = 0; i < n; i++) {
+    var bw = iw / n;
+    var bx = padL + bw * i;
+    var tip = 'Day ' + pts[i].day + (pts[i].live ? ' (live)' : '') +
+      ' \u00b7 you ' + pts[i].me + ' \u00b7 opp ' + pts[i].opp +
+      ' \u00b7 ' + (pts[i].me === pts[i].opp ? 'level'
+        : (pts[i].me > pts[i].opp ? '+' + (Math.round((pts[i].me - pts[i].opp) * 10) / 10)
+                                  : (Math.round((pts[i].me - pts[i].opp) * 10) / 10)));
+    hits += '<rect x="' + bx.toFixed(1) + '" y="0" width="' + bw.toFixed(1) + '" height="' + H + '"' +
+      ' fill="transparent" data-tip="' + slEsc(tip) + '" title="' + slEsc(tip) + '"></rect>';
+  }
+
+  var last = pts[n - 1];
+  var lead = Math.round((last.me - last.opp) * 10) / 10;
+  return '<div data-espflow style="margin:0 0 14px;">' +
+    '<div style="display:flex;align-items:baseline;gap:8px;margin:0 0 4px;">' +
+      '<span style="font-size:9px;letter-spacing:0.12em;color:rgba(255,255,255,0.3);">MATCHUP FLOW</span>' +
+      '<span style="flex:1;"></span>' +
+      '<span style="font-size:10px;color:' + (lead > 0 ? '#4ade80' : lead < 0 ? '#f87171' : 'rgba(255,255,255,0.5)') + ';">' +
+        (lead > 0 ? '+' + lead : lead === 0 ? 'level' : String(lead)) + '</span>' +
+    '</div>' +
+    '<svg viewBox="0 0 ' + W + ' ' + H + '" width="100%" height="' + H + '" preserveAspectRatio="none" style="display:block;">' +
+      '<polyline points="' + po + '" fill="none" stroke="' + oppCol + '" stroke-width="1.5" stroke-linejoin="round"/>' +
+      '<polyline points="' + pm + '" fill="none" stroke="' + accent + '" stroke-width="2" stroke-linejoin="round"/>' +
+      (last.live
+        ? '<circle cx="' + X(n - 1).toFixed(1) + '" cy="' + Y(last.me).toFixed(1) + '" r="3" fill="' + accent + '"/>'
+        : '') +
+      hits +
+    '</svg>' +
+    '<div style="display:flex;gap:10px;margin-top:2px;font-size:9px;color:rgba(255,255,255,0.35);">' +
+      '<span style="color:' + accent + ';">\u25cf you</span>' +
+      '<span>\u25cf opponent</span>' +
+      '<span style="flex:1;text-align:right;">tap a day</span>' +
+    '</div>' +
+  '</div>';
 }
 
 // ─────────────────────────────────────────────────────────────────
