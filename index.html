@@ -115620,6 +115620,45 @@ function mrWeekResult(row) {
   return null;
 }
 
+// Yahoo's season record without a single request.
+//
+// The old path called _mdHydrateMatchupTallies, which fetches each
+// league's full matchup history — 11 requests, slow enough to look like
+// it had stalled. But /standings already returns outcome_totals, which
+// Skipper parses into skLeagueData[key].team.record, and for Yahoo that
+// IS the matchup record: one W/L/T per week even in categories leagues
+// (unlike ESPN, where a cats record is per-category). So it's a cache
+// read. MGRREC4
+function mrYahooSeason() {
+  var out = {}, pending = 0;
+  var leagues = [];
+  try {
+    if (typeof _ppLeagues === 'function') {
+      var syn = _ppLeagues();
+      if (Object.prototype.toString.call(syn) === '[object Array]') leagues = syn;
+    }
+  } catch (e) {}
+  if (!leagues.length && typeof fyLeagues !== 'undefined' &&
+      Object.prototype.toString.call(fyLeagues) === '[object Array]') leagues = fyLeagues;
+
+  for (var i = 0; i < leagues.length; i++) {
+    var lg = leagues[i];
+    if (!lg || !lg.league_key) continue;
+    var st = lg.scoring_type;
+    var isH2H = (st === 'head' || st === 'headone' || st === 'headpoint');
+    if (!isH2H) continue;   // roto / season-long have no matchup record
+    var sport = String(lg.sport || 'other').toLowerCase();
+    if (!out[sport]) out[sport] = { w: 0, l: 0, t: 0, n: 0 };
+    var ld = (typeof skLeagueData === 'object' && skLeagueData)
+      ? (skLeagueData[lg.league_key] || {}) : {};
+    var rec = _mrParseRec(ld.team && ld.team.record);
+    if (!rec) { pending++; continue; }
+    out[sport].w += rec.w; out[sport].l += rec.l; out[sport].t += rec.t;
+    out[sport].n++;
+  }
+  return { bySport: out, pending: pending };
+}
+
 function _mrBlank() {
   return { leagues: 0, recLeagues: 0, weekLeagues: 0,
            sw: 0, sl: 0, st: 0, ww: 0, wl: 0, wt: 0 };
@@ -115645,16 +115684,22 @@ function mrCollect() {
   try {
     if (typeof _mdBuildRollup === 'function') {
       var roll = _mdBuildRollup();
+      // Week comes from the rollup (pure cache reads); season comes from
+      // standings rather than the per-league history fetch. MGRREC4
+      var ys = mrYahooSeason();
+      pending += ys.pending;
       for (var sp in roll) {
         if (!roll.hasOwnProperty(sp)) continue;
         var r = roll[sp];
-        var b = bucket(sp.toLowerCase(), 'yahoo');
+        var sk2 = sp.toLowerCase();
+        var b = bucket(sk2, 'yahoo');
         b.leagues += r.leagueCount || 0;
-        b.recLeagues += r.matchupLeaguesLoaded || 0;
-        b.sw += r.matchupW || 0; b.sl += r.matchupL || 0; b.st += r.matchupT || 0;
         b.weekLeagues += r.weekLeagueCount || 0;
         b.ww += r.weekW || 0; b.wl += r.weekL || 0; b.wt += r.weekT || 0;
-        pending += r.matchupLeaguesPending || 0;
+        var yr = ys.bySport[sk2];
+        if (yr) {
+          b.sw += yr.w; b.sl += yr.l; b.st += yr.t; b.recLeagues += yr.n;
+        }
       }
     }
   } catch (e) {}
@@ -115819,12 +115864,17 @@ function mrRenderBody() {
         '<span style="font-family:var(--sk-font-display,serif);font-size:18px;color:#fff;">' +
           slEsc(label) + '</span>' +
         '<span style="flex:1;"></span>' +
+        (sec.total.recLeagues
+          ? '<span style="font-family:var(--sk-font-mono,monospace);font-size:11.5px;' +
+            'color:var(--sk-gold,#eab308);margin-right:8px;">' + _mrPct(sec.total, false) + '</span>'
+          : '') +
         '<span style="font-size:9.5px;letter-spacing:0.12em;color:rgba(255,255,255,0.4);">' +
           sec.total.leagues + ' LEAGUE' + (sec.total.leagues === 1 ? '' : 'S') + '</span>' +
       '</div>' +
       '<div style="display:flex;font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
         'padding:0 0 4px;border-bottom:1px solid rgba(255,255,255,0.08);">' +
         '<span style="flex:1;">PLATFORM</span>' +
+        '<span style="flex:0 0 44px;text-align:right;">WIN%</span>' +
         '<span style="flex:0 0 78px;text-align:right;">SEASON</span>' +
         '<span style="flex:0 0 62px;text-align:right;">WEEK</span></div>';
 
@@ -115838,6 +115888,9 @@ function mrRenderBody() {
           'color:' + pl.accent + ';">' + pl.label +
           '<span style="color:rgba(255,255,255,0.28);font-weight:400;margin-left:5px;">\u00b7' +
             st.leagues + '</span></span>' +
+        '<span style="flex:0 0 44px;text-align:right;font-family:var(--sk-font-mono,monospace);' +
+          'font-size:11.5px;color:rgba(255,255,255,0.5);">' +
+          (st.recLeagues ? _mrPct(st, false) : '') + '</span>' +
         '<span style="flex:0 0 78px;text-align:right;font-family:var(--sk-font-mono,monospace);' +
           'font-size:12.5px;color:rgba(255,255,255,0.85);">' +
           (st.recLeagues ? _mrRec(st, false) : '\u2014') + '</span>' +
@@ -115849,6 +115902,9 @@ function mrRenderBody() {
 
     h += '<div style="display:flex;align-items:center;padding:8px 0 0;">' +
       '<span style="flex:1;font-size:10px;letter-spacing:0.12em;color:rgba(255,255,255,0.45);">TOTAL</span>' +
+      '<span style="flex:0 0 44px;text-align:right;font-family:var(--sk-font-mono,monospace);' +
+        'font-size:11.5px;font-weight:700;color:var(--sk-gold,#eab308);">' +
+        (sec.total.recLeagues ? _mrPct(sec.total, false) : '') + '</span>' +
       '<span style="flex:0 0 78px;text-align:right;font-family:var(--sk-font-mono,monospace);' +
         'font-size:13px;font-weight:700;color:#fff;">' + _mrRec(sec.total, false) + '</span>' +
       '<span style="flex:0 0 62px;text-align:right;font-family:var(--sk-font-mono,monospace);' +
@@ -115939,14 +115995,11 @@ function openManagerRecord() {
     if (b) b.innerHTML = '<div style="color:#fca5a5;font-size:12px;">Error: ' +
       slEsc(e.message || String(e)) + '</div>';
   }
-  // Yahoo's season tallies come from per-league fetches. Reuse the existing
-  // machinery rather than duplicating it, and repaint as each lands. MGRREC
-  try {
-    if (typeof _mdHydrateMatchupTallies === 'function' && typeof _mrPollTallies === 'function') {
-      _mdHydrateMatchupTallies(null);
-      _mrPollTallies(0);
-    }
-  } catch (e2) {}
+  // No fetching. Everything here is a cache read now — Yahoo's season
+  // comes from standings, the rest from the ext registry. If a league
+  // hasn't hydrated yet it's reported as pending and a short poll picks
+  // it up, but nothing is requested on this dashboard's behalf. MGRREC4
+  try { if (typeof _mrPollTallies === 'function') _mrPollTallies(0); } catch (e2) {}
 }
 function closeManagerRecord() {
   var ov = document.getElementById('mrOverlay');
