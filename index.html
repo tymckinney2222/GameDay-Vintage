@@ -120311,6 +120311,22 @@ function espCacheMeta(id, game, j) {
 // order ourselves from wins then points-for. The probe page reports
 // which fields actually exist so this can be tightened rather than left
 // guessing forever. ESPNSLICE1
+// A season-points league reports record.overall.pointsFor = 0 while the
+// real season total sits on team.points. A "!= null" check latches onto
+// that zero and every standings row reads 0 — the same falsy trap as the
+// tier-ordinal bug. Prefer the first NON-ZERO candidate. ESPNSLICE2Q
+function espPickPoints(overall, team) {
+  var cands = [(overall || {}).pointsFor, (team || {}).points, (team || {}).pointsFor];
+  var i;
+  for (i = 0; i < cands.length; i++) {
+    if (cands[i] != null && Number(cands[i]) !== 0) return Number(cands[i]);
+  }
+  for (i = 0; i < cands.length; i++) {
+    if (cands[i] != null) return Number(cands[i]);
+  }
+  return null;
+}
+
 function espStandingsRow(j, teamId) {
   if (!j || !j.teams || !j.teams.length || teamId == null) return null;
   var teams = j.teams, mine = null, i;
@@ -120320,13 +120336,7 @@ function espStandingsRow(j, teamId) {
   if (!mine) return null;
 
   function ovrOf(t) { return (t.record && t.record.overall) || {}; }
-  function pfOf(t) {
-    var o = ovrOf(t);
-    if (o.pointsFor != null) return Number(o.pointsFor);
-    if (t.points != null) return Number(t.points);
-    if (t.pointsFor != null) return Number(t.pointsFor);
-    return 0;
-  }
+  function pfOf(t) { return espPickPoints(ovrOf(t), t) || 0; }
 
   var o = ovrOf(mine);
   var w = o.wins || 0, l = o.losses || 0, t2 = o.ties || 0;
@@ -120617,8 +120627,10 @@ function espStandingsAll(j, myTeamId) {
     var t = teams[i] || {};
     var o = (t.record && t.record.overall) || {};
     var w = o.wins || 0, l = o.losses || 0, ti = o.ties || 0;
-    var pf = (o.pointsFor != null) ? Number(o.pointsFor)
-           : (t.points != null) ? Number(t.points) : null;
+    // Same non-zero preference as espStandingsRow: a season-points league
+    // reports record.overall.pointsFor = 0 with the real total on
+    // team.points, and "!= null" latched onto the zero. ESPNSLICE2Q
+    var pf = espPickPoints(o, t);
     var logo = String(t.logo || '');
     rows.push({
       teamId: String(t.id),
@@ -121946,6 +121958,92 @@ function espLiveCatValues(scoreByStat, todayByStat) {
     else if (r.mode === 'era') out[k] = num * 9 / (den / 3);
   }
   return out;
+}
+
+// ── ESPN SLICE 2Q (season-points standings) ── ESPNSLICE2Q ──
+// A season-long TOTAL_POINTS league has no matchups. ESPN's own standings
+// show TOT and CHG (today's change), which is a different table from the
+// H2H W-L-T / GB / FPTS one.
+function espIsSeasonPts(row) {
+  var st = String(((((row || {}).raw || {}).settings || {}).scoringSettings || {}).scoringType || '');
+  if (!st) return false;
+  if (/CATEGOR/i.test(st)) return false;
+  return /TOTAL/i.test(st) || st.indexOf('H2H') !== 0;
+}
+
+// ESPN's own standings table, so season-points leagues get TOT / TODAY
+// instead of a column of zeros.
+function _espStandingsPaneHtml(row) {
+  var rows = row && row.standingsAll;
+  if (!rows || !rows.length) {
+    return '<div style="color:rgba(255,255,255,0.35);font-size:12px;">No standings yet.</div>';
+  }
+  var seasonPts = espIsSeasonPts(row);
+  var cats = espIsCats(row);
+  var myIds = row.myTeamIds || {};
+  var accent = extProvAccent('espn');
+  var i;
+
+  // Season leagues sort on total points; ESPN's playoffSeed is 0 there.
+  var list = rows.slice(0);
+  if (seasonPts) {
+    list.sort(function (a, b) { return (b.pf || 0) - (a.pf || 0); });
+  }
+
+  var recW = cats ? 76 : 56;
+  var h = '<div data-espstand>';
+  h += '<div style="display:flex;align-items:baseline;gap:8px;padding:0 0 5px;' +
+    'border-bottom:1px solid rgba(255,255,255,0.08);font-size:9px;letter-spacing:0.1em;' +
+    'color:rgba(255,255,255,0.3);">' +
+    '<span style="flex:0 0 20px;">RK</span>' +
+    '<span style="flex:1;">TEAM</span>' +
+    (seasonPts
+      ? '<span style="flex:0 0 62px;text-align:right;">TOTAL</span>' +
+        '<span style="flex:0 0 48px;text-align:right;">TODAY</span>'
+      : '<span style="flex:0 0 ' + recW + 'px;text-align:right;">W-L-T</span>' +
+        '<span style="flex:0 0 34px;text-align:right;">GB</span>' +
+        (cats ? '' : '<span style="flex:0 0 56px;text-align:right;">FPTS</span>')) +
+    '</div>';
+
+  for (i = 0; i < list.length; i++) {
+    var r = list[i];
+    var mine = !!myIds[r.teamId];
+    var rank = seasonPts ? (i + 1) : (r.rank || (i + 1));
+    var today = espTodayTeamTotal(row.rosters, r.teamId);
+    h += '<div style="display:flex;align-items:center;gap:8px;padding:7px 6px;border-radius:7px;' +
+      'margin:0 0 2px;font-size:12.5px;' + (mine ? 'background:rgba(239,68,68,0.10);' : '') + '">' +
+      '<span style="flex:0 0 20px;color:rgba(255,255,255,0.35);font-family:var(--sk-font-mono,monospace);">' +
+        rank + '</span>' +
+      '<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' +
+        'color:' + (mine ? accent + ';font-weight:700' : 'rgba(255,255,255,0.82)') + ';">' +
+        slEsc(r.teamName) + '</span>';
+    if (seasonPts) {
+      h += '<span style="flex:0 0 62px;text-align:right;font-family:var(--sk-font-mono,monospace);' +
+          'font-weight:700;color:rgba(255,255,255,0.85);">' +
+          ((r.pf != null) ? r.pf : '\u2014') + '</span>' +
+        '<span style="flex:0 0 48px;text-align:right;font-family:var(--sk-font-mono,monospace);' +
+          'font-weight:700;color:' +
+          (today == null ? 'rgba(255,255,255,0.25)'
+            : today < 0 ? '#f87171' : today > 0 ? '#4ade80' : 'rgba(255,255,255,0.35)') + ';">' +
+          (today == null ? '\u2014' : (today > 0 ? '+' : '') + today) + '</span>';
+    } else {
+      h += '<span style="flex:0 0 ' + recW + 'px;text-align:right;white-space:nowrap;' +
+          'font-family:var(--sk-font-mono,monospace);color:rgba(255,255,255,0.8);">' +
+          slEsc(r.record || '\u2014') + '</span>' +
+        '<span style="flex:0 0 34px;text-align:right;font-family:var(--sk-font-mono,monospace);' +
+          'color:rgba(255,255,255,0.5);">' + ((r.gb != null) ? r.gb : '\u2014') + '</span>' +
+        (cats ? ''
+          : '<span style="flex:0 0 56px;text-align:right;font-family:var(--sk-font-mono,monospace);' +
+            'color:rgba(255,255,255,0.8);">' + ((r.pf != null) ? r.pf : '\u2014') + '</span>');
+    }
+    h += '</div>';
+  }
+  if (seasonPts) {
+    h += '<div style="color:rgba(255,255,255,0.28);font-size:9.5px;margin-top:8px;line-height:1.5;">' +
+      'TODAY is each team\u2019s starters so far today \u00b7 ESPN calls this column CHG</div>';
+  }
+  h += '</div>';
+  return h;
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -123547,6 +123645,30 @@ function skBuildExtCardHTML(l) {
           : l.provider === 'espn' ? 'TODAY\u2019S LINEUP'
           : 'THIS WEEK\u2019S LINEUP') + ' \u203a</div>'
       : '') +
+    // Season-points leagues have no matchup, so the card had nothing under
+    // the title. Show the season total and today's movement. ESPNSLICE2Q
+    ((l.provider === 'espn' && typeof espIsSeasonPts === 'function' && espIsSeasonPts(l) &&
+      l.standings && l.standings.pf != null)
+      ? (function () {
+          var td = (typeof espTodayTeamTotal === 'function' && l.rosters)
+            ? espTodayTeamTotal(l.rosters, (function () {
+                for (var q in (l.myTeamIds || {})) {
+                  if (l.myTeamIds.hasOwnProperty(q)) return q;
+                } return null;
+              })())
+            : null;
+          return '<div class="sk-card-score-row">' +
+            '<span class="sk-ext-myscore" style="color:' + accent + '">' + l.standings.pf + '</span>' +
+            (td != null
+              ? '<span class="sk-ext-lead" style="color:' +
+                (td < 0 ? '#f87171' : td > 0 ? '#4ade80' : 'rgba(255,255,255,0.6)') + '"> ' +
+                (td > 0 ? '\u2191 +' + td : td < 0 ? '\u2193 ' + Math.abs(td) : 'even') +
+                ' today</span>'
+              : '') +
+            '<span class="sk-ext-oppname"> season points</span>' +
+          '</div>';
+        })()
+      : '') +
     // Top bat + arm for today, mirroring the Yahoo card's top-player line.
     // ESPNSLICE2H
     ((l.provider === 'espn' && typeof _espTopTodayHtml === 'function')
@@ -124713,7 +124835,12 @@ function extOpenLeague(key) {
 
   // STANDINGS pane
   var standingsHtml = '';
-  if (row.standingsAll && row.standingsAll.length) {
+  // ESPN builds its own so a season-points league can show TOTAL / TODAY
+  // instead of an H2H table full of zeros. ESPNSLICE2Q
+  var espOwnsStandings = (row.provider === 'espn' && typeof _espStandingsPaneHtml === 'function');
+  if (espOwnsStandings) {
+    standingsHtml = _espStandingsPaneHtml(row);
+  } else if (row.standingsAll && row.standingsAll.length) {
     standingsHtml += '<div style="display:flex;color:rgba(255,255,255,0.35);font-size:9px;letter-spacing:0.08em;padding:4px 0;border-bottom:1px solid rgba(255,255,255,0.1);">' +
       '<span style="width:24px;">RK</span><span style="flex:1;">TEAM</span>' +
       (ptsMode
