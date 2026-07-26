@@ -123084,6 +123084,34 @@ function _slShortName(n) {
   return parts[0].charAt(0) + '. ' + parts.slice(1).join(' ');
 }
 
+// Names were only ever resolved by the Roster tab handler, so the Week
+// tab and the Today's Lineup modal showed raw Sleeper player ids until
+// you'd visited Roster first. This wrapper is the shared entry point:
+// safe to call from anywhere, resolves at most once per row, and hands
+// back a promise-ish callback when the names have landed. SLNAMES
+function slEnsureRosterNames(row, done) {
+  if (!row || row.provider !== 'sleeper' || !row.rosters || !row.rosters.byTeam) {
+    if (done) done(); return;
+  }
+  if (row._slNamesDone) { if (done) done(); return; }
+  if (row._slNamesBusy) {
+    // Already in flight — queue the caller rather than firing a second
+    // fetch of a dictionary the docs ask us to request sparingly.
+    row._slNamesWaiting = row._slNamesWaiting || [];
+    if (done) row._slNamesWaiting.push(done);
+    return;
+  }
+  row._slNamesBusy = 1;
+  slResolveRosterNames(row, function () {
+    row._slNamesBusy = 0;
+    row._slNamesDone = 1;
+    var q = row._slNamesWaiting || [];
+    row._slNamesWaiting = null;
+    if (done) done();
+    for (var i = 0; i < q.length; i++) { try { q[i](); } catch (e) {} }
+  });
+}
+
 function slResolveRosterNames(row, done) {
   var id = row.key.slice(4);
   var sport = String(row.sport || 'nfl').toLowerCase();
@@ -123576,6 +123604,16 @@ function _extLineupRowHtml(name, slot, statLine, fpTxt, accent, dim) {
 
 // SLEEPER body — week fantasy points (authoritative) + raw week stats.
 function _slLineupFill(row, bodyEl, headEl) {
+  // The modal opens straight off the Today card, so it can run before the
+  // detail view has ever been opened. Resolve names first, then re-fill.
+  // SLNAMES
+  if (typeof slEnsureRosterNames === 'function' && row && !row._slNamesDone &&
+      row.rosters && row.rosters.byTeam) {
+    slEnsureRosterNames(row, function () { _slLineupFill(row, bodyEl, headEl); });
+    bodyEl.innerHTML = '<div style="color:rgba(255,255,255,0.4);font-size:12px;">' +
+      'Loading player names\u2026</div>';
+    return;
+  }
   var sport = String(row.sport || 'nba').toLowerCase();
   var season = String(row.season || (row.raw && row.raw.season) || '');
   var week = _slpCurrentWeek(row);
@@ -125071,6 +125109,28 @@ function extOpenLeague(key) {
   // Category tallies and points both move all day, and until now the only
   // refresh path was opening the Roster tab. Opening the league is the
   // natural moment to re-pull the cheap 175KB scores. ESPNSLICE2L
+  // Sleeper: get names in place before any tab renders. SLNAMES
+  if (row.provider === 'sleeper' && typeof slEnsureRosterNames === 'function') {
+    slEnsureRosterNames(row, function () {
+      // Repaint whichever pane is showing now that ids became names.
+      var body = document.getElementById('skExtDetailBody');
+      if (!body) return;
+      var panes = body.querySelectorAll('[data-extpane]');
+      for (var pi = 0; pi < panes.length; pi++) {
+        var pn = panes[pi].getAttribute('data-extpane');
+        if (pn === 'roster' && typeof _extRosterPaneHtml === 'function') {
+          panes[pi].innerHTML = _extRosterPaneHtml(row, row.myTeamIds || {});
+        } else if (pn === 'weekgames' && panes[pi].innerHTML &&
+                   panes[pi].innerHTML.indexOf('Tap to load') === -1 &&
+                   typeof slLoadWeekGames === 'function') {
+          // Only rebuild if it has already been opened — otherwise leave
+          // its "tap to load" placeholder alone. SLNAMES
+          slLoadWeekGames(row, panes[pi].id);
+        }
+      }
+    });
+  }
+
   if (row.provider === 'espn') {
     // Categories need today's per-player stats to rebuild live totals, so
     // the heavier both-payload refresh is the right one there. Points
@@ -125433,8 +125493,8 @@ function extSetDetailTab(id) {
                    'Reopen this tab to retry.</div>'
                  : '');
         };
-        if (rowX.provider === 'sleeper' && typeof slResolveRosterNames === 'function') {
-          slResolveRosterNames(rowX, _resolveDone);
+        if (rowX.provider === 'sleeper' && typeof slEnsureRosterNames === 'function') {
+          slEnsureRosterNames(rowX, _resolveDone);   // SLNAMES
         } else {
           extLoadPlayerIds(rowX.sport, _resolveDone);
         }
