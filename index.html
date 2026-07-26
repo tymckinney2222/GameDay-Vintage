@@ -121233,9 +121233,11 @@ function _espSlotLabel(game, slotId, universal) {
   return '#' + slotId;
 }
 
-function espRosters(j, game, scoredIds) {
+function espRosters(j, game, scoredIds, sport) {
   if (!j || !j.teams || !j.teams.length) return null;
   var universal = _espUniversalSlots(j);
+  // One scoreboard lookup for the whole roster. ESPN3E
+  var todayIds = (typeof _espTodayGameIds === 'function') ? _espTodayGameIds(sport) : null;
   var byTeam = {}, i, k;
   for (i = 0; i < j.teams.length; i++) {
     var t = j.teams[i] || {};
@@ -121254,14 +121256,22 @@ function espRosters(j, game, scoredIds) {
       // Points come from ESPN's own appliedTotal, never recomputed.
       var pp = (typeof espPlayerPoints === 'function')
         ? espPlayerPoints(pl, j.seasonId, j.scoringPeriodId) : {};
+      var tg = (typeof espTodayGame === 'function')
+        ? espTodayGame(pl, todayIds) : { known: false, hasGame: null, order: null };
       var wins = (typeof espBuildWindows === 'function')
         ? espBuildWindows(pl, j.seasonId, j.scoringPeriodId, scoredIds || []) : null;
       items.push({
         playerId: String(e.playerId || pl.id || ''),
         pts: pp.season, today: pp.today, proj: pp.proj, last7: pp.last7,
         windows: wins,
-        // Usual batting slot, from proGamePlayerDetail. ESPN3
-        order: (typeof espLineupOrder === 'function') ? espLineupOrder(pl) : null,
+        // Today's slot when we can identify today's game; otherwise the
+        // player's usual one. ESPN3E
+        order: (tg.known && tg.hasGame && tg.order != null)
+          ? tg.order
+          : ((typeof espLineupOrder === 'function') ? espLineupOrder(pl) : null),
+        orderIsToday: !!(tg.known && tg.hasGame && tg.order != null),
+        noGame: !!(tg.known && tg.hasGame === false),
+        gameKnown: !!tg.known,
         name: nm,
         // _extRosterItemName reads .pos and renders it on the right, so
         // the slot goes there — it's the column the ESPN app shows too.
@@ -121309,7 +121319,7 @@ function espLoadRosters(row) {
   return espCurrentSeason(sv.game).then(function (season) {
     return espFetchLeague(sv.game, sv.id, season, '?view=mRoster');
   }).then(function (j) {
-    row.rosters = espRosters(j, sv.game, espScoredIds(row));
+    row.rosters = espRosters(j, sv.game, espScoredIds(row), row.sport);
     row._espRosterBusy = 0;
     // Today's team totals and the live category math both need rosters,
     // and the score payload was fetched before they existed. Recompute off
@@ -121504,8 +121514,19 @@ function _espRosterRowsHtml(row, myTeam) {
       '<span style="flex:1;min-width:0;">' +
         '<span style="display:block;font-size:12.5px;color:#fff;overflow:hidden;' +
           'text-overflow:ellipsis;white-space:nowrap;">' + slEsc(it.name) +
-          (it.order ? '<span style="color:rgba(255,255,255,0.3);font-size:9px;' +
-                      'margin-left:5px;">bats ' + it.order + '</span>' : '') +
+          // A starter whose team isn't playing today can't score for you —
+          // the single most useful thing to flag on a daily lineup. Only
+          // shown when today's game was actually identified, never guessed.
+          // ESPN3E
+          (it.starter && it.noGame
+            ? '<span style="color:#f87171;font-size:9px;font-weight:700;' +
+              'margin-left:5px;" title="No game today">\u2715 no game</span>' : '') +
+          (it.order ? '<span style="color:' +
+                      (it.orderIsToday ? 'rgba(74,222,128,0.75)' : 'rgba(255,255,255,0.3)') +
+                      ';font-size:9px;margin-left:5px;"' +
+                      (it.orderIsToday ? ' title="Today\u2019s batting order"'
+                                       : ' title="Usual batting order"') +
+                      '>bats ' + it.order + '</span>' : '') +
           (it.injury ? '<span style="color:#f87171;font-size:9px;font-weight:700;' +
                        'margin-left:5px;">IL</span>' : '') + '</span>' +
         statLine +
@@ -121732,7 +121753,7 @@ function espRefreshLive(row, force) {
       espFetchLeague(sv.game, sv.id, season, espScoreView(row))
     ]);
   }).then(function (res) {
-    var built = espRosters(res[0], sv.game, espScoredIds(row));
+    var built = espRosters(res[0], sv.game, espScoredIds(row), row.sport);
     if (built) row.rosters = built;
     row._espScoreJson = res[1];
     var ls = espLiveScores(res[1], row.standingsAll, row.rosters, espIsCats(row), row);
@@ -121847,7 +121868,7 @@ function _espLineupFill(row, bodyEl, headEl) {
   var accent = extProvAccent('espn');
 
   var items = myTeam.items;
-  var total = 0, scoring = 0, nS = 0, nB = 0, live = 0, starters = '', bench = '', i;
+  var total = 0, scoring = 0, nS = 0, nB = 0, live = 0, idle = 0, starters = '', bench = '', i;
   for (i = 0; i < items.length; i++) {
     var it = items[i] || {};
     var w = (it.windows && it.windows.today) || null;
@@ -121856,6 +121877,7 @@ function _espLineupFill(row, bodyEl, headEl) {
     if (it.starter && w && w.stats) {
       for (var lk in w.stats) { if (w.stats.hasOwnProperty(lk)) { live++; break; } }
     }
+    if (it.starter && it.noGame) idle++;   // ESPN3E
 
     // Same inline-labelled stat line as the roster tab, scored cats only.
     var line = '';
@@ -121879,7 +121901,9 @@ function _espLineupFill(row, bodyEl, headEl) {
                 : Number(w.total) < 0 ? '#f87171' : 'rgba(255,255,255,0.35)') }
       : { txt: '\u2014', color: 'rgba(255,255,255,0.28)' };
 
-    var html = _extLineupRowHtml(it.name || String(it.playerId), it.slot || '',
+    var nameTxt = (it.name || String(it.playerId)) +
+      (it.starter && it.noGame ? '  \u2715 no game' : '');
+    var html = _extLineupRowHtml(nameTxt, it.slot || '',
                                  line, fp, accent, !it.starter);
     if (it.starter) { starters += html; nS++; } else { bench += html; nB++; }
   }
@@ -121892,6 +121916,7 @@ function _espLineupFill(row, bodyEl, headEl) {
     out = '<div style="text-align:center;padding:10px 0 12px">' +
       '<div style="color:rgba(255,255,255,0.42);font-size:10px;letter-spacing:0.12em">' +
         nS + ' STARTERS \u00b7 ' + nB + ' BENCH' +
+        (idle ? ' \u00b7 ' + idle + ' NOT PLAYING' : '') +
         (live ? ' \u00b7 ' + live + ' WITH STATS TODAY' : ' \u00b7 NO GAMES FINAL YET') +
       '</div></div>';
   } else {
@@ -121901,7 +121926,8 @@ function _espLineupFill(row, bodyEl, headEl) {
         (Math.round(total * 10) / 10).toFixed(1) + '</div>' +
       '<div style="color:rgba(255,255,255,0.42);font-size:10px;letter-spacing:0.12em;margin-top:4px">' +
         'FP FROM ' + nS + ' STARTERS' +
-        (scoring ? ' \u00b7 ' + scoring + ' SCORING' : ' \u00b7 NO GAMES FINAL YET') + '</div></div>';
+        (scoring ? ' \u00b7 ' + scoring + ' SCORING' : ' \u00b7 NO GAMES FINAL YET') +
+        (idle ? ' \u00b7 ' + idle + ' NOT PLAYING' : '') + '</div></div>';
   }
 
   var top = espTopToday(row.rosters, (function () {
@@ -122477,6 +122503,59 @@ function espLineupOrder(pl) {
     if (tally[lo] > bestN) { bestN = tally[lo]; best = Number(lo); }
   }
   return best;
+}
+
+// ── Today's game, per player ── ESPN3E ──
+// proGamePlayerDetail is keyed by ESPN event id, and until now we couldn't
+// tell which key was today's — so batting order was reported as the
+// player's USUAL slot rather than today's.
+//
+// GameDay already fetches ESPN's scoreboard for every league into
+// allGames, and those carry the same event ids. Intersecting the two
+// identifies today's game exactly, which gives both a today-accurate
+// batting slot and a confident "no game today" flag.
+function _espTodayGameIds(sport) {
+  var out = null;
+  try {
+    if (typeof allGames === 'undefined' || !allGames) return null;
+    var key = String(sport || '').toUpperCase();
+    var list = allGames[key];
+    if (!list || !list.length) return null;
+    var now = new Date();
+    var y = now.getFullYear(), m = now.getMonth(), d = now.getDate();
+    out = {};
+    var n = 0;
+    for (var i = 0; i < list.length; i++) {
+      var g = list[i];
+      if (!g || !g.id) continue;
+      if (g.date) {
+        var gd = new Date(g.date);
+        // Local calendar day, so a 7pm start doesn't roll into tomorrow.
+        if (gd.getFullYear() !== y || gd.getMonth() !== m || gd.getDate() !== d) continue;
+      }
+      out[String(g.id)] = 1; n++;
+    }
+    if (!n) return null;
+  } catch (e) { return null; }
+  return out;
+}
+
+// What do we know about this player's day?
+//   hasGame  - his team plays today (his team's event id is in the set)
+//   order    - today's batting slot, when the lineup has been posted
+//   known    - whether we could identify today's game at all
+function espTodayGame(pl, todayIds) {
+  var d = pl && pl.proGamePlayerDetail;
+  if (!todayIds) return { known: false, hasGame: null, order: null, status: '' };
+  if (!d) return { known: true, hasGame: false, order: null, status: '' };
+  for (var k in d) {
+    if (!d.hasOwnProperty(k)) continue;
+    if (!todayIds[String(k)]) continue;
+    var e = d[k] || {};
+    var lo = (e.lineupOrder != null && e.lineupOrder > 0) ? Number(e.lineupOrder) : null;
+    return { known: true, hasGame: true, order: lo, status: String(e.starterStatus || '') };
+  }
+  return { known: true, hasGame: false, order: null, status: '' };
 }
 
 // ─── Matchup flow chart ─────────────────────────────────────────────
