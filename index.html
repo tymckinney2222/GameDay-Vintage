@@ -122660,6 +122660,73 @@ function _espFlowTableHtml(row) {
   return h;
 }
 
+// Season-points pace, mirroring the Yahoo season card's
+// "+0.0 today  +0.0 vs 6th" line.
+//
+// Today's gain is my starters' daily total. The comparison is against the
+// team immediately ahead in the standings — or, if I'm leading, the team
+// immediately behind, since that's who's chasing. ESPN3D
+function espSeasonPace(row) {
+  if (!row || !espIsSeasonPts(row) || !row.standingsAll || !row.standingsAll.length) return null;
+  var myId = null, k;
+  for (k in (row.myTeamIds || {})) { if (row.myTeamIds.hasOwnProperty(k)) { myId = k; break; } }
+  if (!myId) return null;
+
+  // Season leagues rank on total points; playoffSeed is 0 there.
+  var list = row.standingsAll.slice(0);
+  list.sort(function (a, b) { return (b.pf || 0) - (a.pf || 0); });
+  var idx = -1, i;
+  for (i = 0; i < list.length; i++) { if (list[i].teamId === String(myId)) { idx = i; break; } }
+  if (idx === -1) return null;
+
+  var myToday = espTodayTeamTotal(row.rosters, myId);
+  var targetIdx = (idx === 0) ? 1 : idx - 1;
+  var target = list[targetIdx] || null;
+  if (!target) return { rank: idx + 1, myToday: myToday, target: null };
+
+  var theirToday = espTodayTeamTotal(row.rosters, target.teamId);
+  var delta = (myToday == null || theirToday == null)
+    ? null
+    : Math.round((myToday - theirToday) * 10) / 10;
+
+  return {
+    rank: idx + 1,
+    myToday: myToday,
+    target: target,
+    targetRank: targetIdx + 1,
+    targetToday: theirToday,
+    // Points between us, so the card can say how much ground the day moved.
+    gap: Math.round(((target.pf || 0) - (list[idx].pf || 0)) * 10) / 10,
+    delta: delta,
+    chasing: idx !== 0
+  };
+}
+
+function _espSeasonPaceHtml(row, accent) {
+  var p = espSeasonPace(row);
+  if (!p) return '';
+  var ord = (typeof _skOrdinal === 'function') ? _skOrdinal
+          : (typeof skOrdinal === 'function') ? skOrdinal
+          : function (n) { return String(n); };
+  var bits = '';
+  if (p.myToday != null) {
+    bits += '<span style="color:' +
+      (p.myToday > 0 ? '#4ade80' : p.myToday < 0 ? '#f87171' : 'rgba(255,255,255,0.45)') + '">' +
+      (p.myToday > 0 ? '+' : '') + p.myToday + '</span>' +
+      '<span style="color:rgba(255,255,255,0.4)"> today</span>';
+  }
+  if (p.target && p.delta != null) {
+    bits += '<span style="color:rgba(255,255,255,0.2)">  \u00b7  </span>' +
+      '<span style="color:' +
+        (p.delta > 0 ? '#4ade80' : p.delta < 0 ? '#f87171' : 'rgba(255,255,255,0.45)') + '">' +
+        (p.delta > 0 ? '+' : '') + p.delta + '</span>' +
+      '<span style="color:rgba(255,255,255,0.4)"> vs ' + ord(p.targetRank) + '</span>';
+  }
+  if (!bits) return '';
+  return '<div style="font-family:var(--sk-font-mono,monospace);font-size:11.5px;' +
+    'margin-top:2px;">' + bits + '</div>';
+}
+
 function _espFlowChartHtml(row) {
   var s = espFlowSeries(row);
   if (!s || s.points.length < 2) return '';
@@ -124373,6 +124440,18 @@ function skBuildExtCardHTML(l) {
     '</div>' +
     '<div class="sk-card-league">' + slEsc(subLine) + '</div>' +
     scoreRowHtml +
+    // Season-points leagues have no matchup, so the card shows the season
+    // total plus today's movement and how the day went against the team
+    // immediately ahead — the same read as the Yahoo season card.
+    // ESPNSLICE2Q / ESPN3D
+    ((l.provider === 'espn' && typeof espIsSeasonPts === 'function' && espIsSeasonPts(l) &&
+      l.standings && l.standings.pf != null)
+      ? '<div class="sk-card-score-row">' +
+          '<span class="sk-ext-myscore" style="color:' + accent + '">' + l.standings.pf + '</span>' +
+          '<span class="sk-ext-oppname"> season points</span>' +
+        '</div>' +
+        ((typeof _espSeasonPaceHtml === 'function') ? _espSeasonPaceHtml(l, accent) : '')
+      : '') +
     // Lineup CTA — the external cousin of Yahoo's "Today's Lineup" row.
     // Only shown once a roster actually exists. stopPropagation keeps the
     // card's own detail-view tap from firing underneath it.
@@ -124382,30 +124461,6 @@ function skBuildExtCardHTML(l) {
         (l.provider === 'fantrax' ? 'ROSTER STATS'
           : l.provider === 'espn' ? 'TODAY\u2019S LINEUP'
           : 'THIS WEEK\u2019S LINEUP') + ' \u203a</div>'
-      : '') +
-    // Season-points leagues have no matchup, so the card had nothing under
-    // the title. Show the season total and today's movement. ESPNSLICE2Q
-    ((l.provider === 'espn' && typeof espIsSeasonPts === 'function' && espIsSeasonPts(l) &&
-      l.standings && l.standings.pf != null)
-      ? (function () {
-          var td = (typeof espTodayTeamTotal === 'function' && l.rosters)
-            ? espTodayTeamTotal(l.rosters, (function () {
-                for (var q in (l.myTeamIds || {})) {
-                  if (l.myTeamIds.hasOwnProperty(q)) return q;
-                } return null;
-              })())
-            : null;
-          return '<div class="sk-card-score-row">' +
-            '<span class="sk-ext-myscore" style="color:' + accent + '">' + l.standings.pf + '</span>' +
-            (td != null
-              ? '<span class="sk-ext-lead" style="color:' +
-                (td < 0 ? '#f87171' : td > 0 ? '#4ade80' : 'rgba(255,255,255,0.6)') + '"> ' +
-                (td > 0 ? '\u2191 +' + td : td < 0 ? '\u2193 ' + Math.abs(td) : 'even') +
-                ' today</span>'
-              : '') +
-            '<span class="sk-ext-oppname"> season points</span>' +
-          '</div>';
-        })()
       : '') +
     // Top bat + arm for today, mirroring the Yahoo card's top-player line.
     // ESPNSLICE2H
