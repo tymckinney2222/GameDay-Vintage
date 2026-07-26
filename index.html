@@ -121752,6 +121752,7 @@ function espRefreshLive(row, force) {
     if (mp && typeof _espMatchupPaneHtml === 'function') {
       var mh = mp.querySelector('[data-espmatch]');
       if (mh) mh.outerHTML = _espMatchupPaneHtml(row);
+      if (typeof _espBindDetailTips === 'function') _espBindDetailTips();   // ESPN3B
     }
   }).catch(function () {
     row._espLiveBusy = 0;
@@ -121953,6 +121954,7 @@ function espRefreshScores(row, force) {
     if (p && typeof _espMatchupPaneHtml === 'function') {
       var holder = p.querySelector('[data-espmatch]');
       if (holder) holder.outerHTML = _espMatchupPaneHtml(row);
+      if (typeof _espBindDetailTips === 'function') _espBindDetailTips();   // ESPN3B
     }
   }).catch(function () { row._espScoreBusy = 0; });
 }
@@ -122517,16 +122519,57 @@ function espFlowSeries(row) {
     for (i = 0; i < keys.length; i++) {
       runM += Number((mp || {})[keys[i]] || 0);
       runO += Number((op || {})[keys[i]] || 0);
-      pts.push({ day: keys[i], me: Math.round(runM * 10) / 10, opp: Math.round(runO * 10) / 10, live: false });
+      pts.push({ day: keys[i], me: Math.round(runM * 10) / 10,
+                 opp: Math.round(runO * 10) / 10, live: false,
+                 date: _espDayDate(keys[i], cur) });
     }
     if (!hasToday && (todayMine != null || todayOpp != null)) {
       runM += (todayMine || 0); runO += (todayOpp || 0);
       pts.push({ day: Number(cur), me: Math.round(runM * 10) / 10,
-                 opp: Math.round(runO * 10) / 10, live: true });
+                 opp: Math.round(runO * 10) / 10, live: true,
+                 date: _espDayDate(Number(cur), cur) });
     }
     return { points: pts, period: period };
   }
   return null;
+}
+
+// scoringPeriodId counts days, and we know which one is today, so an
+// earlier period is exactly (cur - day) days back on the calendar. ESPN3B
+var _ESP_DOW = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+function _espDayDate(day, cur) {
+  if (cur == null) return null;
+  var back = Number(cur) - Number(day);
+  if (!(back >= 0) || back > 400) return null;
+  var d = new Date();
+  d.setDate(d.getDate() - back);
+  return { dow: _ESP_DOW[d.getDay()], md: (d.getMonth() + 1) + '/' + d.getDate() };
+}
+
+// Tooltips inside the external-league detail overlay. The rotations panel
+// has its own binder scoped to #nbrBody, which is why the chart's tap
+// targets did nothing here — nothing was listening. Reuses the same
+// tooltip element and positioning. ESPN3B
+function _espBindDetailTips() {
+  var body = document.getElementById('skExtDetailBody');
+  if (!body || body._espTipBound) return;
+  body._espTipBound = 1;
+  body.addEventListener('click', function (ev) {
+    var el = ev.target;
+    while (el && el !== body && !(el.getAttribute && el.getAttribute('data-tip'))) el = el.parentNode;
+    if (!el || el === body) { if (typeof _nbrHideTip === 'function') _nbrHideTip(); return; }
+    if (typeof _nbrShowTip === 'function') _nbrShowTip(el, el.getAttribute('data-tip'));
+    ev.stopPropagation();
+  });
+  body.addEventListener('scroll', function () {
+    if (typeof _nbrHideTip === 'function') _nbrHideTip();
+  });
+  if (!window._espTipDocBound) {
+    window._espTipDocBound = 1;
+    document.addEventListener('click', function () {
+      if (typeof _nbrHideTip === 'function') _nbrHideTip();
+    });
+  }
 }
 
 function _espFlowChartHtml(row) {
@@ -122534,57 +122577,83 @@ function _espFlowChartHtml(row) {
   if (!s || s.points.length < 2) return '';
   var pts = s.points, n = pts.length, i;
   var accent = extProvAccent('espn');
-  var oppCol = 'rgba(255,255,255,0.42)';
+  var oppCol = 'rgba(255,255,255,0.40)';
   var maxV = 0;
-  for (i = 0; i < n; i++) { if (pts[i].me > maxV) maxV = pts[i].me; if (pts[i].opp > maxV) maxV = pts[i].opp; }
+  for (i = 0; i < n; i++) {
+    if (pts[i].me > maxV) maxV = pts[i].me;
+    if (pts[i].opp > maxV) maxV = pts[i].opp;
+  }
   if (!maxV) return '';
-  var W = 320, H = 96, padL = 4, padR = 4, padT = 8, padB = 14;
+  var top = Math.ceil(maxV / 25) * 25 || maxV;
+
+  // Room at the bottom for day labels, and a little at the left for the
+  // running total. ESPN3B
+  var W = 320, H = 118, padL = 6, padR = 6, padT = 10, padB = 26;
   var iw = W - padL - padR, ih = H - padT - padB;
-  function X(i2) { return padL + (n === 1 ? iw / 2 : (iw * i2) / (n - 1)); }
-  function Y(v) { return padT + ih - (ih * v) / maxV; }
+  function X(k) { return padL + (n === 1 ? iw / 2 : (iw * k) / (n - 1)); }
+  function Y(v) { return padT + ih - (ih * v) / top; }
 
-  var pm = '', po = '';
+  var pm = '', po = '', dots = '', labels = '', hits = '';
   for (i = 0; i < n; i++) {
-    pm += (i ? ' ' : '') + X(i).toFixed(1) + ',' + Y(pts[i].me).toFixed(1);
-    po += (i ? ' ' : '') + X(i).toFixed(1) + ',' + Y(pts[i].opp).toFixed(1);
+    var x = X(i), ym = Y(pts[i].me), yo = Y(pts[i].opp);
+    pm += (i ? ' ' : '') + x.toFixed(1) + ',' + ym.toFixed(1);
+    po += (i ? ' ' : '') + x.toFixed(1) + ',' + yo.toFixed(1);
+
+    // A dot per real data point, so the shape reads as measurements
+    // rather than a smooth invention.
+    dots += '<circle cx="' + x.toFixed(1) + '" cy="' + yo.toFixed(1) + '" r="1.8" fill="' + oppCol + '"/>';
+    dots += '<circle cx="' + x.toFixed(1) + '" cy="' + ym.toFixed(1) + '" r="' +
+      (pts[i].live ? '3.2' : '2.2') + '" fill="' + accent + '"/>';
+
+    var lab = pts[i].date ? (pts[i].live ? 'today' : pts[i].date.dow) : ('d' + pts[i].day);
+    labels += '<text x="' + x.toFixed(1) + '" y="' + (H - 8) + '" text-anchor="middle" ' +
+      'font-size="8.5" fill="' + (pts[i].live ? accent : 'rgba(255,255,255,0.34)') + '">' +
+      slEsc(lab) + '</text>';
+
+    var diff = Math.round((pts[i].me - pts[i].opp) * 10) / 10;
+    var tip = (pts[i].date ? pts[i].date.dow + ' ' + pts[i].date.md : 'Day ' + pts[i].day) +
+      (pts[i].live ? ' \u00b7 in progress' : '') +
+      '\nYou ' + pts[i].me + '  \u00b7  Opp ' + pts[i].opp +
+      '\n' + (diff === 0 ? 'level' : (diff > 0 ? 'ahead by ' + diff : 'behind by ' + Math.abs(diff)));
+    var bw = iw / n, bx = padL + bw * i;
+    hits += '<rect x="' + bx.toFixed(1) + '" y="0" width="' + bw.toFixed(1) + '" height="' + H + '" ' +
+      'fill="transparent" style="cursor:pointer" data-tip="' + slEsc(tip) + '" title="' + slEsc(tip) + '"></rect>';
   }
 
-  // Tap targets: a full-height invisible band per day, so a fingertip
-  // anywhere in the column hits it. Tooltip per the house rule.
-  var hits = '';
-  for (i = 0; i < n; i++) {
-    var bw = iw / n;
-    var bx = padL + bw * i;
-    var tip = 'Day ' + pts[i].day + (pts[i].live ? ' (live)' : '') +
-      ' \u00b7 you ' + pts[i].me + ' \u00b7 opp ' + pts[i].opp +
-      ' \u00b7 ' + (pts[i].me === pts[i].opp ? 'level'
-        : (pts[i].me > pts[i].opp ? '+' + (Math.round((pts[i].me - pts[i].opp) * 10) / 10)
-                                  : (Math.round((pts[i].me - pts[i].opp) * 10) / 10)));
-    hits += '<rect x="' + bx.toFixed(1) + '" y="0" width="' + bw.toFixed(1) + '" height="' + H + '"' +
-      ' fill="transparent" data-tip="' + slEsc(tip) + '" title="' + slEsc(tip) + '"></rect>';
-  }
+  // Soft fill under my line to separate it from the opponent's.
+  var area = pm + ' ' + X(n - 1).toFixed(1) + ',' + (padT + ih).toFixed(1) +
+             ' ' + X(0).toFixed(1) + ',' + (padT + ih).toFixed(1);
 
   var last = pts[n - 1];
   var lead = Math.round((last.me - last.opp) * 10) / 10;
+  var leadCol = lead > 0 ? '#4ade80' : lead < 0 ? '#f87171' : 'rgba(255,255,255,0.5)';
+
   return '<div data-espflow style="margin:0 0 14px;">' +
-    '<div style="display:flex;align-items:baseline;gap:8px;margin:0 0 4px;">' +
+    '<div style="display:flex;align-items:baseline;gap:8px;margin:0 0 2px;">' +
       '<span style="font-size:9px;letter-spacing:0.12em;color:rgba(255,255,255,0.3);">MATCHUP FLOW</span>' +
       '<span style="flex:1;"></span>' +
-      '<span style="font-size:10px;color:' + (lead > 0 ? '#4ade80' : lead < 0 ? '#f87171' : 'rgba(255,255,255,0.5)') + ';">' +
+      '<span style="font-family:var(--sk-font-mono,monospace);font-size:11px;color:' + accent + ';">' +
+        last.me + '</span>' +
+      '<span style="font-size:10px;color:rgba(255,255,255,0.3);">vs</span>' +
+      '<span style="font-family:var(--sk-font-mono,monospace);font-size:11px;' +
+        'color:rgba(255,255,255,0.55);">' + last.opp + '</span>' +
+      '<span style="font-size:10px;font-weight:700;color:' + leadCol + ';">' +
         (lead > 0 ? '+' + lead : lead === 0 ? 'level' : String(lead)) + '</span>' +
     '</div>' +
-    '<svg viewBox="0 0 ' + W + ' ' + H + '" width="100%" height="' + H + '" preserveAspectRatio="none" style="display:block;">' +
-      '<polyline points="' + po + '" fill="none" stroke="' + oppCol + '" stroke-width="1.5" stroke-linejoin="round"/>' +
-      '<polyline points="' + pm + '" fill="none" stroke="' + accent + '" stroke-width="2" stroke-linejoin="round"/>' +
-      (last.live
-        ? '<circle cx="' + X(n - 1).toFixed(1) + '" cy="' + Y(last.me).toFixed(1) + '" r="3" fill="' + accent + '"/>'
-        : '') +
-      hits +
+    '<svg viewBox="0 0 ' + W + ' ' + H + '" width="100%" height="' + H + '" style="display:block;overflow:visible;">' +
+      '<line x1="' + padL + '" y1="' + (padT + ih).toFixed(1) + '" x2="' + (W - padR) +
+        '" y2="' + (padT + ih).toFixed(1) + '" stroke="rgba(255,255,255,0.08)" stroke-width="1"/>' +
+      '<polygon points="' + area + '" fill="' + accent + '" opacity="0.10"/>' +
+      '<polyline points="' + po + '" fill="none" stroke="' + oppCol + '" stroke-width="1.5" ' +
+        'stroke-linejoin="round" stroke-linecap="round"/>' +
+      '<polyline points="' + pm + '" fill="none" stroke="' + accent + '" stroke-width="2" ' +
+        'stroke-linejoin="round" stroke-linecap="round"/>' +
+      dots + labels + hits +
     '</svg>' +
-    '<div style="display:flex;gap:10px;margin-top:2px;font-size:9px;color:rgba(255,255,255,0.35);">' +
-      '<span style="color:' + accent + ';">\u25cf you</span>' +
-      '<span>\u25cf opponent</span>' +
-      '<span style="flex:1;text-align:right;">tap a day</span>' +
+    '<div style="display:flex;gap:12px;margin-top:2px;font-size:9px;color:rgba(255,255,255,0.35);">' +
+      '<span><span style="color:' + accent + '">\u25cf</span> you</span>' +
+      '<span><span style="color:' + oppCol + '">\u25cf</span> opponent</span>' +
+      '<span style="flex:1;text-align:right;">tap a day for detail</span>' +
     '</div>' +
   '</div>';
 }
@@ -125499,6 +125568,11 @@ function extOpenLeague(key) {
   // it wholesale. ESPNSLICE2M
   var espOwnsMatchup = (row.provider === 'espn' && typeof _espMatchupPaneHtml === 'function');
   if (espOwnsMatchup) matchupHtml = _espMatchupPaneHtml(row);
+  // The chart's tap targets need a listener; nothing was binding them.
+  // ESPN3B
+  if (row.provider === 'espn' && typeof _espBindDetailTips === 'function') {
+    setTimeout(_espBindDetailTips, 0);
+  }
   // Avatar cascade for matchup rows — mirrors the Standings tab so team
   // logos carry over: my uploaded logo -> real Sleeper avatar (pulled
   // from the standings rows, keyed by roster/team id) -> letter circle.
