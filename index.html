@@ -115488,24 +115488,82 @@ var _mdMatchupInflight = {};
 // Summing those together would inflate a cats league roughly elevenfold.
 // The schedule carries a "winner" per matchup though, which is one W/L/T
 // regardless of format, so that's what this walks. MGRREC
+function espWeeksPlayed(row) {
+  var j = row && row._espScoreJson;
+  var cur = j && j.status && j.status.currentMatchupPeriod;
+  return (cur != null && cur > 0) ? (cur - 1) : null;
+}
+
+// One W/L/T per weekly matchup, whatever the format. Tries three sources
+// in order and reports which one it used, so a wrong total is traceable
+// rather than mysterious. MGRREC2
+//
+// record.overall is NOT interchangeable across ESPN formats:
+//   H2H points          10-5-0    = 15 weeks   -> matchup record
+//   H2H MOST categories  4-9-2    = 15 weeks   -> matchup record
+//   H2H categories      61-90-14  = 15 x 11    -> PER-CATEGORY
+// The first two are usable directly; the third would inflate a season
+// elevenfold. They're told apart by arithmetic — does the total look like
+// one entry per completed week — rather than by the scoringType string,
+// which reads CATEGORY for both variants.
 function espMatchupRecord(row) {
   var j = row && row._espScoreJson;
-  if (!j || !j.schedule) return null;
-  var myIds = row.myTeamIds || {};
-  var w = 0, l = 0, t = 0, i;
-  for (i = 0; i < j.schedule.length; i++) {
-    var m = j.schedule[i] || {};
-    var a = m.away || {}, h = m.home || {};
-    var meAway = !!(a.teamId != null && myIds[String(a.teamId)]);
-    var meHome = !!(h.teamId != null && myIds[String(h.teamId)]);
-    if (!meAway && !meHome) continue;
-    var win = String(m.winner || '').toUpperCase();
-    if (!win || win === 'UNDECIDED') continue;   // in progress or unplayed
-    if (win === 'TIE') { t++; continue; }
-    if ((win === 'AWAY' && meAway) || (win === 'HOME' && meHome)) w++;
-    else l++;
+  var myIds = (row && row.myTeamIds) || {};
+  var w = 0, l = 0, t = 0, decided = 0, via = '';
+  if (j && j.schedule) {
+    for (var i = 0; i < j.schedule.length; i++) {
+      var m = j.schedule[i] || {};
+      var a = m.away || {}, h = m.home || {};
+      var meAway = !!(a.teamId != null && myIds[String(a.teamId)]);
+      var meHome = !!(h.teamId != null && myIds[String(h.teamId)]);
+      if (!meAway && !meHome) continue;
+
+      // 1. An explicit winner flag, when ESPN sets one.
+      var win = String(m.winner || '').toUpperCase();
+      if (win && win !== 'UNDECIDED') {
+        decided++; via = via || 'winner';
+        if (win === 'TIE') t++;
+        else if ((win === 'AWAY' && meAway) || (win === 'HOME' && meHome)) w++;
+        else l++;
+        continue;
+      }
+
+      // 2. Category tally for that week, when it's populated.
+      var mc = (meAway ? a.cumulativeScore : h.cumulativeScore) || null;
+      var oc = (meAway ? h.cumulativeScore : a.cumulativeScore) || null;
+      if (mc && oc && ((mc.wins || 0) + (mc.losses || 0) + (mc.ties || 0)) > 0) {
+        decided++; via = via || 'cats';
+        if ((mc.wins || 0) > (oc.wins || 0)) w++;
+        else if ((mc.wins || 0) < (oc.wins || 0)) l++;
+        else t++;
+        continue;
+      }
+
+      // 3. Points for that week.
+      var ms = meAway ? a.totalPoints : h.totalPoints;
+      var os = meAway ? h.totalPoints : a.totalPoints;
+      if (ms != null && os != null && (Number(ms) || Number(os))) {
+        decided++; via = via || 'points';
+        if (Number(ms) > Number(os)) w++;
+        else if (Number(ms) < Number(os)) l++;
+        else t++;
+      }
+    }
   }
-  return (w + l + t) ? { w: w, l: l, t: t } : null;
+  if (decided) return { w: w, l: l, t: t, src: via, n: decided };
+
+  // 4. Fall back to record.overall, but only when it looks like a matchup
+  //    record — roughly one entry per completed week.
+  var rec = _mrParseRec(row && row.standings && row.standings.record);
+  if (rec) {
+    var weeks = espWeeksPlayed(row);
+    var tot = rec.w + rec.l + rec.t;
+    if (weeks && tot && tot <= weeks + 2) {
+      return { w: rec.w, l: rec.l, t: rec.t, src: 'record', n: tot };
+    }
+    return { w: 0, l: 0, t: 0, src: 'per-cat', n: 0, unusable: true };
+  }
+  return null;
 }
 
 var MR_PLATFORMS = [
@@ -115608,14 +115666,38 @@ function mrCollect() {
       // LEAGUES and sit out the record — the same way Yahoo shows 11
       // leagues but only 9 loaded into 108-42-3.
       var fmt = (typeof extFormatKey === 'function') ? extFormatKey(row) : '';
-      if (fmt === 'point') continue;
+      if (fmt === 'point') {
+        // Still worth listing, so it's visibly excluded rather than
+        // silently missing from the trace. MGRREC2
+        if (!bk.detail) bk.detail = [];
+        bk.detail.push({ name: (row.name || row.key), fmt: fmt, rec: '\u2014',
+                         src: 'season-long, no record', n: 0, weeks: null,
+                         raw: '', week: '\u2014' });
+        continue;
+      }
       var rec = mrSeasonRec(row);
-      if (rec) { bk.recLeagues++; bk.sw += rec.w; bk.sl += rec.l; bk.st += rec.t; }
+      if (rec && !rec.unusable) {
+        bk.recLeagues++; bk.sw += rec.w; bk.sl += rec.l; bk.st += rec.t;
+      }
       var wk = mrWeekResult(row);
       if (wk) {
         bk.weekLeagues++;
         if (wk === 'W') bk.ww++; else if (wk === 'L') bk.wl++; else bk.wt++;
       }
+      // Per-league trace, so a total that looks wrong can be traced to the
+      // league and the source that produced it. Computed AFTER wk, since
+      // var hoists the declaration but not the value. MGRREC2
+      if (!bk.detail) bk.detail = [];
+      bk.detail.push({
+        name: (row.name || row.key),
+        fmt: fmt || '?',
+        rec: rec ? (rec.w + '-' + rec.l + '-' + rec.t) : '\u2014',
+        src: rec ? (rec.src || '?') : 'none',
+        n: rec ? (rec.n || 0) : 0,
+        weeks: (typeof espWeeksPlayed === 'function') ? espWeeksPlayed(row) : null,
+        raw: (row.standings && row.standings.record) || '',
+        week: wk || '\u2014'
+      });
     }
   } catch (e2) {}
 
@@ -115791,6 +115873,44 @@ function mrRenderBody() {
           'font-size:12.5px;color:#fff;">' + _mrRec(pg, false) + '</span>' +
         '<span style="flex:0 0 56px;text-align:right;font-family:var(--sk-font-mono,monospace);' +
           'font-size:11px;color:rgba(255,255,255,0.4);">' + _mrPct(pg, false) + '</span>' +
+      '</div>';
+    }
+    h += '</div>';
+  }
+
+  // Per-league trace. Small, and it makes a surprising total explainable
+  // instead of something to argue with. MGRREC2
+  var det = [];
+  for (k in data.bySport) {
+    if (!data.bySport.hasOwnProperty(k)) continue;
+    for (var dp in data.bySport[k].plats) {
+      if (!data.bySport[k].plats.hasOwnProperty(dp)) continue;
+      var dd = data.bySport[k].plats[dp].detail;
+      if (dd) for (var di = 0; di < dd.length; di++) det.push(dd[di]);
+    }
+  }
+  if (det.length) {
+    h += '<div style="background:var(--sk-bg-card,rgba(255,255,255,0.03));' +
+      'border:1px solid rgba(255,255,255,0.07);border-radius:12px;padding:14px;margin:0 0 10px;">' +
+      '<div style="font-size:9.5px;letter-spacing:0.14em;color:rgba(255,255,255,0.4);' +
+        'margin:0 0 8px;">PER LEAGUE \u00b7 NON-YAHOO</div>';
+    for (i = 0; i < det.length; i++) {
+      var dt = det[i];
+      h += '<div style="padding:5px 0;border-bottom:1px solid rgba(255,255,255,0.04);">' +
+        '<div style="display:flex;align-items:baseline;gap:8px;">' +
+          '<span style="flex:1;min-width:0;font-size:11.5px;color:rgba(255,255,255,0.8);' +
+            'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + slEsc(dt.name) + '</span>' +
+          '<span style="font-family:var(--sk-font-mono,monospace);font-size:12px;color:#fff;">' +
+            slEsc(dt.rec) + '</span>' +
+          '<span style="font-family:var(--sk-font-mono,monospace);font-size:11px;color:#4ade80;">' +
+            slEsc(dt.week) + '</span>' +
+        '</div>' +
+        '<div style="font-size:9px;color:rgba(255,255,255,0.3);">' +
+          slEsc(dt.fmt) + ' \u00b7 via ' + slEsc(dt.src) +
+          (dt.n ? ' \u00b7 ' + dt.n + ' wks' : '') +
+          (dt.weeks != null ? ' of ' + dt.weeks : '') +
+          (dt.raw ? ' \u00b7 raw ' + slEsc(dt.raw) : '') +
+        '</div>' +
       '</div>';
     }
     h += '</div>';
