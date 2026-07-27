@@ -113397,14 +113397,26 @@ function dbpMarcel(p, gpOverride) {
 // than dropping them — a real player missing is worse than a mixed basis,
 // so long as the mix is visible.
 function dbpApplyMarcel(pool) {
-  if (!pool || !pool.players) return 0;
-  var n = 0, i;
+  if (!pool || !pool.players) return { n: 0, blended: 0, byYears: {} };
+  var n = 0, blended = 0, byYears = {}, i, k;
   for (i = 0; i < pool.players.length; i++) {
-    var m = dbpMarcel(pool.players[i]);
-    pool.players[i].proj = m;
-    if (m) n++;
+    var pl = pool.players[i];
+    var m = dbpMarcel(pl);
+    pl.proj = m;
+    if (!m) continue;
+    n++;
+    // How many seasons actually contributed. One means the "blend" is the
+    // input line unchanged, which is worth knowing — it's the difference
+    // between a projection and a copy of last season. DBMCOV
+    var yrs = 0;
+    for (k in (pl.hist || {})) {
+      if (pl.hist.hasOwnProperty(k) && Number(pl.hist[k].gp) > 0) yrs++;
+    }
+    if (yrs > 3) yrs = 3;
+    byYears[yrs] = (byYears[yrs] || 0) + 1;
+    if (yrs >= 2) blended++;
   }
-  return n;
+  return { n: n, blended: blended, byYears: byYears };
 }
 
 // ── DRAFT POOL: VALUATION (slice 2) ── DBVAL ──
@@ -116368,7 +116380,7 @@ var _fppBoard = {
   // costs nothing and stays consistent across all four platforms: the
   // scoring varies by league, the projection should not. DBBASIS
   basis: 'esp',         // 'esp' | 'proj' (Marcel) | 'last'   DBMARCEL
-  marcelN: 0,           // how many players the blend could cover
+  marcel: { n: 0, blended: 0, byYears: {} },   // DBMCOV
   progress: '',
   // How many rows to RENDER. The pool holds 600; a 12-team league with 15
   // roster spots drafts 180, and deeper NHL leagues go past that, so 120
@@ -116459,7 +116471,8 @@ function _fppBoardLoad(force) {
   }).then(function (pool) {
     _fppBoard.pool = pool;
     // Blend once per load, not per re-value. DBMARCEL
-    _fppBoard.marcelN = (typeof dbpApplyMarcel === 'function') ? dbpApplyMarcel(pool) : 0;
+    _fppBoard.marcel = (typeof dbpApplyMarcel === 'function')
+      ? dbpApplyMarcel(pool) : { n: 0, blended: 0, byYears: {} };
     _fppBoard.busy = false;
     if (pool && pool.error) _fppBoard.err = 'Using the cached pool \u2014 ' + pool.error;
     _fppBoardValue();
@@ -116469,6 +116482,23 @@ function _fppBoardLoad(force) {
     _fppBoard.err = 'Couldn\u2019t load the player pool: ' + (e && e.message ? e.message : String(e));
     _fppRender();
   });
+}
+
+// Says plainly when the blend has nothing to blend. A board that silently
+// equals Last Season is worse than one that admits it. DBMCOV
+function _fppMarcelNote(B) {
+  var m = B.marcel || { n: 0, blended: 0, byYears: {} };
+  var one = m.byYears[1] || 0;
+  if (!m.n) return 'Marcel \u2014 no history in the pool';
+  if (!m.blended) {
+    return '\u26a0 Marcel has only ONE season for all ' + m.n +
+      ' players, so this is identical to Last Season';
+  }
+  var parts = [];
+  if (m.byYears[3]) parts.push(m.byYears[3] + ' with 3');
+  if (m.byYears[2]) parts.push(m.byYears[2] + ' with 2');
+  if (one) parts.push(one + ' with 1 (unblended)');
+  return 'Marcel blend \u00b7 ' + parts.join(', ');
 }
 
 function _fppBoardAge(pool) {
@@ -116524,7 +116554,7 @@ function _fppBoardHtml() {
       ? 'Z-scores against the top 180, summed. Balanced across categories.'
       : 'Projected fantasy points under this league\u2019s scoring.') +
     ' \u00b7 ' + (B.basis === 'esp' ? 'ESPN projection'
-                : B.basis === 'proj' ? ('Marcel 3-season blend \u00b7 ' + B.marcelN + ' covered')
+                : B.basis === 'proj' ? _fppMarcelNote(B)
                 : 'last season\u2019s actuals') +
     ' \u00b7 ' + keys.length + ' categories</div>' +
     // The pool and the rendered list are different sizes; say so rather
