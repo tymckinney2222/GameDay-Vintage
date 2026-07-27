@@ -113429,30 +113429,72 @@ function dbpValuePool(pool, opts) {
   return { mode: opts.mode || 'points', cats: cats, norm: norm, players: out };
 }
 
-// ── Tiers ──────────────────────────────────────────────────────────
-// Tier boundaries sit at the LARGEST value gaps, so a break means "there is
-// real distance here" rather than "we reached a round number". Fixed-size
-// tiers hide exactly the cliffs a draft board exists to show.
-function dbpTiers(ranked, wanted, limit) {
+// ── Tiers ──────────────────────────────────────────────
+// Cutting at the largest ABSOLUTE gaps degenerates: elite players are
+// naturally spread far apart while the middle is dense, so every one of the
+// biggest gaps lands in the top ten and you get a column of one-man tiers
+// above a single enormous one. A tier of one says nothing.
+//
+// So a gap is judged against its NEIGHBOURHOOD instead. Ten points between
+// the two best players is ordinary; ten points in a flat stretch of the
+// third round is a cliff. A minimum tier size then stops a break from
+// separating individuals rather than groups.
+function _dbpMedian(a) {
+  if (!a || !a.length) return 0;
+  var c = a.slice(0).sort(function (x, y) { return x - y; });
+  var m = Math.floor(c.length / 2);
+  return (c.length % 2) ? c[m] : (c[m - 1] + c[m]) / 2;
+}
+
+function dbpTiers(ranked, wanted, limit, minSize) {
   if (!ranked || !ranked.players || !ranked.players.length) return [];
   var list = ranked.players.slice(0, limit || 200);
-  var n = Math.max(2, Math.min(wanted || 10, list.length));
-  var gaps = [], i;
-  for (i = 1; i < list.length; i++) {
-    gaps.push({ at: i, d: list[i - 1].value - list[i].value });
+  var n = list.length, i;
+  minSize = Math.max(2, minSize || 3);
+  var maxTiers = Math.max(2, Math.min(wanted || 10, Math.floor(n / minSize)));
+  if (n < minSize * 2) {
+    return [{ tier: 1, players: list, top: list[0].value,
+              bottom: list[n - 1].value, drop: null }];
   }
-  gaps.sort(function (a, b) { return b.d - a.d; });
-  var cuts = {}, taken = 0;
-  for (i = 0; i < gaps.length && taken < n - 1; i++) {
-    if (gaps[i].d <= 0) break;
-    cuts[gaps[i].at] = 1; taken++;
+
+  var gaps = [];
+  for (i = 1; i < n; i++) gaps.push(list[i - 1].value - list[i].value);
+
+  // Local scale = median gap in a window centred on each gap. Median, not
+  // mean, so one huge neighbouring gap doesn't flatten everything near it.
+  var W = 10, rel = [];
+  for (i = 0; i < gaps.length; i++) {
+    var lo = Math.max(0, i - W), hi = Math.min(gaps.length, i + W + 1);
+    var scale = _dbpMedian(gaps.slice(lo, hi));
+    if (!(scale > 0)) scale = 0.0001;
+    rel.push({ at: i + 1, d: gaps[i], r: gaps[i] / scale });
   }
+
+  // Greedy by relative size, but a cut must leave minSize either side of
+  // itself and of every cut already taken.
+  var order = rel.slice(0).sort(function (x, y) { return y.r - x.r; });
+  var cuts = [];
+  for (i = 0; i < order.length && cuts.length < maxTiers - 1; i++) {
+    var at = order[i].at;
+    if (order[i].d <= 0) break;
+    if (at < minSize || n - at < minSize) continue;
+    var okHere = true;
+    for (var c = 0; c < cuts.length; c++) {
+      if (Math.abs(cuts[c] - at) < minSize) { okHere = false; break; }
+    }
+    if (okHere) cuts.push(at);
+  }
+  cuts.sort(function (x, y) { return x - y; });
+
+  var mark = {}, k;
+  for (k = 0; k < cuts.length; k++) mark[cuts[k]] = 1;
   var tiers = [], cur = [];
-  for (i = 0; i < list.length; i++) {
-    if (cuts[i] && cur.length) { tiers.push(cur); cur = []; }
+  for (i = 0; i < n; i++) {
+    if (mark[i] && cur.length) { tiers.push(cur); cur = []; }
     cur.push(list[i]);
   }
   if (cur.length) tiers.push(cur);
+
   var out = [];
   for (i = 0; i < tiers.length; i++) {
     out.push({
