@@ -113351,11 +113351,18 @@ function dbpGetPool(sport, force, onProgress) {
 //      byte-identical to the unfiltered pull, which is the only reason it
 //      was caught. Do not "simplify" the key name.
 //
+//   4. sortDraftRanks is REQUIRED on this endpoint. Removing it returns 400
+//      even though filterIds makes the ordering meaningless. This shipped
+//      broken once: three fields were changed away from the proven trial L
+//      at the same time, and the one that mattered was the one dropped, not
+//      the ones added.
+//
 // sourceIds is pinned to [0]. Prior seasons also carry ESPN's PRESEASON
 // PROJECTION for that year — McDavid's 2024 src1 reads 61G/148P, a forecast
 // that never happened — and blending a forecast into Marcel would be wrong
-// in a way nothing on screen would reveal. Excluding it also roughly halves
-// the payload.
+// in a way nothing on screen would reveal. Confirmed safe and worthwhile by
+// probe trial P: the response drops to src0 only and loses about a quarter
+// of its bytes (NHL 100 KB to 79 KB, NBA 170 KB to 129 KB per 50 players).
 var DBP_HIST_CHUNK = 200;   // ESPN's hard per-call ceiling, same as the pool
 
 function dbpHistFilter(ids) {
@@ -113363,6 +113370,12 @@ function dbpHistFilter(ids) {
     players: {
       limit: DBP_HIST_CHUNK,
       offset: 0,
+      // REQUIRED. ESPN answers 400 to this endpoint with no sort, even when
+      // filterIds makes the ordering irrelevant. Dropping it as redundant
+      // is what made every history request fail; probe trial Q isolated it
+      // (Q = the working trial O with only this field removed → HTTP 400,
+      // on both sports). Do not remove it again.
+      sortDraftRanks: { sortPriority: 100, sortAsc: true, value: 'STANDARD' },
       filterIds: { value: ids },
       filterStatsForSplitTypeIds: { value: [0] },
       filterStatsForSourceIds: { value: [0] }
@@ -113412,7 +113425,7 @@ function dbpFetchHistory(pool, onProgress) {
     }
   }
 
-  var done = 0, filled = 0, failed = 0;
+  var done = 0, filled = 0, failed = 0, firstErr = '';
   function step(k) {
     if (k >= chunks.length) return Promise.resolve();
     var c = chunks[k];
@@ -113439,8 +113452,15 @@ function dbpFetchHistory(pool, onProgress) {
       })
       // A chunk that fails costs its slice of one season, not the whole
       // basis — the players it covered simply blend from fewer years, which
-      // dbpApplyMarcel already reports honestly.
-      ['catch'](function () { failed++; })
+      // dbpApplyMarcel already reports honestly. But NEVER swallow the
+      // reason: the first version counted failures and discarded the error,
+      // which turned six dead requests into a bare number with no cause
+      // attached. That is the silent-failure shape this codebase keeps
+      // getting bitten by, and it cost a whole round trip to diagnose.
+      ['catch'](function (e) {
+        failed++;
+        if (!firstErr) firstErr = (e && e.message) ? e.message : String(e);
+      })
       .then(function () {
         done++;
         if (onProgress) {
@@ -113456,7 +113476,8 @@ function dbpFetchHistory(pool, onProgress) {
     // Only claim completeness when every request landed, or a partial pull
     // would be cached and never retried.
     if (!failed) pool.histFull = 1;
-    return { years: years, filled: filled, requests: chunks.length, failed: failed };
+    return { years: years, filled: filled, requests: chunks.length,
+             failed: failed, err: firstErr };
   });
 }
 
@@ -116674,7 +116695,41 @@ function _dbhpTrials(season) {
     { lbl: 'N  /seasons/' + s2 + '/ + filterIds seeded from B',
       note: 'the weakest year (K joined 26 of 50) under the winning approach',
       view: 'kona_player_info', season: s2, idKey: 'filterIds',
-      filter: f({ filterStatsForSplitTypeIds: { value: [0] } }) }
+      filter: f({ filterStatsForSplitTypeIds: { value: [0] } }) },
+
+    // ── Why does the SHIPPED history pull fail? ──────────────────
+    // Trial L proved the mechanism, yet production reports 6 of 6 failed.
+    // Two things were changed from L at once, which is the exact mistake
+    // this probe exists to prevent: production DROPPED sortDraftRanks and
+    // ADDED filterStatsForSourceIds [0]. It also asks for 200 ids, not 50.
+    // Three variables, so the ladder separates them one at a time and the
+    // break names itself.
+    { lbl: 'O  L again \u2014 control, must still pass',
+      note: 'if this fails, the problem is not the filter at all',
+      view: 'kona_player_info', season: s1, idKey: 'filterIds',
+      filter: f({ filterStatsForSplitTypeIds: { value: [0] } }) },
+
+    { lbl: 'P  O + filterStatsForSourceIds [0]',
+      note: 'the filter production ADDED, which no trial ever tested',
+      view: 'kona_player_info', season: s1, idKey: 'filterIds',
+      filter: f({ filterStatsForSplitTypeIds: { value: [0] },
+                  filterStatsForSourceIds: { value: [0] } }) },
+
+    { lbl: 'Q  O with sortDraftRanks REMOVED',
+      note: 'the field production DROPPED',
+      view: 'kona_player_info', season: s1, idKey: 'filterIds',
+      filter: { players: { limit: DBHP_PAGE, offset: 0,
+                           filterStatsForSplitTypeIds: { value: [0] } } } },
+
+    { lbl: 'R  the real dbpHistFilter(), 50 ids',
+      note: 'production\u2019s OWN builder \u2014 no hand-copy to argue with',
+      view: 'kona_player_info', season: s1,
+      rawFilter: dbpHistFilter, filter: f({}) },
+
+    { lbl: 'S  the real dbpHistFilter(), 200 ids from the live pool',
+      note: 'exactly what shipped, at the size it ships',
+      view: 'kona_player_info', season: s1, poolIds: 200,
+      rawFilter: dbpHistFilter, filter: f({}) }
   ];
 }
 
@@ -116701,6 +116756,16 @@ function _dbhpIdList() {
   return out;
 }
 
+// Ids straight off the LIVE pool, so a trial can reproduce production's own
+// call at production's own size rather than a 50-id miniature of it.
+function _dbhpPoolIds(n) {
+  var out = [], i;
+  var pl = (typeof _fppBoard !== 'undefined' && _fppBoard.pool &&
+            _fppBoard.pool.players) || [];
+  for (i = 0; i < pl.length && out.length < n; i++) out.push(Number(pl[i].id));
+  return out;
+}
+
 function _dbhpFetchTrial(sport, season, trial, idx) {
   // A trial may target a PRIOR season by overriding the year in the path.
   // The season is part of the URL, not the filter, so this is the one knob
@@ -116712,16 +116777,23 @@ function _dbhpFetchTrial(sport, season, trial, idx) {
 
   // Seeded trials get their id list at RUN time, not build time — the
   // reference page hasn't been fetched yet when the trial list is built.
-  var filt = trial.filter, reqIds = 0;
-  if (trial.idKey) {
-    var seeded = {}, kk;
-    for (kk in filt.players) {
-      if (filt.players.hasOwnProperty(kk)) seeded[kk] = filt.players[kk];
-    }
-    var idList = _dbhpIdList();
+  // rawFilter hands the ids to production's OWN filter builder, so there is
+  // no hand-copied approximation to argue with when it disagrees.
+  var filt = trial.filter, reqIds = 0, reqSet = {};
+  if (trial.idKey || trial.rawFilter) {
+    var idList = trial.poolIds ? _dbhpPoolIds(trial.poolIds) : _dbhpIdList();
     reqIds = idList.length;
-    seeded[trial.idKey] = { value: idList };
-    filt = { players: seeded };
+    for (var q = 0; q < idList.length; q++) reqSet[String(idList[q])] = true;
+    if (trial.rawFilter) {
+      filt = trial.rawFilter(idList);
+    } else {
+      var seeded = {}, kk;
+      for (kk in filt.players) {
+        if (filt.players.hasOwnProperty(kk)) seeded[kk] = filt.players[kk];
+      }
+      seeded[trial.idKey] = { value: idList };
+      filt = { players: seeded };
+    }
   }
   var hdr = JSON.stringify(filt);
 
@@ -116739,6 +116811,7 @@ function _dbhpFetchTrial(sport, season, trial, idx) {
       hash: _dbhpHash(txt),
       hdrBytes: hdr.length,
       reqIds: reqIds,
+      reqSet: reqSet,
       json: JSON.parse(txt)
     };
   });
@@ -116814,6 +116887,13 @@ function _dbhpReport(sport, trial, res) {
     var got = _dbhpCount(ids);
     _dbhpLog('   ids shared with trial B: ' + shared + ' of ' + got);
     if (res.reqIds) {
+      // Judged against THIS trial's own ask, not the reference page — a
+      // pool-seeded trial legitimately requests ids trial B never saw.
+      // Defaulted, because a throw here would kill the whole run and take
+      // every line already gathered with it.
+      var rs = res.reqSet || {};
+      var inAsk = 0, k2;
+      for (k2 in ids) { if (ids.hasOwnProperty(k2) && rs[k2]) inAsk++; }
       // Asked-vs-returned is NOT the test. An IGNORED id filter still
       // returns a full page, so the two counts match by coincidence
       // whenever the page limit equals the number asked for — which is
@@ -116823,12 +116903,12 @@ function _dbhpReport(sport, trial, res) {
       // A shortfall below the ask is expected and fine: it means that
       // player has no line for that season, which is a rookie, not a bug.
       _dbhpLog('   >> SEEDED YIELD: asked ' + res.reqIds + ', got ' + got +
-        ', of which requested ' + shared +
+        ', of which requested ' + inAsk +
         (got === 0
           ? '  \u2014 nothing came back, INCONCLUSIVE'
-          : shared === got
+          : inAsk === got
             ? '  \u2713 filter HONOURED'
-            : '  \u2718 filter IGNORED \u2014 ' + (got - shared) + ' came back unasked'));
+            : '  \u2718 filter IGNORED \u2014 ' + (got - inAsk) + ' came back unasked'));
     }
   }
 
@@ -116852,7 +116932,7 @@ function _dbhpReport(sport, trial, res) {
   }
 }
 
-function _dbhpRun() {
+function _dbhpRun(only) {
   if (_dbhpBusy) return;
   _dbhpBusy = true;
   _dbhpLines = [];
@@ -116861,6 +116941,14 @@ function _dbhpRun() {
   var sport = _fppState.sport;
   var season = dbpSeason();
   var trials = _dbhpTrials(season);
+  // A subset still needs trial B, which seeds the id list every seeded
+  // trial joins against.
+  if (only) {
+    trials = trials.filter(function (t) {
+      var c = t.lbl.charAt(0);
+      return c === 'B' || only.indexOf(c) >= 0;
+    });
+  }
 
   _dbhpLog('DRAFT-POOL HISTORY PROBE');
   _dbhpLog(new Date().toString());
@@ -117087,7 +117175,8 @@ function _fppMarcelNote(B) {
   var one = m.byYears[1] || 0;
   var partial = (B.hist && B.hist.failed)
     ? ' \u00b7 \u26a0 ' + B.hist.failed + ' of ' + B.hist.requests +
-      ' history requests failed'
+      ' history requests failed' +
+      (B.hist.err ? ' (' + slEsc(B.hist.err) + ')' : '')
     : '';
   if (!m.n) return 'Marcel \u2014 no history in the pool' + partial;
   if (!m.blended) {
@@ -117140,8 +117229,10 @@ function _fppBoardHtml() {
   // Last season currently produce the same board. Remove with the block
   // above once the history question is settled.
   h += '<div class="fpp-probe-row">' +
+    '<button class="fpp-probe-btn" onclick="_dbhpRun(\'OPQRS\')">' +
+      '\ud83d\udd2c Why is history failing?</button>' +
     '<button class="fpp-probe-btn" onclick="_dbhpRun()">' +
-      '\ud83e\uddea Probe pool history (' + slEsc(_fppState.sport.toUpperCase()) + ')</button>' +
+      '\ud83e\uddea Full probe (' + slEsc(_fppState.sport.toUpperCase()) + ')</button>' +
     '<button class="fpp-probe-btn" id="dbhpSave"' +
       (_dbhpLines.length ? '' : ' style="display:none"') +
       ' onclick="_dbhpSave()">\u2b07 Save .txt</button>' +
