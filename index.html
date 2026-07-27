@@ -113007,6 +113007,467 @@ var PW_TTL = 60 * 60 * 1000; // 1 hour — Yahoo updates throughout the day
 // Category definition: key (stable id), label (shown), hint (stat source
 // note). "manual" flags a category the player card can't provide (Build 2
 // still leaves it for you to type): NBA 40+/50+ bonuses, NHL hits/blocks.
+// ── DRAFT POOL: DATA LAYER (slice 1) ── DBPOOL ──
+// The draftable player universe from ESPN, decoded into the FP Projector's
+// own category keys so the board can reuse _fppScoreVal / _fppPlayerFp
+// rather than inventing a second scoring path.
+//
+// No Worker. Probes confirmed the X-Fantasy-Filter preflight succeeds from
+// a browser origin, and that a 3-page pull of 600 players costs ~1.7 MB
+// (NBA) / ~1.0 MB (NHL) in under half a second.
+//
+// CACHE-BUSTING IS NOT OPTIONAL. The filter travels in a HEADER and the
+// browser's HTTP cache keys on URL alone, so without a unique URL every
+// page returns the FIRST page's body. That cost two probes: 600 "unique"
+// players that were one page repeated, and 26 MB apparently downloaded in
+// 296 ms.
+var DBP_BASE = 'https://lm-api-reads.fantasy.espn.com/apis/v3/games';
+var DBP_PAGE = 200;      // ESPN's hard cap per call
+var DBP_PAGES = 3;       // 600 players covers a draft with room to spare
+var DBP_CACHE_PREFIX = 'gdhq_dbpool_v1_';
+var DBP_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+// ── statId → FP Projector category key ─────────────────────────────
+// Decoded from real lines and verified arithmetically, not from docs:
+//   NBA  — every total ÷ GP matched its per-game twin on Jokic, and the
+//          site API independently named 19 of them.
+//   NHL  — PPG+PPA=PPP and SHG+SHA=SHP held for three skaters; faceoffs
+//          read 0/0 for a defenceman; hits and blocks split exactly along
+//          position (Tkachuk 162 hits, Makar 117 blocks).
+var DBP_STAT = {
+  nba: {
+    0:'pts', 1:'blk', 2:'stl', 3:'ast', 4:'oreb', 5:'dreb', 6:'reb',
+    8:'flag', 11:'to', 13:'fgm', 15:'ftm', 17:'tpm',
+    37:'dd', 38:'td', 40:'min', 42:'gp'
+  },
+  nhl_skater: {
+    13:'g', 14:'a', 15:'plusminus', 16:'pts', 17:'pim',
+    18:'ppg', 19:'ppa', 38:'ppp', 20:'shg', 21:'sha',
+    22:'gwg', 23:'fw', 24:'fl', 29:'sog', 31:'hit', 32:'blk',
+    26:'toi', 30:'gp'
+  },
+  nhl_goalie: {
+    0:'gs', 3:'sa', 4:'ga', 6:'sv', 9:'otl',
+    10:'gaa', 11:'svpct', 8:'toi', 30:'gp'
+    // ids 1 and 2 are wins and losses, but the sample goalie was 23-23 so
+    // which is which is unproven. Deliberately unmapped rather than
+    // guessed — a wrong W/L would silently corrupt every goalie's value.
+  }
+};
+
+// ESPN defaultPositionId → readable slot.
+var DBP_POS = {
+  nba: { 1:'PG', 2:'SG', 3:'SF', 4:'PF', 5:'C' },
+  nhl: { 1:'C', 2:'LW', 3:'RW', 4:'D', 5:'G' }
+};
+
+function dbpGameFor(sport) { return sport === 'nhl' ? 'fhl' : 'fba'; }
+
+// NHL splits its stat map by role; NBA has one.
+function dbpModeFor(sport, posId) {
+  if (sport !== 'nhl') return 'nba';
+  return (Number(posId) === 5) ? 'nhl_goalie' : 'nhl_skater';
+}
+
+function dbpSeason() {
+  var d = new Date();
+  // ESPN labels a fantasy season by the calendar year it ends in, and the
+  // completed season's actuals come back tagged with the CURRENT season id
+  // — which broke an earlier probe that filtered on the prior year.
+  return (d.getMonth() >= 8) ? (d.getFullYear() + 1) : d.getFullYear();
+}
+
+function _dbpUnwrap(e) { return (e && e.player) ? e.player : e; }
+
+// The completed season's actuals, whatever seasonId ESPN tags them with.
+function _dbpActuals(p) {
+  var st = (p && p.stats) || [], i;
+  for (i = 0; i < st.length; i++) {
+    if (st[i].statSourceId === 0 && st[i].statSplitTypeId === 0) return st[i];
+  }
+  return null;
+}
+// ESPN's own projection, kept as a second opinion beside the Marcel blend.
+function _dbpProjection(p) {
+  var st = (p && p.stats) || [], i;
+  for (i = 0; i < st.length; i++) {
+    if (st[i].statSourceId === 1 && st[i].statSplitTypeId === 0) return st[i];
+  }
+  return null;
+}
+
+// Raw ESPN stat bag → { catKey: value } for one mode.
+function dbpDecodeStats(line, modeKey) {
+  if (!line || !line.stats) return null;
+  var map = DBP_STAT[modeKey];
+  if (!map) return null;
+  var out = {}, k, any = false;
+  for (k in line.stats) {
+    if (!line.stats.hasOwnProperty(k)) continue;
+    var cat = map[Number(k)];
+    if (!cat) continue;
+    var v = Number(line.stats[k]);
+    if (isNaN(v)) continue;
+    out[cat] = v;
+    any = true;
+  }
+  return any ? out : null;
+}
+
+// One ESPN pool entry → the slim record the board and the cache both use.
+function dbpDecodePlayer(raw, sport) {
+  var p = _dbpUnwrap(raw);
+  if (!p || p.id == null) return null;
+  var posId = Number(p.defaultPositionId);
+  var mode = dbpModeFor(sport, posId);
+  var act = dbpDecodeStats(_dbpActuals(p), mode);
+  var prj = dbpDecodeStats(_dbpProjection(p), mode);
+  var own = p.ownership || {};
+  var dr = (p.draftRanksByRankType && p.draftRanksByRankType.STANDARD) || null;
+  return {
+    id: String(p.id),
+    name: p.fullName || ((p.firstName || '') + ' ' + (p.lastName || '')).replace(/^\s+|\s+$/g, ''),
+    posId: posId,
+    pos: (DBP_POS[sport] || {})[posId] || '',
+    mode: mode,
+    teamId: (p.proTeamId != null) ? Number(p.proTeamId) : null,
+    slots: p.eligibleSlots || [],
+    inj: p.injuryStatus || '',
+    // last season's actuals — what the Marcel blend projects FROM
+    last: act,
+    // ESPN's own projection — the second opinion
+    esp: prj,
+    owned: (own.percentOwned != null) ? Math.round(Number(own.percentOwned) * 10) / 10 : null,
+    ownChg: (own.percentChange != null) ? Math.round(Number(own.percentChange) * 10) / 10 : null,
+    rank: (dr && dr.rank) ? Number(dr.rank) : null
+  };
+}
+
+// ── Fetch ──────────────────────────────────────────────────────────
+function dbpFilter(offset) {
+  return {
+    players: {
+      limit: DBP_PAGE,
+      offset: offset,
+      // Draft rank, not ownership: a rookie has no pre-draft ownership at
+      // all, so an owned-sort buries exactly the players a draft board
+      // most needs.
+      sortDraftRanks: { sortPriority: 100, sortAsc: true, value: 'STANDARD' },
+      filterStatsForSplitTypeIds: { value: [0] },
+      filterStatsForSourceIds: { value: [0, 1] }
+    }
+  };
+}
+
+function dbpFetchPage(sport, season, offset) {
+  var url = DBP_BASE + '/' + dbpGameFor(sport) + '/seasons/' + season +
+    '/segments/0/leaguedefaults/3?view=kona_player_info' +
+    '&_dbp=' + Date.now() + '_' + offset;   // see the cache note above
+  return fetch(url, {
+    cache: 'no-store',
+    headers: { 'X-Fantasy-Filter': JSON.stringify(dbpFilter(offset)) }
+  }).then(function (r) {
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  }).then(function (j) {
+    return (j && j.players) || [];
+  });
+}
+
+// Pages run in sequence, not parallel — three simultaneous multi-hundred-KB
+// responses on a phone is worse than three quick ones.
+function dbpFetchPool(sport, onProgress) {
+  var season = dbpSeason();
+  var byId = {}, pages = 0;
+  function step(i) {
+    if (i >= DBP_PAGES) return Promise.resolve();
+    return dbpFetchPage(sport, season, i * DBP_PAGE).then(function (list) {
+      pages++;
+      for (var k = 0; k < list.length; k++) {
+        var rec = dbpDecodePlayer(list[k], sport);
+        if (rec) byId[rec.id] = rec;
+      }
+      if (onProgress) {
+        try { onProgress(pages, DBP_PAGES, _dbpCount(byId)); } catch (e) {}
+      }
+      // A short page means we've reached the end of the pool.
+      if (list.length < DBP_PAGE) return;
+      return step(i + 1);
+    });
+  }
+  return step(0).then(function () {
+    var out = [], k;
+    for (k in byId) { if (byId.hasOwnProperty(k)) out.push(byId[k]); }
+    out.sort(function (a, b) {
+      var ar = (a.rank != null) ? a.rank : 99999;
+      var br = (b.rank != null) ? b.rank : 99999;
+      return ar - br;
+    });
+    return { sport: sport, season: season, ts: Date.now(), players: out };
+  });
+}
+function _dbpCount(o) { var n = 0, k; for (k in o) { if (o.hasOwnProperty(k)) n++; } return n; }
+
+// ── Cache ──────────────────────────────────────────────────────────
+// A draft is time-pressured and this is a phone, so the pool survives a
+// stutter. Keyed by sport + season; stale after a day.
+function dbpCacheKey(sport, season) { return DBP_CACHE_PREFIX + sport + '_' + season; }
+
+function dbpCacheSave(pool) {
+  if (!pool || !pool.players) return false;
+  try {
+    localStorage.setItem(dbpCacheKey(pool.sport, pool.season), JSON.stringify(pool));
+    return true;
+  } catch (e) {
+    // Quota. Drop the ESPN projection (the second opinion) and retry — a
+    // board with our own projections still works; no board at all doesn't.
+    try {
+      var slim = { sport: pool.sport, season: pool.season, ts: pool.ts, slim: 1, players: [] };
+      for (var i = 0; i < pool.players.length; i++) {
+        var p = pool.players[i], c = {};
+        for (var k in p) { if (p.hasOwnProperty(k) && k !== 'esp') c[k] = p[k]; }
+        slim.players.push(c);
+      }
+      localStorage.setItem(dbpCacheKey(pool.sport, pool.season), JSON.stringify(slim));
+      return true;
+    } catch (e2) { return false; }
+  }
+}
+
+function dbpCacheLoad(sport) {
+  var season = dbpSeason();
+  try {
+    var raw = localStorage.getItem(dbpCacheKey(sport, season));
+    if (!raw) return null;
+    var j = JSON.parse(raw);
+    if (!j || !j.players || !j.players.length) return null;
+    j.ageMs = Date.now() - (j.ts || 0);
+    j.stale = j.ageMs > DBP_MAX_AGE_MS;
+    return j;
+  } catch (e) { return null; }
+}
+
+// Cache first, network only when missing or stale. force=1 always refetches.
+function dbpGetPool(sport, force, onProgress) {
+  if (!force) {
+    var hit = dbpCacheLoad(sport);
+    if (hit && !hit.stale) return Promise.resolve(hit);
+  }
+  return dbpFetchPool(sport, onProgress).then(function (pool) {
+    dbpCacheSave(pool);
+    pool.ageMs = 0; pool.stale = false;
+    return pool;
+  })['catch'](function (err) {
+    // Serve stale rather than nothing — mid-draft, an old board beats none.
+    var fallback = dbpCacheLoad(sport);
+    if (fallback) { fallback.error = String(err); return fallback; }
+    throw err;
+  });
+}
+
+// ── DRAFT POOL: VALUATION (slice 2) ── DBVAL ──
+// Turning a projection into "what is this player worth IN THIS LEAGUE".
+//
+// Two different jobs, because points and categories leagues are not the
+// same question:
+//   POINTS — Σ(stat × the league's own scoring value). One number, directly
+//            comparable, and it reuses the Projector's scoring resolution
+//            rather than growing a second one.
+//   CATS   — a per-category z-score against the drafted population, summed.
+//            Summing raw stats is wrong here: 40 points and 40 assists are
+//            not interchangeable, and a player elite in three categories is
+//            worth very differently from one who is average in eight.
+//
+// NBA is scored per game; NHL is scored on season totals. That mirrors how
+// the Projector already presents each sport.
+var DBP_PERGAME = { nba: true, nhl_skater: false, nhl_goalie: false };
+
+// Categories where LOWER is better, so the z-score must be inverted or the
+// board would rank the worst players first.
+var DBP_LOWER_BETTER = { to: 1, ga: 1, gaa: 1, l: 1, fl: 1, pim: 1 };
+
+// PIM is a real ambiguity: it's a positive category in leagues that score
+// it and a negative one nowhere. The league's own scoring value settles it,
+// so the sign of the multiplier wins over this table when one exists.
+function dbpLowerBetter(cat, scoreVal) {
+  if (scoreVal != null && scoreVal !== 0) return scoreVal < 0;
+  return !!DBP_LOWER_BETTER[cat];
+}
+
+// The stat line a valuation should read: our own projection when supplied,
+// otherwise ESPN's, otherwise last season's actuals.
+function dbpBasis(p, prefer) {
+  if (!p) return null;
+  if (prefer === 'esp' && p.esp) return p.esp;
+  if (prefer === 'last' && p.last) return p.last;
+  if (p.proj) return p.proj;          // slice 3 fills this from the Marcel blend
+  if (p.esp) return p.esp;
+  return p.last || null;
+}
+
+// Season totals → per game, for the sports that score that way.
+function dbpRate(line, mode) {
+  if (!line) return null;
+  if (!DBP_PERGAME[mode]) return line;
+  var gp = Number(line.gp || 0);
+  if (!gp) return line;
+  var out = {}, k;
+  for (k in line) {
+    if (!line.hasOwnProperty(k)) continue;
+    if (k === 'gp') { out[k] = gp; continue; }
+    var v = Number(line[k]);
+    out[k] = isNaN(v) ? line[k] : (v / gp);
+  }
+  return out;
+}
+
+// ── Points leagues ─────────────────────────────────────────────────
+// scoring is { catKey: pointValue } — whatever the league actually scores.
+function dbpValuePoints(p, scoring, prefer) {
+  var line = dbpRate(dbpBasis(p, prefer), p.mode);
+  if (!line) return null;
+  var total = 0, parts = {}, k, any = false;
+  for (k in scoring) {
+    if (!scoring.hasOwnProperty(k)) continue;
+    var sv = Number(scoring[k]);
+    if (!sv) continue;
+    var v = Number(line[k]);
+    if (isNaN(v)) continue;
+    var c = v * sv;
+    parts[k] = Math.round(c * 100) / 100;
+    total += c;
+    any = true;
+  }
+  if (!any) return null;
+  return { value: Math.round(total * 100) / 100, parts: parts };
+}
+
+// ── Categories leagues ─────────────────────────────────────────────
+// Mean and SD are taken over the DRAFTABLE population, not the whole pool.
+// Including 600 deep-bench players drags the mean down and compresses every
+// z-score toward zero, which flatters replacement-level players.
+function dbpCatStats(players, cats, prefer, depth) {
+  var n = Math.min(depth || players.length, players.length);
+  var acc = {}, i, c;
+  for (c = 0; c < cats.length; c++) acc[cats[c]] = { sum: 0, sq: 0, n: 0 };
+  for (i = 0; i < n; i++) {
+    var line = dbpRate(dbpBasis(players[i], prefer), players[i].mode);
+    if (!line) continue;
+    for (c = 0; c < cats.length; c++) {
+      var v = Number(line[cats[c]]);
+      if (isNaN(v)) continue;
+      var a = acc[cats[c]];
+      a.sum += v; a.sq += v * v; a.n++;
+    }
+  }
+  var out = {};
+  for (c = 0; c < cats.length; c++) {
+    var s = acc[cats[c]];
+    if (!s.n) { out[cats[c]] = null; continue; }
+    var mean = s.sum / s.n;
+    var varc = (s.sq / s.n) - (mean * mean);
+    out[cats[c]] = { mean: mean, sd: Math.sqrt(varc > 0 ? varc : 0), n: s.n };
+  }
+  return out;
+}
+
+function dbpValueCats(p, cats, norm, scoring, prefer) {
+  var line = dbpRate(dbpBasis(p, prefer), p.mode);
+  if (!line) return null;
+  var total = 0, parts = {}, any = false, c;
+  for (c = 0; c < cats.length; c++) {
+    var cat = cats[c], st = norm[cat];
+    if (!st || !st.sd) continue;
+    var v = Number(line[cat]);
+    if (isNaN(v)) continue;
+    var z = (v - st.mean) / st.sd;
+    if (dbpLowerBetter(cat, scoring ? scoring[cat] : null)) z = -z;
+    parts[cat] = Math.round(z * 100) / 100;
+    total += z;
+    any = true;
+  }
+  if (!any) return null;
+  return { value: Math.round(total * 100) / 100, parts: parts };
+}
+
+// ── Whole-pool valuation ───────────────────────────────────────────
+// opts: { cats:[keys], scoring:{key:val}, mode:'points'|'cats',
+//         prefer:'proj'|'esp'|'last', depth:N, replacement:N }
+function dbpValuePool(pool, opts) {
+  if (!pool || !pool.players) return null;
+  opts = opts || {};
+  var players = pool.players, cats = opts.cats || [], out = [], i;
+  var norm = (opts.mode === 'cats')
+    ? dbpCatStats(players, cats, opts.prefer, opts.depth || 180)
+    : null;
+
+  for (i = 0; i < players.length; i++) {
+    var p = players[i];
+    var v = (opts.mode === 'cats')
+      ? dbpValueCats(p, cats, norm, opts.scoring, opts.prefer)
+      : dbpValuePoints(p, opts.scoring || {}, opts.prefer);
+    if (!v) continue;
+    out.push({
+      id: p.id, name: p.name, pos: p.pos, posId: p.posId, mode: p.mode,
+      teamId: p.teamId, inj: p.inj, owned: p.owned, rank: p.rank,
+      value: v.value, parts: v.parts
+    });
+  }
+  out.sort(function (a, b) { return b.value - a.value; });
+
+  // Value above replacement. A raw total says a 12th-round centre is worth
+  // "40"; what matters is how much better he is than the man you could have
+  // taken instead, which is what makes positions comparable.
+  var rep = opts.replacement || 0;
+  if (rep > 0 && out.length) {
+    var repVal = out[Math.min(rep, out.length - 1)].value;
+    for (i = 0; i < out.length; i++) {
+      out[i].vor = Math.round((out[i].value - repVal) * 100) / 100;
+    }
+  }
+  for (i = 0; i < out.length; i++) out[i].ovr = i + 1;
+  return { mode: opts.mode || 'points', cats: cats, norm: norm, players: out };
+}
+
+// ── Tiers ──────────────────────────────────────────────────────────
+// Tier boundaries sit at the LARGEST value gaps, so a break means "there is
+// real distance here" rather than "we reached a round number". Fixed-size
+// tiers hide exactly the cliffs a draft board exists to show.
+function dbpTiers(ranked, wanted, limit) {
+  if (!ranked || !ranked.players || !ranked.players.length) return [];
+  var list = ranked.players.slice(0, limit || 200);
+  var n = Math.max(2, Math.min(wanted || 10, list.length));
+  var gaps = [], i;
+  for (i = 1; i < list.length; i++) {
+    gaps.push({ at: i, d: list[i - 1].value - list[i].value });
+  }
+  gaps.sort(function (a, b) { return b.d - a.d; });
+  var cuts = {}, taken = 0;
+  for (i = 0; i < gaps.length && taken < n - 1; i++) {
+    if (gaps[i].d <= 0) break;
+    cuts[gaps[i].at] = 1; taken++;
+  }
+  var tiers = [], cur = [];
+  for (i = 0; i < list.length; i++) {
+    if (cuts[i] && cur.length) { tiers.push(cur); cur = []; }
+    cur.push(list[i]);
+  }
+  if (cur.length) tiers.push(cur);
+  var out = [];
+  for (i = 0; i < tiers.length; i++) {
+    out.push({
+      tier: i + 1,
+      players: tiers[i],
+      top: tiers[i][0].value,
+      bottom: tiers[i][tiers[i].length - 1].value,
+      drop: (i + 1 < tiers.length)
+        ? Math.round((tiers[i][tiers[i].length - 1].value - tiers[i + 1][0].value) * 100) / 100
+        : null
+    });
+  }
+  return out;
+}
+
 var _FPP_CATS = {
   nba: [
     { key: 'pts',  label: 'Points',         def: 1 },
@@ -113325,6 +113786,7 @@ function _fppCats() {
 
 var _fppState = {
   sport: 'nba',           // 'nba' | 'nhl'
+  view: 'compare',        // 'compare' | 'board'   DBBOARD
   nhlRole: 'skater',      // 'skater' | 'goalie' (only when sport === 'nhl')
   scoring: {},            // modeKey -> { catKey -> pointValue }
   players: [              // two columns
@@ -115624,6 +116086,182 @@ function _fppOpenCard(colIdx) {
 }
 
 // ── Render ──────────────────────────────────────────────────────────
+// ── DRAFT BOARD: UI (slice 3) ── DBBOARD ──
+// A third view inside the FP Projector. The Compare view answers "which of
+// these two is worth more"; the Board answers "who should I take now",
+// over the whole draftable pool, valued by the league already selected
+// above. It reuses _fppScoreVal, so there is exactly one place in the app
+// that decides what a category is worth.
+var _fppBoard = {
+  busy: false, err: '', pool: null, ranked: null, tiers: null,
+  mode: 'points',       // 'points' | 'cats'
+  progress: '',
+  limit: 120
+};
+
+// The league's scoring, in the shape the valuation wants. Categories with
+// no value are dropped — an unscored stat should not move a ranking.
+function _fppBoardScoring() {
+  var cats = _fppCats(), out = {}, i;
+  for (i = 0; i < cats.length; i++) {
+    var v = _fppScoreVal(cats[i].key);
+    if (v) out[cats[i].key] = v;
+  }
+  return out;
+}
+function _fppBoardCatKeys() {
+  var s = _fppBoardScoring(), out = [], k;
+  for (k in s) { if (s.hasOwnProperty(k)) out.push(k); }
+  return out;
+}
+
+function _fppSetView(v) {
+  _fppState.view = v;
+  _fppRender();
+  // The board is useless empty, so a cached pool paints immediately.
+  if (v === 'board' && !_fppBoard.ranked && !_fppBoard.busy) _fppBoardLoad(0);
+}
+function _fppBoardSetMode(m) {
+  _fppBoard.mode = m;
+  _fppBoardValue();
+  _fppRender();
+}
+
+// Value whatever pool we hold. Split from the fetch so switching between
+// points and categories, or changing a scoring value, never re-downloads.
+function _fppBoardValue() {
+  if (!_fppBoard.pool) { _fppBoard.ranked = null; _fppBoard.tiers = null; return; }
+  var scoring = _fppBoardScoring();
+  var keys = _fppBoardCatKeys();
+  if (!keys.length) {
+    _fppBoard.ranked = null; _fppBoard.tiers = null;
+    _fppBoard.err = 'No categories carry a scoring value yet \u2014 pick a league above, or set values by hand.';
+    return;
+  }
+  _fppBoard.err = '';
+  _fppBoard.ranked = dbpValuePool(_fppBoard.pool, {
+    mode: _fppBoard.mode,
+    cats: keys,
+    scoring: scoring,
+    prefer: 'last',
+    depth: 180,
+    // Roughly a drafted starting pool; makes VOR meaningful without asking
+    // for league size we may not have.
+    replacement: 120
+  });
+  _fppBoard.tiers = dbpTiers(_fppBoard.ranked, 12, _fppBoard.limit);
+}
+
+function _fppBoardLoad(force) {
+  if (_fppBoard.busy) return;
+  _fppBoard.busy = true; _fppBoard.err = ''; _fppBoard.progress = '';
+  _fppRender();
+  var sport = _fppState.sport;
+  dbpGetPool(sport, force, function (page, total, n) {
+    _fppBoard.progress = 'page ' + page + ' of ' + total + ' \u00b7 ' + n + ' players';
+    var el = document.getElementById('fppBoardProg');
+    if (el) el.textContent = _fppBoard.progress;
+  }).then(function (pool) {
+    _fppBoard.pool = pool;
+    _fppBoard.busy = false;
+    if (pool && pool.error) _fppBoard.err = 'Using the cached pool \u2014 ' + pool.error;
+    _fppBoardValue();
+    _fppRender();
+  })['catch'](function (e) {
+    _fppBoard.busy = false;
+    _fppBoard.err = 'Couldn\u2019t load the player pool: ' + (e && e.message ? e.message : String(e));
+    _fppRender();
+  });
+}
+
+function _fppBoardAge(pool) {
+  if (!pool || !pool.ts) return '';
+  var m = Math.round((Date.now() - pool.ts) / 60000);
+  if (m < 1) return 'just now';
+  if (m < 60) return m + ' min ago';
+  var hr = Math.round(m / 60);
+  return hr + (hr === 1 ? ' hour ago' : ' hours ago');
+}
+
+function _fppBoardHtml() {
+  var B = _fppBoard;
+  var h = '';
+
+  h += '<div class="fpp-boardbar" style="display:flex;gap:6px;align-items:center;margin:0 0 10px;">' +
+    '<button class="fpp-sport' + (B.mode === 'points' ? ' active' : '') +
+      '" onclick="_fppBoardSetMode(\'points\')">Points</button>' +
+    '<button class="fpp-sport' + (B.mode === 'cats' ? ' active' : '') +
+      '" onclick="_fppBoardSetMode(\'cats\')">Categories</button>' +
+    '<span style="flex:1"></span>' +
+    '<button class="fpp-sport" onclick="_fppBoardLoad(1)"' + (B.busy ? ' disabled' : '') + '>' +
+      (B.busy ? '\u2026' : 'Refresh') + '</button>' +
+  '</div>';
+
+  if (B.busy) {
+    return h + '<div style="color:rgba(255,255,255,0.5);font-size:12.5px;padding:12px 2px;">' +
+      'Loading the player pool\u2026<br><span id="fppBoardProg" style="opacity:0.6">' +
+      slEsc(B.progress) + '</span></div>';
+  }
+  if (B.err) {
+    h += '<div style="color:#fca5a5;font-size:12px;margin:0 0 10px;">' + slEsc(B.err) + '</div>';
+  }
+  if (!B.ranked || !B.ranked.players.length) {
+    return h + '<div style="color:rgba(255,255,255,0.45);font-size:12.5px;padding:10px 2px;">' +
+      'No board yet. Pick a league above so its scoring can be applied, then Refresh.</div>';
+  }
+
+  var keys = B.ranked.cats || [];
+  h += '<div style="color:rgba(255,255,255,0.32);font-size:9.5px;line-height:1.6;margin:0 0 10px;">' +
+    (B.mode === 'cats'
+      ? 'Z-scores against the top 180, summed. Balanced across categories.'
+      : 'Projected fantasy points under this league\u2019s scoring.') +
+    ' \u00b7 ' + keys.length + ' categories \u00b7 pool ' +
+    (B.pool ? B.pool.players.length : 0) + ' \u00b7 ' + _fppBoardAge(B.pool) + '</div>';
+
+  var tiers = B.tiers || [], t, i;
+  for (t = 0; t < tiers.length; t++) {
+    var T = tiers[t];
+    h += '<div style="display:flex;align-items:baseline;gap:8px;margin:12px 0 4px;">' +
+      '<span style="font-size:10px;letter-spacing:0.14em;color:var(--sk-gold,#eab308);' +
+        'font-weight:700;">TIER ' + T.tier + '</span>' +
+      '<span style="flex:1;height:1px;background:rgba(255,255,255,0.08);"></span>' +
+      (T.drop != null
+        ? '<span style="font-size:9.5px;color:rgba(255,255,255,0.3);">next drop ' +
+          (Math.round(T.drop * 10) / 10) + '</span>'
+        : '') +
+    '</div>';
+    for (i = 0; i < T.players.length; i++) {
+      var p = T.players[i];
+      h += '<div style="display:flex;align-items:center;gap:8px;padding:5px 4px;' +
+        'border-bottom:1px solid rgba(255,255,255,0.04);font-size:12.5px;">' +
+        '<span style="flex:0 0 26px;font-family:var(--sk-font-mono,monospace);' +
+          'color:rgba(255,255,255,0.3);">' + p.ovr + '</span>' +
+        '<span style="flex:0 0 30px;font-size:9.5px;font-weight:700;' +
+          'color:rgba(255,255,255,0.45);">' + slEsc(p.pos || '') + '</span>' +
+        '<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;' +
+          'white-space:nowrap;color:#fff;">' + slEsc(p.name) +
+          (p.inj && p.inj !== 'ACTIVE'
+            ? '<span style="color:#f87171;font-size:9px;font-weight:700;margin-left:5px;">' +
+              slEsc(String(p.inj).slice(0, 3)) + '</span>' : '') +
+        '</span>' +
+        (p.vor != null
+          ? '<span style="flex:0 0 46px;text-align:right;font-family:var(--sk-font-mono,monospace);' +
+            'font-size:10.5px;color:' + (p.vor > 0 ? 'rgba(74,222,128,0.8)' : 'rgba(255,255,255,0.25)') +
+            ';">' + (p.vor > 0 ? '+' : '') + p.vor + '</span>'
+          : '') +
+        '<span style="flex:0 0 54px;text-align:right;font-family:var(--sk-font-mono,monospace);' +
+          'font-weight:700;color:#fff;">' + p.value + '</span>' +
+      '</div>';
+    }
+  }
+
+  h += '<div style="color:rgba(255,255,255,0.28);font-size:9.5px;line-height:1.6;margin-top:12px;">' +
+    'Tier breaks fall at the largest value gaps, so a break means real ' +
+    'distance rather than a round number. The green figure is value above ' +
+    'the 120th player \u2014 what you gain over taking someone else at that spot.</div>';
+  return h;
+}
+
 function _fppRender() {
   var body = document.getElementById('fppBody');
   if (!body) return;
@@ -115670,6 +116308,21 @@ function _fppRender() {
   html += '</div>';
   if (!leagues.length) {
     html += '<div class="fpp-league-empty">No points leagues found for ' + (_fppState.sport === 'nhl' ? 'NHL' : 'NBA') + ' \u2014 enter scoring manually below.</div>';
+  }
+
+  // ── Compare / Board ── DBBOARD ──
+  // Below the league bar on purpose: the board is valued by whichever
+  // league is selected above, so the two read as one flow.
+  html += '<div class="fpp-sportbar" style="margin-top:10px">';
+  html += '<button class="fpp-sport' + (_fppState.view !== 'board' ? ' active' : '') +
+    '" onclick="_fppSetView(\'compare\')">Compare</button>';
+  html += '<button class="fpp-sport' + (_fppState.view === 'board' ? ' active' : '') +
+    '" onclick="_fppSetView(\'board\')">Draft Board</button>';
+  html += '</div>';
+
+  if (_fppState.view === 'board') {
+    body.innerHTML = html + _fppBoardHtml();
+    return;
   }
 
   // ── TEMPORARY PROBE: Yahoo projected-stats discovery ─────────────
