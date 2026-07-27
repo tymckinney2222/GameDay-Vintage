@@ -113023,7 +113023,16 @@ var PW_TTL = 60 * 60 * 1000; // 1 hour — Yahoo updates throughout the day
 // 296 ms.
 var DBP_BASE = 'https://lm-api-reads.fantasy.espn.com/apis/v3/games';
 var DBP_PAGE = 200;      // ESPN's hard cap per call
-var DBP_PAGES = 3;       // 600 players covers a draft with room to spare
+// 600 missed players ESPN declines to rank at all: Wedgewood sat at overall
+// position 1116 with STANDARD rank NONE despite 45 games, 43 starts and 31
+// wins, because unranked players sort to the tail. 1200 reaches him.
+var DBP_PAGES = 6;
+// Prior seasons are NOT fetched for the whole 1200. The deep tail is mostly
+// genuinely undraftable, and history there would double the request count
+// for players nobody blends. They keep the ESPN-proj and last-season bases,
+// and dbpApplyMarcel's coverage note already reports them as one-season
+// rather than pretending otherwise. DBHIST2
+var DBP_HIST_DEPTH = 600;
 var DBP_CACHE_PREFIX = 'gdhq_dbpool_v1_';
 var DBP_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
@@ -113257,10 +113266,38 @@ function _dbpCount(o) { var n = 0, k; for (k in o) { if (o.hasOwnProperty(k)) n+
 // ── Cache ──────────────────────────────────────────────────────────
 // A draft is time-pressured and this is a phone, so the pool survives a
 // stutter. Keyed by sport + season; stale after a day.
-function dbpCacheKey(sport, season) { return DBP_CACHE_PREFIX + sport + '_' + season; }
+// Depth is part of the key on purpose. A cached 600-player pool is still
+// perfectly valid JSON under a 1200 setting, so without this it would load
+// happily and the extra players would silently never appear.
+function dbpCacheKey(sport, season) {
+  return DBP_CACHE_PREFIX + sport + '_' + season + '_d' + (DBP_PAGES * DBP_PAGE);
+}
+
+// Pool caches from a previous depth are dead weight the moment the key
+// changes — a 600-player pool is roughly a megabyte of JSON that nothing
+// will ever read again, competing for the same origin quota as the 1200 we
+// are about to write. Swept before every save rather than once at boot, so
+// it self-heals no matter which entry point ran first.
+function dbpCachePurgeStale(sport, season) {
+  var keep = dbpCacheKey(sport, season);
+  var kill = [], i, k;
+  try {
+    for (i = 0; i < localStorage.length; i++) {
+      k = localStorage.key(i);
+      if (!k || k.indexOf(DBP_CACHE_PREFIX) !== 0) continue;
+      if (k === keep) continue;
+      // Only this sport+season's other depths. Another sport's pool, or a
+      // past season's, is not ours to delete.
+      if (k.indexOf(DBP_CACHE_PREFIX + sport + '_' + season + '_d') === 0) kill.push(k);
+    }
+    for (i = 0; i < kill.length; i++) localStorage.removeItem(kill[i]);
+  } catch (e) { /* a storage that won't enumerate is not worth failing over */ }
+  return kill.length;
+}
 
 function dbpCacheSave(pool) {
   if (!pool || !pool.players) return false;
+  dbpCachePurgeStale(pool.sport, pool.season);
   try {
     localStorage.setItem(dbpCacheKey(pool.sport, pool.season), JSON.stringify(pool));
     return true;
@@ -113412,8 +113449,13 @@ function dbpFetchHistory(pool, onProgress) {
   // one re-derived from the historical row: a position change between
   // seasons would otherwise drop a skater onto the goalie stat map, whose
   // ids mean entirely different things.
+  // Index and request only the top slice. The pool is sorted by draft rank
+  // ascending with unranked last, so the first DBP_HIST_DEPTH entries are
+  // the ones a blend can actually matter for. A response is only written
+  // back into this same slice, so a stray id can't land outside it.
+  var depth = Math.min(DBP_HIST_DEPTH, pool.players.length);
   var byId = {}, ids = [], i;
-  for (i = 0; i < pool.players.length; i++) {
+  for (i = 0; i < depth; i++) {
     byId[String(pool.players[i].id)] = pool.players[i];
     ids.push(Number(pool.players[i].id));
   }
@@ -113477,7 +113519,7 @@ function dbpFetchHistory(pool, onProgress) {
     // would be cached and never retried.
     if (!failed) pool.histFull = 1;
     return { years: years, filled: filled, requests: chunks.length,
-             failed: failed, err: firstErr };
+             failed: failed, err: firstErr, depth: depth };
   });
 }
 
@@ -116520,484 +116562,6 @@ function _fppOpenCard(colIdx) {
 }
 
 // ── Render ──────────────────────────────────────────────────────────
-// ── TEMPORARY PROBE: draft-pool season history ── DBHPROBE ──
-// The pool returns ONE season of actuals, so the Marcel basis on the board
-// is decorative: with a single season the blend weights collapse to [1] and
-// the output is (line / gp) * gp — the input line, unchanged.
-//
-// ESPN demonstrably HAS the history: the Projector's Compare tab blends
-// three seasons out of the player-card endpoints (its McDavid reads 39.9 G /
-// 216 FP against the board's 48 / 321). So the open question is which knob on
-// kona_player_info exposes history, or whether that view only ever carries
-// the current season and history needs a different endpoint entirely.
-//
-// ONE VARIABLE AT A TIME. Each trial changes exactly one thing from the
-// production filter, so any difference in the output names its own cause.
-// Two earlier attempts at this failed by moving several things at once and
-// by trusting a parser that misaligned names to values.
-//
-// EVERY REQUEST IS CACHE-BUSTED. The filter travels in a HEADER and the
-// browser cache keys on URL alone, so trials sharing a URL would silently
-// replay one body and read as "the filter made no difference" — which is
-// exactly the wrong conclusion. Each trial also hashes its raw body, so an
-// identical response is reported as identical rather than inferred.
-var DBHP_PAGE = 50;      // top 50 by draft rank always contains the targets
-var DBHP_TARGETS = {
-  // Matched on a normalized substring, so diacritics and suffixes are moot.
-  nba: ['jokic', 'doncic'],
-  nhl: ['mcdavid', 'mackinnon']
-};
-var _dbhpLines = [];
-var _dbhpBusy = false;
-var _dbhpSeen = {};      // body hash → the trial that first returned it
-var _dbhpRefIds = {};    // player ids from the reference page, for join yield
-
-// Lowercase, de-accented, letters only. Avoids String.normalize, which is
-// missing on some of the older Android webviews this app still runs on.
-function _dbhpNorm(s) {
-  s = String(s == null ? '' : s).toLowerCase();
-  s = s.replace(/[\u00e0-\u00e5]/g, 'a').replace(/[\u00e8-\u00eb]/g, 'e')
-       .replace(/[\u00ec-\u00ef]/g, 'i').replace(/[\u00f2-\u00f6]/g, 'o')
-       .replace(/[\u00f9-\u00fc]/g, 'u')
-       .replace(/[\u0107\u010d\u00e7]/g, 'c')
-       .replace(/[\u0161]/g, 's').replace(/[\u017e]/g, 'z');
-  return s.replace(/[^a-z]/g, '');
-}
-
-// djb2 over the raw response text. Only ever compared against another hash
-// from this same run, so collision resistance is not a concern.
-function _dbhpHash(s) {
-  var h = 5381, i;
-  for (i = 0; i < s.length; i++) { h = ((h << 5) + h + s.charCodeAt(i)) | 0; }
-  return (h >>> 0).toString(16);
-}
-
-function _dbhpLog(line) {
-  _dbhpLines.push(line);
-  var el = document.getElementById('dbhpOut');
-  if (el) {
-    el.innerHTML = skEscape(_dbhpLines.join('\n')).replace(/\n/g, '<br>');
-    el.scrollTop = el.scrollHeight;
-  }
-}
-
-// A count map rendered as "key×n, key×n", largest first.
-function _dbhpTally(map) {
-  var out = [], k;
-  for (k in map) { if (map.hasOwnProperty(k)) out.push([k, map[k]]); }
-  out.sort(function (a, b) { return b[1] - a[1]; });
-  var bits = [], i;
-  for (i = 0; i < out.length; i++) { bits.push(out[i][0] + '\u00d7' + out[i][1]); }
-  return bits.length ? bits.join(', ') : '(none)';
-}
-
-function _dbhpCount(o) { var n = 0, k; for (k in o) { if (o.hasOwnProperty(k)) n++; } return n; }
-
-// The trial matrix. Production sends all three stat filters together, so it
-// appears here as the control rather than as the baseline — the baseline is
-// no stat filters at all, which is the only way to see what ESPN volunteers.
-function _dbhpTrials(season) {
-  var s = season, s1 = season - 1, s2 = season - 2;
-  function f(extra) {
-    var o = {
-      limit: DBHP_PAGE,
-      offset: 0,
-      sortDraftRanks: { sortPriority: 100, sortAsc: true, value: 'STANDARD' }
-    }, k;
-    for (k in extra) { if (extra.hasOwnProperty(k)) o[k] = extra[k]; }
-    return { players: o };
-  }
-  return [
-    { lbl: 'A  no stat filters at all',
-      note: 'what ESPN volunteers when nothing is restricted',
-      view: 'kona_player_info', filter: f({}) },
-
-    { lbl: 'B  splitTypeIds [0] only',
-      note: 'the minimal filter that yields season lines \u2014 also the id ' +
-            'reference the season-walk trials are joined against',
-      ref: true,
-      view: 'kona_player_info',
-      filter: f({ filterStatsForSplitTypeIds: { value: [0] } }) },
-
-    { lbl: 'C  sourceIds [0,1] only',
-      view: 'kona_player_info',
-      filter: f({ filterStatsForSourceIds: { value: [0, 1] } }) },
-
-    { lbl: 'D  externalIds [' + s2 + ',' + s1 + ',' + s + '] only',
-      view: 'kona_player_info',
-      filter: f({ filterStatsForExternalIds: { value: [s2, s1, s] } }) },
-
-    { lbl: 'E  externalIds [' + s1 + '] alone \u2014 PRIOR season only',
-      note: 'the decisive one: if this still returns ' + s +
-            ', externalIds is being ignored outright',
-      view: 'kona_player_info',
-      filter: f({ filterStatsForExternalIds: { value: [s1] } }) },
-
-    { lbl: 'F  splitTypeIds [0,1,2,3]',
-      note: 'does history hide under a different split type',
-      view: 'kona_player_info',
-      filter: f({ filterStatsForSplitTypeIds: { value: [0, 1, 2, 3] } }) },
-
-    { lbl: 'G  sourceIds [0,1,2,3]',
-      note: 'is there a source beyond actuals(0) and projection(1)',
-      view: 'kona_player_info',
-      filter: f({ filterStatsForSourceIds: { value: [0, 1, 2, 3] } }) },
-
-    { lbl: 'H  PRODUCTION combo (control)',
-      note: 'exactly what dbpFilter sends today',
-      view: 'kona_player_info',
-      filter: f({ filterStatsForSplitTypeIds: { value: [0] },
-                  filterStatsForSourceIds: { value: [0, 1] },
-                  filterStatsForExternalIds: { value: [s2, s1, s] } }) },
-
-    { lbl: 'I  view=kona_playercard, no stat filters',
-      note: 'the card view is where the Compare tab finds three seasons',
-      view: 'kona_playercard', filter: f({}) },
-
-    // ── The season-URL walk ──────────────────────────────────────
-    // Trials A-I established that NO header filter reaches a prior season:
-    // every split, every source, both views return seasonId 2026 only, and
-    // externalIds [2025] returns nothing rather than falling back. The one
-    // knob left is the season in the PATH, which a header filter can't
-    // touch. J and K are trial B with exactly one thing changed — the year
-    // — so a difference has only one possible cause.
-    { lbl: 'J  /seasons/' + s1 + '/ \u2014 splitTypeIds [0] (= trial B, prior year)',
-      note: 'does leaguedefaults/3 exist and carry actuals for a past season',
-      view: 'kona_player_info', season: s1,
-      filter: f({ filterStatsForSplitTypeIds: { value: [0] } }) },
-
-    { lbl: 'K  /seasons/' + s2 + '/ \u2014 splitTypeIds [0] (= trial B, two back)',
-      note: 'the third Marcel input, if J works',
-      view: 'kona_player_info', season: s2,
-      filter: f({ filterStatsForSplitTypeIds: { value: [0] } }) },
-
-    // ── Seeded joins ─────────────────────────────────────────────
-    // J and K proved the history is real, but each page is sorted by THAT
-    // season's draft rank, so only ~32 of 50 ids carried over. A Marcel fed
-    // that way blends three seasons for some players and one for others,
-    // semi-randomly — worse than today's honest "only ONE season" note.
-    //
-    // Asking for the ids outright should fix it. The filter key is NOT
-    // established, and a null result under the wrong name would read exactly
-    // like "ids can't be filtered" — the same trap that cost two earlier
-    // probes. So both plausible names are tried against the SAME season, and
-    // whichever answers names itself.
-    { lbl: 'L  /seasons/' + s1 + '/ + filterIds seeded from B',
-      note: 'candidate key #1 \u2014 compare the yield against trial J',
-      view: 'kona_player_info', season: s1, idKey: 'filterIds',
-      filter: f({ filterStatsForSplitTypeIds: { value: [0] } }) },
-
-    { lbl: 'M  /seasons/' + s1 + '/ + filterPlayerIds seeded from B',
-      note: 'candidate key #2 \u2014 same season as L, so only the key differs',
-      view: 'kona_player_info', season: s1, idKey: 'filterPlayerIds',
-      filter: f({ filterStatsForSplitTypeIds: { value: [0] } }) },
-
-    { lbl: 'N  /seasons/' + s2 + '/ + filterIds seeded from B',
-      note: 'the weakest year (K joined 26 of 50) under the winning approach',
-      view: 'kona_player_info', season: s2, idKey: 'filterIds',
-      filter: f({ filterStatsForSplitTypeIds: { value: [0] } }) },
-
-    // ── Why does the SHIPPED history pull fail? ──────────────────
-    // Trial L proved the mechanism, yet production reports 6 of 6 failed.
-    // Two things were changed from L at once, which is the exact mistake
-    // this probe exists to prevent: production DROPPED sortDraftRanks and
-    // ADDED filterStatsForSourceIds [0]. It also asks for 200 ids, not 50.
-    // Three variables, so the ladder separates them one at a time and the
-    // break names itself.
-    { lbl: 'O  L again \u2014 control, must still pass',
-      note: 'if this fails, the problem is not the filter at all',
-      view: 'kona_player_info', season: s1, idKey: 'filterIds',
-      filter: f({ filterStatsForSplitTypeIds: { value: [0] } }) },
-
-    { lbl: 'P  O + filterStatsForSourceIds [0]',
-      note: 'the filter production ADDED, which no trial ever tested',
-      view: 'kona_player_info', season: s1, idKey: 'filterIds',
-      filter: f({ filterStatsForSplitTypeIds: { value: [0] },
-                  filterStatsForSourceIds: { value: [0] } }) },
-
-    { lbl: 'Q  O with sortDraftRanks REMOVED',
-      note: 'the field production DROPPED',
-      view: 'kona_player_info', season: s1, idKey: 'filterIds',
-      filter: { players: { limit: DBHP_PAGE, offset: 0,
-                           filterStatsForSplitTypeIds: { value: [0] } } } },
-
-    { lbl: 'R  the real dbpHistFilter(), 50 ids',
-      note: 'production\u2019s OWN builder \u2014 no hand-copy to argue with',
-      view: 'kona_player_info', season: s1,
-      rawFilter: dbpHistFilter, filter: f({}) },
-
-    { lbl: 'S  the real dbpHistFilter(), 200 ids from the live pool',
-      note: 'exactly what shipped, at the size it ships',
-      view: 'kona_player_info', season: s1, poolIds: 200,
-      rawFilter: dbpHistFilter, filter: f({}) }
-  ];
-}
-
-// A few real numbers off a season-level line, so "2025 came back" can be
-// told apart from "2026 came back wearing a 2025 label". Ids are the
-// verified ones from DBP_STAT; targets are skaters, so the goalie map
-// never applies here.
-function _dbhpSig(sport, e) {
-  var s = e && e.stats;
-  if (!s) return '';
-  function v(k) {
-    return (s[k] != null) ? String(Math.round(Number(s[k]) * 10) / 10) : '?';
-  }
-  if (sport === 'nhl') return ' sig=' + v(13) + 'g/' + v(16) + 'p/' + v(30) + 'gp';
-  return ' sig=' + v(0) + 'pts/' + v(42) + 'gp';
-}
-
-// The reference page's ids as a numeric array, for the seeded trials.
-function _dbhpIdList() {
-  var out = [], k;
-  for (k in _dbhpRefIds) {
-    if (_dbhpRefIds.hasOwnProperty(k)) out.push(Number(k));
-  }
-  return out;
-}
-
-// Ids straight off the LIVE pool, so a trial can reproduce production's own
-// call at production's own size rather than a 50-id miniature of it.
-function _dbhpPoolIds(n) {
-  var out = [], i;
-  var pl = (typeof _fppBoard !== 'undefined' && _fppBoard.pool &&
-            _fppBoard.pool.players) || [];
-  for (i = 0; i < pl.length && out.length < n; i++) out.push(Number(pl[i].id));
-  return out;
-}
-
-function _dbhpFetchTrial(sport, season, trial, idx) {
-  // A trial may target a PRIOR season by overriding the year in the path.
-  // The season is part of the URL, not the filter, so this is the one knob
-  // the header-filter probes could never reach.
-  var yr = trial.season || season;
-  var url = DBP_BASE + '/' + dbpGameFor(sport) + '/seasons/' + yr +
-    '/segments/0/leaguedefaults/3?view=' + trial.view +
-    '&_dbhp=' + Date.now() + '_' + idx;    // see the cache note above
-
-  // Seeded trials get their id list at RUN time, not build time — the
-  // reference page hasn't been fetched yet when the trial list is built.
-  // rawFilter hands the ids to production's OWN filter builder, so there is
-  // no hand-copied approximation to argue with when it disagrees.
-  var filt = trial.filter, reqIds = 0, reqSet = {};
-  if (trial.idKey || trial.rawFilter) {
-    var idList = trial.poolIds ? _dbhpPoolIds(trial.poolIds) : _dbhpIdList();
-    reqIds = idList.length;
-    for (var q = 0; q < idList.length; q++) reqSet[String(idList[q])] = true;
-    if (trial.rawFilter) {
-      filt = trial.rawFilter(idList);
-    } else {
-      var seeded = {}, kk;
-      for (kk in filt.players) {
-        if (filt.players.hasOwnProperty(kk)) seeded[kk] = filt.players[kk];
-      }
-      seeded[trial.idKey] = { value: idList };
-      filt = { players: seeded };
-    }
-  }
-  var hdr = JSON.stringify(filt);
-
-  var t0 = Date.now();
-  return fetch(url, {
-    cache: 'no-store',
-    headers: { 'X-Fantasy-Filter': hdr }
-  }).then(function (r) {
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    return r.text();     // text first, so the real byte size is measurable
-  }).then(function (txt) {
-    return {
-      ms: Date.now() - t0,
-      bytes: txt.length,
-      hash: _dbhpHash(txt),
-      hdrBytes: hdr.length,
-      reqIds: reqIds,
-      reqSet: reqSet,
-      json: JSON.parse(txt)
-    };
-  });
-}
-
-// Everything the open question needs, per trial: how many DISTINCT actuals
-// seasons each player carries (the headline number), which seasonIds and
-// source/split combos appear at all, and then the full stats[] dump for two
-// known players so a wrong aggregate can be caught by eye.
-function _dbhpReport(sport, trial, res) {
-  var list = (res.json && res.json.players) || [];
-  var targets = DBHP_TARGETS[sport] || [];
-  var seasons = {}, combos = {}, perPlayer = {}, hits = [], ids = {};
-  var i, j;
-
-  for (i = 0; i < list.length; i++) {
-    var p = _dbpUnwrap(list[i]);
-    if (!p) continue;
-    ids[String(p.id)] = true;
-    var st = p.stats || [], distinct = {};
-    for (j = 0; j < st.length; j++) {
-      var sid = String(st[j].seasonId);
-      seasons[sid] = (seasons[sid] || 0) + 1;
-      var ck = 'src' + st[j].statSourceId + '/split' + st[j].statSplitTypeId;
-      combos[ck] = (combos[ck] || 0) + 1;
-      // Only ACTUALS count toward history — a projection is not a season.
-      if (st[j].statSourceId === 0) distinct[sid] = true;
-    }
-    var nSeasons = _dbhpCount(distinct);
-    perPlayer[nSeasons] = (perPlayer[nSeasons] || 0) + 1;
-
-    var nn = _dbhpNorm(p.fullName || '');
-    for (j = 0; j < targets.length; j++) {
-      if (nn && nn.indexOf(targets[j]) >= 0) { hits.push(p); break; }
-    }
-  }
-
-  _dbhpLog('   ' + list.length + ' players \u00b7 ' +
-    Math.round(res.bytes / 1024) + ' KB \u00b7 ' + res.ms + ' ms \u00b7 body ' + res.hash);
-
-  // Header size is the whole question for a seeded join: 50 ids is nothing,
-  // but production carries 600, and the filter travels in a HEADER. The
-  // projection assumes ids of the same width, which they are within a sport.
-  if (res.reqIds) {
-    var per = res.reqIds ? ((res.hdrBytes - 200) / res.reqIds) : 0;
-    _dbhpLog('   filter header ' + res.hdrBytes + ' B for ' + res.reqIds +
-      ' ids \u2014 600 ids would be roughly ' +
-      Math.round((200 + per * 600) / 1024 * 10) / 10 + ' KB');
-  }
-
-  // An identical body means the filter changed nothing OR the cache replayed.
-  // The cache-buster rules out the second, which makes this a real finding.
-  if (_dbhpSeen[res.hash]) {
-    _dbhpLog('   \u26a0 BYTE-IDENTICAL to trial ' + _dbhpSeen[res.hash] +
-      ' \u2014 this filter changed nothing');
-  } else {
-    _dbhpSeen[res.hash] = trial.lbl.split(' ')[0];
-  }
-
-  _dbhpLog('   >> actuals seasons per player: ' + _dbhpTally(perPlayer));
-  _dbhpLog('   seasonIds: ' + _dbhpTally(seasons));
-  _dbhpLog('   combos:    ' + _dbhpTally(combos));
-
-  // A prior-season page is only useful if its players are the SAME players.
-  // Draft rank reorders year to year, so the overlap against the reference
-  // page is the real join yield — the fraction of the board Marcel could
-  // actually blend.
-  if (trial.ref) {
-    _dbhpRefIds = ids;
-  } else if (_dbhpCount(_dbhpRefIds)) {
-    var shared = 0, k;
-    for (k in ids) { if (ids.hasOwnProperty(k) && _dbhpRefIds[k]) shared++; }
-    var got = _dbhpCount(ids);
-    _dbhpLog('   ids shared with trial B: ' + shared + ' of ' + got);
-    if (res.reqIds) {
-      // Judged against THIS trial's own ask, not the reference page — a
-      // pool-seeded trial legitimately requests ids trial B never saw.
-      // Defaulted, because a throw here would kill the whole run and take
-      // every line already gathered with it.
-      var rs = res.reqSet || {};
-      var inAsk = 0, k2;
-      for (k2 in ids) { if (ids.hasOwnProperty(k2) && rs[k2]) inAsk++; }
-      // Asked-vs-returned is NOT the test. An IGNORED id filter still
-      // returns a full page, so the two counts match by coincidence
-      // whenever the page limit equals the number asked for — which is
-      // exactly how trial M first read as a success while being
-      // byte-identical to the unfiltered trial J. The real signal is
-      // whether every player that came back was one we asked for.
-      // A shortfall below the ask is expected and fine: it means that
-      // player has no line for that season, which is a rookie, not a bug.
-      _dbhpLog('   >> SEEDED YIELD: asked ' + res.reqIds + ', got ' + got +
-        ', of which requested ' + inAsk +
-        (got === 0
-          ? '  \u2014 nothing came back, INCONCLUSIVE'
-          : inAsk === got
-            ? '  \u2713 filter HONOURED'
-            : '  \u2718 filter IGNORED \u2014 ' + (got - inAsk) + ' came back unasked'));
-    }
-  }
-
-  for (i = 0; i < hits.length; i++) {
-    var h = hits[i], hs = h.stats || [];
-    _dbhpLog('   ' + (h.fullName || '?') + ' #' + h.id + ' \u2014 ' +
-      hs.length + ' stat lines');
-    for (j = 0; j < hs.length; j++) {
-      var e = hs[j];
-      _dbhpLog('     src' + e.statSourceId + ' split' + e.statSplitTypeId +
-        ' season' + e.seasonId +
-        ' ext=' + (e.externalId != null ? e.externalId : '-') +
-        ' per' + (e.scoringPeriodId != null ? e.scoringPeriodId : '-') +
-        ' n=' + _dbhpCount(e.stats || {}) +
-        (e.statSplitTypeId !== 5 ? _dbhpSig(sport, e) : ''));
-    }
-    if (!hs.length) _dbhpLog('     (no stats[] at all)');
-  }
-  if (!hits.length) {
-    _dbhpLog('   (neither target player was in this page)');
-  }
-}
-
-function _dbhpRun(only) {
-  if (_dbhpBusy) return;
-  _dbhpBusy = true;
-  _dbhpLines = [];
-  _dbhpSeen = {};
-  _dbhpRefIds = {};
-  var sport = _fppState.sport;
-  var season = dbpSeason();
-  var trials = _dbhpTrials(season);
-  // A subset still needs trial B, which seeds the id list every seeded
-  // trial joins against.
-  if (only) {
-    trials = trials.filter(function (t) {
-      var c = t.lbl.charAt(0);
-      return c === 'B' || only.indexOf(c) >= 0;
-    });
-  }
-
-  _dbhpLog('DRAFT-POOL HISTORY PROBE');
-  _dbhpLog(new Date().toString());
-  _dbhpLog('sport ' + sport + ' \u00b7 game ' + dbpGameFor(sport) +
-    ' \u00b7 season ' + season + ' \u00b7 window [' + (season - 2) + ',' +
-    (season - 1) + ',' + season + ']');
-  _dbhpLog('targets: ' + (DBHP_TARGETS[sport] || []).join(', ') +
-    ' \u00b7 ' + DBHP_PAGE + ' players per trial');
-  _dbhpLog('');
-
-  var chain = Promise.resolve(), idx = 0;
-  trials.forEach(function (trial) {
-    var myIdx = idx++;
-    chain = chain.then(function () {
-      _dbhpLog(trial.lbl);
-      if (trial.note) _dbhpLog('   (' + trial.note + ')');
-      return _dbhpFetchTrial(sport, season, trial, myIdx)
-        .then(function (res) { _dbhpReport(sport, trial, res); })
-        ['catch'](function (err) {
-          _dbhpLog('   FAILED \u2014 ' + ((err && err.message) || 'error'));
-        })
-        .then(function () { _dbhpLog(''); });
-    });
-  });
-
-  return chain.then(function () {
-    _dbhpBusy = false;
-    _dbhpLog('done \u2014 tap Save .txt, or screenshot this panel.');
-    var b = document.getElementById('dbhpSave');
-    if (b) b.style.display = '';
-  })['catch'](function () { _dbhpBusy = false; });
-}
-
-// No devtools on this phone, and the output runs to a few hundred lines, so
-// it has to leave the app as a file rather than as a screenshot.
-function _dbhpSave() {
-  if (!_dbhpLines.length) return;
-  var blob = new Blob([_dbhpLines.join('\r\n')], { type: 'text/plain;charset=utf-8' });
-  var url = URL.createObjectURL(blob);
-  var a = document.createElement('a');
-  a.href = url;
-  a.download = 'dbhp-probe-' + _fppState.sport + '-' +
-    new Date().toISOString().slice(0, 19).replace(/[:T]/g, '') + '.txt';
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  setTimeout(function () { URL.revokeObjectURL(url); }, 1500);
-}
-
 // ── DRAFT BOARD: UI (slice 3) ── DBBOARD ──
 // A third view inside the FP Projector. The Compare view answers "which of
 // these two is worth more"; the Board answers "who should I take now",
@@ -117222,27 +116786,6 @@ function _fppBoardHtml() {
       '" onclick="_fppBoardSetBasis(\'proj\')">Marcel</button>' +
     '<button class="fpp-sport' + (B.basis === 'last' ? ' active' : '') +
       '" onclick="_fppBoardSetBasis(\'last\')">Last season</button>' +
-  '</div>';
-
-  // TEMPORARY: draft-pool season-history probe. DBHPROBE
-  // Sits directly under BASIS because it exists to answer why Marcel and
-  // Last season currently produce the same board. Remove with the block
-  // above once the history question is settled.
-  h += '<div class="fpp-probe-row">' +
-    '<button class="fpp-probe-btn" onclick="_dbhpRun(\'OPQRS\')">' +
-      '\ud83d\udd2c Why is history failing?</button>' +
-    '<button class="fpp-probe-btn" onclick="_dbhpRun()">' +
-      '\ud83e\uddea Full probe (' + slEsc(_fppState.sport.toUpperCase()) + ')</button>' +
-    '<button class="fpp-probe-btn" id="dbhpSave"' +
-      (_dbhpLines.length ? '' : ' style="display:none"') +
-      ' onclick="_dbhpSave()">\u2b07 Save .txt</button>' +
-  '</div>' +
-  // Repainted from _dbhpLines rather than left empty, so switching basis
-  // mid-probe doesn't throw away a run that took nine round trips.
-  '<div class="fpp-probe-out" id="dbhpOut" ' +
-    'style="max-height:300px;overflow:auto;white-space:normal;">' +
-    (_dbhpLines.length
-      ? slEsc(_dbhpLines.join('\n')).replace(/\n/g, '<br>') : '') +
   '</div>';
 
   if (B.busy) {
