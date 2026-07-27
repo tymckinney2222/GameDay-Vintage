@@ -113084,13 +113084,29 @@ function dbpSeason() {
 
 function _dbpUnwrap(e) { return (e && e.player) ? e.player : e; }
 
-// The completed season's actuals, whatever seasonId ESPN tags them with.
-function _dbpActuals(p) {
-  var st = (p && p.stats) || [], i;
+// Every actuals line, keyed by season. The Marcel blend needs three; the
+// board only needs the newest, so both are kept rather than one discarded.
+// DBHIST
+function _dbpActualLines(p) {
+  var st = (p && p.stats) || [], out = {}, i, n = 0;
   for (i = 0; i < st.length; i++) {
-    if (st[i].statSourceId === 0 && st[i].statSplitTypeId === 0) return st[i];
+    if (st[i].statSourceId !== 0 || st[i].statSplitTypeId !== 0) continue;
+    var sid = String(st[i].seasonId);
+    if (!out[sid]) { out[sid] = st[i]; n++; }
   }
-  return null;
+  return n ? out : null;
+}
+
+// The newest actuals line — what the board reads when basis is 'last'.
+function _dbpActuals(p) {
+  var all = _dbpActualLines(p);
+  if (!all) return null;
+  var best = null, bestId = -1, k;
+  for (k in all) {
+    if (!all.hasOwnProperty(k)) continue;
+    if (Number(k) > bestId) { bestId = Number(k); best = all[k]; }
+  }
+  return best;
 }
 // ESPN's own projection, kept as a second opinion beside the Marcel blend.
 function _dbpProjection(p) {
@@ -113127,6 +113143,18 @@ function dbpDecodePlayer(raw, sport) {
   var mode = dbpModeFor(sport, posId);
   var act = dbpDecodeStats(_dbpActuals(p), mode);
   var prj = dbpDecodeStats(_dbpProjection(p), mode);
+  // Season-keyed history for the Marcel blend, newest first when read.
+  // DBHIST
+  var raw = _dbpActualLines(p), hist = null, hk, hn = 0;
+  if (raw) {
+    hist = {};
+    for (hk in raw) {
+      if (!raw.hasOwnProperty(hk)) continue;
+      var dec = dbpDecodeStats(raw[hk], mode);
+      if (dec) { hist[hk] = dec; hn++; }
+    }
+    if (!hn) hist = null;
+  }
   var own = p.ownership || {};
   var dr = (p.draftRanksByRankType && p.draftRanksByRankType.STANDARD) || null;
   return {
@@ -113138,8 +113166,10 @@ function dbpDecodePlayer(raw, sport) {
     teamId: (p.proTeamId != null) ? Number(p.proTeamId) : null,
     slots: p.eligibleSlots || [],
     inj: p.injuryStatus || '',
-    // last season's actuals — what the Marcel blend projects FROM
+    // last season's actuals — what the board reads when basis is 'last'
     last: act,
+    // up to three seasons, keyed by seasonId. DBHIST
+    hist: hist,
     // ESPN's own projection — the second opinion
     esp: prj,
     owned: (own.percentOwned != null) ? Math.round(Number(own.percentOwned) * 10) / 10 : null,
@@ -113149,6 +113179,9 @@ function dbpDecodePlayer(raw, sport) {
 }
 
 // ── Fetch ──────────────────────────────────────────────────────────
+// Filled by dbpFetchPool before any page goes out.
+var DBP_SEASON_WINDOW = [0, 0, 0];
+
 function dbpFilter(offset) {
   return {
     players: {
@@ -113159,7 +113192,14 @@ function dbpFilter(offset) {
       // most needs.
       sortDraftRanks: { sortPriority: 100, sortAsc: true, value: 'STANDARD' },
       filterStatsForSplitTypeIds: { value: [0] },
-      filterStatsForSourceIds: { value: [0, 1] }
+      filterStatsForSourceIds: { value: [0, 1] },
+      // Three seasons, because the Marcel blend weights the last three.
+      // ESPN tags the COMPLETED season with the CURRENT season id, so the
+      // window is [cur-2, cur-1, cur] rather than the years you'd expect.
+      // DBHIST
+      filterStatsForExternalIds: { value: [DBP_SEASON_WINDOW[0],
+                                           DBP_SEASON_WINDOW[1],
+                                           DBP_SEASON_WINDOW[2]] }
     }
   };
 }
@@ -113183,6 +113223,7 @@ function dbpFetchPage(sport, season, offset) {
 // responses on a phone is worse than three quick ones.
 function dbpFetchPool(sport, onProgress) {
   var season = dbpSeason();
+  DBP_SEASON_WINDOW = [season - 2, season - 1, season];   // DBHIST
   var byId = {}, pages = 0;
   function step(i) {
     if (i >= DBP_PAGES) return Promise.resolve();
@@ -113224,18 +113265,33 @@ function dbpCacheSave(pool) {
     localStorage.setItem(dbpCacheKey(pool.sport, pool.season), JSON.stringify(pool));
     return true;
   } catch (e) {
-    // Quota. Drop the ESPN projection (the second opinion) and retry — a
-    // board with our own projections still works; no board at all doesn't.
-    try {
-      var slim = { sport: pool.sport, season: pool.season, ts: pool.ts, slim: 1, players: [] };
+    // Quota. Shed in order of what costs least: older seasons first (only
+    // the Marcel blend reads them), then ESPN's projection, then nothing
+    // more — a board with fewer inputs still works, no board doesn't.
+    // DBHIST
+    function strip(dropHist, dropEsp) {
+      var out = { sport: pool.sport, season: pool.season, ts: pool.ts,
+                  slim: (dropHist ? 1 : 0) + (dropEsp ? 2 : 0), players: [] };
       for (var i = 0; i < pool.players.length; i++) {
-        var p = pool.players[i], c = {};
-        for (var k in p) { if (p.hasOwnProperty(k) && k !== 'esp') c[k] = p[k]; }
-        slim.players.push(c);
+        var p = pool.players[i], c = {}, k;
+        for (k in p) {
+          if (!p.hasOwnProperty(k)) continue;
+          if (dropHist && k === 'hist') continue;
+          if (dropEsp && k === 'esp') continue;
+          c[k] = p[k];
+        }
+        out.players.push(c);
       }
-      localStorage.setItem(dbpCacheKey(pool.sport, pool.season), JSON.stringify(slim));
-      return true;
-    } catch (e2) { return false; }
+      return out;
+    }
+    var steps = [strip(true, false), strip(true, true)], si;
+    for (si = 0; si < steps.length; si++) {
+      try {
+        localStorage.setItem(dbpCacheKey(pool.sport, pool.season), JSON.stringify(steps[si]));
+        return true;
+      } catch (e2) { /* try the next rung */ }
+    }
+    return false;
   }
 }
 
@@ -113268,6 +113324,87 @@ function dbpGetPool(sport, force, onProgress) {
     if (fallback) { fallback.error = String(err); return fallback; }
     throw err;
   });
+}
+
+// ── Marcel blend over the pooled history ── DBMARCEL ──
+// The same shape as the Projector's own Projected basis: a 60/30/10
+// weighting of the last three seasons' PER-GAME rates, renormalised when
+// fewer seasons exist, multiplied back out by a projected games total.
+//
+// It runs on the pool's three-season history rather than per-player card
+// fetches, so it covers 600 players for the same three requests.
+//
+// Rates (GAA, save %) are NOT blended this way — averaging them across
+// seasons of different workloads is meaningless. The newest value carries.
+var DBP_RATE_CATS = { gaa: 1, svpct: 1 };
+
+function _dbpMarcelWeights(n) {
+  if (n >= 3) return [0.6, 0.3, 0.1];
+  if (n === 2) return [0.6 / 0.9, 0.3 / 0.9];
+  return [1];
+}
+
+function dbpMarcel(p, gpOverride) {
+  if (!p || !p.hist) return null;
+  var years = [], k;
+  for (k in p.hist) { if (p.hist.hasOwnProperty(k)) years.push(Number(k)); }
+  if (!years.length) return null;
+  years.sort(function (a, b) { return b - a; });          // newest first
+  if (years.length > 3) years = years.slice(0, 3);
+
+  // Only seasons with games played can contribute a rate.
+  var use = [], i;
+  for (i = 0; i < years.length; i++) {
+    var ln = p.hist[String(years[i])];
+    if (ln && Number(ln.gp) > 0) use.push(ln);
+  }
+  if (!use.length) return null;
+
+  var w = _dbpMarcelWeights(use.length);
+  var rate = {}, seen = {};
+  for (i = 0; i < use.length; i++) {
+    var line = use[i], gp = Number(line.gp);
+    for (k in line) {
+      if (!line.hasOwnProperty(k)) continue;
+      if (k === 'gp' || DBP_RATE_CATS[k]) continue;
+      var v = Number(line[k]);
+      if (isNaN(v)) continue;
+      rate[k] = (rate[k] || 0) + (v / gp) * w[i];
+      seen[k] = 1;
+    }
+  }
+
+  // Projected games: the most recent season, which is what the Projector
+  // seeds its GP box with. Overridable so a lever can drive it later.
+  var projGp = (gpOverride != null && gpOverride > 0)
+    ? Number(gpOverride) : Number(use[0].gp);
+  if (!(projGp > 0)) return null;
+
+  var out = { gp: projGp };
+  for (k in seen) {
+    if (!seen.hasOwnProperty(k)) continue;
+    out[k] = Math.round(rate[k] * projGp * 10) / 10;
+  }
+  // Carry rate stats forward from the newest season untouched.
+  for (k in DBP_RATE_CATS) {
+    if (use[0][k] != null) out[k] = use[0][k];
+  }
+  return out;
+}
+
+// Attach a Marcel line to every player that has enough history. Players
+// without it keep proj null, and the board falls back per-player rather
+// than dropping them — a real player missing is worse than a mixed basis,
+// so long as the mix is visible.
+function dbpApplyMarcel(pool) {
+  if (!pool || !pool.players) return 0;
+  var n = 0, i;
+  for (i = 0; i < pool.players.length; i++) {
+    var m = dbpMarcel(pool.players[i]);
+    pool.players[i].proj = m;
+    if (m) n++;
+  }
+  return n;
 }
 
 // ── DRAFT POOL: VALUATION (slice 2) ── DBVAL ──
@@ -113926,11 +114063,18 @@ function _fppColGp(colIdx) {
   return (gp && gp > 0) ? gp : null;
 }
 // FP per game for a column = its (season-total) FP ÷ games played. NHL only.
+// Every basis now holds SEASON TOTALS, for both sports. The Projected
+// basis always did (a per-game blend times a projected GP); Last Season
+// arrived as per-game averages, which is what made the two disagree.
+// Last Season is converted on the way in instead — see _fppApplyFetched.
+// So the FP sum is a season total, and FP/G is that over GP. FPUNITS
 function _fppPlayerFpPerGame(colIdx) {
   var gp = _fppColGp(colIdx);
   if (!gp) return null;
   return _fppPlayerFp(colIdx) / gp;
 }
+
+function _fppPlayerFpSeason(colIdx) { return _fppPlayerFp(colIdx); }
 // The card's stats payload has three categories (Averages / Totals / Misc
 // Totals). We read per-game stats straight from Averages, and season-total
 // stats (DD2/TD3/TECH/FLAG for NBA; G/A/PPG/… for NHL) divided by GP. Label
@@ -114899,9 +115043,29 @@ function _fppApplyFetched(colIdx) {
   var p = _fppState.players[colIdx];
   if (!p || !p.fetched) return;
   var line = p.fetched.line || {};
+  // NBA's card stats arrive as per-game averages (_FPP_EXTRACT.nba reads
+  // src 'avg'), while the Projected basis produces season totals. Showing
+  // one of each made the two bases incomparable and the FP figures
+  // nonsense. Scale to totals here so every basis speaks the same units.
+  // Cats flagged perGame:false in the extract are already totals and are
+  // left alone. FPUNITS
+  var ex = (typeof _FPP_EXTRACT !== 'undefined' && _FPP_EXTRACT[_fppModeKey()]) || null;
+  var gp = Number(p.fetched.gp || 0);
+  var scale = (_fppState.sport !== 'nhl' && gp > 0);
   _fppCats().forEach(function(cat) {
     if (cat.manual) return; // never overwrite manual-entry fields (incl. FW/FL)
-    if (line[cat.key] != null) p.stats[cat.key] = line[cat.key];
+    if (line[cat.key] != null) {
+      var v = line[cat.key];
+      if (scale) {
+        var spec = ex ? ex[cat.key] : null;
+        // Only per-game values need scaling; season totals already are.
+        if (!spec || spec.perGame) {
+          var n = parseFloat(v);
+          if (!isNaN(n)) v = Math.round(n * gp * 10) / 10;
+        }
+      }
+      p.stats[cat.key] = v;
+    }
     else if (p.stats[cat.key] != null) delete p.stats[cat.key]; // clear stale
   });
 }
@@ -116009,6 +116173,59 @@ function _fppPickPlayer(id, name) {
 // changing the scoring league re-pulls every picked player from the right
 // source. Stale guards: a newer pick (name/espnId changed) or a newer
 // league selection (changed again mid-flight) drops the result.
+// ── Compare: fill gaps from the draft pool ── DBFILL ──
+// The Compare tab assembles a line from Yahoo (via a donor league) and
+// ESPN player cards. Its own comment names the hole: "ESPN's endpoints
+// carry no Hits/Blocks" — and a donor league that doesn't track them
+// leaves those cells blank.
+//
+// The draft pool has them. Hits and blocks are statIds 31 and 32, proven
+// by positional signature (Tkachuk 162 hits, Makar 117 blocks), and every
+// value there is a season TOTAL rather than an average.
+//
+// Strictly gap-filling: a value already present always wins, so this can
+// only add cells that were previously empty. Cache-only — filling two
+// columns must never trigger a 600-player download.
+function _fppPoolPlayer(espnId, sport) {
+  if (!espnId || typeof dbpCacheLoad !== 'function') return null;
+  try {
+    var pool = dbpCacheLoad(sport);
+    if (!pool || !pool.players) return null;
+    var want = String(espnId), i;
+    for (i = 0; i < pool.players.length; i++) {
+      if (String(pool.players[i].id) === want) return pool.players[i];
+    }
+  } catch (e) {}
+  return null;
+}
+
+// The pool's line in the units Compare expects: NBA per game, NHL season
+// totals — the same split _FPP_LABEL uses (src 'avg' vs src 'tot').
+function _fppPoolLine(espnId, sport) {
+  var p = _fppPoolPlayer(espnId, sport);
+  if (!p || !p.last) return null;
+  if (typeof dbpRate !== 'function') return p.last;
+  return dbpRate(p.last, p.mode);
+}
+
+// Returns how many cells it filled, so the source label can say so.
+function _fppPoolFill(line, espnId, sport) {
+  if (!line) return 0;
+  var pl = _fppPoolLine(espnId, sport);
+  if (!pl) return 0;
+  var n = 0, k;
+  for (k in pl) {
+    if (!pl.hasOwnProperty(k)) continue;
+    if (k === 'gp' || k === 'toi' || k === 'min') continue;
+    if (line[k] != null && line[k] !== '') continue;   // never overwrite
+    var v = Number(pl[k]);
+    if (isNaN(v)) continue;
+    line[k] = v;
+    n++;
+  }
+  return n;
+}
+
 function _fppFetchAndApplyCol(col, id, name) {
   // Yahoo is the stat source (needs a selected league for context). ESPN
   // supplies GP (Yahoo doesn't return it). Both run; we combine on resolve.
@@ -116045,8 +116262,10 @@ function _fppFetchAndApplyCol(col, id, name) {
       } else {
         line = eLine;
       }
+      // Anything Yahoo and the ESPN card both left blank. DBFILL
+      var poolN = _fppPoolFill(line, id, _fppState.sport);
       var hasAny = Object.keys(line).length > 0;
-      if (res || yLine) {
+      if (res || yLine || poolN) {
         _fppState.players[col].fetched = {
           line: line,
           gp: (res && res.gpLast) || null,          // GP is ESPN's job either way
@@ -116055,7 +116274,8 @@ function _fppFetchAndApplyCol(col, id, name) {
           seasonLabel: yLine
             ? (String(year) + '-' + String((year + 1) % 100))
             : ((res && res.seasonLabel) || 'Last Season'),
-          source: yLine ? (Object.keys(eLine).length ? 'yahoo+espn' : 'yahoo') : 'espn',
+          source: (yLine ? (Object.keys(eLine).length ? 'yahoo+espn' : 'yahoo') : 'espn') +
+                  (poolN ? ('+pool ' + poolN) : ''),
           hasData: hasAny
         };
       }
@@ -116147,9 +116367,17 @@ var _fppBoard = {
   // ESPN's projection is stat-level and already in the payload, so it
   // costs nothing and stays consistent across all four platforms: the
   // scoring varies by league, the projection should not. DBBASIS
-  basis: 'esp',         // 'esp' | 'last'  (Marcel once 3 seasons land)
+  basis: 'esp',         // 'esp' | 'proj' (Marcel) | 'last'   DBMARCEL
+  marcelN: 0,           // how many players the blend could cover
   progress: '',
-  limit: 120
+  // How many rows to RENDER. The pool holds 600; a 12-team league with 15
+  // roster spots drafts 180, and deeper NHL leagues go past that, so 120
+  // was cutting off players who genuinely get taken.
+  limit: 250,
+  // Where "replacement level" sits for the value-above figure. A different
+  // question from how many rows to show — they were both 120, which made
+  // the two look like one setting. DBLIMIT
+  replacement: 150
 };
 
 // The league's scoring, in the shape the valuation wants. Categories with
@@ -116182,6 +116410,14 @@ function _fppBoardSetMode(m) {
 
 // Changing basis re-values in place — the pool already holds both lines.
 // DBBASIS
+// Reveal another 250 without refetching — the pool is already local.
+// DBLIMIT
+function _fppBoardMore() {
+  _fppBoard.limit = Math.min(_fppBoard.limit + 250, 1000);
+  _fppBoardValue();
+  _fppRender();
+}
+
 function _fppBoardSetBasis(b) {
   _fppBoard.basis = b;
   _fppBoardValue();
@@ -116206,11 +116442,9 @@ function _fppBoardValue() {
     scoring: scoring,
     prefer: _fppBoard.basis,   // DBBASIS
     depth: 180,
-    // Roughly a drafted starting pool; makes VOR meaningful without asking
-    // for league size we may not have.
-    replacement: 120
+    replacement: _fppBoard.replacement
   });
-  _fppBoard.tiers = dbpTiers(_fppBoard.ranked, 12, _fppBoard.limit);
+  _fppBoard.tiers = dbpTiers(_fppBoard.ranked, 14, _fppBoard.limit, 3);
 }
 
 function _fppBoardLoad(force) {
@@ -116224,6 +116458,8 @@ function _fppBoardLoad(force) {
     if (el) el.textContent = _fppBoard.progress;
   }).then(function (pool) {
     _fppBoard.pool = pool;
+    // Blend once per load, not per re-value. DBMARCEL
+    _fppBoard.marcelN = (typeof dbpApplyMarcel === 'function') ? dbpApplyMarcel(pool) : 0;
     _fppBoard.busy = false;
     if (pool && pool.error) _fppBoard.err = 'Using the cached pool \u2014 ' + pool.error;
     _fppBoardValue();
@@ -116263,6 +116499,8 @@ function _fppBoardHtml() {
     '<span style="font-size:9px;letter-spacing:0.12em;color:rgba(255,255,255,0.35);">BASIS</span>' +
     '<button class="fpp-sport' + (B.basis === 'esp' ? ' active' : '') +
       '" onclick="_fppBoardSetBasis(\'esp\')">ESPN proj</button>' +
+    '<button class="fpp-sport' + (B.basis === 'proj' ? ' active' : '') +
+      '" onclick="_fppBoardSetBasis(\'proj\')">Marcel</button>' +
     '<button class="fpp-sport' + (B.basis === 'last' ? ' active' : '') +
       '" onclick="_fppBoardSetBasis(\'last\')">Last season</button>' +
   '</div>';
@@ -116285,9 +116523,22 @@ function _fppBoardHtml() {
     (B.mode === 'cats'
       ? 'Z-scores against the top 180, summed. Balanced across categories.'
       : 'Projected fantasy points under this league\u2019s scoring.') +
-    ' \u00b7 ' + (B.basis === 'esp' ? 'ESPN projection' : 'last season\u2019s actuals') +
-    ' \u00b7 ' + keys.length + ' categories \u00b7 pool ' +
-    (B.pool ? B.pool.players.length : 0) + ' \u00b7 ' + _fppBoardAge(B.pool) + '</div>';
+    ' \u00b7 ' + (B.basis === 'esp' ? 'ESPN projection'
+                : B.basis === 'proj' ? ('Marcel 3-season blend \u00b7 ' + B.marcelN + ' covered')
+                : 'last season\u2019s actuals') +
+    ' \u00b7 ' + keys.length + ' categories</div>' +
+    // The pool and the rendered list are different sizes; say so rather
+    // than leaving it to be inferred. DBLIMIT
+    '<div style="color:rgba(255,255,255,0.32);font-size:9.5px;margin:0 0 10px;">' +
+      'Showing ' + Math.min(B.limit, B.ranked.players.length) + ' of ' +
+      B.ranked.players.length + ' ranked \u00b7 ' +
+      (B.pool ? B.pool.players.length : 0) + ' in the pool \u00b7 ' +
+      'replacement level at #' + B.replacement + ' \u00b7 ' + _fppBoardAge(B.pool) +
+      (B.limit < B.ranked.players.length
+        ? ' \u00b7 <a href="#" onclick="_fppBoardMore();return false;" ' +
+          'style="color:var(--sk-gold,#eab308);text-decoration:underline;">show more</a>'
+        : '') +
+    '</div>';
 
   var tiers = B.tiers || [], t, i;
   for (t = 0; t < tiers.length; t++) {
@@ -116491,12 +116742,14 @@ function _fppRender() {
     } else {
       html += '<button class="fpp-ppick" onclick="_fppOpenSearch(' + c + ')">+ Pick player ' + (c + 1) + '</button>';
     }
-    // Both sports now use Yahoo season TOTALS: FP/G leads (season FP ÷ GP),
-    // with the season FP total as the sub-line.
+    // FP/G leads, season total beneath. Each is derived from whichever the
+    // stats actually are, rather than assuming season totals. FPUNITS
     var fpgVal = _fppPlayerFpPerGame(c);
+    var fpSeason = _fppPlayerFpSeason(c);
     html += '<div class="fpp-total" id="fppTotal' + c + '">' + (fpgVal == null ? '\u2013' : _fppFmt(fpgVal)) + '</div>';
     html += '<div class="fpp-total-lbl">proj. FP / game</div>';
-    html += '<div class="fpp-total-sub" id="fppTotalSub' + c + '">' + _fppFmt(_fppPlayerFp(c)) + ' <span>season FP</span></div>';
+    html += '<div class="fpp-total-sub" id="fppTotalSub' + c + '">' +
+      (fpSeason == null ? '\u2013' : _fppFmt(fpSeason)) + ' <span>season FP</span></div>';
     html += '</div>';
   }
   html += '</div>';
