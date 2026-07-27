@@ -116365,6 +116365,282 @@ function _fppOpenCard(colIdx) {
 }
 
 // ── Render ──────────────────────────────────────────────────────────
+// ── TEMPORARY PROBE: draft-pool season history ── DBHPROBE ──
+// The pool returns ONE season of actuals, so the Marcel basis on the board
+// is decorative: with a single season the blend weights collapse to [1] and
+// the output is (line / gp) * gp — the input line, unchanged.
+//
+// ESPN demonstrably HAS the history: the Projector's Compare tab blends
+// three seasons out of the player-card endpoints (its McDavid reads 39.9 G /
+// 216 FP against the board's 48 / 321). So the open question is which knob on
+// kona_player_info exposes history, or whether that view only ever carries
+// the current season and history needs a different endpoint entirely.
+//
+// ONE VARIABLE AT A TIME. Each trial changes exactly one thing from the
+// production filter, so any difference in the output names its own cause.
+// Two earlier attempts at this failed by moving several things at once and
+// by trusting a parser that misaligned names to values.
+//
+// EVERY REQUEST IS CACHE-BUSTED. The filter travels in a HEADER and the
+// browser cache keys on URL alone, so trials sharing a URL would silently
+// replay one body and read as "the filter made no difference" — which is
+// exactly the wrong conclusion. Each trial also hashes its raw body, so an
+// identical response is reported as identical rather than inferred.
+var DBHP_PAGE = 50;      // top 50 by draft rank always contains the targets
+var DBHP_TARGETS = {
+  // Matched on a normalized substring, so diacritics and suffixes are moot.
+  nba: ['jokic', 'doncic'],
+  nhl: ['mcdavid', 'mackinnon']
+};
+var _dbhpLines = [];
+var _dbhpBusy = false;
+var _dbhpSeen = {};      // body hash → the trial that first returned it
+
+// Lowercase, de-accented, letters only. Avoids String.normalize, which is
+// missing on some of the older Android webviews this app still runs on.
+function _dbhpNorm(s) {
+  s = String(s == null ? '' : s).toLowerCase();
+  s = s.replace(/[\u00e0-\u00e5]/g, 'a').replace(/[\u00e8-\u00eb]/g, 'e')
+       .replace(/[\u00ec-\u00ef]/g, 'i').replace(/[\u00f2-\u00f6]/g, 'o')
+       .replace(/[\u00f9-\u00fc]/g, 'u')
+       .replace(/[\u0107\u010d\u00e7]/g, 'c')
+       .replace(/[\u0161]/g, 's').replace(/[\u017e]/g, 'z');
+  return s.replace(/[^a-z]/g, '');
+}
+
+// djb2 over the raw response text. Only ever compared against another hash
+// from this same run, so collision resistance is not a concern.
+function _dbhpHash(s) {
+  var h = 5381, i;
+  for (i = 0; i < s.length; i++) { h = ((h << 5) + h + s.charCodeAt(i)) | 0; }
+  return (h >>> 0).toString(16);
+}
+
+function _dbhpLog(line) {
+  _dbhpLines.push(line);
+  var el = document.getElementById('dbhpOut');
+  if (el) {
+    el.innerHTML = skEscape(_dbhpLines.join('\n')).replace(/\n/g, '<br>');
+    el.scrollTop = el.scrollHeight;
+  }
+}
+
+// A count map rendered as "key×n, key×n", largest first.
+function _dbhpTally(map) {
+  var out = [], k;
+  for (k in map) { if (map.hasOwnProperty(k)) out.push([k, map[k]]); }
+  out.sort(function (a, b) { return b[1] - a[1]; });
+  var bits = [], i;
+  for (i = 0; i < out.length; i++) { bits.push(out[i][0] + '\u00d7' + out[i][1]); }
+  return bits.length ? bits.join(', ') : '(none)';
+}
+
+function _dbhpCount(o) { var n = 0, k; for (k in o) { if (o.hasOwnProperty(k)) n++; } return n; }
+
+// The trial matrix. Production sends all three stat filters together, so it
+// appears here as the control rather than as the baseline — the baseline is
+// no stat filters at all, which is the only way to see what ESPN volunteers.
+function _dbhpTrials(season) {
+  var s = season, s1 = season - 1, s2 = season - 2;
+  function f(extra) {
+    var o = {
+      limit: DBHP_PAGE,
+      offset: 0,
+      sortDraftRanks: { sortPriority: 100, sortAsc: true, value: 'STANDARD' }
+    }, k;
+    for (k in extra) { if (extra.hasOwnProperty(k)) o[k] = extra[k]; }
+    return { players: o };
+  }
+  return [
+    { lbl: 'A  no stat filters at all',
+      note: 'what ESPN volunteers when nothing is restricted',
+      view: 'kona_player_info', filter: f({}) },
+
+    { lbl: 'B  splitTypeIds [0] only',
+      view: 'kona_player_info',
+      filter: f({ filterStatsForSplitTypeIds: { value: [0] } }) },
+
+    { lbl: 'C  sourceIds [0,1] only',
+      view: 'kona_player_info',
+      filter: f({ filterStatsForSourceIds: { value: [0, 1] } }) },
+
+    { lbl: 'D  externalIds [' + s2 + ',' + s1 + ',' + s + '] only',
+      view: 'kona_player_info',
+      filter: f({ filterStatsForExternalIds: { value: [s2, s1, s] } }) },
+
+    { lbl: 'E  externalIds [' + s1 + '] alone \u2014 PRIOR season only',
+      note: 'the decisive one: if this still returns ' + s +
+            ', externalIds is being ignored outright',
+      view: 'kona_player_info',
+      filter: f({ filterStatsForExternalIds: { value: [s1] } }) },
+
+    { lbl: 'F  splitTypeIds [0,1,2,3]',
+      note: 'does history hide under a different split type',
+      view: 'kona_player_info',
+      filter: f({ filterStatsForSplitTypeIds: { value: [0, 1, 2, 3] } }) },
+
+    { lbl: 'G  sourceIds [0,1,2,3]',
+      note: 'is there a source beyond actuals(0) and projection(1)',
+      view: 'kona_player_info',
+      filter: f({ filterStatsForSourceIds: { value: [0, 1, 2, 3] } }) },
+
+    { lbl: 'H  PRODUCTION combo (control)',
+      note: 'exactly what dbpFilter sends today',
+      view: 'kona_player_info',
+      filter: f({ filterStatsForSplitTypeIds: { value: [0] },
+                  filterStatsForSourceIds: { value: [0, 1] },
+                  filterStatsForExternalIds: { value: [s2, s1, s] } }) },
+
+    { lbl: 'I  view=kona_playercard, no stat filters',
+      note: 'the card view is where the Compare tab finds three seasons',
+      view: 'kona_playercard', filter: f({}) }
+  ];
+}
+
+function _dbhpFetchTrial(sport, season, trial, idx) {
+  var url = DBP_BASE + '/' + dbpGameFor(sport) + '/seasons/' + season +
+    '/segments/0/leaguedefaults/3?view=' + trial.view +
+    '&_dbhp=' + Date.now() + '_' + idx;    // see the cache note above
+  var t0 = Date.now();
+  return fetch(url, {
+    cache: 'no-store',
+    headers: { 'X-Fantasy-Filter': JSON.stringify(trial.filter) }
+  }).then(function (r) {
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.text();     // text first, so the real byte size is measurable
+  }).then(function (txt) {
+    return {
+      ms: Date.now() - t0,
+      bytes: txt.length,
+      hash: _dbhpHash(txt),
+      json: JSON.parse(txt)
+    };
+  });
+}
+
+// Everything the open question needs, per trial: how many DISTINCT actuals
+// seasons each player carries (the headline number), which seasonIds and
+// source/split combos appear at all, and then the full stats[] dump for two
+// known players so a wrong aggregate can be caught by eye.
+function _dbhpReport(sport, trial, res) {
+  var list = (res.json && res.json.players) || [];
+  var targets = DBHP_TARGETS[sport] || [];
+  var seasons = {}, combos = {}, perPlayer = {}, hits = [];
+  var i, j;
+
+  for (i = 0; i < list.length; i++) {
+    var p = _dbpUnwrap(list[i]);
+    if (!p) continue;
+    var st = p.stats || [], distinct = {};
+    for (j = 0; j < st.length; j++) {
+      var sid = String(st[j].seasonId);
+      seasons[sid] = (seasons[sid] || 0) + 1;
+      var ck = 'src' + st[j].statSourceId + '/split' + st[j].statSplitTypeId;
+      combos[ck] = (combos[ck] || 0) + 1;
+      // Only ACTUALS count toward history — a projection is not a season.
+      if (st[j].statSourceId === 0) distinct[sid] = true;
+    }
+    var nSeasons = _dbhpCount(distinct);
+    perPlayer[nSeasons] = (perPlayer[nSeasons] || 0) + 1;
+
+    var nn = _dbhpNorm(p.fullName || '');
+    for (j = 0; j < targets.length; j++) {
+      if (nn && nn.indexOf(targets[j]) >= 0) { hits.push(p); break; }
+    }
+  }
+
+  _dbhpLog('   ' + list.length + ' players \u00b7 ' +
+    Math.round(res.bytes / 1024) + ' KB \u00b7 ' + res.ms + ' ms \u00b7 body ' + res.hash);
+
+  // An identical body means the filter changed nothing OR the cache replayed.
+  // The cache-buster rules out the second, which makes this a real finding.
+  if (_dbhpSeen[res.hash]) {
+    _dbhpLog('   \u26a0 BYTE-IDENTICAL to trial ' + _dbhpSeen[res.hash] +
+      ' \u2014 this filter changed nothing');
+  } else {
+    _dbhpSeen[res.hash] = trial.lbl.split(' ')[0];
+  }
+
+  _dbhpLog('   >> actuals seasons per player: ' + _dbhpTally(perPlayer));
+  _dbhpLog('   seasonIds: ' + _dbhpTally(seasons));
+  _dbhpLog('   combos:    ' + _dbhpTally(combos));
+
+  for (i = 0; i < hits.length; i++) {
+    var h = hits[i], hs = h.stats || [];
+    _dbhpLog('   ' + (h.fullName || '?') + ' #' + h.id + ' \u2014 ' +
+      hs.length + ' stat lines');
+    for (j = 0; j < hs.length; j++) {
+      var e = hs[j];
+      _dbhpLog('     src' + e.statSourceId + ' split' + e.statSplitTypeId +
+        ' season' + e.seasonId +
+        ' ext=' + (e.externalId != null ? e.externalId : '-') +
+        ' per' + (e.scoringPeriodId != null ? e.scoringPeriodId : '-') +
+        ' n=' + _dbhpCount(e.stats || {}));
+    }
+    if (!hs.length) _dbhpLog('     (no stats[] at all)');
+  }
+  if (!hits.length) {
+    _dbhpLog('   (neither target player was in this page)');
+  }
+}
+
+function _dbhpRun() {
+  if (_dbhpBusy) return;
+  _dbhpBusy = true;
+  _dbhpLines = [];
+  _dbhpSeen = {};
+  var sport = _fppState.sport;
+  var season = dbpSeason();
+  var trials = _dbhpTrials(season);
+
+  _dbhpLog('DRAFT-POOL HISTORY PROBE');
+  _dbhpLog(new Date().toString());
+  _dbhpLog('sport ' + sport + ' \u00b7 game ' + dbpGameFor(sport) +
+    ' \u00b7 season ' + season + ' \u00b7 window [' + (season - 2) + ',' +
+    (season - 1) + ',' + season + ']');
+  _dbhpLog('targets: ' + (DBHP_TARGETS[sport] || []).join(', ') +
+    ' \u00b7 ' + DBHP_PAGE + ' players per trial');
+  _dbhpLog('');
+
+  var chain = Promise.resolve(), idx = 0;
+  trials.forEach(function (trial) {
+    var myIdx = idx++;
+    chain = chain.then(function () {
+      _dbhpLog(trial.lbl);
+      if (trial.note) _dbhpLog('   (' + trial.note + ')');
+      return _dbhpFetchTrial(sport, season, trial, myIdx)
+        .then(function (res) { _dbhpReport(sport, trial, res); })
+        ['catch'](function (err) {
+          _dbhpLog('   FAILED \u2014 ' + ((err && err.message) || 'error'));
+        })
+        .then(function () { _dbhpLog(''); });
+    });
+  });
+
+  return chain.then(function () {
+    _dbhpBusy = false;
+    _dbhpLog('done \u2014 tap Save .txt, or screenshot this panel.');
+    var b = document.getElementById('dbhpSave');
+    if (b) b.style.display = '';
+  })['catch'](function () { _dbhpBusy = false; });
+}
+
+// No devtools on this phone, and the output runs to a few hundred lines, so
+// it has to leave the app as a file rather than as a screenshot.
+function _dbhpSave() {
+  if (!_dbhpLines.length) return;
+  var blob = new Blob([_dbhpLines.join('\r\n')], { type: 'text/plain;charset=utf-8' });
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement('a');
+  a.href = url;
+  a.download = 'dbhp-probe-' + _fppState.sport + '-' +
+    new Date().toISOString().slice(0, 19).replace(/[:T]/g, '') + '.txt';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(function () { URL.revokeObjectURL(url); }, 1500);
+}
+
 // ── DRAFT BOARD: UI (slice 3) ── DBBOARD ──
 // A third view inside the FP Projector. The Compare view answers "which of
 // these two is worth more"; the Board answers "who should I take now",
@@ -116533,6 +116809,25 @@ function _fppBoardHtml() {
       '" onclick="_fppBoardSetBasis(\'proj\')">Marcel</button>' +
     '<button class="fpp-sport' + (B.basis === 'last' ? ' active' : '') +
       '" onclick="_fppBoardSetBasis(\'last\')">Last season</button>' +
+  '</div>';
+
+  // TEMPORARY: draft-pool season-history probe. DBHPROBE
+  // Sits directly under BASIS because it exists to answer why Marcel and
+  // Last season currently produce the same board. Remove with the block
+  // above once the history question is settled.
+  h += '<div class="fpp-probe-row">' +
+    '<button class="fpp-probe-btn" onclick="_dbhpRun()">' +
+      '\ud83e\uddea Probe pool history (' + slEsc(_fppState.sport.toUpperCase()) + ')</button>' +
+    '<button class="fpp-probe-btn" id="dbhpSave"' +
+      (_dbhpLines.length ? '' : ' style="display:none"') +
+      ' onclick="_dbhpSave()">\u2b07 Save .txt</button>' +
+  '</div>' +
+  // Repainted from _dbhpLines rather than left empty, so switching basis
+  // mid-probe doesn't throw away a run that took nine round trips.
+  '<div class="fpp-probe-out" id="dbhpOut" ' +
+    'style="max-height:300px;overflow:auto;white-space:normal;">' +
+    (_dbhpLines.length
+      ? slEsc(_dbhpLines.join('\n')).replace(/\n/g, '<br>') : '') +
   '</div>';
 
   if (B.busy) {
