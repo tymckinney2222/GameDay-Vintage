@@ -124131,6 +124131,9 @@ function espRosters(j, game, scoredIds, sport) {
         ? espBuildWindows(pl, j.seasonId, j.scoringPeriodId, scoredIds || []) : null;
       items.push({
         playerId: String(e.playerId || pl.id || ''),
+        // ESPN identifies the real-life club by NUMBER only; the
+        // abbreviation is resolved later from espProTeamMap. ESPPROTEAM
+        teamId: (pl.proTeamId != null) ? Number(pl.proTeamId) : null,
         pts: pp.season, today: pp.today, proj: pp.proj, last7: pp.last7,
         windows: wins,
         // Today's slot when we can identify today's game; otherwise the
@@ -124161,7 +124164,13 @@ function espRosters(j, game, scoredIds, sport) {
     });
     byTeam[String(t.id)] = { teamName: espTeamName(t), items: items };
   }
-  return { period: (j.scoringPeriodId != null) ? j.scoringPeriodId : null, byTeam: byTeam };
+  return {
+    period: (j.scoringPeriodId != null) ? j.scoringPeriodId : null,
+    // Needed to key the pro-team abbreviation map, which is per sport AND
+    // per season. ESPPROTEAM
+    season: (j.seasonId != null) ? j.seasonId : null,
+    byTeam: byTeam
+  };
 }
 
 function _espRosterPane() {
@@ -124802,6 +124811,98 @@ function _espGroupTotalsHtml(row, items, wantPitchers, game, cats, accent) {
         'No stats yet today.</div>');
 }
 
+// ── ESPN PRO-TEAM CHIPS ── ESPPROTEAM ──
+// The roster payload names a player's real-life club with a NUMERIC
+// proTeamId and never an abbreviation, and ESPN's fantasy numbering is its
+// own — it is not the site API's team ids. Rather than hardcode ~124
+// id/abbrev pairs across four sports from memory, where a single wrong
+// entry produces a wrong badge AND a wrong colour and neither is obvious on
+// sight, this asks ESPN for its own list and caches it per sport+season.
+// One small request, authoritative, and it survives a relocation or rebrand
+// without anyone editing a table.
+var _espProTeams = {};        // 'flb:2026' -> { '13': 'ATH', ... }
+var _espProTeamsBusy = {};
+
+function espProTeamMap(game, season, cb) {
+  var ck = game + ':' + season;
+  if (_espProTeams[ck]) { if (cb) cb(_espProTeams[ck]); return; }
+  if (_espProTeamsBusy[ck]) return;    // already in flight; its cb will repaint
+  _espProTeamsBusy[ck] = 1;
+  fetch(ESP_BASE + game + '/seasons/' + season + '?view=proTeamSchedules_wl')
+    .then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    }).then(function (j) {
+      var list = (j && j.settings && j.settings.proTeams) || [];
+      var map = {}, i;
+      for (i = 0; i < list.length; i++) {
+        var t = list[i] || {};
+        if (t.id == null) continue;
+        var ab = String(t.abbrev || '').toUpperCase();
+        // id 0 is ESPN's free-agent placeholder and carries no usable
+        // abbreviation. Dropped so those players render with no chip at all
+        // rather than an empty coloured box.
+        if (!ab || Number(t.id) === 0) continue;
+        map[String(t.id)] = ab;
+      }
+      _espProTeams[ck] = map;
+      _espProTeamsBusy[ck] = 0;
+      if (cb) cb(map);
+    })['catch'](function () {
+      // A failure costs the chips, never the lineup. Deliberately NOT cached
+      // as an empty map, which would make one bad request permanent.
+      _espProTeamsBusy[ck] = 0;
+    });
+}
+
+// Colour for a club abbreviation in a KNOWN sport.
+//
+// _skTeamColor cannot be reused here. It infers the sport from Yahoo state
+// (fyLeagues, skTodayState.leagueKey), which for an ESPN league resolves to
+// nothing and falls through to the MLB palette — right for MLB by luck, and
+// wrong for NBA/NHL, where MIL is Bucks-not-Brewers and LA, TB and SJ all
+// collide across sports. The sport is passed in here rather than guessed.
+// An unknown sport returns null, which renders a plain uncoloured chip:
+// no badge is better than a confidently wrong colour.
+function espSportTeamColor(sport, abbr) {
+  if (!abbr) return null;
+  var key = String(abbr).toUpperCase();
+  var sp = String(sport || '').toLowerCase();
+  if (sp === 'nba' && typeof nbaArenaTheme === 'function') {
+    var nt = nbaArenaTheme(key);
+    if (nt && nt.accent) return nt.accent;
+  }
+  if (sp === 'nhl' && typeof nhlArenaTheme === 'function') {
+    var ht = nhlArenaTheme(key);
+    if (ht && ht.accent) return ht.accent;
+  }
+  if (sp === 'nfl' && typeof _nflTeamColor === 'function') {
+    var ft = _nflTeamColor(key);
+    if (ft) return ft;
+  }
+  if (sp === 'mlb') {
+    var mk = key;
+    if (typeof SK_MLB_ABBR_ALIAS !== 'undefined' && SK_MLB_ABBR_ALIAS &&
+        SK_MLB_ABBR_ALIAS[mk]) mk = SK_MLB_ABBR_ALIAS[mk];
+    if (typeof SK_MLB_TEAM_COLORS !== 'undefined' && SK_MLB_TEAM_COLORS) {
+      return SK_MLB_TEAM_COLORS[mk] || null;
+    }
+  }
+  return null;
+}
+
+// Same markup and classes as the Yahoo card's _skBuildTeamChip, so the two
+// lineup cards share one look and one stylesheet rather than drifting.
+function espTeamChip(sport, abbr) {
+  if (!abbr) return '';
+  var tc = espSportTeamColor(sport, abbr);
+  if (tc) {
+    return '<span class="sk-contrib-team team-color" style="--tc:' + tc + '">' +
+      slEsc(abbr) + '</span>';
+  }
+  return '<span class="sk-contrib-team">' + slEsc(abbr) + '</span>';
+}
+
 function _espLineupFill(row, bodyEl, headEl) {
   var myIds = row.myTeamIds || {};
   var myTeam = null, k;
@@ -124821,6 +124922,17 @@ function _espLineupFill(row, bodyEl, headEl) {
   var sp = String(row.sport || '').toLowerCase();
   if (sp === 'nfl') game = 'ffl'; else if (sp === 'nba') game = 'fba'; else if (sp === 'nhl') game = 'fhl';
   var accent = extProvAccent('espn');
+
+  // Club abbreviations come from ESPN's own pro-team list. If it isn't
+  // cached yet the lineup still renders immediately — just without chips —
+  // and refills when the map arrives. The callback only runs after the map
+  // is cached, so the re-entry finds it and cannot loop; a failed fetch
+  // fires no callback at all. ESPPROTEAM
+  var ptSeason = (row.rosters && row.rosters.season) || null;
+  var ptMap = ptSeason ? (_espProTeams[game + ':' + ptSeason] || null) : null;
+  if (ptSeason && !ptMap) {
+    espProTeamMap(game, ptSeason, function () { _espLineupFill(row, bodyEl, headEl); });
+  }
 
   var items = myTeam.items;
   var total = 0, scoring = 0, nS = 0, nB = 0, live = 0, idle = 0, bench = '', i;
@@ -124859,8 +124971,12 @@ function _espLineupFill(row, bodyEl, headEl) {
 
     var nameTxt = (it.name || String(it.playerId)) +
       (it.starter && it.noGame ? '  \u2715 no game' : '');
+    // sp is this league's sport, so the palette is chosen explicitly rather
+    // than inferred — MIL, LA, TB and SJ mean different clubs per sport.
+    var abbr = (ptMap && it.teamId != null) ? (ptMap[String(it.teamId)] || '') : '';
     var html = _extLineupRowHtml(nameTxt, it.slot || '',
-                                 line, fp, accent, !it.starter);
+                                 line, fp, accent, !it.starter,
+                                 abbr ? espTeamChip(sp, abbr) : '');
     if (it.starter) {
       // Split so each half can carry its own totals line. ESPN3F
       if (espIsPitcherSlot(it)) { arms += html; nArm++; } else { bats += html; nBat++; }
@@ -127157,14 +127273,25 @@ function _slStatLine(st, sport) {
   return parts.join(' \u00b7 ');
 }
 
-function _extLineupRowHtml(name, slot, statLine, fpTxt, accent, dim) {
+function _extLineupRowHtml(name, slot, statLine, fpTxt, accent, dim, chip) {
   var slotChip = slot
     ? '<span style="display:inline-block;min-width:34px;text-align:center;font-size:9px;font-weight:700;letter-spacing:0.5px;padding:3px 5px;border-radius:5px;border:1px solid rgba(255,255,255,0.14);background:rgba(255,255,255,0.05);color:rgba(255,255,255,0.6);flex-shrink:0">' + slEsc(slot) + '</span>'
     : '';
+  // The name and its club chip share a flex line so the chip keeps its own
+  // width while the NAME is the thing that ellipses. Putting the chip inside
+  // the name element would allow a long name to clip the badge away
+  // entirely. chip is optional, so Sleeper and Fantrax callers are
+  // unaffected.
+  var nameHtml = chip
+    ? '<div style="display:flex;align-items:center;gap:6px;min-width:0">' +
+        '<span style="color:' + (dim ? 'rgba(255,255,255,0.55)' : '#fff') + ';font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + slEsc(name) + '</span>' +
+        chip +
+      '</div>'
+    : '<div style="color:' + (dim ? 'rgba(255,255,255,0.55)' : '#fff') + ';font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + slEsc(name) + '</div>';
   return '<div style="display:flex;align-items:flex-start;gap:8px;padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.05)">' +
     slotChip +
     '<div style="flex:1;min-width:0">' +
-      '<div style="color:' + (dim ? 'rgba(255,255,255,0.55)' : '#fff') + ';font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + slEsc(name) + '</div>' +
+      nameHtml +
       (statLine ? '<div style="color:rgba(255,255,255,0.45);font-size:10px;font-family:var(--sk-font-mono);margin-top:2px;line-height:1.4">' + statLine + '</div>' : '') +
     '</div>' +
     (fpTxt != null
