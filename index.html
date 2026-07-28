@@ -26652,6 +26652,10 @@
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
       <span>League availability</span>
     </button>
+    <button class="sk-account-item" onclick="skCloseAccountMenu(); skRunAuthDeepProbe();">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15 7h3a5 5 0 0 1 0 10h-3M9 17H6A5 5 0 0 1 6 7h3M8 12h8"/></svg>
+      <span>Auth path probe</span>
+    </button>
     <button class="sk-account-item" onclick="skCloseAccountMenu(); skRunAuthProbe();">
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4M12 18v4M4.9 4.9l2.8 2.8M16.3 16.3l2.8 2.8M2 12h4M18 12h4M4.9 19.1l2.8-2.8M16.3 7.7l2.8-2.8"/></svg>
       <span>403 burst probe</span>
@@ -119432,6 +119436,311 @@ async function skRunAuthProbe() {
     'Run this several times, especially during a failure.' +
     '</div>';
   host.innerHTML = html;
+}
+
+// ── AUTH PATH PROBE ── FY403B ──
+// The burst probe varies WHAT is asked and proved the answer isn't there:
+// seven variants, identical 403, including /game/{gk} which touches no
+// league, no team and no user games collection. A refusal on that endpoint
+// happens before Yahoo looks at the request's subject at all.
+//
+// So this varies HOW the request arrives instead. The decisive pair is the
+// deliberately invalid token against the real one, sent to the same URL
+// through the same Worker, microseconds apart:
+//
+//   bad token -> 401, real token -> 403
+//       Yahoo evaluated the credential and refused THIS APP. That points at
+//       the app registration or its entitlement, and an egress IP is not
+//       involved — a blocked IP could not answer 401 to one and 403 to the
+//       other.
+//
+//   bad token -> 403, real token -> 403
+//       The verdict is reached before the credential is read. That is
+//       caller-level: the app id or the address it arrives from. Nothing
+//       done to the token will change it.
+//
+// Also worth knowing: an access token lives about an hour, so if this were
+// token expiry the symptom would flap hourly. It persists for DAYS, which a
+// one-hour credential cycle cannot produce. The forced-refresh probe is
+// here to close that off with evidence rather than argument.
+var _FY_DEEP_LS = 'fy_deep_probe_hist';
+
+// Raw fetch that never throws and reports everything readable. Deliberately
+// not fyApi: that attaches a token unconditionally, retries, caches, and
+// truncates the error body — all four would erase what is being measured.
+function _fyDeepFetch(url, authHeader) {
+  var t0 = Date.now();
+  var opt = { headers: {} };
+  if (authHeader) opt.headers['Authorization'] = authHeader;
+  return fetch(url, opt).then(function (res) {
+    return res.text().then(function (body) {
+      // CORS hides every response header except a short safelist unless the
+      // Worker names them in Access-Control-Expose-Headers. Report what got
+      // through AND the fact that the list may be incomplete, so a missing
+      // WWW-Authenticate is never read as "Yahoo didn't send one".
+      var hdrs = [];
+      try {
+        res.headers.forEach(function (v, k) { hdrs.push(k + ': ' + v); });
+      } catch (eH) {}
+      return {
+        code: res.status, ms: Date.now() - t0, body: body || '',
+        headers: hdrs, net: false
+      };
+    });
+  })['catch'](function (e) {
+    return { code: 0, ms: Date.now() - t0, net: true,
+             body: String((e && e.message) || e), headers: [] };
+  });
+}
+
+// Age and expiry of the access token in hand, with the token itself masked.
+function _fyDeepTokenInfo() {
+  if (typeof fyTokens === 'undefined' || !fyTokens) {
+    return { has: false, line: 'no token in memory' };
+  }
+  var t = fyTokens;
+  var minted = t.token_time || 0;
+  var ageMin = minted ? Math.round((Date.now() - minted) / 60000) : null;
+  var lifeMin = t.expires_in ? Math.round(t.expires_in / 60) : null;
+  var leftMin = (minted && t.expires_in)
+    ? Math.round((minted + t.expires_in * 1000 - Date.now()) / 60000) : null;
+  var acc = String(t.access_token || '');
+  return {
+    has: !!acc,
+    line: 'minted ' + (ageMin != null ? ageMin + ' min ago' : '?') +
+      ' \u00b7 lifetime ' + (lifeMin != null ? lifeMin + ' min' : '?') +
+      ' \u00b7 ' + (leftMin != null
+        ? (leftMin > 0 ? leftMin + ' min left' : Math.abs(leftMin) + ' min EXPIRED')
+        : 'expiry unknown') +
+      ' \u00b7 refresh_token ' + (t.refresh_token ? 'present' : 'MISSING') +
+      ' \u00b7 access_token ' + (acc ? (acc.length + ' chars, \u2026' + acc.slice(-6)) : 'none')
+  };
+}
+
+function _fyDeepVerdict(by) {
+  var out = [];
+  var bad = by.badtoken || {}, real = by.real || {}, none = by.noauth || {};
+  var alive = by.worker || {}, fresh = by.refreshed || {};
+
+  if (alive.code === 0) {
+    out.push(['bad', 'The Worker itself did not answer. Nothing below means ' +
+      'anything until that is fixed \u2014 this is connectivity, not Yahoo.']);
+    return out;
+  }
+  if (real.code === 200) {
+    out.push(['ok', 'Yahoo is answering normally right now. Run this again ' +
+      'during a failure \u2014 a clean pass in a good window proves nothing.']);
+    return out;
+  }
+
+  if (bad.code === 401 && real.code === 403) {
+    out.push(['key', 'DECISIVE: an invalid token gets 401, yours gets 403. ' +
+      'Yahoo is reading the credential and refusing THIS APPLICATION. ' +
+      'An egress IP block cannot answer two different codes to two ' +
+      'requests sent microseconds apart, so the address is not the cause. ' +
+      'Check the app registration and its Fantasy Sports read permission.']);
+  } else if (bad.code === 403 && real.code === 403) {
+    out.push(['key', 'DECISIVE: an invalid token gets the SAME 403 as yours. ' +
+      'The refusal is reached before the credential is read, so it is not ' +
+      'about your token and refreshing it will not help. This is ' +
+      'caller-level \u2014 the client id, or the address the request leaves ' +
+      'from. If it is the Worker\u2019s egress IP, it is not fixable from here.']);
+  } else if (bad.code && real.code) {
+    out.push(['warn', 'Invalid token \u2192 ' + bad.code + ', real token \u2192 ' +
+      real.code + '. Not a pattern this probe has a rule for; the raw ' +
+      'bodies below are the thing to read.']);
+  }
+
+  if (none.code && bad.code && none.code !== bad.code) {
+    out.push(['warn', 'No Authorization header \u2192 ' + none.code +
+      ', invalid token \u2192 ' + bad.code +
+      '. The Worker treats a missing header differently from a bad one.']);
+  }
+
+  if (fresh.code && real.code && fresh.code !== real.code) {
+    out.push([fresh.code === 200 ? 'ok' : 'warn',
+      'A FRESHLY REFRESHED token behaves differently (' + real.code +
+      ' \u2192 ' + fresh.code + '). That is the one result that would make ' +
+      'this a token problem after all.']);
+  } else if (fresh.code && fresh.code === real.code) {
+    out.push(['bad', 'A freshly refreshed token gets the same ' + fresh.code +
+      '. Token staleness is ruled out.']);
+  }
+
+  return out;
+}
+
+function skRunAuthDeepProbe() {
+  var host = document.getElementById('_fyDeepHost');
+  if (host && host.parentNode) host.parentNode.removeChild(host);
+  host = document.createElement('div');
+  host.id = '_fyDeepHost';
+  host.style.cssText = 'position:fixed;inset:0;z-index:2147483000;background:rgba(4,7,13,0.96);overflow:auto;padding:18px;font-family:JetBrains Mono,monospace;font-size:12px;color:#cbd5e1;line-height:1.6';
+  var closeBtn = '<button onclick="var h=document.getElementById(\'_fyDeepHost\');if(h&&h.parentNode)h.parentNode.removeChild(h);" style="position:sticky;top:0;float:right;width:36px;height:36px;border-radius:8px;border:1px solid rgba(255,255,255,0.2);background:#0d1220;color:#e2e8f0;font-size:16px;font-weight:700">\u2715</button>';
+  var title = '<div style="color:#fbbf24;font-weight:700;font-size:14px;margin-bottom:10px">Auth Path Probe</div>';
+  host.innerHTML = closeBtn + title + '<div>Testing how the request arrives\u2026</div>';
+  document.body.appendChild(host);
+
+  // Same game-key derivation the burst probe uses, and the same endpoint it
+  // proved still 403s: no league, no team, no user games collection.
+  var mlbGk = '469';
+  try {
+    var lgs = (typeof fyLeagues !== 'undefined' && fyLeagues) ? fyLeagues : [];
+    for (var li = 0; li < lgs.length; li++) {
+      if (String(lgs[li].sport || '').toLowerCase() === 'mlb' && lgs[li].league_key) {
+        mlbGk = String(lgs[li].league_key).split('.')[0];
+        break;
+      }
+    }
+  } catch (eK) {}
+
+  var path = '/game/' + mlbGk;
+  var url = YAHOO_WORKER + '/api' + path;
+  var tokInfo = _fyDeepTokenInfo();
+  var by = {}, steps = [];
+
+  function step(id, label, note, run) {
+    return run().then(function (r) {
+      by[id] = r;
+      steps.push({ id: id, label: label, note: note, r: r });
+    });
+  }
+
+  // Sequential, and the two credential probes run back to back so they share
+  // conditions as closely as possible. Parallel would be faster but a burst
+  // is exactly what might trip a throttle and confound the reading.
+  var chain = step('worker', 'Worker reachable',
+    'the Worker root, no Yahoo call involved',
+    function () { return _fyDeepFetch(YAHOO_WORKER + '/', null); });
+
+  chain = chain.then(function () {
+    return step('noauth', 'No Authorization header at all',
+      'how the stack answers a request carrying no credential',
+      function () { return _fyDeepFetch(url, null); });
+  });
+
+  chain = chain.then(function () {
+    return step('badtoken', 'Deliberately INVALID token',
+      'a well-formed header with a token Yahoo has never issued',
+      function () { return _fyDeepFetch(url, 'Bearer 0'); });
+  });
+
+  chain = chain.then(function () {
+    return step('real', 'Your REAL token',
+      'identical URL, identical Worker, moments later',
+      function () {
+        return Promise.resolve(fyGetToken()).then(function (tok) {
+          if (!tok) return { code: 0, ms: 0, net: true, headers: [],
+                             body: 'no token available' };
+          return _fyDeepFetch(url, 'Bearer ' + tok);
+        });
+      });
+  });
+
+  // Force a brand-new access token and retry. If a one-hour credential were
+  // the story, this is where it would show.
+  chain = chain.then(function () {
+    return step('refreshed', 'Same call with a FRESHLY minted token',
+      'forces a refresh first, so token age cannot be the variable',
+      function () {
+        if (typeof fyTokens === 'undefined' || !fyTokens || !fyTokens.refresh_token) {
+          return Promise.resolve({ code: 0, ms: 0, net: true, headers: [],
+                                   body: 'no refresh_token to use' });
+        }
+        return fetch(YAHOO_WORKER + '/refresh', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ refresh_token: fyTokens.refresh_token })
+        }).then(function (res) {
+          if (!res.ok) throw new Error('refresh returned HTTP ' + res.status);
+          return res.json();
+        }).then(function (nt) {
+          // Keep it: a refresh that isn't stored means the next real call
+          // silently uses the old token and this probe made things worse.
+          fyTokens = nt;
+          try { _skSafeSetItem('fy_tokens', JSON.stringify(nt)); } catch (eW) {}
+          return _fyDeepFetch(url, 'Bearer ' + nt.access_token);
+        })['catch'](function (e) {
+          return { code: 0, ms: 0, net: true, headers: [],
+                   body: 'refresh failed: ' + ((e && e.message) || e) };
+        });
+      });
+  });
+
+  return chain.then(function () {
+    var hist = [];
+    try { hist = JSON.parse(localStorage.getItem(_FY_DEEP_LS) || '[]') || []; } catch (eH) {}
+    var slim = { ts: Date.now(), r: {} };
+    for (var s = 0; s < steps.length; s++) slim.r[steps[s].id] = steps[s].r.code;
+    hist.unshift(slim);
+    hist = hist.slice(0, 12);
+    try { localStorage.setItem(_FY_DEEP_LS, JSON.stringify(hist)); } catch (eS) {}
+
+    var html = closeBtn + title;
+    var vs = _fyDeepVerdict(by);
+    for (var v = 0; v < vs.length; v++) {
+      var kind = vs[v][0];
+      var col = (kind === 'ok') ? '#4ade80' : (kind === 'bad') ? '#ef4444'
+              : (kind === 'key') ? '#fbbf24' : '#94a3b8';
+      html += '<div style="color:' + col + ';margin-bottom:10px">' + vs[v][1] + '</div>';
+    }
+
+    html += '<div style="color:#fbbf24;font-size:12px;font-weight:700;margin:16px 0 6px">TOKEN IN HAND</div>' +
+      '<div style="color:#94a3b8;font-size:10px;word-break:break-word">' +
+      skEscapeMaybe(tokInfo.line) + '</div>';
+
+    html += '<div style="color:#fbbf24;font-size:12px;font-weight:700;margin:16px 0 6px">THIS RUN</div>';
+    for (var p = 0; p < steps.length; p++) {
+      var st = steps[p], r = st.r;
+      var badge = (r.code === 200)
+        ? '<span style="color:#4ade80;font-weight:700">OK</span>'
+        : '<span style="color:#ef4444;font-weight:700">' +
+          (r.code ? ('HTTP ' + r.code) : 'NO RESPONSE') + '</span>';
+      html += '<div style="background:#0d1220;border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:8px;margin:4px 0;font-size:10px">' +
+        '<div>' + skEscapeMaybe(st.label) + ' \u00b7 ' + badge +
+          ' <span style="color:#64748b">' + r.ms + 'ms</span></div>' +
+        '<div style="color:#64748b;margin-top:3px">' + skEscapeMaybe(st.note) + '</div>' +
+        (r.body ? '<div style="color:#f59e0b;margin-top:4px;word-break:break-word;white-space:pre-wrap">' +
+          skEscapeMaybe(r.body.slice(0, 600)) + '</div>' : '') +
+        (r.headers.length ? '<div style="color:#475569;margin-top:4px;word-break:break-all">' +
+          skEscapeMaybe(r.headers.join(' \u00b7 ')) + '</div>' : '') +
+        '</div>';
+    }
+
+    if (hist.length > 1) {
+      html += '<div style="color:#fbbf24;font-size:12px;font-weight:700;margin:16px 0 6px">PREVIOUS RUNS</div>' +
+        '<div style="color:#64748b;font-size:9px;margin-bottom:4px">worker / noauth / bad / real / fresh</div>';
+      var ids = ['worker', 'noauth', 'badtoken', 'real', 'refreshed'];
+      for (var h = 1; h < hist.length; h++) {
+        var cells = '';
+        for (var i = 0; i < ids.length; i++) {
+          var code = hist[h].r[ids[i]];
+          cells += '<span style="display:inline-block;min-width:44px;color:' +
+            (code === 200 ? '#4ade80' : '#ef4444') + '">' + (code || 'x') + '</span>';
+        }
+        html += '<div style="font-size:10px;padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.05)">' +
+          '<span style="color:#64748b;display:inline-block;min-width:120px">' +
+          new Date(hist[h].ts).toLocaleString() + '</span>' + cells + '</div>';
+      }
+    }
+
+    html += '<div style="margin-top:16px"><button onclick="skRunAuthDeepProbe()" style="padding:8px 18px;border-radius:999px;border:1px solid rgba(255,255,255,0.25);background:none;color:#e2e8f0;font-size:11px;font-weight:700">Run again</button></div>';
+    html += '<div style="color:#64748b;font-size:10px;margin-top:16px;line-height:1.6">' +
+      'The comparison that matters is INVALID token vs REAL token, same URL, ' +
+      'moments apart. Different codes mean Yahoo read the credential and ' +
+      'refused the app; the same code means the refusal happens before the ' +
+      'credential is read, which is caller-level and not fixable by ' +
+      'reconnecting. Response headers are mostly hidden by CORS unless the ' +
+      'Worker lists them in Access-Control-Expose-Headers, so an absent ' +
+      'WWW-Authenticate here is not evidence Yahoo omitted one. ' +
+      'Run during a failure.' +
+      '</div>';
+    host.innerHTML = html;
+  })['catch'](function (e) {
+    host.innerHTML = closeBtn + title +
+      '<div style="color:#ef4444">Probe failed: ' +
+      skEscapeMaybe(String((e && e.message) || e)) + '</div>';
+  });
 }
 
 async function skShowLeagueAvailability() {
