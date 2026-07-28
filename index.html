@@ -125723,7 +125723,219 @@ function espIsSeasonPts(row) {
 
 // ESPN's own standings table, so season-points leagues get TOT / TODAY
 // instead of a column of zeros.
+// ── ESPN SEASON STATS ── ESPSEASONSTATS ──
+// ESPN's own standings screen filters three ways: Points, Season Stats and
+// Daily Stats. This is Season Stats, and it costs NO new request —
+// teams[].valuesByStat is already in row.raw from the mTeam sync. A probe
+// confirmed it is populated for POINTS leagues too, not just categories:
+// 10 of 10 teams, 17 stat ids each, across both points leagues.
+//
+// Columns are SPLIT into BATTING and PITCHING groups, and that is not
+// decoration. ESP_STAT_NAME_FLB maps two different stats to the same label
+// three times over — H is both 1 (batting hits) and 37 (hits allowed), BB is
+// both 10 (drawn) and 39 (allowed), K is both 27 (batter) and 48 (pitcher) —
+// and a points league scores ALL SIX. Flat, the table would carry two
+// columns called H, two called BB and two called K with nothing to tell them
+// apart. Under group headers the short labels are unambiguous again.
+//
+// Which id is which was derived from the leagues' own rate stats rather than
+// assumed, because guessing here produces a table that looks right and isn't:
+//   1 H / 0 AB               = .2532  vs scored AVG  .253      -> 1 is batting
+//   45 ER * 9 / 34 IP        = 3.368  vs scored ERA  3.36831   -> 37/45 pitching
+//   (39 BB + 37 H) / 34 IP   = 1.1485 vs scored WHIP 1.14851   -> 39 is allowed
+// The 27/48 strikeout split is weaker evidence — 48 sits with the pitching
+// categories in the H2H_CATEGORY league — so it is grouping, not arithmetic.
+
+// ESPN's MLB stat ids run batting 0-29 and pitching 32-60. Every id this app
+// has actually seen fits that split, and the probe dumps agree (27 batter SO
+// grouped with the batting categories, 48 pitcher K with the pitching ones).
+// An unseen id falls back to the boundary rather than being dropped, so a
+// stat ESPN adds later still lands somewhere sensible instead of vanishing.
+function espStatSide(game, id) {
+  if (game !== 'flb') return 'b';    // only baseball splits into two groups
+  return (Number(id) < 32) ? 'b' : 'p';
+}
+
+// Inside a BATTING group, a batter's strikeouts read better as SO than K,
+// which is also what ESPN's own screen shows.
+var ESP_STAT_LABEL_OVER = { 27: 'SO' };
+
+function espStatLabel(game, id) {
+  if (game === 'flb' && ESP_STAT_LABEL_OVER[id]) return ESP_STAT_LABEL_OVER[id];
+  return espStatName(game, id) || '';
+}
+
+function _espSsGame(row) {
+  var sp = String((row && row.sport) || '').toLowerCase();
+  if (sp === 'nfl') return 'ffl';
+  if (sp === 'nba') return 'fba';
+  if (sp === 'nhl') return 'fhl';
+  return 'flb';
+}
+
+// Does this league have anything to show? Drives whether the toggle appears
+// at all, so a league without the field never offers an empty tab.
+function espHasSeasonStats(row) {
+  var teams = ((row && row.raw) || {}).teams || [];
+  for (var i = 0; i < teams.length; i++) {
+    if (teams[i] && teams[i].valuesByStat) return true;
+  }
+  return false;
+}
+
+// Column list in scoringItems order — the league's own scoring order, which
+// is the order its manager already thinks in. Ids with no label are skipped:
+// the probe found two (33 and 35) that are unmapped AND unscored, so showing
+// them as "?" would add noise and no information.
+function _espSsCols(row, game) {
+  var items = ((((row.raw || {}).settings || {}).scoringSettings) || {}).scoringItems || [];
+  var teams = ((row.raw || {}).teams) || [];
+  var bat = [], pit = [], seen = {}, i, j;
+  for (i = 0; i < items.length; i++) {
+    var id = items[i] && items[i].statId;
+    if (id == null) continue;
+    var key = String(id);
+    if (seen[key]) continue;
+    var label = espStatLabel(game, key);
+    if (!label) continue;
+    var any = false;
+    for (j = 0; j < teams.length; j++) {
+      var vb = teams[j] && teams[j].valuesByStat;
+      if (vb && vb[key] != null) { any = true; break; }
+    }
+    if (!any) continue;
+    seen[key] = 1;
+    var col = { id: key, label: label };
+    if (espStatSide(game, key) === 'p') pit.push(col); else bat.push(col);
+  }
+  return { bat: bat, pit: pit };
+}
+
+function _espSeasonStatsHtml(row) {
+  var game = _espSsGame(row);
+  var teams = ((row.raw || {}).teams) || [];
+  var cols = _espSsCols(row, game);
+  var all = cols.bat.concat(cols.pit);
+  if (!all.length) {
+    return '<div style="color:rgba(255,255,255,0.35);font-size:12px;">' +
+      'ESPN hasn\u2019t sent per-team season stats for this league.</div>';
+  }
+
+  // Same order the Points view uses, so switching tabs doesn't reshuffle the
+  // table under the reader.
+  var seasonPts = (typeof espIsSeasonPts === 'function') ? espIsSeasonPts(row) : false;
+  var srows = (row.standingsAll || []).slice(0);
+  if (seasonPts) srows.sort(function (a, b) { return (b.pf || 0) - (a.pf || 0); });
+  var byId = {}, i, j;
+  for (i = 0; i < teams.length; i++) byId[String(teams[i].id)] = teams[i];
+
+  var myIds = row.myTeamIds || {};
+  var accent = extProvAccent('espn');
+  var mono = 'font-family:var(--sk-font-mono,monospace);';
+  var cellPad = 'padding:5px 7px;text-align:right;white-space:nowrap;';
+  var stick = 'position:sticky;left:0;z-index:2;background:#0b0f19;';
+
+  var h = '<div data-espstand>';
+  h += _espStandToggleHtml(row, 'season');
+  h += '<div style="overflow-x:auto;-webkit-overflow-scrolling:touch;">';
+  h += '<table style="border-collapse:collapse;font-size:11.5px;min-width:100%;">';
+
+  // Group header. colspan 0 is invalid, so a group with no columns is simply
+  // not emitted — an NBA/NHL league puts everything in one group.
+  h += '<thead><tr style="color:rgba(255,255,255,0.3);font-size:9px;letter-spacing:0.1em;">' +
+    '<th style="' + stick + cellPad + 'text-align:left;"></th>';
+  if (cols.bat.length) {
+    h += '<th colspan="' + cols.bat.length + '" style="' + cellPad +
+      'text-align:center;border-bottom:1px solid rgba(255,255,255,0.10);">' +
+      (game === 'flb' ? 'BATTING' : 'TEAM') + '</th>';
+  }
+  if (cols.pit.length) {
+    h += '<th colspan="' + cols.pit.length + '" style="' + cellPad +
+      'text-align:center;border-bottom:1px solid rgba(255,255,255,0.10);' +
+      'border-left:1px solid rgba(255,255,255,0.14);">PITCHING</th>';
+  }
+  h += '</tr>';
+
+  h += '<tr style="color:rgba(255,255,255,0.42);font-size:9px;letter-spacing:0.08em;">' +
+    '<th style="' + stick + cellPad + 'text-align:left;">TEAM</th>';
+  for (i = 0; i < all.length; i++) {
+    var first = (cols.bat.length && i === cols.bat.length);
+    h += '<th style="' + cellPad + (first ? 'border-left:1px solid rgba(255,255,255,0.14);' : '') +
+      '">' + slEsc(all[i].label) + '</th>';
+  }
+  h += '</tr></thead><tbody>';
+
+  for (i = 0; i < srows.length; i++) {
+    var sr = srows[i];
+    var t = byId[String(sr.teamId)];
+    var vb = (t && t.valuesByStat) || null;
+    var mine = !!myIds[sr.teamId];
+    var bg = mine ? 'background:rgba(239,68,68,0.10);' : '';
+    h += '<tr>' +
+      '<td style="' + stick + cellPad + 'text-align:left;max-width:118px;overflow:hidden;' +
+      'text-overflow:ellipsis;' + (mine ? 'background:#1a0f13;' : '') +
+      'color:' + (mine ? accent + ';font-weight:700' : 'rgba(255,255,255,0.82)') + ';">' +
+      slEsc(t && t.abbrev ? t.abbrev : (sr.teamName || '?')) + '</td>';
+    for (j = 0; j < all.length; j++) {
+      var v = vb ? vb[all[j].id] : null;
+      var edge = (cols.bat.length && j === cols.bat.length)
+        ? 'border-left:1px solid rgba(255,255,255,0.14);' : '';
+      h += '<td style="' + cellPad + mono + bg + edge +
+        'color:rgba(255,255,255,' + (mine ? '0.95' : '0.72') + ');">' +
+        (v == null ? '\u2014' : slEsc(espStatFmt(all[j].id, v))) + '</td>';
+    }
+    h += '</tr>';
+  }
+  h += '</tbody></table></div>';
+  h += '<div style="color:rgba(255,255,255,0.28);font-size:9.5px;margin-top:8px;line-height:1.5;">' +
+    'Season totals from ESPN\u2019s own per-team values, in this league\u2019s ' +
+    'scoring order. Swipe the table sideways for the rest.</div>';
+  h += '</div>';
+  return h;
+}
+
+// Which view each league is on. Keyed by league so switching leagues doesn't
+// carry one league's choice into another.
+var _espStandView = {};
+
+function _espStandToggleHtml(row, active) {
+  if (!espHasSeasonStats(row)) return '';
+  var key = String(row.key || '').replace(/'/g, '');
+  function tab(id, label) {
+    var on = (active === id);
+    return '<button onclick="espSetStandView(\'' + key + '\',\'' + id + '\')" ' +
+      'style="flex:1;padding:6px 4px;border-radius:7px;border:1px solid ' +
+      (on ? 'rgba(239,68,68,0.55)' : 'rgba(255,255,255,0.12)') + ';' +
+      'background:' + (on ? 'rgba(239,68,68,0.14)' : 'transparent') + ';' +
+      'color:' + (on ? '#ef4444' : 'rgba(255,255,255,0.55)') + ';' +
+      'font-size:10px;font-weight:700;letter-spacing:0.06em;">' + label + '</button>';
+  }
+  return '<div style="display:flex;gap:6px;margin:0 0 9px;">' +
+    tab('pts', 'POINTS') + tab('season', 'SEASON STATS') + '</div>';
+}
+
+function espSetStandView(key, view) {
+  _espStandView[key] = view;
+  var row = null, list = [], i;
+  try { if (typeof extSyncedLeagues === 'function') list = extSyncedLeagues() || []; } catch (e) {}
+  for (i = 0; i < list.length; i++) {
+    if (list[i] && String(list[i].key) === String(key)) { row = list[i]; break; }
+  }
+  if (!row) return;
+  // Swap the pane in place rather than re-rendering the whole league view,
+  // which would lose the scroll position on a long standings table.
+  var host = document.querySelector('[data-espstand]');
+  if (host) host.outerHTML = _espStandingsPaneHtml(row);
+}
+
 function _espStandingsPaneHtml(row) {
+  // Season Stats is a second view of the SAME pane, swapped in place by
+  // espSetStandView. Checked before the standingsAll guard because a league
+  // can carry valuesByStat while its standings rows are still empty.
+  // ESPSEASONSTATS
+  if (_espStandView[String(row && row.key)] === 'season' && espHasSeasonStats(row)) {
+    return _espSeasonStatsHtml(row);
+  }
   var rows = row && row.standingsAll;
   if (!rows || !rows.length) {
     return '<div style="color:rgba(255,255,255,0.35);font-size:12px;">No standings yet.</div>';
@@ -125742,6 +125954,7 @@ function _espStandingsPaneHtml(row) {
 
   var recW = cats ? 76 : 56;
   var h = '<div data-espstand>';
+  h += _espStandToggleHtml(row, 'pts');   // ESPSEASONSTATS
   h += '<div style="display:flex;align-items:baseline;gap:8px;padding:0 0 5px;' +
     'border-bottom:1px solid rgba(255,255,255,0.08);font-size:9px;letter-spacing:0.1em;' +
     'color:rgba(255,255,255,0.3);">' +
