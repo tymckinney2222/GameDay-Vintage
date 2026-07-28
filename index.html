@@ -124541,6 +124541,27 @@ var ESP_SPLIT_SEASON = 0, ESP_SPLIT_7 = 1, ESP_SPLIT_15 = 2, ESP_SPLIT_30 = 3, E
 
 // Pull one stat entry. Passing null for period means "don't care", which
 // matters because season entries carry scoringPeriodId 0.
+// Every entry matching the filter, not just the first.
+//
+// A DOUBLEHEADER puts TWO split-5 entries under the SAME scoringPeriodId,
+// one per game, distinguished only by externalId (the ESPN game id).
+// espStatEntry returns the first and stops, so the second game's line was
+// silently dropped — a player could read 0 FP here while ESPN's app showed
+// 4, and the miss looked random because it depended purely on which game
+// happened to sit first in the array. ESPDH
+function espStatEntries(pl, src, split, season, period) {
+  var st = (pl && pl.stats) || [], out = [], i;
+  for (i = 0; i < st.length; i++) {
+    var e = st[i] || {};
+    if (e.statSourceId !== src) continue;
+    if (e.statSplitTypeId !== split) continue;
+    if (season != null && Number(e.seasonId) !== Number(season)) continue;
+    if (period != null && Number(e.scoringPeriodId) !== Number(period)) continue;
+    out.push(e);
+  }
+  return out;
+}
+
 function espStatEntry(pl, src, split, season, period) {
   var st = (pl && pl.stats) || [];
   for (var i = 0; i < st.length; i++) {
@@ -124819,19 +124840,35 @@ function espBuildWindows(pl, season, period, scoredIds) {
   for (i = 0; i < ESP_WINDOWS.length; i++) {
     w = ESP_WINDOWS[i];
     var sn = w.prevSeason ? (Number(season) - 1) : season;
-    e = espStatEntry(pl, w.src, w.split, sn, w.useCur ? period : null);
-    if (!e) { out[w.key] = null; continue; }
-    var st = {};
-    if (e.stats && scoredIds) {
-      for (k = 0; k < scoredIds.length; k++) {
-        var id = scoredIds[k];
-        if (e.stats[id] != null) st[id] = e.stats[id];
+    var es = espStatEntries(pl, w.src, w.split, sn, w.useCur ? period : null);
+    if (!es.length) { out[w.key] = null; continue; }
+    var st = {}, total = null, n, j;
+    for (n = 0; n < es.length; n++) {
+      e = es[n];
+      if (e.stats && scoredIds) {
+        for (k = 0; k < scoredIds.length; k++) {
+          var id = scoredIds[k];
+          if (e.stats[id] == null) continue;
+          // Counting stats add up across games. RATE stats do NOT — summing
+          // two AVGs or two ERAs produces a number that is simply false — so
+          // on a doubleheader they are dropped instead. espScoredIds already
+          // keeps AB/H/IP/ER/BB for cats leagues precisely so the rates can
+          // be rebuilt downstream from components that DO add. ESPDH
+          if (es.length > 1 && ESP_STAT_RATE[id]) continue;
+          st[id] = (st[id] == null ? 0 : st[id]) + Number(e.stats[id]);
+        }
       }
+      var t = espAppliedTotal(e);
+      if (t != null) total = (total == null ? 0 : total) + t;
     }
+    if (total != null) total = Math.round(total * 10) / 10;
     // appliedAverage is ESPN's own per-game number - the app's AVG column.
     // Ohtani reads 287 total / 2.9 avg, exactly what the app shows.
-    var avg = (e.appliedAverage != null) ? Math.round(Number(e.appliedAverage) * 10) / 10 : null;
-    out[w.key] = { total: espAppliedTotal(e), avg: avg, stats: st };
+    // Across two games in one day there is no single per-game average to
+    // report, so it is left blank rather than invented.
+    var avg = (es.length === 1 && es[0].appliedAverage != null)
+      ? Math.round(Number(es[0].appliedAverage) * 10) / 10 : null;
+    out[w.key] = { total: total, avg: avg, stats: st, games: es.length };
   }
   return out;
 }
@@ -125928,6 +125965,33 @@ function espSetStandView(key, view) {
   if (host) host.outerHTML = _espStandingsPaneHtml(row);
 }
 
+// Season points INCLUDING today's in-progress starters.
+//
+// team.points is the sum of COMPLETED scoring periods only. The probe caught
+// it directly: CORKED read 3095 here while ESPN's own standings showed 3110,
+// and the 15-point gap was exactly that day's starters. The matchup card
+// already composes its number this way in espLiveScores; the standings pane
+// was the one place still showing the stale figure.
+//
+// Guarded against double counting: if the team object carries
+// pointsByScoringPeriod WITH today's period already in it, the base total
+// includes today and nothing is added. ESPLIVETOT
+function espLiveTeamTotal(row, teamId, basePf) {
+  var base = (basePf == null) ? null : Number(basePf);
+  var td = (typeof espTodayTeamTotal === 'function')
+    ? espTodayTeamTotal(row && row.rosters, teamId) : null;
+  if (td == null || base == null) return base;
+  var per = (row && row.rosters && row.rosters.period);
+  var teams = ((row && row.raw) || {}).teams || [], i;
+  for (i = 0; i < teams.length; i++) {
+    if (String(teams[i].id) !== String(teamId)) continue;
+    var pbs = teams[i].pointsByScoringPeriod;
+    if (pbs && per != null && pbs[String(per)] != null) return base;
+    break;
+  }
+  return Math.round((base + td) * 10) / 10;
+}
+
 function _espStandingsPaneHtml(row) {
   // Season Stats is a second view of the SAME pane, swapped in place by
   // espSetStandView. Checked before the standingsAll guard because a league
@@ -125947,9 +126011,15 @@ function _espStandingsPaneHtml(row) {
   var i;
 
   // Season leagues sort on total points; ESPN's playoffSeed is 0 there.
+  // Sorted on the LIVE total so the order matches the numbers on screen —
+  // ranking by the stale figure while displaying the live one would put a
+  // smaller number above a bigger one. ESPLIVETOT
   var list = rows.slice(0);
   if (seasonPts) {
-    list.sort(function (a, b) { return (b.pf || 0) - (a.pf || 0); });
+    list.sort(function (a, b) {
+      return (espLiveTeamTotal(row, b.teamId, b.pf) || 0) -
+             (espLiveTeamTotal(row, a.teamId, a.pf) || 0);
+    });
   }
 
   var recW = cats ? 76 : 56;
@@ -125997,9 +126067,10 @@ function _espStandingsPaneHtml(row) {
         })() +
       '</span>';
     if (seasonPts) {
+      var liveTot = espLiveTeamTotal(row, r.teamId, r.pf);   // ESPLIVETOT
       h += '<span style="flex:0 0 62px;text-align:right;font-family:var(--sk-font-mono,monospace);' +
           'font-weight:700;color:rgba(255,255,255,0.85);">' +
-          ((r.pf != null) ? r.pf : '\u2014') + '</span>' +
+          ((liveTot != null) ? liveTot : '\u2014') + '</span>' +
         '<span style="flex:0 0 48px;text-align:right;font-family:var(--sk-font-mono,monospace);' +
           'font-weight:700;color:' +
           (today == null ? 'rgba(255,255,255,0.25)'
@@ -126019,7 +126090,8 @@ function _espStandingsPaneHtml(row) {
   }
   if (seasonPts) {
     h += '<div style="color:rgba(255,255,255,0.28);font-size:9.5px;margin-top:8px;line-height:1.5;">' +
-      'TODAY is each team\u2019s starters so far today \u00b7 ESPN calls this column CHG</div>';
+      'TOTAL includes today\u2019s starters so far \u00b7 TODAY is that same figure ' +
+      'on its own \u00b7 ESPN calls it CHG</div>';
   }
   h += '</div>';
   return h;
