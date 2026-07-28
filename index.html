@@ -26652,6 +26652,10 @@
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
       <span>League availability</span>
     </button>
+    <button class="sk-account-item" onclick="skCloseAccountMenu(); skRunEspSeasonStatsProbe();">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18M7 16V9M12 16V5M17 16v-4"/></svg>
+      <span>ESPN season stats probe</span>
+    </button>
     <button class="sk-account-item" onclick="skCloseAccountMenu(); skRunAuthDeepProbe();">
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15 7h3a5 5 0 0 1 0 10h-3M9 17H6A5 5 0 0 1 6 7h3M8 12h8"/></svg>
       <span>Auth path probe</span>
@@ -119854,6 +119858,184 @@ function skRunAuthDeepProbe() {
       '<div style="color:#ef4444">Probe failed: ' +
       skEscapeMaybe(String((e && e.message) || e)) + '</div>';
   });
+}
+
+// ── TEMPORARY PROBE: ESPN per-team season stats ── ESPVBSPROBE ──
+// ESPN's own app filters its standings three ways: Points, Season Stats and
+// Daily Stats. We render Points only. teams[].valuesByStat looks like the
+// source for Season Stats — it holds each team's season totals keyed by the
+// same statIds everything else uses, and it is ALREADY in row.raw, because
+// the league sync fetches ?view=mTeam&view=mSettings.
+//
+// The catch is that every existing use of valuesByStat in this file is on a
+// CATEGORIES league (espSeasonCatRows returns null for anything else), so
+// there is no evidence it is populated for a POINTS league. Building a
+// standings table on a field that turns out to be empty or thin is a wasted
+// build, and worse, one that looks finished until someone opens it.
+//
+// So: dump it first. The numbers to check are the ones on ESPN's own
+// screen — for the Kansas City league, the CORKED/BATS row read
+// SB 70, IP 548.1, H 482, ER 244 against a TOT of 3110.
+var _espVbsLines = [];
+
+function _espVbsLog(s) {
+  _espVbsLines.push(s);
+}
+
+function _espVbsGame(row) {
+  var sp = String((row && row.sport) || '').toLowerCase();
+  if (sp === 'nfl') return 'ffl';
+  if (sp === 'nba') return 'fba';
+  if (sp === 'nhl') return 'fhl';
+  return 'flb';
+}
+
+function _espVbsCount(o) {
+  var n = 0, k;
+  for (k in o) { if (o.hasOwnProperty(k)) n++; }
+  return n;
+}
+
+function _espVbsDumpLeague(row) {
+  var game = _espVbsGame(row);
+  var cats = (typeof espIsCats === 'function') ? espIsCats(row) : false;
+  var st = String(((((row.raw || {}).settings || {}).scoringSettings) || {}).scoringType || '?');
+  var teams = ((row.raw || {}).teams) || [];
+
+  _espVbsLog('');
+  _espVbsLog('=== ' + (row.name || row.key) + ' ===');
+  _espVbsLog('  sport ' + row.sport + ' \u00b7 game ' + game +
+    ' \u00b7 season ' + (row.season || '?') +
+    ' \u00b7 scoringType "' + st + '" \u00b7 ' + (cats ? 'CATEGORIES' : 'POINTS'));
+  _espVbsLog('  teams in raw: ' + teams.length);
+
+  if (!teams.length) {
+    _espVbsLog('  >> row.raw has no teams[] \u2014 the mTeam view did not land');
+    return;
+  }
+
+  // Which statIds does this league actually score? For a points league this
+  // is the natural column set for a Season Stats table.
+  var items = ((((row.raw || {}).settings || {}).scoringSettings) || {}).scoringItems || [];
+  var scored = [], si;
+  for (si = 0; si < items.length; si++) {
+    if (items[si] && items[si].statId != null) scored.push(String(items[si].statId));
+  }
+  _espVbsLog('  scoringItems: ' + scored.length + ' stat ids');
+
+  var myIds = (row.myTeamIds || {});
+  var withVbs = 0, i, k;
+  for (i = 0; i < teams.length; i++) {
+    if (teams[i] && teams[i].valuesByStat) withVbs++;
+  }
+  _espVbsLog('  >> teams carrying valuesByStat: ' + withVbs + ' of ' + teams.length);
+  if (!withVbs) {
+    _espVbsLog('  >> EMPTY for this league \u2014 Season Stats cannot come from here');
+    return;
+  }
+
+  for (i = 0; i < teams.length; i++) {
+    var t = teams[i] || {};
+    var isMine = !!myIds[String(t.id)];
+    var vbs = t.valuesByStat || null;
+    var label = (t.abbrev || '') + ' ' + (t.name ||
+      ((t.location || '') + ' ' + (t.nickname || '')).replace(/^\s+|\s+$/g, '') || ('team ' + t.id));
+    _espVbsLog('  ' + (isMine ? '* ' : '  ') + label +
+      ' \u00b7 id ' + t.id +
+      ' \u00b7 valuesByStat keys: ' + (vbs ? _espVbsCount(vbs) : 0) +
+      (t.points != null ? ' \u00b7 points ' + t.points : ''));
+    if (!vbs || !isMine) continue;
+
+    // Full dump for MY team only — this is the row to hold against ESPN's
+    // own screen. Scored stats first, since those are the candidate columns,
+    // then anything else the payload carries.
+    var seen = {}, out = [], j, id;
+    for (j = 0; j < scored.length; j++) {
+      id = scored[j];
+      if (vbs[id] == null || seen[id]) continue;
+      seen[id] = 1;
+      out.push('      ' + id + ' ' + (espStatName(game, id) || '?') +
+        ' = ' + espStatFmt(id, vbs[id]) + '   (raw ' + vbs[id] + ')');
+    }
+    if (out.length) {
+      _espVbsLog('    SCORED STATS (' + out.length + '):');
+      for (j = 0; j < out.length; j++) _espVbsLog(out[j]);
+    }
+    var extra = [];
+    for (k in vbs) {
+      if (!vbs.hasOwnProperty(k) || seen[k]) continue;
+      extra.push('      ' + k + ' ' + (espStatName(game, k) || '?') +
+        ' = ' + espStatFmt(k, vbs[k]) + '   (raw ' + vbs[k] + ')');
+    }
+    if (extra.length) {
+      _espVbsLog('    OTHER STATS PRESENT (' + extra.length + '):');
+      for (j = 0; j < extra.length; j++) _espVbsLog(extra[j]);
+    }
+  }
+}
+
+function skRunEspSeasonStatsProbe() {
+  var host = document.getElementById('_espVbsHost');
+  if (host && host.parentNode) host.parentNode.removeChild(host);
+  host = document.createElement('div');
+  host.id = '_espVbsHost';
+  host.style.cssText = 'position:fixed;inset:0;z-index:2147483000;background:rgba(4,7,13,0.96);overflow:auto;padding:18px;font-family:JetBrains Mono,monospace;font-size:11px;color:#cbd5e1;line-height:1.55';
+  var closeBtn = '<button onclick="var h=document.getElementById(\'_espVbsHost\');if(h&&h.parentNode)h.parentNode.removeChild(h);" style="position:sticky;top:0;float:right;width:36px;height:36px;border-radius:8px;border:1px solid rgba(255,255,255,0.2);background:#0d1220;color:#e2e8f0;font-size:16px;font-weight:700">\u2715</button>';
+  var title = '<div style="color:#ef4444;font-weight:700;font-size:14px;margin-bottom:10px">ESPN Season Stats Probe</div>';
+  document.body.appendChild(host);
+
+  _espVbsLines = [];
+  _espVbsLog('ESPN valuesByStat PROBE');
+  _espVbsLog(new Date().toString());
+
+  var list = [];
+  try {
+    if (typeof extSyncedLeagues === 'function') list = extSyncedLeagues() || [];
+  } catch (e) {}
+  var esp = [], i;
+  for (i = 0; i < list.length; i++) {
+    if (list[i] && list[i].provider === 'espn') esp.push(list[i]);
+  }
+  _espVbsLog('ESPN leagues synced: ' + esp.length);
+
+  if (!esp.length) {
+    _espVbsLog('');
+    _espVbsLog('Nothing to read. Open an ESPN league once so it syncs, then rerun.');
+  }
+  for (i = 0; i < esp.length; i++) {
+    try { _espVbsDumpLeague(esp[i]); }
+    catch (e2) {
+      _espVbsLog('  FAILED on ' + ((esp[i] && esp[i].name) || '?') +
+        ' \u2014 ' + ((e2 && e2.message) || e2));
+    }
+  }
+
+  _espVbsLog('');
+  _espVbsLog('WHAT TO CHECK: open the same league in ESPN\u2019s app, Standings >');
+  _espVbsLog('Season Stats, and compare YOUR row (marked *) column by column.');
+  _espVbsLog('If the numbers match, a Season Stats table needs no new fetch.');
+
+  var body = skEscapeMaybe(_espVbsLines.join('\n')).replace(/\n/g, '<br>');
+  host.innerHTML = closeBtn + title +
+    '<div style="white-space:normal;word-break:break-word">' + body + '</div>' +
+    '<div style="margin-top:16px">' +
+      '<button onclick="skRunEspSeasonStatsProbe()" style="padding:8px 18px;border-radius:999px;border:1px solid rgba(255,255,255,0.25);background:none;color:#e2e8f0;font-size:11px;font-weight:700">Run again</button> ' +
+      '<button onclick="_espVbsSave()" style="padding:8px 18px;border-radius:999px;border:1px solid rgba(255,255,255,0.25);background:none;color:#e2e8f0;font-size:11px;font-weight:700">\u2b07 Save .txt</button>' +
+    '</div>';
+}
+
+function _espVbsSave() {
+  if (!_espVbsLines.length) return;
+  var blob = new Blob([_espVbsLines.join('\r\n')], { type: 'text/plain;charset=utf-8' });
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement('a');
+  a.href = url;
+  a.download = 'esp-valuesbystat-' +
+    new Date().toISOString().slice(0, 19).replace(/[:T]/g, '') + '.txt';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(function () { URL.revokeObjectURL(url); }, 1500);
 }
 
 async function skShowLeagueAvailability() {
