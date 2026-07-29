@@ -125992,6 +125992,61 @@ function espLiveTeamTotal(row, teamId, basePf) {
   return Math.round((base + td) * 10) / 10;
 }
 
+// My team id in a synced league, or null.
+function espMyTeamId(row) {
+  var k;
+  for (k in ((row && row.myTeamIds) || {})) {
+    if (row.myTeamIds.hasOwnProperty(k)) return k;
+  }
+  return null;
+}
+
+// ONE live-sorted view of a season-points league, computed once and shared.
+//
+// The standings pane, the Today card and the pace line each used to derive
+// their own ordering from the stale team.points, so the moment TOTAL went
+// live they could disagree about who is 7th — the pane ranking on the live
+// number while the card still ranked on the completed one. Everything reads
+// this instead. The per-team total is computed once here rather than inside
+// a comparator, where it would have run O(n log n) times. ESPLIVETOT
+function espLiveStandings(row) {
+  var rows = (row && row.standingsAll) || [];
+  var live = {}, list = rows.slice(0), i;
+  for (i = 0; i < rows.length; i++) {
+    live[String(rows[i].teamId)] = espLiveTeamTotal(row, rows[i].teamId, rows[i].pf);
+  }
+  list.sort(function (a, b) {
+    return (live[String(b.teamId)] || 0) - (live[String(a.teamId)] || 0);
+  });
+  return { list: list, live: live };
+}
+
+// My live season total, for the surfaces that show a single number.
+function espMyLiveTotal(row) {
+  var id = espMyTeamId(row);
+  if (id == null) return null;
+  var sr = (row && row.standings) || null;
+  var base = (sr && sr.pf != null) ? sr.pf : null;
+  if (base == null) {
+    var rows = (row && row.standingsAll) || [], i;
+    for (i = 0; i < rows.length; i++) {
+      if (String(rows[i].teamId) === String(id)) { base = rows[i].pf; break; }
+    }
+  }
+  return espLiveTeamTotal(row, id, base);
+}
+
+// My rank under the live ordering, 1-based, or null.
+function espMyLiveRank(row) {
+  var id = espMyTeamId(row);
+  if (id == null) return null;
+  var ls = espLiveStandings(row), i;
+  for (i = 0; i < ls.list.length; i++) {
+    if (String(ls.list[i].teamId) === String(id)) return i + 1;
+  }
+  return null;
+}
+
 function _espStandingsPaneHtml(row) {
   // Season Stats is a second view of the SAME pane, swapped in place by
   // espSetStandView. Checked before the standingsAll guard because a league
@@ -126011,15 +126066,13 @@ function _espStandingsPaneHtml(row) {
   var i;
 
   // Season leagues sort on total points; ESPN's playoffSeed is 0 there.
-  // Sorted on the LIVE total so the order matches the numbers on screen —
-  // ranking by the stale figure while displaying the live one would put a
-  // smaller number above a bigger one. ESPLIVETOT
-  var list = rows.slice(0);
+  // Ordering and totals both come from the shared live view, so the pane
+  // can't rank on one number while displaying another. ESPLIVETOT
+  var list = rows.slice(0), liveMap = null;
   if (seasonPts) {
-    list.sort(function (a, b) {
-      return (espLiveTeamTotal(row, b.teamId, b.pf) || 0) -
-             (espLiveTeamTotal(row, a.teamId, a.pf) || 0);
-    });
+    var _ls = espLiveStandings(row);
+    list = _ls.list;
+    liveMap = _ls.live;
   }
 
   var recW = cats ? 76 : 56;
@@ -126067,7 +126120,7 @@ function _espStandingsPaneHtml(row) {
         })() +
       '</span>';
     if (seasonPts) {
-      var liveTot = espLiveTeamTotal(row, r.teamId, r.pf);   // ESPLIVETOT
+      var liveTot = liveMap ? liveMap[String(r.teamId)] : r.pf;   // ESPLIVETOT
       h += '<span style="flex:0 0 62px;text-align:right;font-family:var(--sk-font-mono,monospace);' +
           'font-weight:700;color:rgba(255,255,255,0.85);">' +
           ((liveTot != null) ? liveTot : '\u2014') + '</span>' +
@@ -126442,13 +126495,14 @@ function _espFlowTableHtml(row) {
 // immediately behind, since that's who's chasing. ESPN3D
 function espSeasonPace(row) {
   if (!row || !espIsSeasonPts(row) || !row.standingsAll || !row.standingsAll.length) return null;
-  var myId = null, k;
-  for (k in (row.myTeamIds || {})) { if (row.myTeamIds.hasOwnProperty(k)) { myId = k; break; } }
-  if (!myId) return null;
+  var myId = espMyTeamId(row);
+  if (myId == null) return null;
 
-  // Season leagues rank on total points; playoffSeed is 0 there.
-  var list = row.standingsAll.slice(0);
-  list.sort(function (a, b) { return (b.pf || 0) - (a.pf || 0); });
+  // Same live ordering the standings pane uses. Ranking here on the stale
+  // team.points while the pane ranked on the live total would have the card
+  // saying "7th" next to a tab saying 6th. ESPLIVETOT
+  var _ls = espLiveStandings(row);
+  var list = _ls.list, live = _ls.live;
   var idx = -1, i;
   for (i = 0; i < list.length; i++) { if (list[i].teamId === String(myId)) { idx = i; break; } }
   if (idx === -1) return null;
@@ -126469,8 +126523,10 @@ function espSeasonPace(row) {
     target: target,
     targetRank: targetIdx + 1,
     targetToday: theirToday,
-    // Points between us, so the card can say how much ground the day moved.
-    gap: Math.round(((target.pf || 0) - (list[idx].pf || 0)) * 10) / 10,
+    // Points between us, live on both sides — a gap measured against a
+    // stale total would misstate how much ground today actually moved.
+    gap: Math.round(((live[String(target.teamId)] || 0) -
+                     (live[String(list[idx].teamId)] || 0)) * 10) / 10,
     delta: delta,
     chasing: idx !== 0
   };
@@ -128160,10 +128216,20 @@ function skBuildExtCardHTML(l) {
   var headerRight = '';
   if (l.standings && l.standings.rank) {
     var hs = l.standings;
+    // Season-points leagues show a total here rather than a W-L-T, so it has
+    // to be the live one, and the rank has to come from the live ordering —
+    // otherwise the header could read "3095 · 7th" beside a standings tab
+    // showing 3126 and 6th. ESPLIVETOT
+    var _hLive = (l.provider === 'espn' && typeof espIsSeasonPts === 'function' &&
+                  espIsSeasonPts(l) && typeof espMyLiveTotal === 'function')
+      ? espMyLiveTotal(l) : null;
+    var _hRank = (_hLive != null && typeof espMyLiveRank === 'function')
+      ? espMyLiveRank(l) : null;
+    var _hPf = (_hLive != null) ? _hLive : hs.pf;
     var recPart = hs.record ? hs.record
-      : (hs.pf != null && Number(hs.pf) > 0) ? (Math.round(Number(hs.pf) * 10) / 10 + '')
+      : (_hPf != null && Number(_hPf) > 0) ? (Math.round(Number(_hPf) * 10) / 10 + '')
       : '';
-    var rankPart = _skOrdinal(hs.rank) + ' of ' + (hs.total || '?');
+    var rankPart = _skOrdinal(_hRank || hs.rank) + ' of ' + (hs.total || '?');
     headerRight = recPart ? (recPart + ' \u00b7 ' + rankPart) : rankPart;
   }
 
@@ -128244,11 +128310,18 @@ function skBuildExtCardHTML(l) {
     // ESPNSLICE2Q / ESPN3D
     ((l.provider === 'espn' && typeof espIsSeasonPts === 'function' && espIsSeasonPts(l) &&
       l.standings && l.standings.pf != null)
-      ? '<div class="sk-card-score-row">' +
-          '<span class="sk-ext-myscore" style="color:' + accent + '">' + l.standings.pf + '</span>' +
-          '<span class="sk-ext-oppname"> season points</span>' +
-        '</div>' +
-        ((typeof _espSeasonPaceHtml === 'function') ? _espSeasonPaceHtml(l, accent) : '')
+      ? (function () {
+          // The live total, not team.points — that figure covers COMPLETED
+          // scoring periods only, so the card was reading 3095 while the
+          // standings tab beside it read 3126. ESPLIVETOT
+          var _lt = (typeof espMyLiveTotal === 'function') ? espMyLiveTotal(l) : null;
+          if (_lt == null) _lt = l.standings.pf;
+          return '<div class="sk-card-score-row">' +
+            '<span class="sk-ext-myscore" style="color:' + accent + '">' + _lt + '</span>' +
+            '<span class="sk-ext-oppname"> season points</span>' +
+          '</div>' +
+          ((typeof _espSeasonPaceHtml === 'function') ? _espSeasonPaceHtml(l, accent) : '');
+        })()
       : '') +
     // Lineup CTA — the external cousin of Yahoo's "Today's Lineup" row.
     // Only shown once a roster actually exists. stopPropagation keeps the
