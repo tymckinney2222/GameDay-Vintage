@@ -126547,25 +126547,57 @@ function espFreezeAdjust(row) {
 }
 
 // ── SNAPSHOT TREND ── ESPTREND ──
-// Day-over-day movement from the stored snapshots. Yahoo's daily-delta table
-// does the same from its own snaps.
+// Day-over-day movement from the stored snapshots, matching Yahoo's daily
+// delta and weekly totals tables.
 //
-// Reads the COMPLETED-period totals (pfByTeam), never the live ones. A live
-// figure means something different depending on what time of day the capture
-// ran, so a series built from it would show swings that are artefacts of when
-// the app was opened rather than of anything that happened on the field.
-function espSnapshotTrend(row, maxDays) {
+// ATTRIBUTION, and this is the part that is easy to get wrong. A snapshot
+// holds team.points, which counts COMPLETED scoring periods only — so a
+// capture taken on Tuesday, at any hour, reflects totals through MONDAY
+// night. The difference between a Tuesday snapshot and a Wednesday snapshot
+// is therefore what was scored on TUESDAY, and it belongs on the Tuesday
+// row. Labelling a delta with the later snapshot's date would report every
+// day's production one day late, which is invisible in a single number and
+// obvious in a weekly grid.
+//
+// It reads pfByTeam and never liveByTeam for the same reason: pf does not
+// move during a day, so a mid-afternoon capture and a 6am capture produce
+// the same series. live moves hour to hour and would turn "when did I open
+// the app" into apparent scoring swings.
+function _espDateAdd(dateStr, days) {
+  var p = String(dateStr).split('-');
+  var d = new Date(Number(p[0]), Number(p[1]) - 1, Number(p[2]));
+  d.setDate(d.getDate() + (days || 0));
+  return d.getFullYear() + '-' + ('0' + (d.getMonth() + 1)).slice(-2) + '-' +
+         ('0' + d.getDate()).slice(-2);
+}
+
+// Monday-anchored week key for a date. Yahoo's MLB grid runs Mon-Sun, so the
+// two line up when the histories are eventually merged.
+function _espWeekStart(dateStr) {
+  var p = String(dateStr).split('-');
+  var d = new Date(Number(p[0]), Number(p[1]) - 1, Number(p[2]));
+  var dow = d.getDay();                 // 0 Sun .. 6 Sat
+  var back = (dow === 0) ? 6 : (dow - 1);
+  d.setDate(d.getDate() - back);
+  return d.getFullYear() + '-' + ('0' + (d.getMonth() + 1)).slice(-2) + '-' +
+         ('0' + d.getDate()).slice(-2);
+}
+
+// One entry per COVERED day: { date, myDelta, avg, rank, of, best, span }.
+// span > 1 means the pair straddles a gap in the snapshots, so the delta
+// covers several days and is reported on the first of them rather than
+// silently inflating one day's number.
+function espDailyDeltas(row) {
   var snaps = espListPtsSnapshots(row && row.key) || [];
-  if (snaps.length < 2) return { snaps: snaps.length, days: [] };
   var myId = (typeof espMyTeamId === 'function') ? espMyTeamId(row) : null;
-  var days = [], i, k;
+  var out = [], i, k, j;
   for (i = 1; i < snaps.length; i++) {
     var prev = snaps[i - 1], cur = snaps[i];
     var deltas = [], myDelta = null, best = null;
     for (k in (cur.pfByTeam || {})) {
       if (!cur.pfByTeam.hasOwnProperty(k)) continue;
       var p0 = (prev.pfByTeam || {})[k];
-      if (p0 == null) continue;
+      if (p0 == null) continue;          // team absent earlier: not a gain
       var d = Math.round((Number(cur.pfByTeam[k]) - Number(p0)) * 10) / 10;
       deltas.push({ teamId: k, delta: d });
       if (myId != null && String(k) === String(myId)) myDelta = d;
@@ -126573,22 +126605,87 @@ function espSnapshotTrend(row, maxDays) {
     }
     if (!deltas.length) continue;
     var sum = 0;
-    for (var j = 0; j < deltas.length; j++) sum += deltas[j].delta;
-    // Rank within the day: 1 means nobody outscored me.
+    for (j = 0; j < deltas.length; j++) sum += deltas[j].delta;
     var rank = null;
     if (myDelta != null) {
       rank = 1;
       for (j = 0; j < deltas.length; j++) if (deltas[j].delta > myDelta) rank++;
     }
-    days.push({
-      from: prev.date, to: cur.date,
+    // Days between captures. Consecutive daily snaps give 1.
+    var span = 1;
+    try {
+      var t0 = new Date(prev.date + 'T00:00:00').getTime();
+      var t1 = new Date(cur.date + 'T00:00:00').getTime();
+      var dd = Math.round((t1 - t0) / 86400000);
+      if (dd > 0) span = dd;
+    } catch (e) {}
+    out.push({
+      date: prev.date,               // the day these points were SCORED
+      through: cur.date,             // the capture that revealed them
+      span: span,
       myDelta: myDelta, rank: rank, of: deltas.length,
       avg: Math.round((sum / deltas.length) * 10) / 10,
       best: best
     });
   }
+  return { snaps: snaps.length, days: out };
+}
+
+// Kept for callers that want a tail-limited list.
+function espSnapshotTrend(row, maxDays) {
+  var t = espDailyDeltas(row);
+  var days = t.days;
   if (maxDays && days.length > maxDays) days = days.slice(days.length - maxDays);
-  return { snaps: snaps.length, days: days };
+  return { snaps: t.snaps, days: days };
+}
+
+// Mon-Sun grid for one week. Always returns seven cells so the structure is
+// visible before any snapshots exist — an empty grid that shows what is
+// coming beats a line of text saying there is no data.
+function espWeekGrid(row, weekStart) {
+  var t = espDailyDeltas(row);
+  var byDate = {}, i;
+  for (i = 0; i < t.days.length; i++) {
+    // A multi-day span lands on its first day; the rest stay blank rather
+    // than repeating a number that covers all of them.
+    byDate[t.days[i].date] = t.days[i];
+  }
+  var ws = weekStart || _espWeekStart(_todayDateString());
+  var cells = [], total = null;
+  for (i = 0; i < 7; i++) {
+    var d = _espDateAdd(ws, i);
+    var hit = byDate[d] || null;
+    if (hit && hit.myDelta != null) total = (total == null ? 0 : total) + hit.myDelta;
+    cells.push({ date: d, day: ['MON','TUE','WED','THU','FRI','SAT','SUN'][i], row: hit });
+  }
+  return { weekStart: ws, cells: cells, total: (total == null ? null : Math.round(total * 10) / 10),
+           snaps: t.snaps };
+}
+
+// Season-to-date weekly totals, newest first.
+function espWeeklyTotals(row) {
+  var t = espDailyDeltas(row);
+  var byWeek = {}, order = [], i;
+  for (i = 0; i < t.days.length; i++) {
+    var d = t.days[i];
+    if (d.myDelta == null) continue;
+    var wk = _espWeekStart(d.date);
+    if (!byWeek[wk]) { byWeek[wk] = { week: wk, mine: 0, lg: 0, days: 0 }; order.push(wk); }
+    byWeek[wk].mine += d.myDelta;
+    byWeek[wk].lg += d.avg;
+    byWeek[wk].days++;
+  }
+  var out = [];
+  for (i = 0; i < order.length; i++) {
+    var w = byWeek[order[i]];
+    out.push({
+      week: w.week, days: w.days,
+      mine: Math.round(w.mine * 10) / 10,
+      lgAvg: Math.round(w.lg * 10) / 10
+    });
+  }
+  out.sort(function (a, b) { return a.week < b.week ? 1 : -1; });
+  return { snaps: t.snaps, weeks: out };
 }
 
 function _espPacePanelHtml(row) {
@@ -126713,34 +126810,75 @@ function _espPacePanelHtml(row) {
       'effect. Directional, not a forecast.</div>';
   }
 
-  // ── TREND ──
-  var tr = (typeof espSnapshotTrend === 'function') ? espSnapshotTrend(row, 14) : null;
-  h += '<div style="font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
-    'margin:14px 0 2px;">DAY BY DAY</div>';
-  if (!tr || tr.days.length === 0) {
-    h += '<div style="font-size:10px;color:rgba(255,255,255,0.3);line-height:1.5;">' +
-      (tr && tr.snaps === 1
-        ? 'First snapshot captured today. Day-over-day movement appears once ' +
-          'there are two.'
-        : 'Snapshots start capturing automatically from today. This fills in ' +
-          'as the days accumulate \u2014 nothing to do.') + '</div>';
-  } else {
-    for (i = tr.days.length - 1; i >= 0; i--) {
-      var dRow = tr.days[i];
-      var dCol = (dRow.myDelta == null) ? 'rgba(255,255,255,0.3)'
-        : dRow.myDelta > dRow.avg ? '#4ade80' : 'rgba(255,255,255,0.7)';
-      h += '<div style="display:flex;align-items:center;gap:8px;padding:4px 6px;' +
-        'font-size:10.5px;' + mono + '">' +
-        '<span style="flex:0 0 62px;color:rgba(255,255,255,0.3);">' +
-          slEsc(String(dRow.to).slice(5)) + '</span>' +
-        '<span style="flex:0 0 52px;text-align:right;font-weight:700;color:' + dCol + ';">' +
-          (dRow.myDelta == null ? '\u2014' : (dRow.myDelta > 0 ? '+' : '') + dRow.myDelta) +
-        '</span>' +
-        '<span style="flex:1;color:rgba(255,255,255,0.25);">lg avg ' + dRow.avg + '</span>' +
-        '<span style="flex:0 0 46px;text-align:right;color:rgba(255,255,255,0.35);">' +
-          (dRow.rank == null ? '' : dRow.rank + ' of ' + dRow.of) + '</span>' +
+  // ── THIS WEEK, DAY BY DAY ──
+  // The seven cells render whether or not any snapshots exist, so the shape
+  // of what is coming is visible from day one.
+  var wg = (typeof espWeekGrid === 'function') ? espWeekGrid(row) : null;
+  if (wg) {
+    h += '<div style="font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
+      'margin:14px 0 2px;">THIS WEEK \u00b7 DAY BY DAY</div>' +
+      '<div style="font-size:9.5px;color:rgba(255,255,255,0.3);margin:0 0 6px;">' +
+      'week of ' + slEsc(wg.weekStart.slice(5)) +
+      (wg.total != null ? ' \u00b7 you <b style="color:rgba(255,255,255,0.65)">+' +
+        wg.total + '</b>' : '') + '</div>';
+    h += '<div style="display:flex;gap:3px;">';
+    for (i = 0; i < wg.cells.length; i++) {
+      var cell = wg.cells[i];
+      var v = cell.row && cell.row.myDelta;
+      var got = (v != null);
+      var beat = got && cell.row.avg != null && v > cell.row.avg;
+      h += '<div style="flex:1;min-width:0;text-align:center;padding:5px 2px;' +
+        'border-radius:6px;background:' +
+        (got ? 'rgba(255,255,255,0.05)' : 'rgba(255,255,255,0.02)') + ';">' +
+        '<div style="font-size:8px;letter-spacing:0.06em;color:rgba(255,255,255,0.22);">' +
+          cell.day + '</div>' +
+        '<div style="' + mono + 'font-size:11px;font-weight:700;margin-top:2px;color:' +
+          (got ? (beat ? '#4ade80' : 'rgba(255,255,255,0.75)') : 'rgba(255,255,255,0.14)') +
+          ';">' + (got ? v : '\u00b7') + '</div>' +
+        '<div style="' + mono + 'font-size:7.5px;color:rgba(255,255,255,0.2);margin-top:1px;">' +
+          (got && cell.row.avg != null ? cell.row.avg : '') + '</div>' +
       '</div>';
     }
+    h += '</div>';
+    h += '<div style="color:rgba(255,255,255,0.22);font-size:8.5px;margin-top:4px;">' +
+      'your points that day, league average beneath \u00b7 a day fills in once ' +
+      'the NEXT morning\u2019s snap lands</div>';
+  }
+
+  // ── WEEKLY TOTALS ──
+  var wt = (typeof espWeeklyTotals === 'function') ? espWeeklyTotals(row) : null;
+  h += '<div style="font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
+    'margin:14px 0 2px;">WEEKLY TOTALS</div>';
+  if (!wt || !wt.weeks.length) {
+    h += '<div style="font-size:10px;color:rgba(255,255,255,0.3);line-height:1.5;">' +
+      'Fills in as weeks complete. Each row is your points for that week ' +
+      'against the league average.</div>';
+  } else {
+    h += '<div style="display:flex;gap:8px;padding:0 6px 3px;font-size:8.5px;' +
+      'letter-spacing:0.06em;color:rgba(255,255,255,0.22);">' +
+      '<span style="flex:1;">WEEK OF</span>' +
+      '<span style="flex:0 0 34px;text-align:right;">DAYS</span>' +
+      '<span style="flex:0 0 52px;text-align:right;">YOU</span>' +
+      '<span style="flex:0 0 52px;text-align:right;">LG AVG</span></div>';
+    for (i = 0; i < wt.weeks.length; i++) {
+      var w = wt.weeks[i];
+      var ahead = w.mine > w.lgAvg;
+      h += '<div style="display:flex;gap:8px;align-items:center;padding:4px 6px;' +
+        'font-size:10.5px;' + mono + 'border-radius:6px;' +
+        (i % 2 ? 'background:rgba(255,255,255,0.02);' : '') + '">' +
+        '<span style="flex:1;color:rgba(255,255,255,0.5);">' +
+          slEsc(w.week.slice(5)) + '</span>' +
+        '<span style="flex:0 0 34px;text-align:right;color:rgba(255,255,255,0.22);">' +
+          w.days + '</span>' +
+        '<span style="flex:0 0 52px;text-align:right;font-weight:700;color:' +
+          (ahead ? '#4ade80' : 'rgba(255,255,255,0.75)') + ';">' + w.mine + '</span>' +
+        '<span style="flex:0 0 52px;text-align:right;color:rgba(255,255,255,0.3);">' +
+          w.lgAvg + '</span>' +
+      '</div>';
+    }
+    h += '<div style="color:rgba(255,255,255,0.22);font-size:8.5px;margin-top:4px;">' +
+      'DAYS is how many of that week\u2019s days have a snapshot pair \u2014 a week ' +
+      'with gaps totals only the days it has</div>';
   }
 
   var snaps = espListPtsSnapshots(row.key) || [];
