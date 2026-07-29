@@ -127101,26 +127101,59 @@ function _espPacePanelHtml(row) {
 // and the current standings, and is labelled as a projection throughout.
 // When ESPN does populate the real tiers, espRealBracket picks them up and
 // the projection steps aside.
+// The highest matchup period the league actually schedules. Two independent
+// sources, both already in memory: the matchupPeriods map in scheduleSettings
+// (keys run through the playoffs) and the schedule array in mMatchupScore.
+// Returns 0 when neither is available. ESPBRACKET
+function _espMaxPeriodSeen(row, ss) {
+  var max = 0, k, v, i;
+  var mp = ss && ss.matchupPeriods;
+  if (mp && typeof mp === 'object') {
+    for (k in mp) {
+      if (!mp.hasOwnProperty(k)) continue;
+      v = Number(k);
+      if (!isNaN(v) && v > max) max = v;
+    }
+  }
+  var sch = ((row && row._espScoreJson) || {}).schedule || [];
+  for (i = 0; i < sch.length; i++) {
+    v = Number((sch[i] || {}).matchupPeriodId);
+    if (!isNaN(v) && v > max) max = v;
+  }
+  return max;
+}
+
 function espPlayoffSettings(row) {
   var ss = ((((row || {}).raw || {}).settings) || {}).scheduleSettings;
   if (!ss) return null;
   var teams = Number(ss.playoffTeamCount);
   var roundLen = Number(ss.playoffMatchupPeriodLength);
-  var total = Number(ss.matchupPeriodCount);
+  // matchupPeriodCount is the REGULAR SEASON length, not the whole schedule.
+  // Playoff periods are numbered after it: a league with matchupPeriodCount
+  // 21 plays regular-season matchups through period 21 and opens the bracket
+  // at 22. Treating it as the season total shortened every regular season by
+  // the length of the bracket, which made the last real weeks look like
+  // playoff weeks and eliminated teams that were still alive. ESPBRACKET
+  var regCount = Number(ss.matchupPeriodCount);
   // Season-points leagues report playoffTeamCount 0 and matchupPeriodCount 1
   // — no matchups, so no bracket. Anything under two teams is the same case.
-  if (!teams || teams < 2 || !total || isNaN(roundLen) || roundLen < 1) return null;
+  if (!teams || teams < 2 || !regCount || regCount < 1 ||
+      isNaN(roundLen) || roundLen < 1) return null;
 
   // Rounds needed to get the field down to one. A field that isn't a power
   // of two gives the top seeds a first-round bye, which is how ESPN runs it.
   var rounds = 0, n = teams;
   while (n > 1) { n = Math.ceil(n / 2); rounds++; }
   var playoffPeriods = rounds * roundLen;
-  var start = total - playoffPeriods + 1;
-  if (start < 2) return null;      // a schedule with no room for a regular season
+  var start = regCount + 1;
+  var computed = regCount + playoffPeriods;
+  // Prefer the schedule ESPN actually published when it runs past the
+  // regular season; fall back to the computed length when it doesn't.
+  var seen = _espMaxPeriodSeen(row, ss);
+  var total = (seen > regCount && seen > computed) ? seen : computed;
   return {
     teams: teams, roundLen: roundLen, rounds: rounds,
-    total: total, startPeriod: start, lastRegular: start - 1,
+    total: total, startPeriod: start, lastRegular: regCount,
     reseed: !!ss.playoffReseed,
     seedingRule: String(ss.playoffSeedingRule || ''),
     consolation: (ss.consolationLadderDisabled === false)
@@ -127280,8 +127313,8 @@ function _espBracketHtml(row) {
     'periods ' + ps.startPeriod + '\u2013' + ps.total + '<br>' +
     'now in period ' + pic.cur + ' of ' + ps.total + ' \u00b7 <b style="color:' +
     (pic.periodsLeft <= 2 ? '#fbbf24' : 'rgba(255,255,255,0.6)') + '">' +
-    pic.periodsLeft + '</b> regular-season week' + (pic.periodsLeft === 1 ? '' : 's') +
-    ' left' +
+    pic.periodsLeft + '</b> regular-season period' +
+    (pic.periodsLeft === 1 ? '' : 's') + ' left (this one included)' +
     (ps.reseed ? ' \u00b7 reseeds each round' : ' \u00b7 bracket holds, no reseed') +
     '</div>';
 
@@ -127369,10 +127402,10 @@ function _espBracketHtml(row) {
     'line-height:1.5;">' +
     'Seeded by ' + slEsc(ps.seedingRule || 'record') + '. The dashed line is the ' +
     'cutoff; the number is wins behind it, a tie counting a half. ELIM means the ' +
-    'gap exceeds what the remaining ' + pic.periodsLeft + ' week' +
+    'gap exceeds what the remaining ' + pic.periodsLeft + ' period' +
     (pic.periodsLeft === 1 ? '' : 's') + ' can swing' +
     (pic.perPeriod > 1
-      ? ' (each week is worth ' + pic.perPeriod + ' category decisions here, ' +
+      ? ' (each period is worth ' + pic.perPeriod + ' category decisions here, ' +
         'so the swing is larger than it looks)'
       : '') +
     '. ' +
