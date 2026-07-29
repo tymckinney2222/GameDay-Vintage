@@ -127024,16 +127024,51 @@ function _espProjNum(v) {
   return isNaN(n) ? null : n;
 }
 
+// Does every CATEGORY count as its own W/L/T, rather than the matchup
+// producing a single decision?
+//
+// ESPN separates these explicitly and the difference is large. In
+// H2H_CATEGORY a 6-4-1 week adds 6 wins, 4 losses and a tie — which is why
+// Minnesota's records read 102-65-9 after seventeen weeks. In
+// H2H_MOST_CATEGORIES the same week adds exactly one win, which is why
+// Detroit reads 12-1-3. Applying the wrong model to a projection understates
+// a category league by an order of magnitude and looks entirely plausible
+// while doing it. ESPPROJCAT
+function espIsEachCategory(row) {
+  var st = String(((((row || {}).raw || {}).settings || {}).scoringSettings || {})
+                    .scoringType || '').toUpperCase();
+  return st === 'H2H_CATEGORY';
+}
+
 // W/L/T deltas for the current matchup period, keyed by team id.
 function espProjectedDeltas(row) {
   var ls = row && row.liveScores;
   if (!ls || !ls.games || !ls.games.length) return {};
   var cats = (typeof espIsCats === 'function') ? espIsCats(row) : false;
+  var each = espIsEachCategory(row);
   var out = {}, i;
   for (i = 0; i < ls.games.length; i++) {
     var g = ls.games[i] || {};
     if (!g.awayId || !g.homeId) continue;                    // bye week
     if (g.winner && g.winner !== 'UNDECIDED') continue;      // already banked
+    var ak = String(g.awayId), hk = String(g.homeId);
+
+    if (each) {
+      // The category tally IS the record change. awayRec is "w-l-t" from the
+      // away side; the home side is its mirror, so one parse drives both.
+      var ar = _espParseRec(g.awayRec);
+      if (!ar) {
+        // No usable tally. Skipped rather than falling back to the one-per-
+        // matchup model, which would be silently and badly wrong here.
+        continue;
+      }
+      if (!out[ak]) out[ak] = { w: 0, l: 0, t: 0 };
+      if (!out[hk]) out[hk] = { w: 0, l: 0, t: 0 };
+      out[ak].w += ar.w; out[ak].l += ar.l; out[ak].t += ar.t;
+      out[hk].w += ar.l; out[hk].l += ar.w; out[hk].t += ar.t;
+      continue;
+    }
+
     // Number(null) is 0, not NaN, so a plain isNaN check quietly turned two
     // teams with NO DATA YET into a recorded tie. Absent and zero are
     // different states: a real 0-0 IS a tie if the period ended now, but a
@@ -127041,7 +127076,6 @@ function espProjectedDeltas(row) {
     var av = _espProjNum(cats ? g.awayWins : g.awayScore);
     var hv = _espProjNum(cats ? g.homeWins : g.homeScore);
     if (av == null || hv == null) continue;
-    var ak = String(g.awayId), hk = String(g.homeId);
     if (!out[ak]) out[ak] = { w: 0, l: 0, t: 0 };
     if (!out[hk]) out[hk] = { w: 0, l: 0, t: 0 };
     if (av > hv) { out[ak].w++; out[hk].l++; }
@@ -127120,8 +127154,18 @@ function _espProjStandingsHtml(row) {
     var mvTxt = move > 0 ? '\u25b2' + move : move < 0 ? '\u25bc' + (-move) : '\u2013';
     var mvCol = move > 0 ? '#4ade80' : move < 0 ? '#f87171' : 'rgba(255,255,255,0.22)';
     var dd = r.delta || { w: 0, l: 0, t: 0 };
-    var res = dd.w ? 'W' : dd.l ? 'L' : dd.t ? 'T' : '';
-    var resCol = dd.w ? '#4ade80' : dd.l ? '#f87171' : 'rgba(255,255,255,0.4)';
+    // In an each-category league this period contributes a whole tally, so
+    // showing a lone "W" would hide that a 6-4-1 week is very different from
+    // a 10-0-1 one.
+    var each2 = (typeof espIsEachCategory === 'function') && espIsEachCategory(row);
+    var res, resCol;
+    if (each2) {
+      res = (dd.w || dd.l || dd.t) ? (dd.w + '-' + dd.l + '-' + dd.t) : '';
+      resCol = (dd.w > dd.l) ? '#4ade80' : (dd.l > dd.w) ? '#f87171' : 'rgba(255,255,255,0.4)';
+    } else {
+      res = dd.w ? 'W' : dd.l ? 'L' : dd.t ? 'T' : '';
+      resCol = dd.w ? '#4ade80' : dd.l ? '#f87171' : 'rgba(255,255,255,0.4)';
+    }
 
     h += '<div style="display:flex;align-items:center;gap:8px;padding:7px 6px;border-radius:7px;' +
       'margin:0 0 2px;font-size:12.5px;' + (mine ? 'background:rgba(239,68,68,0.10);' : '') + '">' +
@@ -127146,7 +127190,11 @@ function _espProjStandingsHtml(row) {
   h += '<div style="color:rgba(255,255,255,0.28);font-size:9.5px;margin-top:8px;line-height:1.5;">' +
     'Records with this period\u2019s live result applied, re-ranked on win ' +
     'pct then points-for. ' +
-    (cats ? 'Category leads decide each matchup.' : 'Running score decides each matchup.') +
+    ((typeof espIsEachCategory === 'function' && espIsEachCategory(row))
+      ? 'Every category counts as its own W-L-T, so a 6-4-1 week adds six ' +
+        'wins, four losses and a tie.'
+      : cats ? 'Category leads decide each matchup.'
+             : 'Running score decides each matchup.') +
     ' Matchups ESPN has already settled are left out, since their result is ' +
     'in the record above.</div>';
   h += '</div>';
