@@ -119927,7 +119927,8 @@ function _espVbsScanSettings(row) {
         continue;
       }
       walked++;
-      if (/limit|game|start|max|cap/i.test(k) || v === 200) {
+      if (/limit|game|start|max|cap|playoff|bracket|seed|tier|consolation/i.test(k) ||
+          v === 200) {
         hits.push('      ' + p + ' = ' + v);
       }
     }
@@ -119978,6 +119979,83 @@ function _espVbsScanSettings(row) {
     for (sk in lsc) { if (lsc.hasOwnProperty(sk)) slots.push(sk + ':' + lsc[sk]); }
     _espVbsLog('  lineupSlotCounts: ' + slots.join(' '));
   }
+
+  // scheduleSettings in full. A bracket needs to know how many teams make
+  // the playoffs, when they start and how long each round runs, and none of
+  // those names are guessable. ESPBRACKET
+  var ss = s.scheduleSettings;
+  _espVbsLog('  settings.scheduleSettings:');
+  if (!ss) {
+    _espVbsLog('      ABSENT');
+  } else {
+    var fk, nf = 0;
+    for (fk in ss) {
+      if (!ss.hasOwnProperty(fk)) continue;
+      var fv = ss[fk];
+      nf++;
+      if (fv && typeof fv === 'object') {
+        var inner = [], ik;
+        for (ik in fv) { if (fv.hasOwnProperty(ik) && typeof fv[ik] !== 'object') inner.push(ik + '=' + fv[ik]); }
+        _espVbsLog('      ' + fk + ': {' + inner.slice(0, 12).join(' ') + '}');
+      } else {
+        _espVbsLog('      ' + fk + ' = ' + fv);
+      }
+    }
+    if (!nf) _espVbsLog('      (empty)');
+  }
+}
+
+// Fetch the season schedule and report whether it carries bracket structure.
+// row.raw comes from mTeam+mSettings and has no schedule; espLiveScores
+// fetches mMatchupScore but keeps only the CURRENT period's games and
+// discards the rest, so the season's shape has never actually been looked
+// at. One request per league, read-only. ESPBRACKET
+function _espVbsScanSchedule(row, done) {
+  var sv = (typeof espFindSaved === 'function' && row && row.key)
+    ? espFindSaved(String(row.key).slice(4)) : null;
+  if (!sv) { _espVbsLog('  schedule: no saved league record'); if (done) done(); return; }
+  var game = _espVbsGame(row);
+  var url = ESP_BASE + game + '/seasons/' + (row.season || '') +
+    '/segments/0/leagues/' + sv.id + '?view=mMatchupScore&_vbs=' + Date.now();
+  fetch(url, { cache: 'no-store' }).then(function (r) {
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  }).then(function (j) {
+    var sch = (j && j.schedule) || [];
+    _espVbsLog('  schedule entries: ' + sch.length);
+    if (!sch.length) { if (done) done(); return; }
+    var periods = {}, tiers = {}, winners = {}, i, k;
+    for (i = 0; i < sch.length; i++) {
+      var m = sch[i] || {};
+      periods[String(m.matchupPeriodId)] = (periods[String(m.matchupPeriodId)] || 0) + 1;
+      var tt = (m.playoffTierType != null) ? String(m.playoffTierType) : '(absent)';
+      tiers[tt] = (tiers[tt] || 0) + 1;
+      var wn = (m.winner != null) ? String(m.winner) : '(absent)';
+      winners[wn] = (winners[wn] || 0) + 1;
+    }
+    var pk = [];
+    for (k in periods) { if (periods.hasOwnProperty(k)) pk.push(Number(k)); }
+    pk.sort(function (a, b) { return a - b; });
+    _espVbsLog('  matchupPeriodIds: ' + (pk.length ? (pk[0] + '..' + pk[pk.length - 1] +
+      ' (' + pk.length + ' distinct)') : 'none'));
+    _espVbsLog('  playoffTierType: ' + _espVbsTally(tiers));
+    _espVbsLog('  winner: ' + _espVbsTally(winners));
+    // Every field on one entry, so nothing useful stays hidden behind a
+    // filter the way statId did.
+    var flds = [], f;
+    for (f in sch[0]) { if (sch[0].hasOwnProperty(f)) flds.push(f); }
+    _espVbsLog('  entry fields: ' + flds.join(' '));
+    if (done) done();
+  })['catch'](function (e) {
+    _espVbsLog('  schedule FAILED \u2014 ' + ((e && e.message) || e));
+    if (done) done();
+  });
+}
+
+function _espVbsTally(map) {
+  var out = [], k;
+  for (k in map) { if (map.hasOwnProperty(k)) out.push(k + '\u00d7' + map[k]); }
+  return out.length ? out.join(', ') : '(none)';
 }
 
 function _espVbsDumpLeague(row) {
@@ -120095,18 +120173,34 @@ function skRunEspSeasonStatsProbe() {
     }
   }
 
-  _espVbsLog('');
-  _espVbsLog('WHAT TO CHECK: open the same league in ESPN\u2019s app, Standings >');
-  _espVbsLog('Season Stats, and compare YOUR row (marked *) column by column.');
-  _espVbsLog('If the numbers match, a Season Stats table needs no new fetch.');
-
-  var body = skEscapeMaybe(_espVbsLines.join('\n')).replace(/\n/g, '<br>');
-  host.innerHTML = closeBtn + title +
-    '<div style="white-space:normal;word-break:break-word">' + body + '</div>' +
-    '<div style="margin-top:16px">' +
-      '<button onclick="skRunEspSeasonStatsProbe()" style="padding:8px 18px;border-radius:999px;border:1px solid rgba(255,255,255,0.25);background:none;color:#e2e8f0;font-size:11px;font-weight:700">Run again</button> ' +
-      '<button onclick="_espVbsSave()" style="padding:8px 18px;border-radius:999px;border:1px solid rgba(255,255,255,0.25);background:none;color:#e2e8f0;font-size:11px;font-weight:700">\u2b07 Save .txt</button>' +
-    '</div>';
+  // The schedule scans are network calls, so they run in sequence after the
+  // in-memory dump and the panel repaints once they land. ESPBRACKET
+  function _vbsRender() {
+    var body2 = skEscapeMaybe(_espVbsLines.join('\n')).replace(/\n/g, '<br>');
+    host.innerHTML = closeBtn + title +
+      '<div style="white-space:normal;word-break:break-word">' + body2 + '</div>' +
+      '<div style="margin-top:16px">' +
+        '<button onclick="skRunEspSeasonStatsProbe()" style="padding:8px 18px;border-radius:999px;border:1px solid rgba(255,255,255,0.25);background:none;color:#e2e8f0;font-size:11px;font-weight:700">Run again</button> ' +
+        '<button onclick="_espVbsSave()" style="padding:8px 18px;border-radius:999px;border:1px solid rgba(255,255,255,0.25);background:none;color:#e2e8f0;font-size:11px;font-weight:700">\u2b07 Save .txt</button>' +
+      '</div>';
+  }
+  function _vbsStep(n) {
+    if (n >= esp.length) {
+      _espVbsLog('');
+      _espVbsLog('WHAT TO CHECK: open the same league in ESPN\u2019s app, Standings >');
+      _espVbsLog('Season Stats, and compare YOUR row (marked *) column by column.');
+      _espVbsLog('If the numbers match, a Season Stats table needs no new fetch.');
+      _vbsRender();
+      return;
+    }
+    _espVbsLog('');
+    _espVbsLog('--- schedule: ' + ((esp[n] && esp[n].name) || '?') + ' ---');
+    _vbsRender();
+    try { _espVbsScanSchedule(esp[n], function () { _vbsStep(n + 1); }); }
+    catch (e3) { _espVbsLog('  scan threw \u2014 ' + e3); _vbsStep(n + 1); }
+  }
+  _vbsStep(0);
+  return;
 }
 
 function _espVbsSave() {
