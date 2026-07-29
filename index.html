@@ -119904,6 +119904,44 @@ function _espVbsCount(o) {
   return n;
 }
 
+// Hunt the settings tree for a games CAP. Stat 33 is confirmed as the games
+// STARTED count (79, matching the app's 79/200), so the 200 must live
+// somewhere in mSettings — but the field name is not something to guess at,
+// and a wrong guess would silently show the wrong denominator. This reports
+// every candidate and lets the value be matched by eye. ESPGAMELIMIT
+function _espVbsScanSettings(row) {
+  var s = ((row || {}).raw || {}).settings;
+  if (!s) { _espVbsLog('  settings: ABSENT (mSettings did not land)'); return; }
+  var hits = [], walked = 0;
+  function walk(o, path, depth) {
+    if (!o || typeof o !== 'object' || depth > 5) return;
+    var k;
+    for (k in o) {
+      if (!o.hasOwnProperty(k)) continue;
+      var v = o[k], p = path ? (path + '.' + k) : k;
+      if (v && typeof v === 'object') {
+        // scoringItems and friends are long arrays of per-stat objects;
+        // descending into them buries the signal under hundreds of lines.
+        if (Object.prototype.toString.call(v) === '[object Array]' && v.length > 12) continue;
+        walk(v, p, depth + 1);
+        continue;
+      }
+      walked++;
+      if (/limit|game|start|max|cap/i.test(k) || v === 200) {
+        hits.push('      ' + p + ' = ' + v);
+      }
+    }
+  }
+  walk(s, '', 0);
+  _espVbsLog('  settings scalars walked: ' + walked);
+  _espVbsLog('  games-limit candidates (' + hits.length + '):');
+  for (var i = 0; i < hits.length && i < 80; i++) _espVbsLog(hits[i]);
+  if (!hits.length) {
+    _espVbsLog('      (none \u2014 the cap is not in mSettings; it would need ' +
+      'another view)');
+  }
+}
+
 function _espVbsDumpLeague(row) {
   var game = _espVbsGame(row);
   var cats = (typeof espIsCats === 'function') ? espIsCats(row) : false;
@@ -119930,6 +119968,7 @@ function _espVbsDumpLeague(row) {
     if (items[si] && items[si].statId != null) scored.push(String(items[si].statId));
   }
   _espVbsLog('  scoringItems: ' + scored.length + ' stat ids');
+  _espVbsScanSettings(row);   // ESPGAMELIMIT
 
   var myIds = (row.myTeamIds || {});
   var withVbs = 0, i, k;
@@ -124794,6 +124833,16 @@ var ESP_STAT_NAME_FLB = {
   20: 'R', 21: 'RBI', 23: 'SB', 27: 'K',
   // pitching
   34: 'IP', 37: 'H', 39: 'BB', 41: 'WHIP', 45: 'ER',
+  // 33 is GAMES STARTED, confirmed not inferred: the probe read 33 = 79 for
+  // CORKED and the ESPN app's roster header showed "Max Games Started
+  // 79/200" for that same team. An earlier guess had it as HR allowed
+  // because 79 over 546 IP is 1.30 per nine, which is a believable HRA rate
+  // — a reminder that a plausible rate proves nothing on its own.
+  33: 'GS',
+  // 35 is still unidentified. It divides by IP to 4.19 and 4.12 across two
+  // leagues, which fits BATTERS FACED, but nothing has been matched against
+  // a figure in the app yet, so it stays unmapped rather than mislabelled.
+  //
   // 47 identified by elimination against the app: it sat next to WHIP
   // showing 1.9/3.8 where the app's ERA column read 1.48/3.66.
   47: 'ERA', 48: 'K', 53: 'W', 54: 'L', 57: 'SV', 60: 'HD'
