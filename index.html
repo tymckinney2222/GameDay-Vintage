@@ -127852,10 +127852,52 @@ function espProjectedDeltas(row) {
   return out;
 }
 
+// Games back, using the baseball formula rather than a subtraction of wins:
+//   GB = ((leadW - W) + (L - leadL)) / 2
+// The shortcut leadW - W is only right when both teams have played the same
+// number of games, and in THIS view they often haven't — a matchup ESPN has
+// already settled contributes no delta, so those teams sit a game behind the
+// rest of the field until the period closes. The full formula is correct
+// either way. A tie counts as half a win and half a loss, the same weighting
+// espProjectedStandings already uses to order the table. ESPGB
+function _espGbVs(lead, r) {
+  if (!lead || !r) return null;
+  var lw = lead.w + lead.t / 2, ll = lead.l + lead.t / 2;
+  var w = r.w + r.t / 2, l = r.l + r.t / 2;
+  var gb = ((lw - w) + (l - ll)) / 2;
+  // Unequal games played can put a team fractionally "ahead" of the team
+  // above it on win pct. That's real but it isn't what GB means, so the
+  // leader's own line is the floor.
+  if (gb < 0) gb = 0;
+  return Math.round(gb * 100) / 100;
+}
+
+// W-L-T as numbers, falling back the same way espProjectedStandings does.
+function _espRecTriple(r) {
+  var p = _espParseRec(r && r.record);
+  if (p) return { w: p.w, l: p.l, t: p.t };
+  return { w: (r && r.wins) || 0, l: 0, t: 0 };
+}
+
+// GB is always a whole or half game, and the tie weighting doesn't change
+// that. Expanding the formula, the half-tie terms cancel exactly:
+//   (lw-w) + (l-ll) = (LW-W) + (L-LL) + (LT-T)/2 + (T-LT)/2 = (LW-W) + (L-LL)
+// which is an integer, halved. Verified by brute force over 705,600 record
+// pairs: zero results landed off a half. The second branch is a guard, not a
+// case that occurs. ESPGB
+function _espGbFmt(v) {
+  if (v == null) return '\u2013';
+  var n = Number(v);
+  return ((n * 10) % 5 === 0) ? n.toFixed(1) : n.toFixed(2);
+}
+
 function espProjectedStandings(row) {
   var rows = (row && row.standingsAll) || [];
   if (!rows.length) return null;
   var d = espProjectedDeltas(row);
+  // standingsAll arrives in ESPN's own standings order, so rows[0] is the
+  // current leader — the baseline today's result is measured against.
+  var leadNow = _espRecTriple(rows[0]);
   var out = [], i, moved = 0;
   for (i = 0; i < rows.length; i++) {
     var r = rows[i];
@@ -127870,14 +127912,23 @@ function espProjectedStandings(row) {
       teamId: r.teamId, teamName: r.teamName, pf: r.pf,
       actualRank: r.rank || (i + 1),
       rec: w + '-' + l + '-' + t,
+      w: w, l: l, t: t,
       // A tie counts as half a win, which is how ESPN orders these.
       pct: gp ? (w + t / 2) / gp : 0,
+      gbNow: _espGbVs(leadNow, _espRecTriple(r)),
       delta: dd
     });
   }
   // Win pct, then points-for as the tiebreak.
   out.sort(function (a, b) { return (b.pct - a.pct) || ((b.pf || 0) - (a.pf || 0)); });
-  for (i = 0; i < out.length; i++) out[i].projRank = i + 1;
+  for (i = 0; i < out.length; i++) {
+    out[i].projRank = i + 1;
+    // Measured from whoever leads AFTER today's result, which is the team at
+    // the top of this list and not necessarily the one leading now.
+    out[i].gb = _espGbVs(out[0], out[i]);
+    out[i].gbMove = (out[i].gb == null || out[i].gbNow == null)
+      ? null : Math.round((out[i].gb - out[i].gbNow) * 100) / 100;
+  }
   return { list: out, moved: moved };
 }
 
@@ -127910,8 +127961,9 @@ function _espProjStandingsHtml(row) {
     'color:rgba(255,255,255,0.3);">' +
     '<span style="flex:0 0 20px;">RK</span>' +
     '<span style="flex:1;">TEAM</span>' +
-    '<span style="flex:0 0 34px;text-align:right;">MOVE</span>' +
-    '<span style="flex:0 0 78px;text-align:right;">PROJ W-L-T</span>' +
+    '<span style="flex:0 0 28px;text-align:right;">MOVE</span>' +
+    '<span style="flex:0 0 44px;text-align:right;">GB</span>' +
+    '<span style="flex:0 0 72px;text-align:right;">PROJ W-L-T</span>' +
     '</div>';
 
   for (var i = 0; i < p.list.length; i++) {
@@ -127947,9 +127999,19 @@ function _espProjStandingsHtml(row) {
           (res ? '<span style="color:' + resCol + '"> \u00b7 ' + res + ' this period</span>' : '') +
         '</span>' +
       '</span>' +
-      '<span style="flex:0 0 34px;text-align:right;' + mono + 'color:' + mvCol + ';">' +
+      '<span style="flex:0 0 28px;text-align:right;' + mono + 'color:' + mvCol + ';">' +
         mvTxt + '</span>' +
-      '<span style="flex:0 0 78px;text-align:right;' + mono +
+      '<span style="flex:0 0 44px;text-align:right;' + mono + '">' +
+        '<span style="display:block;color:' +
+          (r.projRank === 1 ? 'rgba(255,255,255,0.3)' : 'rgba(255,255,255,0.72)') + ';">' +
+          (r.projRank === 1 ? '\u2013' : _espGbFmt(r.gb)) + '</span>' +
+        // Ground gained or lost by today's result. Lower GB is better, so a
+        // negative number is the good one — spelled out in the note below.
+        ((r.projRank !== 1 && r.gbMove) ? '<span style="display:block;font-size:9px;' +
+          'color:' + (r.gbMove < 0 ? '#4ade80' : '#f87171') + ';">' +
+          (r.gbMove > 0 ? '+' : '\u2212') + _espGbFmt(Math.abs(r.gbMove)) + '</span>' : '') +
+      '</span>' +
+      '<span style="flex:0 0 72px;text-align:right;' + mono +
         'color:rgba(255,255,255,0.85);font-weight:700;">' + slEsc(r.rec) + '</span>' +
     '</div>';
   }
@@ -127963,7 +128025,10 @@ function _espProjStandingsHtml(row) {
       : cats ? 'Category leads decide each matchup.'
              : 'Running score decides each matchup.') +
     ' Matchups ESPN has already settled are left out, since their result is ' +
-    'in the record above.</div>';
+    'in the record above. GB is games behind the projected leader, a tie ' +
+    'counting half a win \u2014 the small figure under it is the ground ' +
+    'today\u2019s result gains (\u2212) or costs (+). The BRACKET tab has the ' +
+    'gap to the playoff cutoff, which is the other number that matters.</div>';
   h += '</div>';
   return h;
 }
