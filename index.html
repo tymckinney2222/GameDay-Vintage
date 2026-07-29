@@ -125268,6 +125268,435 @@ function _espTopTodayHtml(l, accent) {
     parts.join('<span style="color:var(--sk-text-4);margin:0 6px">\u00b7</span>') + '</div>';
 }
 
+// ── MATCHUP OUTLOOK ── ESPOUTLOOK ──
+// Two numbers the ESPN app doesn't show and Yahoo's card doesn't either:
+// how much of the matchup period is actually left, and what the current
+// margin is worth given how these two teams score.
+//
+// Everything comes from payloads already in memory. row._espScoreJson holds
+// the WHOLE season schedule, and every matchup in it carries each side's
+// pointsByScoringPeriod — a per-day scoring history for all ten teams that
+// has been sitting unread. That history is what makes a win probability
+// honest rather than a guess at variance.
+
+// Days in a matchup period, as scoringPeriodIds.
+//
+// scheduleSettings.matchupPeriods maps period -> array of scoring period ids,
+// which is the exact membership and therefore handles an irregular period
+// (the two-week All-Star one) without special-casing. It is NOT confirmed
+// present in every league's payload, so there are two fallbacks and the
+// source is reported so the UI can say which one it used.
+function _espPeriodDays(row, period) {
+  var ss = ((((row || {}).raw || {}).settings) || {}).scheduleSettings || {};
+  var mp = ss.matchupPeriods;
+  var key = String(period), i, out;
+  if (mp && mp[key] && mp[key].length) {
+    out = [];
+    for (i = 0; i < mp[key].length; i++) {
+      var n = Number(mp[key][i]);
+      if (!isNaN(n)) out.push(n);
+    }
+    if (out.length) {
+      out.sort(function (a, b) { return a - b; });
+      return { days: out, source: 'settings' };
+    }
+  }
+  // Fallback: measure the period length from the periods already finished,
+  // rather than converting matchupPeriodLength into days. That setting's unit
+  // is ambiguous — 1 could mean one week or one scoring period, and MLB
+  // scoring periods are days — and a wrong unit here would silently scale
+  // every number downstream. Completed periods have already banked one entry
+  // per day, so their key count IS the length, measured not assumed.
+  var banked = _espBankedDaysByPeriod(row);
+  if (!banked.byPeriod[key] && !banked.modeLen) return { days: null, source: null };
+  var len = banked.modeLen;
+  if (!len) return { days: null, source: null };
+  // The mode across every completed period, so the one irregular two-week
+  // period can't set the length for all the others.
+  var mine = banked.byPeriod[key];
+  var j2 = row && row._espScoreJson;
+  var today2 = (j2 && j2.scoringPeriodId != null) ? Number(j2.scoringPeriodId) : null;
+  var start = (mine && mine.length) ? mine[0] : today2;
+  if (start == null) return { days: null, source: null };
+  var full = [];
+  for (i = 0; i < len; i++) full.push(start + i);
+  return { days: full, source: 'derived' };
+}
+
+// Days each matchup period has actually banked, plus the most common length
+// across the periods that are finished.
+function _espBankedDaysByPeriod(row) {
+  var j = row && row._espScoreJson;
+  var sch = (j && j.schedule) || [];
+  var cur = (j && j.status && j.status.currentMatchupPeriod);
+  var seen = {}, i, s, k;
+  for (i = 0; i < sch.length; i++) {
+    var m = sch[i] || {};
+    var p = Number(m.matchupPeriodId);
+    if (isNaN(p)) continue;
+    var pk = String(p);
+    var sides = [m.away, m.home];
+    for (s = 0; s < 2; s++) {
+      var pbs = sides[s] && sides[s].pointsByScoringPeriod;
+      if (!pbs) continue;
+      if (!seen[pk]) seen[pk] = {};
+      for (k in pbs) {
+        if (!pbs.hasOwnProperty(k)) continue;
+        var d = Number(k);
+        if (!isNaN(d)) seen[pk][d] = 1;
+      }
+    }
+  }
+  var byPeriod = {}, tally = {}, pk2, dd;
+  for (pk2 in seen) {
+    if (!seen.hasOwnProperty(pk2)) continue;
+    var list = [];
+    for (dd in seen[pk2]) { if (seen[pk2].hasOwnProperty(dd)) list.push(Number(dd)); }
+    list.sort(function (a, b) { return a - b; });
+    byPeriod[pk2] = list;
+    // Only FINISHED periods report a trustworthy length; the current one is
+    // still filling in.
+    if (cur != null && Number(pk2) < Number(cur) && list.length) {
+      tally[list.length] = (tally[list.length] || 0) + 1;
+    }
+  }
+  var modeLen = null, best = 0, lk;
+  for (lk in tally) {
+    if (tally.hasOwnProperty(lk) && tally[lk] > best) { best = tally[lk]; modeLen = Number(lk); }
+  }
+  return { byPeriod: byPeriod, modeLen: modeLen };
+}
+
+// Where today sits in the period, and how much of it remains.
+//   dayIdx          1-based day number, null when today isn't in the period
+//   daysLeft        remaining INCLUDING today, which is still in progress
+//   daysAfterToday  whole days not yet started
+function _espPeriodPosition(row, period) {
+  var pd = _espPeriodDays(row, period);
+  if (!pd.days) return null;
+  var j = row && row._espScoreJson;
+  var today = (j && j.scoringPeriodId != null) ? Number(j.scoringPeriodId) : null;
+  var days = pd.days, i, idx = -1;
+  if (today != null) {
+    for (i = 0; i < days.length; i++) { if (days[i] === today) { idx = i; break; } }
+  }
+  var totalDays = days.length;
+  if (idx < 0) {
+    // Between periods, or a scoringPeriodId that hasn't caught up. Before the
+    // period all of it is left; after it, none.
+    if (today != null && today < days[0]) {
+      return { totalDays: totalDays, dayIdx: null, daysLeft: totalDays,
+               daysAfterToday: totalDays, source: pd.source, today: today };
+    }
+    return { totalDays: totalDays, dayIdx: null, daysLeft: 0,
+             daysAfterToday: 0, source: pd.source, today: today };
+  }
+  return {
+    totalDays: totalDays, dayIdx: idx + 1,
+    daysLeft: totalDays - idx,
+    daysAfterToday: totalDays - idx - 1,
+    source: pd.source, today: today
+  };
+}
+
+// Days on which the whole league scored nothing — a real off day (the
+// All-Star break, chiefly). Kept out of the per-day sample, because a
+// league-wide zero says nothing about how a team scores and would drag every
+// mean down and every variance up.
+function _espLeagueOffDays(row) {
+  var j = row && row._espScoreJson;
+  var sch = (j && j.schedule) || [];
+  var sum = {}, cnt = {}, i, s, k;
+  for (i = 0; i < sch.length; i++) {
+    var m = sch[i] || {};
+    var sides = [m.away, m.home];
+    for (s = 0; s < 2; s++) {
+      var pbs = sides[s] && sides[s].pointsByScoringPeriod;
+      if (!pbs) continue;
+      for (k in pbs) {
+        if (!pbs.hasOwnProperty(k)) continue;
+        var v = Number(pbs[k]);
+        if (isNaN(v)) continue;
+        sum[k] = (sum[k] || 0) + Math.abs(v);
+        cnt[k] = (cnt[k] || 0) + 1;
+      }
+    }
+  }
+  var off = {};
+  for (k in sum) {
+    // At least four teams reporting, and not one point between them.
+    if (sum.hasOwnProperty(k) && cnt[k] >= 4 && sum[k] === 0) off[k] = 1;
+  }
+  return off;
+}
+
+// One team's per-day scores across the whole season, from every matchup it
+// appears in. Today is excluded — it is still in progress and lands in this
+// map only once the day closes.
+function _espTeamDayScores(row, teamId, offDays) {
+  var j = row && row._espScoreJson;
+  var sch = (j && j.schedule) || [];
+  var today = (j && j.scoringPeriodId != null) ? String(j.scoringPeriodId) : null;
+  var out = [], i, s, k;
+  for (i = 0; i < sch.length; i++) {
+    var m = sch[i] || {};
+    var sides = [m.away, m.home];
+    for (s = 0; s < 2; s++) {
+      var side = sides[s];
+      if (!side || side.teamId == null) continue;
+      if (String(side.teamId) !== String(teamId)) continue;
+      var pbs = side.pointsByScoringPeriod;
+      if (!pbs) continue;
+      for (k in pbs) {
+        if (!pbs.hasOwnProperty(k)) continue;
+        if (today != null && String(k) === today) continue;
+        if (offDays && offDays[k]) continue;
+        var v = Number(pbs[k]);
+        if (!isNaN(v)) out.push(v);
+      }
+    }
+  }
+  return out;
+}
+
+function _espMeanSd(a) {
+  var n = a.length, i, s = 0;
+  if (n < 2) return null;
+  for (i = 0; i < n; i++) s += a[i];
+  var mu = s / n, q = 0;
+  for (i = 0; i < n; i++) q += (a[i] - mu) * (a[i] - mu);
+  // Sample standard deviation: n-1, because this is a sample of the season's
+  // days and not the population of them.
+  return { mean: mu, sd: Math.sqrt(q / (n - 1)), n: n };
+}
+
+// How much of today a team still has coming: the share of its starters who
+// have a game today but haven't recorded anything yet. On the last day of a
+// period this is the difference between a coin flip and a decided matchup,
+// so it is worth computing rather than treating today as spent.
+function _espTodayRemainFrac(row, teamId) {
+  var t = row && row.rosters && row.rosters.byTeam &&
+          row.rosters.byTeam[String(teamId)];
+  if (!t || !t.items) return null;
+  var withGame = 0, started = 0, i, k;
+  for (i = 0; i < t.items.length; i++) {
+    var it = t.items[i];
+    if (!it || !it.starter) continue;
+    if (it.noGame) continue;                 // no game today, nothing coming
+    withGame++;
+    var w = it.windows && it.windows.today;
+    var any = false;
+    if (w && w.stats) {
+      for (k in w.stats) { if (w.stats.hasOwnProperty(k)) { any = true; break; } }
+    }
+    if (any) started++;
+  }
+  if (!withGame) return 0;
+  return (withGame - started) / withGame;
+}
+
+// Standard normal CDF, Abramowitz & Stegun 26.2.17 — accurate to ~7.5e-8,
+// which is far tighter than the model feeding it.
+function _espNormCdf(z) {
+  var p = 0.2316419, b = [0.319381530, -0.356563782, 1.781477937,
+                          -1.821255978, 1.330274429];
+  var neg = (z < 0);
+  if (neg) z = -z;
+  var t = 1 / (1 + p * z);
+  var poly = 0, i, tp = t;
+  for (i = 0; i < 5; i++) { poly += b[i] * tp; tp *= t; }
+  var pdf = Math.exp(-z * z / 2) / Math.sqrt(2 * Math.PI);
+  var cdf = 1 - pdf * poly;
+  return neg ? (1 - cdf) : cdf;
+}
+
+// The whole picture for my current matchup. Null when there's nothing to say.
+function espMatchupOutlook(row) {
+  if (typeof espIsSeasonPts === 'function' && espIsSeasonPts(row)) return null;
+  var ls = row && row.liveScores;
+  var j = row && row._espScoreJson;
+  if (!ls || !ls.games || !ls.games.length || !j) return null;
+  var period = (j.status && j.status.currentMatchupPeriod);
+  if (period == null) return null;
+
+  var myIds = row.myTeamIds || {}, i, g = null, meAway = false;
+  for (i = 0; i < ls.games.length; i++) {
+    var gg = ls.games[i];
+    if (gg.awayId != null && myIds[String(gg.awayId)]) { g = gg; meAway = true; break; }
+    if (gg.homeId != null && myIds[String(gg.homeId)]) { g = gg; meAway = false; break; }
+  }
+  if (!g || !g.awayId || !g.homeId) return null;       // bye week
+
+  var pos = _espPeriodPosition(row, period);
+  if (!pos) return null;
+
+  var myId = String(meAway ? g.awayId : g.homeId);
+  var opId = String(meAway ? g.homeId : g.awayId);
+  var out = {
+    period: Number(period), myId: myId, opId: opId,
+    oppName: meAway ? g.home : g.away,
+    totalDays: pos.totalDays, dayIdx: pos.dayIdx,
+    daysLeft: pos.daysLeft, daysAfterToday: pos.daysAfterToday,
+    daySource: pos.source,
+    gap: null, needPerDay: null, winPct: null, thin: false,
+    me: null, opp: null
+  };
+
+  // Categories leagues settle on a tally, not a total, so the points model
+  // does not apply. The day count still does, and that's the half worth
+  // showing there.
+  var cats = (typeof espIsCats === 'function') ? espIsCats(row) : false;
+  if (cats) {
+    var mw = meAway ? g.awayWins : g.homeWins;
+    var ow = meAway ? g.homeWins : g.awayWins;
+    out.catLead = (mw != null && ow != null) ? (Number(mw) - Number(ow)) : null;
+    return out;
+  }
+
+  var myS = Number(meAway ? g.awayScore : g.homeScore);
+  var opS = Number(meAway ? g.homeScore : g.awayScore);
+  if (isNaN(myS) || isNaN(opS)) return out;
+  out.myScore = Math.round(myS * 10) / 10;
+  out.oppScore = Math.round(opS * 10) / 10;
+  out.gap = Math.round((myS - opS) * 10) / 10;
+
+  var off = _espLeagueOffDays(row);
+  var mine = _espMeanSd(_espTeamDayScores(row, myId, off));
+  var theirs = _espMeanSd(_espTeamDayScores(row, opId, off));
+  out.me = mine;
+  out.opp = theirs;
+
+  // Effective days remaining, per team: whole days not yet started plus
+  // whatever share of today that team still has coming.
+  var fMe = _espTodayRemainFrac(row, myId);
+  var fOp = _espTodayRemainFrac(row, opId);
+  var dMe = pos.daysAfterToday + (fMe == null ? 0 : fMe);
+  var dOp = pos.daysAfterToday + (fOp == null ? 0 : fOp);
+  out.todayLeftMe = fMe;
+  out.todayLeftOpp = fOp;
+  out.effDaysMe = Math.round(dMe * 100) / 100;
+  out.effDaysOpp = Math.round(dOp * 100) / 100;
+
+  // Pace: the net margin per remaining day that closes the gap. Only
+  // meaningful when behind and when days actually remain.
+  if (out.gap < 0 && pos.daysLeft > 0) {
+    out.needPerDay = Math.round((Math.abs(out.gap) / pos.daysLeft) * 10) / 10;
+  } else if (out.gap > 0 && pos.daysLeft > 0) {
+    out.cushionPerDay = Math.round((out.gap / pos.daysLeft) * 10) / 10;
+  }
+
+  // Under six days there is no usable spread, so no probability is offered at
+  // all. Under twenty it is offered with a flag: a standard deviation from a
+  // dozen days carries enough error of its own to matter.
+  if (!mine || !theirs || mine.n < 6 || theirs.n < 6) { out.thin = true; return out; }
+  if (mine.n < 20 || theirs.n < 20) out.thin = true;
+
+  var varTotal = dMe * mine.sd * mine.sd + dOp * theirs.sd * theirs.sd;
+  if (varTotal <= 0) {
+    // Nothing left to play by this model's reckoning: the margin is the result.
+    out.winPct = (out.gap > 0) ? 100 : (out.gap < 0 ? 0 : 50);
+  } else {
+    var expected = out.gap + (dMe * mine.mean) - (dOp * theirs.mean);
+    var z = expected / Math.sqrt(varTotal);
+    out.winPct = Math.round(_espNormCdf(z) * 1000) / 10;
+    out.expFinalMe = Math.round((myS + dMe * mine.mean) * 10) / 10;
+    out.expFinalOpp = Math.round((opS + dOp * theirs.mean) * 10) / 10;
+  }
+  // A starter who has already recorded anything counts as finished, which is
+  // this model's weakest assumption — someone in the fourth inning still has a
+  // night ahead of him. So while the period is still open the number never
+  // reads 0 or 100, because it isn't entitled to that confidence.
+  if (out.daysLeft > 0) {
+    if (out.winPct < 1) out.winPct = 1;
+    if (out.winPct > 99) out.winPct = 99;
+  }
+  out.expFinalMe = Math.round((myS + dMe * mine.mean) * 10) / 10;
+  out.expFinalOpp = Math.round((opS + dOp * theirs.mean) * 10) / 10;
+  return out;
+}
+
+// ── The card line ──
+// One row under the score: how much of the period is left, the pace the
+// margin demands, and the win probability with a thin bar behind it. Tapping
+// it explains itself, since the inputs matter as much as the output and there
+// is no console on a phone.
+function _espOutlookRowHtml(l, accent) {
+  if (typeof espMatchupOutlook !== 'function') return '';
+  var o = null;
+  try { o = espMatchupOutlook(l); } catch (e) { return ''; }
+  if (!o || !o.totalDays) return '';
+
+  var left = [];
+  if (o.daysLeft > 0) {
+    left.push(o.daysLeft + 'd left');
+  } else {
+    left.push('period closed');
+  }
+  if (o.needPerDay != null) left.push('need +' + o.needPerDay + '/d');
+  else if (o.cushionPerDay != null) left.push('up ' + o.cushionPerDay + '/d');
+  if (o.daySource === 'derived') left.push('est');
+
+  var pctTxt = '', bar = '';
+  if (o.winPct != null) {
+    var col = o.winPct >= 60 ? '#4ade80' : o.winPct <= 40 ? '#f87171' : '#fbbf24';
+    pctTxt = '<span style="font-family:var(--sk-font-mono);font-size:13px;' +
+      'font-weight:800;color:' + col + '">' + (Math.round(o.winPct * 10) / 10) + '%</span>' +
+      '<span style="font-size:9px;font-weight:700;letter-spacing:0.8px;' +
+      'color:var(--sk-text-3);margin-left:4px">WIN' +
+      (o.thin ? '<span style="color:#fbbf24">*</span>' : '') + '</span>';
+    bar = '<div style="height:3px;border-radius:2px;background:rgba(255,255,255,0.07);' +
+      'margin-top:5px;overflow:hidden">' +
+      '<div style="height:100%;width:' + Math.max(1, Math.min(100, o.winPct)) + '%;' +
+      'background:' + col + ';opacity:0.75"></div></div>';
+  } else if (o.catLead != null) {
+    var ccol = o.catLead > 0 ? '#4ade80' : o.catLead < 0 ? '#f87171' : 'var(--sk-text-3)';
+    pctTxt = '<span style="font-family:var(--sk-font-mono);font-size:11px;font-weight:700;' +
+      'color:' + ccol + '">' +
+      (o.catLead > 0 ? '+' + o.catLead : o.catLead) + ' cats</span>';
+  }
+
+  var kAttr = String(l.key || '').replace(/'/g, '');
+  return '<div class="sk-card-status-row" style="cursor:pointer" ' +
+    'onclick="event.stopPropagation(); espOutlookWhy(\'' + kAttr + '\')">' +
+    '<span style="font-family:var(--sk-font-mono);font-size:10px;' +
+    'color:var(--sk-text-3)">' + slEsc(left.join(' \u00b7 ')) + '</span>' +
+    (pctTxt ? '<span style="margin-left:auto;white-space:nowrap">' + pctTxt + '</span>' : '') +
+    '</div>' + bar;
+}
+
+// Tap-to-explain. The probability is only as good as the sample behind it, so
+// the sample is what gets shown.
+function espOutlookWhy(key) {
+  var list = [], row = null, i;
+  try { if (typeof extSyncedLeagues === 'function') list = extSyncedLeagues() || []; } catch (e) {}
+  for (i = 0; i < list.length; i++) {
+    if (list[i] && String(list[i].key) === String(key)) { row = list[i]; break; }
+  }
+  if (!row) return;
+  var o = null;
+  try { o = espMatchupOutlook(row); } catch (e) {}
+  if (!o) { if (typeof skToast === 'function') skToast('No matchup to read yet.'); return; }
+
+  var msg = 'Day ' + (o.dayIdx || '?') + ' of ' + o.totalDays +
+    (o.daySource === 'derived' ? ' (length estimated from finished periods)' : '') + '. ';
+  if (o.gap != null) {
+    msg += (o.gap === 0 ? 'Level' : (o.gap > 0 ? 'Up ' : 'Down ') + Math.abs(o.gap)) +
+      ' with ' + o.daysLeft + ' day' + (o.daysLeft === 1 ? '' : 's') + ' left. ';
+  }
+  if (o.me && o.opp) {
+    msg += 'You score ' + (Math.round(o.me.mean * 10) / 10) + '/day (sd ' +
+      (Math.round(o.me.sd * 10) / 10) + ', ' + o.me.n + ' days), them ' +
+      (Math.round(o.opp.mean * 10) / 10) + ' (sd ' + (Math.round(o.opp.sd * 10) / 10) +
+      ', ' + o.opp.n + '). ';
+  }
+  if (o.effDaysMe != null) {
+    msg += 'Counting ' + o.effDaysMe + ' days of scoring still coming for you and ' +
+      o.effDaysOpp + ' for them. ';
+  }
+  if (o.thin) msg += 'Thin sample \u2014 treat the number loosely. ';
+  if (typeof skToast === 'function') skToast(msg);
+}
+
 // ESPN lineup modal. Today's fantasy points per player, straight from the
 // roster payload — no extra request, no name resolution.
 // ── Lineup group totals ── ESPN3F ──
@@ -130579,6 +131008,10 @@ function skBuildExtCardHTML(l) {
           : l.provider === 'espn' ? 'TODAY\u2019S LINEUP'
           : 'THIS WEEK\u2019S LINEUP') + ' \u203a</div>'
       : '') +
+    // Days left in the period, the pace the margin demands, and the win
+    // probability. ESPOUTLOOK
+    ((l.provider === 'espn' && typeof _espOutlookRowHtml === 'function')
+      ? _espOutlookRowHtml(l, accent) : '') +
     // Top bat + arm for today, mirroring the Yahoo card's top-player line.
     // ESPNSLICE2H
     ((l.provider === 'espn' && typeof _espTopTodayHtml === 'function')
