@@ -126446,6 +126446,59 @@ function espMyLiveRank(row) {
   return null;
 }
 
+// ── GAMES-STARTED CAP ── ESPGAMELIMIT ──
+// ESPN caps games started in some leagues ("Max Games Started 79/200" on the
+// roster screen). Both halves are already in memory:
+//   used  -> teams[].valuesByStat[33]                  (mTeam)
+//   cap   -> rosterSettings.lineupSlotStatLimits[*]    (mSettings)
+//
+// The limit node is keyed by LINEUP SLOT and names the stat it caps in a
+// statId field, so it is matched on statId rather than on the slot key —
+// nothing guarantees which slot carries it, and both leagues that have one
+// happened to use slot 22, which is exactly the kind of coincidence that
+// hard-codes a bug.
+//
+// SEASON POINTS ONLY, and that is a real distinction rather than caution:
+// H2H leagues carry the same field with a PER-SCORING-PERIOD value. The
+// Los Angeles league reads 1.714285714, which is 12/7 — twelve starts a week
+// spread across seven days. Rendering that as "79/1.7" would be nonsense.
+function espStatLimit(row, statId) {
+  if (typeof espIsSeasonPts !== 'function' || !espIsSeasonPts(row)) return null;
+  var lim = ((((row || {}).raw || {}).settings || {}).rosterSettings || {})
+              .lineupSlotStatLimits;
+  if (!lim) return null;
+  var k;
+  for (k in lim) {
+    if (!lim.hasOwnProperty(k)) continue;
+    var n = lim[k];
+    if (!n || typeof n !== 'object') continue;
+    if (String(n.statId) !== String(statId)) continue;
+    var v = Number(n.limitValue);
+    if (isNaN(v) || v <= 0) continue;
+    return v;
+  }
+  return null;
+}
+
+// { used, cap, left } for one team, or null when this league has no cap.
+function espGamesStarted(row, teamId) {
+  var cap = espStatLimit(row, 33);
+  if (cap == null) return null;
+  var teams = (((row || {}).raw || {}).teams) || [], i;
+  for (i = 0; i < teams.length; i++) {
+    if (String(teams[i].id) !== String(teamId)) continue;
+    var vb = teams[i].valuesByStat;
+    var used = (vb && vb['33'] != null) ? Number(vb['33']) : null;
+    if (used == null || isNaN(used)) return null;
+    return {
+      used: Math.round(used * 10) / 10,
+      cap: Math.round(cap * 10) / 10,
+      left: Math.round((cap - used) * 10) / 10
+    };
+  }
+  return null;
+}
+
 function _espStandingsPaneHtml(row) {
   // Season Stats and Daily Stats are further views of the SAME pane, swapped
   // in place by espSetStandView. Checked before the standingsAll guard
@@ -126524,6 +126577,19 @@ function _espStandingsPaneHtml(row) {
           if (x.owner) bits.push(slEsc(x.owner));
           if (x.waiver) bits.push('W' + x.waiver);
           if (x.projRank && !seasonPts) bits.push('proj ' + x.projRank);
+          // Games-started budget, league-wide rather than just mine —
+          // seeing who is burning starts is half the value. ESPGAMELIMIT
+          var gs = (typeof espGamesStarted === 'function')
+            ? espGamesStarted(row, r.teamId) : null;
+          if (gs) {
+            // Coloured on what is LEFT, not on percentage used: with 200
+            // starts the difference between 60% and 70% used is noise, but
+            // "9 left" is the number that changes a waiver decision.
+            var gsCol = gs.left <= 10 ? '#f87171'
+                      : gs.left <= 25 ? '#fbbf24' : 'rgba(255,255,255,0.32)';
+            bits.push('<span style="color:' + gsCol + '">GS ' +
+              gs.used + '/' + gs.cap + '</span>');
+          }
           if (!bits.length) return '';
           return '<span style="display:block;font-size:9px;letter-spacing:0.04em;' +
             'color:rgba(255,255,255,0.32);overflow:hidden;text-overflow:ellipsis;' +
@@ -126569,7 +126635,11 @@ function _espStandingsPaneHtml(row) {
   if (seasonPts) {
     h += '<div style="color:rgba(255,255,255,0.28);font-size:9.5px;margin-top:8px;line-height:1.5;">' +
       'TOTAL includes today\u2019s starters so far \u00b7 TODAY is that same figure ' +
-      'on its own \u00b7 GAP is points ahead of (+) or behind (\u2212) you</div>';
+      'on its own \u00b7 GAP is points ahead of (+) or behind (\u2212) you' +
+      ((typeof espStatLimit === 'function' && espStatLimit(row, 33) != null)
+        ? ' \u00b7 GS is games started against this league\u2019s cap'
+        : '') +
+      '</div>';
   }
   h += '</div>';
   return h;
