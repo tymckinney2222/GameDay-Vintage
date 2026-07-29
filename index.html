@@ -125286,45 +125286,11 @@ function _espTopTodayHtml(l, accent) {
 // (the two-week All-Star one) without special-casing. It is NOT confirmed
 // present in every league's payload, so there are two fallbacks and the
 // source is reported so the UI can say which one it used.
-function _espPeriodDays(row, period) {
-  var ss = ((((row || {}).raw || {}).settings) || {}).scheduleSettings || {};
-  var mp = ss.matchupPeriods;
-  var key = String(period), i, out;
-  if (mp && mp[key] && mp[key].length) {
-    out = [];
-    for (i = 0; i < mp[key].length; i++) {
-      var n = Number(mp[key][i]);
-      if (!isNaN(n)) out.push(n);
-    }
-    if (out.length) {
-      out.sort(function (a, b) { return a - b; });
-      return { days: out, source: 'settings' };
-    }
-  }
-  // Fallback: measure the period length from the periods already finished,
-  // rather than converting matchupPeriodLength into days. That setting's unit
-  // is ambiguous — 1 could mean one week or one scoring period, and MLB
-  // scoring periods are days — and a wrong unit here would silently scale
-  // every number downstream. Completed periods have already banked one entry
-  // per day, so their key count IS the length, measured not assumed.
-  var banked = _espBankedDaysByPeriod(row);
-  if (!banked.byPeriod[key] && !banked.modeLen) return { days: null, source: null };
-  var len = banked.modeLen;
-  if (!len) return { days: null, source: null };
-  // The mode across every completed period, so the one irregular two-week
-  // period can't set the length for all the others.
-  var mine = banked.byPeriod[key];
-  var j2 = row && row._espScoreJson;
-  var today2 = (j2 && j2.scoringPeriodId != null) ? Number(j2.scoringPeriodId) : null;
-  var start = (mine && mine.length) ? mine[0] : today2;
-  if (start == null) return { days: null, source: null };
-  var full = [];
-  for (i = 0; i < len; i++) full.push(start + i);
-  return { days: full, source: 'derived' };
-}
-
-// Days each matchup period has actually banked, plus the most common length
-// across the periods that are finished.
+// Days already banked per matchup period, plus the modal period LENGTH.
+//
+// Length is the SPAN of day ids (max - min + 1) rather than the count of keys:
+// if one day is missing from every team's map the count undercounts it, while
+// the span survives as long as the first and last day are present.
 function _espBankedDaysByPeriod(row) {
   var j = row && row._espScoreJson;
   var sch = (j && j.schedule) || [];
@@ -125357,7 +125323,8 @@ function _espBankedDaysByPeriod(row) {
     // Only FINISHED periods report a trustworthy length; the current one is
     // still filling in.
     if (cur != null && Number(pk2) < Number(cur) && list.length) {
-      tally[list.length] = (tally[list.length] || 0) + 1;
+      var span = list[list.length - 1] - list[0] + 1;
+      tally[span] = (tally[span] || 0) + 1;
     }
   }
   var modeLen = null, best = 0, lk;
@@ -125367,35 +125334,93 @@ function _espBankedDaysByPeriod(row) {
   return { byPeriod: byPeriod, modeLen: modeLen };
 }
 
-// Where today sits in the period, and how much of it remains.
-//   dayIdx          1-based day number, null when today isn't in the period
+// The day ids scheduleSettings.matchupPeriods claims for a period — IF they
+// are day ids at all.
+//
+// This is the assumption that broke, and it broke silently. In football a
+// matchup period contains exactly one scoring period, so the map reads
+// {"1":[1],"2":[2],...} and its values serve as both. Read the same way for
+// MLB — where scoring periods are DAYS and a matchup period spans a week —
+// period 17 came back as [17] while today's scoringPeriodId was 125. Nothing
+// was in range, so the code concluded the period had ended, on day three of
+// seven, and reported "period closed" with no estimate marker because it
+// believed it was using authoritative settings.
+//
+// So the list is now checked against day ids actually observed in
+// pointsByScoringPeriod, and discarded unless it lands in the same numbering
+// space. Being unable to confirm it is treated as a reason not to use it.
+// ESPOUTLOOK
+function _espSettingsPeriodDays(row, period, observed) {
+  var ss = ((((row || {}).raw || {}).settings) || {}).scheduleSettings || {};
+  var mp = ss.matchupPeriods;
+  var key = String(period), i, out = [];
+  if (!mp || !mp[key] || !mp[key].length) return null;
+  for (i = 0; i < mp[key].length; i++) {
+    var n = Number(mp[key][i]);
+    if (!isNaN(n)) out.push(n);
+  }
+  if (!out.length) return null;
+  out.sort(function (a, b) { return a - b; });
+  // With nothing observed there is nothing to check against, so it stays
+  // untrusted rather than being taken on faith.
+  if (!observed || !observed.length) return null;
+  var lo = observed[0], hi = observed[observed.length - 1];
+  if (out[out.length - 1] < lo || out[0] > hi) return null;
+  return out;
+}
+
+// Where today sits in the period and how much of it remains, built on day ids
+// that have actually been seen rather than on a settings field whose units
+// can't be confirmed.
+//   dayIdx          1-based day number within the period
 //   daysLeft        remaining INCLUDING today, which is still in progress
 //   daysAfterToday  whole days not yet started
 function _espPeriodPosition(row, period) {
-  var pd = _espPeriodDays(row, period);
-  if (!pd.days) return null;
   var j = row && row._espScoreJson;
   var today = (j && j.scoringPeriodId != null) ? Number(j.scoringPeriodId) : null;
-  var days = pd.days, i, idx = -1;
-  if (today != null) {
-    for (i = 0; i < days.length; i++) { if (days[i] === today) { idx = i; break; } }
+  if (today == null) return null;
+  var cur = (j && j.status && j.status.currentMatchupPeriod);
+  var isCurrent = (cur != null && Number(cur) === Number(period));
+
+  var banked = _espBankedDaysByPeriod(row);
+  var observed = banked.byPeriod[String(period)] || [];
+  var setDays = _espSettingsPeriodDays(row, period, observed);
+
+  // scoringPeriodId is a season-long day counter, so the period's first day
+  // subtracted from today gives the position directly — no dependence on how
+  // many keys happen to be present.
+  var first = null;
+  if (setDays) first = setDays[0];
+  else if (observed.length) first = observed[0];
+  else if (isCurrent) first = today;             // day one, nothing banked yet
+  if (first == null) return null;
+
+  var source = setDays ? 'settings' : (observed.length ? 'observed' : 'first-day');
+  var dayIdx = today - first + 1;
+  // A nonsense position means the ids aren't what they appear to be. Counting
+  // banked days is cruder but can't be off by a hundred.
+  if (dayIdx < 1 || dayIdx > 40) {
+    dayIdx = observed.length + 1;
+    source = 'count';
   }
-  var totalDays = days.length;
-  if (idx < 0) {
-    // Between periods, or a scoringPeriodId that hasn't caught up. Before the
-    // period all of it is left; after it, none.
-    if (today != null && today < days[0]) {
-      return { totalDays: totalDays, dayIdx: null, daysLeft: totalDays,
-               daysAfterToday: totalDays, source: pd.source, today: today };
-    }
-    return { totalDays: totalDays, dayIdx: null, daysLeft: 0,
-             daysAfterToday: 0, source: pd.source, today: today };
-  }
+
+  var lenSource = 'settings';
+  var totalDays = setDays ? setDays.length : null;
+  if (!totalDays) { totalDays = banked.modeLen; lenSource = 'mode'; }
+  if (!totalDays) { totalDays = dayIdx; lenSource = 'assumed'; }
+  // ESPN says this IS the current period, so it cannot already be over,
+  // whatever the arithmetic concludes. This is the invariant the first cut
+  // lacked, and the reason a live matchup read as finished.
+  if (isCurrent && totalDays < dayIdx) { totalDays = dayIdx; lenSource = 'floored'; }
+
+  var daysLeft = totalDays - dayIdx + 1;
+  if (daysLeft < 0) daysLeft = 0;
+  if (isCurrent && daysLeft < 1) daysLeft = 1;
   return {
-    totalDays: totalDays, dayIdx: idx + 1,
-    daysLeft: totalDays - idx,
-    daysAfterToday: totalDays - idx - 1,
-    source: pd.source, today: today
+    totalDays: totalDays, dayIdx: dayIdx, daysLeft: daysLeft,
+    daysAfterToday: (daysLeft > 1) ? (daysLeft - 1) : 0,
+    source: source, lenSource: lenSource, today: today,
+    observedDays: observed.length, isCurrent: isCurrent
   };
 }
 
@@ -125537,7 +125562,8 @@ function espMatchupOutlook(row) {
     oppName: meAway ? g.home : g.away,
     totalDays: pos.totalDays, dayIdx: pos.dayIdx,
     daysLeft: pos.daysLeft, daysAfterToday: pos.daysAfterToday,
-    daySource: pos.source,
+    daySource: pos.source, lenSource: pos.lenSource,
+    observedDays: pos.observedDays, isCurrent: pos.isCurrent,
     gap: null, needPerDay: null, winPct: null, thin: false,
     me: null, opp: null
   };
@@ -125634,7 +125660,10 @@ function _espOutlookRowHtml(l, accent) {
   }
   if (o.needPerDay != null) left.push('need +' + o.needPerDay + '/d');
   else if (o.cushionPerDay != null) left.push('up ' + o.cushionPerDay + '/d');
-  if (o.daySource === 'derived') left.push('est');
+  // Only flagged when the period LENGTH had to be assumed. A length taken
+  // from the modal length of finished periods is measured evidence, not an
+  // estimate, so it doesn't earn a warning.
+  if (o.lenSource === 'assumed' || o.lenSource === 'floored') left.push('est');
 
   var pctTxt = '', bar = '';
   if (o.winPct != null) {
@@ -125678,7 +125707,7 @@ function espOutlookWhy(key) {
   if (!o) { if (typeof skToast === 'function') skToast('No matchup to read yet.'); return; }
 
   var msg = 'Day ' + (o.dayIdx || '?') + ' of ' + o.totalDays +
-    (o.daySource === 'derived' ? ' (length estimated from finished periods)' : '') + '. ';
+    ' (day from ' + o.daySource + ', length from ' + o.lenSource + '). ';
   if (o.gap != null) {
     msg += (o.gap === 0 ? 'Level' : (o.gap > 0 ? 'Up ' : 'Down ') + Math.abs(o.gap)) +
       ' with ' + o.daysLeft + ' day' + (o.daysLeft === 1 ? '' : 's') + ' left. ';
@@ -125694,6 +125723,19 @@ function espOutlookWhy(key) {
       o.effDaysOpp + ' for them. ';
   }
   if (o.thin) msg += 'Thin sample \u2014 treat the number loosely. ';
+  // The shape of matchupPeriods is what broke this feature once already, so
+  // it's readable on the device rather than only in a console there isn't one
+  // of. ESPOUTLOOK
+  var ss = ((((row || {}).raw || {}).settings) || {}).scheduleSettings || {};
+  var mp = ss.matchupPeriods;
+  var raw = mp && mp[String(o.period)];
+  if (raw && raw.length) {
+    msg += 'settings.matchupPeriods[' + o.period + '] = [' +
+      raw.slice(0, 4).join(',') + (raw.length > 4 ? ',\u2026' : '') + '] (' +
+      raw.length + '), ' + o.observedDays + ' days banked.';
+  } else {
+    msg += 'No matchupPeriods entry; ' + o.observedDays + ' days banked.';
+  }
   if (typeof skToast === 'function') skToast(msg);
 }
 
