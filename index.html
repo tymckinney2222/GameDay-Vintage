@@ -125040,7 +125040,7 @@ function espBuildWindows(pl, season, period, scoredIds) {
     var sn = w.prevSeason ? (Number(season) - 1) : season;
     var es = espStatEntries(pl, w.src, w.split, sn, w.useCur ? period : null);
     if (!es.length) { out[w.key] = null; continue; }
-    var st = {}, total = null, n, j;
+    var st = {}, fp = null, total = null, n, j, ak;
     for (n = 0; n < es.length; n++) {
       e = es[n];
       if (e.stats && scoredIds) {
@@ -125056,6 +125056,21 @@ function espBuildWindows(pl, season, period, scoredIds) {
           st[id] = (st[id] == null ? 0 : st[id]) + Number(e.stats[id]);
         }
       }
+      // appliedStats is ESPN's OWN per-statId point contribution — the
+      // breakdown behind appliedTotal, already carrying the league's point
+      // values and already resolved for two-way players. Kept so a points
+      // league can show where a day's fantasy points came from without
+      // re-deriving anything. Small: only the stats that actually applied.
+      // ESPDAILYH2H
+      if (e.appliedStats) {
+        for (ak in e.appliedStats) {
+          if (!e.appliedStats.hasOwnProperty(ak)) continue;
+          var av = Number(e.appliedStats[ak]);
+          if (isNaN(av)) continue;
+          if (fp == null) fp = {};
+          fp[ak] = (fp[ak] == null ? 0 : fp[ak]) + av;
+        }
+      }
       var t = espAppliedTotal(e);
       if (t != null) total = (total == null ? 0 : total) + t;
     }
@@ -125066,7 +125081,7 @@ function espBuildWindows(pl, season, period, scoredIds) {
     // report, so it is left blank rather than invented.
     var avg = (es.length === 1 && es[0].appliedAverage != null)
       ? Math.round(Number(es[0].appliedAverage) * 10) / 10 : null;
-    out[w.key] = { total: total, avg: avg, stats: st, games: es.length };
+    out[w.key] = { total: total, avg: avg, stats: st, fp: fp, games: es.length };
   }
   return out;
 }
@@ -126076,6 +126091,334 @@ function espDailyRates(vals, game) {
   return vals;
 }
 
+// ── TODAY, HEAD TO HEAD ── ESPDAILYH2H ──
+// The daily table shows all ten teams in raw counting stats. This isolates
+// the two teams that matter this week and restates the day in FANTASY
+// POINTS, which is the currency a points league is actually settled in.
+//
+// The points are never re-derived from stats x point values. espAppliedTotal
+// already documents why: a hand-rolled multiply was wrong by 124 on Shohei
+// Ohtani, because a two-way player carries batting AND pitching stats while
+// the league scores him on one side only. ESPN's appliedStats holds just the
+// statIds that actually applied, already multiplied by the league's own point
+// values, so summing those is exact by construction and adds up to
+// appliedTotal.
+
+// Per-stat fantasy points for one team's starters today, from appliedStats.
+// { fp: {statId: points}, sum, total } — sum is the breakdown's own total,
+// total is the trusted appliedTotal sum. They should agree; the table says so
+// when they don't rather than quietly disagreeing.
+function espDailyTeamFp(rosters, teamId) {
+  var t = rosters && rosters.byTeam && rosters.byTeam[String(teamId)];
+  if (!t || !t.items) return null;
+  var fp = {}, sum = 0, total = null, any = false, i, k;
+  for (i = 0; i < t.items.length; i++) {
+    var it = t.items[i];
+    if (!it || !it.starter) continue;
+    var w = it.windows && it.windows.today;
+    if (!w) continue;
+    if (w.total != null) total = (total == null ? 0 : total) + Number(w.total);
+    if (!w.fp) continue;
+    for (k in w.fp) {
+      if (!w.fp.hasOwnProperty(k)) continue;
+      var v = Number(w.fp[k]);
+      if (isNaN(v)) continue;
+      fp[k] = (fp[k] == null ? 0 : fp[k]) + v;
+      sum += v;
+      any = true;
+    }
+  }
+  if (!any) return null;
+  return {
+    fp: fp, derived: false,
+    sum: Math.round(sum * 10) / 10,
+    total: (total == null) ? null : Math.round(total * 10) / 10
+  };
+}
+
+// The league's point value for one stat, used ONLY by the fallback below.
+function _espStatPointVal(row, statId) {
+  var items = ((((row || {}).raw || {}).settings || {}).scoringSettings || {}).scoringItems || [];
+  for (var i = 0; i < items.length; i++) {
+    if (!items[i] || String(items[i].statId) !== String(statId)) continue;
+    var p = items[i].points;
+    if (p == null || isNaN(Number(p))) return null;
+    return Number(p);
+  }
+  return null;
+}
+
+// Fallback for the case where appliedStats never lands: multiply the day's
+// counting stats by the league's point values. Flagged as derived, because
+// this is the path that can disagree with ESPN on a two-way player. Rate
+// stats are excluded — they aren't scored, and espDailyRates injects them.
+function espDailyTeamFpDerived(row, teamId) {
+  var raw = espDailyTeamStats(row && row.rosters, teamId);
+  if (!raw) return null;
+  var fp = {}, sum = 0, any = false, k;
+  for (k in raw) {
+    if (!raw.hasOwnProperty(k)) continue;
+    if (ESP_STAT_RATE[k]) continue;
+    var pv = _espStatPointVal(row, k);
+    if (pv == null) continue;
+    var v = Number(raw[k]) * pv;
+    if (isNaN(v)) continue;
+    fp[k] = Math.round(v * 10) / 10;
+    sum += v;
+    any = true;
+  }
+  if (!any) return null;
+  var trusted = (typeof espTodayTeamTotal === 'function')
+    ? espTodayTeamTotal(row && row.rosters, teamId) : null;
+  return {
+    fp: fp, derived: true,
+    sum: Math.round(sum * 10) / 10,
+    total: trusted
+  };
+}
+
+// Who I'm playing this matchup period, read off the schedule already in
+// memory. Null for a season-long league (no opponent) and for a bye.
+function espMyMatchupPair(row) {
+  if (typeof espIsSeasonPts === 'function' && espIsSeasonPts(row)) return null;
+  var j = row && row._espScoreJson;
+  var sch = (j && j.schedule) || [];
+  var period = (j && j.status && j.status.currentMatchupPeriod);
+  if (!sch.length || period == null) return null;
+  var myIds = row.myTeamIds || {}, i;
+  for (i = 0; i < sch.length; i++) {
+    var m = sch[i] || {};
+    if (Number(m.matchupPeriodId) !== Number(period)) continue;
+    var a = m.away || {}, h = m.home || {};
+    var meAway = !!(a.teamId != null && myIds[String(a.teamId)]);
+    var meHome = !!(h.teamId != null && myIds[String(h.teamId)]);
+    if (!meAway && !meHome) continue;
+    var mine = meAway ? a : h, opp = meAway ? h : a;
+    if (mine.teamId == null || opp.teamId == null) return null;   // bye
+    return {
+      period: Number(period), away: meAway,
+      mineId: String(mine.teamId), oppId: String(opp.teamId)
+    };
+  }
+  return null;
+}
+
+// Stat ids to show, in the league's own scoring order, limited to the ones
+// either side actually put on the board today.
+function _espH2HRowIds(row, game, a, b) {
+  var items = ((((row.raw || {}).settings || {}).scoringSettings) || {}).scoringItems || [];
+  var bat = [], pit = [], seen = {}, i;
+  for (i = 0; i < items.length; i++) {
+    var id = items[i] && items[i].statId;
+    if (id == null) continue;
+    var key = String(id);
+    if (seen[key]) continue;
+    var label = espStatLabel(game, key);
+    if (!label) continue;
+    var inA = !!(a && a[key] != null), inB = !!(b && b[key] != null);
+    if (!inA && !inB) continue;
+    seen[key] = 1;
+    var col = { id: key, label: label };
+    if (espStatSide(game, key) === 'p') pit.push(col); else bat.push(col);
+  }
+  return { bat: bat, pit: pit };
+}
+
+function _espH2HTeamLabel(row, byId, teamId) {
+  var t = byId[String(teamId)];
+  if (t && t.abbrev) return String(t.abbrev);
+  var srows = (row.standingsAll || []), i;
+  for (i = 0; i < srows.length; i++) {
+    if (String(srows[i].teamId) === String(teamId)) return srows[i].teamName || ('Team ' + teamId);
+  }
+  return 'Team ' + teamId;
+}
+
+// Rows are stats and columns are teams — the transpose of the table above it.
+// Fifteen stat columns across two rows needs a sideways swipe to read; two
+// team columns down fifteen rows fits a phone without one.
+function _espDailyH2HHtml(row, game) {
+  var pair = espMyMatchupPair(row);
+  if (!pair) return '';
+  var teams = ((row.raw || {}).teams) || [], byId = {}, i;
+  for (i = 0; i < teams.length; i++) byId[String(teams[i].id)] = teams[i];
+  var meLbl = _espH2HTeamLabel(row, byId, pair.mineId);
+  var opLbl = _espH2HTeamLabel(row, byId, pair.oppId);
+
+  var cats = (typeof espIsCats === 'function') && espIsCats(row);
+  var accent = extProvAccent('espn');
+  var mono = 'font-family:var(--sk-font-mono,monospace);';
+  var pad = 'padding:5px 6px;text-align:right;white-space:nowrap;';
+  var head = '<div style="margin-top:16px;padding-top:12px;' +
+    'border-top:1px solid rgba(255,255,255,0.10);">' +
+    '<div style="font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
+    'margin:0 0 7px;">THIS WEEK\u2019S MATCHUP \u00b7 PERIOD ' + pair.period + '</div>';
+
+  // ── categories leagues: no fantasy points exist, so the same two teams in
+  // raw stats is the honest version of this section. ──
+  var aRaw = espDailyRates(espDailyTeamStats(row.rosters, pair.mineId) || {}, game);
+  var bRaw = espDailyRates(espDailyTeamStats(row.rosters, pair.oppId) || {}, game);
+  var aFp = null, bFp = null, fpMode = false, derived = false;
+  if (!cats) {
+    aFp = espDailyTeamFp(row.rosters, pair.mineId);
+    bFp = espDailyTeamFp(row.rosters, pair.oppId);
+    if (!aFp && !bFp) {
+      aFp = espDailyTeamFpDerived(row, pair.mineId);
+      bFp = espDailyTeamFpDerived(row, pair.oppId);
+    }
+    fpMode = !!(aFp || bFp);
+    derived = !!((aFp && aFp.derived) || (bFp && bFp.derived));
+  }
+
+  var aVals = fpMode ? ((aFp || {}).fp || {}) : aRaw;
+  var bVals = fpMode ? ((bFp || {}).fp || {}) : bRaw;
+  var ids = _espH2HRowIds(row, game, aVals, bVals);
+  var all = ids.bat.concat(ids.pit);
+  if (!all.length) {
+    return head + '<div style="color:rgba(255,255,255,0.35);font-size:11.5px;">' +
+      meLbl + ' vs ' + opLbl + ' \u2014 neither side has put anything on the ' +
+      'board yet today.</div></div>';
+  }
+
+  function fmtFp(v) {
+    if (v == null) return '\u2014';
+    var n = Math.round(Number(v) * 10) / 10;
+    return (n > 0 ? '' : '') + String(n);
+  }
+  function cell(v, extra) {
+    return '<td style="' + pad + mono + (extra || '') + '">' + v + '</td>';
+  }
+
+  var h = head;
+  h += '<table style="border-collapse:collapse;font-size:11.5px;width:100%;">';
+  h += '<thead>';
+  h += '<tr style="color:rgba(255,255,255,0.42);font-size:9px;letter-spacing:0.08em;">' +
+    '<th style="' + pad + 'text-align:left;"></th>' +
+    (fpMode
+      ? '<th colspan="2" style="' + pad + 'text-align:center;color:' + accent + ';">' +
+          slEsc(meLbl) + '</th>' +
+        '<th colspan="2" style="' + pad + 'text-align:center;">' + slEsc(opLbl) + '</th>'
+      : '<th style="' + pad + 'color:' + accent + ';">' + slEsc(meLbl) + '</th>' +
+        '<th style="' + pad + '">' + slEsc(opLbl) + '</th>') +
+    '<th style="' + pad + '">\u0394</th></tr>';
+  if (fpMode) {
+    h += '<tr style="color:rgba(255,255,255,0.26);font-size:8.5px;letter-spacing:0.06em;">' +
+      '<th style="' + pad + 'text-align:left;">STAT</th>' +
+      '<th style="' + pad + '">#</th><th style="' + pad + '">FP</th>' +
+      '<th style="' + pad + '">#</th><th style="' + pad + '">FP</th>' +
+      '<th style="' + pad + '"></th></tr>';
+  }
+  h += '</thead><tbody>';
+
+  var span = fpMode ? 6 : 4;
+  var groups = [];
+  if (ids.bat.length) groups.push({ label: (game === 'flb' ? 'BATTING' : 'TEAM'), cols: ids.bat });
+  if (ids.pit.length) groups.push({ label: 'PITCHING', cols: ids.pit });
+
+  var gi, j;
+  for (gi = 0; gi < groups.length; gi++) {
+    if (groups.length > 1) {
+      h += '<tr><td colspan="' + span + '" style="padding:7px 6px 3px;font-size:8.5px;' +
+        'letter-spacing:0.1em;color:rgba(255,255,255,0.26);' +
+        'border-bottom:1px solid rgba(255,255,255,0.07);">' +
+        groups[gi].label + '</td></tr>';
+    }
+    for (j = 0; j < groups[gi].cols.length; j++) {
+      var c = groups[gi].cols[j];
+      var av = aVals[c.id], bv = bVals[c.id];
+      // Fantasy points are additive, so a stat a team didn't produce is worth
+      // zero rather than unknown — and that keeps the column of deltas
+      // summing to the delta on the TODAY FP row. Raw counts stay null-safe:
+      // a missing rate stat has no meaningful difference.
+      var d;
+      if (fpMode) {
+        d = Math.round(((av == null ? 0 : Number(av)) -
+                        (bv == null ? 0 : Number(bv))) * 10) / 10;
+      } else {
+        d = (av == null || bv == null) ? null
+          : Math.round((Number(av) - Number(bv)) * 10) / 10;
+      }
+      // In FP mode a bigger number is always better, so the delta can be
+      // coloured. In raw mode it can't — more strikeouts is good for a
+      // pitcher and bad for a batter — so it stays neutral.
+      var dCol = 'rgba(255,255,255,0.35)';
+      if (fpMode && d != null && d > 0) dCol = '#4ade80';
+      else if (fpMode && d != null && d < 0) dCol = '#f87171';
+      h += '<tr>' +
+        '<td style="' + pad + 'text-align:left;color:rgba(255,255,255,0.6);">' +
+          slEsc(c.label) + '</td>';
+      if (fpMode) {
+        var arw = aRaw ? aRaw[c.id] : null, brw = bRaw ? bRaw[c.id] : null;
+        h += cell(arw == null ? '\u2014' : slEsc(espStatFmt(c.id, arw)),
+              'color:rgba(255,255,255,0.3);font-size:10px;') +
+          cell(fmtFp(av), 'color:rgba(255,255,255,0.92);font-weight:600;') +
+          cell(brw == null ? '\u2014' : slEsc(espStatFmt(c.id, brw)),
+              'color:rgba(255,255,255,0.3);font-size:10px;') +
+          cell(fmtFp(bv), 'color:rgba(255,255,255,0.72);');
+      } else {
+        h += cell(av == null ? '\u2014' : slEsc(espStatFmt(c.id, av)),
+              'color:rgba(255,255,255,0.92);font-weight:600;') +
+          cell(bv == null ? '\u2014' : slEsc(espStatFmt(c.id, bv)),
+              'color:rgba(255,255,255,0.72);');
+      }
+      h += cell(d == null ? '\u2014' : ((d > 0 ? '+' : '') + d), 'color:' + dCol + ';') +
+        '</tr>';
+    }
+  }
+
+  // Total row. The FP total is the TRUSTED appliedTotal sum, not the sum of
+  // the column above it — the same number the Matchup tab shows.
+  if (fpMode) {
+    var at = (aFp && aFp.total != null) ? aFp.total : null;
+    var bt = (bFp && bFp.total != null) ? bFp.total : null;
+    var dt = (at == null || bt == null) ? null : Math.round((at - bt) * 10) / 10;
+    h += '<tr style="border-top:1px solid rgba(255,255,255,0.14);">' +
+      '<td style="' + pad + 'text-align:left;font-size:9px;letter-spacing:0.08em;' +
+      'color:rgba(255,255,255,0.5);">TODAY FP</td>' +
+      '<td style="' + pad + '"></td>' +
+      cell(fmtFp(at), 'color:' + accent + ';font-weight:700;font-size:12.5px;') +
+      '<td style="' + pad + '"></td>' +
+      cell(fmtFp(bt), 'color:rgba(255,255,255,0.85);font-weight:700;font-size:12.5px;') +
+      cell(dt == null ? '\u2014' : ((dt > 0 ? '+' : '') + dt),
+        'font-weight:700;color:' +
+        (dt == null ? 'rgba(255,255,255,0.35)' : dt > 0 ? '#4ade80' : dt < 0 ? '#f87171'
+          : 'rgba(255,255,255,0.35)') + ';') +
+      '</tr>';
+  }
+  h += '</tbody></table>';
+
+  var note = fpMode
+    ? (derived
+        ? 'FP multiplied out from this league\u2019s point values \u2014 ESPN didn\u2019t ' +
+          'send its own breakdown, so a two-way player may be counted on the ' +
+          'wrong side. The TODAY FP row is ESPN\u2019s number and is right regardless.'
+        : 'FP is ESPN\u2019s own applied points per stat, not a recomputation \u00b7 ' +
+          '# is the raw count beside it')
+    : 'This league scores by category, so there are no fantasy points \u2014 raw ' +
+      'totals for the two teams instead. \u0394 is left uncoloured because higher ' +
+      'isn\u2019t always better.';
+  h += '<div style="color:rgba(255,255,255,0.28);font-size:9.5px;margin-top:7px;' +
+    'line-height:1.5;">' + note + ' \u00b7 starters only, today only.';
+
+  // Reconciliation. Silent when it agrees, explicit when it doesn't.
+  if (fpMode && !derived) {
+    var gapA = (aFp && aFp.total != null && aFp.sum != null)
+      ? Math.abs(aFp.total - aFp.sum) : 0;
+    var gapB = (bFp && bFp.total != null && bFp.sum != null)
+      ? Math.abs(bFp.total - bFp.sum) : 0;
+    if (gapA > 0.05 || gapB > 0.05) {
+      h += '<br><span style="color:#fbbf24;">The per-stat column doesn\u2019t sum to ' +
+        'the TODAY FP row (' +
+        (gapA > 0.05 ? slEsc(meLbl) + ' off by ' + (Math.round(gapA * 10) / 10) : '') +
+        (gapA > 0.05 && gapB > 0.05 ? ', ' : '') +
+        (gapB > 0.05 ? slEsc(opLbl) + ' off by ' + (Math.round(gapB * 10) / 10) : '') +
+        '). Trust the TODAY FP row.</span>';
+    }
+  }
+  h += '</div></div>';
+  return h;
+}
+
 // teamId -> { statId: value } for whichever view is active.
 function _espSsValues(row, mode, game) {
   var out = {}, teams = ((row.raw || {}).teams) || [], i;
@@ -126268,6 +126611,9 @@ function _espSeasonStatsHtml(row, mode) {
       : 'Season totals from ESPN\u2019s own per-team values') +
     ' \u00b7 in this league\u2019s scoring order \u00b7 tap a column to sort, TEAM to reset ' +
     '\u00b7 swipe sideways for the rest.</div>';
+  if (mode === 'daily' && typeof _espDailyH2HHtml === 'function') {
+    h += _espDailyH2HHtml(row, game);
+  }
   h += '</div>';
   return h;
 }
