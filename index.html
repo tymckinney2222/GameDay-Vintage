@@ -124360,6 +124360,11 @@ function espEnrichLeagues() {
         row.standingsAll = built.rows;
         row.myTeamIds = built.myIds;
         if (built.mine) row.standings = built.mine;
+        // Capture the day here, not only on render. This runs for every
+        // synced league whether or not you ever open it — hooking the
+        // standings view alone meant a league you didn't look at simply
+        // lost that day, silently and unrecoverably. ESPPTSSNAP
+        try { if (typeof espMaybeSnapshot === 'function') espMaybeSnapshot(row); } catch (eS) {}
         _extRepaintToday();
       }
 
@@ -126223,6 +126228,10 @@ function espWritePtsSnapshot(row, date) {
   var snap = {
     ts: Date.now(), leagueKey: row.key, date: snapDate,
     period: (row.rosters && row.rosters.period != null) ? row.rosters.period : null,
+    // Whether today's rosters were loaded when this was taken. Without them
+    // the live figures are just the completed totals, and the day's record
+    // can be upgraded later — see espMaybeSnapshot. ESPPTSSNAP
+    hadRosters: !!(row.rosters && row.rosters.byTeam),
     pfByTeam: pfByTeam, liveByTeam: liveByTeam
   };
   var k = _espPtsSnapKey(row.key, snapDate);
@@ -126287,21 +126296,61 @@ function _espPurgeOldPtsSnapshots() {
   return kill.length;
 }
 
-// Once per league per day, fired from the standings render. Cheap: a key
-// lookup, then nothing. The capture has to be automatic — a history that
-// depends on remembering to tap a button has gaps exactly on the busy days.
+// Called from league sync AND from the standings render. Captures at most
+// one useful write per league per day, and never lets a day go uncaptured
+// just because you didn't open that league.
+//
+// It UPSERTS rather than skipping. The first capture usually happens at sync
+// time, before rosters have loaded, so its live figures are only the
+// completed totals. When rosters arrive a later call rewrites the same date
+// with real live numbers. The rule is one-directional — a record is only
+// replaced by one that knows more — so the day improves and never degrades.
 var _espSnapTried = {};
 function espMaybeSnapshot(row) {
   if (!row || !row.key) return;
   if (typeof espIsSeasonPts !== 'function' || !espIsSeasonPts(row)) return;
   var d = _todayDateString();
-  var memo = row.key + '_' + d;
+  var hasRosters = !!(row.rosters && row.rosters.byTeam);
+  var memo = row.key + '_' + d + '_' + (hasRosters ? 'r' : 'n');
   if (_espSnapTried[memo]) return;
   _espSnapTried[memo] = 1;
+
+  var existing = null;
   try {
-    if (localStorage.getItem(_espPtsSnapKey(row.key, d)) != null) return;
+    var rawS = localStorage.getItem(_espPtsSnapKey(row.key, d));
+    if (rawS) existing = JSON.parse(rawS);
   } catch (e) {}
+  // Already have the better version, or this call is no better than what is
+  // stored — either way there is nothing to gain by writing.
+  if (existing && (existing.hadRosters || !hasRosters)) return;
+
   try { espWritePtsSnapshot(row, d); } catch (e2) {}
+}
+
+// Force a capture for one league right now, overwriting today's record.
+// The automatic path is deliberately conservative; this exists for the case
+// where you want the day pinned at a specific moment — after the late games
+// settle, say, rather than whenever the app happened to sync. ESPPTSSNAP
+function espSnapNow(key) {
+  var row = null, list = [], i;
+  try { if (typeof extSyncedLeagues === 'function') list = extSyncedLeagues() || []; } catch (e) {}
+  for (i = 0; i < list.length; i++) {
+    if (list[i] && String(list[i].key) === String(key)) { row = list[i]; break; }
+  }
+  if (!row) return;
+  var snap = espWritePtsSnapshot(row, _todayDateString());
+  if (typeof skToast === 'function') {
+    skToast(snap
+      ? ('Snapped ' + _espCountKeys(snap.pfByTeam) + ' teams')
+      : ('Snap failed \u2014 ' + (window._espLastPtsSnapReason || 'unknown')));
+  }
+  if (typeof espRepaintStandPane === 'function') espRepaintStandPane(key);
+}
+
+function _espCountKeys(o) {
+  var n = 0, k;
+  for (k in o) { if (o && o.hasOwnProperty(k)) n++; }
+  return n;
 }
 
 // ── PACE + CATCH THE LEADERS ── ESPPACE ──
@@ -126400,6 +126449,148 @@ function espCatchRows(row) {
   return { clock: p.clock, me: me, list: out, avg: p.avg };
 }
 
+// ── CAP WATCH + FREEZE-ADJUSTED CATCH ── ESPCAPWATCH ──
+// Ports Yahoo's Cap Watch, with games started standing in for innings
+// pitched. The unit differs; the shape of the problem does not.
+//
+// A team that exhausts its games-started allowance stops starting pitchers
+// for the rest of the season. If a rival ahead of me freezes in six weeks
+// and nine weeks remain, they spend three weeks not accruing pitching points
+// while I keep going — so the naive "gap divided by weeks left" OVERSTATES
+// how hard they are to catch.
+//
+//   contestedWeeks = weeks until they freeze  (both still scoring)
+//   frozenWeeks    = weeksLeft - contestedWeeks
+//   frozenGain     = myPace * frozenWeeks     (ground I gain for free)
+//   residualGap    = gap - frozenGain
+//   adjusted       = residualGap / contestedWeeks
+//
+// CAVEAT, carried over from the Yahoo version because it is just as true
+// here: this models a freeze as a COMPLETE scoring stop. A frozen team still
+// hits. So the adjusted number overstates the effect, more so in a
+// hitting-heavy league. It is a directional read, not a forecast — which is
+// why the unadjusted number stays on screen next to it.
+function espCapWatch(row) {
+  var cap = (typeof espStatLimit === 'function') ? espStatLimit(row, 33) : null;
+  if (cap == null) return null;
+  var clock = espSeasonClock(row);
+  if (!clock || clock.weeksElapsed <= 0) return null;
+  var ls = (typeof espLiveStandings === 'function') ? espLiveStandings(row) : null;
+  if (!ls || !ls.list.length) return null;
+  var teams = ((row.raw || {}).teams) || [];
+  var byId = {}, i;
+  for (i = 0; i < teams.length; i++) byId[String(teams[i].id)] = teams[i];
+  var myId = (typeof espMyTeamId === 'function') ? espMyTeamId(row) : null;
+
+  var out = [];
+  for (i = 0; i < ls.list.length; i++) {
+    var r = ls.list[i];
+    var t = byId[String(r.teamId)];
+    var vb = t && t.valuesByStat;
+    var used = (vb && vb['33'] != null) ? Number(vb['33']) : null;
+    if (used == null || isNaN(used)) continue;
+    var perWk = used / clock.weeksElapsed;
+    var left = cap - used;
+    // Weeks until the cap runs out at the current rate. A team using none
+    // never freezes, which is reported as null rather than Infinity.
+    var wksToCap = (perWk > 0) ? (left / perWk) : null;
+    var freezes = (wksToCap != null && wksToCap < clock.weeksLeft);
+    out.push({
+      teamId: r.teamId, teamName: r.teamName,
+      used: Math.round(used * 10) / 10,
+      cap: cap,
+      left: Math.round(left * 10) / 10,
+      perWk: Math.round(perWk * 10) / 10,
+      wksToCap: (wksToCap == null) ? null : Math.round(wksToCap * 10) / 10,
+      freezes: freezes,
+      mine: (myId != null && String(r.teamId) === String(myId))
+    });
+  }
+  if (!out.length) return null;
+  out.sort(function (a, b) { return (a.left || 0) - (b.left || 0); });
+  return { cap: cap, clock: clock, rows: out };
+}
+
+// Freeze-adjusted catch numbers, keyed by team id, or null when there is no
+// cap to model.
+function espFreezeAdjust(row) {
+  var cw = espCapWatch(row);
+  if (!cw) return null;
+  var c = espCatchRows(row);
+  if (!c || !c.list.length) return null;
+  var byId = {}, i;
+  for (i = 0; i < cw.rows.length; i++) byId[String(cw.rows[i].teamId)] = cw.rows[i];
+  var weeksLeft = c.clock.weeksLeft;
+  var myPace = c.me.pace;
+  var out = {};
+  for (i = 0; i < c.list.length; i++) {
+    var t = c.list[i];
+    var cwr = byId[String(t.teamId)];
+    if (!cwr || !cwr.freezes || cwr.wksToCap == null) continue;
+    var contested = Math.max(0, Math.min(cwr.wksToCap, weeksLeft));
+    var frozen = Math.max(0, weeksLeft - contested);
+    var frozenGain = myPace * frozen;
+    var residual = t.gap - frozenGain;
+    out[String(t.teamId)] = {
+      contested: Math.round(contested * 10) / 10,
+      frozen: Math.round(frozen * 10) / 10,
+      frozenGain: Math.round(frozenGain * 10) / 10,
+      residual: Math.round(residual * 10) / 10,
+      // residual <= 0 means my own pace runs them down while they sit
+      // frozen; no out-scoring required.
+      caught: (residual <= 0),
+      adjusted: (residual > 0 && contested > 0)
+        ? Math.round((residual / contested) * 10) / 10 : null
+    };
+  }
+  return out;
+}
+
+// ── SNAPSHOT TREND ── ESPTREND ──
+// Day-over-day movement from the stored snapshots. Yahoo's daily-delta table
+// does the same from its own snaps.
+//
+// Reads the COMPLETED-period totals (pfByTeam), never the live ones. A live
+// figure means something different depending on what time of day the capture
+// ran, so a series built from it would show swings that are artefacts of when
+// the app was opened rather than of anything that happened on the field.
+function espSnapshotTrend(row, maxDays) {
+  var snaps = espListPtsSnapshots(row && row.key) || [];
+  if (snaps.length < 2) return { snaps: snaps.length, days: [] };
+  var myId = (typeof espMyTeamId === 'function') ? espMyTeamId(row) : null;
+  var days = [], i, k;
+  for (i = 1; i < snaps.length; i++) {
+    var prev = snaps[i - 1], cur = snaps[i];
+    var deltas = [], myDelta = null, best = null;
+    for (k in (cur.pfByTeam || {})) {
+      if (!cur.pfByTeam.hasOwnProperty(k)) continue;
+      var p0 = (prev.pfByTeam || {})[k];
+      if (p0 == null) continue;
+      var d = Math.round((Number(cur.pfByTeam[k]) - Number(p0)) * 10) / 10;
+      deltas.push({ teamId: k, delta: d });
+      if (myId != null && String(k) === String(myId)) myDelta = d;
+      if (!best || d > best.delta) best = { teamId: k, delta: d };
+    }
+    if (!deltas.length) continue;
+    var sum = 0;
+    for (var j = 0; j < deltas.length; j++) sum += deltas[j].delta;
+    // Rank within the day: 1 means nobody outscored me.
+    var rank = null;
+    if (myDelta != null) {
+      rank = 1;
+      for (j = 0; j < deltas.length; j++) if (deltas[j].delta > myDelta) rank++;
+    }
+    days.push({
+      from: prev.date, to: cur.date,
+      myDelta: myDelta, rank: rank, of: deltas.length,
+      avg: Math.round((sum / deltas.length) * 10) / 10,
+      best: best
+    });
+  }
+  if (maxDays && days.length > maxDays) days = days.slice(days.length - maxDays);
+  return { snaps: snaps.length, days: days };
+}
+
 function _espPacePanelHtml(row) {
   var c = espCatchRows(row);
   if (!c) {
@@ -126439,6 +126630,8 @@ function _espPacePanelHtml(row) {
     '</div>';
   }
 
+  var fz = (typeof espFreezeAdjust === 'function') ? espFreezeAdjust(row) : null;
+
   h += '<div style="font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
     'margin:14px 0 2px;">CATCH THE LEADERS</div>';
   if (!c.list.length) {
@@ -126452,6 +126645,7 @@ function _espPacePanelHtml(row) {
       // A rival whose season pace is BELOW mine is already coming back to me;
       // the catch number alone would hide that, so the two are shown together.
       var drifting = t.paceGap < 0;
+      var adj = fz ? fz[String(t.teamId)] : null;
       h += '<div style="padding:7px 6px;border-radius:7px;margin:0 0 3px;' +
         'background:rgba(255,255,255,0.03);">' +
         '<div style="display:flex;align-items:baseline;gap:8px;">' +
@@ -126469,20 +126663,103 @@ function _espPacePanelHtml(row) {
           '<span>NEED TO BEAT BY <b style="color:rgba(255,255,255,0.7)">' +
             (t.need == null ? '\u2014' : '+' + t.need) + '</b>/wk</span>' +
         '</div>' +
+        (adj
+          ? '<div style="margin-top:4px;font-size:9.5px;' + mono + 'color:' +
+              (adj.caught ? '#4ade80' : 'rgba(251,191,36,0.85)') + ';">' +
+              (adj.caught
+                ? ('\u2713 they freeze with ' + adj.frozen + ' wks left \u2014 your own pace ' +
+                   'covers the gap without out-scoring them')
+                : ('freeze-adjusted: +' + adj.adjusted + '/wk over ' + adj.contested +
+                   ' contested wks')) +
+            '</div>'
+          : '') +
+      '</div>';
+    }
+  }
+
+  // ── CAP WATCH ──
+  var cw = (typeof espCapWatch === 'function') ? espCapWatch(row) : null;
+  if (cw) {
+    h += '<div style="font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
+      'margin:14px 0 2px;">CAP WATCH \u00b7 GAMES STARTED</div>' +
+      '<div style="font-size:9.5px;color:rgba(255,255,255,0.3);margin:0 0 8px;">' +
+      'cap ' + cw.cap + ' \u00b7 who runs out before the season does</div>';
+    for (i = 0; i < cw.rows.length; i++) {
+      var g = cw.rows[i];
+      var pctUsed = cw.cap > 0 ? Math.round((g.used / cw.cap) * 100) : 0;
+      var barCol = g.freezes ? '#f87171' : (g.mine ? accent : 'rgba(255,255,255,0.28)');
+      h += '<div style="display:flex;align-items:center;gap:8px;padding:5px 6px;' +
+        'border-radius:6px;' + (g.mine ? 'background:rgba(239,68,68,0.10);' : '') + '">' +
+        '<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;' +
+          'white-space:nowrap;font-size:11.5px;color:' +
+          (g.mine ? accent + ';font-weight:700' : 'rgba(255,255,255,0.78)') + ';">' +
+          slEsc(g.teamName) + '</span>' +
+        '<span style="flex:0 0 52px;height:5px;border-radius:3px;' +
+          'background:rgba(255,255,255,0.06);overflow:hidden;">' +
+          '<span style="display:block;height:100%;width:' + Math.min(100, pctUsed) + '%;' +
+          'background:' + barCol + ';"></span></span>' +
+        '<span style="flex:0 0 58px;text-align:right;' + mono + 'font-size:10.5px;' +
+          'color:rgba(255,255,255,0.7);">' + g.used + '/' + cw.cap + '</span>' +
+        '<span style="flex:0 0 62px;text-align:right;' + mono + 'font-size:9.5px;color:' +
+          (g.freezes ? '#f87171' : 'rgba(255,255,255,0.3)') + ';">' +
+          (g.wksToCap == null ? 'no starts'
+            : g.freezes ? ('caps in ' + g.wksToCap + 'w') : 'clears') +
+        '</span>' +
+      '</div>';
+    }
+    h += '<div style="color:rgba(255,255,255,0.25);font-size:9px;margin:4px 0 0;' +
+      'line-height:1.5;">Freeze-adjusted catch math treats a capped team as ' +
+      'scoring nothing further, but they still hit \u2014 so it overstates the ' +
+      'effect. Directional, not a forecast.</div>';
+  }
+
+  // ── TREND ──
+  var tr = (typeof espSnapshotTrend === 'function') ? espSnapshotTrend(row, 14) : null;
+  h += '<div style="font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
+    'margin:14px 0 2px;">DAY BY DAY</div>';
+  if (!tr || tr.days.length === 0) {
+    h += '<div style="font-size:10px;color:rgba(255,255,255,0.3);line-height:1.5;">' +
+      (tr && tr.snaps === 1
+        ? 'First snapshot captured today. Day-over-day movement appears once ' +
+          'there are two.'
+        : 'Snapshots start capturing automatically from today. This fills in ' +
+          'as the days accumulate \u2014 nothing to do.') + '</div>';
+  } else {
+    for (i = tr.days.length - 1; i >= 0; i--) {
+      var dRow = tr.days[i];
+      var dCol = (dRow.myDelta == null) ? 'rgba(255,255,255,0.3)'
+        : dRow.myDelta > dRow.avg ? '#4ade80' : 'rgba(255,255,255,0.7)';
+      h += '<div style="display:flex;align-items:center;gap:8px;padding:4px 6px;' +
+        'font-size:10.5px;' + mono + '">' +
+        '<span style="flex:0 0 62px;color:rgba(255,255,255,0.3);">' +
+          slEsc(String(dRow.to).slice(5)) + '</span>' +
+        '<span style="flex:0 0 52px;text-align:right;font-weight:700;color:' + dCol + ';">' +
+          (dRow.myDelta == null ? '\u2014' : (dRow.myDelta > 0 ? '+' : '') + dRow.myDelta) +
+        '</span>' +
+        '<span style="flex:1;color:rgba(255,255,255,0.25);">lg avg ' + dRow.avg + '</span>' +
+        '<span style="flex:0 0 46px;text-align:right;color:rgba(255,255,255,0.35);">' +
+          (dRow.rank == null ? '' : dRow.rank + ' of ' + dRow.of) + '</span>' +
       '</div>';
     }
   }
 
   var snaps = espListPtsSnapshots(row.key) || [];
+  var kAttr2 = String(row.key || '').replace(/'/g, '');
   h += '<div style="color:rgba(255,255,255,0.28);font-size:9.5px;margin-top:10px;line-height:1.5;">' +
     'SEASON AVG GAP is their full-season pace against yours \u2014 backward-looking, ' +
     'not recent form. NEED TO BEAT BY is the gap spread over the weeks left. ' +
-    'Season window is approximate.' +
-    (snaps.length
-      ? ' \u00b7 ' + snaps.length + ' daily snapshot' + (snaps.length === 1 ? '' : 's') +
-        ' captured so far'
-      : '') +
+    'Season window is approximate. Day-by-day uses completed-period totals, ' +
+    'so the time of day a snapshot ran doesn\u2019t distort it.' +
     '</div>';
+  h += '<div style="display:flex;align-items:center;gap:8px;margin-top:8px;">' +
+    '<button onclick="espSnapNow(\'' + kAttr2 + '\')" ' +
+      'style="padding:5px 12px;border-radius:999px;border:1px solid rgba(255,255,255,0.16);' +
+      'background:none;color:rgba(255,255,255,0.5);font-size:9.5px;font-weight:700;' +
+      'letter-spacing:0.05em;">SNAP NOW</button>' +
+    '<span style="font-size:9px;color:rgba(255,255,255,0.25);">' +
+      snaps.length + ' day' + (snaps.length === 1 ? '' : 's') + ' captured \u00b7 ' +
+      'automatic on every sync</span>' +
+  '</div>';
   h += '</div>';
   return h;
 }
