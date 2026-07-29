@@ -126173,6 +126173,320 @@ function _espSeasonStatsHtml(row, mode) {
   return h;
 }
 
+// ── ESPN SEASON-POINTS SNAPSHOTS ── ESPPTSSNAP ──
+// Deliberately the same shape as Yahoo's pts_snap_v1_ records, so the two
+// can feed one history layer later without a migration:
+//   { ts, leagueKey, date, period, pfByTeam, liveByTeam }
+//
+// It stores BOTH the completed-period total and the live one, because they
+// answer different questions and the difference is not recoverable after the
+// fact. team.points covers COMPLETED scoring periods; the live figure adds
+// today's in-progress starters. A snapshot taken at 3am and one taken at 8pm
+// mean different things on the live number and identical things on pf, so
+// keeping both means a consumer can pick a consistent basis rather than
+// discovering mid-analysis that the series mixes the two.
+var ESP_PTS_SNAP_PREFIX = 'esp_pts_snap_v1_';
+
+function _espPtsSnapKey(leagueKey, date) {
+  return ESP_PTS_SNAP_PREFIX + leagueKey + '_' + date;
+}
+
+// Capture every team's totals for this league at the given date (today
+// by default).
+// Reads straight from what is already in memory — no fetch. Returns the
+// saved snapshot, or null with a reason on window._espLastPtsSnapReason.
+function espWritePtsSnapshot(row, date) {
+  window._espLastPtsSnapReason = '';
+  if (!row || !row.key) { window._espLastPtsSnapReason = 'no league'; return null; }
+  if (typeof espIsSeasonPts !== 'function' || !espIsSeasonPts(row)) {
+    window._espLastPtsSnapReason = 'not a season-points league'; return null;
+  }
+  var rows = row.standingsAll || [];
+  if (!rows.length) { window._espLastPtsSnapReason = 'no standings'; return null; }
+
+  var live = (typeof espLiveStandings === 'function') ? espLiveStandings(row).live : {};
+  var pfByTeam = {}, liveByTeam = {}, captured = 0, i;
+  for (i = 0; i < rows.length; i++) {
+    var r = rows[i];
+    if (r.pf == null || isNaN(Number(r.pf))) continue;
+    pfByTeam[String(r.teamId)] = Number(r.pf);
+    var lv = live[String(r.teamId)];
+    if (lv != null && !isNaN(Number(lv))) liveByTeam[String(r.teamId)] = Number(lv);
+    captured++;
+  }
+  // One team's total says nothing about a race. Same floor Yahoo uses.
+  if (captured < 2) {
+    window._espLastPtsSnapReason = 'fewer than 2 totals'; return null;
+  }
+
+  var snapDate = date || _todayDateString();
+  var snap = {
+    ts: Date.now(), leagueKey: row.key, date: snapDate,
+    period: (row.rosters && row.rosters.period != null) ? row.rosters.period : null,
+    pfByTeam: pfByTeam, liveByTeam: liveByTeam
+  };
+  var k = _espPtsSnapKey(row.key, snapDate);
+  var json = JSON.stringify(snap);
+  function trySet() {
+    try { localStorage.setItem(k, json); return true; } catch (e) { return false; }
+  }
+  if (!trySet()) {
+    // Snapshots are tiny; the space is almost always held by something else.
+    // Same escalating ladder the Yahoo writer uses, for the same reason — a
+    // full-quota morning must not silently skip the day's capture, because
+    // that day cannot be recaptured later.
+    try { _espPurgeOldPtsSnapshots(); } catch (e2) {}
+    try { if (typeof _purgeOldPtsSnapshots === 'function') _purgeOldPtsSnapshots(); } catch (e2) {}
+    try { if (typeof _purgeOldCatsSnapshots === 'function') _purgeOldCatsSnapshots(); } catch (e2) {}
+    try {
+      if (typeof _purgeOldFpCaches === 'function') { _purgedOldFpCaches = false; _purgeOldFpCaches(); }
+    } catch (e2) {}
+    if (!trySet()) {
+      window._espLastPtsSnapReason = 'storage full \u2014 even after cleanup';
+      return null;
+    }
+  }
+  try { _espPurgeOldPtsSnapshots(); } catch (e) {}
+  return snap;
+}
+
+function espListPtsSnapshots(leagueKey) {
+  var prefix = ESP_PTS_SNAP_PREFIX + leagueKey + '_';
+  var out = [], i;
+  try {
+    for (i = 0; i < localStorage.length; i++) {
+      var k = localStorage.key(i);
+      if (!k || k.indexOf(prefix) !== 0) continue;
+      try {
+        var v = localStorage.getItem(k);
+        if (v) out.push(JSON.parse(v));
+      } catch (e) {}
+    }
+  } catch (e) {}
+  out.sort(function (a, b) { return a.date < b.date ? -1 : 1; });
+  return out;
+}
+
+function _espPurgeOldPtsSnapshots() {
+  var days = (typeof CATS_SNAP_TTL_DAYS === 'number') ? CATS_SNAP_TTL_DAYS : 84;
+  var cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - days);
+  var cs = cutoff.getFullYear() + '-' +
+    ('0' + (cutoff.getMonth() + 1)).slice(-2) + '-' +
+    ('0' + cutoff.getDate()).slice(-2);
+  var kill = [], i, k;
+  try {
+    for (i = 0; i < localStorage.length; i++) {
+      k = localStorage.key(i);
+      if (!k || k.indexOf(ESP_PTS_SNAP_PREFIX) !== 0) continue;
+      var d = k.slice(k.lastIndexOf('_') + 1);
+      if (d && d < cs) kill.push(k);
+    }
+    for (i = 0; i < kill.length; i++) localStorage.removeItem(kill[i]);
+  } catch (e) {}
+  return kill.length;
+}
+
+// Once per league per day, fired from the standings render. Cheap: a key
+// lookup, then nothing. The capture has to be automatic — a history that
+// depends on remembering to tap a button has gaps exactly on the busy days.
+var _espSnapTried = {};
+function espMaybeSnapshot(row) {
+  if (!row || !row.key) return;
+  if (typeof espIsSeasonPts !== 'function' || !espIsSeasonPts(row)) return;
+  var d = _todayDateString();
+  var memo = row.key + '_' + d;
+  if (_espSnapTried[memo]) return;
+  _espSnapTried[memo] = 1;
+  try {
+    if (localStorage.getItem(_espPtsSnapKey(row.key, d)) != null) return;
+  } catch (e) {}
+  try { espWritePtsSnapshot(row, d); } catch (e2) {}
+}
+
+// ── PACE + CATCH THE LEADERS ── ESPPACE ──
+// Ports Yahoo's skBuildPacePerWeekTable and skBuildCatchTheLeaders.
+//
+// Both need a season CALENDAR, and Yahoo does not derive one — it hardcodes
+// a Mar 25 to Sep 27 window for baseball. The same approach is used here
+// rather than inventing a cleverer one, so the two produce matching numbers.
+// The windows are approximate by nature: a week either way moves a pace
+// figure by a percent or two, which does not change a decision.
+function _espSeasonWindow(sport, season) {
+  var yr = Number(season) || (new Date()).getFullYear();
+  var sp = String(sport || '').toLowerCase();
+  var s, e;
+  if (sp === 'nba') { s = (yr - 1) + '-10-21'; e = yr + '-04-13'; }
+  else if (sp === 'nhl') { s = (yr - 1) + '-10-07'; e = yr + '-04-17'; }
+  else { s = yr + '-03-25'; e = yr + '-09-27'; }   // mlb, and the default
+  var sm = new Date(s + 'T00:00:00').getTime();
+  var em = new Date(e + 'T23:59:59').getTime();
+  if (isNaN(sm) || isNaN(em) || em <= sm) return null;
+  return { startMs: sm, endMs: em };
+}
+
+// { weeksElapsed, weeksLeft } or null when it is too early to mean anything.
+function espSeasonClock(row) {
+  var w = _espSeasonWindow(row && row.sport, row && row.season);
+  if (!w) return null;
+  var MS_WK = 1000 * 60 * 60 * 24 * 7;
+  var now = Date.now();
+  var elapsed = (now - w.startMs) / MS_WK;
+  var left = Math.max(0, (w.endMs - now) / MS_WK);
+  // Under a week in, a per-week rate is division by almost nothing and
+  // produces a wild number. Yahoo bails at the same point.
+  if (elapsed < 1) return null;
+  return {
+    weeksElapsed: Math.round(elapsed * 10) / 10,
+    weeksLeft: Math.round(left * 10) / 10
+  };
+}
+
+// Every team's points-per-week, sorted, plus the league average and my row.
+function espPaceRows(row) {
+  var clock = espSeasonClock(row);
+  if (!clock) return null;
+  var ls = (typeof espLiveStandings === 'function') ? espLiveStandings(row) : null;
+  if (!ls || !ls.list.length) return null;
+  var myId = (typeof espMyTeamId === 'function') ? espMyTeamId(row) : null;
+  var out = [], sum = 0, i;
+  for (i = 0; i < ls.list.length; i++) {
+    var r = ls.list[i];
+    var tot = ls.live[String(r.teamId)];
+    if (tot == null || isNaN(Number(tot))) continue;
+    var pace = Number(tot) / clock.weeksElapsed;
+    sum += pace;
+    out.push({
+      teamId: r.teamId, teamName: r.teamName, total: Number(tot),
+      pace: Math.round(pace * 10) / 10,
+      mine: (myId != null && String(r.teamId) === String(myId))
+    });
+  }
+  if (out.length < 2) return null;
+  out.sort(function (a, b) { return b.pace - a.pace; });
+  return {
+    clock: clock, rows: out,
+    avg: Math.round((sum / out.length) * 10) / 10
+  };
+}
+
+// For each team ahead of me: the season-average gap in pace, and the extra
+// points per week I need to post to run them down before the season ends.
+function espCatchRows(row) {
+  var p = espPaceRows(row);
+  if (!p) return null;
+  var me = null, i;
+  for (i = 0; i < p.rows.length; i++) { if (p.rows[i].mine) { me = p.rows[i]; break; } }
+  if (!me) return null;
+  var out = [];
+  for (i = 0; i < p.rows.length; i++) {
+    var r = p.rows[i];
+    if (r.mine || r.total <= me.total) continue;
+    var gap = Math.round((r.total - me.total) * 10) / 10;
+    // With no weeks left there is nothing to make up in — reported as null
+    // rather than dividing by zero and printing Infinity.
+    var need = (p.clock.weeksLeft > 0)
+      ? Math.round((gap / p.clock.weeksLeft) * 10) / 10 : null;
+    out.push({
+      teamId: r.teamId, teamName: r.teamName, total: r.total, pace: r.pace,
+      gap: gap,
+      // Their season pace minus mine: the margin they have actually been
+      // posting on me per week, which is the honest read on whether the
+      // catch is realistic. Yahoo labels this SEASON AVG GAP.
+      paceGap: Math.round((r.pace - me.pace) * 10) / 10,
+      need: need
+    });
+  }
+  return { clock: p.clock, me: me, list: out, avg: p.avg };
+}
+
+function _espPacePanelHtml(row) {
+  var c = espCatchRows(row);
+  if (!c) {
+    return '<div data-espstand>' + _espStandToggleHtml(row, 'pace') +
+      '<div style="color:rgba(255,255,255,0.35);font-size:12px;">' +
+      'Not enough of the season has run yet for a per-week rate.</div></div>';
+  }
+  var p = espPaceRows(row);
+  var accent = extProvAccent('espn');
+  var mono = 'font-family:var(--sk-font-mono,monospace);';
+  var max = p.rows.length ? p.rows[0].pace : 0;
+
+  var h = '<div data-espstand>';
+  h += _espStandToggleHtml(row, 'pace');
+
+  h += '<div style="font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
+    'margin:0 0 2px;">PACE PER WEEK</div>' +
+    '<div style="font-size:9.5px;color:rgba(255,255,255,0.3);margin:0 0 8px;">' +
+    'total \u00f7 ' + c.clock.weeksElapsed + ' weeks \u00b7 league avg <b style="color:' +
+    'rgba(255,255,255,0.6)">' + p.avg + '</b>/wk</div>';
+
+  for (var i = 0; i < p.rows.length; i++) {
+    var r = p.rows[i];
+    var pct = max > 0 ? Math.round((r.pace / max) * 100) : 0;
+    h += '<div style="display:flex;align-items:center;gap:8px;padding:5px 6px;border-radius:6px;' +
+      (r.mine ? 'background:rgba(239,68,68,0.10);' : '') + '">' +
+      '<span style="flex:0 0 16px;' + mono + 'font-size:10px;color:rgba(255,255,255,0.25);">' +
+        (i + 1) + '</span>' +
+      '<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' +
+        'font-size:12px;color:' + (r.mine ? accent + ';font-weight:700' : 'rgba(255,255,255,0.8)') +
+        ';">' + slEsc(r.teamName) + '</span>' +
+      '<span style="flex:0 0 64px;height:5px;border-radius:3px;background:rgba(255,255,255,0.06);' +
+        'overflow:hidden;"><span style="display:block;height:100%;width:' + pct + '%;' +
+        'background:' + (r.mine ? accent : 'rgba(255,255,255,0.28)') + ';"></span></span>' +
+      '<span style="flex:0 0 56px;text-align:right;' + mono + 'font-size:11.5px;font-weight:700;' +
+        'color:rgba(255,255,255,0.85);">' + r.pace + '</span>' +
+    '</div>';
+  }
+
+  h += '<div style="font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
+    'margin:14px 0 2px;">CATCH THE LEADERS</div>';
+  if (!c.list.length) {
+    h += '<div style="font-size:11.5px;color:#4ade80;margin-bottom:6px;">' +
+      'Nobody above you \u2014 you\u2019re leading this league.</div>';
+  } else {
+    h += '<div style="font-size:9.5px;color:rgba(255,255,255,0.3);margin:0 0 8px;">' +
+      c.clock.weeksLeft + ' weeks left \u00b7 your pace ' + c.me.pace + '/wk</div>';
+    for (i = 0; i < c.list.length; i++) {
+      var t = c.list[i];
+      // A rival whose season pace is BELOW mine is already coming back to me;
+      // the catch number alone would hide that, so the two are shown together.
+      var drifting = t.paceGap < 0;
+      h += '<div style="padding:7px 6px;border-radius:7px;margin:0 0 3px;' +
+        'background:rgba(255,255,255,0.03);">' +
+        '<div style="display:flex;align-items:baseline;gap:8px;">' +
+          '<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;' +
+            'white-space:nowrap;font-size:12px;color:rgba(255,255,255,0.82);">' +
+            slEsc(t.teamName) + '</span>' +
+          '<span style="' + mono + 'font-size:11px;color:rgba(248,113,113,0.9);">+' +
+            t.gap + '</span>' +
+        '</div>' +
+        '<div style="display:flex;gap:12px;margin-top:3px;font-size:9.5px;' + mono +
+          'color:rgba(255,255,255,0.35);">' +
+          '<span>SEASON AVG GAP <b style="color:' +
+            (drifting ? '#4ade80' : 'rgba(255,255,255,0.7)') + '">' +
+            (t.paceGap > 0 ? '+' : '') + t.paceGap + '</b>/wk</span>' +
+          '<span>NEED TO BEAT BY <b style="color:rgba(255,255,255,0.7)">' +
+            (t.need == null ? '\u2014' : '+' + t.need) + '</b>/wk</span>' +
+        '</div>' +
+      '</div>';
+    }
+  }
+
+  var snaps = espListPtsSnapshots(row.key) || [];
+  h += '<div style="color:rgba(255,255,255,0.28);font-size:9.5px;margin-top:10px;line-height:1.5;">' +
+    'SEASON AVG GAP is their full-season pace against yours \u2014 backward-looking, ' +
+    'not recent form. NEED TO BEAT BY is the gap spread over the weeks left. ' +
+    'Season window is approximate.' +
+    (snaps.length
+      ? ' \u00b7 ' + snaps.length + ' daily snapshot' + (snaps.length === 1 ? '' : 's') +
+        ' captured so far'
+      : '') +
+    '</div>';
+  h += '</div>';
+  return h;
+}
+
 // ── PROJECTED STANDINGS ("if today ended") ── ESPPROJ ──
 // Takes each team's completed-period record and applies the CURRENT
 // matchup's live result, then re-ranks. Cats leagues decide on category
@@ -126352,10 +126666,13 @@ function _espStandToggleHtml(row, active) {
     // points — calling it POINTS described the wrong thing entirely.
     tab('pts', (typeof espIsCats === 'function' && espIsCats(row)) ? 'RECORD' : 'POINTS') +
     tab('season', 'SEASON') + tab('daily', 'DAILY') +
-    // Only when it would say something different from the RECORD tab.
-    // ESPPROJ
+    // IF TODAY is head-to-head only; PACE is season-points only. They never
+    // both apply, so the tab row stays four wide either way. ESPPACE
     ((typeof espHasProjection === 'function' && espHasProjection(row))
       ? tab('proj', 'IF TODAY') : '') +
+    ((typeof espIsSeasonPts === 'function' && espIsSeasonPts(row) &&
+      typeof espSeasonClock === 'function' && espSeasonClock(row))
+      ? tab('pace', 'PACE') : '') +
     '</div>';
 }
 
@@ -126504,7 +126821,15 @@ function _espStandingsPaneHtml(row) {
   // in place by espSetStandView. Checked before the standingsAll guard
   // because a league can carry valuesByStat while its standings rows are
   // still empty. ESPSEASONSTATS
+  // A season-points league captures its daily snapshot here, on render.
+  // Automatic on purpose: a history that depends on remembering to tap a
+  // button has gaps exactly on the days worth remembering. ESPPTSSNAP
+  try { if (typeof espMaybeSnapshot === 'function') espMaybeSnapshot(row); } catch (e) {}
+
   var _sv = _espStandView[String(row && row.key)];
+  if (_sv === 'pace' && typeof espSeasonClock === 'function' && espSeasonClock(row)) {
+    return _espPacePanelHtml(row);   // ESPPACE
+  }
   if (_sv === 'proj' && espHasProjection(row)) {   // ESPPROJ
     return _espProjStandingsHtml(row);
   }
