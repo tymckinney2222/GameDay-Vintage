@@ -127089,6 +127089,300 @@ function _espPacePanelHtml(row) {
   return h;
 }
 
+// ── PROJECTED PLAYOFF BRACKET ── ESPBRACKET ──
+// Everything here comes from payloads already in memory. row._espScoreJson
+// retains the whole mMatchupScore response — all 105 schedule entries plus
+// status.currentMatchupPeriod — and espLiveScores only ever reads one
+// period out of it, so the season's shape has been sitting unused.
+//
+// The bracket ESPN publishes is NOT available yet: playoffTierType reads
+// NONE on every entry in every league, because ESPN assigns tiers only once
+// the regular season ends. So this projects the bracket from the settings
+// and the current standings, and is labelled as a projection throughout.
+// When ESPN does populate the real tiers, espRealBracket picks them up and
+// the projection steps aside.
+function espPlayoffSettings(row) {
+  var ss = ((((row || {}).raw || {}).settings) || {}).scheduleSettings;
+  if (!ss) return null;
+  var teams = Number(ss.playoffTeamCount);
+  var roundLen = Number(ss.playoffMatchupPeriodLength);
+  var total = Number(ss.matchupPeriodCount);
+  // Season-points leagues report playoffTeamCount 0 and matchupPeriodCount 1
+  // — no matchups, so no bracket. Anything under two teams is the same case.
+  if (!teams || teams < 2 || !total || isNaN(roundLen) || roundLen < 1) return null;
+
+  // Rounds needed to get the field down to one. A field that isn't a power
+  // of two gives the top seeds a first-round bye, which is how ESPN runs it.
+  var rounds = 0, n = teams;
+  while (n > 1) { n = Math.ceil(n / 2); rounds++; }
+  var playoffPeriods = rounds * roundLen;
+  var start = total - playoffPeriods + 1;
+  if (start < 2) return null;      // a schedule with no room for a regular season
+  return {
+    teams: teams, roundLen: roundLen, rounds: rounds,
+    total: total, startPeriod: start, lastRegular: start - 1,
+    reseed: !!ss.playoffReseed,
+    seedingRule: String(ss.playoffSeedingRule || ''),
+    consolation: (ss.consolationLadderDisabled === false)
+  };
+}
+
+// The current matchup period, straight from ESPN rather than inferred from
+// record lengths.
+function espCurrentMatchupPeriod(row) {
+  var j = row && row._espScoreJson;
+  var p = j && j.status && j.status.currentMatchupPeriod;
+  return (p == null) ? null : Number(p);
+}
+
+// If ESPN has published real playoff matchups, use those. Returns null until
+// playoffTierType stops reading NONE everywhere.
+function espRealBracket(row) {
+  var j = row && row._espScoreJson;
+  var sch = (j && j.schedule) || [];
+  var out = [], i;
+  for (i = 0; i < sch.length; i++) {
+    var m = sch[i] || {};
+    var tt = String(m.playoffTierType || '');
+    if (!tt || tt === 'NONE') continue;
+    out.push({
+      period: Number(m.matchupPeriodId), tier: tt,
+      awayId: (m.away && m.away.teamId != null) ? String(m.away.teamId) : null,
+      homeId: (m.home && m.home.teamId != null) ? String(m.home.teamId) : null,
+      winner: String(m.winner || '')
+    });
+  }
+  if (!out.length) return null;
+  out.sort(function (a, b) { return a.period - b.period; });
+  return out;
+}
+
+// Seeds in standings order, with the playoff cutoff marked.
+function espSeeds(row) {
+  var ps = espPlayoffSettings(row);
+  if (!ps) return null;
+  var rows = (row && row.standingsAll) || [];
+  if (!rows.length) return null;
+  var myIds = row.myTeamIds || {};
+  var out = [], i;
+  for (i = 0; i < rows.length; i++) {
+    out.push({
+      seed: i + 1, teamId: rows[i].teamId, teamName: rows[i].teamName,
+      record: rows[i].record, pf: rows[i].pf,
+      "in": (i < ps.teams),
+      mine: !!myIds[rows[i].teamId]
+    });
+  }
+  return { settings: ps, seeds: out };
+}
+
+// First-round pairings: 1 plays the lowest seed, 2 the next, and so on. A
+// field that isn't a power of two gives the top seeds byes.
+function espProjectedPairings(row) {
+  var s = espSeeds(row);
+  if (!s) return null;
+  var n = s.settings.teams;
+  var field = s.seeds.slice(0, n);
+  if (field.length < n) return null;          // fewer teams than playoff spots
+  var bracketSize = 1;
+  while (bracketSize < n) bracketSize *= 2;
+  var byes = bracketSize - n;
+  var games = [], i;
+  // The top seeds sit out round one when the field isn't a power of two.
+  var playing = field.slice(byes);
+  for (i = 0; i < playing.length / 2; i++) {
+    games.push({ hi: playing[i], lo: playing[playing.length - 1 - i] });
+  }
+  return { settings: s.settings, byes: field.slice(0, byes), games: games, seeds: s.seeds };
+}
+
+// Where a team stands against the cutoff, in matchups rather than vibes.
+//   periodsLeft   regular-season matchups still to play
+//   gapToCut      wins behind the last playoff spot (a tie counts a half)
+//   alive         whether the gap is still closable in the periods left
+// For an each-category league a matchup is worth catCount decisions, not
+// one, so the swing per period is scaled accordingly — otherwise a category
+// league looks mathematically dead weeks before it is.
+function espPlayoffPicture(row) {
+  var s = espSeeds(row);
+  if (!s) return null;
+  var cur = espCurrentMatchupPeriod(row);
+  if (cur == null) return null;
+  var ps = s.settings;
+  var periodsLeft = Math.max(0, ps.lastRegular - cur + 1);
+
+  var each = (typeof espIsEachCategory === 'function') && espIsEachCategory(row);
+  var perPeriod = 1;
+  if (each) {
+    var items = ((((row.raw || {}).settings || {}).scoringSettings) || {}).scoringItems || [];
+    if (items.length) perPeriod = items.length;
+  }
+  // Each matchup is a two-way swing: I gain and they lose.
+  var maxSwing = periodsLeft * perPeriod * 2;
+
+  function score(r) {
+    var p = _espParseRec(r.record);
+    if (!p) return null;
+    return p.w + p.t / 2;
+  }
+  var cutIdx = ps.teams - 1;
+  var cutRow = s.seeds[cutIdx] || null;
+  var cutScore = cutRow ? score(cutRow) : null;
+
+  var me = null, i;
+  for (i = 0; i < s.seeds.length; i++) { if (s.seeds[i].mine) { me = s.seeds[i]; break; } }
+
+  var list = [];
+  for (i = 0; i < s.seeds.length; i++) {
+    var r = s.seeds[i];
+    var sc = score(r);
+    var gap = (sc == null || cutScore == null) ? null
+      : Math.round((cutScore - sc) * 10) / 10;
+    list.push({
+      seed: r.seed, teamId: r.teamId, teamName: r.teamName, record: r.record,
+      "in": r["in"], mine: r.mine,
+      gap: r["in"] ? 0 : gap,
+      alive: r["in"] ? true : (gap == null ? null : (gap <= maxSwing))
+    });
+  }
+  return {
+    settings: ps, cur: cur, periodsLeft: periodsLeft,
+    perPeriod: perPeriod, maxSwing: maxSwing,
+    me: me, cutRow: cutRow, list: list
+  };
+}
+
+function espHasBracket(row) {
+  if (typeof espIsSeasonPts === 'function' && espIsSeasonPts(row)) return false;
+  return !!espPlayoffSettings(row);
+}
+
+function _espBracketHtml(row) {
+  var pic = espPlayoffPicture(row);
+  var pr = espProjectedPairings(row);
+  if (!pic || !pr) {
+    return '<div data-espstand>' + _espStandToggleHtml(row, 'bracket') +
+      '<div style="color:rgba(255,255,255,0.35);font-size:12px;">' +
+      'No playoff structure in this league\u2019s settings.</div></div>';
+  }
+  var ps = pic.settings;
+  var accent = extProvAccent('espn');
+  var mono = 'font-family:var(--sk-font-mono,monospace);';
+  var real = espRealBracket(row);
+
+  var h = '<div data-espstand>';
+  h += _espStandToggleHtml(row, 'bracket');
+
+  h += '<div style="font-size:9.5px;color:rgba(255,255,255,0.3);margin:0 0 9px;' +
+    'line-height:1.5;">' +
+    ps.teams + ' teams \u00b7 ' + ps.rounds + ' round' + (ps.rounds === 1 ? '' : 's') +
+    ' \u00b7 ' + ps.roundLen + ' week' + (ps.roundLen === 1 ? '' : 's') + ' each \u00b7 ' +
+    'periods ' + ps.startPeriod + '\u2013' + ps.total + '<br>' +
+    'now in period ' + pic.cur + ' of ' + ps.total + ' \u00b7 <b style="color:' +
+    (pic.periodsLeft <= 2 ? '#fbbf24' : 'rgba(255,255,255,0.6)') + '">' +
+    pic.periodsLeft + '</b> regular-season week' + (pic.periodsLeft === 1 ? '' : 's') +
+    ' left' +
+    (ps.reseed ? ' \u00b7 reseeds each round' : ' \u00b7 bracket holds, no reseed') +
+    '</div>';
+
+  if (real) {
+    h += '<div style="font-size:9.5px;color:#4ade80;margin:0 0 8px;">' +
+      'ESPN has published the real bracket \u2014 ' + real.length +
+      ' playoff matchup' + (real.length === 1 ? '' : 's') + ' below are actual, ' +
+      'not projected.</div>';
+  }
+
+  // ── projected first round ──
+  h += '<div style="font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
+    'margin:0 0 4px;">' + (real ? 'BRACKET' : 'PROJECTED FIRST ROUND') + '</div>';
+  var g, i;
+  for (i = 0; i < pr.byes.length; i++) {
+    h += '<div style="display:flex;align-items:center;gap:8px;padding:6px;' +
+      'border-radius:7px;margin:0 0 3px;background:rgba(255,255,255,0.03);' +
+      'font-size:11.5px;">' +
+      '<span style="' + mono + 'color:rgba(255,255,255,0.3);flex:0 0 18px;">' +
+        pr.byes[i].seed + '</span>' +
+      '<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;' +
+        'white-space:nowrap;color:' +
+        (pr.byes[i].mine ? accent + ';font-weight:700' : 'rgba(255,255,255,0.8)') + ';">' +
+        slEsc(pr.byes[i].teamName) + '</span>' +
+      '<span style="font-size:9px;color:rgba(74,222,128,0.7);letter-spacing:0.06em;">BYE</span>' +
+    '</div>';
+  }
+  for (i = 0; i < pr.games.length; i++) {
+    g = pr.games[i];
+    h += '<div style="padding:6px;border-radius:7px;margin:0 0 3px;' +
+      'background:rgba(255,255,255,0.03);font-size:11.5px;">' +
+      '<div style="display:flex;align-items:center;gap:8px;">' +
+        '<span style="' + mono + 'color:rgba(255,255,255,0.3);flex:0 0 18px;">' +
+          g.hi.seed + '</span>' +
+        '<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;' +
+          'white-space:nowrap;color:' +
+          (g.hi.mine ? accent + ';font-weight:700' : 'rgba(255,255,255,0.8)') + ';">' +
+          slEsc(g.hi.teamName) + '</span>' +
+        '<span style="' + mono + 'font-size:10px;color:rgba(255,255,255,0.35);">' +
+          slEsc(g.hi.record || '') + '</span>' +
+      '</div>' +
+      '<div style="display:flex;align-items:center;gap:8px;margin-top:3px;">' +
+        '<span style="' + mono + 'color:rgba(255,255,255,0.3);flex:0 0 18px;">' +
+          g.lo.seed + '</span>' +
+        '<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;' +
+          'white-space:nowrap;color:' +
+          (g.lo.mine ? accent + ';font-weight:700' : 'rgba(255,255,255,0.8)') + ';">' +
+          slEsc(g.lo.teamName) + '</span>' +
+        '<span style="' + mono + 'font-size:10px;color:rgba(255,255,255,0.35);">' +
+          slEsc(g.lo.record || '') + '</span>' +
+      '</div>' +
+    '</div>';
+  }
+
+  // ── the race for the cutoff ──
+  h += '<div style="font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
+    'margin:14px 0 4px;">THE RACE</div>';
+  for (i = 0; i < pic.list.length; i++) {
+    var r = pic.list[i];
+    var isCut = (i === ps.teams - 1);
+    h += '<div style="display:flex;align-items:center;gap:8px;padding:5px 6px;' +
+      'font-size:11.5px;border-radius:6px;' +
+      (r.mine ? 'background:rgba(239,68,68,0.10);' : '') +
+      (isCut ? 'border-bottom:1px dashed rgba(251,191,36,0.45);' : '') + '">' +
+      '<span style="' + mono + 'flex:0 0 18px;color:' +
+        (r["in"] ? 'rgba(74,222,128,0.75)' : 'rgba(255,255,255,0.25)') + ';">' +
+        r.seed + '</span>' +
+      '<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;' +
+        'white-space:nowrap;color:' +
+        (r.mine ? accent + ';font-weight:700' : 'rgba(255,255,255,0.78)') + ';">' +
+        slEsc(r.teamName) + '</span>' +
+      '<span style="' + mono + 'flex:0 0 62px;text-align:right;font-size:10px;' +
+        'color:rgba(255,255,255,0.45);">' + slEsc(r.record || '') + '</span>' +
+      '<span style="' + mono + 'flex:0 0 60px;text-align:right;font-size:9.5px;color:' +
+        (r["in"] ? 'rgba(74,222,128,0.7)'
+          : r.alive === false ? 'rgba(248,113,113,0.75)'
+          : 'rgba(251,191,36,0.7)') + ';">' +
+        (r["in"] ? 'IN'
+          : r.alive === false ? 'ELIM'
+          : (r.gap == null ? '' : '\u2212' + r.gap)) + '</span>' +
+    '</div>';
+  }
+
+  h += '<div style="color:rgba(255,255,255,0.28);font-size:9.5px;margin-top:8px;' +
+    'line-height:1.5;">' +
+    'Seeded by ' + slEsc(ps.seedingRule || 'record') + '. The dashed line is the ' +
+    'cutoff; the number is wins behind it, a tie counting a half. ELIM means the ' +
+    'gap exceeds what the remaining ' + pic.periodsLeft + ' week' +
+    (pic.periodsLeft === 1 ? '' : 's') + ' can swing' +
+    (pic.perPeriod > 1
+      ? ' (each week is worth ' + pic.perPeriod + ' category decisions here, ' +
+        'so the swing is larger than it looks)'
+      : '') +
+    '. ' +
+    (real ? '' : 'ESPN hasn\u2019t published the real bracket yet \u2014 it appears ' +
+      'here automatically once it does. ') +
+    'Pairings assume the standings hold.</div>';
+  h += '</div>';
+  return h;
+}
+
 // ── PROJECTED STANDINGS ("if today ended") ── ESPPROJ ──
 // Takes each team's completed-period record and applies the CURRENT
 // matchup's live result, then re-ranks. Cats leagues decide on category
@@ -127323,6 +127617,10 @@ function _espStandToggleHtml(row, active) {
     ((typeof espIsSeasonPts === 'function' && espIsSeasonPts(row) &&
       typeof espSeasonClock === 'function' && espSeasonClock(row))
       ? tab('pace', 'PACE') : '') +
+    // Every league type except season points, which has no matchups and
+    // reports playoffTeamCount 0. ESPBRACKET
+    ((typeof espHasBracket === 'function' && espHasBracket(row))
+      ? tab('bracket', 'BRACKET') : '') +
     '</div>';
 }
 
@@ -127479,6 +127777,9 @@ function _espStandingsPaneHtml(row) {
   var _sv = _espStandView[String(row && row.key)];
   if (_sv === 'pace' && typeof espSeasonClock === 'function' && espSeasonClock(row)) {
     return _espPacePanelHtml(row);   // ESPPACE
+  }
+  if (_sv === 'bracket' && typeof espHasBracket === 'function' && espHasBracket(row)) {
+    return _espBracketHtml(row);   // ESPBRACKET
   }
   if (_sv === 'proj' && espHasProjection(row)) {   // ESPPROJ
     return _espProjStandingsHtml(row);
