@@ -124253,7 +124253,11 @@ function espLiveScores(j, standingsRows, rosters, cats, row) {
       away: a.name, home: h.name,
       awayScore: a.score, homeScore: h.score,
       awayRec: a.rec, homeRec: h.rec,
-      awayWins: a.wins, homeWins: h.wins
+      awayWins: a.wins, homeWins: h.wins,
+      // ESPN's own finality flag. UNDECIDED means the period is still live;
+      // anything else means the result is settled and already folded into
+      // record.overall, which the projection must not count twice. ESPPROJ
+      winner: String(m.winner || '')
     });
   }
   if (!games.length) return null;
@@ -126082,6 +126086,164 @@ function _espSeasonStatsHtml(row, mode) {
   return h;
 }
 
+// ── PROJECTED STANDINGS ("if today ended") ── ESPPROJ ──
+// Takes each team's completed-period record and applies the CURRENT
+// matchup's live result, then re-ranks. Cats leagues decide on category
+// wins, H2H points on the running score.
+//
+// Season-points leagues are excluded on purpose, not by oversight: they have
+// no weekly matchups, and their TOTAL column already includes today, so a
+// projected view would render the same table twice under a different name.
+//
+// The double-count trap is the whole risk here. ESPN's record.overall covers
+// COMPLETED periods only — the same completed-only pattern that already bit
+// totalPoints and cumulativeScore.scoreByStat — so a matchup that has
+// FINISHED is already in the record. Adding its result again would inflate
+// every projection by a full week, and it would look plausible. ESPN's own
+// winner flag is the guard: anything other than UNDECIDED is settled and
+// contributes nothing.
+function _espParseRec(rec) {
+  var m = String(rec == null ? '' : rec).match(/^(\d+)\s*-\s*(\d+)\s*-\s*(\d+)$/);
+  if (!m) return null;
+  return { w: Number(m[1]), l: Number(m[2]), t: Number(m[3]) };
+}
+
+// Strict: null, undefined and '' are MISSING, not zero.
+function _espProjNum(v) {
+  if (v == null || v === '') return null;
+  var n = Number(v);
+  return isNaN(n) ? null : n;
+}
+
+// W/L/T deltas for the current matchup period, keyed by team id.
+function espProjectedDeltas(row) {
+  var ls = row && row.liveScores;
+  if (!ls || !ls.games || !ls.games.length) return {};
+  var cats = (typeof espIsCats === 'function') ? espIsCats(row) : false;
+  var out = {}, i;
+  for (i = 0; i < ls.games.length; i++) {
+    var g = ls.games[i] || {};
+    if (!g.awayId || !g.homeId) continue;                    // bye week
+    if (g.winner && g.winner !== 'UNDECIDED') continue;      // already banked
+    // Number(null) is 0, not NaN, so a plain isNaN check quietly turned two
+    // teams with NO DATA YET into a recorded tie. Absent and zero are
+    // different states: a real 0-0 IS a tie if the period ended now, but a
+    // pair of nulls is a matchup we cannot call at all.
+    var av = _espProjNum(cats ? g.awayWins : g.awayScore);
+    var hv = _espProjNum(cats ? g.homeWins : g.homeScore);
+    if (av == null || hv == null) continue;
+    var ak = String(g.awayId), hk = String(g.homeId);
+    if (!out[ak]) out[ak] = { w: 0, l: 0, t: 0 };
+    if (!out[hk]) out[hk] = { w: 0, l: 0, t: 0 };
+    if (av > hv) { out[ak].w++; out[hk].l++; }
+    else if (hv > av) { out[hk].w++; out[ak].l++; }
+    else { out[ak].t++; out[hk].t++; }
+  }
+  return out;
+}
+
+function espProjectedStandings(row) {
+  var rows = (row && row.standingsAll) || [];
+  if (!rows.length) return null;
+  var d = espProjectedDeltas(row);
+  var out = [], i, moved = 0;
+  for (i = 0; i < rows.length; i++) {
+    var r = rows[i];
+    var base = _espParseRec(r.record);
+    var dd = d[String(r.teamId)] || { w: 0, l: 0, t: 0 };
+    if (dd.w || dd.l || dd.t) moved++;
+    var w = (base ? base.w : (r.wins || 0)) + dd.w;
+    var l = (base ? base.l : 0) + dd.l;
+    var t = (base ? base.t : 0) + dd.t;
+    var gp = w + l + t;
+    out.push({
+      teamId: r.teamId, teamName: r.teamName, pf: r.pf,
+      actualRank: r.rank || (i + 1),
+      rec: w + '-' + l + '-' + t,
+      // A tie counts as half a win, which is how ESPN orders these.
+      pct: gp ? (w + t / 2) / gp : 0,
+      delta: dd
+    });
+  }
+  // Win pct, then points-for as the tiebreak.
+  out.sort(function (a, b) { return (b.pct - a.pct) || ((b.pf || 0) - (a.pf || 0)); });
+  for (i = 0; i < out.length; i++) out[i].projRank = i + 1;
+  return { list: out, moved: moved };
+}
+
+// Does the projection have anything to say? Drives whether the tab appears,
+// so a league between periods never offers a tab that just mirrors RECORD.
+function espHasProjection(row) {
+  if (typeof espIsSeasonPts === 'function' && espIsSeasonPts(row)) return false;
+  var ls = row && row.liveScores;
+  if (!ls || !ls.games || !ls.games.length) return false;
+  var d = espProjectedDeltas(row), k;
+  for (k in d) { if (d.hasOwnProperty(k)) return true; }
+  return false;
+}
+
+function _espProjStandingsHtml(row) {
+  var p = espProjectedStandings(row);
+  if (!p || !p.list.length) {
+    return '<div data-espstand>' + _espStandToggleHtml(row, 'proj') +
+      '<div style="color:rgba(255,255,255,0.35);font-size:12px;">No standings yet.</div></div>';
+  }
+  var myIds = row.myTeamIds || {};
+  var accent = extProvAccent('espn');
+  var mono = 'font-family:var(--sk-font-mono,monospace);';
+  var cats = (typeof espIsCats === 'function') ? espIsCats(row) : false;
+
+  var h = '<div data-espstand>';
+  h += _espStandToggleHtml(row, 'proj');
+  h += '<div style="display:flex;align-items:baseline;gap:8px;padding:0 0 5px;' +
+    'border-bottom:1px solid rgba(255,255,255,0.08);font-size:9px;letter-spacing:0.1em;' +
+    'color:rgba(255,255,255,0.3);">' +
+    '<span style="flex:0 0 20px;">RK</span>' +
+    '<span style="flex:1;">TEAM</span>' +
+    '<span style="flex:0 0 34px;text-align:right;">MOVE</span>' +
+    '<span style="flex:0 0 78px;text-align:right;">PROJ W-L-T</span>' +
+    '</div>';
+
+  for (var i = 0; i < p.list.length; i++) {
+    var r = p.list[i];
+    var mine = !!myIds[r.teamId];
+    var move = r.actualRank - r.projRank;    // positive = climbed
+    var mvTxt = move > 0 ? '\u25b2' + move : move < 0 ? '\u25bc' + (-move) : '\u2013';
+    var mvCol = move > 0 ? '#4ade80' : move < 0 ? '#f87171' : 'rgba(255,255,255,0.22)';
+    var dd = r.delta || { w: 0, l: 0, t: 0 };
+    var res = dd.w ? 'W' : dd.l ? 'L' : dd.t ? 'T' : '';
+    var resCol = dd.w ? '#4ade80' : dd.l ? '#f87171' : 'rgba(255,255,255,0.4)';
+
+    h += '<div style="display:flex;align-items:center;gap:8px;padding:7px 6px;border-radius:7px;' +
+      'margin:0 0 2px;font-size:12.5px;' + (mine ? 'background:rgba(239,68,68,0.10);' : '') + '">' +
+      '<span style="flex:0 0 20px;color:rgba(255,255,255,0.35);' + mono + '">' +
+        r.projRank + '</span>' +
+      '<span style="flex:1;min-width:0;">' +
+        '<span style="display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' +
+          'color:' + (mine ? accent + ';font-weight:700' : 'rgba(255,255,255,0.82)') + ';">' +
+          slEsc(r.teamName) + '</span>' +
+        '<span style="display:block;font-size:9px;color:rgba(255,255,255,0.3);' + mono + '">' +
+          'now ' + r.actualRank +
+          (res ? '<span style="color:' + resCol + '"> \u00b7 ' + res + ' this period</span>' : '') +
+        '</span>' +
+      '</span>' +
+      '<span style="flex:0 0 34px;text-align:right;' + mono + 'color:' + mvCol + ';">' +
+        mvTxt + '</span>' +
+      '<span style="flex:0 0 78px;text-align:right;' + mono +
+        'color:rgba(255,255,255,0.85);font-weight:700;">' + slEsc(r.rec) + '</span>' +
+    '</div>';
+  }
+
+  h += '<div style="color:rgba(255,255,255,0.28);font-size:9.5px;margin-top:8px;line-height:1.5;">' +
+    'Records with this period\u2019s live result applied, re-ranked on win ' +
+    'pct then points-for. ' +
+    (cats ? 'Category leads decide each matchup.' : 'Running score decides each matchup.') +
+    ' Matchups ESPN has already settled are left out, since their result is ' +
+    'in the record above.</div>';
+  h += '</div>';
+  return h;
+}
+
 // Which view each league is on. Keyed by league so switching leagues doesn't
 // carry one league's choice into another.
 var _espStandView = {};
@@ -126102,7 +126264,12 @@ function _espStandToggleHtml(row, active) {
     // A categories league's first tab shows W-L-T and games back, not
     // points — calling it POINTS described the wrong thing entirely.
     tab('pts', (typeof espIsCats === 'function' && espIsCats(row)) ? 'RECORD' : 'POINTS') +
-    tab('season', 'SEASON') + tab('daily', 'DAILY') + '</div>';
+    tab('season', 'SEASON') + tab('daily', 'DAILY') +
+    // Only when it would say something different from the RECORD tab.
+    // ESPPROJ
+    ((typeof espHasProjection === 'function' && espHasProjection(row))
+      ? tab('proj', 'IF TODAY') : '') +
+    '</div>';
 }
 
 function espSetStandView(key, view) {
@@ -126198,6 +126365,9 @@ function _espStandingsPaneHtml(row) {
   // because a league can carry valuesByStat while its standings rows are
   // still empty. ESPSEASONSTATS
   var _sv = _espStandView[String(row && row.key)];
+  if (_sv === 'proj' && espHasProjection(row)) {   // ESPPROJ
+    return _espProjStandingsHtml(row);
+  }
   if ((_sv === 'season' || _sv === 'daily') && espHasSeasonStats(row)) {
     return _espSeasonStatsHtml(row, _sv);
   }
