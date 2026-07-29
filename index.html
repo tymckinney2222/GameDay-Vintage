@@ -126639,53 +126639,74 @@ function espSnapshotTrend(row, maxDays) {
   return { snaps: t.snaps, days: days };
 }
 
-// Mon-Sun grid for one week. Always returns seven cells so the structure is
-// visible before any snapshots exist — an empty grid that shows what is
-// coming beats a line of text saying there is no data.
-function espWeekGrid(row, weekStart) {
-  var t = espDailyDeltas(row);
-  var byDate = {}, i;
-  for (i = 0; i < t.days.length; i++) {
-    // A multi-day span lands on its first day; the rest stay blank rather
-    // than repeating a number that covers all of them.
-    byDate[t.days[i].date] = t.days[i];
-  }
+// Per-team production for each day of a Mon-Sun week.
+//   prod(dt) = snap[dt+1].pf - snap[dt].pf
+// The morning snap on dt holds totals through dt-1, so the pair straddling
+// dt is what was scored ON dt. Today's column stays blank until tomorrow's
+// snap lands, which is correct rather than missing.
+function espWeekProduction(row, weekStart) {
+  var snaps = espListPtsSnapshots(row && row.key) || [];
+  var byDate = {}, i, k;
+  for (i = 0; i < snaps.length; i++) byDate[snaps[i].date] = snaps[i];
   var ws = weekStart || _espWeekStart(_todayDateString());
-  var cells = [], total = null;
+  var days = [], any = false;
   for (i = 0; i < 7; i++) {
-    var d = _espDateAdd(ws, i);
-    var hit = byDate[d] || null;
-    if (hit && hit.myDelta != null) total = (total == null ? 0 : total) + hit.myDelta;
-    cells.push({ date: d, day: ['MON','TUE','WED','THU','FRI','SAT','SUN'][i], row: hit });
+    var dt = _espDateAdd(ws, i);
+    var s0 = byDate[dt], s1 = byDate[_espDateAdd(dt, 1)];
+    if (!s0 || !s1 || !s0.pfByTeam || !s1.pfByTeam) { days.push(null); continue; }
+    var m = {}, got = false;
+    for (k in s1.pfByTeam) {
+      if (!s1.pfByTeam.hasOwnProperty(k)) continue;
+      var b = s0.pfByTeam[k];
+      if (b == null) continue;         // team absent earlier: not a gain
+      m[k] = Math.round((Number(s1.pfByTeam[k]) - Number(b)) * 10) / 10;
+      got = true;
+    }
+    days.push(got ? m : null);
+    if (got) any = true;
   }
-  return { weekStart: ws, cells: cells, total: (total == null ? null : Math.round(total * 10) / 10),
-           snaps: t.snaps };
+  return { weekStart: ws, days: days, any: any, snaps: snaps.length };
 }
 
-// Season-to-date weekly totals, newest first.
-function espWeeklyTotals(row) {
-  var t = espDailyDeltas(row);
-  var byWeek = {}, order = [], i;
-  for (i = 0; i < t.days.length; i++) {
-    var d = t.days[i];
-    if (d.myDelta == null) continue;
-    var wk = _espWeekStart(d.date);
-    if (!byWeek[wk]) { byWeek[wk] = { week: wk, mine: 0, lg: 0, days: 0 }; order.push(wk); }
-    byWeek[wk].mine += d.myDelta;
-    byWeek[wk].lg += d.avg;
-    byWeek[wk].days++;
+// Cumulative production per team per completed week, newest week last.
+function espWeeklyProduction(row) {
+  var snaps = espListPtsSnapshots(row && row.key) || [];
+  var byDate = {}, i, k;
+  for (i = 0; i < snaps.length; i++) byDate[snaps[i].date] = snaps[i];
+  var dates = [];
+  for (k in byDate) { if (byDate.hasOwnProperty(k)) dates.push(k); }
+  dates.sort();
+  var weeks = {}, order = [];
+  for (i = 0; i < dates.length; i++) {
+    var dt = dates[i];
+    var s0 = byDate[dt], s1 = byDate[_espDateAdd(dt, 1)];
+    if (!s0 || !s1 || !s0.pfByTeam || !s1.pfByTeam) continue;
+    // The day dt was PLAYED decides the week it belongs to.
+    var wk = _espWeekStart(dt);
+    if (!weeks[wk]) { weeks[wk] = { week: wk, days: 0, byTeam: {} }; order.push(wk); }
+    weeks[wk].days++;
+    for (k in s1.pfByTeam) {
+      if (!s1.pfByTeam.hasOwnProperty(k)) continue;
+      var b = s0.pfByTeam[k];
+      if (b == null) continue;
+      weeks[wk].byTeam[k] = Math.round(
+        ((weeks[wk].byTeam[k] || 0) + (Number(s1.pfByTeam[k]) - Number(b))) * 10) / 10;
+    }
   }
+  order.sort();
   var out = [];
-  for (i = 0; i < order.length; i++) {
-    var w = byWeek[order[i]];
-    out.push({
-      week: w.week, days: w.days,
-      mine: Math.round(w.mine * 10) / 10,
-      lgAvg: Math.round(w.lg * 10) / 10
-    });
-  }
-  out.sort(function (a, b) { return a.week < b.week ? 1 : -1; });
-  return { snaps: t.snaps, weeks: out };
+  for (i = 0; i < order.length; i++) out.push(weeks[order[i]]);
+  return { weeks: out, snaps: snaps.length };
+}
+
+// The teams immediately above me, closest first — the ones a weekly margin
+// is actually about. Yahoo shows three.
+function espRivalsAhead(row, n) {
+  var c = espCatchRows(row);
+  if (!c || !c.list.length) return [];
+  var list = c.list.slice(0);
+  list.sort(function (a, b) { return a.gap - b.gap; });
+  return list.slice(0, n || 3);
 }
 
 function _espPacePanelHtml(row) {
@@ -126810,75 +126831,147 @@ function _espPacePanelHtml(row) {
       'effect. Directional, not a forecast.</div>';
   }
 
-  // ── THIS WEEK, DAY BY DAY ──
-  // The seven cells render whether or not any snapshots exist, so the shape
-  // of what is coming is visible from day one.
-  var wg = (typeof espWeekGrid === 'function') ? espWeekGrid(row) : null;
-  if (wg) {
+  // ── DAILY DETAIL: my score, then my MARGIN against every team ──
+  // Yahoo's shape. The top row is my raw production; every row beneath is
+  // what I gained or lost on that team that day, because a margin is what
+  // actually moves a chase — my score against the league average says
+  // nothing about the team I am trying to catch.
+  var wp = (typeof espWeekProduction === 'function') ? espWeekProduction(row) : null;
+  if (wp) {
+    var DAYS = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN'];
+    var todayStr = _todayDateString();
+    var myKey = (typeof espMyTeamId === 'function') ? String(espMyTeamId(row)) : null;
+    var cellW = 'flex:1;min-width:0;text-align:right;';
+    var needByTeam = {};
+    for (i = 0; i < c.list.length; i++) needByTeam[String(c.list[i].teamId)] = c.list[i].need;
+
     h += '<div style="font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
-      'margin:14px 0 2px;">THIS WEEK \u00b7 DAY BY DAY</div>' +
-      '<div style="font-size:9.5px;color:rgba(255,255,255,0.3);margin:0 0 6px;">' +
-      'week of ' + slEsc(wg.weekStart.slice(5)) +
-      (wg.total != null ? ' \u00b7 you <b style="color:rgba(255,255,255,0.65)">+' +
-        wg.total + '</b>' : '') + '</div>';
-    h += '<div style="display:flex;gap:3px;">';
-    for (i = 0; i < wg.cells.length; i++) {
-      var cell = wg.cells[i];
-      var v = cell.row && cell.row.myDelta;
-      var got = (v != null);
-      var beat = got && cell.row.avg != null && v > cell.row.avg;
-      h += '<div style="flex:1;min-width:0;text-align:center;padding:5px 2px;' +
-        'border-radius:6px;background:' +
-        (got ? 'rgba(255,255,255,0.05)' : 'rgba(255,255,255,0.02)') + ';">' +
-        '<div style="font-size:8px;letter-spacing:0.06em;color:rgba(255,255,255,0.22);">' +
-          cell.day + '</div>' +
-        '<div style="' + mono + 'font-size:11px;font-weight:700;margin-top:2px;color:' +
-          (got ? (beat ? '#4ade80' : 'rgba(255,255,255,0.75)') : 'rgba(255,255,255,0.14)') +
-          ';">' + (got ? v : '\u00b7') + '</div>' +
-        '<div style="' + mono + 'font-size:7.5px;color:rgba(255,255,255,0.2);margin-top:1px;">' +
-          (got && cell.row.avg != null ? cell.row.avg : '') + '</div>' +
+      'margin:14px 0 2px;">DAILY DETAIL \u00b7 this week vs every team</div>';
+    if (!wp.any) {
+      h += '<div style="font-size:10px;color:rgba(255,255,255,0.3);margin:0 0 5px;">' +
+        'No day is complete yet this week \u2014 a day fills in once the NEXT ' +
+        'morning\u2019s snap lands.</div>';
+    }
+    h += '<div style="overflow-x:auto;-webkit-overflow-scrolling:touch;">' +
+      '<div style="min-width:340px;">';
+
+    // header
+    h += '<div style="display:flex;gap:2px;align-items:center;padding:0 0 3px;' +
+      'font-size:8px;letter-spacing:0.05em;color:rgba(255,255,255,0.22);">' +
+      '<span style="flex:0 0 76px;">TEAM</span>';
+    for (i = 0; i < 7; i++) {
+      var isT = (_espDateAdd(wp.weekStart, i) === todayStr);
+      h += '<span style="' + cellW + (isT ? 'color:rgba(251,191,36,0.7);' : '') + '">' +
+        DAYS[i] + '</span>';
+    }
+    h += '<span style="flex:0 0 34px;text-align:right;">TOT</span>' +
+      '<span style="flex:0 0 38px;text-align:right;">NEED</span></div>';
+
+    // my raw production — the reference row, deliberately uncoloured
+    var myTot = 0, myAny = false;
+    h += '<div style="display:flex;gap:2px;align-items:center;padding:3px 0;' + mono +
+      'font-size:10px;border-bottom:1px solid rgba(255,255,255,0.07);">' +
+      '<span style="flex:0 0 76px;color:' + accent + ';font-weight:700;">My score</span>';
+    for (i = 0; i < 7; i++) {
+      var dp = wp.days[i];
+      var mv = (dp && myKey != null && dp[myKey] != null) ? dp[myKey] : null;
+      if (mv != null) { myTot += mv; myAny = true; }
+      h += '<span style="' + cellW + 'color:rgba(255,255,255,0.75);">' +
+        (mv == null ? '\u00b7' : Math.round(mv)) + '</span>';
+    }
+    h += '<span style="flex:0 0 34px;text-align:right;color:rgba(255,255,255,0.85);' +
+      'font-weight:700;">' + (myAny ? Math.round(myTot) : '\u00b7') + '</span>' +
+      '<span style="flex:0 0 38px;text-align:right;color:rgba(255,255,255,0.2);">\u2014</span>' +
+      '</div>';
+
+    // one row per rival: my production minus theirs, each day
+    for (var q = 0; q < p.rows.length; q++) {
+      var pr = p.rows[q];
+      if (myKey != null && String(pr.teamId) === myKey) continue;
+      var rowTot = 0, rowAny = false, cellsH = '';
+      for (i = 0; i < 7; i++) {
+        var dpr = wp.days[i];
+        var mine2 = (dpr && myKey != null) ? dpr[myKey] : null;
+        var theirs = dpr ? dpr[String(pr.teamId)] : null;
+        if (mine2 == null || theirs == null) {
+          cellsH += '<span style="' + cellW + 'color:rgba(255,255,255,0.14);">\u00b7</span>';
+          continue;
+        }
+        var margin = Math.round((mine2 - theirs) * 10) / 10;
+        rowTot += margin; rowAny = true;
+        cellsH += '<span style="' + cellW + 'color:' +
+          (margin > 0 ? '#4ade80' : margin < 0 ? '#f87171' : 'rgba(255,255,255,0.35)') +
+          ';">' + (margin > 0 ? '+' : '') + Math.round(margin) + '</span>';
+      }
+      var needV = needByTeam[String(pr.teamId)];
+      h += '<div style="display:flex;gap:2px;align-items:center;padding:3px 0;' + mono +
+        'font-size:10px;">' +
+        '<span style="flex:0 0 76px;overflow:hidden;text-overflow:ellipsis;' +
+          'white-space:nowrap;color:rgba(255,255,255,0.6);">' + slEsc(pr.teamName) + '</span>' +
+        cellsH +
+        '<span style="flex:0 0 34px;text-align:right;font-weight:700;color:' +
+          (!rowAny ? 'rgba(255,255,255,0.14)'
+            : rowTot > 0 ? '#4ade80' : rowTot < 0 ? '#f87171' : 'rgba(255,255,255,0.4)') +
+          ';">' + (rowAny ? ((rowTot > 0 ? '+' : '') + Math.round(rowTot)) : '\u00b7') + '</span>' +
+        '<span style="flex:0 0 38px;text-align:right;color:rgba(251,191,36,0.65);">' +
+          (needV == null ? '\u2014' : '+' + Math.round(needV)) + '</span>' +
       '</div>';
     }
-    h += '</div>';
-    h += '<div style="color:rgba(255,255,255,0.22);font-size:8.5px;margin-top:4px;">' +
-      'your points that day, league average beneath \u00b7 a day fills in once ' +
-      'the NEXT morning\u2019s snap lands</div>';
+    h += '</div></div>';
+    h += '<div style="color:rgba(255,255,255,0.22);font-size:8.5px;margin-top:4px;' +
+      'line-height:1.5;">Each cell is your points that day minus theirs \u2014 green ' +
+      'you gained, red you lost. TOT is your week-to-date margin on that team. ' +
+      'NEED is the weekly margin required to catch them. Blank days weren\u2019t ' +
+      'snapped, or haven\u2019t completed.</div>';
   }
 
-  // ── WEEKLY TOTALS ──
-  var wt = (typeof espWeeklyTotals === 'function') ? espWeeklyTotals(row) : null;
+  // ── WEEKLY TOTALS: my margin on the nearest rivals, week by week ──
+  var wkp = (typeof espWeeklyProduction === 'function') ? espWeeklyProduction(row) : null;
+  var rivals = (typeof espRivalsAhead === 'function') ? espRivalsAhead(row, 3) : [];
   h += '<div style="font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
     'margin:14px 0 2px;">WEEKLY TOTALS</div>';
-  if (!wt || !wt.weeks.length) {
+  if (!wkp || !wkp.weeks.length) {
     h += '<div style="font-size:10px;color:rgba(255,255,255,0.3);line-height:1.5;">' +
-      'Fills in as weeks complete. Each row is your points for that week ' +
-      'against the league average.</div>';
+      'Fills in as weeks complete \u2014 your points each week, and the margin ' +
+      'on the teams closest above you.</div>';
   } else {
-    h += '<div style="display:flex;gap:8px;padding:0 6px 3px;font-size:8.5px;' +
-      'letter-spacing:0.06em;color:rgba(255,255,255,0.22);">' +
-      '<span style="flex:1;">WEEK OF</span>' +
-      '<span style="flex:0 0 34px;text-align:right;">DAYS</span>' +
-      '<span style="flex:0 0 52px;text-align:right;">YOU</span>' +
-      '<span style="flex:0 0 52px;text-align:right;">LG AVG</span></div>';
-    for (i = 0; i < wt.weeks.length; i++) {
-      var w = wt.weeks[i];
-      var ahead = w.mine > w.lgAvg;
-      h += '<div style="display:flex;gap:8px;align-items:center;padding:4px 6px;' +
-        'font-size:10.5px;' + mono + 'border-radius:6px;' +
-        (i % 2 ? 'background:rgba(255,255,255,0.02);' : '') + '">' +
-        '<span style="flex:1;color:rgba(255,255,255,0.5);">' +
-          slEsc(w.week.slice(5)) + '</span>' +
-        '<span style="flex:0 0 34px;text-align:right;color:rgba(255,255,255,0.22);">' +
-          w.days + '</span>' +
-        '<span style="flex:0 0 52px;text-align:right;font-weight:700;color:' +
-          (ahead ? '#4ade80' : 'rgba(255,255,255,0.75)') + ';">' + w.mine + '</span>' +
-        '<span style="flex:0 0 52px;text-align:right;color:rgba(255,255,255,0.3);">' +
-          w.lgAvg + '</span>' +
-      '</div>';
+    var myK2 = (typeof espMyTeamId === 'function') ? String(espMyTeamId(row)) : null;
+    h += '<div style="display:flex;gap:6px;padding:0 0 3px;font-size:8px;' +
+      'letter-spacing:0.05em;color:rgba(255,255,255,0.22);">' +
+      '<span style="flex:0 0 52px;">WEEK</span>' +
+      '<span style="flex:0 0 30px;text-align:right;">D</span>' +
+      '<span style="flex:0 0 44px;text-align:right;">YOU</span>';
+    for (i = 0; i < rivals.length; i++) {
+      h += '<span style="flex:1;min-width:0;text-align:right;overflow:hidden;' +
+        'text-overflow:ellipsis;white-space:nowrap;">' +
+        slEsc(String(rivals[i].teamName).slice(0, 8)) + '</span>';
     }
-    h += '<div style="color:rgba(255,255,255,0.22);font-size:8.5px;margin-top:4px;">' +
-      'DAYS is how many of that week\u2019s days have a snapshot pair \u2014 a week ' +
-      'with gaps totals only the days it has</div>';
+    h += '</div>';
+    for (var wi = wkp.weeks.length - 1; wi >= 0; wi--) {
+      var wk2 = wkp.weeks[wi];
+      var myProd = (myK2 != null && wk2.byTeam[myK2] != null) ? wk2.byTeam[myK2] : null;
+      h += '<div style="display:flex;gap:6px;align-items:center;padding:4px 0;' + mono +
+        'font-size:10px;' + (wi % 2 ? '' : 'background:rgba(255,255,255,0.02);') + '">' +
+        '<span style="flex:0 0 52px;color:rgba(255,255,255,0.45);">' +
+          slEsc(wk2.week.slice(5)) + '</span>' +
+        '<span style="flex:0 0 30px;text-align:right;color:rgba(255,255,255,0.2);">' +
+          wk2.days + '</span>' +
+        '<span style="flex:0 0 44px;text-align:right;font-weight:700;' +
+          'color:rgba(255,255,255,0.85);">' +
+          (myProd == null ? '\u00b7' : Math.round(myProd)) + '</span>';
+      for (i = 0; i < rivals.length; i++) {
+        var tp = wk2.byTeam[String(rivals[i].teamId)];
+        var mg = (myProd == null || tp == null) ? null : Math.round(myProd - tp);
+        h += '<span style="flex:1;min-width:0;text-align:right;color:' +
+          (mg == null ? 'rgba(255,255,255,0.14)'
+            : mg > 0 ? '#4ade80' : mg < 0 ? '#f87171' : 'rgba(255,255,255,0.35)') +
+          ';">' + (mg == null ? '\u00b7' : (mg > 0 ? '+' : '') + mg) + '</span>';
+      }
+      h += '</div>';
+    }
+    h += '<div style="color:rgba(255,255,255,0.22);font-size:8.5px;margin-top:4px;' +
+      'line-height:1.5;">YOU is your points that week; each rival column is your ' +
+      'margin on them. D is how many of that week\u2019s days had a snapshot pair.</div>';
   }
 
   var snaps = espListPtsSnapshots(row.key) || [];
