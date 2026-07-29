@@ -125820,14 +125820,75 @@ function espHasSeasonStats(row) {
   return false;
 }
 
+// Today's per-stat production for one team, summed across its STARTERS —
+// the same set espTodayTeamTotal sums for points, so the daily table and the
+// TODAY column can never describe different rosters.
+//
+// Rate stats are skipped on the way in. Two players' batting averages do not
+// add, and neither do two ERAs; the components (AB, H, IP, ER, BB) DO add,
+// and espScoredIds already keeps them for cats leagues precisely so the
+// rates can be rebuilt afterwards. ESPDAILY
+function espDailyTeamStats(rosters, teamId) {
+  var t = rosters && rosters.byTeam && rosters.byTeam[String(teamId)];
+  if (!t || !t.items) return null;
+  var out = {}, any = false, i, k;
+  for (i = 0; i < t.items.length; i++) {
+    var it = t.items[i];
+    if (!it || !it.starter) continue;
+    var w = it.windows && it.windows.today;
+    if (!w || !w.stats) continue;
+    for (k in w.stats) {
+      if (!w.stats.hasOwnProperty(k)) continue;
+      if (ESP_STAT_RATE[k]) continue;
+      var n = Number(w.stats[k]);
+      if (isNaN(n)) continue;
+      out[k] = (out[k] || 0) + n;
+      any = true;
+    }
+  }
+  return any ? out : null;
+}
+
+// Rebuild the three MLB rate stats from components that do add up. Only
+// filled when every component is present, so a partial day shows a dash
+// rather than a rate computed from half a roster. IP is stored as OUTS.
+function espDailyRates(vals, game) {
+  if (game !== 'flb' || !vals) return vals;
+  var ab = vals['0'], h = vals['1'];
+  if (ab != null && Number(ab) > 0 && h != null) vals['2'] = Number(h) / Number(ab);
+  var outs = vals['34'];
+  if (outs != null && Number(outs) > 0) {
+    var ip = Number(outs) / 3;
+    var er = vals['45'];
+    if (er != null) vals['47'] = Number(er) * 9 / ip;
+    var bba = vals['39'], ha = vals['37'];
+    if (bba != null && ha != null) vals['41'] = (Number(bba) + Number(ha)) / ip;
+  }
+  return vals;
+}
+
+// teamId -> { statId: value } for whichever view is active.
+function _espSsValues(row, mode, game) {
+  var out = {}, teams = ((row.raw || {}).teams) || [], i;
+  for (i = 0; i < teams.length; i++) {
+    var id = String(teams[i].id);
+    if (mode === 'daily') {
+      var d = espDailyTeamStats(row.rosters, id);
+      out[id] = d ? espDailyRates(d, game) : null;
+    } else {
+      out[id] = teams[i].valuesByStat || null;
+    }
+  }
+  return out;
+}
+
 // Column list in scoringItems order — the league's own scoring order, which
 // is the order its manager already thinks in. Ids with no label are skipped:
 // the probe found two (33 and 35) that are unmapped AND unscored, so showing
 // them as "?" would add noise and no information.
-function _espSsCols(row, game) {
+function _espSsCols(row, game, vals) {
   var items = ((((row.raw || {}).settings || {}).scoringSettings) || {}).scoringItems || [];
-  var teams = ((row.raw || {}).teams) || [];
-  var bat = [], pit = [], seen = {}, i, j;
+  var bat = [], pit = [], seen = {}, i, k;
   for (i = 0; i < items.length; i++) {
     var id = items[i] && items[i].statId;
     if (id == null) continue;
@@ -125836,9 +125897,8 @@ function _espSsCols(row, game) {
     var label = espStatLabel(game, key);
     if (!label) continue;
     var any = false;
-    for (j = 0; j < teams.length; j++) {
-      var vb = teams[j] && teams[j].valuesByStat;
-      if (vb && vb[key] != null) { any = true; break; }
+    for (k in vals) {
+      if (vals.hasOwnProperty(k) && vals[k] && vals[k][key] != null) { any = true; break; }
     }
     if (!any) continue;
     seen[key] = 1;
@@ -125848,32 +125908,91 @@ function _espSsCols(row, game) {
   return { bat: bat, pit: pit };
 }
 
-function _espSeasonStatsHtml(row) {
+// Sort state per league. Null means "standings order", which is the default
+// and what tapping TEAM returns to.
+var _espSsSort = {};
+
+function espSetSsSort(key, id) {
+  var cur = _espSsSort[key];
+  if (!id) {
+    _espSsSort[key] = null;                       // TEAM header resets
+  } else if (cur && cur.id === id) {
+    _espSsSort[key] = { id: id, dir: -cur.dir };  // same column flips
+  } else {
+    _espSsSort[key] = { id: id, dir: -1 };        // new column starts high-to-low
+  }
+  espRepaintStandPane(key);
+}
+
+function espRepaintStandPane(key) {
+  var row = null, list = [], i;
+  try { if (typeof extSyncedLeagues === 'function') list = extSyncedLeagues() || []; } catch (e) {}
+  for (i = 0; i < list.length; i++) {
+    if (list[i] && String(list[i].key) === String(key)) { row = list[i]; break; }
+  }
+  if (!row) return;
+  // Swap the pane in place rather than re-rendering the whole league view,
+  // which would lose the scroll position on a long standings table.
+  var host = document.querySelector('[data-espstand]');
+  if (host) host.outerHTML = _espStandingsPaneHtml(row);
+}
+
+function _espSeasonStatsHtml(row, mode) {
+  mode = (mode === 'daily') ? 'daily' : 'season';
   var game = _espSsGame(row);
-  var teams = ((row.raw || {}).teams) || [];
-  var cols = _espSsCols(row, game);
+  var key = String(row.key || '');
+  var vals = _espSsValues(row, mode, game);
+  var cols = _espSsCols(row, game, vals);
   var all = cols.bat.concat(cols.pit);
+
   if (!all.length) {
-    return '<div style="color:rgba(255,255,255,0.35);font-size:12px;">' +
-      'ESPN hasn\u2019t sent per-team season stats for this league.</div>';
+    var msg = (mode === 'daily')
+      ? (row.rosters && row.rosters.byTeam
+          ? 'Nothing has scored yet today.'
+          : 'Open the league\u2019s Roster tab once, then come back \u2014 daily ' +
+            'stats are built from the rosters, which load on demand.')
+      : 'ESPN hasn\u2019t sent per-team season stats for this league.';
+    return '<div data-espstand>' + _espStandToggleHtml(row, mode) +
+      '<div style="color:rgba(255,255,255,0.35);font-size:12px;">' + msg + '</div></div>';
   }
 
-  // Same order the Points view uses, so switching tabs doesn't reshuffle the
-  // table under the reader.
+  // Standings order by default, so switching tabs doesn't reshuffle the table
+  // under the reader; a chosen column overrides it.
   var seasonPts = (typeof espIsSeasonPts === 'function') ? espIsSeasonPts(row) : false;
-  var srows = (row.standingsAll || []).slice(0);
-  if (seasonPts) srows.sort(function (a, b) { return (b.pf || 0) - (a.pf || 0); });
-  var byId = {}, i, j;
-  for (i = 0; i < teams.length; i++) byId[String(teams[i].id)] = teams[i];
+  var srows;
+  if (seasonPts && typeof espLiveStandings === 'function') {
+    srows = espLiveStandings(row).list.slice(0);
+  } else {
+    srows = (row.standingsAll || []).slice(0);
+  }
+
+  var sort = _espSsSort[key] || null;
+  if (sort) {
+    // Teams with no value for the sorted column sink to the bottom in BOTH
+    // directions — ascending would otherwise be led by every team that has
+    // nothing, which reads as data rather than absence.
+    srows.sort(function (a, b) {
+      var va = vals[String(a.teamId)] ? vals[String(a.teamId)][sort.id] : null;
+      var vb = vals[String(b.teamId)] ? vals[String(b.teamId)][sort.id] : null;
+      var na = (va == null) ? null : Number(va);
+      var nb = (vb == null) ? null : Number(vb);
+      if (na == null && nb == null) return 0;
+      if (na == null) return 1;
+      if (nb == null) return -1;
+      return (na - nb) * sort.dir;
+    });
+  }
 
   var myIds = row.myTeamIds || {};
   var accent = extProvAccent('espn');
   var mono = 'font-family:var(--sk-font-mono,monospace);';
   var cellPad = 'padding:5px 7px;text-align:right;white-space:nowrap;';
   var stick = 'position:sticky;left:0;z-index:2;background:#0b0f19;';
+  var byId = {}, teams = ((row.raw || {}).teams) || [], i, j;
+  for (i = 0; i < teams.length; i++) byId[String(teams[i].id)] = teams[i];
 
   var h = '<div data-espstand>';
-  h += _espStandToggleHtml(row, 'season');
+  h += _espStandToggleHtml(row, mode);
   h += '<div style="overflow-x:auto;-webkit-overflow-scrolling:touch;">';
   h += '<table style="border-collapse:collapse;font-size:11.5px;min-width:100%;">';
 
@@ -125893,19 +126012,26 @@ function _espSeasonStatsHtml(row) {
   }
   h += '</tr>';
 
+  var kAttr = key.replace(/'/g, '');
   h += '<tr style="color:rgba(255,255,255,0.42);font-size:9px;letter-spacing:0.08em;">' +
-    '<th style="' + stick + cellPad + 'text-align:left;">TEAM</th>';
+    '<th onclick="espSetSsSort(\'' + kAttr + '\',\'\')" ' +
+      'style="' + stick + cellPad + 'text-align:left;cursor:pointer;' +
+      (sort ? '' : 'color:#ef4444;') + '">TEAM</th>';
   for (i = 0; i < all.length; i++) {
     var first = (cols.bat.length && i === cols.bat.length);
-    h += '<th style="' + cellPad + (first ? 'border-left:1px solid rgba(255,255,255,0.14);' : '') +
-      '">' + slEsc(all[i].label) + '</th>';
+    var on = !!(sort && sort.id === all[i].id);
+    h += '<th onclick="espSetSsSort(\'' + kAttr + '\',\'' + all[i].id + '\')" ' +
+      'style="' + cellPad + 'cursor:pointer;' +
+      (first ? 'border-left:1px solid rgba(255,255,255,0.14);' : '') +
+      (on ? 'color:#ef4444;' : '') + '">' + slEsc(all[i].label) +
+      (on ? (sort.dir < 0 ? ' \u25be' : ' \u25b4') : '') + '</th>';
   }
   h += '</tr></thead><tbody>';
 
   for (i = 0; i < srows.length; i++) {
     var sr = srows[i];
     var t = byId[String(sr.teamId)];
-    var vb = (t && t.valuesByStat) || null;
+    var vb = vals[String(sr.teamId)] || null;
     var mine = !!myIds[sr.teamId];
     var bg = mine ? 'background:rgba(239,68,68,0.10);' : '';
     h += '<tr>' +
@@ -125917,7 +126043,9 @@ function _espSeasonStatsHtml(row) {
       var v = vb ? vb[all[j].id] : null;
       var edge = (cols.bat.length && j === cols.bat.length)
         ? 'border-left:1px solid rgba(255,255,255,0.14);' : '';
+      var hot = !!(sort && sort.id === all[j].id);
       h += '<td style="' + cellPad + mono + bg + edge +
+        (hot ? 'background:rgba(239,68,68,0.07);' : '') +
         'color:rgba(255,255,255,' + (mine ? '0.95' : '0.72') + ');">' +
         (v == null ? '\u2014' : slEsc(espStatFmt(all[j].id, v))) + '</td>';
     }
@@ -125925,8 +126053,12 @@ function _espSeasonStatsHtml(row) {
   }
   h += '</tbody></table></div>';
   h += '<div style="color:rgba(255,255,255,0.28);font-size:9.5px;margin-top:8px;line-height:1.5;">' +
-    'Season totals from ESPN\u2019s own per-team values, in this league\u2019s ' +
-    'scoring order. Swipe the table sideways for the rest.</div>';
+    (mode === 'daily'
+      ? 'Today\u2019s totals from each team\u2019s STARTERS \u00b7 rates rebuilt from ' +
+        'components, since averages don\u2019t add across players'
+      : 'Season totals from ESPN\u2019s own per-team values') +
+    ' \u00b7 in this league\u2019s scoring order \u00b7 tap a column to sort, TEAM to reset ' +
+    '\u00b7 swipe sideways for the rest.</div>';
   h += '</div>';
   return h;
 }
@@ -125941,28 +126073,19 @@ function _espStandToggleHtml(row, active) {
   function tab(id, label) {
     var on = (active === id);
     return '<button onclick="espSetStandView(\'' + key + '\',\'' + id + '\')" ' +
-      'style="flex:1;padding:6px 4px;border-radius:7px;border:1px solid ' +
+      'style="flex:1;padding:6px 3px;border-radius:7px;border:1px solid ' +
       (on ? 'rgba(239,68,68,0.55)' : 'rgba(255,255,255,0.12)') + ';' +
       'background:' + (on ? 'rgba(239,68,68,0.14)' : 'transparent') + ';' +
       'color:' + (on ? '#ef4444' : 'rgba(255,255,255,0.55)') + ';' +
-      'font-size:10px;font-weight:700;letter-spacing:0.06em;">' + label + '</button>';
+      'font-size:9.5px;font-weight:700;letter-spacing:0.04em;">' + label + '</button>';
   }
-  return '<div style="display:flex;gap:6px;margin:0 0 9px;">' +
-    tab('pts', 'POINTS') + tab('season', 'SEASON STATS') + '</div>';
+  return '<div style="display:flex;gap:5px;margin:0 0 9px;">' +
+    tab('pts', 'POINTS') + tab('season', 'SEASON') + tab('daily', 'DAILY') + '</div>';
 }
 
 function espSetStandView(key, view) {
   _espStandView[key] = view;
-  var row = null, list = [], i;
-  try { if (typeof extSyncedLeagues === 'function') list = extSyncedLeagues() || []; } catch (e) {}
-  for (i = 0; i < list.length; i++) {
-    if (list[i] && String(list[i].key) === String(key)) { row = list[i]; break; }
-  }
-  if (!row) return;
-  // Swap the pane in place rather than re-rendering the whole league view,
-  // which would lose the scroll position on a long standings table.
-  var host = document.querySelector('[data-espstand]');
-  if (host) host.outerHTML = _espStandingsPaneHtml(row);
+  espRepaintStandPane(key);
 }
 
 // Season points INCLUDING today's in-progress starters.
@@ -126048,12 +126171,13 @@ function espMyLiveRank(row) {
 }
 
 function _espStandingsPaneHtml(row) {
-  // Season Stats is a second view of the SAME pane, swapped in place by
-  // espSetStandView. Checked before the standingsAll guard because a league
-  // can carry valuesByStat while its standings rows are still empty.
-  // ESPSEASONSTATS
-  if (_espStandView[String(row && row.key)] === 'season' && espHasSeasonStats(row)) {
-    return _espSeasonStatsHtml(row);
+  // Season Stats and Daily Stats are further views of the SAME pane, swapped
+  // in place by espSetStandView. Checked before the standingsAll guard
+  // because a league can carry valuesByStat while its standings rows are
+  // still empty. ESPSEASONSTATS
+  var _sv = _espStandView[String(row && row.key)];
+  if ((_sv === 'season' || _sv === 'daily') && espHasSeasonStats(row)) {
+    return _espSeasonStatsHtml(row, _sv);
   }
   var rows = row && row.standingsAll;
   if (!rows || !rows.length) {
