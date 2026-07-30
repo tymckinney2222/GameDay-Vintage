@@ -126272,7 +126272,8 @@ function _espGroupTotalsHtml(row, items, wantPitchers, game, cats, accent) {
     var lbl = espStatName(game, id);
     if (!lbl) continue;
     bits.push(extStatBit(lbl, espStatFmt(id, tot.stats[id]),
-                         'rgba(255,255,255,0.35)', 'rgba(255,255,255,0.8)'));
+                         'rgba(255,255,255,0.35)', 'rgba(255,255,255,0.8)',
+                         extStatIsBad(row, game, id)));
   }
   var label = wantPitchers ? 'PITCHERS' : 'BATTERS';
   var right = '';
@@ -126449,7 +126450,8 @@ function _espLineupFill(row, bodyEl, headEl) {
         if (!w.stats.hasOwnProperty(sk)) continue;
         var lbl = espStatName(game, sk);
         if (!lbl) continue;
-        bits.push(extStatBit(lbl, espStatFmt(sk, w.stats[sk])));
+        bits.push(extStatBit(lbl, espStatFmt(sk, w.stats[sk]), null, null,
+                             extStatIsBad(row, game, sk)));
       }
       line = bits.join('<span style="color:rgba(255,255,255,0.18)"> \u00b7 </span>');
     }
@@ -126463,9 +126465,11 @@ function _espLineupFill(row, bodyEl, headEl) {
                 : Number(w.total) < 0 ? '#f87171' : 'rgba(255,255,255,0.35)') }
       : { txt: '\u2014', color: 'rgba(255,255,255,0.28)' };
 
-    var nameTxt = (it.name || String(it.playerId)) +
-      (it.starter && it.noGame ? '  \u2715 no game'
-        : (it.starter && it.noLineup ? '  \u00b7 no lineup posted' : ''));
+    // No day-status wording here. It belongs on the roster tab, where there's
+    // room for it; in the modal it repeated on nearly every row and crowded
+    // out the three things this view is for — name, club, today's line.
+    // ESPNOGAME
+    var nameTxt = (it.name || String(it.playerId));
     // sp is this league's sport, so the palette is chosen explicitly rather
     // than inferred — MIL, LA, TB and SJ mean different clubs per sport.
     var abbr = (ptMap && it.teamId != null) ? (ptMap[String(it.teamId)] || '') : '';
@@ -131351,6 +131355,38 @@ function _slStatLine(st, sport) {
 // VALUES go gold; labels and zeroes stay dim. Yahoo's lineup is deliberately
 // left alone — it has its own established styling.
 var EXT_STAT_HOT = '#fbbf24';
+var EXT_STAT_BAD = '#f87171';
+
+// Stats where a BIGGER number is worse. Keyed on label and side, because the
+// same label means opposite things either side of the ball: a walk is good
+// for a batter and bad for a pitcher, and so is a hit.
+//
+// MLB only, deliberately. The label sets for the other sports aren't verified
+// against their id maps, and a confidently wrong colour is worse than no
+// colour — points leagues in every sport are already covered by the scoring
+// check below, which needs no table at all. EXTSTATBAD
+var EXT_STAT_BAD_FLB = {
+  b: { SO: 1, K: 1, CS: 1, GIDP: 1, E: 1 },
+  p: { H: 1, BB: 1, ER: 1, ERA: 1, WHIP: 1, L: 1, HR: 1, R: 1, BS: 1, HBP: 1 }
+};
+
+// Does a bigger number here hurt?
+//
+// The league's own scoring settles it first: whatever a stat is called, a
+// league that pays negative points for it treats it as bad, and that answer
+// is right even for a scoring quirk no static table would predict. Categories
+// leagues pay no points, so those fall back to the stat's meaning.
+function extStatIsBad(row, game, statId) {
+  var pv = (typeof _espStatPointVal === 'function')
+    ? _espStatPointVal(row, statId) : null;
+  if (pv != null && !isNaN(pv) && pv !== 0) return pv < 0;
+  if (game !== 'flb') return false;
+  var lbl = (typeof espStatLabel === 'function')
+    ? String(espStatLabel(game, statId) || '').toUpperCase() : '';
+  if (!lbl) return false;
+  var side = (typeof espStatSide === 'function') ? espStatSide(game, statId) : '';
+  return !!(side === 'p' ? EXT_STAT_BAD_FLB.p[lbl] : EXT_STAT_BAD_FLB.b[lbl]);
+}
 
 // Tested against the FORMATTED value rather than the raw one, so it behaves
 // for ".000" (a genuine zero), "14.0", "1.000", "-1" and an em-dash alike.
@@ -131362,13 +131398,30 @@ function extStatHot(v) {
   return !isNaN(n) && n !== 0;
 }
 
+// The signed number behind a formatted value, or null when there isn't one.
+function extStatNum(v) {
+  var s = String(v == null ? '' : v).replace(/[^0-9.\-]/g, '');
+  if (!s || s === '-' || s === '.') return null;
+  var n = Number(s);
+  return isNaN(n) ? null : n;
+}
+
 // "LABEL value", with the value lit when it isn't zero.
-function extStatBit(label, val, labelCol, valCol) {
-  var hot = extStatHot(val);
+//
+// Gold means good. A stat the league counts against you gets red instead, and
+// so does any negative value — a strikeout lit up gold alongside a home run
+// read as though both were worth having. EXTSTATBAD
+function extStatBit(label, val, labelCol, valCol, bad) {
+  var n = extStatNum(val);
+  var hot = (n != null && n !== 0);
+  var isBad = !!bad || (n != null && n < 0);
+  var col = hot
+    ? (isBad ? EXT_STAT_BAD : EXT_STAT_HOT)
+    : (valCol || 'rgba(255,255,255,0.5)');
   return '<span style="color:' + (labelCol || 'rgba(255,255,255,0.35)') + '">' +
       slEsc(String(label)) + '</span> ' +
-    '<span style="color:' + (hot ? EXT_STAT_HOT : (valCol || 'rgba(255,255,255,0.5)')) + ';' +
-      (hot ? 'font-weight:700;' : '') + '">' + slEsc(String(val)) + '</span>';
+    '<span style="color:' + col + ';' + (hot ? 'font-weight:700;' : '') + '">' +
+      slEsc(String(val)) + '</span>';
 }
 
 function _extLineupRowHtml(name, slot, statLine, fpTxt, accent, dim, chip) {
