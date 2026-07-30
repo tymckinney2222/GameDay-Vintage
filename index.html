@@ -125475,10 +125475,21 @@ function espStatName(game, id) {
   var m = ESP_STAT_NAMES[game];
   return (m && m[id]) ? m[id] : '';
 }
+// Rates written WITHOUT a leading zero, by baseball convention: a batting
+// average is .300, never 0.300. ERA and WHIP are not in this set — they are
+// written 0.00 and 1.267 — and stripping their zero turned a scoreless
+// outing into ".000", which reads as a missing number rather than a perfect
+// one. Barely visible on season figures, which sit above 1.000 almost
+// always; constant on a single day's line. ESPRATEFMT
+var ESP_STAT_NO_LEAD_ZERO = { 2: 1, 9: 1, 17: 1, 18: 1 };
+
 function espStatFmt(id, v) {
   if (v == null) return '\u2014';
   var n = Number(v);
-  if (ESP_STAT_RATE[id]) return (Math.round(n * 1000) / 1000).toFixed(3).replace(/^0/, '');
+  if (ESP_STAT_RATE[id]) {
+    var r = (Math.round(n * 1000) / 1000).toFixed(3);
+    return ESP_STAT_NO_LEAD_ZERO[id] ? r.replace(/^0/, '') : r;
+  }
   // Outs back to innings in baseball notation: 145 outs is 48.1, not 48.3.
   if (String(id) === '34') return Math.floor(n / 3) + '.' + (n % 3);
   return String(Math.round(n * 10) / 10);
@@ -126406,6 +126417,134 @@ function _espGroupTotalsHtml(row, items, wantPitchers, game, cats, accent) {
         'No stats yet today.</div>');
 }
 
+// ── TODAY'S CATEGORIES, HEAD TO HEAD ── ESPTODAYCATS ──
+// The matchup tab's grid shows the category race for the whole period. This
+// is the same grid for TODAY ONLY, at the top of the lineup modal, so the
+// question "did my guys actually win me anything today" has an answer in the
+// place you go to look at your guys.
+//
+// Everything is already in memory: espTodayByStat sums each side's starters,
+// and espDailyRates rebuilds AVG / WHIP / ERA from components, because an
+// average can't be added across players. Rates stay blank until every
+// component is there rather than being computed off half a roster.
+function _espTeamCard(row, teamId) {
+  var rows = (row && row.standingsAll) || [], i;
+  for (i = 0; i < rows.length; i++) {
+    if (String(rows[i].teamId) === String(teamId)) {
+      return { name: rows[i].teamName || ('Team ' + teamId), avatar: rows[i].avatar || '' };
+    }
+  }
+  return { name: 'Team ' + teamId, avatar: '' };
+}
+
+function _espTodayCatsHtml(row, game, accent) {
+  if (typeof espIsCats !== 'function' || !espIsCats(row)) return '';
+  if (typeof espMyMatchupPair !== 'function') return '';
+  var pair = null;
+  try { pair = espMyMatchupPair(row); } catch (e) { return ''; }
+  if (!pair) return '';
+
+  var mine = espTodayByStat(row.rosters, pair.mineId);
+  var opp = espTodayByStat(row.rosters, pair.oppId);
+  if (!mine && !opp) return '';
+  mine = espDailyRates(mine || {}, game);
+  opp = espDailyRates(opp || {}, game);
+
+  // The league's own categories, in its own order. scoreByStat-style
+  // components (AB / H / IP / ER) are filtered out the same way the matchup
+  // grid filters them, or the list doubles in length with two rows labelled
+  // "H".
+  var items = ((((row.raw || {}).settings || {}).scoringSettings || {}).scoringItems) || [];
+  var only = {}, i;
+  for (i = 0; i < items.length; i++) {
+    if (items[i] && items[i].statId != null) only[items[i].statId] = 1;
+  }
+  var order = (typeof espScoredIds === 'function') ? espScoredIds(row) : [];
+  var ids = [];
+  for (i = 0; i < order.length; i++) {
+    if (items.length && !only[order[i]]) continue;
+    ids.push(order[i]);
+  }
+  if (!ids.length) return '';
+
+  var me = _espTeamCard(row, pair.mineId);
+  var th = _espTeamCard(row, pair.oppId);
+  // Absent versus zero, once more. If a side has ANY stats today then its
+  // team is playing, and a counting category it hasn't touched really is
+  // zero — leaving it null would score no result and quietly understate the
+  // grid. Rate categories get no such treatment: a missing ERA means nobody
+  // has thrown, which is unknown, not 0.00.
+  var meLive = false, opLive = false, kk;
+  for (kk in mine) { if (mine.hasOwnProperty(kk)) { meLive = true; break; } }
+  for (kk in opp) { if (opp.hasOwnProperty(kk)) { opLive = true; break; } }
+
+  var w = 0, l = 0, t = 0, body = '', id, mv, ov, res;
+  for (i = 0; i < ids.length; i++) {
+    id = ids[i];
+    var isRate = !!ESP_STAT_RATE[id];
+    mv = (mine[id] != null) ? mine[id] : ((meLive && !isRate) ? 0 : null);
+    ov = (opp[id] != null) ? opp[id] : ((opLive && !isRate) ? 0 : null);
+    res = espCatResult(id, mv, ov);
+    if (res === 'WIN') w++; else if (res === 'LOSS') l++; else if (res === 'TIE') t++;
+    var win = (res === 'WIN'), loss = (res === 'LOSS'), tie = (res === 'TIE');
+    // Nothing from either side yet reads as absent, not as a tie at nothing.
+    var blank = (mv == null && ov == null);
+    body += '<div style="display:grid;grid-template-columns:1fr 54px 1fr;' +
+      'align-items:center;padding:4px 2px;' +
+      'border-bottom:1px solid rgba(255,255,255,0.045);' +
+      (blank ? 'opacity:0.32;' : (tie ? 'opacity:0.55;' : '')) +
+      (win ? 'background:linear-gradient(90deg,rgba(74,222,128,0.06),transparent);' : '') +
+      (loss ? 'background:linear-gradient(90deg,transparent,rgba(248,113,113,0.06));' : '') +
+      '">' +
+      '<div style="display:flex;align-items:center;justify-content:flex-end;gap:4px">' +
+        '<span style="font-family:var(--sk-font-mono);font-size:12px;font-weight:700;color:' +
+          (win ? '#4ade80' : loss ? '#f87171' : 'rgba(255,255,255,0.5)') + '">' +
+          (mv != null ? slEsc(espStatFmt(id, mv)) : '\u2014') + '</span>' +
+        (win ? '<span style="color:#4ade80;font-size:8px">\u25c0</span>' : '') +
+      '</div>' +
+      '<div style="text-align:center;font-size:8.5px;letter-spacing:0.06em;' +
+        'color:rgba(255,255,255,0.32)">' + slEsc(espStatName(game, id) || ('#' + id)) + '</div>' +
+      '<div style="display:flex;align-items:center;justify-content:flex-start;gap:4px">' +
+        (loss ? '<span style="color:#f87171;font-size:8px">\u25b6</span>' : '') +
+        '<span style="font-family:var(--sk-font-mono);font-size:12px;font-weight:700;color:' +
+          (loss ? '#4ade80' : 'rgba(255,255,255,0.5)') + '">' +
+          (ov != null ? slEsc(espStatFmt(id, ov)) : '\u2014') + '</span>' +
+      '</div>' +
+    '</div>';
+  }
+
+  function badge(c, right) {
+    var img = c.avatar
+      ? '<img src="' + slEsc(c.avatar) + '" alt="" style="width:18px;height:18px;' +
+        'border-radius:4px;object-fit:cover;flex-shrink:0">'
+      : '';
+    var nm = '<span style="font-size:9px;font-weight:700;letter-spacing:0.04em;' +
+      'color:rgba(255,255,255,0.5);overflow:hidden;text-overflow:ellipsis;' +
+      'white-space:nowrap">' + slEsc(c.name) + '</span>';
+    return '<div style="display:flex;align-items:center;gap:5px;min-width:0;flex:1;' +
+      (right ? 'justify-content:flex-end' : '') + '">' +
+      (right ? nm + img : img + nm) + '</div>';
+  }
+
+  return '<div style="margin:0 0 14px">' +
+    '<div style="display:flex;align-items:center;gap:8px;padding:0 0 7px;' +
+      'border-bottom:1px solid rgba(255,255,255,0.08)">' +
+      badge(me, false) +
+      '<span style="font-family:var(--sk-font-mono);font-size:11px;font-weight:800;' +
+        'flex-shrink:0;color:rgba(255,255,255,0.75)">' +
+        '<span style="color:' + (w > l ? '#4ade80' : 'rgba(255,255,255,0.6)') + '">' + w + '</span>' +
+        '<span style="color:rgba(255,255,255,0.25)">-</span>' + t +
+        '<span style="color:rgba(255,255,255,0.25)">-</span>' +
+        '<span style="color:' + (l > w ? '#f87171' : 'rgba(255,255,255,0.6)') + '">' + l + '</span>' +
+      '</span>' +
+      badge(th, true) +
+    '</div>' + body +
+    '<div style="color:rgba(255,255,255,0.26);font-size:9px;line-height:1.5;margin-top:5px">' +
+      'Today only, from both sides\u2019 starters \u00b7 rates rebuilt from components' +
+    '</div>' +
+  '</div>';
+}
+
 // ── ESPN PRO-TEAM CHIPS ── ESPPROTEAM ──
 // The roster payload names a player's real-life club with a NUMERIC
 // proTeamId and never an abbreviation, and ESPN's fantasy numbering is its
@@ -126623,6 +126762,12 @@ function _espLineupFill(row, bodyEl, headEl) {
     if (top.pit) tb.push('ARM ' + top.pit.name + ' ' + (top.pit.pts > 0 ? '+' : '') + top.pit.pts);
     out += '<div style="text-align:center;color:rgba(255,255,255,0.5);font-size:10px;' +
       'letter-spacing:0.06em;margin:-6px 0 12px">' + slEsc(tb.join('   \u00b7   ')) + '</div>';
+  }
+
+  // A categories league gets today's category race against the actual
+  // opponent, above the roster. ESPTODAYCATS
+  if (cats && typeof _espTodayCatsHtml === 'function') {
+    out += _espTodayCatsHtml(row, game, accent);
   }
 
   // Batters, then pitchers, each under its own day-total line. ESPN3F
