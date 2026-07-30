@@ -126115,6 +126115,115 @@ function espMatchupOutlook(row) {
 // margin demands, and the win probability with a thin bar behind it. Tapping
 // it explains itself, since the inputs matter as much as the output and there
 // is no console on a phone.
+// ── CATS SCORECARD LINE ── ESPCATFLIP ──
+// A categories card has no fantasy points, so the win probability, its bar
+// and the top BAT/ARM line all switch themselves off — it was left showing
+// the day count and a tally and nothing else. These two lines are what the
+// tally can't say: whether today moved anything, and what's within reach.
+
+// Ground held, as a number, so all six transitions order correctly:
+// a LOSS that became a TIE gained half a category, and a WIN that became a
+// TIE gave half of one back.
+function _espCatScore(result) {
+  if (result === 'WIN') return 1;
+  if (result === 'TIE') return 0.5;
+  if (result === 'LOSS') return 0;
+  return null;
+}
+
+// Categories that changed hands today.
+function espCatFlips(cb) {
+  if (!cb || !cb.rows || !cb.live) return { gained: [], lost: [] };
+  var gained = [], lost = [], i;
+  for (i = 0; i < cb.rows.length; i++) {
+    var r = cb.rows[i];
+    var now = _espCatScore(r.result), was = _espCatScore(r.wasResult);
+    if (now == null || was == null || now === was) continue;
+    (now > was ? gained : lost).push(r.id);
+  }
+  return { gained: gained, lost: lost };
+}
+
+// Categories one play from changing hands.
+//
+// Only counting categories are ranked. A 0.04 ERA gap and a 1-run gap are
+// not comparable without a per-category sense of what a day swings, and
+// there's no season history per category in memory to build one from — so
+// rate categories qualify only when they're exactly level, which needs no
+// scale at all. Better a short honest list than a ranked misleading one.
+function espCatClose(cb, maxGap) {
+  if (!cb || !cb.rows) return [];
+  var lim = (maxGap == null) ? 2 : maxGap;
+  var out = [], i;
+  for (i = 0; i < cb.rows.length; i++) {
+    var r = cb.rows[i];
+    if (r.mine == null || r.opp == null) continue;
+    var diff = Number(r.mine) - Number(r.opp);
+    if (isNaN(diff)) continue;
+    var isRate = !!ESP_STAT_RATE[r.id];
+    if (isRate) {
+      if (diff !== 0) continue;              // level only
+      out.push({ id: r.id, gap: 0, rate: true });
+      continue;
+    }
+    if (Math.abs(diff) > lim) continue;
+    // Sign it from my side, flipping the ones where lower wins so a positive
+    // number always means I'm ahead.
+    var mine = ESP_LOWER_BETTER[r.id] ? -diff : diff;
+    out.push({ id: r.id, gap: Math.round(mine * 10) / 10, rate: false });
+  }
+  // Closest first, and among equally close ones the categories you are LEVEL
+  // in or BEHIND come before the ones you are narrowly ahead in. A category
+  // you might lose is worth more of the two slots on the card than one you
+  // might win by the same margin.
+  out.sort(function (a, b) {
+    var d = Math.abs(a.gap) - Math.abs(b.gap);
+    if (d) return d;
+    return (a.gap > 0 ? 1 : 0) - (b.gap > 0 ? 1 : 0);
+  });
+  return out;
+}
+
+function _espCatsCardLineHtml(l, accent) {
+  if (typeof espIsCats !== 'function' || !espIsCats(l)) return '';
+  var cb = l && l._espCats;
+  if (!cb || !cb.rows || !cb.rows.length) return '';
+  var game = 'flb';
+  var sp = String(l.sport || '').toLowerCase();
+  if (sp === 'nba') game = 'fba'; else if (sp === 'nhl') game = 'fhl';
+  else if (sp === 'nfl') game = 'ffl';
+
+  function nm(id) { return espStatName(game, id) || ('#' + id); }
+  var bits = [];
+
+  var f = espCatFlips(cb), fp = [], i;
+  for (i = 0; i < f.gained.length && fp.length < 2; i++) {
+    fp.push('<span style="color:#4ade80">+' + slEsc(nm(f.gained[i])) + '</span>');
+  }
+  for (i = 0; i < f.lost.length && fp.length < 3; i++) {
+    fp.push('<span style="color:#f87171">\u2212' + slEsc(nm(f.lost[i])) + '</span>');
+  }
+  if (fp.length) bits.push('today ' + fp.join(' '));
+
+  var cl = espCatClose(cb), cp = [];
+  for (i = 0; i < cl.length && cp.length < 2; i++) {
+    var c = cl[i];
+    var txt = c.gap === 0
+      ? slEsc(nm(c.id)) + ' level'
+      : slEsc(nm(c.id)) + ' ' + (c.gap > 0 ? '+' : '\u2212') + Math.abs(c.gap);
+    cp.push('<span style="color:' +
+      (c.gap === 0 ? '#fbbf24' : (c.gap > 0 ? 'rgba(255,255,255,0.55)' : '#f87171')) +
+      '">' + txt + '</span>');
+  }
+  if (cp.length) bits.push('close ' + cp.join(', '));
+
+  if (!bits.length) return '';
+  return '<div style="font-family:var(--sk-font-mono);font-size:9.5px;' +
+    'color:var(--sk-text-3);margin-top:5px;line-height:1.5">' +
+    bits.join('<span style="color:rgba(255,255,255,0.18)"> \u00b7 </span>') +
+    '</div>';
+}
+
 function _espOutlookRowHtml(l, accent) {
   if (typeof espMatchupOutlook !== 'function') return '';
   var o = null;
@@ -126625,9 +126734,17 @@ function espCatBreakdown(j, row) {
     for (k in ids) {
       if (!ids.hasOwnProperty(k)) continue;
       if (items.length && !only[k]) continue;
-      var mv = (myLive[k] != null) ? myLive[k] : _espStatVal(ms ? ms[k] : null);
-      var ov = (opLive[k] != null) ? opLive[k] : _espStatVal(os ? os[k] : null);
-      rows.push({ id: k, mine: mv, opp: ov, result: espCatResult(k, mv, ov) });
+      // The PRE-TODAY pair, kept alongside the live one. scoreByStat stops
+      // at the last completed period, so ms/os already are yesterday's grid
+      // — both states were being computed here and only the live one
+      // survived. Diffing the two results is what tells you whether today
+      // actually moved anything. ESPCATFLIP
+      var pm = _espStatVal(ms ? ms[k] : null);
+      var po = _espStatVal(os ? os[k] : null);
+      var mv = (myLive[k] != null) ? myLive[k] : pm;
+      var ov = (opLive[k] != null) ? opLive[k] : po;
+      rows.push({ id: k, mine: mv, opp: ov, result: espCatResult(k, mv, ov),
+                  preMine: pm, preOpp: po, wasResult: espCatResult(k, pm, po) });
     }
     if (!rows.length) return null;
     return { rows: rows, period: period, live: !!(myToday || opToday),
@@ -131919,6 +132036,10 @@ function skBuildExtCardHTML(l) {
     // probability. ESPOUTLOOK
     ((l.provider === 'espn' && typeof _espOutlookRowHtml === 'function')
       ? _espOutlookRowHtml(l, accent) : '') +
+    // Categories leagues only — what today moved and what's in reach.
+    // ESPCATFLIP
+    ((l.provider === 'espn' && typeof _espCatsCardLineHtml === 'function')
+      ? _espCatsCardLineHtml(l, accent) : '') +
     // Top bat + arm for today, mirroring the Yahoo card's top-player line.
     // ESPNSLICE2H
     ((l.provider === 'espn' && typeof _espTopTodayHtml === 'function')
