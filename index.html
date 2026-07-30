@@ -124989,11 +124989,59 @@ function _espSlotLabel(game, slotId, universal) {
   return '#' + slotId;
 }
 
+// Resolve the day flags left unanswered at roster-build time. ESPNOGAME
+//
+// espProTeamMap is fetched lazily and usually lands AFTER the rosters are
+// built, so at build time there was no way to map a numeric proTeamId to a
+// club and every player came back "don't know". This fills those in once the
+// map is available. Only items still holding null are touched — anything
+// already settled by a matching event id stays settled.
+function _espResolveDayFlags(row, game) {
+  var rs = row && row.rosters;
+  if (!rs || !rs.byTeam) return 0;
+  var season = rs.season;
+  var proMap = season ? (_espProTeams[game + ':' + season] || null) : null;
+  if (!proMap) return 0;
+  var abbrs = (typeof _espTodayTeamAbbrs === 'function')
+    ? _espTodayTeamAbbrs(row.sport) : null;
+  if (!abbrs) return 0;
+  var n = 0, tk, i;
+  for (tk in rs.byTeam) {
+    if (!rs.byTeam.hasOwnProperty(tk)) continue;
+    var items = (rs.byTeam[tk] || {}).items || [];
+    for (i = 0; i < items.length; i++) {
+      var it = items[i];
+      if (!it || it.dayHasGame != null) continue;      // already known
+      if (it.teamId == null || Number(it.teamId) === 0) continue;
+      var ab = proMap[String(it.teamId)];
+      if (!ab) continue;                                // club unresolvable
+      ab = String(ab).toUpperCase();
+      var playing = !!abbrs[ab];
+      if (!playing && typeof _skNormalizeTeamAbbr === 'function') {
+        var nb = String(_skNormalizeTeamAbbr(ab) || '').toUpperCase();
+        if (nb && abbrs[nb]) playing = true;
+      }
+      it.dayHasGame = playing;
+      it.gameKnown = true;
+      it.noGame = !playing;
+      it.noLineup = playing && (it.order == null || !it.orderIsToday);
+      n++;
+    }
+  }
+  return n;
+}
+
 function espRosters(j, game, scoredIds, sport) {
   if (!j || !j.teams || !j.teams.length) return null;
   var universal = _espUniversalSlots(j);
   // One scoreboard lookup for the whole roster. ESPN3E
   var todayIds = (typeof _espTodayGameIds === 'function') ? _espTodayGameIds(sport) : null;
+  // Club-level schedule, so "his team isn't playing" is decided by the
+  // schedule rather than by whether ESPN has attached per-player detail
+  // yet. ESPNOGAME
+  var todayAbbrs = (typeof _espTodayTeamAbbrs === 'function')
+    ? _espTodayTeamAbbrs(sport) : null;
+  var proMap = _espProTeams[game + ':' + j.seasonId] || null;
   var byTeam = {}, i, k;
   for (i = 0; i < j.teams.length; i++) {
     var t = j.teams[i] || {};
@@ -125013,7 +125061,8 @@ function espRosters(j, game, scoredIds, sport) {
       var pp = (typeof espPlayerPoints === 'function')
         ? espPlayerPoints(pl, j.seasonId, j.scoringPeriodId) : {};
       var tg = (typeof espTodayGame === 'function')
-        ? espTodayGame(pl, todayIds) : { known: false, hasGame: null, order: null };
+        ? espTodayGame(pl, todayIds, todayAbbrs, proMap)
+        : { known: false, hasGame: null, order: null };
       var wins = (typeof espBuildWindows === 'function')
         ? espBuildWindows(pl, j.seasonId, j.scoringPeriodId, scoredIds || []) : null;
       items.push({
@@ -125029,7 +125078,15 @@ function espRosters(j, game, scoredIds, sport) {
           ? tg.order
           : ((typeof espLineupOrder === 'function') ? espLineupOrder(pl) : null),
         orderIsToday: !!(tg.known && tg.hasGame && tg.order != null),
+        // Only a confirmed idle club. Not-yet-known is a separate state and
+        // must not borrow this flag — the idle count, the win-probability
+        // model and the red cross all read it as fact. ESPNOGAME
         noGame: !!(tg.known && tg.hasGame === false),
+        // His club plays, but the lineup hasn't been posted yet.
+        noLineup: !!(tg.known && tg.hasGame === true && tg.order == null),
+        // Tri-state, kept so a later pass can resolve the ones that were
+        // unanswerable at build time without disturbing the settled ones.
+        dayHasGame: tg.known ? !!tg.hasGame : null,
         gameKnown: !!tg.known,
         name: nm,
         // _extRosterItemName reads .pos and renders it on the right, so
@@ -125300,13 +125357,21 @@ function _espRosterRowsHtml(row, myTeam) {
       '<span style="flex:1;min-width:0;">' +
         '<span style="display:block;font-size:12.5px;color:#fff;overflow:hidden;' +
           'text-overflow:ellipsis;white-space:nowrap;">' + slEsc(it.name) +
-          // A starter whose team isn't playing today can't score for you —
-          // the single most useful thing to flag on a daily lineup. Only
-          // shown when today's game was actually identified, never guessed.
-          // ESPN3E
+          // A starter whose club isn't playing today can't score for you —
+          // the single most useful thing to flag on a daily lineup. The cross
+          // is reserved for that confirmed case. A club that IS playing but
+          // whose lineup hasn't been posted gets a neutral note instead:
+          // saying "no game" there was a false statement of fact, and on a
+          // morning slate it was the answer for nearly the whole roster.
+          // ESPN3E / ESPNOGAME
           (it.starter && it.noGame
             ? '<span style="color:#f87171;font-size:9px;font-weight:700;' +
-              'margin-left:5px;" title="No game today">\u2715 no game</span>' : '') +
+              'margin-left:5px;" title="Club is not playing today">\u2715 no game</span>'
+            : (it.starter && it.noLineup
+              ? '<span style="color:rgba(255,255,255,0.3);font-size:9px;' +
+                'margin-left:5px;" title="Club plays today; lineup not posted yet">' +
+                'no lineup posted</span>'
+              : '')) +
           (it.order ? '<span style="color:' +
                       (it.orderIsToday ? 'rgba(74,222,128,0.75)' : 'rgba(255,255,255,0.3)') +
                       ';font-size:9px;margin-left:5px;"' +
@@ -126355,6 +126420,10 @@ function _espLineupFill(row, bodyEl, headEl) {
   var ptMap = ptSeason ? (_espProTeams[game + ':' + ptSeason] || null) : null;
   if (ptSeason && !ptMap) {
     espProTeamMap(game, ptSeason, function () { _espLineupFill(row, bodyEl, headEl); });
+  } else if (ptMap) {
+    // Map is in hand: settle any day flags that couldn't be answered when
+    // the rosters were built. ESPNOGAME
+    if (typeof _espResolveDayFlags === 'function') _espResolveDayFlags(row, game);
   }
 
   var items = myTeam.items;
@@ -126395,7 +126464,8 @@ function _espLineupFill(row, bodyEl, headEl) {
       : { txt: '\u2014', color: 'rgba(255,255,255,0.28)' };
 
     var nameTxt = (it.name || String(it.playerId)) +
-      (it.starter && it.noGame ? '  \u2715 no game' : '');
+      (it.starter && it.noGame ? '  \u2715 no game'
+        : (it.starter && it.noLineup ? '  \u00b7 no lineup posted' : ''));
     // sp is this league's sport, so the palette is chosen explicitly rather
     // than inferred — MIL, LA, TB and SJ mean different clubs per sport.
     var abbr = (ptMap && it.teamId != null) ? (ptMap[String(it.teamId)] || '') : '';
@@ -129579,22 +129649,89 @@ function _espTodayGameIds(sport) {
   return out;
 }
 
+// Club abbreviations with a game on today's slate, from the scoreboard
+// already in memory. This is the authority on whether a team plays — it comes
+// from the schedule itself rather than from whether ESPN has got round to
+// attaching per-player detail. ESPNOGAME
+function _espTodayTeamAbbrs(sport) {
+  var out = null;
+  try {
+    if (typeof allGames === 'undefined' || !allGames) return null;
+    var list = allGames[String(sport || '').toUpperCase()];
+    if (!list || !list.length) return null;
+    var now = new Date();
+    var y = now.getFullYear(), m = now.getMonth(), d = now.getDate();
+    out = {}; var n = 0, i, sides, si;
+    for (i = 0; i < list.length; i++) {
+      var g = list[i];
+      if (!g) continue;
+      if (g.date) {
+        var gd = new Date(g.date);
+        if (gd.getFullYear() !== y || gd.getMonth() !== m || gd.getDate() !== d) continue;
+      }
+      sides = [g.home, g.away];
+      for (si = 0; si < 2; si++) {
+        var ab = sides[si] && sides[si].abbr;
+        if (!ab) continue;
+        ab = String(ab).toUpperCase();
+        out[ab] = 1; n++;
+        // Fantasy and site abbreviations are both ESPN's but come from
+        // different APIs and don't always agree, so both spellings go in.
+        if (typeof _skNormalizeTeamAbbr === 'function') {
+          var nb = String(_skNormalizeTeamAbbr(ab) || '').toUpperCase();
+          if (nb && nb !== ab) out[nb] = 1;
+        }
+      }
+    }
+    if (!n) return null;
+  } catch (e) { return null; }
+  return out;
+}
+
 // What do we know about this player's day?
-//   hasGame  - his team plays today (his team's event id is in the set)
+//   hasGame  - true he plays, false his club is idle, null we can't tell
 //   order    - today's batting slot, when the lineup has been posted
-//   known    - whether we could identify today's game at all
-function espTodayGame(pl, todayIds) {
+//   known    - whether the question could be answered at all
+//
+// The absent-versus-negative trap, again. proGamePlayerDetail missing was
+// read as "no game today", but ESPN simply hasn't populated it yet for most
+// of the slate until close to first pitch — so a full roster of players with
+// games rendered as a wall of red crosses. Missing detail is NOT a schedule
+// fact and must never be reported as one.
+//
+// The club's own schedule settles it: if the team is on today's slate the
+// player has a game, whatever the per-player payload does or doesn't say. If
+// the club can't be resolved at all, the answer is "don't know" — which the
+// UI states plainly instead of asserting the worse of the two. ESPNOGAME
+function espTodayGame(pl, todayIds, todayAbbrs, proMap) {
+  var unknown = { known: false, hasGame: null, order: null, status: '' };
   var d = pl && pl.proGamePlayerDetail;
-  if (!todayIds) return { known: false, hasGame: null, order: null, status: '' };
-  if (!d) return { known: true, hasGame: false, order: null, status: '' };
-  for (var k in d) {
-    if (!d.hasOwnProperty(k)) continue;
-    if (!todayIds[String(k)]) continue;
-    var e = d[k] || {};
-    var lo = (e.lineupOrder != null && e.lineupOrder > 0) ? Number(e.lineupOrder) : null;
-    return { known: true, hasGame: true, order: lo, status: String(e.starterStatus || '') };
+  // A matching event id is the strongest signal: his club plays AND ESPN has
+  // attached his detail for it.
+  if (todayIds && d) {
+    for (var k in d) {
+      if (!d.hasOwnProperty(k)) continue;
+      if (!todayIds[String(k)]) continue;
+      var e = d[k] || {};
+      var lo = (e.lineupOrder != null && e.lineupOrder > 0) ? Number(e.lineupOrder) : null;
+      return { known: true, hasGame: true, order: lo,
+               status: String(e.starterStatus || '') };
+    }
   }
-  return { known: true, hasGame: false, order: null, status: '' };
+  // No per-player detail for today. Fall back to the club's schedule.
+  if (!todayAbbrs || !proMap) return unknown;
+  var tid = (pl && pl.proTeamId != null) ? String(pl.proTeamId) : null;
+  if (!tid || tid === '0') return unknown;         // 0 is ESPN's free agent
+  var ab = proMap[tid];
+  if (!ab) return unknown;                          // club not resolvable
+  ab = String(ab).toUpperCase();
+  var playing = !!todayAbbrs[ab];
+  if (!playing && typeof _skNormalizeTeamAbbr === 'function') {
+    var nb = String(_skNormalizeTeamAbbr(ab) || '').toUpperCase();
+    if (nb && todayAbbrs[nb]) playing = true;
+  }
+  // Playing but no detail yet: the lineup simply hasn't been posted.
+  return { known: true, hasGame: playing, order: null, status: '' };
 }
 
 // ─── Matchup flow chart ─────────────────────────────────────────────
