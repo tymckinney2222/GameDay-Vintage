@@ -128442,28 +128442,51 @@ function espRealBracket(row) {
 }
 
 // Seeds in standings order, with the playoff cutoff marked.
-function espSeeds(row) {
+//
+// mode 'proj' seeds off the IF TODAY table instead of the official one, which
+// is what drives the alternate bracket: the same structure re-cut against
+// records that already carry the current period's live result. ESPBRACKET2
+function espSeeds(row, mode) {
   var ps = espPlayoffSettings(row);
   if (!ps) return null;
-  var rows = (row && row.standingsAll) || [];
+  var projected = (mode === 'proj');
+  var rows = null, i;
+  if (projected) {
+    var p = (typeof espProjectedStandings === 'function')
+      ? espProjectedStandings(row) : null;
+    if (!p || !p.list || !p.list.length) return null;
+    rows = [];
+    for (i = 0; i < p.list.length; i++) {
+      rows.push({
+        teamId: p.list[i].teamId, teamName: p.list[i].teamName,
+        record: p.list[i].rec, pf: p.list[i].pf,
+        // Where this team sits in the OFFICIAL table, so the renderer can
+        // show what today's result moved.
+        actualSeed: p.list[i].actualRank
+      });
+    }
+  } else {
+    rows = (row && row.standingsAll) || [];
+  }
   if (!rows.length) return null;
   var myIds = row.myTeamIds || {};
-  var out = [], i;
+  var out = [];
   for (i = 0; i < rows.length; i++) {
     out.push({
       seed: i + 1, teamId: rows[i].teamId, teamName: rows[i].teamName,
       record: rows[i].record, pf: rows[i].pf,
+      actualSeed: (rows[i].actualSeed != null) ? rows[i].actualSeed : (i + 1),
       "in": (i < ps.teams),
       mine: !!myIds[rows[i].teamId]
     });
   }
-  return { settings: ps, seeds: out };
+  return { settings: ps, seeds: out, projected: projected };
 }
 
 // First-round pairings: 1 plays the lowest seed, 2 the next, and so on. A
 // field that isn't a power of two gives the top seeds byes.
-function espProjectedPairings(row) {
-  var s = espSeeds(row);
+function espProjectedPairings(row, mode) {
+  var s = espSeeds(row, mode);
   if (!s) return null;
   var n = s.settings.teams;
   var field = s.seeds.slice(0, n);
@@ -128477,7 +128500,8 @@ function espProjectedPairings(row) {
   for (i = 0; i < playing.length / 2; i++) {
     games.push({ hi: playing[i], lo: playing[playing.length - 1 - i] });
   }
-  return { settings: s.settings, byes: field.slice(0, byes), games: games, seeds: s.seeds };
+  return { settings: s.settings, byes: field.slice(0, byes), games: games,
+           seeds: s.seeds, projected: !!s.projected };
 }
 
 // Where a team stands against the cutoff, in matchups rather than vibes.
@@ -128487,13 +128511,19 @@ function espProjectedPairings(row) {
 // For an each-category league a matchup is worth catCount decisions, not
 // one, so the swing per period is scaled accordingly — otherwise a category
 // league looks mathematically dead weeks before it is.
-function espPlayoffPicture(row) {
-  var s = espSeeds(row);
+function espPlayoffPicture(row, mode) {
+  var s = espSeeds(row, mode);
   if (!s) return null;
   var cur = espCurrentMatchupPeriod(row);
   if (cur == null) return null;
   var ps = s.settings;
-  var periodsLeft = Math.max(0, ps.lastRegular - cur + 1);
+  // The IF TODAY records already have the current period's result banked, so
+  // in that world it is spent and cannot swing anything further. Counting it
+  // as remaining would double it — once in the record, once in the swing —
+  // and would keep teams alive on a period they have notionally played.
+  var periodsLeft = s.projected
+    ? Math.max(0, ps.lastRegular - cur)
+    : Math.max(0, ps.lastRegular - cur + 1);
 
   var each = (typeof espIsEachCategory === 'function') && espIsEachCategory(row);
   var perPeriod = 1;
@@ -128524,6 +128554,8 @@ function espPlayoffPicture(row) {
       : Math.round((cutScore - sc) * 10) / 10;
     list.push({
       seed: r.seed, teamId: r.teamId, teamName: r.teamName, record: r.record,
+      actualSeed: r.actualSeed,
+      seedMove: (r.actualSeed == null) ? 0 : (r.actualSeed - r.seed),
       "in": r["in"], mine: r.mine,
       gap: r["in"] ? 0 : gap,
       alive: r["in"] ? true : (gap == null ? null : (gap <= maxSwing))
@@ -128532,7 +128564,7 @@ function espPlayoffPicture(row) {
   return {
     settings: ps, cur: cur, periodsLeft: periodsLeft,
     perPeriod: perPeriod, maxSwing: maxSwing,
-    me: me, cutRow: cutRow, list: list
+    me: me, cutRow: cutRow, list: list, projected: !!s.projected
   };
 }
 
@@ -128541,9 +128573,46 @@ function espHasBracket(row) {
   return !!espPlayoffSettings(row);
 }
 
+// Which bracket the pane is showing, per league. 'proj' re-cuts it off the
+// IF TODAY records. ESPBRACKET2
+var _espBracketMode = {};
+
+function espSetBracketMode(key, mode) {
+  _espBracketMode[key] = mode;
+  espRepaintStandPane(key);
+}
+
+function _espBracketModeToggleHtml(row, mode) {
+  var key = String(row.key || '').replace(/'/g, '');
+  function pill(id, label) {
+    var on = (mode === id);
+    return '<button onclick="espSetBracketMode(\'' + key + '\',\'' + id + '\')" ' +
+      'style="flex:1;padding:5px 3px;border-radius:6px;border:1px solid ' +
+      (on ? 'rgba(251,191,36,0.5)' : 'rgba(255,255,255,0.10)') + ';' +
+      'background:' + (on ? 'rgba(251,191,36,0.12)' : 'transparent') + ';' +
+      'color:' + (on ? '#fbbf24' : 'rgba(255,255,255,0.45)') + ';' +
+      'font-size:9px;font-weight:700;letter-spacing:0.06em;">' + label + '</button>';
+  }
+  return '<div style="display:flex;gap:5px;margin:0 0 9px;">' +
+    pill('actual', 'AS IT STANDS') + pill('proj', 'IF TODAY HOLDS') + '</div>';
+}
+
 function _espBracketHtml(row) {
-  var pic = espPlayoffPicture(row);
-  var pr = espProjectedPairings(row);
+  var real0 = espRealBracket(row);
+  // Once ESPN publishes the real bracket the regular season is over, so an
+  // alternate seeding has nothing left to change. The toggle is also hidden
+  // when there's no live result to project from.
+  var canProj = !real0 &&
+    (typeof espHasProjection === 'function') && espHasProjection(row);
+  var mode = canProj ? (_espBracketMode[String(row.key)] || 'actual') : 'actual';
+  var pic = espPlayoffPicture(row, mode === 'proj' ? 'proj' : null);
+  var pr = espProjectedPairings(row, mode === 'proj' ? 'proj' : null);
+  // A projection that can't be built falls back rather than blanking the pane.
+  if (mode === 'proj' && (!pic || !pr)) {
+    mode = 'actual';
+    pic = espPlayoffPicture(row);
+    pr = espProjectedPairings(row);
+  }
   if (!pic || !pr) {
     return '<div data-espstand>' + _espStandToggleHtml(row, 'bracket') +
       '<div style="color:rgba(255,255,255,0.35);font-size:12px;">' +
@@ -128552,20 +128621,27 @@ function _espBracketHtml(row) {
   var ps = pic.settings;
   var accent = extProvAccent('espn');
   var mono = 'font-family:var(--sk-font-mono,monospace);';
-  var real = espRealBracket(row);
+  var real = real0;
+  var proj = (mode === 'proj');
 
   var h = '<div data-espstand>';
   h += _espStandToggleHtml(row, 'bracket');
+  if (canProj) h += _espBracketModeToggleHtml(row, mode);
 
   h += '<div style="font-size:9.5px;color:rgba(255,255,255,0.3);margin:0 0 9px;' +
     'line-height:1.5;">' +
     ps.teams + ' teams \u00b7 ' + ps.rounds + ' round' + (ps.rounds === 1 ? '' : 's') +
     ' \u00b7 ' + ps.roundLen + ' week' + (ps.roundLen === 1 ? '' : 's') + ' each \u00b7 ' +
     'periods ' + ps.startPeriod + '\u2013' + ps.total + '<br>' +
-    'now in period ' + pic.cur + ' of ' + ps.total + ' \u00b7 <b style="color:' +
-    (pic.periodsLeft <= 2 ? '#fbbf24' : 'rgba(255,255,255,0.6)') + '">' +
-    pic.periodsLeft + '</b> regular-season period' +
-    (pic.periodsLeft === 1 ? '' : 's') + ' left (this one included)' +
+    (proj
+      ? 'period ' + pic.cur + ' counted as final \u00b7 <b style="color:' +
+        (pic.periodsLeft <= 2 ? '#fbbf24' : 'rgba(255,255,255,0.6)') + '">' +
+        pic.periodsLeft + '</b> regular-season period' +
+        (pic.periodsLeft === 1 ? '' : 's') + ' left after it'
+      : 'now in period ' + pic.cur + ' of ' + ps.total + ' \u00b7 <b style="color:' +
+        (pic.periodsLeft <= 2 ? '#fbbf24' : 'rgba(255,255,255,0.6)') + '">' +
+        pic.periodsLeft + '</b> regular-season period' +
+        (pic.periodsLeft === 1 ? '' : 's') + ' left (this one included)') +
     (ps.reseed ? ' \u00b7 reseeds each round' : ' \u00b7 bracket holds, no reseed') +
     '</div>';
 
@@ -128578,7 +128654,9 @@ function _espBracketHtml(row) {
 
   // ── projected first round ──
   h += '<div style="font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
-    'margin:0 0 4px;">' + (real ? 'BRACKET' : 'PROJECTED FIRST ROUND') + '</div>';
+    'margin:0 0 4px;">' +
+    (real ? 'BRACKET' : proj ? 'FIRST ROUND IF TODAY HOLDS' : 'PROJECTED FIRST ROUND') +
+    '</div>';
   var g, i;
   for (i = 0; i < pr.byes.length; i++) {
     h += '<div style="display:flex;align-items:center;gap:8px;padding:6px;' +
@@ -128633,6 +128711,16 @@ function _espBracketHtml(row) {
       '<span style="' + mono + 'flex:0 0 18px;color:' +
         (r["in"] ? 'rgba(74,222,128,0.75)' : 'rgba(255,255,255,0.25)') + ';">' +
         r.seed + '</span>' +
+      // Seed movement against the official table — the whole point of the
+      // alternate view is seeing what today's result actually shifts.
+      (proj
+        ? '<span style="' + mono + 'flex:0 0 20px;font-size:9px;color:' +
+          (r.seedMove > 0 ? '#4ade80' : r.seedMove < 0 ? '#f87171'
+            : 'rgba(255,255,255,0.15)') + ';">' +
+          (r.seedMove > 0 ? '\u25b2' + r.seedMove
+            : r.seedMove < 0 ? '\u25bc' + Math.abs(r.seedMove) : '\u2013') +
+          '</span>'
+        : '') +
       '<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;' +
         'white-space:nowrap;color:' +
         (r.mine ? accent + ';font-weight:700' : 'rgba(255,255,255,0.78)') + ';">' +
@@ -128645,7 +128733,9 @@ function _espBracketHtml(row) {
           : 'rgba(251,191,36,0.7)') + ';">' +
         (r["in"] ? 'IN'
           : r.alive === false ? 'ELIM'
-          : (r.gap == null ? '' : '\u2212' + r.gap)) + '</span>' +
+          // Level on wins but below the line on the tiebreak. Rendering that
+          // as "−0" reads like a rounding artefact rather than a standing.
+          : (r.gap == null ? '' : (r.gap === 0 ? 'EVEN' : '\u2212' + r.gap))) + '</span>' +
     '</div>';
   }
 
@@ -128662,7 +128752,12 @@ function _espBracketHtml(row) {
     '. ' +
     (real ? '' : 'ESPN hasn\u2019t published the real bracket yet \u2014 it appears ' +
       'here automatically once it does. ') +
-    'Pairings assume the standings hold.</div>';
+    'Pairings assume the standings hold.' +
+    (proj
+      ? ' Seeded off the IF TODAY records, so this period counts as already ' +
+        'won or lost and the arrows show the seed it moves.'
+      : '') +
+    '</div>';
   h += '</div>';
   return h;
 }
