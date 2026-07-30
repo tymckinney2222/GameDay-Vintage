@@ -126636,6 +126636,76 @@ function espCatBreakdown(j, row) {
   return null;
 }
 
+// The ESPN categories matchup, in the Yahoo cats layout. ESPCATSYA
+//
+// The .fy-cats-* / .fy-cat-* rules were written for a Yahoo cats screen whose
+// own comment reads "redesigned (replaces 3-col table)" — and then the
+// renderer that emitted them disappeared. Every one of those class names
+// appears in the stylesheet and nowhere else in the file, so the design was
+// sitting there fully specified and completely dead while ESPN carried on
+// drawing the very 3-column table it was built to replace.
+//
+// So this emits those classes rather than inventing a parallel set: no new
+// CSS, and the two providers genuinely match instead of merely resembling
+// each other. The colour variables it leans on (--border, --text-muted,
+// --text-primary) are declared at :root, so they resolve anywhere.
+//
+// Layout the CSS defines: a summary strip of W / T / L, then one row per
+// category as a 1fr-70px-1fr grid — my value, the category name, theirs. The
+// side classes say which side is MINE; the outcome classes tint the winner
+// and wash the row toward it. Ties drop to 55% opacity so the live
+// categories stand out.
+function _espCatRowHtml(id, game, mine, opp, result) {
+  var cls = 'fy-cat-row left-side';       // ME is always the left column
+  if (result === 'WIN') cls += ' mine-wins';
+  else if (result === 'LOSS') cls += ' mine-loses';
+  else cls += ' tied neutral';
+  var lbl = espStatName(game, id) || ('#' + id);
+  // The arrow sits against the centre on the winning side and points out at
+  // the value that won it, so the eye lands on the number that matters.
+  var lArrow = (result === 'WIN')
+    ? '<span class="fy-cat-arrow">\u25c0</span>' : '';
+  var rArrow = (result === 'LOSS')
+    ? '<span class="fy-cat-arrow">\u25b6</span>' : '';
+  return '<div class="' + cls + '">' +
+    '<div class="fy-cat-side left">' +
+      '<span class="fy-cat-val">' +
+        (mine != null ? slEsc(espStatFmt(id, mine)) : '\u2014') + '</span>' +
+      lArrow +
+    '</div>' +
+    '<div class="fy-cat-name">' +
+      '<span class="fy-cat-name-text">' + slEsc(lbl) + '</span>' +
+      (result === 'TIE' ? '<span class="fy-cat-tie-tag">TIE</span>' : '') +
+    '</div>' +
+    '<div class="fy-cat-side right">' +
+      rArrow +
+      '<span class="fy-cat-val">' +
+        (opp != null ? slEsc(espStatFmt(id, opp)) : '\u2014') + '</span>' +
+    '</div>' +
+  '</div>';
+}
+
+// Who I'm playing this period, for the summary strip's labels.
+function _espCatOppName(row) {
+  var ls = row && row.liveScores;
+  if (!ls || !ls.games) return 'OPPONENT';
+  var myIds = row.myTeamIds || {}, i;
+  for (i = 0; i < ls.games.length; i++) {
+    var g = ls.games[i];
+    if (g.awayId != null && myIds[String(g.awayId)]) return g.home || 'OPPONENT';
+    if (g.homeId != null && myIds[String(g.homeId)]) return g.away || 'OPPONENT';
+  }
+  return 'OPPONENT';
+}
+
+function _espCatMyName(row) {
+  var myIds = row.myTeamIds || {}, rows = row.standingsAll || [], i;
+  for (i = 0; i < rows.length; i++) {
+    if (myIds[String(rows[i].teamId)]) return rows[i].teamName || 'MY TEAM';
+  }
+  return 'MY TEAM';
+}
+
 function _espCatBreakdownHtml(row) {
   var cb = row && row._espCats;
   if (!cb || !cb.rows || !cb.rows.length) return '';
@@ -126650,61 +126720,61 @@ function _espCatBreakdownHtml(row) {
     var py = (pos[y.id] != null) ? pos[y.id] : 999;
     return px - py || Number(x.id) - Number(y.id);
   });
-  var h = '<div data-espcats style="margin:0 0 14px;">' +
-    '<div style="display:flex;font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
-      'padding:0 0 4px;border-bottom:1px solid rgba(255,255,255,0.08);">' +
-      '<span style="flex:1;text-align:right;">ME</span>' +
-      '<span style="flex:0 0 62px;text-align:center;">CATEGORY</span>' +
-      '<span style="flex:1;">OPP</span></div>';
+
+  var tally = (typeof espCatTally === 'function') ? espCatTally(cb.rows) : null;
+  var h = '<div data-espcats style="margin:0 0 14px;">';
+
+  // Summary strip: the tally each side is holding, my side first.
+  if (tally) {
+    h += '<div class="fy-cats-summary"><div class="fy-cats-summary-row">' +
+      '<div class="fy-cats-side' +
+        (tally.w > tally.l ? ' won' : (tally.w < tally.l ? ' lost' : '')) + '">' +
+        '<span class="fy-cats-num">' + tally.w + '</span>' +
+        '<span class="fy-cats-team">' + slEsc(_espCatMyName(row)) + '</span>' +
+      '</div>' +
+      '<div class="fy-cats-tie-block">' +
+        '<span class="fy-cats-tie-num">' + tally.t + '</span>' +
+        '<span class="fy-cats-tie-label">TIED</span>' +
+      '</div>' +
+      '<div class="fy-cats-side' +
+        (tally.l > tally.w ? ' won' : (tally.l < tally.w ? ' lost' : '')) + '">' +
+        '<span class="fy-cats-num">' + tally.l + '</span>' +
+        '<span class="fy-cats-team">' + slEsc(_espCatOppName(row)) + '</span>' +
+      '</div>' +
+    '</div></div>';
+  }
+
+  h += '<div class="fy-cats-list">';
   for (i = 0; i < cb.rows.length; i++) {
     var r = cb.rows[i];
-    var lbl = espStatName(game, r.id) || ('#' + r.id);
-    // Green marks the WINNER on whichever side. Red on the opponent read
-    // as "the opponent is losing", which is the opposite of the truth.
-    var win = r.result === 'WIN', loss = r.result === 'LOSS';
-    h += '<div style="display:flex;align-items:center;padding:5px 0;' +
-      'border-bottom:1px solid rgba(255,255,255,0.04);font-family:var(--sk-font-mono,monospace);">' +
-      '<span style="flex:1;text-align:right;font-size:12.5px;font-weight:' + (win ? '800' : '400') +
-        ';color:' + (win ? '#4ade80' : 'rgba(255,255,255,0.55)') + ';">' +
-        (r.mine != null ? espStatFmt(r.id, r.mine) : '\u2014') + '</span>' +
-      '<span style="flex:0 0 62px;text-align:center;font-size:9.5px;letter-spacing:0.06em;' +
-        'color:rgba(255,255,255,0.4);">' + slEsc(lbl) + '</span>' +
-      '<span style="flex:1;font-size:12.5px;font-weight:' + (loss ? '800' : '400') +
-        ';color:' + (loss ? '#4ade80' : 'rgba(255,255,255,0.55)') + ';">' +
-        (r.opp != null ? espStatFmt(r.id, r.opp) : '\u2014') + '</span>' +
-    '</div>';
+    h += _espCatRowHtml(r.id, game, r.mine, r.opp, r.result);
   }
-  h += '<div style="color:rgba(255,255,255,0.28);font-size:9.5px;line-height:1.5;margin:6px 0 0;">' +
+  h += '</div>';
+
+  h += '<div style="color:rgba(255,255,255,0.28);font-size:9.5px;line-height:1.5;margin:8px 0 0;">' +
     (cb.live
       ? 'Includes today \u00b7 AVG / WHIP / ERA rebuilt from components'
       : 'Through the last completed day') + '</div>';
-  // Season-long category totals from teams[].valuesByStat, compared with
-  // the league average since there's no single opponent over a season.
-  // ESPN3
+
+  // Season-long category totals from teams[].valuesByStat, compared with the
+  // league average since there's no single opponent over a season. Same rows,
+  // so the eye reads them the same way. ESPN3
   var seasonRows = (typeof espSeasonCatRows === 'function') ? espSeasonCatRows(row) : null;
   if (seasonRows && seasonRows.length) {
-    h += '<div style="margin:14px 0 0;">' +
-      '<div style="display:flex;font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
-        'padding:0 0 4px;border-bottom:1px solid rgba(255,255,255,0.08);">' +
-        '<span style="flex:1;text-align:right;">SEASON</span>' +
-        '<span style="flex:0 0 62px;text-align:center;">CATEGORY</span>' +
-        '<span style="flex:1;">LG AVG</span></div>';
+    h += '<div style="margin:16px 0 0;">' +
+      '<div style="display:grid;grid-template-columns:1fr 70px 1fr;font-size:9px;' +
+        'letter-spacing:0.1em;color:rgba(255,255,255,0.3);padding:0 4px 5px;' +
+        'border-bottom:1px solid rgba(255,255,255,0.08);">' +
+        '<span style="text-align:right;">SEASON</span>' +
+        '<span style="text-align:center;">CATEGORY</span>' +
+        '<span>LG AVG</span></div>' +
+      '<div class="fy-cats-list">';
     for (var si = 0; si < seasonRows.length; si++) {
       var sr = seasonRows[si];
-      var slbl = espStatName(game, sr.id) || ('#' + sr.id);
-      var better = espCatResult(sr.id, sr.mine, sr.opp);
-      h += '<div style="display:flex;align-items:center;padding:4px 0;' +
-        'font-family:var(--sk-font-mono,monospace);">' +
-        '<span style="flex:1;text-align:right;font-size:12px;color:' +
-          (better === 'WIN' ? '#4ade80' : 'rgba(255,255,255,0.6)') + ';">' +
-          espStatFmt(sr.id, sr.mine) + '</span>' +
-        '<span style="flex:0 0 62px;text-align:center;font-size:9.5px;' +
-          'color:rgba(255,255,255,0.4);">' + slEsc(slbl) + '</span>' +
-        '<span style="flex:1;font-size:12px;color:rgba(255,255,255,0.45);">' +
-          espStatFmt(sr.id, sr.opp) + '</span>' +
-      '</div>';
+      h += _espCatRowHtml(sr.id, game, sr.mine, sr.opp,
+                          espCatResult(sr.id, sr.mine, sr.opp));
     }
-    h += '</div>';
+    h += '</div></div>';
   }
   h += '</div>';
   return h;
