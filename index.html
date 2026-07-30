@@ -267,6 +267,9 @@
     z-index: 9001; transform: translateX(-100%); transition: transform 0.3s ease;
     display: flex; flex-direction: column; overflow-y: auto;
     border-right: 1px solid rgba(255,255,255,0.06);
+    /* Scroll past the last item rather than ending flush on the home-swipe
+       strip, which makes the bottom entry hard to tap. */
+    padding-bottom: calc(40px + env(safe-area-inset-bottom, 0px));
   }
   .ld-panel.open { transform: translateX(0); }
   .ld-header {
@@ -339,7 +342,40 @@
     overflow: hidden; max-height: 0;
     transition: max-height 0.25s ease;
   }
-  .ld-tools-body.open { max-height: 600px; }
+  /* Headroom for the tool list to grow. At ~48px per item, 600px clipped the
+     twelfth entry silently. */
+  .ld-tools-body.open { max-height: 1400px; }
+
+  /* ─── PROBABLE PITCHERS TOOL — PPSTOOL ───
+     League-agnostic 5-day probables board. Rows reuse the Streaming
+     planner's .sk-stream-* classes wholesale so the two views read the
+     same; only the filter chip row and the TBD note are new. */
+  .pps-filters {
+    display: flex; gap: 6px; margin: 0 0 14px;
+  }
+  .pps-chip {
+    flex: 1; padding: 8px 4px; border-radius: 9px;
+    border: 1px solid rgba(255,255,255,0.12);
+    background: none; color: rgba(255,255,255,0.55);
+    font-family: 'Outfit', sans-serif;
+    font-size: 10px; font-weight: 700; letter-spacing: 0.5px;
+    cursor: pointer; -webkit-tap-highlight-color: transparent;
+  }
+  .pps-chip.on {
+    border-color: rgba(74,222,128,0.5);
+    background: rgba(74,222,128,0.12);
+    color: #4ade80;
+  }
+  .pps-tbd {
+    font-family: var(--sk-font-mono, monospace);
+    font-size: 9.5px; color: rgba(255,255,255,0.28);
+  }
+  .pps-note {
+    font-size: 9.5px; line-height: 1.55;
+    color: rgba(255,255,255,0.3);
+    margin-top: 14px; padding-top: 10px;
+    border-top: 1px solid rgba(255,255,255,0.07);
+  }
   .ld-sport-header {
     display: flex; align-items: center; gap: 12px; width: 100%;
     background: none; border: none; cursor: pointer;
@@ -13520,7 +13556,11 @@
   .pw-body {
     flex: 1;
     overflow-y: auto;
-    padding: 12px 14px 24px;
+    /* .bottom-nav is position:fixed at z-index 8500 and these overlays sit at
+       400, so the nav paints OVER the bottom of this scroller. 24px left the
+       last rows unreachable. Clear the nav's height plus the home-swipe
+       inset. */
+    padding: 12px 14px calc(96px + env(safe-area-inset-bottom, 0px));
   }
   .pw-league-card {
     margin-bottom: 18px;
@@ -26402,6 +26442,20 @@
   <div class="pw-body" id="nbrBody"></div>
 </div>
 
+<!-- Probable Pitchers (5-day, league-agnostic) — PPSTOOL -->
+<div class="pw-overlay" id="ppsOverlay">
+  <div class="pp-header">
+    <div>
+      <div class="pp-eyebrow">MLB</div>
+      <h2 class="pp-title">Probable Pitchers</h2>
+    </div>
+    <button class="pp-close" onclick="closeProbablePitchers()" aria-label="Close">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+    </button>
+  </div>
+  <div class="pw-body" id="ppsBody"></div>
+</div>
+
 <!-- FP Projector (draft tool) -->
 <div class="fpp-pjc-bk" id="fppProjCardBk" onclick="_fppCloseProjCard()"></div>
 <div class="fpp-pjc" id="fppProjCard"></div>
@@ -32282,6 +32336,11 @@ function renderLeagueDrawerBody() {
   html += '<div class="ld-tool-item" onclick="openNbaRotations(); closeLeagueDrawer();">' +
     '<div class="ld-tool-icon">\ud83c\udfc0</div>' +
     '<div class="ld-tool-name">NBA Rotations</div>' +
+  '</div>';
+  // PPSTOOL
+  html += '<div class="ld-tool-item" onclick="openProbablePitchers(); closeLeagueDrawer();">' +
+    '<div class="ld-tool-icon">\u26be</div>' +
+    '<div class="ld-tool-name">Probable Pitchers</div>' +
   '</div>';
   html += '</div>'; // .ld-tools-body
 
@@ -76128,6 +76187,23 @@ var skStreamState = {
 // MLB team abbreviation. Lower K% = tougher matchup for the streamer.
 var _skStreamTeamKpct = null;
 var _skStreamTeamKpctInflight = null;
+// Opponent OPS per team plus this season's league mean/spread for both
+// inputs, filled by the same fetch that fills _skStreamTeamKpct. PPSTOOL
+var _skStreamTeamOps = null;
+var _skStreamLeagueNorm = null;
+
+function _skStreamMean(a) {
+  if (!a || !a.length) return null;
+  var t = 0, i;
+  for (i = 0; i < a.length; i++) t += a[i];
+  return t / a.length;
+}
+function _skStreamSd(a) {
+  if (!a || a.length < 2) return null;
+  var m = _skStreamMean(a), q = 0, i;
+  for (i = 0; i < a.length; i++) q += (a[i] - m) * (a[i] - m);
+  return Math.sqrt(q / (a.length - 1));
+}
 
 function _skStreamFetchTeamKpct() {
   if (_skStreamTeamKpct) return Promise.resolve(_skStreamTeamKpct);
@@ -76173,14 +76249,26 @@ function _skStreamFetchTeamKpct() {
               var pa = ab + bb + hbp + sf;
               if (pa > 0) kpct = k / pa;
             }
-            return { abbr: t.abbreviation, kpct: kpct };
+            // OPS alongside K%, so a matchup can be judged on whether the
+            // offence actually scores and not only on whether it whiffs.
+            // Same payload, one more field. PPSTOOL
+            var ops = null;
+            if (stat.ops != null) {
+              var o = parseFloat(stat.ops);
+              if (!isNaN(o) && o > 0) ops = o;
+            }
+            if (ops == null && stat.obp != null && stat.slg != null) {
+              var ob = parseFloat(stat.obp), sl = parseFloat(stat.slg);
+              if (!isNaN(ob) && !isNaN(sl)) ops = ob + sl;
+            }
+            return { abbr: t.abbreviation, kpct: kpct, ops: ops };
           })
           .catch(function() { return null; });
       });
       return Promise.allSettled(fetches);
     })
     .then(function(results) {
-      var byAbbr = {};
+      var byAbbr = {}, byOps = {}, kList = [], oList = [];
       results.forEach(function(r) {
         if (r.status !== 'fulfilled' || !r.value) return;
         var v = r.value;
@@ -76191,8 +76279,23 @@ function _skStreamFetchTeamKpct() {
           ? _skNormalizeTeamAbbr(v.abbr) : v.abbr;
         byAbbr[normAbbr] = v.kpct;
         if (normAbbr !== v.abbr) byAbbr[v.abbr] = v.kpct;
+        kList.push(v.kpct);
+        if (v.ops != null) {
+          byOps[normAbbr] = v.ops;
+          if (normAbbr !== v.abbr) byOps[v.abbr] = v.ops;
+          oList.push(v.ops);
+        }
       });
       _skStreamTeamKpct = byAbbr;
+      _skStreamTeamOps = byOps;
+      // League mean and spread, measured from this season's own 30 teams
+      // rather than hardcoded. A z-score against them is what makes the
+      // blended matchup score comparable year to year. PPSTOOL
+      _skStreamLeagueNorm = {
+        kMean: _skStreamMean(kList), kSd: _skStreamSd(kList),
+        oMean: _skStreamMean(oList), oSd: _skStreamSd(oList),
+        nK: kList.length, nO: oList.length
+      };
       return byAbbr;
     })
     .catch(function() {
@@ -76220,7 +76323,56 @@ function _skStreamScoreMatchup(opponentAbbr, parkAbbr) {
   if (raw >= 0.235)      bucket = 'good';
   else if (raw >= 0.215) bucket = 'mid';
   else                   bucket = 'tough';
-  return { raw: raw, kpct: kpct, park: park, bucket: bucket };
+
+  // ── Blended score ── PPSTOOL ──
+  // The raw score above is strikeout-only: opponent K% x park K-factor. It
+  // says nothing about whether the offence scores, which is what decides ERA
+  // and wins. This adds opponent OPS as a second component, each input
+  // expressed as a z-score against this season's own 30 teams so the pieces
+  // are comparable and the cutoffs don't drift year to year.
+  //
+  // Returned ALONGSIDE raw/bucket rather than replacing them, because the
+  // existing Streaming planner's thresholds are tuned to the raw scale and
+  // changing it underneath would silently retint that whole view.
+  var norm = _skStreamLeagueNorm;
+  var ops = (_skStreamTeamOps || {})[opponentAbbr];
+  var zK = null, zO = null;
+  var zPark = (park - 1.00) / 0.05;   // park factors are gentle; ~1 sd = 0.05
+  if (norm && norm.kSd) zK = (kpct - norm.kMean) / norm.kSd;
+  if (norm && norm.oSd && ops != null) zO = -(ops - norm.oMean) / norm.oSd;
+  // Without league norms there is no z-score to build on. Scoring on the park
+  // term alone looked plausible and was nonsense — Coors read -2.8, as if the
+  // ballpark were three standard deviations of anything. No data, no score.
+  if (zK == null) {
+    return {
+      raw: raw, kpct: kpct, park: park, bucket: bucket,
+      ops: (ops == null) ? null : ops,
+      blend: null, blendBucket: 'mid', zK: null, zO: zO, zPark: zPark
+    };
+  }
+  // Weights renormalize when a component is missing, so a team with no OPS
+  // figure still gets a score on the same scale instead of a deflated one.
+  var wK = 0.45, wO = 0.40, wP = 0.15;
+  var num = 0, den = 0;
+  if (zK != null) { num += wK * zK; den += wK; }
+  if (zO != null) { num += wO * zO; den += wO; }
+  num += wP * zPark; den += wP;
+  var blend = den ? (num / den) * (wK + wO + wP) : null;
+  // A fallback split for callers with no slate to compare against. Fixed
+  // cutoffs do NOT hold their thirds — the blend's spread moves with each
+  // season's K%/OPS correlation, and a sample that tested 33/38/29 came out
+  // 37/26/37 on the next one. Callers that have a full slate in hand should
+  // bucket by its observed tertiles instead (see _ppsTertiles).
+  var blendBucket = 'mid';
+  if (blend != null) {
+    if (blend >= 0.25) blendBucket = 'good';
+    else if (blend <= -0.25) blendBucket = 'tough';
+  }
+  return {
+    raw: raw, kpct: kpct, park: park, bucket: bucket,
+    ops: (ops == null) ? null : ops,
+    blend: blend, blendBucket: blendBucket, zK: zK, zO: zO, zPark: zPark
+  };
 }
 
 // ─── Probables-driven availability lookup ──────────────────────
@@ -115848,6 +116000,258 @@ function _nbrRgba(hex, a) {
   var h = String(hex || '').replace('#', '');
   function ch(i) { var v = parseInt(h.slice(i, i + 2), 16); return isNaN(v) ? 0 : v; }
   return 'rgba(' + ch(0) + ',' + ch(2) + ',' + ch(4) + ',' + a + ')';
+}
+
+// ─────────────────────────────────────────────────────────────────
+// PROBABLE PITCHERS — 5-day board, no league attached — PPSTOOL
+// ─────────────────────────────────────────────────────────────────
+// The Streaming SP Planner already fetched a 5-day forward window of
+// probables, scored each start, grouped by day and sorted best-first. Its one
+// hard dependency was a Yahoo free-agent map: no availability data meant an
+// empty view. This is the same board with that gate removed — every announced
+// starter in baseball for the next five days, ranked by matchup quality, so
+// availability can be checked wherever the league actually lives.
+//
+// Reuses, unchanged:
+//   _skFetchMlbProbables(start, end)  — MLB Stats API, already range-capable
+//   _skStreamFetchTeamKpct()          — opponent K% + OPS, once per session
+//   _skStreamScoreMatchup(opp, park)  — matchup score (.blend / .blendBucket)
+//   _skStreamWindow(), _skStreamDayLabel(), _skPpOpenPlayer()
+//   .sk-stream-* CSS
+var _ppsState = { filter: 'all', data: null, loading: false, err: '' };
+
+function openProbablePitchers() {
+  var ov = document.getElementById('ppsOverlay');
+  if (!ov) return;
+  ov.classList.add('open');
+  _ppsLoad(0);
+}
+
+function closeProbablePitchers() {
+  var ov = document.getElementById('ppsOverlay');
+  if (ov) ov.classList.remove('open');
+}
+
+function _ppsSetFilter(f) {
+  _ppsState.filter = f;
+  _ppsRender();
+}
+
+function _ppsRefresh() {
+  // Probables move during the day as teams announce, so a manual refresh has
+  // to defeat the 30-minute cache rather than politely re-read it.
+  try { _skMlbProbablesCache = null; } catch (e) {}
+  _ppsLoad(1);
+}
+
+function _ppsLoad(force) {
+  if (_ppsState.data && !force) { _ppsRender(); return; }
+  if (_ppsState.loading) return;
+  _ppsState.loading = true;
+  _ppsState.err = '';
+  _ppsRender();
+  var dates = _skStreamWindow();
+  Promise.all([
+    _skFetchMlbProbables(dates[0], dates[dates.length - 1]),
+    _skStreamFetchTeamKpct()
+  ]).then(function (res) {
+    _ppsState.loading = false;
+    _ppsState.data = { dates: dates, probables: res[0] };
+    _ppsRender();
+  })['catch'](function (e) {
+    _ppsState.loading = false;
+    _ppsState.data = null;
+    _ppsState.err = (e && e.message) ? e.message : 'Request failed';
+    _ppsRender();
+  });
+}
+
+// Every announced starter on one date, scored and sorted best matchup first.
+// Also counts the slots with NO announced starter, which is the difference
+// between "no games" and "not announced yet" on a day four out.
+function _ppsRowsForDate(dateStr, byDate) {
+  var games = (byDate && byDate[dateStr]) || [];
+  var rows = [], tbd = 0, i, k;
+  for (i = 0; i < games.length; i++) {
+    var g = games[i];
+    var sides = ['homePitcher', 'awayPitcher'];
+    for (k = 0; k < 2; k++) {
+      var pitcher = g[sides[k]];
+      if (!pitcher) { tbd++; continue; }
+      var parkAbbr = pitcher.atHome ? pitcher.teamAbbr : pitcher.opponentAbbr;
+      rows.push({
+        pitcher: pitcher,
+        opponent: pitcher.opponentAbbr,
+        park: parkAbbr,
+        atHome: pitcher.atHome,
+        score: _skStreamScoreMatchup(pitcher.opponentAbbr, parkAbbr),
+        gamePk: g.gamePk
+      });
+    }
+  }
+  rows.sort(function (a, b) {
+    var av = (a.score.blend == null) ? -99 : a.score.blend;
+    var bv = (b.score.blend == null) ? -99 : b.score.blend;
+    return bv - av;
+  });
+  return { rows: rows, tbd: tbd, games: games.length };
+}
+
+function _ppsPassesFilter(bucket) {
+  if (_ppsState.filter === 'good') return bucket === 'good';
+  if (_ppsState.filter === 'mid') return bucket === 'good' || bucket === 'mid';
+  return true;
+}
+
+// Tertile cutoffs over the whole window's slate. Bucketing against the starts
+// actually on offer is both self-calibrating — no hardcoded threshold to drift
+// — and the more useful question for a pickup board: GOOD means the best third
+// of what you can start in the next five days, not an abstract grade.
+function _ppsTertiles(blends) {
+  if (!blends || blends.length < 6) return null;
+  var a = blends.slice(0).sort(function (x, y) { return x - y; });
+  return {
+    lo: a[Math.floor(a.length / 3)],
+    hi: a[Math.floor(a.length * 2 / 3)]
+  };
+}
+
+function _ppsBucket(blend, cut) {
+  if (blend == null) return 'mid';
+  if (!cut) return (blend >= 0.25) ? 'good' : (blend <= -0.25) ? 'tough' : 'mid';
+  if (blend >= cut.hi) return 'good';
+  if (blend <= cut.lo) return 'tough';
+  return 'mid';
+}
+
+function _ppsRender() {
+  var body = document.getElementById('ppsBody');
+  if (!body) return;
+
+  if (_ppsState.loading) {
+    body.innerHTML = '<div class="sk-stream-loading">Loading probables\u2026</div>';
+    return;
+  }
+  if (_ppsState.err) {
+    body.innerHTML = '<div class="sk-stream-empty">Could not load probables \u2014 ' +
+      skEscape(_ppsState.err) + '.</div>' +
+      '<div class="pps-note"><button class="pps-chip" onclick="_ppsRefresh()" ' +
+      'style="flex:0 0 auto;padding:8px 16px">RETRY</button></div>';
+    return;
+  }
+  if (!_ppsState.data) { body.innerHTML = ''; return; }
+
+  var dates = _ppsState.data.dates;
+  var byDate = (_ppsState.data.probables && _ppsState.data.probables.byDate) || {};
+  var todayStr = _todayDateString();
+  var f = _ppsState.filter;
+
+  var html = '<div class="pps-filters">' +
+    '<button class="pps-chip' + (f === 'all' ? ' on' : '') +
+      '" onclick="_ppsSetFilter(\'all\')">ALL</button>' +
+    '<button class="pps-chip' + (f === 'mid' ? ' on' : '') +
+      '" onclick="_ppsSetFilter(\'mid\')">GOOD + MID</button>' +
+    '<button class="pps-chip' + (f === 'good' ? ' on' : '') +
+      '" onclick="_ppsSetFilter(\'good\')">GOOD ONLY</button>' +
+  '</div>';
+
+  // First pass: every announced start in the window, so the buckets can be
+  // cut on the real distribution rather than a guessed threshold.
+  var perDay = [], allBlends = [], i, j;
+  for (i = 0; i < dates.length; i++) {
+    perDay.push(_ppsRowsForDate(dates[i], byDate));
+    for (j = 0; j < perDay[i].rows.length; j++) {
+      var bl = perDay[i].rows[j].score.blend;
+      if (bl != null) allBlends.push(bl);
+    }
+  }
+  var cut = _ppsTertiles(allBlends);
+  for (i = 0; i < perDay.length; i++) {
+    for (j = 0; j < perDay[i].rows.length; j++) {
+      perDay[i].rows[j].bucket = _ppsBucket(perDay[i].rows[j].score.blend, cut);
+    }
+  }
+
+  var shown = 0, announced = 0;
+  for (i = 0; i < dates.length; i++) {
+    var dateStr = dates[i];
+    var day = perDay[i];
+    announced += day.rows.length;
+    var keep = [];
+    for (j = 0; j < day.rows.length; j++) {
+      if (_ppsPassesFilter(day.rows[j].bucket)) keep.push(day.rows[j]);
+    }
+    shown += keep.length;
+
+    var meta = keep.length + ' start' + (keep.length === 1 ? '' : 's');
+    if (day.tbd) meta += ' \u00b7 <span class="pps-tbd">' + day.tbd + ' TBD</span>';
+
+    html += '<div class="sk-stream-day">' +
+      '<div class="sk-stream-day-head">' +
+        '<span class="sk-stream-day-label">' +
+          skEscape(_skStreamDayLabel(dateStr, todayStr)) + '</span>' +
+        '<span class="sk-stream-day-count">' + meta + '</span>' +
+      '</div>';
+
+    if (!keep.length) {
+      html += '<div class="sk-stream-day-empty">' +
+        (day.games === 0 ? 'No games scheduled'
+          : day.tbd && !day.rows.length ? 'Starters not announced yet'
+          : 'Nothing in this filter') + '</div>';
+    } else {
+      html += '<div class="sk-stream-rows">';
+      for (j = 0; j < keep.length; j++) {
+        html += _ppsRowHtml(keep[j]);
+      }
+      html += '</div>';
+    }
+    html += '</div>';
+  }
+
+  var norm = _skStreamLeagueNorm || {};
+  html += '<div class="pps-note">' +
+    'Matchup score blends the opponent\u2019s strikeout rate, the opponent\u2019s ' +
+    'OPS and the ballpark, each measured against this season\u2019s 30 teams. ' +
+    'GOOD / MID / TOUGH are thirds of the starts in THIS window, so the label ' +
+    'means best-available rather than an absolute grade. Availability isn\u2019t ' +
+    'shown \u2014 check it in whichever league you\u2019re adding from.<br>' +
+    announced + ' announced starter' + (announced === 1 ? '' : 's') +
+    ' over ' + dates.length + ' days' +
+    (shown !== announced ? ' \u00b7 ' + shown + ' shown' : '') +
+    (norm.nO ? ' \u00b7 offence data for ' + norm.nO + ' teams' : '') +
+    ' \u00b7 <button class="pps-chip" onclick="_ppsRefresh()" ' +
+      'style="flex:0 0 auto;padding:3px 10px;font-size:9px">REFRESH</button>' +
+  '</div>';
+
+  body.innerHTML = html;
+}
+
+function _ppsRowHtml(r) {
+  var atSym = r.atHome ? 'vs' : '@';
+  var b = r.bucket || r.score.blendBucket;
+  var bucketLabel = b === 'good' ? 'GOOD' : b === 'mid' ? 'MID' : 'TOUGH';
+  var kpctStr = (r.score.kpct * 100).toFixed(1) + '%';
+  var opsStr = (r.score.ops == null) ? null : r.score.ops.toFixed(3).replace(/^0/, '');
+  var parkStr = r.score.park.toFixed(2) + 'x';
+  var nameForJs = String(r.pitcher.name || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+  var tapHandler = ' onclick="_skPpOpenPlayer(' + r.pitcher.mlbId +
+    ", '" + nameForJs + "', '" + skEscape(r.pitcher.teamAbbr || '') + "')\"";
+  var sep = '<span class="sk-stream-meta-sep">\u00b7</span>';
+  return '<button class="sk-stream-row bucket-' + b + '"' + tapHandler + '>' +
+    '<div class="sk-stream-row-bar"></div>' +
+    '<div class="sk-stream-row-main">' +
+      '<div class="sk-stream-row-name">' + skEscape(r.pitcher.name) +
+        '<span class="sk-stream-row-team">' + skEscape(r.pitcher.teamAbbr || '') + '</span>' +
+      '</div>' +
+      '<div class="sk-stream-row-meta">' +
+        skEscape(atSym + ' ' + r.opponent) + sep +
+        'opp K ' + kpctStr +
+        (opsStr ? sep + 'opp OPS ' + opsStr : '') + sep +
+        skEscape(r.park) + ' ' + parkStr +
+      '</div>' +
+    '</div>' +
+    '<span class="sk-stream-row-bucket">' + bucketLabel + '</span>' +
+  '</button>';
 }
 
 function openNbaRotations() {
