@@ -117980,6 +117980,78 @@ function espMatchupRecord(row) {
   return null;
 }
 
+// ── SEASON-POINTS PLACINGS ── MGRPLACE ──
+// A season-long points league has no W-L-T, so it counts toward LEAGUES and
+// sits out every record column. What it does have is a position in the table,
+// and that's the thing worth tracking: 3rd of 12 is a season going well
+// whatever the format.
+//
+// Ranks aren't comparable across league sizes on their own — 4th of 8 is a
+// worse season than 4th of 16 — so they're also carried as a percentile,
+// (total - rank) / (total - 1): first is 1.000, last is 0.000, and the two
+// leagues can then be averaged against each other honestly.
+function mrPlacing(row) {
+  if (!row) return null;
+  var rank = null, total = null;
+  // ESPN season-points leagues re-order live during the day, and the cached
+  // standings rank can disagree with what the standings tab is showing. The
+  // live ordering wins where it exists. ESPLIVETOT
+  try {
+    if (row.provider === 'espn' && typeof espIsSeasonPts === 'function' &&
+        espIsSeasonPts(row) && typeof espMyLiveRank === 'function') {
+      var lr = espMyLiveRank(row);
+      if (lr != null && Number(lr) > 0) rank = Number(lr);
+    }
+  } catch (e) {}
+  var st = row.standings || {};
+  if (rank == null && st.rank != null && Number(st.rank) > 0) rank = Number(st.rank);
+  if (st.total != null && Number(st.total) > 0) total = Number(st.total);
+  if (rank == null || total == null || rank > total) return null;
+  return {
+    rank: rank, total: total,
+    // A one-team league has no spread to place within.
+    pct: (total > 1) ? ((total - rank) / (total - 1)) : null,
+    name: (row.name || row.key || '')
+  };
+}
+
+function _mrPlaceAvg(list) {
+  if (!list || !list.length) return null;
+  var s = 0, i;
+  for (i = 0; i < list.length; i++) s += list[i].rank;
+  return Math.round((s / list.length) * 10) / 10;
+}
+function _mrPlacePctl(list) {
+  if (!list || !list.length) return null;
+  var s = 0, n = 0, i;
+  for (i = 0; i < list.length; i++) {
+    if (list[i].pct == null) continue;
+    s += list[i].pct; n++;
+  }
+  return n ? (s / n) : null;
+}
+// Best finish, ordered by percentile rather than raw rank — so 3rd of 16
+// beats 4th of 8, which raw rank would get backwards. Note this does NOT
+// discount small leagues: a win is a win, so 1st of 2 scores a perfect 1.000
+// exactly as 1st of 20 does. Percentile only separates the finishes below
+// first, which is the comparison that was actually broken.
+function _mrPlaceBest(list) {
+  if (!list || !list.length) return null;
+  var best = null, i;
+  for (i = 0; i < list.length; i++) {
+    var c = list[i];
+    if (!best) { best = c; continue; }
+    var cv = (c.pct == null) ? -1 : c.pct;
+    var bv = (best.pct == null) ? -1 : best.pct;
+    if (cv > bv) best = c;
+  }
+  return best;
+}
+function _mrPlaceFmt(p) {
+  if (!p) return '\u2014';
+  return (typeof skOrdinal === 'function' ? skOrdinal(p.rank) : p.rank) + ' of ' + p.total;
+}
+
 var MR_PLATFORMS = [
   { key: 'yahoo',   label: 'Yahoo',   accent: '#7b68ee' },   // = --sk-yahoo. MGRREC7
   { key: 'sleeper', label: 'Sleeper', accent: '#fbbf24' },
@@ -118123,13 +118195,18 @@ function mrHydrateCats(list) {
 
 function _mrBlank() {
   return { leagues: 0, recLeagues: 0, weekLeagues: 0,
-           sw: 0, sl: 0, st: 0, ww: 0, wl: 0, wt: 0 };
+           sw: 0, sl: 0, st: 0, ww: 0, wl: 0, wt: 0,
+           places: [] };          // season-points placings. MGRPLACE
 }
 function _mrAdd(dst, src) {
   dst.leagues += src.leagues; dst.recLeagues += src.recLeagues;
   dst.weekLeagues += src.weekLeagues;
   dst.sw += src.sw; dst.sl += src.sl; dst.st += src.st;
   dst.ww += src.ww; dst.wl += src.wl; dst.wt += src.wt;
+  if (src.places && src.places.length) {
+    if (!dst.places) dst.places = [];
+    for (var pq = 0; pq < src.places.length; pq++) dst.places.push(src.places[pq]);
+  }
 }
 
 // Everything, by sport and platform, plus totals both ways.
@@ -118180,12 +118257,19 @@ function mrCollect() {
       // leagues but only 9 loaded into 108-42-3.
       var fmt = (typeof extFormatKey === 'function') ? extFormatKey(row) : '';
       if (fmt === 'point') {
+        // No record to add, but there IS a placing. MGRPLACE
+        var pl = mrPlacing(row);
+        if (pl) {
+          if (!bk.places) bk.places = [];
+          bk.places.push(pl);
+        }
         // Still worth listing, so it's visibly excluded rather than
         // silently missing from the trace. MGRREC2
         if (!bk.detail) bk.detail = [];
         bk.detail.push({ name: (row.name || row.key), fmt: fmt, rec: '\u2014',
-                         src: 'season-long, no record', n: 0, weeks: null,
-                         raw: '', week: '\u2014' });
+                         src: pl ? ('season-long \u00b7 ' + _mrPlaceFmt(pl))
+                                 : 'season-long, no record',
+                         n: 0, weeks: null, raw: '', week: '\u2014' });
         continue;
       }
       var rec = mrSeasonRec(row);
@@ -118462,6 +118546,90 @@ function mrRenderBody() {
       '</div>';
     }
     h += '</div>';
+  }
+
+  // ── Season points, by sport and platform ── MGRPLACE ──
+  // These leagues have no record, so they're absent from every table above.
+  // This is the same by-sport, by-platform breakdown carrying the one thing
+  // they do have: where I sit in the table.
+  var spRows = [], spAll = [];
+  for (k in data.bySport) {
+    if (!data.bySport.hasOwnProperty(k)) continue;
+    for (var sp3 in data.bySport[k].plats) {
+      if (!data.bySport[k].plats.hasOwnProperty(sp3)) continue;
+      var pl3 = data.bySport[k].plats[sp3].places;
+      if (!pl3 || !pl3.length) continue;
+      var lbl3 = k.toUpperCase();
+      for (var q3 = 0; q3 < MR_SPORTS.length; q3++) {
+        if (MR_SPORTS[q3].key === k) lbl3 = MR_SPORTS[q3].label;
+      }
+      var meta3 = null;
+      for (var m3 = 0; m3 < MR_PLATFORMS.length; m3++) {
+        if (MR_PLATFORMS[m3].key === sp3) meta3 = MR_PLATFORMS[m3];
+      }
+      spRows.push({ sport: lbl3, plat: meta3, places: pl3 });
+      for (var a3 = 0; a3 < pl3.length; a3++) spAll.push(pl3[a3]);
+    }
+  }
+  if (spRows.length) {
+    h += '<div style="background:var(--sk-bg-card,rgba(255,255,255,0.03));' +
+      'border:1px solid rgba(255,255,255,0.07);border-radius:12px;padding:14px;margin:0 0 10px;">' +
+      '<div style="display:flex;align-items:baseline;margin:0 0 10px;">' +
+        '<span style="font-family:var(--sk-font-display,serif);font-size:18px;color:#fff;">' +
+          'Season points</span>' +
+        '<span style="flex:1;"></span>' +
+        '<span style="font-size:9.5px;letter-spacing:0.12em;color:rgba(255,255,255,0.4);">' +
+          spAll.length + ' LEAGUE' + (spAll.length === 1 ? '' : 'S') + '</span>' +
+      '</div>' +
+      '<div style="display:flex;font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
+        'padding:0 0 4px;border-bottom:1px solid rgba(255,255,255,0.08);">' +
+        '<span style="flex:1;">SPORT \u00b7 PLATFORM</span>' +
+        '<span style="flex:0 0 44px;text-align:right;">PCTL</span>' +
+        '<span style="flex:0 0 52px;text-align:right;">AVG</span>' +
+        '<span style="flex:0 0 74px;text-align:right;">BEST</span></div>';
+    for (i = 0; i < spRows.length; i++) {
+      var sr3 = spRows[i];
+      var pc3 = _mrPlacePctl(sr3.places);
+      h += '<div style="display:flex;align-items:center;padding:6px 0;' +
+        'border-bottom:1px solid rgba(255,255,255,0.04);">' +
+        '<span style="flex:1;min-width:0;font-size:11.5px;color:rgba(255,255,255,0.7);' +
+          'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' +
+          slEsc(sr3.sport) +
+          '<span style="color:rgba(255,255,255,0.25);"> \u00b7 </span>' +
+          '<span style="font-weight:700;letter-spacing:0.05em;color:' +
+            (sr3.plat ? sr3.plat.accent : 'rgba(255,255,255,0.6)') + ';">' +
+            slEsc(sr3.plat ? sr3.plat.label : '?') + '</span>' +
+          '<span style="color:rgba(255,255,255,0.28);margin-left:5px;">\u00b7' +
+            sr3.places.length + '</span></span>' +
+        '<span style="flex:0 0 44px;text-align:right;font-family:var(--sk-font-mono,monospace);' +
+          'font-size:11.5px;color:rgba(255,255,255,0.5);">' +
+          (pc3 == null ? '' : pc3.toFixed(3).replace(/^0/, '')) + '</span>' +
+        '<span style="flex:0 0 52px;text-align:right;font-family:var(--sk-font-mono,monospace);' +
+          'font-size:12.5px;color:rgba(255,255,255,0.85);">' +
+          (_mrPlaceAvg(sr3.places) == null ? '\u2014' : _mrPlaceAvg(sr3.places)) + '</span>' +
+        '<span style="flex:0 0 74px;text-align:right;font-family:var(--sk-font-mono,monospace);' +
+          'font-size:11.5px;color:#4ade80;">' +
+          slEsc(_mrPlaceFmt(_mrPlaceBest(sr3.places))) + '</span>' +
+      '</div>';
+    }
+    var pcAll = _mrPlacePctl(spAll);
+    h += '<div style="display:flex;align-items:center;padding:8px 0 0;">' +
+      '<span style="flex:1;font-size:10px;letter-spacing:0.12em;color:rgba(255,255,255,0.45);">ALL</span>' +
+      '<span style="flex:0 0 44px;text-align:right;font-family:var(--sk-font-mono,monospace);' +
+        'font-size:11.5px;font-weight:700;color:var(--sk-gold,#eab308);">' +
+        (pcAll == null ? '' : pcAll.toFixed(3).replace(/^0/, '')) + '</span>' +
+      '<span style="flex:0 0 52px;text-align:right;font-family:var(--sk-font-mono,monospace);' +
+        'font-size:13px;font-weight:700;color:#fff;">' +
+        (_mrPlaceAvg(spAll) == null ? '\u2014' : _mrPlaceAvg(spAll)) + '</span>' +
+      '<span style="flex:0 0 74px;text-align:right;font-family:var(--sk-font-mono,monospace);' +
+        'font-size:12px;font-weight:700;color:#4ade80;">' +
+        slEsc(_mrPlaceFmt(_mrPlaceBest(spAll))) + '</span>' +
+    '</div>' +
+    '<div style="font-size:9px;line-height:1.5;color:rgba(255,255,255,0.28);margin-top:8px;">' +
+      'No W-L in these, so they sit out the records above. PCTL scales a ' +
+      'finish to league size \u2014 first is 1.000, last is .000 \u2014 so an ' +
+      '8-team and a 16-team league can be averaged together.</div>' +
+    '</div>';
   }
 
   // Per-league trace. Small, and it makes a surprising total explainable
