@@ -125506,6 +125506,28 @@ function _espRosterRowsHtml(row, myTeam) {
   var cats = (typeof espIsCats === 'function') ? espIsCats(row) : false;
   var html = '', inBench = false, i;
 
+  // The player card is seeded from here, and ctx wins over anything the card
+  // fetches for itself (pos = ctx.pos || ovPos, and the same for team). So a
+  // blank team meant a card with no club, no colour and a press-box report
+  // reading "this season for ." — while the fantasy SLOT was being handed
+  // over as the position, which is how a Philadelphia guard opened as
+  // "UTIL". The real club comes from the pro-team map. ESPPLAYERID
+  var ptSeason = (row.rosters && row.rosters.season) || row.season || null;
+  var ptKey = ptSeason ? (game + ':' + ptSeason) : null;
+  var ptMap = ptKey ? (_espProTeams[ptKey] || null) : null;
+  var ptNames = ptKey ? (_espProTeamNames[ptKey] || null) : null;
+  if (ptSeason && !ptMap && typeof espProTeamMap === 'function') {
+    // Repaint once it lands, the same way the lineup modal does.
+    espProTeamMap(game, ptSeason, function () {
+      try {
+        var pane = _espRosterPane();
+        if (pane && typeof _extRosterPaneHtml === 'function') {
+          pane.innerHTML = _extRosterPaneHtml(row, row.myTeamIds || {});
+        }
+      } catch (e) {}
+    });
+  }
+
   // Window picker. Every option is already in memory — switching windows
   // re-renders, it never refetches. ESPNSLICE2E
   html += '<div style="display:flex;align-items:center;gap:8px;margin:0 0 10px;">' +
@@ -125555,9 +125577,15 @@ function _espRosterRowsHtml(row, myTeam) {
           bits.join('<span style="color:rgba(255,255,255,0.15);"> \u00b7 </span>') + '</div>';
       }
     }
+    // Real club, not the fantasy slot. Position is left EMPTY on purpose so
+    // the card's own overview supplies it — ctx.pos would otherwise override
+    // the true position with a lineup slot. ESPPLAYERID
+    var tapAbbr = (ptMap && it.teamId != null) ? (ptMap[String(it.teamId)] || '') : '';
+    var tapTeam = (ptNames && it.teamId != null) ? (ptNames[String(it.teamId)] || '') : '';
     var tap = it.playerId
       ? ' onclick="seedAndOpenPlayer(\'' + _espJs(it.playerId) + '\',\'' + _espJs(lgKey) +
-        '\',\'' + _espJs(it.name) + '\',\'' + _espJs(it.slot) + '\',\'\',\'\')"' +
+        '\',\'' + _espJs(it.name) + '\',\'\',\'' + _espJs(tapAbbr) + '\',\'' +
+        _espJs(tapTeam) + '\')"' +
         ' style="cursor:pointer;'
       : ' style="';
     html += '<div' + tap + 'display:flex;align-items:center;gap:8px;padding:6px 0;' +
@@ -126768,6 +126796,10 @@ function _espTodayCatsHtml(row, game, accent) {
 // One small request, authoritative, and it survives a relocation or rebrand
 // without anyone editing a table.
 var _espProTeams = {};        // 'flb:2026' -> { '13': 'ATH', ... }
+// Full club names from the SAME payload, kept in a parallel map so the
+// abbreviation map's shape — and every consumer reading it as a string —
+// stays untouched. 'fba:2027' -> { '20': 'Philadelphia 76ers' }. ESPPLAYERID
+var _espProTeamNames = {};
 var _espProTeamsBusy = {};
 
 function espProTeamMap(game, season, cb) {
@@ -126781,7 +126813,7 @@ function espProTeamMap(game, season, cb) {
       return r.json();
     }).then(function (j) {
       var list = (j && j.settings && j.settings.proTeams) || [];
-      var map = {}, i;
+      var map = {}, names = {}, i;
       for (i = 0; i < list.length; i++) {
         var t = list[i] || {};
         if (t.id == null) continue;
@@ -126791,8 +126823,12 @@ function espProTeamMap(game, season, cb) {
         // rather than an empty coloured box.
         if (!ab || Number(t.id) === 0) continue;
         map[String(t.id)] = ab;
+        var full = String(t.location || '') + ' ' + String(t.name || '');
+        full = full.replace(/^\s+|\s+$/g, '');
+        if (full) names[String(t.id)] = full;
       }
       _espProTeams[ck] = map;
+      _espProTeamNames[ck] = names;
       _espProTeamsBusy[ck] = 0;
       if (cb) cb(map);
     })['catch'](function () {
