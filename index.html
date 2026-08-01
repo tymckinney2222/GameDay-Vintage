@@ -5261,6 +5261,16 @@
   .crs-prob-name { font-size: 13px; font-weight: 700; color: #fff; line-height: 1.15; }
   .crs-prob-line { font-size: 10px; color: rgba(255,255,255,0.45); font-family: 'Share Tech Mono', monospace; }
   .crs-prob-tbd { font-size: 12px; color: rgba(255,255,255,0.3); font-style: italic; padding: 22px 0; }
+  /* Season line under each probable — label left, value right, so the two
+     pitchers' numbers sit on a shared axis and read as a comparison rather
+     than as two lists. STPROBSTATS */
+  .crs-prob-stats { width: 100%; max-width: 132px; margin-top: 2px;
+    font-family: 'Share Tech Mono', monospace; font-size: 10px; }
+  .crs-prob-stat { display: flex; justify-content: space-between; align-items: baseline;
+    gap: 8px; padding: 2px 0; border-top: 1px solid rgba(255,255,255,0.05); }
+  .crs-prob-stat:first-child { border-top: none; }
+  .crs-prob-stat-k { color: rgba(255,255,255,0.34); letter-spacing: 0.08em; }
+  .crs-prob-stat-v { color: rgba(255,255,255,0.78); font-weight: 700; }
   .crs-prob-vs { align-self: center; font-family: 'Barlow Condensed', sans-serif; font-size: 11px;
     font-weight: 700; color: rgba(255,255,255,0.3); letter-spacing: 0.1em; padding-top: 28px; }
   .crs-player-panel {
@@ -29891,21 +29901,39 @@ function parseGames(events, league) {
       var name = a ? (a.shortName || a.displayName || a.fullName || null) : null;
       if (!name) return null;
       // ESPN sometimes provides a record/ERA summary on the probable.
+      // p.statistics is the pitcher's WHOLE season line — a dozen or more
+      // entries — and only three were ever read off it. The rest were
+      // downloaded and dropped. STPROBSTATS
       var line = '';
+      var stats = {};
       if (p.statistics && p.statistics.length) {
         var w, l, era;
         p.statistics.forEach(function(st) {
           var nm = (st.name || st.abbreviation || '').toLowerCase();
-          if (nm === 'wins') w = st.displayValue;
-          else if (nm === 'losses') l = st.displayValue;
-          else if (nm === 'era') era = st.displayValue;
+          var dv = st.displayValue;
+          if (dv != null && dv !== '') stats[nm] = String(dv);
+          if (nm === 'wins') w = dv;
+          else if (nm === 'losses') l = dv;
+          else if (nm === 'era') era = dv;
         });
         if (w != null && l != null) line = w + '-' + l;
         if (era != null) line = line ? (line + ' \u00B7 ' + era + ' ERA') : (era + ' ERA');
       }
       if (!line && p.summary) line = p.summary; // fallback summary string
       var _pid = (a && a.id != null) ? a.id : (p.id != null ? p.id : null);
-      return { name: name, line: line, id: _pid };
+      // What ESPN actually attached to this probable, for the on-screen probe.
+      // The scoreboard feed is lighter than the summary feed and may carry no
+      // statistics at all — in which case the stat block correctly renders
+      // nothing, and the fix is a different endpoint, not a different parser.
+      // Recording the shape is how that gets settled without a console.
+      // STPROBSTATS
+      var _probeKeys = [];
+      try {
+        for (var _pk in p) { if (p.hasOwnProperty(_pk)) _probeKeys.push(_pk); }
+      } catch (e) {}
+      return { name: name, line: line, id: _pid, stats: stats,
+               _rawKeys: _probeKeys,
+               _statCount: (p.statistics && p.statistics.length) || 0 };
     }
     const homeProbable = _getProbable(home);
     const awayProbable = _getProbable(away);
@@ -32393,7 +32421,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-07-31 03:32 UTC';
+var SK_BUILD = '2026-08-01 14:32 UTC';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -37432,6 +37460,27 @@ async function _skStadiumRefresh() {
       await Promise.all(keys.map(function(tk) {
         return fetchTeamFpForDate(tk, today).catch(function(){ return null; });
       }));
+    }
+    // 2b) Same for ESPN. The button used to be Yahoo-only, so an ESPN FP line
+    //     on a stadium card stayed stale until something else happened to
+    //     refresh that league. force=1 defeats the usual throttle, which is
+    //     what an explicit tap means. Failures are swallowed per league so one
+    //     bad league can't stop the rest — or the Yahoo work above. CRSESPFP
+    if (typeof extSyncedLeagues === 'function' && typeof espRefreshLive === 'function') {
+      var espRows = [];
+      try {
+        var _all = extSyncedLeagues() || [];
+        for (var _i = 0; _i < _all.length; _i++) {
+          if (_all[_i] && _all[_i].provider === 'espn') espRows.push(_all[_i]);
+        }
+      } catch (e) {}
+      if (espRows.length) {
+        await Promise.all(espRows.map(function (r) {
+          try {
+            return Promise.resolve(espRefreshLive(r, 1)).catch(function () { return null; });
+          } catch (e) { return Promise.resolve(null); }
+        }));
+      }
     }
     // 3) Refresh the live game feed for the open stadium game, which re-renders
     //    the scoreboard + fantasy tab with the new data.
@@ -53400,7 +53449,7 @@ function _rinkBuildSkaterPanel(data, game, homeAccent, awayAccent, divStyle) {
     // ── Skipper fantasy line — same cross-league FP/cats block MLB uses,
     // now wired into the NHL skater panel so hockey players show their rows. ──
     if (typeof _crsSkipperFpHtml === 'function') {
-      html += _crsSkipperFpHtml(feat.name, '');
+      html += _crsFantasyFpHtml(feat.name, '');            // CRSESPFP
     }
     html += '</div>';
   }
@@ -54919,7 +54968,7 @@ function renderGymStadium() {
     // ── Skipper fantasy line — same cross-league FP/cats block MLB uses,
     // now sport-agnostic so NBA players show their Skipper rows too. ──
     if (typeof _crsSkipperFpHtml === 'function') {
-      html += _crsSkipperFpHtml(featPlayer.name, '');
+      html += _crsFantasyFpHtml(featPlayer.name, '');      // CRSESPFP
     }
     html += '</div>';
   }
@@ -62773,6 +62822,99 @@ function _crsSkipperFpHtml(playerName, divHtml) {
     '</div>' + divHtml;
 }
 
+// Both providers' fantasy blocks for one stadium player, in provider order.
+//
+// divHtml is a divider the callers pass to close the section. Each block used
+// to append it itself, which meant it vanished whenever that block had no
+// rows — so it's appended here instead, once, and only if something was
+// actually rendered. CRSESPFP
+function _crsFantasyFpHtml(playerName, divHtml) {
+  var out = '';
+  if (typeof _crsSkipperFpHtml === 'function') out += _crsSkipperFpHtml(playerName, '');
+  if (typeof _crsEspnFpHtml === 'function') out += _crsEspnFpHtml(playerName, '');
+  return out ? (out + (divHtml || '')) : '';
+}
+
+// The ESPN FP block for a stadium player card. CRSESPFP
+//
+// Deliberately a SEPARATE card from the Skipper (Yahoo) one rather than extra
+// rows inside it. That's not a layout preference — _espFhubRowsFor's own note
+// records why: Yahoo's terms ask that their fantasy data not be commingled
+// with another provider's, which is why the hub already keeps two cards. The
+// stadium card follows the same rule.
+//
+// No new data path. _espFhubIndex walks the synced ESPN leagues' rosters and
+// _espFhubRowsFor returns rows in the same shape the Yahoo hub uses, so this
+// is the existing hub content rendered inline — which is the whole point:
+// seeing it without opening the hub.
+function _crsEspnFpHtml(playerName, divHtml) {
+  if (typeof _espFhubIndex !== 'function' || typeof _espFhubRowsFor !== 'function') return '';
+  var rows;
+  try {
+    var idx = _espFhubIndex();
+    if (!idx || !idx.n) return '';
+    rows = _espFhubRowsFor({ name: playerName }, idx);
+  } catch (e) { return ''; }
+  if (!rows || !rows.length) return '';
+
+  var inner = '';
+  rows.forEach(function (fr) {
+    var lname = fr.leagueName.length > 20 ? fr.leagueName.slice(0, 19) + '\u2026' : fr.leagueName;
+    var fpTag = '';
+    if (!fr.isCats && fr.fp != null) {
+      var fpStr = (fr.fp > 0 ? '+' : '') + fr.fp.toFixed(1);
+      // ESPN red for a positive line, to tell this card apart from Skipper's
+      // violet at a glance. Negative stays the shared red-for-bad.
+      var benched = !!(fr.lineup && (fr.lineup.benched || fr.lineup.noGame));
+      var fpColor = benched ? 'rgba(255,255,255,0.3)'
+        : fr.fp > 0 ? '#ef4444' : fr.fp < 0 ? '#f87171' : 'rgba(255,255,255,0.35)';
+      fpTag = '<span style="font-family:\'Barlow Condensed\',sans-serif;font-size:10px;font-weight:700;' +
+        'color:' + fpColor + ';white-space:nowrap;flex-shrink:0;letter-spacing:0.04em">' +
+        fpStr + ' FP</span>';
+    }
+    // A benched or idle player still gets a row — knowing he's on your bench
+    // in one league and starting in another is exactly what this is for.
+    //
+    // The flag shows ALONGSIDE the stat line, not instead of it. A benched
+    // player still accrues real stats; printing them bare would say he earned
+    // you those points when he didn't. The stats are true either way, so the
+    // honest render is both.
+    var flag = '';
+    if (fr.lineup && fr.lineup.noGame) flag = 'no game';
+    else if (fr.lineup && fr.lineup.benched) flag = 'bench';
+    var flagHtml = flag
+      ? '<span style="color:rgba(255,255,255,0.3);font-size:9px;' +
+        'letter-spacing:0.06em">' + flag + '</span>'
+      : '';
+    var statHtml;
+    if (fr.catHtml && flagHtml) {
+      statHtml = fr.catHtml +
+        '<span style="color:rgba(255,255,255,0.18)"> \u00b7 </span>' + flagHtml;
+    } else if (fr.catHtml) {
+      statHtml = fr.catHtml;
+    } else {
+      statHtml = flagHtml || '<span style="color:rgba(255,255,255,0.28)">\u2014</span>';
+    }
+
+    inner += '<div style="display:flex;align-items:center;gap:6px;min-width:0;margin-bottom:4px;font-size:10px">' +
+      '<span style="font-family:\'Barlow Condensed\',sans-serif;font-weight:700;' +
+        'color:rgba(255,255,255,0.35);letter-spacing:0.7px;text-transform:uppercase;' +
+        'white-space:nowrap;flex-shrink:0;max-width:95px;overflow:hidden;text-overflow:ellipsis">' +
+        (typeof skEscape === 'function' ? skEscape(lname) : lname) +
+      '</span>' +
+      '<span style="flex:1;min-width:0;overflow:hidden;line-height:1.4">' + statHtml + '</span>' +
+      fpTag +
+    '</div>';
+  });
+
+  var hasAnyFp = rows.some(function (r) { return !r.isCats; });
+  var title = hasAnyFp ? 'ESPN FP \u00b7 Today' : 'ESPN Cats \u00b7 Today';
+  return '<div class="crs-season">' +
+    '<div class="crs-season-title" style="color:#ef4444">' + title + '</div>' +
+    '<div style="padding:0">' + inner + '</div>' +
+    '</div>' + (divHtml || '');
+}
+
 function _crsBuildPitchingSection(bx, game, ls, divHtml, featBatterName) {
   if (!bx || !bx.teams) return '';
 
@@ -62921,7 +63063,7 @@ function _crsBuildPitchingSection(bx, game, ls, divHtml, featBatterName) {
 
   // ── Skipper fantasy line — directly under the game stat line so game +
   // fantasy read together (moved up from below the season grid). ──
-  html += _crsSkipperFpHtml(feat.name, divHtml);
+  html += _crsFantasyFpHtml(feat.name, divHtml);           // CRSESPFP
 
   if (seasonHtml) {
     html += '<div class="crs-season"><div class="crs-season-title">Season</div>' +
@@ -66973,6 +67115,14 @@ function _crsTeamStatsPanel(game, accent, awayAccent) {
   return html;
 }
 
+// Surname from a normalized name key, for matching an abbreviated first name
+// ("D. Rasmussen") against a full one within a single roster. STPROBSTATS
+function _crsSurnameKey(k) {
+  if (!k) return '';
+  var parts = String(k).split(/\s+/);
+  return parts.length > 1 ? parts[parts.length - 1] : '';
+}
+
 function _crsProbablesPanel(game, accent) {
   if (!game) return '';
   // Probables live in two shapes depending on the source: ESPN games (MLB,
@@ -66984,7 +67134,88 @@ function _crsProbablesPanel(game, accent) {
   if ((!ap || !ap.name) && (!hp || !hp.name)) return '';
   var slug = { MLB:'mlb', MiLB:'mlb', NCAABB:'college-baseball' }[game.league] || 'mlb';
   function esc(s) { return (typeof skEscapeMaybe === 'function') ? skEscapeMaybe(s) : String(s == null ? '' : s); }
-  function pitcher(side, prob, ac) {
+  // Season line for a probable. STPROBSTATS
+  //
+  // The first cut read this off ESPN's scoreboard. An on-screen probe settled
+  // what that feed actually carries: FIVE entries — wins, losses, era, saves,
+  // errors — so IP, K, BB, WHIP and GS were never going to appear no matter
+  // how the keys were spelled. That approach was wrong.
+  //
+  // The right source was already in memory. Stadium mode is driven by the MLB
+  // Stats API: fetchFenwayData pulls /game/{gamePk}/boxscore into
+  // fenwayLiveData, and that payload carries seasonStats.pitching for every
+  // player on both rosters. The app already reads it — renderMilbPitching
+  // takes its ERA column from p.seasonStats.pitching. So this needs no fetch
+  // at all, just a lookup.
+  //
+  // The one wrinkle: for MLB games the probable comes from ESPN's scoreboard
+  // and carries an ESPN athlete id, while the boxscore is keyed by MLB Stats
+  // API person id. Those are different numbering schemes, so the match is by
+  // normalized name — the same bridge the player card already uses.
+  function probMlbStats(prob, isHome) {
+    if (!prob || !prob.name) return null;
+    var box = (typeof fenwayLiveData !== 'undefined' && fenwayLiveData)
+      ? fenwayLiveData.boxscore : null;
+    var side = box && box.teams && box.teams[isHome ? 'home' : 'away'];
+    var players = side && side.players;
+    if (!players) return null;
+    var want = (typeof _pmNameKey === 'function')
+      ? _pmNameKey(prob.name) : String(prob.name).toLowerCase();
+    if (!want) return null;
+    var k, exact = null, loose = null;
+    for (k in players) {
+      if (!players.hasOwnProperty(k)) continue;
+      var pl = players[k], per = pl && pl.person;
+      if (!per || !per.fullName) continue;
+      var got = (typeof _pmNameKey === 'function')
+        ? _pmNameKey(per.fullName) : String(per.fullName).toLowerCase();
+      if (got === want) { exact = pl; break; }
+      // ESPN abbreviates a first name ("D. Rasmussen"), the boxscore doesn't.
+      // Surname plus first initial is enough within one team's roster.
+      if (!loose && _crsSurnameKey(got) && _crsSurnameKey(got) === _crsSurnameKey(want)) loose = pl;
+    }
+    var hit = exact || loose;
+    return (hit && hit.seasonStats && hit.seasonStats.pitching) || null;
+  }
+
+  // Rows, in the order a pitcher is actually read: workload, then strikeouts
+  // and control. Each row lists the MLB Stats API key first, then the ESPN
+  // spellings, and takes the first that resolves. Rows with no data are
+  // dropped rather than shown empty, so a callup gets a short block instead
+  // of a column of dashes.
+  var _CRS_PROB_ROWS = [
+    { label: 'IP',   keys: ['inningsPitched', 'inningspitched', 'ip'] },
+    { label: 'K',    keys: ['strikeOuts', 'strikeouts', 'k', 'so'] },
+    { label: 'BB',   keys: ['baseOnBalls', 'walks', 'bb'] },
+    { label: 'WHIP', keys: ['whip'] },
+    { label: 'H',    keys: ['hits', 'h'] },
+    { label: 'HR',   keys: ['homeRuns', 'homeruns', 'hr'] },
+    { label: 'GS',   keys: ['gamesStarted', 'gamesstarted', 'gs'] }
+  ];
+  function probStatsHtml(prob, isHome) {
+    var mlb = probMlbStats(prob, isHome);
+    var esp = (prob && prob.stats) || null;
+    if (!mlb && !esp) return '';
+    var out = '', n = 0, i, j;
+    for (i = 0; i < _CRS_PROB_ROWS.length; i++) {
+      var row = _CRS_PROB_ROWS[i], v = null;
+      for (j = 0; j < row.keys.length; j++) {
+        var key = row.keys[j];
+        if (mlb && mlb[key] != null && mlb[key] !== '' && mlb[key] !== '-') { v = mlb[key]; break; }
+        if (esp && esp[key] != null && esp[key] !== '') { v = esp[key]; break; }
+      }
+      if (v == null) continue;
+      out += '<div class="crs-prob-stat">' +
+        '<span class="crs-prob-stat-k">' + esc(row.label) + '</span>' +
+        '<span class="crs-prob-stat-v">' + esc(v) + '</span></div>';
+      n++;
+    }
+    // One lonely row isn't a stat block, it's a stray number.
+    if (n < 2) return '';
+    return '<div class="crs-prob-stats">' + out + '</div>';
+  }
+
+  function pitcher(side, prob, ac, isHome) {
     if (!prob || !prob.name) {
       return '<div class="crs-prob-side"><div class="crs-prob-team" style="color:' + ac + '">' + esc(side) + '</div>' +
         '<div class="crs-prob-tbd">TBD</div></div>';
@@ -67003,11 +67234,24 @@ function _crsProbablesPanel(game, accent) {
     }
     var img = hs ? '<img class="crs-prob-hs" src="' + hs + '" alt="" onerror="this.style.visibility=\'hidden\'">'
                  : '<div class="crs-prob-hs crs-prob-hs-ph">\u26be</div>';
-    return '<div class="crs-prob-side">' +
+    // Tappable, like every other player in the app. The card already carries
+    // the full season line, career, splits and game log — no reason a probable
+    // should be the one player you can't open. STPROBSTATS
+    var tap = '';
+    if (prob.id != null && prob.id !== '') {
+      var _pn = String(prob.name).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+      tap = ' style="cursor:pointer" onclick="' +
+        'window._playerCtx=window._playerCtx||{};' +
+        'window._playerCtx[\'' + prob.id + '\']={name:\'' + _pn + '\',pos:\'P\'};' +
+        'if(typeof openFenwayPlayer===\'function\')openFenwayPlayer(\'' + prob.id + '\',\'' +
+        (game.league === 'MiLB' ? 'MiLB' : 'MLB') + '\')"';
+    }
+    return '<div class="crs-prob-side"' + tap + '>' +
       '<div class="crs-prob-team" style="color:' + ac + '">' + esc(side) + '</div>' +
       img +
       '<div class="crs-prob-name">' + esc(prob.name) + '</div>' +
       (prob.line ? '<div class="crs-prob-line">' + esc(prob.line) + '</div>' : '') +
+      probStatsHtml(prob, isHome) +          // STPROBSTATS
       '</div>';
   }
   // Per-team accents, matching the linescore: home uses the stadium theme
@@ -67022,12 +67266,41 @@ function _crsProbablesPanel(game, accent) {
     var _aw = String(game.away.color).replace('#', '');
     if (/^[0-9a-fA-F]{6}$/.test(_aw)) awayAc = '#' + _aw.toLowerCase();
   }
+  // On-screen probe: tap the PROBABLE PITCHERS heading to see what the feed
+  // actually sent. No devtools on Android, so the alternative is guessing.
+  // STPROBSTATS
+  function probeText() {
+    var parts = [];
+    [['away', ap], ['home', hp]].forEach(function (pair) {
+      var pr = pair[1];
+      if (!pr || !pr.name) return;
+      var isH = (pair[0] === 'home');
+      var mlb = probMlbStats(pr, isH);
+      var box = (typeof fenwayLiveData !== 'undefined' && fenwayLiveData)
+        ? fenwayLiveData.boxscore : null;
+      var side = box && box.teams && box.teams[isH ? 'home' : 'away'];
+      var rosterN = (side && side.players) ? Object.keys(side.players).length : 0;
+      var mk = [];
+      if (mlb) { for (var k in mlb) { if (mlb.hasOwnProperty(k)) mk.push(k); } }
+      parts.push(pair[0] + ' ' + pr.name +
+        ' | boxscore: ' + (box ? (rosterN + ' players') : 'NOT LOADED') +
+        ' | matched: ' + (mlb ? 'yes' : 'NO') +
+        ' | mlb keys: ' + (mk.length ? mk.slice(0, 14).join(' ') : 'none') +
+        ' | espn: ' + (pr._statCount || 0) + ' entries');
+    });
+    return parts.join('\n\n') || 'no probables on this game';
+  }
+  var _probeJs = probeText().replace(/\\/g, '\\\\').replace(/'/g, "\\'")
+    .replace(/\n/g, '\\n');
+
   return '<div class="crs-prob-panel">' +
-    '<div class="crs-prob-head" style="color:' + accent + '">\u26be PROBABLE PITCHERS</div>' +
+    '<div class="crs-prob-head" style="color:' + accent + '" ' +
+      'onclick="if(typeof skToast===\'function\')skToast(\'' + _probeJs + '\')">' +
+      '\u26be PROBABLE PITCHERS</div>' +
     '<div class="crs-prob-row">' +
-      pitcher(game.away.abbr, ap, awayAc) +
+      pitcher(game.away.abbr, ap, awayAc, false) +
       '<div class="crs-prob-vs">vs</div>' +
-      pitcher(game.home.abbr, hp, accent) +
+      pitcher(game.home.abbr, hp, accent, true) +
     '</div></div>';
 }
 
@@ -67563,7 +67836,7 @@ function renderFenwayCoors() {
   html += '<div class="crs-settings-wrap">';
   html += '<button class="crs-settings-gear" id="crsSettingsGear" title="Display & sound settings" ' +
     'onclick="toggleCrsSettings()" aria-label="Display and sound settings">\u2699\uFE0F</button>';
-  html += '<button class="fw-oot-btn fw-yahoo-refresh crs-inline-btn" id="fwYahooRefresh" onclick="_skStadiumRefresh()" aria-label="Refresh fantasy data from Yahoo" title="Refresh fantasy points & stats from Yahoo">\uD83D\uDD04 FP</button>';
+  html += '<button class="fw-oot-btn fw-yahoo-refresh crs-inline-btn" id="fwYahooRefresh" onclick="_skStadiumRefresh()" aria-label="Refresh fantasy data" title="Refresh fantasy points and stats from Yahoo and ESPN">\uD83D\uDD04 FP</button>';
   html += '<button class="fw-oot-btn crs-inline-btn" id="fwOotBtn" onclick="openFwOotPanel()" aria-label="Out of town scores">\uD83D\uDEF0 OOT</button>';
   html += '<div class="crs-font-picker crs-settings-panel" id="crsSettingsPanel">';
   html += '<span class="crs-font-label">FONT</span>';
@@ -67746,7 +68019,7 @@ function renderFenwayCoors() {
 
     // ── Skipper fantasy line — placed directly under the game stat line so
     // game + fantasy read together (moved up from below the season grid). ──
-    html += _crsSkipperFpHtml(featPlayer.name, divHtml);
+    html += _crsFantasyFpHtml(featPlayer.name, divHtml);   // CRSESPFP
 
     // ── Current / last at-bat pitch sequence ──
     var pseqHtml = pbp ? _crsBuildPitchSeq(pbp, featPlayer.name, liveAbName) : '';
@@ -125901,13 +126174,18 @@ function espLiveStamp(row) {
   } catch (e) { return ''; }
 }
 
+// Returns a promise so a caller that needs to know when the data has landed
+// can wait for it — the stadium refresh button does. Every existing caller
+// ignores the return value, so this is additive. CRSESPFP
 function espRefreshLive(row, force) {
-  if (!row || row._espLiveBusy) return;
+  if (!row || row._espLiveBusy) return Promise.resolve(null);
   // Throttle. Flipping the dropdown back and forth shouldn't fire a 1.7MB
   // pair of requests every time.
-  if (!force && row._espLiveAt && (Date.now() - row._espLiveAt) < _ESP_LIVE_MIN_MS) return;
+  if (!force && row._espLiveAt && (Date.now() - row._espLiveAt) < _ESP_LIVE_MIN_MS) {
+    return Promise.resolve(null);
+  }
   var sv = espFindSaved(row.key.slice(4));
-  if (!sv) return;
+  if (!sv) return Promise.resolve(null);
   row._espLiveBusy = 1;
 
   var pane = _espPane('roster');
@@ -125916,7 +126194,7 @@ function espRefreshLive(row, force) {
     if (note) note.textContent = 'refreshing\u2026';
   }
 
-  espCurrentSeason(sv.game).then(function (season) {
+  return espCurrentSeason(sv.game).then(function (season) {
     return Promise.all([
       espFetchLeague(sv.game, sv.id, season, '?view=mRoster'),
       espFetchLeague(sv.game, sv.id, season, espScoreView(row))
