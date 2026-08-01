@@ -26452,6 +26452,20 @@
   <div class="pw-body" id="nbrBody"></div>
 </div>
 
+<!-- Injury Board — pickup scanner. Probe build. INJTOOL -->
+<div class="pw-overlay" id="injOverlay">
+  <div class="pp-header">
+    <div>
+      <div class="pp-eyebrow">MLB</div>
+      <h2 class="pp-title">Injury Board</h2>
+    </div>
+    <button class="pp-close" onclick="closeInjuryBoard()" aria-label="Close">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+    </button>
+  </div>
+  <div class="pw-body" id="injBody"></div>
+</div>
+
 <!-- Probable Pitchers (5-day, league-agnostic) — PPSTOOL -->
 <div class="pw-overlay" id="ppsOverlay">
   <div class="pp-header">
@@ -32370,6 +32384,11 @@ function renderLeagueDrawerBody() {
     '<div class="ld-tool-icon">\u26be</div>' +
     '<div class="ld-tool-name">Probable Pitchers</div>' +
   '</div>';
+  // INJTOOL
+  html += '<div class="ld-tool-item" onclick="openInjuryBoard(); closeLeagueDrawer();">' +
+    '<div class="ld-tool-icon">\ud83e\ude79</div>' +
+    '<div class="ld-tool-name">Injury Board</div>' +
+  '</div>';
   html += '</div>'; // .ld-tools-body
   // SKBUILD
   html += '<div style="padding:14px 16px 4px;font-size:8.5px;letter-spacing:0.08em;' +
@@ -32421,7 +32440,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-08-01 14:46 UTC';
+var SK_BUILD = '2026-08-01 16:19 UTC';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -116321,6 +116340,416 @@ function _nbrRgba(hex, a) {
   var h = String(hex || '').replace('#', '');
   function ch(i) { var v = parseInt(h.slice(i, i + 2), 16); return isNaN(v) ? 0 : v; }
   return 'rgba(' + ch(0) + ',' + ch(2) + ',' + ch(4) + ',' + a + ')';
+}
+
+// ─────────────────────────────────────────────────────────────────
+// INJURY BOARD — stash-candidate scanner. INJTOOL
+// ─────────────────────────────────────────────────────────────────
+// Not "which of my guys are hurt" — the opposite. The useful question is
+// which players I DON'T roster are due back soon enough to be worth stashing,
+// and ESPN's own injuries page can't answer it because it knows nothing about
+// my leagues. So the default view HIDES anyone already rostered and sorts by
+// expected return, soonest first.
+//
+// Shape confirmed by an on-device probe rather than assumed:
+//   j.injuries[]                     30 team groups
+//   j.injuries[i].injuries[]         the players, 275 in total
+//   .status                          "60-Day-IL" / "15-Day-IL" / "Day-To-Day"
+//   .shortComment / .longComment     the beat-writer note
+//   .details.returnDate              "2026-08-25"  ← the whole point
+//   .details.type / .detail / .side  "Elbow" / "Surgery" / "Right"
+//   .athlete.displayName / .position.abbreviation / .team.abbreviation
+//
+// One consequence worth stating: athlete carries NO id field. Matching against
+// my rosters is therefore by normalized name, the same bridge the stadium
+// cards already use. The id needed to open a player card is dug out of the
+// athlete's links instead, and the row is simply not tappable when that fails.
+var _injState = {
+  loading: false, err: '', groups: null, ms: 0, at: 0,
+  hideMine: true, win: 'all', team: '', q: ''
+};
+var _INJ_TTL = 15 * 60 * 1000;   // injuries move on a news cycle, not a clock
+
+function openInjuryBoard() {
+  var ov = document.getElementById('injOverlay');
+  if (!ov) return;
+  ov.classList.add('open');
+  if (!_injState.groups || (Date.now() - _injState.at) > _INJ_TTL) _injLoad();
+  else _injRender();
+}
+
+function closeInjuryBoard() {
+  var ov = document.getElementById('injOverlay');
+  if (ov) ov.classList.remove('open');
+}
+
+function _injSetHideMine(v) { _injState.hideMine = !!v; _injRender(); }
+function _injSetWin(w) { _injState.win = w; _injRender(); }
+
+function _injLoad() {
+  if (_injState.loading) return;
+  _injState.loading = true;
+  _injState.err = '';
+  _injRender();
+  var t0 = Date.now();
+  fetch('https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/injuries')
+    .then(function (r) {
+      _injState.ms = Date.now() - t0;
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    })
+    .then(function (j) {
+      _injState.loading = false;
+      _injState.groups = (j && j.injuries) || null;
+      _injState.at = Date.now();
+      if (!_injState.groups) _injState.err = 'payload shape changed';
+      _injRender();
+    })['catch'](function (e) {
+      _injState.loading = false;
+      _injState.err = (e && e.message) ? e.message : 'request failed';
+      _injRender();
+    });
+}
+
+// "2026-08-25" as a LOCAL midnight. new Date("2026-08-25") parses as UTC,
+// which lands on the previous evening west of Greenwich and would report a
+// player as back a day early — exactly the sort of off-by-one that makes a
+// countdown untrustworthy.
+function _injParseDate(s) {
+  var m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(s || ''));
+  if (!m) return null;
+  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+}
+
+function _injDaysOut(d) {
+  if (!d) return null;
+  var now = new Date();
+  var today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  return Math.round((d - today) / 86400000);
+}
+
+function _injFmtDate(d) {
+  if (!d) return '';
+  var M = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  return M[d.getMonth()] + ' ' + d.getDate();
+}
+
+// ESPN athlete ids aren't on the athlete object here, but they are embedded in
+// its links. No id, no tap — better than opening the wrong player's card.
+function _injAthleteId(a) {
+  var links = (a && a.links) || [], i;
+  for (i = 0; i < links.length; i++) {
+    var href = links[i] && links[i].href;
+    if (!href) continue;
+    var m = /\/id\/(\d+)/.exec(String(href));
+    if (m) return m[1];
+  }
+  return null;
+}
+
+// Is this player on any of my rosters, on any provider?
+function _injIsMine(name) {
+  if (!name) return false;
+  try {
+    if (typeof _skOwnsPlayerByName === 'function' && _skOwnsPlayerByName(name)) return true;
+  } catch (e) {}
+  try {
+    if (typeof _extDotIndex === 'function') {
+      var idx = _extDotIndex();
+      var nm = (typeof _skNormalizeName === 'function')
+        ? _skNormalizeName(name) : String(name).toLowerCase();
+      if (nm && idx && idx.byName && idx.byName[nm]) return true;
+    }
+  } catch (e) {}
+  return false;
+}
+
+// Flatten the 30 team groups into one sorted list of candidates.
+function _injRows() {
+  var out = [], g, i, k;
+  var groups = _injState.groups || [];
+  for (i = 0; i < groups.length; i++) {
+    g = groups[i];
+    var list = (g && g.injuries) || [];
+    for (k = 0; k < list.length; k++) {
+      var inj = list[k] || {};
+      var a = inj.athlete || {};
+      var det = inj.details || {};
+      var name = a.displayName || '';
+      if (!name) continue;
+      var rd = _injParseDate(det.returnDate);
+      var body = [];
+      if (det.type) body.push(det.type);
+      if (det.detail) body.push(det.detail);
+      out.push({
+        name: name,
+        // The group's id, not the abbreviation — the group carries no
+        // abbreviation and an id can't drift with a rebrand. INJTOOL
+        teamId: (g && g.id != null) ? String(g.id) : '',
+        pos: (a.position && a.position.abbreviation) || '',
+        team: (a.team && a.team.abbreviation) || (g && g.abbreviation) || '',
+        status: inj.status || '',
+        fantasy: (det.fantasyStatus && det.fantasyStatus.abbreviation) || '',
+        ailment: body.join(' \u00b7 '),
+        note: inj.shortComment || inj.longComment || '',
+        ret: rd,
+        days: _injDaysOut(rd),
+        athleteId: _injAthleteId(a),
+        mine: _injIsMine(name)
+      });
+    }
+  }
+  // Soonest back first. No date means no idea, so those sort last rather than
+  // being treated as imminent.
+  out.sort(function (x, y) {
+    if (x.ret && y.ret) return x.ret - y.ret;
+    if (x.ret) return -1;
+    if (y.ret) return 1;
+    return x.name.localeCompare(y.name);
+  });
+  return out;
+}
+
+function _injPassesWin(r) {
+  if (_injState.win === 'all') return true;
+  // A window filter is a question about WHEN he's back, so a player with no
+  // return date can't answer it and is excluded rather than assumed.
+  if (r.days == null) return false;
+  var lim = _injState.win === '2w' ? 14 : _injState.win === '4w' ? 28 : 56;
+  return r.days <= lim;
+}
+
+function _injStatusColor(st) {
+  var s = String(st || '').toUpperCase();
+  if (s.indexOf('60') === 0 || s.indexOf('60-') >= 0) return '#f87171';
+  if (s.indexOf('DAY-TO-DAY') >= 0 || s.indexOf('DTD') >= 0) return '#fbbf24';
+  return '#fb923c';
+}
+
+function _injSetTeam(t) { _injState.team = t || ''; _injPaintList(); }
+
+// Typing repaints ONLY the list. The search box lives in the shell, and a
+// shell rebuilt on every keystroke would tear the input out of the DOM and
+// drop focus after the first character — the field would accept one letter
+// and then go dead. The chips can rebuild the shell freely; they don't hold
+// focus, and the input's value is re-rendered from state so it survives.
+// INJTOOL
+function _injOnSearch(v) { _injState.q = String(v || ''); _injPaintList(); }
+function _injClearSearch() { _injState.q = ''; _injRender(); }
+
+function _injPaintList() {
+  var el = document.getElementById('injList');
+  if (el) el.innerHTML = _injListHtml();
+}
+
+// The teams present in the payload, for the picker. Built from the groups
+// rather than a hardcoded list of 30, so a relocation or rename can't leave a
+// dead entry behind. The group carries id + displayName but NO abbreviation
+// (confirmed by probe), so the id is the filter key and the abbreviation for
+// display comes off the players themselves.
+function _injTeams() {
+  var groups = _injState.groups || [], out = [], i;
+  for (i = 0; i < groups.length; i++) {
+    var g = groups[i];
+    if (!g || g.id == null) continue;
+    var n = (g.injuries && g.injuries.length) || 0;
+    if (!n) continue;
+    out.push({ id: String(g.id), name: g.displayName || ('Team ' + g.id), n: n });
+  }
+  out.sort(function (a, b) { return a.name.localeCompare(b.name); });
+  return out;
+}
+
+// Loose name match: case and punctuation folded away, so "acuna" finds
+// "Ronald Acuna Jr." and "o'neil" finds "O'Neil". Matches anywhere in the
+// name, because you rarely remember whether it was the first or last you
+// were after.
+function _injMatchesQ(r) {
+  var q = _injState.q;
+  if (!q) return true;
+  function fold(s) {
+    return String(s || '').toLowerCase()
+      .replace(/[\u2018\u2019']/g, '')
+      .replace(/[^a-z0-9 ]/g, ' ')
+      .replace(/\s+/g, ' ').trim();
+  }
+  var needle = fold(q);
+  if (!needle) return true;
+  return fold(r.name).indexOf(needle) >= 0;
+}
+
+function _injListHtml() {
+  var all = _injRows(), i;
+  var shown = [], hiddenMine = 0, hiddenWin = 0, hiddenTeam = 0, hiddenQ = 0;
+  for (i = 0; i < all.length; i++) {
+    var r = all[i];
+    // Search is the most specific thing the user can ask for, so it's applied
+    // first and its exclusions aren't reported as "outside the window" —
+    // which would read as though the filter, not the query, had hidden them.
+    if (!_injMatchesQ(r)) { hiddenQ++; continue; }
+    if (_injState.team && r.teamId !== _injState.team) { hiddenTeam++; continue; }
+    if (_injState.hideMine && r.mine) { hiddenMine++; continue; }
+    if (!_injPassesWin(r)) { hiddenWin++; continue; }
+    shown.push(r);
+  }
+
+  var mono = 'font-family:var(--sk-font-mono,monospace);';
+  var h = '';
+
+  if (!shown.length) {
+    var why = [];
+    if (hiddenQ) why.push(hiddenQ + ' did not match the search');
+    if (hiddenTeam) why.push(hiddenTeam + ' are on other teams');
+    if (hiddenMine) why.push(hiddenMine + ' already on your rosters');
+    if (hiddenWin) why.push(hiddenWin + ' outside this window');
+    h += '<div style="font-size:11.5px;line-height:1.6;color:rgba(255,255,255,0.4);' +
+      'padding:20px 0">Nothing matches' +
+      (why.length ? ' \u2014 ' + why.join(', ') + '.' : '.') + '</div>';
+    return h;
+  }
+
+  var lastKey = '';
+  for (i = 0; i < shown.length; i++) {
+    var r2 = shown[i];
+    var key = r2.ret ? _injFmtDate(r2.ret) : 'No timetable';
+    if (key !== lastKey) {
+      lastKey = key;
+      var when = '';
+      if (r2.days != null) {
+        when = r2.days <= 0 ? 'due back' :
+               r2.days === 1 ? 'tomorrow' : 'in ' + r2.days + ' days';
+      }
+      h += '<div style="display:flex;align-items:baseline;gap:8px;margin:14px 0 5px;' +
+        'padding-bottom:4px;border-bottom:1px solid rgba(255,255,255,0.08)">' +
+        '<span style="' + mono + 'font-size:11px;font-weight:700;color:#fbbf24">' +
+          slEsc(key) + '</span>' +
+        (when ? '<span style="font-size:9.5px;color:rgba(255,255,255,0.35)">' +
+          slEsc(when) + '</span>' : '') +
+      '</div>';
+    }
+
+    var tap = '';
+    if (r2.athleteId && typeof openPlayerModal === 'function') {
+      tap = ' onclick="openPlayerModal(\'' + r2.athleteId + '\',\'MLB\')" style="cursor:pointer"';
+    }
+    h += '<div' + tap + ' style="padding:7px 2px;border-bottom:1px solid rgba(255,255,255,0.04)">' +
+      '<div style="display:flex;align-items:baseline;gap:7px;min-width:0">' +
+        '<span style="font-size:13px;font-weight:700;color:rgba(255,255,255,0.9);' +
+          'flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' +
+          slEsc(r2.name) + '</span>' +
+        (r2.mine ? '<span style="font-size:8px;font-weight:700;letter-spacing:0.5px;' +
+          'color:#4ade80;flex-shrink:0">MINE</span>' : '') +
+        '<span style="' + mono + 'font-size:9.5px;font-weight:700;flex-shrink:0;color:' +
+          _injStatusColor(r2.status) + '">' + slEsc(r2.status) + '</span>' +
+      '</div>' +
+      '<div style="' + mono + 'font-size:9.5px;color:rgba(255,255,255,0.38);margin-top:1px">' +
+        slEsc([r2.pos, r2.team].filter(Boolean).join(' \u00b7 ')) +
+        (r2.ailment ? '<span style="color:rgba(255,255,255,0.2)"> \u00b7 </span>' +
+          slEsc(r2.ailment) : '') +
+      '</div>' +
+      (r2.note ? '<div style="font-size:10px;line-height:1.45;' +
+        'color:rgba(255,255,255,0.45);margin-top:3px">' + slEsc(r2.note) + '</div>' : '') +
+    '</div>';
+  }
+
+  var bits = [];
+  if (hiddenQ) bits.push(hiddenQ + ' filtered by search');
+  if (hiddenTeam) bits.push(hiddenTeam + ' on other teams');
+  if (hiddenMine) bits.push(hiddenMine + ' on your rosters');
+  if (hiddenWin) bits.push(hiddenWin + ' outside the window');
+  h += '<div style="font-size:9.5px;line-height:1.55;color:rgba(255,255,255,0.28);' +
+    'margin-top:16px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.08)">' +
+    shown.length + ' shown of ' + all.length + ' injured leaguewide' +
+    (bits.length ? ' \u00b7 ' + bits.join(' \u00b7 ') : '') +
+    '. Return dates are ESPN\u2019s estimates and move often. Ownership is ' +
+    'matched by name across every league you\u2019ve synced.' +
+    ' \u00b7 <button onclick="_injState.groups=null;_injLoad()" style="padding:2px 9px;' +
+    'border-radius:6px;border:1px solid rgba(255,255,255,0.14);background:none;' +
+    'color:rgba(255,255,255,0.5);font-size:9px">REFRESH</button></div>';
+
+  return h;
+}
+
+function _injRender() {
+  var body = document.getElementById('injBody');
+  if (!body) return;
+  var mono = 'font-family:var(--sk-font-mono,monospace);';
+
+  if (_injState.loading && !_injState.groups) {
+    body.innerHTML = '<div style="' + mono + 'font-size:11px;color:rgba(255,255,255,0.5)">' +
+      'Loading injuries\u2026</div>';
+    return;
+  }
+  if (_injState.err) {
+    body.innerHTML = '<div style="' + mono + 'font-size:11px;color:#f87171">Could not load \u2014 ' +
+      slEsc(_injState.err) + '</div>' +
+      '<button onclick="_injState.groups=null;_injLoad()" style="margin-top:14px;' +
+      'padding:8px 16px;border-radius:8px;border:1px solid rgba(255,255,255,0.15);' +
+      'background:none;color:rgba(255,255,255,0.7);font-size:11px">RETRY</button>';
+    return;
+  }
+  if (!_injState.groups) { body.innerHTML = ''; return; }
+
+  function chip(label, on, js) {
+    return '<button onclick="' + js + '" style="flex:1;padding:7px 4px;border-radius:8px;' +
+      'border:1px solid ' + (on ? 'rgba(74,222,128,0.5)' : 'rgba(255,255,255,0.12)') + ';' +
+      'background:' + (on ? 'rgba(74,222,128,0.12)' : 'transparent') + ';' +
+      'color:' + (on ? '#4ade80' : 'rgba(255,255,255,0.55)') + ';' +
+      'font-family:\'Outfit\',sans-serif;font-size:10px;font-weight:700;' +
+      'letter-spacing:0.5px">' + label + '</button>';
+  }
+
+  var h = '';
+
+  // Search. Attribute-escaped separately from text: a stray quote in the
+  // value would otherwise break out of the attribute.
+  var qAttr = String(_injState.q || '')
+    .replace(/&/g, '&amp;').replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  h += '<div style="display:flex;gap:6px;margin:0 0 8px;align-items:stretch">' +
+    '<input id="injSearch" type="search" inputmode="search" autocomplete="off" ' +
+      'placeholder="Search player\u2026" value="' + qAttr + '" ' +
+      'oninput="_injOnSearch(this.value)" ' +
+      'style="flex:1;min-width:0;padding:8px 10px;border-radius:8px;' +
+      'border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.04);' +
+      'color:rgba(255,255,255,0.9);font-size:12px;font-family:inherit;' +
+      '-webkit-appearance:none">' +
+    (_injState.q ? '<button onclick="_injClearSearch()" style="flex:0 0 auto;padding:0 12px;' +
+      'border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:none;' +
+      'color:rgba(255,255,255,0.5);font-size:14px">\u00d7</button>' : '') +
+  '</div>';
+
+  // Team picker. A native select rather than 30 chips — it's one tap to a
+  // scrollable list on a phone, and the chip row would be taller than the
+  // board it filters.
+  var teams = _injTeams(), ti;
+  h += '<div style="margin:0 0 8px">' +
+    '<select onchange="_injSetTeam(this.value)" ' +
+      'style="width:100%;padding:8px 10px;border-radius:8px;' +
+      'border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.04);' +
+      'color:rgba(255,255,255,0.9);font-size:12px;font-family:inherit;' +
+      '-webkit-appearance:none">' +
+    '<option value=""' + (_injState.team ? '' : ' selected') + '>All teams</option>';
+  for (ti = 0; ti < teams.length; ti++) {
+    h += '<option value="' + slEsc(teams[ti].id) + '"' +
+      (_injState.team === teams[ti].id ? ' selected' : '') + '>' +
+      slEsc(teams[ti].name) + ' (' + teams[ti].n + ')</option>';
+  }
+  h += '</select></div>';
+
+  h += '<div style="display:flex;gap:6px;margin:0 0 8px">' +
+    chip(_injState.hideMine ? 'HIDING MINE' : 'SHOWING ALL',
+         _injState.hideMine, '_injSetHideMine(' + (_injState.hideMine ? 'false' : 'true') + ')') +
+  '</div>';
+  h += '<div style="display:flex;gap:6px;margin:0 0 14px">' +
+    chip('ANY', _injState.win === 'all', "_injSetWin('all')") +
+    chip('\u2264 2 WK', _injState.win === '2w', "_injSetWin('2w')") +
+    chip('\u2264 4 WK', _injState.win === '4w', "_injSetWin('4w')") +
+    chip('\u2264 8 WK', _injState.win === '8w', "_injSetWin('8w')") +
+  '</div>';
+
+  h += '<div id="injList">' + _injListHtml() + '</div>';
+  body.innerHTML = h;
 }
 
 // ─────────────────────────────────────────────────────────────────
