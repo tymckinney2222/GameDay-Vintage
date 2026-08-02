@@ -32598,7 +32598,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-08-02 16:44 UTC';
+var SK_BUILD = '2026-08-02 16:51 UTC';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -131389,15 +131389,36 @@ function espProjectedStandings(row) {
   if (_divs && typeof espDivisionalSeedOrder === 'function') {
     out = espDivisionalSeedOrder(out, _divs);
   }
+  // In a divisional league GB belongs to the DIVISION race, projected the
+  // same way the RECORD tab measures it now — otherwise this tab would show a
+  // divisional seed order beside an overall GB, which is the exact mismatch
+  // that made RECORD unreadable. ESPDIV
+  var _gbProj = null, _gbNow = null;
+  if (_divs && typeof espDivisionGb === 'function') {
+    _gbProj = espDivisionGb(out.map(function (o) {
+      return { teamId: o.teamId, record: o.rec };
+    }), _divs);
+    _gbNow = espDivisionGb(rows.map(function (rr) {
+      return { teamId: rr.teamId, record: rr.record };
+    }), _divs);
+  }
+
   for (i = 0; i < out.length; i++) {
     out[i].projRank = i + 1;
-    // Measured from whoever leads AFTER today's result, which is the team at
-    // the top of this list and not necessarily the one leading now.
-    out[i].gb = _espGbVs(out[0], out[i]);
+    out[i].div = _divs ? (_divs.byTeam[String(out[i].teamId)] || null) : null;
+    if (_gbProj) {
+      // Divisional: against this team's own division leader, before and after.
+      out[i].gb = _gbProj[String(out[i].teamId)];
+      out[i].gbNow = _gbNow ? _gbNow[String(out[i].teamId)] : null;
+    } else {
+      // Measured from whoever leads AFTER today's result, which is the team at
+      // the top of this list and not necessarily the one leading now.
+      out[i].gb = _espGbVs(out[0], out[i]);
+    }
     out[i].gbMove = (out[i].gb == null || out[i].gbNow == null)
       ? null : Math.round((out[i].gb - out[i].gbNow) * 100) / 100;
   }
-  return { list: out, moved: moved };
+  return { list: out, moved: moved, divs: _divs };
 }
 
 // Does the projection have anything to say? Drives whether the tab appears,
@@ -131422,8 +131443,45 @@ function _espProjStandingsHtml(row) {
   var mono = 'font-family:var(--sk-font-mono,monospace);';
   var cats = (typeof espIsCats === 'function') ? espIsCats(row) : false;
 
+  // Grouped by division when there is one, exactly as RECORD now is — the
+  // seeding already honours divisions, so a flat list here showed a
+  // divisional order beside a divisional GB with nothing saying why R.B.I.
+  // sat fourth on a worse record. ESPDIV
+  var _pdivs = p.divs || null;
+  var plan = [], dI, mI, q;
+  if (_pdivs) {
+    for (dI = 0; dI < _pdivs.order.length; dI++) {
+      var dId = _pdivs.order[dI], members = [];
+      for (mI = 0; mI < p.list.length; mI++) {
+        if (p.list[mI].div === dId) members.push(p.list[mI]);
+      }
+      if (!members.length) continue;
+      // Already ordered by projected record within the whole list, so the
+      // division order falls out of the filter.
+      for (q = 0; q < members.length; q++) {
+        plan.push({ r: members[q], rank: q + 1,
+                    head: (q === 0) ? (_pdivs.names[dId] || 'DIVISION') : null });
+      }
+    }
+    var placed = {};
+    for (q = 0; q < plan.length; q++) placed[String(plan[q].r.teamId)] = 1;
+    var orph = [];
+    for (mI = 0; mI < p.list.length; mI++) {
+      if (!placed[String(p.list[mI].teamId)]) orph.push(p.list[mI]);
+    }
+    for (q = 0; q < orph.length; q++) {
+      plan.push({ r: orph[q], rank: q + 1,
+                  head: (q === 0) ? 'UNASSIGNED' : null });
+    }
+  } else {
+    for (mI = 0; mI < p.list.length; mI++) {
+      plan.push({ r: p.list[mI], rank: p.list[mI].projRank, head: null });
+    }
+  }
+
   var h = '<div data-espstand>';
   h += _espStandToggleHtml(row, 'proj');
+  if (!_pdivs)
   h += '<div style="display:flex;align-items:baseline;gap:8px;padding:0 0 5px;' +
     'border-bottom:1px solid rgba(255,255,255,0.08);font-size:9px;letter-spacing:0.1em;' +
     'color:rgba(255,255,255,0.3);">' +
@@ -131434,8 +131492,24 @@ function _espProjStandingsHtml(row) {
     '<span style="flex:0 0 72px;text-align:right;">PROJ W-L-T</span>' +
     '</div>';
 
-  for (var i = 0; i < p.list.length; i++) {
-    var r = p.list[i];
+  for (var i = 0; i < plan.length; i++) {
+    var _pl = plan[i];
+    var r = _pl.r;
+    if (_pl.head) {
+      h += '<div style="display:flex;align-items:baseline;gap:8px;' +
+        'margin:' + (i ? '12px' : '2px') + ' 0 3px;padding:0 6px 3px;' +
+        'border-bottom:1px solid rgba(255,255,255,0.10);">' +
+        '<span style="flex:0 0 20px;"></span>' +
+        '<span style="flex:1;font-size:9.5px;font-weight:800;letter-spacing:0.14em;' +
+          'color:rgba(255,255,255,0.55);">' + slEsc(_pl.head) + '</span>' +
+        '<span style="flex:0 0 28px;text-align:right;font-size:8px;' +
+          'letter-spacing:0.1em;color:rgba(255,255,255,0.22);">MOVE</span>' +
+        '<span style="flex:0 0 44px;text-align:right;font-size:8px;' +
+          'letter-spacing:0.1em;color:rgba(255,255,255,0.22);">GB</span>' +
+        '<span style="flex:0 0 72px;text-align:right;font-size:8px;' +
+          'letter-spacing:0.1em;color:rgba(255,255,255,0.22);">PROJ W-L-T</span>' +
+        '</div>';
+    }
     var mine = !!myIds[r.teamId];
     var move = r.actualRank - r.projRank;    // positive = climbed
     var mvTxt = move > 0 ? '\u25b2' + move : move < 0 ? '\u25bc' + (-move) : '\u2013';
@@ -131457,12 +131531,19 @@ function _espProjStandingsHtml(row) {
     h += '<div style="display:flex;align-items:center;gap:8px;padding:7px 6px;border-radius:7px;' +
       'margin:0 0 2px;font-size:12.5px;' + (mine ? 'background:rgba(239,68,68,0.10);' : '') + '">' +
       '<span style="flex:0 0 20px;color:rgba(255,255,255,0.35);' + mono + '">' +
-        r.projRank + '</span>' +
+        _pl.rank + '</span>' +
       '<span style="flex:1;min-width:0;">' +
         '<span style="display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' +
           'color:' + (mine ? accent + ';font-weight:700' : 'rgba(255,255,255,0.82)') + ';">' +
           slEsc(r.teamName) + '</span>' +
         '<span style="display:block;font-size:9px;color:rgba(255,255,255,0.3);' + mono + '">' +
+          // Projected overall seed, since the grouped table no longer carries
+          // it in the row order. ESPDIV
+          (_pdivs
+            ? '<span style="color:' +
+                (r.projRank <= _pdivs.n ? 'rgba(74,222,128,0.75)' : 'rgba(255,255,255,0.4)') +
+                '">seed ' + r.projRank + '</span> \u00b7 '
+            : '') +
           'now ' + r.actualRank +
           (res ? '<span style="color:' + resCol + '"> \u00b7 ' + res + ' this period</span>' : '') +
         '</span>' +
@@ -131470,12 +131551,17 @@ function _espProjStandingsHtml(row) {
       '<span style="flex:0 0 28px;text-align:right;' + mono + 'color:' + mvCol + ';">' +
         mvTxt + '</span>' +
       '<span style="flex:0 0 44px;text-align:right;' + mono + '">' +
-        '<span style="display:block;color:' +
-          (r.projRank === 1 ? 'rgba(255,255,255,0.3)' : 'rgba(255,255,255,0.72)') + ';">' +
-          (r.projRank === 1 ? '\u2013' : _espGbFmt(r.gb)) + '</span>' +
+        // A dash marks whoever leads the race this row is IN — the division
+        // when there is one, the whole league otherwise. ESPDIV
+        (function () {
+          var lead = _pdivs ? (r.gb === 0) : (r.projRank === 1);
+          return '<span style="display:block;color:' +
+            (lead ? 'rgba(255,255,255,0.3)' : 'rgba(255,255,255,0.72)') + ';">' +
+            (lead ? '\u2013' : _espGbFmt(r.gb)) + '</span>';
+        })() +
         // Ground gained or lost by today's result. Lower GB is better, so a
         // negative number is the good one — spelled out in the note below.
-        ((r.projRank !== 1 && r.gbMove) ? '<span style="display:block;font-size:9px;' +
+        (((_pdivs ? r.gb !== 0 : r.projRank !== 1) && r.gbMove) ? '<span style="display:block;font-size:9px;' +
           'color:' + (r.gbMove < 0 ? '#4ade80' : '#f87171') + ';">' +
           (r.gbMove > 0 ? '+' : '\u2212') + _espGbFmt(Math.abs(r.gbMove)) + '</span>' : '') +
       '</span>' +
@@ -131493,9 +131579,13 @@ function _espProjStandingsHtml(row) {
       : cats ? 'Category leads decide each matchup.'
              : 'Running score decides each matchup.') +
     ' Matchups ESPN has already settled are left out, since their result is ' +
-    'in the record above. GB is games behind the projected leader, a tie ' +
+    'in the record above. GB is games behind the projected ' +
+    (_pdivs ? 'DIVISION ' : '') + 'leader, a tie ' +
     'counting half a win \u2014 the small figure under it is the ground ' +
-    'today\u2019s result gains (\u2212) or costs (+). The BRACKET tab has the ' +
+    'today\u2019s result gains (\u2212) or costs (+). ' +
+    (_pdivs ? ('Seeds are overall: the ' + _pdivs.n + ' division winners take ' +
+      'the top ' + _pdivs.n + '. ') : '') +
+    'The BRACKET tab has the ' +
     'gap to the playoff cutoff, which is the other number that matters.</div>';
   h += '</div>';
   return h;
