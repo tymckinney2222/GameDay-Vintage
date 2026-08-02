@@ -32598,7 +32598,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-08-02 16:24 UTC';
+var SK_BUILD = '2026-08-02 16:36 UTC';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -131206,6 +131206,113 @@ function espProjectedDeltas(row) {
   return out;
 }
 
+// ── DIVISIONS ── ESPDIV ──
+// A divisional league seeds division WINNERS first, then everyone else by
+// record. ESPN already does that server-side — its playoffSeed put R.B.I.
+// (138-130-20, .514) fourth ahead of Team Winkler (146-127-15, .533), which
+// only makes sense if R.B.I. leads a division. Three things follow from that
+// and none of them were right:
+//
+//   RECORD    ranks came from ESPN's divisional playoffSeed but the GB column
+//             came from record.overall.gamesBack, which is measured off the
+//             OVERALL leader. So the fourth seed showed 27.5 back while the
+//             fifth showed 22.0 — two columns describing different races.
+//   IF TODAY  re-sorted purely on win percentage, discarding the division
+//             rule entirely, so its seeds disagreed with the live ones.
+//   BRACKET   inherits whichever order it is handed, so it was right on the
+//             real standings and wrong on the projected ones.
+//
+// This is the shared layer. It returns null when a league has no divisions,
+// and every consumer falls back to exactly its old behaviour in that case.
+function espDivisions(row) {
+  var raw = (row || {}).raw || {};
+  var teams = raw.teams || [];
+  if (!teams.length) return null;
+
+  var byTeam = {}, ids = {}, n = 0, i;
+  for (i = 0; i < teams.length; i++) {
+    var t = teams[i] || {};
+    // ESPN's own field. The alternates cost nothing and cover the case where
+    // it arrives under a different spelling — better than the whole feature
+    // silently doing nothing.
+    var d = t.divisionId;
+    if (d == null) d = t.divisionID;
+    if (d == null) d = t.division;
+    if (d != null && typeof d === 'object') d = d.id;
+    if (d == null || d === '') continue;
+    byTeam[String(t.id)] = String(d);
+    if (!ids[String(d)]) { ids[String(d)] = 1; n++; }
+  }
+  // One division is no divisions. Two or more is a structure worth honouring.
+  if (n < 2) return null;
+
+  // Names, if the settings carry them. Purely cosmetic — the seeding works
+  // off the ids alone, so a missing name degrades to "Division 1".
+  var names = {};
+  var ds = ((raw.settings || {}).scheduleSettings || {}).divisions;
+  if (ds) {
+    if (Object.prototype.toString.call(ds) === '[object Array]') {
+      for (i = 0; i < ds.length; i++) {
+        if (ds[i] && ds[i].id != null) names[String(ds[i].id)] = ds[i].name || '';
+      }
+    } else {
+      for (var k in ds) {
+        if (!ds.hasOwnProperty(k)) continue;
+        var v = ds[k];
+        names[String((v && v.id != null) ? v.id : k)] =
+          (v && v.name) ? v.name : (typeof v === 'string' ? v : '');
+      }
+    }
+  }
+  var order = [];
+  for (var idk in ids) { if (ids.hasOwnProperty(idk)) order.push(idk); }
+  order.sort(function (a, b) { return Number(a) - Number(b); });
+  for (i = 0; i < order.length; i++) {
+    if (!names[order[i]]) names[order[i]] = 'Division ' + (i + 1);
+  }
+  return { byTeam: byTeam, names: names, order: order, n: n };
+}
+
+// Games behind WITHIN a division. Same formula the bracket cutline uses —
+// ((leadW - W) + (L - leadL)) / 2, ties as half — rather than a subtraction
+// of wins, because teams in these leagues rarely have equal games played.
+function espDivisionGb(rows, divs) {
+  if (!divs) return {};
+  var leadOf = {}, i, r, d;
+  for (i = 0; i < rows.length; i++) {
+    r = rows[i];
+    d = divs.byTeam[String(r.teamId)];
+    if (!d) continue;
+    var t3 = _espRecTriple(r);
+    var pct = (t3.w + t3.l + t3.t) ? (t3.w + t3.t / 2) / (t3.w + t3.l + t3.t) : 0;
+    if (!leadOf[d] || pct > leadOf[d].pct) leadOf[d] = { rec: t3, pct: pct };
+  }
+  var out = {};
+  for (i = 0; i < rows.length; i++) {
+    r = rows[i];
+    d = divs.byTeam[String(r.teamId)];
+    if (!d || !leadOf[d]) { out[String(r.teamId)] = null; continue; }
+    out[String(r.teamId)] = _espGbVs(leadOf[d].rec, _espRecTriple(r));
+  }
+  return out;
+}
+
+// Reorder a record-sorted list into playoff seed order: every division winner
+// first, ranked among themselves, then everyone else by record.
+//
+// The input MUST already be sorted best-record-first, because "division
+// winner" is defined as the first team of its division encountered.
+function espDivisionalSeedOrder(sorted, divs) {
+  if (!divs) return sorted.slice(0);
+  var seenDiv = {}, leaders = [], rest = [], i;
+  for (i = 0; i < sorted.length; i++) {
+    var d = divs.byTeam[String(sorted[i].teamId)];
+    if (d && !seenDiv[d]) { seenDiv[d] = 1; leaders.push(sorted[i]); }
+    else rest.push(sorted[i]);
+  }
+  return leaders.concat(rest);
+}
+
 // Games back, using the baseball formula rather than a subtraction of wins:
 //   GB = ((leadW - W) + (L - leadL)) / 2
 // The shortcut leadW - W is only right when both teams have played the same
@@ -131275,6 +131382,13 @@ function espProjectedStandings(row) {
   }
   // Win pct, then points-for as the tiebreak.
   out.sort(function (a, b) { return (b.pct - a.pct) || ((b.pf || 0) - (a.pf || 0)); });
+  // Then division winners to the top, because that is what the live seeding
+  // does and a projection that ignores it disagrees with the table it is
+  // projecting FROM. No divisions, no change. ESPDIV
+  var _divs = (typeof espDivisions === 'function') ? espDivisions(row) : null;
+  if (_divs && typeof espDivisionalSeedOrder === 'function') {
+    out = espDivisionalSeedOrder(out, _divs);
+  }
   for (i = 0; i < out.length; i++) {
     out[i].projRank = i + 1;
     // Measured from whoever leads AFTER today's result, which is the team at
@@ -131634,6 +131748,30 @@ function _espStandingsPaneHtml(row) {
     var _mid = (typeof espMyTeamId === 'function') ? espMyTeamId(row) : null;
     if (_mid != null && liveMap[String(_mid)] != null) myLive = liveMap[String(_mid)];
   }
+  // ── Divisions ── ESPDIV ──
+  // In a divisional league GB belongs to the DIVISION race. ESPN's
+  // record.overall.gamesBack is measured off the overall leader, which put
+  // the 4th seed 27.5 back and the 5th seed 22.0 back — a column that
+  // contradicts the ranks beside it.
+  var _divs = (typeof espDivisions === 'function') ? espDivisions(row) : null;
+  var _divGb = (_divs && !seasonPts && typeof espDivisionGb === 'function')
+    ? espDivisionGb(list, _divs) : null;
+  // If the seed order disagrees with the record order, the league IS
+  // divisional even when no division field came through — that mismatch is
+  // only possible under a division rule. Saying so beats silently showing a
+  // GB that argues with the ranks.
+  var _seedsImplyDivs = false;
+  if (!_divs && !seasonPts && list.length > 2) {
+    var _prev = null;
+    for (i = 0; i < list.length; i++) {
+      var _t3 = _espRecTriple(list[i]);
+      var _gp = _t3.w + _t3.l + _t3.t;
+      var _p = _gp ? (_t3.w + _t3.t / 2) / _gp : 0;
+      if (_prev != null && _p > _prev + 0.0005) { _seedsImplyDivs = true; break; }
+      _prev = _p;
+    }
+  }
+
   var h = '<div data-espstand>';
   h += _espStandToggleHtml(row, 'pts');   // ESPSEASONSTATS
   h += '<div style="display:flex;align-items:baseline;gap:8px;padding:0 0 5px;' +
@@ -131720,7 +131858,17 @@ function _espStandingsPaneHtml(row) {
           'font-family:var(--sk-font-mono,monospace);color:rgba(255,255,255,0.8);">' +
           slEsc(r.record || '\u2014') + '</span>' +
         '<span style="flex:0 0 34px;text-align:right;font-family:var(--sk-font-mono,monospace);' +
-          'color:rgba(255,255,255,0.5);">' + ((r.gb != null) ? r.gb : '\u2014') + '</span>' +
+          'color:rgba(255,255,255,0.5);">' +
+        // Divisional GB when the league has divisions, ESPN's overall figure
+        // otherwise. A division leader shows a dash, matching the app. ESPDIV
+        (function () {
+          if (_divGb) {
+            var dv = _divGb[String(r.teamId)];
+            if (dv == null) return '\u2014';
+            return (dv === 0) ? '\u2014' : _espGbFmt(dv);
+          }
+          return (r.gb != null) ? r.gb : '\u2014';
+        })() + '</span>' +
         (cats ? ''
           : '<span style="flex:0 0 56px;text-align:right;font-family:var(--sk-font-mono,monospace);' +
             'color:rgba(255,255,255,0.8);">' + ((r.pf != null) ? r.pf : '\u2014') + '</span>');
@@ -131735,6 +131883,19 @@ function _espStandingsPaneHtml(row) {
         ? ' \u00b7 GS is games started against this league\u2019s cap'
         : '') +
       '</div>';
+  }
+  // ESPDIV — say what the GB column is measuring, or why it can't.
+  if (_divGb && _divs) {
+    h += '<div style="font-size:9px;line-height:1.5;color:rgba(255,255,255,0.26);' +
+      'margin-top:6px;">GB is within the division \u2014 ' + _divs.n +
+      ' divisions, and their winners take the top ' + _divs.n + ' seeds. A ' +
+      'dash means that team leads its own.</div>';
+  } else if (_seedsImplyDivs) {
+    h += '<div style="font-size:9px;line-height:1.5;color:rgba(251,191,36,0.55);' +
+      'margin-top:6px;">These seeds don\u2019t follow record order, so this ' +
+      'league seeds by division \u2014 but no division field came through in ' +
+      'the payload, so GB is still measured from the overall leader and will ' +
+      'disagree with the ranks. Worth telling me if you see this.</div>';
   }
   h += '</div>';
   return h;
