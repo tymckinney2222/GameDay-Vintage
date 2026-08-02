@@ -32598,7 +32598,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-08-01 23:30 UTC';
+var SK_BUILD = '2026-08-02 11:30 UTC';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -130143,6 +130143,107 @@ function _espPacePanelHtml(row) {
       'you gained, red you lost. TOT is your week-to-date margin on that team. ' +
       'NEED is the weekly margin required to catch them. Blank days weren\u2019t ' +
       'snapped, or haven\u2019t completed.</div>';
+
+    // ── DAILY TOTALS: every team's own score, not a margin ── ESPDAYTOT ──
+    // The board above answers "am I gaining on them", which needs a margin.
+    // This answers "who actually scored what", which a margin cannot show —
+    // a +30 day looks identical whether you put up 80 against their 50 or 40
+    // against their 10. Same snapshot data, no extra fetch: espWeekProduction
+    // already returns each day as a teamId -> points map and the section above
+    // only ever subtracts two of them.
+    var totRows = [];
+    for (q = 0; q < p.rows.length; q++) {
+      var tr = p.rows[q];
+      var tid = String(tr.teamId);
+      var cells = [], tsum = 0, tany = false;
+      for (i = 0; i < 7; i++) {
+        var dtp = wp.days[i];
+        var vv = (dtp && dtp[tid] != null) ? dtp[tid] : null;
+        cells.push(vv);
+        if (vv != null) { tsum += vv; tany = true; }
+      }
+      totRows.push({
+        teamId: tid, name: tr.teamName, cells: cells,
+        tot: tany ? Math.round(tsum) : null,
+        mine: (myKey != null && tid === myKey)
+      });
+    }
+    // Ordered by what they actually scored this week, so the row order is the
+    // week's leaderboard rather than the season standings.
+    totRows.sort(function (a, b) {
+      if (a.tot == null && b.tot == null) return a.name.localeCompare(b.name);
+      if (a.tot == null) return 1;
+      if (b.tot == null) return -1;
+      return b.tot - a.tot;
+    });
+
+    // The best score in each column, so the eye finds the day's winner without
+    // reading every cell. Ties all highlight — there is no reason to pick one.
+    // A best of zero is not a winner though: on a day nobody scored, gilding
+    // every row would turn the highlight into noise.
+    var dayBest = [], bestTot = null;
+    for (i = 0; i < 7; i++) {
+      var bv = null;
+      for (q = 0; q < totRows.length; q++) {
+        var cv = totRows[q].cells[i];
+        if (cv == null) continue;
+        if (bv == null || cv > bv) bv = cv;
+      }
+      dayBest.push((bv != null && bv > 0) ? bv : null);
+    }
+    for (q = 0; q < totRows.length; q++) {
+      if (totRows[q].tot != null && (bestTot == null || totRows[q].tot > bestTot)) {
+        bestTot = totRows[q].tot;
+      }
+    }
+
+    h += '<div style="font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
+      'margin:16px 0 2px;">DAILY TOTALS \u00b7 every team\u2019s own score</div>';
+    h += '<div style="overflow-x:auto;-webkit-overflow-scrolling:touch;">' +
+      '<div style="min-width:340px;">';
+    h += '<div style="display:flex;gap:2px;align-items:center;padding:0 0 3px;' +
+      'font-size:8px;letter-spacing:0.05em;color:rgba(255,255,255,0.22);">' +
+      '<span style="flex:0 0 76px;">TEAM</span>';
+    for (i = 0; i < 7; i++) {
+      var isT2 = (_espDateAdd(wp.weekStart, i) === todayStr);
+      h += '<span style="' + cellW + (isT2 ? 'color:rgba(251,191,36,0.7);' : '') + '">' +
+        DAYS[i] + '</span>';
+    }
+    h += '<span style="flex:0 0 40px;text-align:right;">TOT</span></div>';
+
+    for (q = 0; q < totRows.length; q++) {
+      var t2 = totRows[q], cellsH2 = '';
+      for (i = 0; i < 7; i++) {
+        var c2 = t2.cells[i];
+        if (c2 == null) {
+          cellsH2 += '<span style="' + cellW + 'color:rgba(255,255,255,0.14);">\u00b7</span>';
+          continue;
+        }
+        var isBest = (dayBest[i] != null && c2 === dayBest[i]);
+        cellsH2 += '<span style="' + cellW + 'color:' +
+          (isBest ? 'rgba(251,191,36,0.95);font-weight:700' : 'rgba(255,255,255,0.62)') +
+          ';">' + Math.round(c2) + '</span>';
+      }
+      h += '<div style="display:flex;gap:2px;align-items:center;padding:3px 0;' + mono +
+        'font-size:10px;' +
+        (t2.mine ? 'background:rgba(255,255,255,0.035);' : '') + '">' +
+        '<span style="flex:0 0 76px;overflow:hidden;text-overflow:ellipsis;' +
+          'white-space:nowrap;color:' +
+          (t2.mine ? accent + ';font-weight:700' : 'rgba(255,255,255,0.6)') + ';">' +
+          slEsc(t2.name) + '</span>' +
+        cellsH2 +
+        '<span style="flex:0 0 40px;text-align:right;font-weight:700;color:' +
+          (t2.tot == null ? 'rgba(255,255,255,0.14)'
+            : (bestTot != null && t2.tot === bestTot) ? 'rgba(251,191,36,0.95)'
+            : 'rgba(255,255,255,0.85)') + ';">' +
+          (t2.tot == null ? '\u00b7' : t2.tot) + '</span>' +
+      '</div>';
+    }
+    h += '</div></div>';
+    h += '<div style="color:rgba(255,255,255,0.22);font-size:8.5px;margin-top:4px;' +
+      'line-height:1.5;">What each team actually scored, ordered by the week so ' +
+      'far. Gold is the best score in that column. Same completed-day snapshots ' +
+      'as above, so the blanks match.</div>';
   }
 
   // ── WEEKLY TOTALS: my margin on the nearest rivals, week by week ──
