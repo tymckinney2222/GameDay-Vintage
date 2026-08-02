@@ -32598,7 +32598,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-08-02 21:47 UTC';
+var SK_BUILD = '2026-08-02 21:57 UTC';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -126950,6 +126950,14 @@ var ESP_STAT_NAMES = { flb: ESP_STAT_NAME_FLB };
 // 71 (FPCT) is a rate and must never be summed — that omission is exactly
 // what produced a fielding percentage of 6.89. ESPFPCT
 var ESP_STAT_RATE = { 2: 1, 9: 1, 17: 1, 18: 1, 41: 1, 47: 1, 49: 1, 71: 1, 82: 1 };
+// ESPN files fielding percentage under its own FIELDING heading, between
+// batting and pitching. espStatSide only knows batter-or-pitcher (id >= 32),
+// which would file it with the arms. ESPGROUP3
+var ESP_STAT_FIELDING = { 71: 1 };
+function espStatGroup(game, id) {
+  if (ESP_STAT_FIELDING[id]) return 'f';
+  return (typeof espStatSide === 'function') ? espStatSide(game, id) : 'b';
+}
 
 function espStatName(game, id) {
   var m = ESP_STAT_NAMES[game];
@@ -128512,10 +128520,18 @@ function _espCatBreakdownHtml(row) {
   var game = 'flb';
   var sp = String(row.sport || '').toLowerCase();
   if (sp === 'nfl') game = 'ffl'; else if (sp === 'nba') game = 'fba'; else if (sp === 'nhl') game = 'fhl';
-  // Keep the league's own category order where we know it.
+  // Grouped the way ESPN groups it — BATTING, then FIELDING, then PITCHING —
+  // with the league's own order preserved inside each group. The league order
+  // alone interleaved a pitching K between SLG and OBP and put fielding
+  // percentage among the bats, so the column read as a jumble against the
+  // app. ESPGROUP3
   var order = espScoredIds(row), pos = {}, i;
   for (i = 0; i < order.length; i++) pos[order[i]] = i;
+  var GRANK = { b: 0, f: 1, p: 2 };
   cb.rows.sort(function (x, y) {
+    var gx = GRANK[espStatGroup(game, x.id)];
+    var gy = GRANK[espStatGroup(game, y.id)];
+    if (gx !== gy) return gx - gy;
     var px = (pos[x.id] != null) ? pos[x.id] : 999;
     var py = (pos[y.id] != null) ? pos[y.id] : 999;
     return px - py || Number(x.id) - Number(y.id);
@@ -128544,9 +128560,20 @@ function _espCatBreakdownHtml(row) {
     '</div></div>';
   }
 
+  var GLABEL = { b: 'BATTING', f: 'FIELDING', p: 'PITCHING' };
+  var lastGroup = null;
   h += '<div class="fy-cats-list">';
   for (i = 0; i < cb.rows.length; i++) {
     var r = cb.rows[i];
+    // Only label a group when the league actually scores more than one, so a
+    // pitching-only league doesn't get a lone header. ESPGROUP3
+    var grp = espStatGroup(game, r.id);
+    if (grp !== lastGroup) {
+      lastGroup = grp;
+      h += '<div style="font-size:8.5px;font-weight:800;letter-spacing:0.16em;' +
+        'color:rgba(255,255,255,0.3);padding:' + (i ? '12px' : '2px') + ' 2px 4px;">' +
+        GLABEL[grp] + '</div>';
+    }
     h += _espCatRowHtml(r.id, game, r.mine, r.opp, r.result);
   }
   h += '</div>';
@@ -128822,6 +128849,23 @@ function espLiveCatValues(scoreByStat, todayByStat) {
   for (k in ESP_RATE_RECIPE) {
     if (!ESP_RATE_RECIPE.hasOwnProperty(k)) continue;
     var r = ESP_RATE_RECIPE[k];
+    // Every component must come from the SAME scope. `out` here is the
+    // period total plus today, but a component the league doesn't score is
+    // absent from scoreByStat and therefore carries TODAY's value only.
+    // Dividing today's total bases by the period's at-bats gave a slugging
+    // figure of .027 against a real .351 — arithmetic on two different
+    // timeframes. If a part is missing from the period baseline, the recipe
+    // can't be run and ESPN's own value stands. ESPRATESCOPE
+    if (scoreByStat) {
+      var mixed = false, ci;
+      for (ci = 0; ci < r.num.length; ci++) {
+        if (scoreByStat[r.num[ci]] == null) mixed = true;
+      }
+      for (ci = 0; ci < r.den.length; ci++) {
+        if (scoreByStat[r.den[ci]] == null) mixed = true;
+      }
+      if (mixed) continue;
+    }
     // The NUMERATOR has to be present too, not just the denominator. Without
     // this a missing total-bases figure alongside a real at-bat count gives
     // slugging of 0/100 = .000, silently overwriting a correct .292 — and the
