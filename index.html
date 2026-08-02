@@ -32598,7 +32598,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-08-02 15:32 UTC';
+var SK_BUILD = '2026-08-02 15:41 UTC';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -129464,6 +129464,19 @@ function espWritePtsSnapshot(row, date) {
 
   var live = (typeof espLiveStandings === 'function') ? espLiveStandings(row).live : {};
   var pfByTeam = {}, liveByTeam = {}, captured = 0, i;
+  // ESPNHLCAP
+  var gpByTeam = null;
+  var _gpCaps = (typeof espNhlCaps === 'function') ? espNhlCaps(row) : null;
+  if (_gpCaps) {
+    var _rawTeams = ((row.raw || {}).teams) || [], _ti;
+    gpByTeam = {};
+    for (_ti = 0; _ti < _rawTeams.length; _ti++) {
+      var _vb = _rawTeams[_ti].valuesByStat;
+      var _gp = (_vb && _vb[String(_gpCaps.statId)] != null)
+        ? Number(_vb[String(_gpCaps.statId)]) : null;
+      if (_gp != null && !isNaN(_gp)) gpByTeam[String(_rawTeams[_ti].id)] = _gp;
+    }
+  }
   for (i = 0; i < rows.length; i++) {
     var r = rows[i];
     if (r.pf == null || isNaN(Number(r.pf))) continue;
@@ -129485,7 +129498,13 @@ function espWritePtsSnapshot(row, date) {
     // the live figures are just the completed totals, and the day's record
     // can be upgraded later — see espMaybeSnapshot. ESPPTSSNAP
     hadRosters: !!(row.rosters && row.rosters.byTeam),
-    pfByTeam: pfByTeam, liveByTeam: liveByTeam
+    pfByTeam: pfByTeam, liveByTeam: liveByTeam,
+    // Games played per team, banked from today. ESPN reports this only as a
+    // running total, so a day's usage can only ever be the difference between
+    // two mornings — which means the history has to start being kept before
+    // it can be read. Costs a few bytes and makes a burn-rate view possible
+    // later; absent for non-NHL leagues, where it stays undefined. ESPNHLCAP
+    gpByTeam: gpByTeam
   };
   var k = _espPtsSnapKey(row.key, snapDate);
   var json = JSON.stringify(snap);
@@ -129962,105 +129981,182 @@ function espRivalsAhead(row, n) {
   return list.slice(0, n || 3);
 }
 
-// ── NHL GAME-LIMIT PROBE ── ESPNHLCAP ──
-// MLB caps one thing — games started — and reads it as
-//   cap  = rosterSettings.lineupSlotStatLimits[*].limitValue   (one node)
-//   used = teams[].valuesByStat['33']                          (one number)
+// ── NHL GAMES-PLAYED CAPS ── ESPNHLCAP ──
+// Confirmed by probe against the drafted 2027 league, not inferred:
+//   rosterSettings.lineupSlotStatLimits
+//     [3] limitValue=738  statId=30      [5] limitValue=164  statId=30
+//     [4] limitValue=410  statId=30      [6] limitValue=82   statId=30
+//   lineupSlotCounts: 3:9  4:5  5:2  6:1  7:5  8:1
+//   teams[].valuesByStat: stat 30 present
 //
-// Hockey caps FOUR things independently: Forwards 738, Defensemen 410,
-// Goalies 164, Utility 82. The caps are almost certainly the same node keyed
-// by lineup slot, and the slots are now known (3=F, 4=D, 5=G, 6=UTIL). The
-// USED side is the open question, and it is the one the whole feature rests
-// on: valuesByStat is keyed by STAT, not by slot, so a single games-played
-// total cannot say how many of those games were forwards. If ESPN doesn't
-// break it down, a four-way board can show budgets but not burn.
+// Two things fall out of that. First, every cap is exactly 82 x its slot
+// count — 738/9, 410/5, 164/2, 82/1 all give 82, and 9+5+2+1 = 17 slots
+// against a 1394 total. So these are not a budget to spend down; they are
+// one full season per starting slot, and the only way to run short is to
+// waste games — streaming, or starting somebody on an off night.
 //
-// espStatLimit is also wrong for this shape — it returns the FIRST node
-// matching a statId and ignores the slot key, which collapses four caps into
-// one. That's correct for MLB and needs a slot-aware sibling here.
-//
-// So this dumps rather than guesses. Three payload assumptions have each cost
-// a round trip this month; the fourth gets asked instead.
-function _espNhlCapProbe(row) {
-  var s = ((row || {}).raw || {}).settings || {};
-  var rs = s.rosterSettings || {};
-  var teams = ((row || {}).raw || {}).teams || [];
-  var mono = 'font-family:var(--sk-font-mono,monospace);font-size:9.5px;';
-  var L = [], k, k2;
+// Second, and this is the limit of what can be built: valuesByStat is keyed
+// by STAT, not by slot. Stat 30 gives one games-played total per team and
+// nothing splits it four ways. The caps are per position but the usage is
+// not, so this board tracks the AGGREGATE honestly rather than inventing a
+// per-position split that the payload cannot support. The per-slot caps are
+// still shown, because knowing the composition is what makes the total mean
+// anything.
+var ESP_NHL_GP_STAT = 30;
 
-  L.push(['lineupSlotStatLimits', null]);
+function espNhlCaps(row) {
+  if (typeof espIsSeasonPts !== 'function' || !espIsSeasonPts(row)) return null;
+  if (String((row || {}).sport || '').toLowerCase() !== 'nhl') return null;
+  var rs = (((row.raw || {}).settings) || {}).rosterSettings || {};
   var lim = rs.lineupSlotStatLimits;
-  if (!lim) L.push(['  ABSENT', null]);
-  else {
-    var n = 0;
-    for (k in lim) {
-      if (!lim.hasOwnProperty(k)) continue;
-      n++;
-      var node = lim[k], f = [];
-      if (node && typeof node === 'object') {
-        for (k2 in node) { if (node.hasOwnProperty(k2)) f.push(k2 + '=' + node[k2]); }
-      } else f.push(String(node));
-      L.push(['  [slot ' + k + '] ' + f.join('  '), null]);
+  if (!lim) return null;
+  var counts = rs.lineupSlotCounts || {};
+  var slots = [], total = 0, k;
+  for (k in lim) {
+    if (!lim.hasOwnProperty(k)) continue;
+    var n = lim[k];
+    if (!n || typeof n !== 'object') continue;
+    var v = Number(n.limitValue);
+    if (isNaN(v) || v <= 0) continue;
+    // Every cap in this league names stat 30. Matching on it rather than
+    // taking whatever is present means a league that caps something else
+    // doesn't get silently folded into a games-played total.
+    if (String(n.statId) !== String(ESP_NHL_GP_STAT)) continue;
+    var cnt = Number(counts[k]);
+    slots.push({
+      slot: String(k),
+      label: (typeof _espSlotLabel === 'function') ? _espSlotLabel('fhl', k, null) : ('#' + k),
+      cap: v,
+      count: (isNaN(cnt) || cnt <= 0) ? null : cnt,
+      // Games per slot: 82 in a normal season, and worth deriving rather
+      // than hardcoding so a shortened season reports itself.
+      perSlot: (!isNaN(cnt) && cnt > 0) ? Math.round(v / cnt) : null
+    });
+    total += v;
+  }
+  if (!slots.length) return null;
+  slots.sort(function (a, b) { return Number(a.slot) - Number(b.slot); });
+  return { slots: slots, total: total, statId: ESP_NHL_GP_STAT };
+}
+
+// Per-team burn against the aggregate cap. Same shape as the MLB cap watch,
+// because it is the same question: who runs out before the season does.
+function espNhlCapWatch(row) {
+  var caps = espNhlCaps(row);
+  if (!caps) return null;
+  var clock = (typeof espSeasonClock === 'function') ? espSeasonClock(row) : null;
+  var ls = (typeof espLiveStandings === 'function') ? espLiveStandings(row) : null;
+  if (!ls || !ls.list.length) return null;
+  var teams = ((row.raw || {}).teams) || [];
+  var byId = {}, i;
+  for (i = 0; i < teams.length; i++) byId[String(teams[i].id)] = teams[i];
+  var myId = (typeof espMyTeamId === 'function') ? espMyTeamId(row) : null;
+  var wksElapsed = (clock && clock.weeksElapsed > 0) ? clock.weeksElapsed : null;
+
+  var out = [], anyUsed = false;
+  for (i = 0; i < ls.list.length; i++) {
+    var r = ls.list[i];
+    var t = byId[String(r.teamId)];
+    var vb = t && t.valuesByStat;
+    var used = (vb && vb[String(caps.statId)] != null)
+      ? Number(vb[String(caps.statId)]) : null;
+    if (used == null || isNaN(used)) used = 0;
+    if (used > 0) anyUsed = true;
+    var left = caps.total - used;
+    var perWk = wksElapsed ? (used / wksElapsed) : null;
+    var wksToCap = (perWk && perWk > 0) ? (left / perWk) : null;
+    // "On budget" is the honest reference: the season has offered a share of
+    // the allowance so far, and a team is ahead or behind THAT, not ahead or
+    // behind the whole cap. Without a season clock there is no share to
+    // compare against and the figure is withheld rather than guessed.
+    var budget = null, waste = null;
+    if (clock && clock.weeksElapsed != null && clock.weeksLeft != null) {
+      var wkTotal = clock.weeksElapsed + clock.weeksLeft;
+      if (wkTotal > 0) {
+        budget = caps.total * (clock.weeksElapsed / wkTotal);
+        waste = Math.round(used - budget);
+      }
     }
-    if (!n) L.push(['  present but empty', null]);
+    out.push({
+      teamId: r.teamId, teamName: r.teamName,
+      used: Math.round(used), cap: caps.total, left: Math.round(left),
+      perWk: (perWk == null) ? null : Math.round(perWk * 10) / 10,
+      wksToCap: (wksToCap == null) ? null : Math.round(wksToCap * 10) / 10,
+      freezes: !!(wksToCap != null && clock && wksToCap < clock.weeksLeft),
+      waste: waste,
+      mine: (myId != null && String(r.teamId) === String(myId))
+    });
+  }
+  out.sort(function (a, b) { return b.used - a.used; });
+  return { caps: caps, rows: out, clock: clock, anyUsed: anyUsed };
+}
+
+function _espNhlCapHtml(row, accent, mono) {
+  var cw = espNhlCapWatch(row);
+  if (!cw) return '';
+  var i, h = '';
+  var caps = cw.caps;
+
+  var parts = [];
+  for (i = 0; i < caps.slots.length; i++) {
+    var sl = caps.slots[i];
+    parts.push(sl.label + ' ' + sl.cap +
+      (sl.count ? ('<span style="color:rgba(255,255,255,0.25)"> (' + sl.count +
+        (sl.perSlot ? '\u00d7' + sl.perSlot : '') + ')</span>') : ''));
   }
 
-  var lsc = rs.lineupSlotCounts;
-  if (lsc) {
-    var sl = [];
-    for (k in lsc) { if (lsc.hasOwnProperty(k)) sl.push(k + ':' + lsc[k]); }
-    L.push(['lineupSlotCounts  ' + sl.join('  '), null]);
+  h += '<div style="font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
+    'margin:14px 0 2px;">GAME LIMITS \u00b7 GAMES PLAYED</div>' +
+    '<div style="font-size:9.5px;color:rgba(255,255,255,0.34);margin:0 0 3px;' + mono + '">' +
+    parts.join('<span style="color:rgba(255,255,255,0.18)"> \u00b7 </span>') + '</div>' +
+    '<div style="font-size:9.5px;color:rgba(255,255,255,0.3);margin:0 0 8px;">' +
+    'cap ' + caps.total + ' total \u00b7 one full season per starting slot, so ' +
+    'the only way to run short is to waste games</div>';
+
+  if (!cw.anyUsed) {
+    h += '<div style="font-size:10.5px;line-height:1.55;color:rgba(255,255,255,0.35);' +
+      'padding:6px 0 2px;">Nobody has played a game yet \u2014 this fills in from ' +
+      'opening night.</div>';
   }
 
-  // Anywhere in settings carrying one of the four numbers off the app screen.
-  var want = { 738: 1, 410: 1, 164: 1, 82: 1 }, hits = [], seen = 0;
-  (function walk(o, path, d) {
-    if (!o || typeof o !== 'object' || d > 5 || seen > 4000) return;
-    for (var kk in o) {
-      if (!o.hasOwnProperty(kk)) continue;
-      seen++;
-      var v = o[kk], pp = path ? (path + '.' + kk) : kk;
-      if (v && typeof v === 'object') walk(v, pp, d + 1);
-      else if (typeof v === 'number' && want[v]) hits.push('  ' + pp + ' = ' + v);
+  for (i = 0; i < cw.rows.length; i++) {
+    var g = cw.rows[i];
+    var pct = caps.total > 0 ? Math.round((g.used / caps.total) * 100) : 0;
+    var barCol = g.freezes ? '#f87171' : (g.mine ? accent : 'rgba(255,255,255,0.28)');
+    // Ahead of budget is the warning colour: it means games are going faster
+    // than the season is, which is the only way this cap ever bites.
+    var wTxt = '', wCol = 'rgba(255,255,255,0.3)';
+    if (g.waste != null) {
+      if (g.waste > 0) { wTxt = '+' + g.waste + ' over'; wCol = '#f87171'; }
+      else if (g.waste < 0) { wTxt = g.waste + ' under'; wCol = 'rgba(255,255,255,0.42)'; }
+      else { wTxt = 'on budget'; wCol = 'rgba(255,255,255,0.42)'; }
     }
-  })(s, '', 0);
-  L.push(['settings fields holding 738 / 410 / 164 / 82  (' + hits.length + ')', null]);
-  for (k = 0; k < hits.length && k < 14; k++) L.push([hits[k], null]);
-  if (!hits.length) L.push(['  none \u2014 the caps are not in mSettings', null]);
-
-  // The used side. Every statId this team reports, so a games-played
-  // breakdown would be visible if one exists.
-  var t0 = teams[0];
-  var vb = t0 && t0.valuesByStat;
-  if (!vb) L.push(['teams[0].valuesByStat  ABSENT', null]);
-  else {
-    var keys = [], cnt = 0;
-    for (k in vb) { if (vb.hasOwnProperty(k)) { keys.push(k + '=' + vb[k]); cnt++; } }
-    L.push(['teams[0].valuesByStat  (' + cnt + ' stats) ' + (t0.abbrev || ''), null]);
-    for (k = 0; k < keys.length; k += 6) {
-      L.push(['  ' + keys.slice(k, k + 6).join('  '), null]);
-    }
-  }
-  // Any other per-team node that might carry the breakdown.
-  if (t0) {
-    var tk = [];
-    for (k in t0) { if (t0.hasOwnProperty(k)) tk.push(k); }
-    L.push(['teams[0] keys  ' + tk.join(' '), null]);
+    h += '<div style="display:flex;align-items:center;gap:8px;padding:5px 6px;' +
+      'border-radius:6px;' + (g.mine ? 'background:rgba(239,68,68,0.10);' : '') + '">' +
+      '<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;' +
+        'white-space:nowrap;font-size:12px;color:' +
+        (g.mine ? accent + ';font-weight:700' : 'rgba(255,255,255,0.72)') + ';">' +
+        slEsc(g.teamName) + '</span>' +
+      '<span style="flex:0 0 62px;height:5px;border-radius:3px;' +
+        'background:rgba(255,255,255,0.08);overflow:hidden;">' +
+        '<span style="display:block;height:100%;width:' + Math.max(0, Math.min(100, pct)) +
+        '%;background:' + barCol + ';"></span></span>' +
+      '<span style="flex:0 0 74px;text-align:right;' + mono + 'font-size:11px;' +
+        'color:rgba(255,255,255,0.7);">' + g.used + '/' + caps.total + '</span>' +
+      '<span style="flex:0 0 66px;text-align:right;' + mono + 'font-size:10px;color:' +
+        (g.freezes ? '#f87171' : wCol) + ';">' +
+        (g.freezes && g.wksToCap != null
+          ? ('caps in ' + g.wksToCap + 'w')
+          : slEsc(wTxt)) + '</span>' +
+    '</div>';
   }
 
-  var h = '<div style="margin:16px 0 0;padding-top:10px;' +
-    'border-top:1px solid rgba(255,255,255,0.08);">' +
-    '<div style="font-size:9px;letter-spacing:0.1em;color:#fbbf24;margin:0 0 6px;">' +
-    'NHL GAME-LIMIT PROBE \u00b7 shape report</div>';
-  for (k = 0; k < L.length; k++) {
-    h += '<div style="' + mono + 'color:rgba(255,255,255,' +
-      (L[k][0].charAt(0) === ' ' ? '0.6' : '0.85') + ');white-space:pre-wrap;' +
-      'word-break:break-word;line-height:1.55;">' + slEsc(L[k][0]) + '</div>';
-  }
-  h += '<div style="font-size:9px;color:rgba(255,255,255,0.28);margin-top:8px;' +
-    'line-height:1.5;">Screenshot this and the four-way pace board gets built ' +
-    'against the real fields. What matters most: whether anything here breaks ' +
-    'games played down by position, or only gives one total.</div></div>';
+  h += '<div style="color:rgba(255,255,255,0.22);font-size:8.5px;margin-top:4px;' +
+    'line-height:1.5;">ESPN caps each position separately but reports games ' +
+    'played as a single total, so this tracks the aggregate. Over/under is ' +
+    'against the share of the allowance the season has offered so far. A team ' +
+    'can sit on budget overall and still run dry in one position \u2014 the ' +
+    'per-slot split needs a source ESPN doesn\u2019t expose.</div>';
   return h;
 }
 
@@ -130081,9 +130177,8 @@ function _espPacePanelHtml(row) {
 
   // NHL probe rides at the foot of this panel until the four-way board
   // replaces it. ESPNHLCAP
-  var _nhlProbe = (String(row.sport || '').toLowerCase() === 'nhl' &&
-                   typeof _espNhlCapProbe === 'function')
-    ? _espNhlCapProbe(row) : '';
+  var _nhlCap = (typeof _espNhlCapHtml === 'function')
+    ? _espNhlCapHtml(row, accent, mono) : '';
 
   h += '<div style="font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
     'margin:0 0 2px;">PACE PER WEEK</div>' +
@@ -130454,7 +130549,7 @@ function _espPacePanelHtml(row) {
       'automatic on every sync</span>' +
   '</div>';
   h += '</div>';
-  h += _nhlProbe;          // ESPNHLCAP
+  h += _nhlCap;            // ESPNHLCAP
   return h;
 }
 
