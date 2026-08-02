@@ -32598,7 +32598,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-08-02 16:13 UTC';
+var SK_BUILD = '2026-08-02 16:24 UTC';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -126898,6 +126898,16 @@ var ESP_STAT_NAME_FLB = {
   // automatic: espStatSide puts anything >= 32 on the pitching side, so it
   // can't collide with batting HR at id 5. ESPHRA
   34: 'IP', 37: 'H', 39: 'BB', 41: 'WHIP', 45: 'ER', 46: 'HR',
+  // 49, 71, 82, 83 identified the same way — by matching values against the
+  // app's own matchup screen, never by assuming ESPN's numbering:
+  //   #71 read 1 vs 1        -> QS   (app: 1 / 1)
+  //   #49 read 8.72 vs 9.00  -> K/9  (app: 8.72 / 9.00)
+  //   #82 read 3.50 vs 6.40  -> K/BB (app: 3.50 / 6.40)
+  //   #83 read 3 vs 1        -> SVHD (app: 3 / 1)
+  // K/9 and K/BB got a second, independent check: solved back through each
+  // team's own ERA and WHIP they give whole-number walks (5 and 6) and ~10
+  // earned runs apiece, which a wrong mapping would not. ESPCAT4
+  49: 'K/9', 71: 'QS', 82: 'K/BB', 83: 'SVHD',
   // 33 is GAMES STARTED, confirmed not inferred: the probe read 33 = 79 for
   // CORKED and the ESPN app's roster header showed "Max Games Started
   // 79/200" for that same team. An earlier guess had it as HR allowed
@@ -126928,7 +126938,9 @@ var ESP_STAT_NAME_FLB = {
 // label. If W and L ever read backwards, swapping 53/54 here is the fix.
 var ESP_STAT_NAMES = { flb: ESP_STAT_NAME_FLB };
 // Rate stats want decimals; counting stats don't.
-var ESP_STAT_RATE = { 2: 1, 9: 1, 17: 1, 18: 1, 41: 1, 47: 1 };
+// 49 (K/9) and 82 (K/BB) join for the reason the flag exists: adding one
+// pitcher's K/9 to another's is meaningless, exactly as it is for ERA. ESPCAT4
+var ESP_STAT_RATE = { 2: 1, 9: 1, 17: 1, 18: 1, 41: 1, 47: 1, 49: 1, 82: 1 };
 
 function espStatName(game, id) {
   var m = ESP_STAT_NAMES[game];
@@ -126945,22 +126957,18 @@ var ESP_STAT_NO_LEAD_ZERO = { 2: 1, 9: 1, 17: 1, 18: 1 };
 function espStatFmt(id, v) {
   if (v == null) return '\u2014';
   var n = Number(v);
-  // An id with no name is one nobody has identified yet, and the only way to
-  // identify it is to match its value against the app's own screen. Rounding
-  // to one decimal defeats that — two different rates both print as "1" and
-  // the category looks like a tie that scores as a loss. Unmapped ids
-  // therefore print in full until they're named. ESPUNMAPPED
-  if (!ESP_STAT_RATE[id] && typeof espStatName === 'function' &&
-      !espStatName('flb', id) && n !== Math.round(n)) {
-    return String(Math.round(n * 1000) / 1000);
-  }
   if (ESP_STAT_RATE[id]) {
     var r = (Math.round(n * 1000) / 1000).toFixed(3);
     return ESP_STAT_NO_LEAD_ZERO[id] ? r.replace(/^0/, '') : r;
   }
   // Outs back to innings in baseball notation: 145 outs is 48.1, not 48.3.
   if (String(id) === '34') return Math.floor(n / 3) + '.' + (n % 3);
-  return String(Math.round(n * 10) / 10);
+  // Everything else here is a COUNT, and counts are whole numbers. A
+  // fractional value means either an unidentified rate or something
+  // unexpected — and rounding it to one decimal hides both. That is how two
+  // different values came to print as "1" and "1", a row that looked like a
+  // tie while scoring as a loss. Whole numbers are unaffected. ESPUNMAPPED
+  return String(Math.round(n * 1000) / 1000);
 }
 
 // The seven windows, in the order the ESPN app lists them.
@@ -128675,11 +128683,20 @@ function _espMatchupPaneHtml(row) {
 var ESP_RATE_RECIPE = {
   2:  { num: [1],       den: [0],  mode: 'ratio' },
   41: { num: [37, 39],  den: [34], mode: 'whip' },
-  47: { num: [45],      den: [34], mode: 'era'  }
+  47: { num: [45],      den: [34], mode: 'era'  },
+  // K/9 is strikeouts per nine innings, which is the ERA shape with K on top
+  // (den 34 is OUTS, and 'era' divides by den/3 then multiplies by 9).
+  // K/BB is a plain ratio of the two counts. ESPCAT4
+  49: { num: [48],      den: [34], mode: 'era'  },
+  82: { num: [48],      den: [39], mode: 'ratio' }
 };
 // Components needed by the recipes above. For a categories league these
 // have to survive the trim even though they aren't scored categories.
-var ESP_RATE_COMPONENTS = [0, 1, 34, 37, 39, 45];
+// 48 (pitcher K) joins because K/9 and K/BB are built from it. It is usually
+// a scored category in its own right and would survive anyway, but a league
+// that scores K/9 without scoring K would otherwise lose the numerator.
+// ESPCAT4
+var ESP_RATE_COMPONENTS = [0, 1, 34, 37, 39, 45, 48];
 
 // Which categories you WANT to be lower. Everything else is higher-better.
 // Note 10 (batter walks) and 39 (walks allowed) are different ids, so
