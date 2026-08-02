@@ -32598,7 +32598,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-08-02 15:18 UTC';
+var SK_BUILD = '2026-08-02 15:32 UTC';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -129962,6 +129962,108 @@ function espRivalsAhead(row, n) {
   return list.slice(0, n || 3);
 }
 
+// ── NHL GAME-LIMIT PROBE ── ESPNHLCAP ──
+// MLB caps one thing — games started — and reads it as
+//   cap  = rosterSettings.lineupSlotStatLimits[*].limitValue   (one node)
+//   used = teams[].valuesByStat['33']                          (one number)
+//
+// Hockey caps FOUR things independently: Forwards 738, Defensemen 410,
+// Goalies 164, Utility 82. The caps are almost certainly the same node keyed
+// by lineup slot, and the slots are now known (3=F, 4=D, 5=G, 6=UTIL). The
+// USED side is the open question, and it is the one the whole feature rests
+// on: valuesByStat is keyed by STAT, not by slot, so a single games-played
+// total cannot say how many of those games were forwards. If ESPN doesn't
+// break it down, a four-way board can show budgets but not burn.
+//
+// espStatLimit is also wrong for this shape — it returns the FIRST node
+// matching a statId and ignores the slot key, which collapses four caps into
+// one. That's correct for MLB and needs a slot-aware sibling here.
+//
+// So this dumps rather than guesses. Three payload assumptions have each cost
+// a round trip this month; the fourth gets asked instead.
+function _espNhlCapProbe(row) {
+  var s = ((row || {}).raw || {}).settings || {};
+  var rs = s.rosterSettings || {};
+  var teams = ((row || {}).raw || {}).teams || [];
+  var mono = 'font-family:var(--sk-font-mono,monospace);font-size:9.5px;';
+  var L = [], k, k2;
+
+  L.push(['lineupSlotStatLimits', null]);
+  var lim = rs.lineupSlotStatLimits;
+  if (!lim) L.push(['  ABSENT', null]);
+  else {
+    var n = 0;
+    for (k in lim) {
+      if (!lim.hasOwnProperty(k)) continue;
+      n++;
+      var node = lim[k], f = [];
+      if (node && typeof node === 'object') {
+        for (k2 in node) { if (node.hasOwnProperty(k2)) f.push(k2 + '=' + node[k2]); }
+      } else f.push(String(node));
+      L.push(['  [slot ' + k + '] ' + f.join('  '), null]);
+    }
+    if (!n) L.push(['  present but empty', null]);
+  }
+
+  var lsc = rs.lineupSlotCounts;
+  if (lsc) {
+    var sl = [];
+    for (k in lsc) { if (lsc.hasOwnProperty(k)) sl.push(k + ':' + lsc[k]); }
+    L.push(['lineupSlotCounts  ' + sl.join('  '), null]);
+  }
+
+  // Anywhere in settings carrying one of the four numbers off the app screen.
+  var want = { 738: 1, 410: 1, 164: 1, 82: 1 }, hits = [], seen = 0;
+  (function walk(o, path, d) {
+    if (!o || typeof o !== 'object' || d > 5 || seen > 4000) return;
+    for (var kk in o) {
+      if (!o.hasOwnProperty(kk)) continue;
+      seen++;
+      var v = o[kk], pp = path ? (path + '.' + kk) : kk;
+      if (v && typeof v === 'object') walk(v, pp, d + 1);
+      else if (typeof v === 'number' && want[v]) hits.push('  ' + pp + ' = ' + v);
+    }
+  })(s, '', 0);
+  L.push(['settings fields holding 738 / 410 / 164 / 82  (' + hits.length + ')', null]);
+  for (k = 0; k < hits.length && k < 14; k++) L.push([hits[k], null]);
+  if (!hits.length) L.push(['  none \u2014 the caps are not in mSettings', null]);
+
+  // The used side. Every statId this team reports, so a games-played
+  // breakdown would be visible if one exists.
+  var t0 = teams[0];
+  var vb = t0 && t0.valuesByStat;
+  if (!vb) L.push(['teams[0].valuesByStat  ABSENT', null]);
+  else {
+    var keys = [], cnt = 0;
+    for (k in vb) { if (vb.hasOwnProperty(k)) { keys.push(k + '=' + vb[k]); cnt++; } }
+    L.push(['teams[0].valuesByStat  (' + cnt + ' stats) ' + (t0.abbrev || ''), null]);
+    for (k = 0; k < keys.length; k += 6) {
+      L.push(['  ' + keys.slice(k, k + 6).join('  '), null]);
+    }
+  }
+  // Any other per-team node that might carry the breakdown.
+  if (t0) {
+    var tk = [];
+    for (k in t0) { if (t0.hasOwnProperty(k)) tk.push(k); }
+    L.push(['teams[0] keys  ' + tk.join(' '), null]);
+  }
+
+  var h = '<div style="margin:16px 0 0;padding-top:10px;' +
+    'border-top:1px solid rgba(255,255,255,0.08);">' +
+    '<div style="font-size:9px;letter-spacing:0.1em;color:#fbbf24;margin:0 0 6px;">' +
+    'NHL GAME-LIMIT PROBE \u00b7 shape report</div>';
+  for (k = 0; k < L.length; k++) {
+    h += '<div style="' + mono + 'color:rgba(255,255,255,' +
+      (L[k][0].charAt(0) === ' ' ? '0.6' : '0.85') + ');white-space:pre-wrap;' +
+      'word-break:break-word;line-height:1.55;">' + slEsc(L[k][0]) + '</div>';
+  }
+  h += '<div style="font-size:9px;color:rgba(255,255,255,0.28);margin-top:8px;' +
+    'line-height:1.5;">Screenshot this and the four-way pace board gets built ' +
+    'against the real fields. What matters most: whether anything here breaks ' +
+    'games played down by position, or only gives one total.</div></div>';
+  return h;
+}
+
 function _espPacePanelHtml(row) {
   var c = espCatchRows(row);
   if (!c) {
@@ -129976,6 +130078,12 @@ function _espPacePanelHtml(row) {
 
   var h = '<div data-espstand>';
   h += _espStandToggleHtml(row, 'pace');
+
+  // NHL probe rides at the foot of this panel until the four-way board
+  // replaces it. ESPNHLCAP
+  var _nhlProbe = (String(row.sport || '').toLowerCase() === 'nhl' &&
+                   typeof _espNhlCapProbe === 'function')
+    ? _espNhlCapProbe(row) : '';
 
   h += '<div style="font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
     'margin:0 0 2px;">PACE PER WEEK</div>' +
@@ -130346,6 +130454,7 @@ function _espPacePanelHtml(row) {
       'automatic on every sync</span>' +
   '</div>';
   h += '</div>';
+  h += _nhlProbe;          // ESPNHLCAP
   return h;
 }
 
