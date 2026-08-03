@@ -32598,7 +32598,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-08-02 22:26 UTC';
+var SK_BUILD = '2026-08-03 00:50 UTC';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -130213,66 +130213,85 @@ function espRivalsAhead(row, n) {
   return list.slice(0, n || 3);
 }
 
-// ── NHL GAMES-PLAYED CAPS ── ESPNHLCAP ──
-// Confirmed by probe against the drafted 2027 league, not inferred:
-//   rosterSettings.lineupSlotStatLimits
-//     [3] limitValue=738  statId=30      [5] limitValue=164  statId=30
-//     [4] limitValue=410  statId=30      [6] limitValue=82   statId=30
-//   lineupSlotCounts: 3:9  4:5  5:2  6:1  7:5  8:1
-//   teams[].valuesByStat: stat 30 present
+// ── GAMES-PLAYED CAPS ── ESPNHLCAP / ESPGAMECAPS ──
+// Started as hockey-only. It isn't a hockey idea — any ESPN season-points
+// league can cap games played per lineup slot, and an NBA league does it too:
+//   PG/SG/SF/PF/C/G/F  82 each      Util  246 (three slots x 82)
+// which totals 820 against ten starting slots, the same lineup the NBA slot
+// map already describes.
 //
-// Two things fall out of that. First, every cap is exactly 82 x its slot
-// count — 738/9, 410/5, 164/2, 82/1 all give 82, and 9+5+2+1 = 17 slots
-// against a 1394 total. So these are not a budget to spend down; they are
-// one full season per starting slot, and the only way to run short is to
-// waste games — streaming, or starting somebody on an off night.
+// The one thing that must NOT be assumed is WHICH stat is capped. Hockey caps
+// stat 30; basketball's games-played id is a different number, and hardcoding
+// hockey's would silently match nothing and report a league with no caps at
+// all. So the stat is read OFF THE LIMITS THEMSELVES — whichever id the
+// league's own limit nodes name is the one to count — and usage comes from
+// valuesByStat under that same id. Nothing to guess.
 //
-// Second, and this is the limit of what can be built: valuesByStat is keyed
-// by STAT, not by slot. Stat 30 gives one games-played total per team and
-// nothing splits it four ways. The caps are per position but the usage is
-// not, so this board tracks the AGGREGATE honestly rather than inventing a
-// per-position split that the payload cannot support. The per-slot caps are
-// still shown, because knowing the composition is what makes the total mean
-// anything.
-var ESP_NHL_GP_STAT = 30;
-
-function espNhlCaps(row) {
+// The rest still holds everywhere: valuesByStat is keyed by stat, not by
+// slot, so usage is one total per team and the board tracks the aggregate
+// honestly rather than inventing a per-slot split.
+function espGameCaps(row) {
   if (typeof espIsSeasonPts !== 'function' || !espIsSeasonPts(row)) return null;
-  if (String((row || {}).sport || '').toLowerCase() !== 'nhl') return null;
   var rs = (((row.raw || {}).settings) || {}).rosterSettings || {};
   var lim = rs.lineupSlotStatLimits;
   if (!lim) return null;
   var counts = rs.lineupSlotCounts || {};
-  var slots = [], total = 0, k;
+  var game = _espGameCode(row);
+
+  // Which stat do the limits cap? Take the one the most nodes name, so a
+  // stray limit on something else can't hijack the board.
+  var tally = {}, k, n, sid, best = null, bestN = 0;
   for (k in lim) {
     if (!lim.hasOwnProperty(k)) continue;
-    var n = lim[k];
+    n = lim[k];
+    if (!n || typeof n !== 'object' || n.statId == null) continue;
+    var v0 = Number(n.limitValue);
+    if (isNaN(v0) || v0 <= 0) continue;
+    sid = String(n.statId);
+    tally[sid] = (tally[sid] || 0) + 1;
+    if (tally[sid] > bestN) { bestN = tally[sid]; best = sid; }
+  }
+  if (best == null) return null;
+
+  var slots = [], total = 0;
+  for (k in lim) {
+    if (!lim.hasOwnProperty(k)) continue;
+    n = lim[k];
     if (!n || typeof n !== 'object') continue;
     var v = Number(n.limitValue);
     if (isNaN(v) || v <= 0) continue;
-    // Every cap in this league names stat 30. Matching on it rather than
-    // taking whatever is present means a league that caps something else
-    // doesn't get silently folded into a games-played total.
-    if (String(n.statId) !== String(ESP_NHL_GP_STAT)) continue;
+    if (String(n.statId) !== best) continue;
     var cnt = Number(counts[k]);
+    var have = (!isNaN(cnt) && cnt > 0);
     slots.push({
       slot: String(k),
-      label: (typeof _espSlotLabel === 'function') ? _espSlotLabel('fhl', k, null) : ('#' + k),
+      label: (typeof _espSlotLabel === 'function') ? _espSlotLabel(game, k, null) : ('#' + k),
       cap: v,
-      count: (isNaN(cnt) || cnt <= 0) ? null : cnt,
-      // Games per slot: 82 in a normal season, and worth deriving rather
-      // than hardcoding so a shortened season reports itself.
-      perSlot: (!isNaN(cnt) && cnt > 0) ? Math.round(v / cnt) : null
+      count: have ? cnt : null,
+      // Games per slot: 82 in a normal NBA or NHL season, 162-ish in
+      // baseball. Derived rather than hardcoded so a shortened season, or a
+      // multi-slot line like UTIL's 246 over three slots, reports itself.
+      perSlot: have ? Math.round(v / cnt) : null
     });
     total += v;
   }
   if (!slots.length) return null;
   slots.sort(function (a, b) { return Number(a.slot) - Number(b.slot); });
-  return { slots: slots, total: total, statId: ESP_NHL_GP_STAT };
+  return { slots: slots, total: total, statId: best, game: game };
 }
 
-// Per-team burn against the aggregate cap. Same shape as the MLB cap watch,
-// because it is the same question: who runs out before the season does.
+// The game code for a league row, since the slot labels are per sport.
+function _espGameCode(row) {
+  var sp = String((row || {}).sport || '').toLowerCase();
+  if (sp === 'nfl') return 'ffl';
+  if (sp === 'nba') return 'fba';
+  if (sp === 'nhl') return 'fhl';
+  return 'flb';
+}
+
+// Kept so nothing that already calls the hockey name has to change.
+function espNhlCaps(row) { return espGameCaps(row); }
+
 function espNhlCapWatch(row) {
   var caps = espNhlCaps(row);
   if (!caps) return null;
