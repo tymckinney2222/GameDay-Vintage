@@ -32598,7 +32598,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-08-03 00:50 UTC';
+var SK_BUILD = '2026-08-07 00:57 UTC';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -51139,6 +51139,69 @@ function _fwFinalBallPos(data) {
 // possessing team's direction). We keep it robust: if we can't resolve a
 // confident 0–100 spot, we return the field with no ball (frozen/blank)
 // rather than guessing a wrong spot.
+// Down, distance, spot and possession from the PLAY DATA. ── FWSITPLAYS ──
+//
+// The situation strip and the ball on the field were already built; they were
+// simply being handed nothing. ESPN's summary endpoint only populates
+// `situation` for some games — for this one it came back empty, so down,
+// distance and yard line were all 0 and the strip fell back to clock and
+// quarter alone.
+//
+// The play data is already fetched and does carry it. Every play has `start`
+// and `end` blocks with down, distance, yardLine and the team on offence, and
+// the LAST play's `end` is precisely the state of the next snap. So the
+// situation is derived when the feed doesn't supply it.
+//
+// yardLine here is absolute 0..100 with 0 at the away end zone — the same
+// convention _fwFinalBallPos already relies on, kept deliberately consistent
+// so the ball and the text can never disagree.
+function _fwSituationFromPlays(data) {
+  if (!data) return null;
+  var last = null;
+  try {
+    // The drive in progress first — that's where a live game lives.
+    var cur = data.drives && data.drives.current;
+    if (cur && cur.plays && cur.plays.length) last = cur.plays[cur.plays.length - 1];
+    if (!last) {
+      var prev = (data.drives && data.drives.previous) || null;
+      if (prev && prev.length) {
+        for (var d = prev.length - 1; d >= 0 && !last; d--) {
+          var pls = prev[d].plays || [];
+          if (pls.length) last = pls[pls.length - 1];
+        }
+      }
+    }
+    if (!last && data.plays && data.plays.length) last = data.plays[data.plays.length - 1];
+  } catch (e) { return null; }
+  if (!last) return null;
+
+  // `end` is the state AFTER the play, which is the next snap. Fall back to
+  // `start` only if end is missing.
+  var e = last.end || last.start || null;
+  if (!e) return null;
+  var yl = (e.yardLine != null) ? Number(e.yardLine) : null;
+  if (yl == null || isNaN(yl) || yl < 0 || yl > 100) yl = null;
+  var dn = (e.down != null) ? Number(e.down) : null;
+  if (dn != null && (isNaN(dn) || dn < 1 || dn > 4)) dn = null;
+  var dist = (e.distance != null) ? Number(e.distance) : null;
+  if (dist != null && isNaN(dist)) dist = null;
+  var teamId = (e.team && e.team.id != null) ? String(e.team.id)
+    : ((last.start && last.start.team && last.start.team.id != null)
+        ? String(last.start.team.id) : null);
+  if (dn == null && yl == null) return null;
+  return { down: dn, distance: dist, ballAbs: yl, possession: teamId };
+}
+
+// "ARI 35" from an absolute spot. Past midfield the number counts back down,
+// and which half it is decides whose abbreviation goes in front.
+function _fwSpotText(ballAbs, awayAbbr, homeAbbr) {
+  if (ballAbs == null || isNaN(ballAbs)) return '';
+  var n = (ballAbs <= 50) ? Math.round(ballAbs) : Math.round(100 - ballAbs);
+  if (n === 50) return '50';
+  if (n <= 0) return 'GOAL';
+  return ((ballAbs < 50) ? (awayAbbr || '') : (homeAbbr || '')) + ' ' + n;
+}
+
 function _fwFieldGraphic(opts) {
   // opts: { awayAbbr, homeAbbr, awayColor, homeColor, yardLine, possTeam,
   //         isRedzone, ballAbs }
@@ -51291,9 +51354,21 @@ function _fwBuildDriveSummary(data, game, awayAccent, homeAccent, divStyle) {
     return (typeof vibrant === 'function') ? vibrant(base || '#888') : (base || '#888');
   }
 
-  var html = '<div class="fw-drives-hd">DRIVE SUMMARY · ' + drives.length + ' DRIVES · TAP TO EXPAND</div>';
+  var html = '<div class="fw-drives-hd">DRIVE SUMMARY · ' + drives.length +
+    ' DRIVES · NEWEST FIRST · TAP TO EXPAND</div>';
   html += '<div class="fw-drives-scroll">';
-  drives.forEach(function(dr, idx) {
+  // Newest drive first. ESPN orders drives.previous oldest to newest, which
+  // put the drive actually in progress at the far right of a horizontal
+  // scroller — the one thing worth seeing was the one thing off screen.
+  //
+  // The ORDER of the chips is reversed, not the array. _fwToggleDrive reads
+  // back from window._fwDriveCache by index, so the index passed to it has to
+  // stay the true position; reversing the array itself would open the wrong
+  // drive on every tap. FWDRIVEREV
+  var _dOrder = [], _di;
+  for (_di = drives.length - 1; _di >= 0; _di--) _dOrder.push(_di);
+  _dOrder.forEach(function(idx) {
+    var dr = drives[idx];
     var tm = dr.team || {};
     var abbr = tm.abbreviation || tm.abbrev || tm.abbr || '?';
     var rawLogo = tm.logo || (tm.logos && tm.logos[0] && tm.logos[0].href) || '';
@@ -51533,6 +51608,16 @@ function renderFieldStadium() {
   var yardLine = situation.yardLine || 0;
   var isRedzone = situation.isRedZone || false;
   var possession = situation.possession || (situation.team && situation.team.id) || '';
+  // FWSITPLAYS — the feed's situation block is often empty; the plays aren't.
+  var _sitPlay = (typeof _fwSituationFromPlays === 'function') ? _fwSituationFromPlays(data) : null;
+  var ballAbsPlay = null;
+  if (_sitPlay) {
+    if (!down && _sitPlay.down != null) down = _sitPlay.down;
+    if (!distance && _sitPlay.distance != null) distance = _sitPlay.distance;
+    if (!possession && _sitPlay.possession) possession = _sitPlay.possession;
+    ballAbsPlay = _sitPlay.ballAbs;
+    if (!yardLine && ballAbsPlay != null) yardLine = ballAbsPlay;
+  }
   var possTeam = String(possession) === String(game.home.id) ? 'home' : (possession ? 'away' : '');
   if (!down && downText) { var dm = downText.match(/(\d)\w+\s*&\s*(\d+)/); if (dm){down=parseInt(dm[1]);distance=parseInt(dm[2]);} }
   var awayTimeouts=3, homeTimeouts=3;
@@ -51618,6 +51703,11 @@ function renderFieldStadium() {
         if (situation.fieldPositionValue != null) absCand = Number(situation.fieldPositionValue);
         else if (situation.homeFieldPosition != null) absCand = Number(situation.homeFieldPosition);
         if (absCand != null && !isNaN(absCand) && absCand >= 0 && absCand <= 100) ballAbs = absCand;
+        // The play-derived spot before the raw yardLine: it is already the
+        // absolute 0..100 the field expects, whereas situation.yardLine is
+        // the number painted on the turf and is ambiguous about which half.
+        // FWSITPLAYS
+        else if (ballAbsPlay != null) ballAbs = ballAbsPlay;
         else if (rawYL != null && !isNaN(rawYL) && rawYL > 0 && rawYL <= 100) ballAbs = rawYL;
       } else {
         // Final: pull the last play's end position.
@@ -51643,12 +51733,25 @@ function renderFieldStadium() {
   html += _fwBuildDriveSummary(data, game, awayAccent, homeAccent, divStyle);
 
   // ── LIVE SITUATION STRIP ──────────────────────────────────────────
-  if (isLive && (down || downText || clock)) {
+  if (isLive && (down || downText || clock || possTeam)) {
     var sitColor = isRedzone ? '#ff2200' : 'rgba(255,255,255,0.55)';
     html += '<div style="display:flex;justify-content:center;gap:0;border-bottom:'+divStyle+'">';
     var sitItems = [];
+    // Who has it, first — the strip showed the state of a drive without ever
+    // saying whose drive it was. FWSITPLAYS
+    if (possTeam) {
+      var _pAb = (possTeam === 'home') ? game.home.abbr : game.away.abbr;
+      var _pCol = (possTeam === 'home') ? homeAccent : awayAccent;
+      sitItems.push({ label:'POSS',
+        val: '<span style="color:' + _pCol + '">\ud83c\udfc8 ' + slEsc(_pAb || '') + '</span>' });
+    }
     if (down && distance) sitItems.push({ label:'DOWN & DIST', val: down+'<span style="font-size:11px"> & </span>'+distance });
-    if (yardLine)         sitItems.push({ label:'BALL ON',  val: String(yardLine) });
+    else if (down)        sitItems.push({ label:'DOWN', val: String(down) });
+    // Spot as the field reads it, not a raw 0..100 — "ARI 35", not "65".
+    var _spotAbs = (ballAbsPlay != null) ? ballAbsPlay : (yardLine || null);
+    var _spot = (typeof _fwSpotText === 'function')
+      ? _fwSpotText(_spotAbs, game.away.abbr, game.home.abbr) : '';
+    if (_spot) sitItems.push({ label:'BALL ON', val: _spot });
     if (clock)            sitItems.push({ label:'CLOCK',    val: clock });
     if (period)           sitItems.push({ label:'QTR',      val: String(period) });
     sitItems.forEach(function(s) {
