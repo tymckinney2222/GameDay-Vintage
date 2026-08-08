@@ -32617,7 +32617,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-08-08 12:14 UTC';
+var SK_BUILD = '2026-08-08 12:28 UTC';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -116914,11 +116914,38 @@ var _nidState = { loading: false, err: '', rows: null, year: null };
 // that no two categories can be confused: a 51-goal 140-point year cannot be
 // mistaken for an assist total, and a goaltender's numbers share no magnitude
 // with a skater's.
-var NID_KNOWN = [
-  { id: 4233563, name: 'Nathan MacKinnon',  note: '2025: 51 G, 89 A, 140 P, 82 GP' },
-  { id: 3895074, name: 'Connor McDavid',    note: '2025: 26 G, 74 A, 100 P, 67 GP' },
-  { id: 4874709, name: 'Connor Hellebuyck', note: 'goaltender — W / GAA / SV%' }
+// Chosen for SHAPE rather than for exact totals, which is what makes this
+// work without me having to remember anyone's season to the digit. A
+// full-season scorer's points sit near 2000 while his blocks sit near 50;
+// a centre's rebounds dwarf his assists and a lead guard's do the opposite.
+// Those magnitudes name the categories on sight, and the two extremes
+// cross-check each other: whichever id is large for the big man and small
+// for the guard is rebounds, and the reverse is assists.
+//
+// A goaltender does the same job in hockey — his numbers share no magnitude
+// with a skater's, which separates the goaltending categories cleanly.
+var NID_SPORTS = [
+  { sport: 'NHL', label: 'HOCKEY', players: [
+    { id: 4233563, name: 'Nathan MacKinnon',  note: 'high-scoring centre — G ~50, A ~90, P ~140, SOG ~300' },
+    { id: 4874709, name: 'Connor Hellebuyck', note: 'GOALTENDER — W ~45, GAA ~2, SV% ~.925, skating cats 0' }
+  ]},
+  { sport: 'NBA', label: 'BASKETBALL', players: [
+    { id: 3945274, name: 'Nikola Jokic',     note: 'centre — REB high, AST high, BLK low' },
+    { id: 4066648, name: 'Anthony Davis',    note: 'big man — REB and BLK high, AST and 3PM low' },
+    { id: 4396993, name: 'Tyrese Haliburton', note: 'lead guard — AST high, REB low, 3PM high' }
+  ]}
 ];
+// Flattened for the fetch; the sport grouping is only for display.
+var NID_KNOWN = (function () {
+  var out = [], i, j;
+  for (i = 0; i < NID_SPORTS.length; i++) {
+    for (j = 0; j < NID_SPORTS[i].players.length; j++) {
+      var p = NID_SPORTS[i].players[j];
+      out.push({ id: p.id, name: p.name, note: p.note, sport: NID_SPORTS[i].sport });
+    }
+  }
+  return out;
+})();
 
 function openNhlIdProbe() {
   var ov = document.getElementById('nidOverlay');
@@ -116945,19 +116972,28 @@ function _nidLoad() {
   // set of actuals.
   var yr = 2026;
   _nidState.year = yr;
-  var ids = [];
-  for (var i = 0; i < NID_KNOWN.length; i++) ids.push(NID_KNOWN[i].id);
-
-  dbpFetchHistChunk('NHL', yr, ids, 'nidprobe')
-    .then(function (players) {
-      _nidState.loading = false;
-      _nidState.rows = players || [];
-      _nidRender();
-    })['catch'](function (e) {
-      _nidState.loading = false;
-      _nidState.err = (e && e.message) ? e.message : 'request failed';
-      _nidRender();
-    });
+  // One call per sport: the endpoint is keyed by game code, so hockey and
+  // basketball ids cannot be asked for together. A sport that fails is
+  // reported rather than sinking the other. ESPNHLIDPROBE
+  var jobs = NID_SPORTS.map(function (sp) {
+    var ids = sp.players.map(function (p) { return p.id; });
+    return dbpFetchHistChunk(sp.sport, yr, ids, 'nid' + sp.sport)
+      .then(function (players) {
+        return { sport: sp.sport, label: sp.label, players: players || [], err: '' };
+      })['catch'](function (e) {
+        return { sport: sp.sport, label: sp.label, players: [],
+                 err: (e && e.message) ? e.message : 'failed' };
+      });
+  });
+  Promise.all(jobs).then(function (res) {
+    _nidState.loading = false;
+    _nidState.rows = res;
+    _nidRender();
+  })['catch'](function (e) {
+    _nidState.loading = false;
+    _nidState.err = (e && e.message) ? e.message : 'request failed';
+    _nidRender();
+  });
 }
 
 // Every (statSourceId, statSplitTypeId) block a player carries, with its full
@@ -117003,73 +117039,81 @@ function _nidRender() {
   }
   if (!_nidState.rows) { body.innerHTML = ''; return; }
 
-  var h = '';
-  h += '<div style="' + mono + 'color:#4ade80">' + _nidState.rows.length +
+  var h = '', gi, i, j, k;
+  var totalPlayers = 0;
+  for (gi = 0; gi < _nidState.rows.length; gi++) totalPlayers += _nidState.rows[gi].players.length;
+  h += '<div style="' + mono + 'color:#4ade80">' + totalPlayers +
     ' players \u00b7 ' + _nidState.year + ' actuals</div>';
 
-  if (!_nidState.rows.length) {
-    h += '<div style="' + mono + 'color:rgba(255,255,255,0.5);margin-top:10px">' +
-      'No players came back. The season path may not hold ' + _nidState.year +
-      ' yet \u2014 worth trying the year before.</div>';
-    body.innerHTML = h;
-    return;
-  }
-
-  var i, j, k;
-  for (i = 0; i < _nidState.rows.length; i++) {
-    var p = _nidState.rows[i];
-    var pl = (p && (p.player || p)) || {};
-    var nm = pl.fullName || pl.name || ('id ' + (pl.id != null ? pl.id : '?'));
-    var known = '';
-    for (j = 0; j < NID_KNOWN.length; j++) {
-      if (String(NID_KNOWN[j].id) === String(pl.id)) known = NID_KNOWN[j].note;
-    }
-    h += '<div style="font-size:11px;font-weight:800;letter-spacing:0.06em;' +
-      'color:#fbbf24;margin:16px 0 2px">' + slEsc(nm) + '</div>';
-    if (known) {
-      h += '<div style="' + mono + 'color:rgba(255,255,255,0.4);margin-bottom:4px">' +
-        'known: ' + slEsc(known) + '</div>';
-    }
-    var blocks = _nidBlocks(p);
-    if (!blocks.length) {
-      h += '<div style="' + mono + 'color:rgba(255,255,255,0.35)">no stat blocks</div>';
+  for (gi = 0; gi < _nidState.rows.length; gi++) {
+    var grp = _nidState.rows[gi];
+    h += '<div style="font-size:10px;font-weight:800;letter-spacing:0.16em;' +
+      'color:rgba(255,255,255,0.5);margin:18px 0 2px;padding-bottom:3px;' +
+      'border-bottom:1px solid rgba(255,255,255,0.12)">' + slEsc(grp.label) + '</div>';
+    if (grp.err) {
+      h += '<div style="' + mono + 'color:#f87171">failed: ' + slEsc(grp.err) + '</div>';
       continue;
     }
-    for (j = 0; j < blocks.length; j++) {
-      var b = blocks[j];
-      var isActual = (b.src === 0);
-      h += '<div style="' + mono + 'color:' +
-        (isActual ? 'rgba(255,255,255,0.55)' : 'rgba(255,255,255,0.25)') + '">' +
-        'src ' + b.src + ' split ' + b.split + ' season ' + b.season +
-        (isActual ? '  \u2190 ACTUAL' : '  (projection \u2014 ignore)') +
-        '  \u00b7 ' + b.n + ' stats</div>';
-      if (!isActual) continue;
-      // Sorted by id so the same order comes back every run and two players
-      // can be read side by side.
-      var keys = [];
-      for (k in b.map) { if (b.map.hasOwnProperty(k)) keys.push(k); }
-      keys.sort(function (x, y) { return Number(x) - Number(y); });
-      var line = [];
-      for (k = 0; k < keys.length; k++) {
-        var v = b.map[keys[k]];
-        var vs = (typeof v === 'number') ? (Math.round(v * 1000) / 1000) : v;
-        line.push('#' + keys[k] + '=' + vs);
+    if (!grp.players.length) {
+      h += '<div style="' + mono + 'color:rgba(255,255,255,0.5)">No players came back \u2014 ' +
+        'the season path may not hold ' + _nidState.year + ' yet.</div>';
+      continue;
+    }
+    for (i = 0; i < grp.players.length; i++) {
+      var p = grp.players[i];
+      var pl = (p && (p.player || p)) || {};
+      var nm = pl.fullName || pl.name || ('id ' + (pl.id != null ? pl.id : '?'));
+      var known = '';
+      for (j = 0; j < NID_KNOWN.length; j++) {
+        if (String(NID_KNOWN[j].id) === String(pl.id)) known = NID_KNOWN[j].note;
       }
-      for (k = 0; k < line.length; k += 5) {
-        h += '<div style="' + mono + 'color:rgba(255,255,255,0.8);padding-left:8px">' +
-          slEsc(line.slice(k, k + 5).join('  ')) + '</div>';
+      h += '<div style="font-size:11px;font-weight:800;letter-spacing:0.06em;' +
+        'color:#fbbf24;margin:14px 0 2px">' + slEsc(nm) + '</div>';
+      if (known) {
+        h += '<div style="' + mono + 'color:rgba(255,255,255,0.4);margin-bottom:4px">' +
+          slEsc(known) + '</div>';
+      }
+      var blocks = _nidBlocks(p);
+      if (!blocks.length) {
+        h += '<div style="' + mono + 'color:rgba(255,255,255,0.35)">no stat blocks</div>';
+        continue;
+      }
+      for (j = 0; j < blocks.length; j++) {
+        var b = blocks[j];
+        var isActual = (b.src === 0);
+        h += '<div style="' + mono + 'color:' +
+          (isActual ? 'rgba(255,255,255,0.55)' : 'rgba(255,255,255,0.25)') + '">' +
+          'src ' + b.src + ' split ' + b.split + ' season ' + b.season +
+          (isActual ? '  \u2190 ACTUAL' : '  (projection \u2014 ignore)') +
+          '  \u00b7 ' + b.n + ' stats</div>';
+        if (!isActual) continue;
+        var keys = [];
+        for (k in b.map) { if (b.map.hasOwnProperty(k)) keys.push(k); }
+        keys.sort(function (x, y) { return Number(x) - Number(y); });
+        var line = [];
+        for (k = 0; k < keys.length; k++) {
+          var v = b.map[keys[k]];
+          var vs = (typeof v === 'number') ? (Math.round(v * 1000) / 1000) : v;
+          line.push('#' + keys[k] + '=' + vs);
+        }
+        for (k = 0; k < line.length; k += 5) {
+          h += '<div style="' + mono + 'color:rgba(255,255,255,0.8);padding-left:8px">' +
+            slEsc(line.slice(k, k + 5).join('  ')) + '</div>';
+        }
       }
     }
   }
 
   h += '<div style="font-size:9.5px;line-height:1.55;color:rgba(255,255,255,0.3);' +
     'margin-top:18px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.08)">' +
-    'Screenshot this. Matching the ids against those known lines names them ' +
-    'by evidence \u2014 an id reading 51 for MacKinnon is goals, 140 is points ' +
-    '\u2014 and the goaltender separates W, GAA and SV% from the skating ' +
-    'categories. That settles the labels, the SKATING / GOALTENDING split and ' +
-    'GAA\u2019s lower-is-better direction in one pass, without waiting for ' +
-    'October.</div>';
+    'Screenshot this. The ids are named by MAGNITUDE, so nobody has to ' +
+    'remember a season to the digit: whichever id reads near 2000 for a ' +
+    'scorer is points, whichever is large for the big man and small for the ' +
+    'guard is rebounds, and the reverse is assists. Values between 0 and 1 ' +
+    'are the percentage categories. The goaltender does the same job in ' +
+    'hockey \u2014 his numbers share no magnitude with a skater\u2019s, which ' +
+    'separates W, GAA and SV%. That settles the labels, the group split and ' +
+    'which categories are lower-is-better, in one pass.</div>';
 
   body.innerHTML = h;
 }
@@ -127260,10 +127304,13 @@ var ESP_STAT_RATE = { 2: 1, 9: 1, 17: 1, 18: 1, 41: 1, 47: 1, 49: 1, 71: 1, 82: 
 // which would file it with the arms. ESPGROUP3
 var ESP_STAT_FIELDING = { 71: 1 };
 function espStatGroup(game, id) {
-  // Only baseball has an id map, so only baseball can group. Hockey's ids
-  // were falling through to 'b' and printing BATTING over a list of skating
-  // categories. ESPSPORTFLAG
-  if (game !== 'flb') return '';
+  // Baseball groups by id. Other sports group by NAME, from the app's own
+  // League Info screen — so hockey will split SKATING / GOALTENDING the
+  // moment its ids are named, and basketball stays ungrouped because ESPN
+  // lists its eight categories under one heading. An unnamed id groups
+  // nowhere, which is what stopped BATTING appearing over skating
+  // categories. ESPSPORTFLAG / ESPCATMETA
+  if (game !== 'flb') return espGroupByName(game, _espNameFor(game, id));
   if (ESP_STAT_FIELDING[id]) return 'f';
   return (typeof espStatSide === 'function') ? espStatSide(game, id) : 'b';
 }
@@ -127280,6 +127327,75 @@ function espStatName(game, id) {
 // always; constant on a single day's line. ESPRATEFMT
 var ESP_STAT_NO_LEAD_ZERO = { 2: 1, 9: 1, 17: 1, 18: 1, 71: 1 };
 
+// ── CATEGORY METADATA BY NAME ── ESPCATMETA ──
+// Taken straight off ESPN's own League Info screen for each league, so the
+// sets and the group split are evidence, not inference.
+//
+// Keyed by NAME rather than by stat id ON PURPOSE. The id -> name binding is
+// the one thing still unknown — every value in the preseason payload is 0, so
+// nothing identifies them — and the Stat ID Probe settles that separately.
+// Everything downstream of the name is knowable NOW: which group a category
+// belongs to, whether fewer is better, whether it prints as a decimal. So it
+// is written now, and the day the names arrive it all works without a second
+// pass.
+//
+// Until then every lookup here misses and returns the same neutral answer the
+// code gives today, which is why adding this changes nothing on screen yet.
+var ESP_CAT_GROUPS = {
+  // Hockey splits the way the app splits it.
+  fhl: [
+    { key: 's', label: 'SKATING',     names: ['G', 'A', '+/-', 'PIM', 'PPP', 'ATOI', 'SOG'] },
+    { key: 'g', label: 'GOALTENDING', names: ['W', 'GAA', 'SV%'] }
+  ],
+  // Basketball's League Info lists all eight under one SCORING heading with
+  // no sub-groups, so it gets none — a lone header over every row is noise.
+  fba: []
+};
+
+// Fewer is better. GAA only: goals allowed per sixty minutes, so a lower
+// number wins the category. Nothing else in either league inverts —
+// penalty minutes might look like a candidate but ESPN scores it as a
+// category you WIN by accumulating.
+var ESP_LOWER_BY_NAME = {
+  fhl: { 'GAA': 1 },
+  fba: {}
+};
+
+// Printed as decimals rather than whole numbers.
+var ESP_RATE_BY_NAME = {
+  fhl: { 'GAA': 1, 'SV%': 1 },
+  fba: { 'FG%': 1, 'FT%': 1 }
+};
+
+// Written without the leading zero, the way a batting average is. A save
+// percentage is .925 and a field goal percentage is .478, but a goals-against
+// average is 2.09 and keeps its digit — same distinction baseball draws
+// between AVG and ERA.
+var ESP_NOLEAD_BY_NAME = {
+  fhl: { 'SV%': 1 },
+  fba: { 'FG%': 1, 'FT%': 1 }
+};
+
+// Group key for a category, by its name. '' when the sport has no groups or
+// the name isn't known yet.
+function espGroupByName(game, name) {
+  var gs = ESP_CAT_GROUPS[game];
+  if (!gs || !gs.length || !name) return '';
+  for (var i = 0; i < gs.length; i++) {
+    for (var j = 0; j < gs[i].names.length; j++) {
+      if (gs[i].names[j] === name) return gs[i].key;
+    }
+  }
+  return '';
+}
+
+function espGroupLabelFor(game, key) {
+  var gs = ESP_CAT_GROUPS[game];
+  if (!gs) return '';
+  for (var i = 0; i < gs.length; i++) if (gs[i].key === key) return gs[i].label;
+  return '';
+}
+
 // ── SPORT-SCOPED STAT FLAGS ── ESPSPORTFLAG ──
 // ESP_STAT_RATE, ESP_STAT_NO_LEAD_ZERO, ESP_LOWER_BETTER and
 // ESP_STAT_FIELDING are all keyed by a bare stat id. Baseball was the only
@@ -127295,14 +127411,30 @@ var ESP_STAT_NO_LEAD_ZERO = { 2: 1, 9: 1, 17: 1, 18: 1, 71: 1 };
 // until their ids are actually identified, which shows a plain number rather
 // than a confidently wrong one.
 function espFlagGame(game) { return (game === 'flb' || game == null) ? 'flb' : game; }
+// Baseball answers by id; every other sport answers by NAME, which is why
+// the name maps above can be filled in before the ids are known. An
+// unidentified id has no name, so these return false and the behaviour is
+// exactly what it was. ESPCATMETA
+function _espNameFor(game, id) {
+  return (typeof espStatName === 'function') ? espStatName(game, id) : '';
+}
 function espIsRate(game, id) {
-  return (espFlagGame(game) === 'flb') ? !!ESP_STAT_RATE[id] : false;
+  var g = espFlagGame(game);
+  if (g === 'flb') return !!ESP_STAT_RATE[id];
+  var m = ESP_RATE_BY_NAME[g];
+  return !!(m && m[_espNameFor(g, id)]);
 }
 function espNoLeadZero(game, id) {
-  return (espFlagGame(game) === 'flb') ? !!ESP_STAT_NO_LEAD_ZERO[id] : false;
+  var g = espFlagGame(game);
+  if (g === 'flb') return !!ESP_STAT_NO_LEAD_ZERO[id];
+  var m = ESP_NOLEAD_BY_NAME[g];
+  return !!(m && m[_espNameFor(g, id)]);
 }
 function espIsLowerBetter(game, id) {
-  return (espFlagGame(game) === 'flb') ? !!ESP_LOWER_BETTER[id] : false;
+  var g = espFlagGame(game);
+  if (g === 'flb') return !!ESP_LOWER_BETTER[id];
+  var m = ESP_LOWER_BY_NAME[g];
+  return !!(m && m[_espNameFor(g, id)]);
 }
 
 function espStatFmt(id, v, game) {
@@ -128394,6 +128526,9 @@ function _espTodayCatsHtml(row, game, accent) {
   var w = 0, l = 0, t = 0, body = '', id, mv, ov, res;
   var _lastG = null;
   var _GL = { b: 'BATTING', f: 'FIELDING', p: 'PITCHING' };
+  function _glLabel(k) {   // ESPCATMETA
+    return (game === 'flb') ? (_GL[k] || '') : (espGroupLabelFor(game, k) || '');
+  }
   for (i = 0; i < ids.length; i++) {
     id = ids[i];
     // ESPGROUP3
@@ -128404,7 +128539,7 @@ function _espTodayCatsHtml(row, game, accent) {
       _lastG = _g;
       body += '<div style="font-size:8px;font-weight:800;letter-spacing:0.16em;' +
         'color:rgba(255,255,255,0.26);padding:' + (i ? '9px' : '1px') + ' 2px 3px;">' +
-        _GL[_g] + '</div>';
+        _glLabel(_g) + '</div>';
     }
     var isRate = !!ESP_STAT_RATE[id];
     mv = (mine[id] != null) ? mine[id] : ((meLive && !isRate) ? 0 : null);
@@ -128980,7 +129115,13 @@ function _espCatBreakdownHtml(row) {
     '</div></div>';
   }
 
+  // Baseball's labels; other sports get theirs from ESP_CAT_GROUPS so a
+  // hockey league says SKATING rather than BATTING. ESPCATMETA
   var GLABEL = { b: 'BATTING', f: 'FIELDING', p: 'PITCHING' };
+  function _grpLabel(k) {
+    return (game === 'flb') ? (GLABEL[k] || '')
+                            : (espGroupLabelFor(game, k) || '');
+  }
   var lastGroup = null;
   h += '<div class="fy-cats-list">';
   for (i = 0; i < cb.rows.length; i++) {
@@ -128993,7 +129134,7 @@ function _espCatBreakdownHtml(row) {
       lastGroup = grp;
       h += '<div style="font-size:8.5px;font-weight:800;letter-spacing:0.16em;' +
         'color:rgba(255,255,255,0.3);padding:' + (i ? '12px' : '2px') + ' 2px 4px;">' +
-        GLABEL[grp] + '</div>';
+        _grpLabel(grp) + '</div>';
     }
     h += _espCatRowHtml(r.id, game, r.mine, r.opp, r.result);
   }
