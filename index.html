@@ -32598,7 +32598,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-08-07 00:57 UTC';
+var SK_BUILD = '2026-08-08 12:10 UTC';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -127058,6 +127058,10 @@ var ESP_STAT_RATE = { 2: 1, 9: 1, 17: 1, 18: 1, 41: 1, 47: 1, 49: 1, 71: 1, 82: 
 // which would file it with the arms. ESPGROUP3
 var ESP_STAT_FIELDING = { 71: 1 };
 function espStatGroup(game, id) {
+  // Only baseball has an id map, so only baseball can group. Hockey's ids
+  // were falling through to 'b' and printing BATTING over a list of skating
+  // categories. ESPSPORTFLAG
+  if (game !== 'flb') return '';
   if (ESP_STAT_FIELDING[id]) return 'f';
   return (typeof espStatSide === 'function') ? espStatSide(game, id) : 'b';
 }
@@ -127074,12 +127078,38 @@ function espStatName(game, id) {
 // always; constant on a single day's line. ESPRATEFMT
 var ESP_STAT_NO_LEAD_ZERO = { 2: 1, 9: 1, 17: 1, 18: 1, 71: 1 };
 
-function espStatFmt(id, v) {
+// ── SPORT-SCOPED STAT FLAGS ── ESPSPORTFLAG ──
+// ESP_STAT_RATE, ESP_STAT_NO_LEAD_ZERO, ESP_LOWER_BETTER and
+// ESP_STAT_FIELDING are all keyed by a bare stat id. Baseball was the only
+// sport with a map, so that was harmless — until an NHL categories league
+// arrived and its ids collided with baseball's:
+//
+//   NHL #17 picked up OBP's rate + no-leading-zero flags and printed ".000"
+//   NHL #27 picked up a BATTER'S STRIKEOUTS flag and was scored LOWER IS
+//           BETTER, which silently reverses that category's result
+//
+// A wrong label is visible; a reversed direction is not. So the flags now
+// only apply to the sport they were written for. Other sports get nothing
+// until their ids are actually identified, which shows a plain number rather
+// than a confidently wrong one.
+function espFlagGame(game) { return (game === 'flb' || game == null) ? 'flb' : game; }
+function espIsRate(game, id) {
+  return (espFlagGame(game) === 'flb') ? !!ESP_STAT_RATE[id] : false;
+}
+function espNoLeadZero(game, id) {
+  return (espFlagGame(game) === 'flb') ? !!ESP_STAT_NO_LEAD_ZERO[id] : false;
+}
+function espIsLowerBetter(game, id) {
+  return (espFlagGame(game) === 'flb') ? !!ESP_LOWER_BETTER[id] : false;
+}
+
+function espStatFmt(id, v, game) {
   if (v == null) return '\u2014';
   var n = Number(v);
-  if (ESP_STAT_RATE[id]) {
+  if (isNaN(n)) return '\u2014';
+  if (espIsRate(game, id)) {
     var r = (Math.round(n * 1000) / 1000).toFixed(3);
-    return ESP_STAT_NO_LEAD_ZERO[id] ? r.replace(/^0/, '') : r;
+    return espNoLeadZero(game, id) ? r.replace(/^0/, '') : r;
   }
   // Outs back to innings in baseball notation: 145 outs is 48.1, not 48.3.
   if (String(id) === '34') return Math.floor(n / 3) + '.' + (n % 3);
@@ -128166,7 +128196,9 @@ function _espTodayCatsHtml(row, game, accent) {
     id = ids[i];
     // ESPGROUP3
     var _g = espStatGroup(game, id);
-    if (_g !== _lastG) {
+    // No group means the sport has no id map yet, so there is nothing
+    // truthful to head the section with. ESPSPORTFLAG
+    if (_g && _g !== _lastG) {
       _lastG = _g;
       body += '<div style="font-size:8px;font-weight:800;letter-spacing:0.16em;' +
         'color:rgba(255,255,255,0.26);padding:' + (i ? '9px' : '1px') + ' 2px 3px;">' +
@@ -128175,7 +128207,7 @@ function _espTodayCatsHtml(row, game, accent) {
     var isRate = !!ESP_STAT_RATE[id];
     mv = (mine[id] != null) ? mine[id] : ((meLive && !isRate) ? 0 : null);
     ov = (opp[id] != null) ? opp[id] : ((opLive && !isRate) ? 0 : null);
-    res = espCatResult(id, mv, ov);
+    res = espCatResult(id, mv, ov, game);   // ESPSPORTFLAG
     if (res === 'WIN') w++; else if (res === 'LOSS') l++; else if (res === 'TIE') t++;
     var win = (res === 'WIN'), loss = (res === 'LOSS'), tie = (res === 'TIE');
     // Nothing from either side yet reads as absent, not as a tie at nothing.
@@ -128190,7 +128222,7 @@ function _espTodayCatsHtml(row, game, accent) {
       '<div style="display:flex;align-items:center;justify-content:flex-end;gap:4px">' +
         '<span style="font-family:var(--sk-font-mono);font-size:12px;font-weight:700;color:' +
           (win ? '#4ade80' : loss ? '#f87171' : 'rgba(255,255,255,0.5)') + '">' +
-          (mv != null ? slEsc(espStatFmt(id, mv)) : '\u2014') + '</span>' +
+          (mv != null ? slEsc(espStatFmt(id, mv, game)) : '\u2014') + '</span>' +
         (win ? '<span style="color:#4ade80;font-size:8px">\u25c0</span>' : '') +
       '</div>' +
       '<div style="text-align:center;font-size:8.5px;letter-spacing:0.06em;' +
@@ -128199,7 +128231,7 @@ function _espTodayCatsHtml(row, game, accent) {
         (loss ? '<span style="color:#f87171;font-size:8px">\u25b6</span>' : '') +
         '<span style="font-family:var(--sk-font-mono);font-size:12px;font-weight:700;color:' +
           (loss ? '#4ade80' : 'rgba(255,255,255,0.5)') + '">' +
-          (ov != null ? slEsc(espStatFmt(id, ov)) : '\u2014') + '</span>' +
+          (ov != null ? slEsc(espStatFmt(id, ov, game)) : '\u2014') + '</span>' +
       '</div>' +
     '</div>';
   }
@@ -128542,6 +128574,8 @@ function _espStatResult(v) {
 }
 
 function espCatBreakdown(j, row) {
+  // The sport, so the direction flags apply to the right one. ESPSPORTFLAG
+  var _cbGame = (typeof _espGameCode === 'function') ? _espGameCode(row) : 'flb';
   if (!j || !j.schedule || !espIsCats(row)) return null;
   var period = (j.status && j.status.currentMatchupPeriod);
   if (period == null) return null;
@@ -128588,8 +128622,9 @@ function espCatBreakdown(j, row) {
       var po = _espStatVal(os ? os[k] : null);
       var mv = (myLive[k] != null) ? myLive[k] : pm;
       var ov = (opLive[k] != null) ? opLive[k] : po;
-      rows.push({ id: k, mine: mv, opp: ov, result: espCatResult(k, mv, ov),
-                  preMine: pm, preOpp: po, wasResult: espCatResult(k, pm, po) });
+      rows.push({ id: k, mine: mv, opp: ov, result: espCatResult(k, mv, ov, _cbGame),
+                  preMine: pm, preOpp: po,
+                  wasResult: espCatResult(k, pm, po, _cbGame), game: _cbGame });
     }
     if (!rows.length) return null;
     return { rows: rows, period: period, live: !!(myToday || opToday),
@@ -128632,7 +128667,7 @@ function _espCatRowHtml(id, game, mine, opp, result) {
   return '<div class="' + cls + '">' +
     '<div class="fy-cat-side left">' +
       '<span class="fy-cat-val">' +
-        (mine != null ? slEsc(espStatFmt(id, mine)) : '\u2014') + '</span>' +
+        (mine != null ? slEsc(espStatFmt(id, mine, game)) : '\u2014') + '</span>' +
       lArrow +
     '</div>' +
     '<div class="fy-cat-name">' +
@@ -128642,7 +128677,7 @@ function _espCatRowHtml(id, game, mine, opp, result) {
     '<div class="fy-cat-side right">' +
       rArrow +
       '<span class="fy-cat-val">' +
-        (opp != null ? slEsc(espStatFmt(id, opp)) : '\u2014') + '</span>' +
+        (opp != null ? slEsc(espStatFmt(id, opp, game)) : '\u2014') + '</span>' +
     '</div>' +
   '</div>';
 }
@@ -128751,7 +128786,8 @@ function _espCatBreakdownHtml(row) {
     // Only label a group when the league actually scores more than one, so a
     // pitching-only league doesn't get a lone header. ESPGROUP3
     var grp = espStatGroup(game, r.id);
-    if (grp !== lastGroup) {
+    // ESPSPORTFLAG — see above.
+    if (grp && grp !== lastGroup) {
       lastGroup = grp;
       h += '<div style="font-size:8.5px;font-weight:800;letter-spacing:0.16em;' +
         'color:rgba(255,255,255,0.3);padding:' + (i ? '12px' : '2px') + ' 2px 4px;">' +
@@ -128943,11 +128979,14 @@ var ESP_LOWER_BETTER = { 27: 1, 37: 1, 39: 1, 41: 1, 45: 1, 46: 1, 47: 1, 54: 1 
 // last COMPLETED period — the same staleness the values had. Once today is
 // folded in it can be flatly wrong: 14 runs against 15 was still flagged
 // WIN. So the result is derived from the live numbers instead.
-function espCatResult(id, mine, opp) {
+function espCatResult(id, mine, opp, game) {
   if (mine == null || opp == null) return '';
   var a = Number(mine), b = Number(opp);
+  if (isNaN(a) || isNaN(b)) return '';
   if (a === b) return 'TIE';
-  var lower = !!ESP_LOWER_BETTER[id];
+  // Direction is sport-scoped: an id meaning "fewer is better" in baseball
+  // means something else entirely in hockey. ESPSPORTFLAG
+  var lower = espIsLowerBetter(game, id);
   return (lower ? (a < b) : (a > b)) ? 'WIN' : 'LOSS';
 }
 
@@ -128957,7 +128996,9 @@ function espCatResult(id, mine, opp) {
 function espCatTally(rows) {
   var w = 0, l = 0, t = 0;
   for (var i = 0; i < rows.length; i++) {
-    var r = espCatResult(rows[i].id, rows[i].mine, rows[i].opp);
+    // Each row carries the sport it came from, so a caller cannot supply the
+    // wrong one by omission. ESPSPORTFLAG
+    var r = espCatResult(rows[i].id, rows[i].mine, rows[i].opp, rows[i].game);
     if (r === 'WIN') w++; else if (r === 'LOSS') l++; else if (r === 'TIE') t++;
   }
   return { w: w, l: l, t: t, rec: w + '-' + l + '-' + t };
