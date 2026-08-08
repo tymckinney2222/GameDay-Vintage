@@ -32617,7 +32617,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-08-08 12:35 UTC';
+var SK_BUILD = '2026-08-08 12:42 UTC';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -116925,18 +116925,22 @@ var _nidState = { loading: false, err: '', rows: null, year: null };
 // A goaltender does the same job in hockey — his numbers share no magnitude
 // with a skater's, which separates the goaltending categories cleanly.
 var NID_SPORTS = [
-  { sport: 'NHL', label: 'HOCKEY', players: [
-    { id: 4233563, name: 'Nathan MacKinnon',  note: 'high-scoring centre — G ~50, A ~90, P ~140, SOG ~300' },
-    { id: 4874709, name: 'Connor Hellebuyck', note: 'GOALTENDER — W ~45, GAA ~2, SV% ~.925, skating cats 0' }
-  ]},
-  { sport: 'NBA', label: 'BASKETBALL', players: [
-    { id: 3945274, name: 'Nikola Jokic',     note: 'centre — REB high, AST high, BLK low' },
-    { id: 4066648, name: 'Anthony Davis',    note: 'big man — REB and BLK high, AST and 3PM low' },
-    { id: 4396993, name: 'Tyrese Haliburton', note: 'lead guard — AST high, REB low, 3PM high' }
-  ]}
+  // Hockey came back EMPTY on the first run, and basketball came back with
+  // two players I hadn't asked for — Doncic and Hachimura rather than Jokic
+  // and Davis. Both symptoms are the same cause: hardcoded athlete ids that
+  // I did not actually know. ESPN happily returns whoever owns the id, or
+  // nothing at all.
+  //
+  // So the ids come from the league itself now. Whatever is on a synced
+  // roster is guaranteed to exist in that sport, and taking several gives the
+  // contrast the identification needs. ESPNHLIDPROBE
+  { sport: 'NHL', label: 'HOCKEY', players: [], fromRoster: 'nhl' },
+  { sport: 'NBA', label: 'BASKETBALL', players: [], fromRoster: 'nba' }
 ];
 // Flattened for the fetch; the sport grouping is only for display.
-var NID_KNOWN = (function () {
+// Rebuilt on demand, because the roster-sourced lists are filled in at fetch
+// time rather than declared up front. ESPNHLIDPROBE
+function _nidKnown() {
   var out = [], i, j;
   for (i = 0; i < NID_SPORTS.length; i++) {
     for (j = 0; j < NID_SPORTS[i].players.length; j++) {
@@ -116945,7 +116949,41 @@ var NID_KNOWN = (function () {
     }
   }
   return out;
-})();
+}
+
+// Athlete ids from a synced league of this sport. Rosters are the one place
+// ids are guaranteed valid — they came from ESPN in the first place. Takes a
+// spread across the roster rather than the first few, since two players from
+// the same line tell you less than a scorer and a goaltender. ESPNHLIDPROBE
+function _nidRosterIds(sport, want) {
+  var out = [], seen = {};
+  try {
+    var rows = (typeof extSyncedLeagues === 'function') ? extSyncedLeagues() : [];
+    for (var i = 0; i < rows.length; i++) {
+      var r = rows[i];
+      if (!r || r.provider !== 'espn') continue;
+      if (String(r.sport || '').toLowerCase() !== sport) continue;
+      var byTeam = (r.rosters && r.rosters.byTeam) || null;
+      if (!byTeam) continue;
+      for (var tk in byTeam) {
+        if (!byTeam.hasOwnProperty(tk)) continue;
+        var items = (byTeam[tk] && byTeam[tk].items) || [];
+        for (var q = 0; q < items.length; q++) {
+          var pid = items[q] && items[q].playerId;
+          if (pid == null || seen[String(pid)]) continue;
+          seen[String(pid)] = 1;
+          out.push({ id: pid, name: items[q].name || ('id ' + pid),
+                     slot: items[q].slot || '' });
+        }
+      }
+    }
+  } catch (e) { return []; }
+  // Spread across the list so the sample isn't all one position.
+  if (out.length <= want) return out;
+  var picked = [], step = Math.floor(out.length / want);
+  for (var n = 0; n < want; n++) picked.push(out[n * step]);
+  return picked;
+}
 
 function openNhlIdProbe() {
   var ov = document.getElementById('nidOverlay');
@@ -116976,7 +117014,18 @@ function _nidLoad() {
   // basketball ids cannot be asked for together. A sport that fails is
   // reported rather than sinking the other. ESPNHLIDPROBE
   var jobs = NID_SPORTS.map(function (sp) {
+    // Roster-sourced where configured, so the ids are certain to exist.
+    if (sp.fromRoster) {
+      sp.players = _nidRosterIds(sp.fromRoster, 6).map(function (p) {
+        return { id: p.id, name: p.name,
+                 note: 'from your roster' + (p.slot ? (' \u00b7 ' + p.slot) : '') };
+      });
+    }
     var ids = sp.players.map(function (p) { return p.id; });
+    if (!ids.length) {
+      return Promise.resolve({ sport: sp.sport, label: sp.label, players: [],
+        err: 'no synced ' + sp.sport + ' league with rosters loaded' });
+    }
     return dbpFetchHistChunk(sp.sport, yr, ids, 'nid' + sp.sport)
       .then(function (players) {
         return { sport: sp.sport, label: sp.label, players: players || [], err: '' };
@@ -117039,8 +117088,9 @@ function _nidLines() {
       var pl = (p && (p.player || p)) || {};
       var nm = pl.fullName || pl.name || ('id ' + (pl.id != null ? pl.id : '?'));
       L.push('  ' + nm);
-      for (j = 0; j < NID_KNOWN.length; j++) {
-        if (String(NID_KNOWN[j].id) === String(pl.id)) L.push('    ' + NID_KNOWN[j].note);
+      var _kn2 = _nidKnown();
+      for (j = 0; j < _kn2.length; j++) {
+        if (String(_kn2[j].id) === String(pl.id)) L.push('    ' + _kn2[j].note);
       }
       var blocks = _nidBlocks(p);
       if (!blocks.length) { L.push('    no stat blocks'); continue; }
@@ -117135,8 +117185,9 @@ function _nidRender() {
       var pl = (p && (p.player || p)) || {};
       var nm = pl.fullName || pl.name || ('id ' + (pl.id != null ? pl.id : '?'));
       var known = '';
-      for (j = 0; j < NID_KNOWN.length; j++) {
-        if (String(NID_KNOWN[j].id) === String(pl.id)) known = NID_KNOWN[j].note;
+      var _kn = _nidKnown();
+      for (j = 0; j < _kn.length; j++) {
+        if (String(_kn[j].id) === String(pl.id)) known = _kn[j].note;
       }
       h += '<div style="font-size:11px;font-weight:800;letter-spacing:0.06em;' +
         'color:#fbbf24;margin:14px 0 2px">' + slEsc(nm) + '</div>';
@@ -126488,6 +126539,8 @@ function espTodayTeamTotal(rosters, teamId) {
 }
 
 function espLiveScores(j, standingsRows, rosters, cats, row) {
+  // The sport, so the rate guards below know which flags apply. ESPSPORTFLAG
+  var _cbGame = (typeof _espGameCode === 'function') ? _espGameCode(row) : 'flb';
   if (!j || !j.schedule || !j.schedule.length) return null;
   var period = (j.status && j.status.currentMatchupPeriod);
   if (period == null) return null;
@@ -126569,8 +126622,8 @@ function espLiveScores(j, standingsRows, rosters, cats, row) {
       var aS = (m.away && m.away.cumulativeScore) ? m.away.cumulativeScore.scoreByStat : null;
       var hS = (m.home && m.home.cumulativeScore) ? m.home.cumulativeScore.scoreByStat : null;
       if (aS && hS) {
-        var aL = espLiveCatValues(aS, espTodayByStat(rosters, a.id));
-        var hL = espLiveCatValues(hS, espTodayByStat(rosters, h.id));
+        var aL = espLiveCatValues(aS, espTodayByStat(rosters, a.id, _cbGame), _cbGame);
+        var hL = espLiveCatValues(hS, espTodayByStat(rosters, h.id, _cbGame), _cbGame);
         var rws = [], kk;
         for (kk in aS) {
           if (!aS.hasOwnProperty(kk)) continue;
@@ -126578,7 +126631,10 @@ function espLiveScores(j, standingsRows, rosters, cats, row) {
           rws.push({
             id: kk,
             mine: (aL[kk] != null) ? aL[kk] : _espStatVal(aS[kk]),
-            opp: (hL[kk] != null) ? hL[kk] : _espStatVal(hS[kk])
+            opp: (hL[kk] != null) ? hL[kk] : _espStatVal(hS[kk]),
+            // Carried so espCatTally scores it with the right sport's
+            // direction flags. ESPSPORTFLAG
+            game: _cbGame
           });
         }
         if (rws.length) {
@@ -127363,7 +127419,36 @@ var ESP_STAT_NAME_FLB = {
 // Still INFERRED: which of 53/60 is W vs HD, and which of 45/54 is ER vs L.
 // Each pair shares a point value, so a swap cannot change a score - only a
 // label. If W and L ever read backwards, swapping 53/54 here is the fix.
-var ESP_STAT_NAMES = { flb: ESP_STAT_NAME_FLB };
+// ── BASKETBALL STAT IDS ── ESPFBAIDS ──
+// Not inferred. Two real 2026 lines came back from the probe and four
+// arithmetic identities hold exactly on BOTH of them, which they could not do
+// under any other assignment:
+//
+//   #0  = 2 x #13 + #15 + #17     points from field goals, free throws, threes
+//   #6  = #4 + #5                 total rebounds from offensive + defensive
+//   #19 = #13 / #14               field goal percentage from made / attempted
+//   #20 = #15 / #16               free throw percentage
+//   #21 = #17 / #18               three point percentage
+//
+// Doncic: 2x693 + 503 + 254 = 2143, exactly his points. Hachimura:
+// 2x307 + 50 + 116 = 780, exactly his. An identity that lands to the unit on
+// two different players is not a coincidence.
+//
+// Steals and blocks are the only pair the identities can't separate, so they
+// were settled on shape: per game #2 reads 1.64 and 0.57 while #1 reads 0.53
+// and 0.31. Steals outnumber blocks for a lead guard and for a wing forward
+// alike, so #2 is steals and #1 is blocks.
+var ESP_STAT_NAME_FBA = {
+  0: 'PTS', 1: 'BLK', 2: 'STL', 3: 'AST',
+  4: 'OREB', 5: 'DREB', 6: 'REB',
+  11: 'TO',
+  13: 'FGM', 14: 'FGA', 15: 'FTM', 16: 'FTA',
+  17: '3PM', 18: '3PA',
+  19: 'FG%', 20: 'FT%', 21: '3P%',
+  40: 'MIN', 41: 'GS', 42: 'GP'
+};
+
+var ESP_STAT_NAMES = { flb: ESP_STAT_NAME_FLB, fba: ESP_STAT_NAME_FBA };
 // Rate stats want decimals; counting stats don't.
 // 49 (K/9) and 82 (K/BB) join for the reason the flag exists: adding one
 // pitcher's K/9 to another's is meaningless, exactly as it is for ERA. ESPCAT4
@@ -127435,7 +127520,7 @@ var ESP_LOWER_BY_NAME = {
 // Printed as decimals rather than whole numbers.
 var ESP_RATE_BY_NAME = {
   fhl: { 'GAA': 1, 'SV%': 1 },
-  fba: { 'FG%': 1, 'FT%': 1 }
+  fba: { 'FG%': 1, 'FT%': 1, '3P%': 1 }
 };
 
 // Written without the leading zero, the way a batting average is. A save
@@ -127444,7 +127529,7 @@ var ESP_RATE_BY_NAME = {
 // between AVG and ERA.
 var ESP_NOLEAD_BY_NAME = {
   fhl: { 'SV%': 1 },
-  fba: { 'FG%': 1, 'FT%': 1 }
+  fba: { 'FG%': 1, 'FT%': 1, '3P%': 1 }
 };
 
 // Group key for a category, by its name. '' when the sport has no groups or
@@ -128401,7 +128486,7 @@ function _espApplyRates(sums) {
 }
 
 // Today's totals for one half of the lineup.
-function espGroupTotals(items, wantPitchers) {
+function espGroupTotals(items, wantPitchers, game) {
   var sums = {}, fp = 0, hasFp = false, played = 0, i, k;
   for (i = 0; i < items.length; i++) {
     var it = items[i];
@@ -128421,7 +128506,7 @@ function espGroupTotals(items, wantPitchers) {
       // rates here leaves the rebuild untouched. A rate with no recipe is
       // simply absent and renders as a dash, which is the honest answer when
       // the parts to compute it were never fetched. ESPRATESUM
-      if (ESP_STAT_RATE[k]) continue;
+      if (espIsRate(game, k)) continue;   // ESPSPORTFLAG
       var _sv = Number(w.stats[k]);
       if (isNaN(_sv)) continue;
       sums[k] = (sums[k] || 0) + _sv;
@@ -128456,7 +128541,7 @@ var ESP_FIRST_EVENT = {
 };
 
 function _espGroupTotalsHtml(row, items, wantPitchers, game, cats, accent) {
-  var tot = espGroupTotals(items, wantPitchers);
+  var tot = espGroupTotals(items, wantPitchers, game);
   var order = (typeof espScoredIds === 'function') ? espScoredIds(row) : [];
   var bits = [], i, id;
   for (i = 0; i < order.length; i++) {
@@ -128551,8 +128636,8 @@ function _espTodayCatsHtml(row, game, accent) {
   try { pair = espMyMatchupPair(row); } catch (e) { return ''; }
   if (!pair) return '';
 
-  var mine = espTodayByStat(row.rosters, pair.mineId);
-  var opp = espTodayByStat(row.rosters, pair.oppId);
+  var mine = espTodayByStat(row.rosters, pair.mineId, game);
+  var opp = espTodayByStat(row.rosters, pair.oppId, game);
   if (!mine && !opp) return '';
   mine = espDailyRates(mine || {}, game);
   opp = espDailyRates(opp || {}, game);
@@ -129004,10 +129089,11 @@ function espCatBreakdown(j, row) {
     for (k in (os || {})) if (os.hasOwnProperty(k)) ids[k] = 1;
     // Fold today in — scoreByStat stops at the last completed period.
     // ESPNSLICE2N
-    var myToday = espTodayByStat(row.rosters, mine.teamId);
-    var opToday = espTodayByStat(row.rosters, opp.teamId);
-    var myLive = espLiveCatValues(ms, myToday);
-    var opLive = espLiveCatValues(os, opToday);
+    var _lcGame = (typeof _espGameCode === 'function') ? _espGameCode(row) : 'flb';
+    var myToday = espTodayByStat(row.rosters, mine.teamId, _lcGame);
+    var opToday = espTodayByStat(row.rosters, opp.teamId, _lcGame);
+    var myLive = espLiveCatValues(ms, myToday, _lcGame);
+    var opLive = espLiveCatValues(os, opToday, _lcGame);
 
     // Only the league's real categories. scoreByStat also carries AB / H /
     // IP / BB / ER as rate components, which made the grid twice as long
@@ -129424,7 +129510,7 @@ function _espNum(v) {
 }
 
 // Today's per-category totals for one team, from its STARTERS.
-function espTodayByStat(rosters, teamId) {
+function espTodayByStat(rosters, teamId, game) {
   var t = rosters && rosters.byTeam && rosters.byTeam[String(teamId)];
   if (!t || !t.items) return null;
   var out = {}, any = false, i, k;
@@ -129436,7 +129522,7 @@ function espTodayByStat(rosters, teamId) {
     for (k in w.stats) {
       if (!w.stats.hasOwnProperty(k)) continue;
       // Same rule as everywhere else: a rate is not additive. ESPRATESUM
-      if (ESP_STAT_RATE[k]) continue;
+      if (espIsRate(game, k)) continue;   // ESPSPORTFLAG
       var _tv = Number(w.stats[k]);
       if (isNaN(_tv)) continue;
       out[k] = (out[k] || 0) + _tv;
@@ -129447,7 +129533,7 @@ function espTodayByStat(rosters, teamId) {
 }
 
 // Merge completed-period totals with today, rebuilding rates from parts.
-function espLiveCatValues(scoreByStat, todayByStat) {
+function espLiveCatValues(scoreByStat, todayByStat, game) {
   var out = {}, k, i;
   for (k in (scoreByStat || {})) {
     if (!scoreByStat.hasOwnProperty(k)) continue;
@@ -129467,7 +129553,7 @@ function espLiveCatValues(scoreByStat, todayByStat) {
       // one keep the completed-period value, which is stale by a day but is
       // at least a real percentage rather than a sum of percentages.
       // ESPRATESUM
-      if (ESP_STAT_RATE[k]) continue;
+      if (espIsRate(game, k)) continue;   // ESPSPORTFLAG
       out[k] = (out[k] || 0) + Number(todayByStat[k]);
     }
   }
@@ -129599,7 +129685,7 @@ function espHasSeasonStats(row) {
 // add, and neither do two ERAs; the components (AB, H, IP, ER, BB) DO add,
 // and espScoredIds already keeps them for cats leagues precisely so the
 // rates can be rebuilt afterwards. ESPDAILY
-function espDailyTeamStats(rosters, teamId) {
+function espDailyTeamStats(rosters, teamId, game) {
   var t = rosters && rosters.byTeam && rosters.byTeam[String(teamId)];
   if (!t || !t.items) return null;
   var out = {}, any = false, i, k;
@@ -129610,7 +129696,7 @@ function espDailyTeamStats(rosters, teamId) {
     if (!w || !w.stats) continue;
     for (k in w.stats) {
       if (!w.stats.hasOwnProperty(k)) continue;
-      if (ESP_STAT_RATE[k]) continue;
+      if (espIsRate(game, k)) continue;   // ESPSPORTFLAG
       var n = Number(w.stats[k]);
       if (isNaN(n)) continue;
       out[k] = (out[k] || 0) + n;
