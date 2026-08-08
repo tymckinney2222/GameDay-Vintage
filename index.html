@@ -26610,6 +26610,20 @@
   <div class="pw-body" id="nbrBody"></div>
 </div>
 
+<!-- NHL stat-id probe. Temporary. ESPNHLIDPROBE -->
+<div class="pw-overlay" id="nidOverlay">
+  <div class="pp-header">
+    <div>
+      <div class="pp-eyebrow">NHL</div>
+      <h2 class="pp-title">Stat ID Probe</h2>
+    </div>
+    <button class="pp-close" onclick="closeNhlIdProbe()" aria-label="Close">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+    </button>
+  </div>
+  <div class="pw-body" id="nidBody"></div>
+</div>
+
 <!-- Injury Board — pickup scanner. Probe build. INJTOOL -->
 <div class="pw-overlay" id="injOverlay">
   <div class="pp-header">
@@ -32547,6 +32561,11 @@ function renderLeagueDrawerBody() {
     '<div class="ld-tool-icon">\ud83e\ude79</div>' +
     '<div class="ld-tool-name">Injury Board</div>' +
   '</div>';
+  // ESPNHLIDPROBE — temporary; remove once the NHL ids are named.
+  html += '<div class="ld-tool-item" onclick="openNhlIdProbe(); closeLeagueDrawer();">' +
+    '<div class="ld-tool-icon">\ud83c\udfd2</div>' +
+    '<div class="ld-tool-name">NHL Stat ID Probe</div>' +
+  '</div>';
   html += '</div>'; // .ld-tools-body
   // SKBUILD
   html += '<div style="padding:14px 16px 4px;font-size:8.5px;letter-spacing:0.08em;' +
@@ -32598,7 +32617,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-08-08 12:10 UTC';
+var SK_BUILD = '2026-08-08 12:14 UTC';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -116870,6 +116889,189 @@ function _nbrRgba(hex, a) {
   var h = String(hex || '').replace('#', '');
   function ch(i) { var v = parseInt(h.slice(i, i + 2), 16); return isNaN(v) ? 0 : v; }
   return 'rgba(' + ch(0) + ',' + ch(2) + ',' + ch(4) + ',' + a + ')';
+}
+
+// ── NHL STAT-ID PROBE ── ESPNHLIDPROBE ──
+// The categories league is preseason, so every value on screen is 0 and there
+// is nothing to match ids against. Waiting for October isn't necessary though:
+// ESPN serves PRIOR SEASON actuals keyed by the SAME stat ids, through the
+// path-walking trick the draft board already proved (the season lives in the
+// URL, not in a header filter — see the notes above dbpFetchHistChunk).
+//
+// So the probe pulls a handful of players whose real seasons are a matter of
+// record and prints their id->value map. An id showing 51 for MacKinnon is
+// goals; one showing 140 is points. That identifies the ids by evidence
+// rather than by assuming ESPN's numbering, which is exactly how the MLB
+// mapping got settled — and how the two that were guessed got settled WRONG
+// the first time.
+//
+// Deliberately reads a whole map rather than testing a hypothesis: the point
+// is to see every id the league scores, including the ones nobody has thought
+// to guess.
+var _nidState = { loading: false, err: '', rows: null, year: null };
+
+// Known, checkable seasons. Chosen because their lines are lopsided enough
+// that no two categories can be confused: a 51-goal 140-point year cannot be
+// mistaken for an assist total, and a goaltender's numbers share no magnitude
+// with a skater's.
+var NID_KNOWN = [
+  { id: 4233563, name: 'Nathan MacKinnon',  note: '2025: 51 G, 89 A, 140 P, 82 GP' },
+  { id: 3895074, name: 'Connor McDavid',    note: '2025: 26 G, 74 A, 100 P, 67 GP' },
+  { id: 4874709, name: 'Connor Hellebuyck', note: 'goaltender — W / GAA / SV%' }
+];
+
+function openNhlIdProbe() {
+  var ov = document.getElementById('nidOverlay');
+  if (!ov) return;
+  ov.classList.add('open');
+  if (!_nidState.rows && !_nidState.loading) _nidLoad();
+  else _nidRender();
+}
+function closeNhlIdProbe() {
+  var ov = document.getElementById('nidOverlay');
+  if (ov) ov.classList.remove('open');
+}
+
+function _nidLoad() {
+  if (typeof dbpFetchHistChunk !== 'function') {
+    _nidState.err = 'draft-board history fetch not available';
+    _nidRender();
+    return;
+  }
+  _nidState.loading = true;
+  _nidState.err = '';
+  _nidRender();
+  // The season BEFORE the current one, which is the most recent completed
+  // set of actuals.
+  var yr = 2026;
+  _nidState.year = yr;
+  var ids = [];
+  for (var i = 0; i < NID_KNOWN.length; i++) ids.push(NID_KNOWN[i].id);
+
+  dbpFetchHistChunk('NHL', yr, ids, 'nidprobe')
+    .then(function (players) {
+      _nidState.loading = false;
+      _nidState.rows = players || [];
+      _nidRender();
+    })['catch'](function (e) {
+      _nidState.loading = false;
+      _nidState.err = (e && e.message) ? e.message : 'request failed';
+      _nidRender();
+    });
+}
+
+// Every (statSourceId, statSplitTypeId) block a player carries, with its full
+// id->value map. Source 0 is actuals; anything else is a projection and is
+// labelled as such rather than dropped, so a block that looks wrong can be
+// recognised instead of silently missing.
+function _nidBlocks(p) {
+  var pl = (p && (p.player || p)) || {};
+  var st = pl.stats || [];
+  var out = [], i;
+  for (i = 0; i < st.length; i++) {
+    var e = st[i] || {};
+    var m = e.stats || {};
+    var n = 0, k;
+    for (k in m) { if (m.hasOwnProperty(k)) n++; }
+    if (!n) continue;
+    out.push({
+      src: e.statSourceId, split: e.statSplitTypeId,
+      season: e.seasonId, applied: e.appliedTotal,
+      map: m, n: n
+    });
+  }
+  return out;
+}
+
+function _nidRender() {
+  var body = document.getElementById('nidBody');
+  if (!body) return;
+  var mono = 'font-family:var(--sk-font-mono,monospace);font-size:10px;line-height:1.55;';
+
+  if (_nidState.loading) {
+    body.innerHTML = '<div style="' + mono + 'color:rgba(255,255,255,0.5)">Fetching ' +
+      (_nidState.year || '') + ' actuals\u2026</div>';
+    return;
+  }
+  if (_nidState.err) {
+    body.innerHTML = '<div style="' + mono + 'color:#f87171">FAILED: ' +
+      slEsc(_nidState.err) + '</div>' +
+      '<button onclick="_nidState.rows=null;_nidLoad()" style="margin-top:14px;' +
+      'padding:8px 16px;border-radius:8px;border:1px solid rgba(255,255,255,0.15);' +
+      'background:none;color:rgba(255,255,255,0.7);font-size:11px">RETRY</button>';
+    return;
+  }
+  if (!_nidState.rows) { body.innerHTML = ''; return; }
+
+  var h = '';
+  h += '<div style="' + mono + 'color:#4ade80">' + _nidState.rows.length +
+    ' players \u00b7 ' + _nidState.year + ' actuals</div>';
+
+  if (!_nidState.rows.length) {
+    h += '<div style="' + mono + 'color:rgba(255,255,255,0.5);margin-top:10px">' +
+      'No players came back. The season path may not hold ' + _nidState.year +
+      ' yet \u2014 worth trying the year before.</div>';
+    body.innerHTML = h;
+    return;
+  }
+
+  var i, j, k;
+  for (i = 0; i < _nidState.rows.length; i++) {
+    var p = _nidState.rows[i];
+    var pl = (p && (p.player || p)) || {};
+    var nm = pl.fullName || pl.name || ('id ' + (pl.id != null ? pl.id : '?'));
+    var known = '';
+    for (j = 0; j < NID_KNOWN.length; j++) {
+      if (String(NID_KNOWN[j].id) === String(pl.id)) known = NID_KNOWN[j].note;
+    }
+    h += '<div style="font-size:11px;font-weight:800;letter-spacing:0.06em;' +
+      'color:#fbbf24;margin:16px 0 2px">' + slEsc(nm) + '</div>';
+    if (known) {
+      h += '<div style="' + mono + 'color:rgba(255,255,255,0.4);margin-bottom:4px">' +
+        'known: ' + slEsc(known) + '</div>';
+    }
+    var blocks = _nidBlocks(p);
+    if (!blocks.length) {
+      h += '<div style="' + mono + 'color:rgba(255,255,255,0.35)">no stat blocks</div>';
+      continue;
+    }
+    for (j = 0; j < blocks.length; j++) {
+      var b = blocks[j];
+      var isActual = (b.src === 0);
+      h += '<div style="' + mono + 'color:' +
+        (isActual ? 'rgba(255,255,255,0.55)' : 'rgba(255,255,255,0.25)') + '">' +
+        'src ' + b.src + ' split ' + b.split + ' season ' + b.season +
+        (isActual ? '  \u2190 ACTUAL' : '  (projection \u2014 ignore)') +
+        '  \u00b7 ' + b.n + ' stats</div>';
+      if (!isActual) continue;
+      // Sorted by id so the same order comes back every run and two players
+      // can be read side by side.
+      var keys = [];
+      for (k in b.map) { if (b.map.hasOwnProperty(k)) keys.push(k); }
+      keys.sort(function (x, y) { return Number(x) - Number(y); });
+      var line = [];
+      for (k = 0; k < keys.length; k++) {
+        var v = b.map[keys[k]];
+        var vs = (typeof v === 'number') ? (Math.round(v * 1000) / 1000) : v;
+        line.push('#' + keys[k] + '=' + vs);
+      }
+      for (k = 0; k < line.length; k += 5) {
+        h += '<div style="' + mono + 'color:rgba(255,255,255,0.8);padding-left:8px">' +
+          slEsc(line.slice(k, k + 5).join('  ')) + '</div>';
+      }
+    }
+  }
+
+  h += '<div style="font-size:9.5px;line-height:1.55;color:rgba(255,255,255,0.3);' +
+    'margin-top:18px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.08)">' +
+    'Screenshot this. Matching the ids against those known lines names them ' +
+    'by evidence \u2014 an id reading 51 for MacKinnon is goals, 140 is points ' +
+    '\u2014 and the goaltender separates W, GAA and SV% from the skating ' +
+    'categories. That settles the labels, the SKATING / GOALTENDING split and ' +
+    'GAA\u2019s lower-is-better direction in one pass, without waiting for ' +
+    'October.</div>';
+
+  body.innerHTML = h;
 }
 
 // ─────────────────────────────────────────────────────────────────
