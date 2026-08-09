@@ -32598,7 +32598,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-08-09 13:26 UTC';
+var SK_BUILD = '2026-08-09 13:41 UTC';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -119547,41 +119547,69 @@ function _mrParseRec(str) {
 }
 
 // Season matchup record for one external league.
-// Has this league's season actually started? ── SKPRESEASON ──
+// Has this league actually played anything? ── SKPRESEASON ──
 //
-// A drafted-but-unplayed league poisons the record two different ways.
-// espMatchupRecord skips matchup periods at or past the CURRENT one, but a
-// preseason league has no currentMatchupPeriod at all — so the guard never
-// fires, every scheduled week gets evaluated at 0-0 categories, and all of
-// them come back TIES. A seventeen-week hockey league adds seventeen ties to
-// a record that hasn't had a game played in it. Season-points and roto
-// leagues do their own version: everyone sits on zero, so the standings hand
-// back an arbitrary placing that drags the percentile.
+// A drafted-but-unplayed league poisons the record two ways. espMatchupRecord
+// skips matchup periods at or past the CURRENT one, but a preseason league has
+// no currentMatchupPeriod at all — so the guard never fires, every scheduled
+// week evaluates at 0-0 categories, and all of them come back TIES. Season
+// points and roto do their own version: everyone sits on zero, so the
+// standings hand back an arbitrary placing that drags the percentile.
 //
-// Evidence comes first and the calendar second. If anything has actually been
-// scored, the league counts no matter what the date says — a season window
-// that's wrong must never discard real results. Only when there is no
-// evidence AND the calendar agrees the season hasn't opened is it held back.
+// The first attempt at this asked a CALENDAR whether the season had opened.
+// That worked for ESPN and failed for everyone else, because each provider
+// numbers its seasons differently: Sleeper labels a basketball season with
+// its opening year while ESPN uses the closing one, and Fantrax often sends
+// no season at all. A Sleeper NBA "2026" was therefore measured against the
+// 2025-26 window — a season that had already both started and finished — so
+// the gate waved it through.
+//
+// Chasing each provider's convention is a losing game. Evidence needs no
+// convention: has anything been played? Points scored, or a decided matchup,
+// anywhere in the league. A league with none of that has nothing to
+// contribute, so excluding it costs nothing and is self-correcting — the day
+// a game is played it starts counting on its own.
 function skSeasonStarted(row) {
   if (!row) return false;
   var rows = row.standingsAll || (row.standings ? [row.standings] : []), i;
-
-  // Evidence: any points scored, or any decided matchup, anywhere in the
-  // league — not just on my team, since I might simply be on a bye.
   for (i = 0; i < rows.length; i++) {
     var r = rows[i] || {};
+    // Points for, on any team. Checked league-wide rather than on mine alone,
+    // since I might simply be on a bye in the opening week.
     if (r.pf != null && Number(r.pf) > 0) return true;
+    // Or a decided matchup, from the platform's own standings string.
     var p = (typeof _mrParseRec === 'function') ? _mrParseRec(r.record) : null;
     if (p && ((p.w || 0) + (p.l || 0) + (p.t || 0)) > 0) return true;
   }
+  return false;
+}
 
-  // Calendar. Unknown sport or season means no opinion, so it counts.
+// Leagues the person has explicitly told the record to ignore. The evidence
+// test above is automatic and should be right, but "should be" has already
+// been wrong once here, and a wrong total is worse than a manual switch.
+// SKPRESEASON
+var SK_MR_EXCLUDE_KEY = 'sk_mr_exclude_v1';
+
+function skMrExcluded() {
   try {
-    if (typeof _espSeasonWindow !== 'function') return true;
-    var w = _espSeasonWindow(String(row.sport || '').toLowerCase(), row.season);
-    if (!w || !w.startMs) return true;
-    return Date.now() >= w.startMs;
-  } catch (e) { return true; }
+    var raw = localStorage.getItem(SK_MR_EXCLUDE_KEY);
+    return raw ? (JSON.parse(raw) || {}) : {};
+  } catch (e) { return {}; }
+}
+
+function skMrToggleLeague(key) {
+  var ex = skMrExcluded();
+  if (ex[key]) delete ex[key]; else ex[key] = 1;
+  try { localStorage.setItem(SK_MR_EXCLUDE_KEY, JSON.stringify(ex)); } catch (e) {}
+  if (typeof mrRenderBody === 'function') mrRenderBody();
+}
+
+// One test both the automatic and the manual rule feed into.
+function skMrCounts(row) {
+  if (!row) return false;
+  var ex = skMrExcluded();
+  if (ex[row.key]) return false;
+  return skSeasonStarted(row);
 }
 
 function mrSeasonRec(row) {
@@ -119602,11 +119630,16 @@ function mrWeekResult(row) {
     if (g.awayWins != null && g.homeWins != null) {
       var mw = meAway ? g.awayWins : g.homeWins;
       var ow = meAway ? g.homeWins : g.awayWins;
+      // Nobody has taken a single category yet. That is a matchup which
+      // hasn't started, not one that is level — and calling it a tie is
+      // where the 0-0-1 week record came from. SKPRESEASON
+      if (!mw && !ow) return null;
       return mw > ow ? 'W' : mw < ow ? 'L' : 'T';
     }
     var ms = meAway ? g.awayScore : g.homeScore;
     var os = meAway ? g.homeScore : g.awayScore;
     if (ms == null || os == null) return null;
+    if (!Number(ms) && !Number(os)) return null;   // 0-0, nothing played
     return ms > os ? 'W' : ms < os ? 'L' : 'T';
   }
   return null;
@@ -119767,12 +119800,15 @@ function mrCollect() {
       // noise — ties it never played, or a placing nobody has earned. It is
       // listed below rather than dropped, so it reads as waiting rather than
       // as missing. SKPRESEASON
-      if (typeof skSeasonStarted === 'function' && !skSeasonStarted(row)) {
+      if (typeof skMrCounts === 'function' && !skMrCounts(row)) {
+        var _exMap = (typeof skMrExcluded === 'function') ? skMrExcluded() : {};
         if (!bk.detail) bk.detail = [];
-        bk.detail.push({ name: (row.name || row.key),
+        bk.detail.push({ name: (row.name || row.key), key: row.key,
                          fmt: (typeof extFormatKey === 'function') ? extFormatKey(row) : '',
-                         rec: '\u2014', src: 'season hasn\u2019t started',
-                         n: 0, weeks: null, raw: '', week: '\u2014', pre: true });
+                         rec: '\u2014',
+                         src: _exMap[row.key] ? 'excluded by you' : 'nothing played yet',
+                         n: 0, weeks: null, raw: '', week: '\u2014', pre: true,
+                         manual: !!_exMap[row.key] });
         continue;
       }
       bk.leagues++;
@@ -119790,7 +119826,7 @@ function mrCollect() {
         // Still worth listing, so it's visibly excluded rather than
         // silently missing from the trace. MGRREC2
         if (!bk.detail) bk.detail = [];
-        bk.detail.push({ name: (row.name || row.key), fmt: fmt, rec: '\u2014',
+        bk.detail.push({ name: (row.name || row.key), key: row.key, fmt: fmt, rec: '\u2014',
                          src: pl ? ('season-long \u00b7 ' + _mrPlaceFmt(pl))
                                  : 'season-long, no record',
                          n: 0, weeks: null, raw: '', week: '\u2014' });
@@ -119811,6 +119847,7 @@ function mrCollect() {
       if (!bk.detail) bk.detail = [];
       bk.detail.push({
         name: (row.name || row.key),
+        key: row.key,
         fmt: fmt || '?',
         rec: rec ? (rec.w + '-' + rec.l + '-' + rec.t) : '\u2014',
         src: rec ? (rec.src || '?') : 'none',
@@ -120021,6 +120058,73 @@ function _skArchiveBtn() {
   '</div>';
 }
 
+// The per-league list, with a switch on each row. Extracted so the empty
+// state can show it too — a person with only preseason leagues most needs to
+// see WHY nothing is counting. SKPRESEASON
+function _mrPreListHtml(data) {
+  var det = [], k, dp, dd, di;
+  for (k in data.bySport) {
+    if (!data.bySport.hasOwnProperty(k)) continue;
+    for (dp in data.bySport[k].plats) {
+      if (!data.bySport[k].plats.hasOwnProperty(dp)) continue;
+      dd = data.bySport[k].plats[dp].detail;
+      if (dd) for (di = 0; di < dd.length; di++) det.push(dd[di]);
+    }
+  }
+  return _mrDetailHtml(det);
+}
+
+function _mrDetailHtml(det) {
+  if (!det.length) return '';
+  var h = '<div style="background:var(--sk-bg-card,rgba(255,255,255,0.03));' +
+    'border:1px solid rgba(255,255,255,0.07);border-radius:12px;padding:14px;margin:0 0 10px;">' +
+    '<div style="font-size:9.5px;letter-spacing:0.14em;color:rgba(255,255,255,0.4);' +
+      'margin:0 0 8px;">PER LEAGUE \u00b7 NON-YAHOO</div>';
+  for (var i = 0; i < det.length; i++) {
+    var dt = det[i];
+    var on = !dt.pre;
+    h += '<div style="display:flex;align-items:flex-start;gap:9px;padding:5px 0;' +
+      'border-bottom:1px solid rgba(255,255,255,0.04);' + (dt.pre ? 'opacity:0.5;' : '') + '">' +
+      // The switch. A counted league can be turned off; one held back for
+      // having played nothing can be forced on, for a platform whose
+      // standings don't report anything Skipper recognises as evidence.
+      (dt.key
+        ? '<button onclick="skMrToggleLeague(\'' + slEsc(String(dt.key).replace(/\\/g, '')) + '\')" ' +
+          'aria-label="' + (on ? 'Exclude' : 'Include') + ' this league" ' +
+          'style="flex:0 0 26px;height:15px;margin-top:2px;border-radius:999px;cursor:pointer;' +
+            'border:1px solid ' + (on ? 'rgba(74,222,128,0.5)' : 'rgba(255,255,255,0.18)') + ';' +
+            'background:' + (on ? 'rgba(74,222,128,0.18)' : 'rgba(255,255,255,0.05)') + ';' +
+            'position:relative;padding:0;">' +
+            '<span style="position:absolute;top:1.5px;' + (on ? 'right:2px' : 'left:2px') + ';' +
+              'width:10px;height:10px;border-radius:50%;background:' +
+              (on ? '#4ade80' : 'rgba(255,255,255,0.35)') + ';"></span>' +
+          '</button>'
+        : '<span style="flex:0 0 26px;"></span>') +
+      '<div style="flex:1;min-width:0;">' +
+        '<div style="display:flex;align-items:baseline;gap:8px;">' +
+          '<span style="flex:1;min-width:0;font-size:11.5px;color:rgba(255,255,255,0.8);' +
+            'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + slEsc(dt.name) + '</span>' +
+          '<span style="font-family:var(--sk-font-mono,monospace);font-size:12px;color:#fff;">' +
+            slEsc(dt.rec) + '</span>' +
+          '<span style="font-family:var(--sk-font-mono,monospace);font-size:11px;color:#4ade80;">' +
+            slEsc(dt.week) + '</span>' +
+        '</div>' +
+        '<div style="font-size:9px;color:rgba(255,255,255,0.3);">' +
+          slEsc(dt.fmt) + (dt.pre ? ' \u00b7 ' : ' \u00b7 via ') + slEsc(dt.src) +
+          (dt.n ? ' \u00b7 ' + dt.n + ' wks' : '') +
+          (dt.weeks != null ? ' of ' + dt.weeks : '') +
+          (dt.raw ? ' \u00b7 raw ' + slEsc(dt.raw) : '') +
+        '</div>' +
+      '</div>' +
+    '</div>';
+  }
+  h += '<div style="font-size:9px;line-height:1.5;color:rgba(255,255,255,0.28);margin-top:7px;">' +
+    'The switch decides whether a league feeds the figures above. Leagues with ' +
+    'nothing played are off automatically \u2014 a drafted league has no result ' +
+    'to contribute, and counting one would be inventing it.</div>';
+  return h + '</div>';
+}
+
 function mrRenderBody() {
   var body = document.getElementById('mrBody');
   if (!body) return;
@@ -120032,8 +120136,15 @@ function mrRenderBody() {
   var g = data.grand;
 
   if (!g.leagues) {
+    // The trophy case still belongs here: it describes seasons that FINISHED,
+    // and having nothing in progress says nothing about those. It used to sit
+    // below this return, so a person whose leagues were all preseason saw no
+    // case at all. SKPRESEASON
     body.innerHTML = '<div style="color:rgba(255,255,255,0.45);font-size:13px;padding:20px 4px;">' +
-      'No synced leagues yet.</div>';
+      'No leagues are counting toward the record yet \u2014 nothing has been ' +
+      'played in the ones you\u2019ve synced.</div>' +
+      ((typeof _skTrophyHtml === 'function') ? _skTrophyHtml() : '') +
+      _mrPreListHtml(data);
     return;
   }
 
@@ -120321,36 +120432,7 @@ function mrRenderBody() {
   // seasons in progress. SKARCHIVE
   if (typeof _skTrophyHtml === 'function') h += _skTrophyHtml();
 
-  if (det.length) {
-    h += '<div style="background:var(--sk-bg-card,rgba(255,255,255,0.03));' +
-      'border:1px solid rgba(255,255,255,0.07);border-radius:12px;padding:14px;margin:0 0 10px;">' +
-      '<div style="font-size:9.5px;letter-spacing:0.14em;color:rgba(255,255,255,0.4);' +
-        'margin:0 0 8px;">PER LEAGUE \u00b7 NON-YAHOO</div>';
-    for (i = 0; i < det.length; i++) {
-      var dt = det[i];
-      // A league still waiting on its opening day is dimmed, so the list
-      // shows it is synced and ready without implying it fed the numbers
-      // above. SKPRESEASON
-      h += '<div style="padding:5px 0;border-bottom:1px solid rgba(255,255,255,0.04);' +
-        (dt.pre ? 'opacity:0.45;' : '') + '">' +
-        '<div style="display:flex;align-items:baseline;gap:8px;">' +
-          '<span style="flex:1;min-width:0;font-size:11.5px;color:rgba(255,255,255,0.8);' +
-            'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + slEsc(dt.name) + '</span>' +
-          '<span style="font-family:var(--sk-font-mono,monospace);font-size:12px;color:#fff;">' +
-            slEsc(dt.rec) + '</span>' +
-          '<span style="font-family:var(--sk-font-mono,monospace);font-size:11px;color:#4ade80;">' +
-            slEsc(dt.week) + '</span>' +
-        '</div>' +
-        '<div style="font-size:9px;color:rgba(255,255,255,0.3);">' +
-          slEsc(dt.fmt) + (dt.pre ? ' \u00b7 ' : ' \u00b7 via ') + slEsc(dt.src) +
-          (dt.n ? ' \u00b7 ' + dt.n + ' wks' : '') +
-          (dt.weeks != null ? ' of ' + dt.weeks : '') +
-          (dt.raw ? ' \u00b7 raw ' + slEsc(dt.raw) : '') +
-        '</div>' +
-      '</div>';
-    }
-    h += '</div>';
-  }
+  h += _mrDetailHtml(det);   // SKPRESEASON
 
   h += '<div style="color:rgba(255,255,255,0.28);font-size:9.5px;line-height:1.6;margin-top:4px;">' +
     'One W/L/T per weekly matchup, every platform counted the same way. ' +
