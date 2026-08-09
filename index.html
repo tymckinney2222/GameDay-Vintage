@@ -32598,7 +32598,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-08-09 13:41 UTC';
+var SK_BUILD = '2026-08-09 14:01 UTC';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -119612,6 +119612,26 @@ function skMrCounts(row) {
   return skSeasonStarted(row);
 }
 
+// Forget an exclusion on a league that has nothing to exclude.
+//
+// The switch was drawn on every row, but skMrCounts holds back anything with
+// no results whatever the switch says — so tapping one of those flipped the
+// stored flag and the label while the switch itself never moved. Only leagues
+// with results could actually toggle, which is why exactly one of them
+// behaved and the rest looked broken.
+//
+// The flags those dead taps left behind are the real hazard: they would sit
+// in storage until the season opened and then quietly exclude a league that
+// was now playing, for a reason nobody would remember choosing. So they are
+// cleared as soon as they are seen to be meaningless. SKPRESEASON
+function skMrDropStaleExclude(key) {
+  var ex = skMrExcluded();
+  if (!ex[key]) return false;
+  delete ex[key];
+  try { localStorage.setItem(SK_MR_EXCLUDE_KEY, JSON.stringify(ex)); } catch (e) {}
+  return true;
+}
+
 function mrSeasonRec(row) {
   if (row.provider === 'espn') return espMatchupRecord(row);
   return _mrParseRec(row.standings && row.standings.record);
@@ -119801,14 +119821,20 @@ function mrCollect() {
       // listed below rather than dropped, so it reads as waiting rather than
       // as missing. SKPRESEASON
       if (typeof skMrCounts === 'function' && !skMrCounts(row)) {
-        var _exMap = (typeof skMrExcluded === 'function') ? skMrExcluded() : {};
+        // Evidence decides the reason, not the switch — a league with nothing
+        // played is held back whether or not it was ever tapped.
+        var _played = (typeof skSeasonStarted === 'function') ? skSeasonStarted(row) : true;
+        if (!_played && typeof skMrDropStaleExclude === 'function') {
+          skMrDropStaleExclude(row.key);
+        }
         if (!bk.detail) bk.detail = [];
         bk.detail.push({ name: (row.name || row.key), key: row.key,
                          fmt: (typeof extFormatKey === 'function') ? extFormatKey(row) : '',
                          rec: '\u2014',
-                         src: _exMap[row.key] ? 'excluded by you' : 'nothing played yet',
+                         src: _played ? 'excluded by you' : 'nothing played yet',
                          n: 0, weeks: null, raw: '', week: '\u2014', pre: true,
-                         manual: !!_exMap[row.key] });
+                         // Only a league with results has anything to switch.
+                         switchable: _played });
         continue;
       }
       bk.leagues++;
@@ -119826,7 +119852,8 @@ function mrCollect() {
         // Still worth listing, so it's visibly excluded rather than
         // silently missing from the trace. MGRREC2
         if (!bk.detail) bk.detail = [];
-        bk.detail.push({ name: (row.name || row.key), key: row.key, fmt: fmt, rec: '\u2014',
+        bk.detail.push({ name: (row.name || row.key), key: row.key, switchable: true,
+                         fmt: fmt, rec: '\u2014',
                          src: pl ? ('season-long \u00b7 ' + _mrPlaceFmt(pl))
                                  : 'season-long, no record',
                          n: 0, weeks: null, raw: '', week: '\u2014' });
@@ -119848,6 +119875,7 @@ function mrCollect() {
       bk.detail.push({
         name: (row.name || row.key),
         key: row.key,
+        switchable: true,
         fmt: fmt || '?',
         rec: rec ? (rec.w + '-' + rec.l + '-' + rec.t) : '\u2014',
         src: rec ? (rec.src || '?') : 'none',
@@ -120088,7 +120116,10 @@ function _mrDetailHtml(det) {
       // The switch. A counted league can be turned off; one held back for
       // having played nothing can be forced on, for a platform whose
       // standings don't report anything Skipper recognises as evidence.
-      (dt.key
+      // A switch only where one can move. A league with nothing played gets a
+      // small hollow dot instead: it says "waiting", and cannot be tapped into
+      // implying otherwise. SKPRESEASON
+      ((dt.key && dt.switchable !== false)
         ? '<button onclick="skMrToggleLeague(\'' + slEsc(String(dt.key).replace(/\\/g, '')) + '\')" ' +
           'aria-label="' + (on ? 'Exclude' : 'Include') + ' this league" ' +
           'style="flex:0 0 26px;height:15px;margin-top:2px;border-radius:999px;cursor:pointer;' +
@@ -120099,7 +120130,10 @@ function _mrDetailHtml(det) {
               'width:10px;height:10px;border-radius:50%;background:' +
               (on ? '#4ade80' : 'rgba(255,255,255,0.35)') + ';"></span>' +
           '</button>'
-        : '<span style="flex:0 0 26px;"></span>') +
+        : '<span title="waiting on its first game" style="flex:0 0 26px;height:15px;' +
+            'margin-top:2px;display:flex;align-items:center;justify-content:center;">' +
+            '<span style="width:7px;height:7px;border-radius:50%;' +
+              'border:1px solid rgba(255,255,255,0.22);"></span></span>') +
       '<div style="flex:1;min-width:0;">' +
         '<div style="display:flex;align-items:baseline;gap:8px;">' +
           '<span style="flex:1;min-width:0;font-size:11.5px;color:rgba(255,255,255,0.8);' +
@@ -120119,9 +120153,9 @@ function _mrDetailHtml(det) {
     '</div>';
   }
   h += '<div style="font-size:9px;line-height:1.5;color:rgba(255,255,255,0.28);margin-top:7px;">' +
-    'The switch decides whether a league feeds the figures above. Leagues with ' +
-    'nothing played are off automatically \u2014 a drafted league has no result ' +
-    'to contribute, and counting one would be inventing it.</div>';
+    'The switch decides whether a league feeds the figures above. A league ' +
+    'showing a hollow dot has played nothing yet \u2014 there is no result to ' +
+    'include, so it has no switch until its first game.</div>';
   return h + '</div>';
 }
 
