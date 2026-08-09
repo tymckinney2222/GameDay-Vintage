@@ -32598,7 +32598,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-08-09 13:08 UTC';
+var SK_BUILD = '2026-08-09 13:26 UTC';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -119547,6 +119547,43 @@ function _mrParseRec(str) {
 }
 
 // Season matchup record for one external league.
+// Has this league's season actually started? ── SKPRESEASON ──
+//
+// A drafted-but-unplayed league poisons the record two different ways.
+// espMatchupRecord skips matchup periods at or past the CURRENT one, but a
+// preseason league has no currentMatchupPeriod at all — so the guard never
+// fires, every scheduled week gets evaluated at 0-0 categories, and all of
+// them come back TIES. A seventeen-week hockey league adds seventeen ties to
+// a record that hasn't had a game played in it. Season-points and roto
+// leagues do their own version: everyone sits on zero, so the standings hand
+// back an arbitrary placing that drags the percentile.
+//
+// Evidence comes first and the calendar second. If anything has actually been
+// scored, the league counts no matter what the date says — a season window
+// that's wrong must never discard real results. Only when there is no
+// evidence AND the calendar agrees the season hasn't opened is it held back.
+function skSeasonStarted(row) {
+  if (!row) return false;
+  var rows = row.standingsAll || (row.standings ? [row.standings] : []), i;
+
+  // Evidence: any points scored, or any decided matchup, anywhere in the
+  // league — not just on my team, since I might simply be on a bye.
+  for (i = 0; i < rows.length; i++) {
+    var r = rows[i] || {};
+    if (r.pf != null && Number(r.pf) > 0) return true;
+    var p = (typeof _mrParseRec === 'function') ? _mrParseRec(r.record) : null;
+    if (p && ((p.w || 0) + (p.l || 0) + (p.t || 0)) > 0) return true;
+  }
+
+  // Calendar. Unknown sport or season means no opinion, so it counts.
+  try {
+    if (typeof _espSeasonWindow !== 'function') return true;
+    var w = _espSeasonWindow(String(row.sport || '').toLowerCase(), row.season);
+    if (!w || !w.startMs) return true;
+    return Date.now() >= w.startMs;
+  } catch (e) { return true; }
+}
+
 function mrSeasonRec(row) {
   if (row.provider === 'espn') return espMatchupRecord(row);
   return _mrParseRec(row.standings && row.standings.record);
@@ -119726,6 +119763,18 @@ function mrCollect() {
       var plat = row.provider;
       if (plat !== 'sleeper' && plat !== 'fantrax' && plat !== 'espn') continue;
       var bk = bucket(row.sport, plat);
+      // A drafted league whose season hasn't opened contributes nothing but
+      // noise — ties it never played, or a placing nobody has earned. It is
+      // listed below rather than dropped, so it reads as waiting rather than
+      // as missing. SKPRESEASON
+      if (typeof skSeasonStarted === 'function' && !skSeasonStarted(row)) {
+        if (!bk.detail) bk.detail = [];
+        bk.detail.push({ name: (row.name || row.key),
+                         fmt: (typeof extFormatKey === 'function') ? extFormatKey(row) : '',
+                         rec: '\u2014', src: 'season hasn\u2019t started',
+                         n: 0, weeks: null, raw: '', week: '\u2014', pre: true });
+        continue;
+      }
       bk.leagues++;
       // Season-points and roto have no W-L at all, so they count toward
       // LEAGUES and sit out the record — the same way Yahoo shows 11
@@ -120279,7 +120328,11 @@ function mrRenderBody() {
         'margin:0 0 8px;">PER LEAGUE \u00b7 NON-YAHOO</div>';
     for (i = 0; i < det.length; i++) {
       var dt = det[i];
-      h += '<div style="padding:5px 0;border-bottom:1px solid rgba(255,255,255,0.04);">' +
+      // A league still waiting on its opening day is dimmed, so the list
+      // shows it is synced and ready without implying it fed the numbers
+      // above. SKPRESEASON
+      h += '<div style="padding:5px 0;border-bottom:1px solid rgba(255,255,255,0.04);' +
+        (dt.pre ? 'opacity:0.45;' : '') + '">' +
         '<div style="display:flex;align-items:baseline;gap:8px;">' +
           '<span style="flex:1;min-width:0;font-size:11.5px;color:rgba(255,255,255,0.8);' +
             'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + slEsc(dt.name) + '</span>' +
@@ -120289,7 +120342,7 @@ function mrRenderBody() {
             slEsc(dt.week) + '</span>' +
         '</div>' +
         '<div style="font-size:9px;color:rgba(255,255,255,0.3);">' +
-          slEsc(dt.fmt) + ' \u00b7 via ' + slEsc(dt.src) +
+          slEsc(dt.fmt) + (dt.pre ? ' \u00b7 ' : ' \u00b7 via ') + slEsc(dt.src) +
           (dt.n ? ' \u00b7 ' + dt.n + ' wks' : '') +
           (dt.weeks != null ? ' of ' + dt.weeks : '') +
           (dt.raw ? ' \u00b7 raw ' + slEsc(dt.raw) : '') +
@@ -120302,7 +120355,9 @@ function mrRenderBody() {
   h += '<div style="color:rgba(255,255,255,0.28);font-size:9.5px;line-height:1.6;margin-top:4px;">' +
     'One W/L/T per weekly matchup, every platform counted the same way. ' +
     'Season-long and roto leagues count toward LEAGUES but have no matchup record. ' +
-    'Ties count as ties.</div>';
+    'Ties count as ties. A league whose season hasn\u2019t opened is listed ' +
+    'but left out of every figure above \u2014 it has no result to contribute, ' +
+    'and counting one would be inventing it.</div>';
 
   body.innerHTML = h;
 }
@@ -130542,6 +130597,13 @@ function _espSeasonWindow(sport, season) {
   var s, e;
   if (sp === 'nba') { s = (yr - 1) + '-10-21'; e = yr + '-04-13'; }
   else if (sp === 'nhl') { s = (yr - 1) + '-10-07'; e = yr + '-04-17'; }
+  // Football, which had been falling through to the baseball window — a
+  // September-to-January season being told it runs March to September. It
+  // never mattered while this only fed pace figures for the sports above,
+  // but the preseason gate reads the same window, and a drafted NFL league
+  // in August was landing INSIDE baseball's season and counting. Unlike the
+  // others the NFL season sits inside one calendar year. SKPRESEASON
+  else if (sp === 'nfl') { s = yr + '-09-04'; e = (yr + 1) + '-01-05'; }
   else { s = yr + '-03-25'; e = yr + '-09-27'; }   // mlb, and the default
   var sm = new Date(s + 'T00:00:00').getTime();
   var em = new Date(e + 'T23:59:59').getTime();
