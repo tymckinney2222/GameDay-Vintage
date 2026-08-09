@@ -32598,7 +32598,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-08-09 14:20 UTC';
+var SK_BUILD = '2026-08-09 23:13 UTC';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -132754,6 +132754,197 @@ var _espStandView = {};
 // Pace figures need a season clock. The NHL game-limit board doesn't: the
 // caps are known the moment the league is drafted, and preseason is exactly
 // when you want to see what you're working with.
+// ── SEASON SCHEDULE ── ESPSCHED ──
+// ESPN ships the WHOLE season's schedule in the payload Skipper already
+// fetches — row._espScoreJson.schedule, every matchup period, played or not.
+// The preseason tie bug proved it: all seventeen weeks were sitting there
+// before a single game had been played. So this costs no request.
+//
+// Season-points and roto leagues have no matchups at all, so the tab does not
+// appear for them; there is nothing to schedule.
+function espHasSchedule(row) {
+  if (!row) return false;
+  var fmt = (typeof extFormatKey === 'function') ? extFormatKey(row) : '';
+  if (fmt === 'point' || fmt === 'roto') return false;
+  var j = row._espScoreJson;
+  return !!(j && j.schedule && j.schedule.length);
+}
+
+// One team's season, oldest week first.
+//
+// Result is only claimed for weeks BEFORE the current period. ESPN keeps live
+// values in cumulativeScore and totalPoints for the week in progress, which
+// read exactly like a finished result — that is what made the record double
+// count once, and a schedule that declares this week already lost would be
+// the same mistake wearing a different hat.
+function espTeamSchedule(row, teamId) {
+  var j = row && row._espScoreJson;
+  if (!j || !j.schedule) return null;
+  var cur = (j.status && j.status.currentMatchupPeriod) || 1;
+  var names = {}, i;
+  var st = (row.standingsAll) || [];
+  for (i = 0; i < st.length; i++) names[String(st[i].teamId)] = st[i];
+  var cats = (typeof espIsCats === 'function') && espIsCats(row);
+
+  var out = [];
+  for (i = 0; i < j.schedule.length; i++) {
+    var m = j.schedule[i] || {};
+    var a = m.away || {}, h = m.home || {};
+    var meAway = (a.teamId != null && String(a.teamId) === String(teamId));
+    var meHome = (h.teamId != null && String(h.teamId) === String(teamId));
+    if (!meAway && !meHome) continue;
+
+    var me = meAway ? a : h, opp = meAway ? h : a;
+    var period = Number(m.matchupPeriodId);
+    var done = period < Number(cur);
+    var live = period === Number(cur);
+
+    // A bye: ESPN gives the week a matchup with no opponent side.
+    var oppId = (opp && opp.teamId != null) ? String(opp.teamId) : null;
+
+    var myScore = null, oppScore = null, res = '';
+    if (cats) {
+      var mc = me.cumulativeScore || {}, oc = opp.cumulativeScore || {};
+      if (mc.wins != null || oc.wins != null) {
+        myScore = (mc.wins || 0) + '-' + (mc.losses || 0) + '-' + (mc.ties || 0);
+        oppScore = (oc.wins || 0) + '-' + (oc.losses || 0) + '-' + (oc.ties || 0);
+        if (done) {
+          res = ((mc.wins || 0) > (oc.wins || 0)) ? 'W'
+              : ((mc.wins || 0) < (oc.wins || 0)) ? 'L' : 'T';
+        }
+      }
+    } else {
+      if (me.totalPoints != null || opp.totalPoints != null) {
+        myScore = Math.round((Number(me.totalPoints) || 0) * 10) / 10;
+        oppScore = Math.round((Number(opp.totalPoints) || 0) * 10) / 10;
+        if (done) {
+          res = (myScore > oppScore) ? 'W' : (myScore < oppScore) ? 'L' : 'T';
+        }
+      }
+    }
+    // An explicit winner flag beats the arithmetic where ESPN sets one.
+    if (done) {
+      var wf = String(m.winner || '').toUpperCase();
+      if (wf === 'AWAY') res = meAway ? 'W' : 'L';
+      else if (wf === 'HOME') res = meHome ? 'W' : 'L';
+      else if (wf === 'TIE') res = 'T';
+    }
+
+    var oppRow = oppId ? names[oppId] : null;
+    out.push({
+      period: period,
+      done: done, live: live,
+      bye: !oppId,
+      oppId: oppId,
+      oppName: oppRow ? (oppRow.teamName || ('Team ' + oppId)) : (oppId ? ('Team ' + oppId) : 'BYE'),
+      oppRank: oppRow ? oppRow.rank : null,
+      oppRecord: oppRow ? (oppRow.record || '') : '',
+      home: meHome,
+      myScore: myScore, oppScore: oppScore,
+      result: res
+    });
+  }
+  out.sort(function (x, y) { return x.period - y.period; });
+  return out.length ? { rows: out, cur: Number(cur), cats: cats } : null;
+}
+
+var _espSchedTeam = {};   // per league, whose schedule is showing
+
+function espSetSchedTeam(leagueKey, teamId) {
+  _espSchedTeam[String(leagueKey)] = String(teamId);
+  // Same repaint the view tabs use, so switching team behaves identically to
+  // switching tab rather than needing its own path.
+  if (typeof espRepaintStandPane === 'function') espRepaintStandPane(String(leagueKey));
+}
+
+function _espSchedPaneHtml(row) {
+  var accent = extProvAccent('espn');
+  var mono = 'font-family:var(--sk-font-mono,monospace);';
+  var myId = (typeof espMyTeamId === 'function') ? espMyTeamId(row) : null;
+  var showId = _espSchedTeam[String(row.key)] || (myId != null ? String(myId) : null);
+  var st = row.standingsAll || [];
+  if (showId == null && st.length) showId = String(st[0].teamId);
+
+  var h = '<div data-espstand>' + _espStandToggleHtml(row, 'sched');
+
+  // Whose schedule. Defaults to mine, but the useful question is often about
+  // somebody else's run-in — who a rival still has to play.
+  if (st.length > 1) {
+    h += '<select onchange="espSetSchedTeam(\'' +
+      slEsc(String(row.key).replace(/'/g, '')) + '\', this.value)" ' +
+      'style="width:100%;padding:7px 9px;margin:0 0 9px;border-radius:8px;' +
+      'border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.04);' +
+      'color:rgba(255,255,255,0.85);font-size:12px;font-family:inherit;' +
+      '-webkit-appearance:none;">';
+    for (var q = 0; q < st.length; q++) {
+      var isMe = (myId != null && String(st[q].teamId) === String(myId));
+      h += '<option value="' + slEsc(String(st[q].teamId)) + '"' +
+        (String(st[q].teamId) === String(showId) ? ' selected' : '') + '>' +
+        slEsc(st[q].teamName || ('Team ' + st[q].teamId)) +
+        (isMe ? ' \u2014 my team' : '') + '</option>';
+    }
+    h += '</select>';
+  }
+
+  var sc = espTeamSchedule(row, showId);
+  if (!sc) {
+    return h + '<div style="color:rgba(255,255,255,0.35);font-size:12px;">' +
+      'No schedule for this team.</div></div>';
+  }
+
+  // A running record through completed weeks, so the column means something
+  // beyond a list of letters.
+  var w = 0, l = 0, t = 0, i;
+  for (i = 0; i < sc.rows.length; i++) {
+    if (sc.rows[i].result === 'W') w++;
+    else if (sc.rows[i].result === 'L') l++;
+    else if (sc.rows[i].result === 'T') t++;
+  }
+  h += '<div style="display:flex;align-items:baseline;gap:8px;padding:0 2px 6px;">' +
+    '<span style="flex:1;font-size:9px;letter-spacing:0.12em;color:rgba(255,255,255,0.3);">' +
+      'WK \u00b7 OPPONENT</span>' +
+    '<span style="' + mono + 'font-size:11px;color:rgba(255,255,255,0.7);">' +
+      w + '-' + l + '-' + t + '</span>' +
+    '<span style="font-size:9px;color:rgba(255,255,255,0.28);">so far</span>' +
+  '</div>';
+
+  for (i = 0; i < sc.rows.length; i++) {
+    var r = sc.rows[i];
+    var col = (r.result === 'W') ? '#4ade80'
+            : (r.result === 'L') ? '#f87171'
+            : (r.result === 'T') ? 'var(--sk-gold,#eab308)' : 'rgba(255,255,255,0.35)';
+    h += '<div style="display:flex;align-items:center;gap:8px;padding:6px 6px;' +
+      'border-bottom:1px solid rgba(255,255,255,0.04);border-radius:6px;' +
+      (r.live ? 'background:rgba(239,68,68,0.09);' : '') +
+      (r.done ? '' : 'opacity:0.72;') + '">' +
+      '<span style="flex:0 0 26px;' + mono + 'font-size:10px;color:rgba(255,255,255,0.32);">' +
+        r.period + '</span>' +
+      '<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;' +
+        'white-space:nowrap;font-size:12px;color:' +
+        (r.bye ? 'rgba(255,255,255,0.35)' : 'rgba(255,255,255,0.82)') + ';">' +
+        (r.bye ? 'Bye' :
+          ('<span style="color:rgba(255,255,255,0.3);font-size:10px;">' +
+            (r.home ? 'vs' : '@') + '</span> ' + slEsc(r.oppName))) +
+        (r.oppRank ? ('<span style="' + mono + 'font-size:9px;color:rgba(255,255,255,0.28);"> ' +
+          (typeof _skOrdinal === 'function' ? _skOrdinal(r.oppRank) : r.oppRank) + '</span>') : '') +
+      '</span>' +
+      (r.live ? '<span style="font-size:8px;letter-spacing:0.1em;color:' + accent + ';">LIVE</span>' : '') +
+      '<span style="flex:0 0 84px;text-align:right;' + mono + 'font-size:10.5px;' +
+        'color:rgba(255,255,255,0.55);">' +
+        ((r.myScore == null || r.bye) ? '' : (r.myScore + ' \u2013 ' + r.oppScore)) + '</span>' +
+      '<span style="flex:0 0 14px;text-align:right;' + mono + 'font-size:12px;' +
+        'font-weight:700;color:' + col + ';">' + (r.result || '') + '</span>' +
+    '</div>';
+  }
+
+  h += '<div style="font-size:9px;line-height:1.5;color:rgba(255,255,255,0.28);margin-top:7px;">' +
+    'The whole season, from the schedule ESPN already sends \u2014 no extra ' +
+    'request. A result is only claimed for weeks that have FINISHED; the week ' +
+    'in progress shows its live score without calling it, because ESPN\u2019s ' +
+    'running totals look identical to a final one.</div>';
+  return h + '</div>';
+}
+
 function espHasPaceTab(row) {
   if (typeof espIsSeasonPts !== 'function' || !espIsSeasonPts(row)) return false;
   if (typeof espSeasonClock === 'function' && espSeasonClock(row)) return true;
@@ -132778,6 +132969,9 @@ function _espStandToggleHtml(row, active) {
     // points — calling it POINTS described the wrong thing entirely.
     tab('pts', (typeof espIsCats === 'function' && espIsCats(row)) ? 'RECORD' : 'POINTS') +
     tab('season', 'SEASON') + tab('daily', 'DAILY') +
+    // ESPSCHED — same predicate the router uses, so the two can't disagree.
+    ((typeof espHasSchedule === 'function' && espHasSchedule(row))
+      ? tab('sched', 'SCHEDULE') : '') +
     // IF TODAY is head-to-head only; PACE is season-points only. They never
     // both apply, so the tab row stays four wide either way. ESPPACE
     ((typeof espHasProjection === 'function' && espHasProjection(row))
@@ -132946,6 +133140,9 @@ function _espStandingsPaneHtml(row) {
   // Must match the tab's own gate exactly, hence the shared predicate — a
   // stricter test here silently sends a selected tab to the points pane.
   // ESPPACE / ESPNHLCAP
+  if (_sv === 'sched' && typeof espHasSchedule === 'function' && espHasSchedule(row)) {
+    return _espSchedPaneHtml(row);   // ESPSCHED
+  }
   if (_sv === 'pace' && typeof espHasPaceTab === 'function' && espHasPaceTab(row)) {
     return _espPacePanelHtml(row);
   }
