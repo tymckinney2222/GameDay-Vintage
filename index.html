@@ -32598,7 +32598,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-08-09 14:01 UTC';
+var SK_BUILD = '2026-08-09 14:12 UTC';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -119213,10 +119213,16 @@ function espMatchupRecord(row) {
   // decided and got banked — while THIS WEEK counted the same result
   // again. That's the double count. MGRREC3
   var curPeriod = (j && j.status && j.status.currentMatchupPeriod) || null;
+  // No current period means the season hasn't opened, so NOTHING is complete.
+  // Treating that as "no filter" let every scheduled week through to be
+  // scored at 0-0 categories, and a seventeen-week league came back as
+  // seventeen ties. Period 1 is the right stand-in: everything at or past it
+  // is unplayed, which is all of them. SKPRESEASON
+  if (curPeriod == null) curPeriod = 1;
   if (j && j.schedule) {
     for (var i = 0; i < j.schedule.length; i++) {
       var m = j.schedule[i] || {};
-      if (curPeriod != null && Number(m.matchupPeriodId) >= Number(curPeriod)) continue;
+      if (Number(m.matchupPeriodId) >= Number(curPeriod)) continue;
       var a = m.away || {}, h = m.home || {};
       var meAway = !!(a.teamId != null && myIds[String(a.teamId)]);
       var meHome = !!(h.teamId != null && myIds[String(h.teamId)]);
@@ -119572,15 +119578,36 @@ function _mrParseRec(str) {
 function skSeasonStarted(row) {
   if (!row) return false;
   var rows = row.standingsAll || (row.standings ? [row.standings] : []), i;
+
+  // A decided matchup is unambiguous: somebody won or tied a real week.
   for (i = 0; i < rows.length; i++) {
-    var r = rows[i] || {};
-    // Points for, on any team. Checked league-wide rather than on mine alone,
-    // since I might simply be on a bye in the opening week.
-    if (r.pf != null && Number(r.pf) > 0) return true;
-    // Or a decided matchup, from the platform's own standings string.
-    var p = (typeof _mrParseRec === 'function') ? _mrParseRec(r.record) : null;
+    var p = (typeof _mrParseRec === 'function') ? _mrParseRec((rows[i] || {}).record) : null;
     if (p && ((p.w || 0) + (p.l || 0) + (p.t || 0)) > 0) return true;
   }
+
+  // Points-for needs care, because "somebody has points" is NOT the same as
+  // "somebody has played". A roto league before opening night has every
+  // category tied at zero, and roto pays a tied category the average of the
+  // places it spans — so all ten teams sit on an identical, non-zero total.
+  // That looked exactly like scoring, which is why one undrafted NBA roto
+  // league kept counting.
+  //
+  // The tell isn't the value, it's the SPREAD. Ten identical totals is the
+  // signature of a league where nothing has happened; a single game creates
+  // separation and it never comes back. So evidence means two DIFFERENT
+  // totals, not a non-zero one.
+  var seen = {}, distinct = 0, positive = false;
+  for (i = 0; i < rows.length; i++) {
+    var pf = (rows[i] || {}).pf;
+    if (pf == null || isNaN(Number(pf))) continue;
+    var v = String(Number(pf));
+    if (!seen[v]) { seen[v] = 1; distinct++; }
+    if (Number(pf) > 0) positive = true;
+  }
+  if (distinct >= 2) return true;
+  // A single standings row can't be compared against anything, so fall back
+  // to the old test rather than refusing to count a league outright.
+  if (rows.length === 1 && positive) return true;
   return false;
 }
 
@@ -119588,48 +119615,56 @@ function skSeasonStarted(row) {
 // test above is automatic and should be right, but "should be" has already
 // been wrong once here, and a wrong total is worse than a manual switch.
 // SKPRESEASON
+// Stores an OVERRIDE per league: 'on', 'off', or absent for automatic.
+//
+// It used to hold exclusions only, which meant the switch could turn a league
+// off but never on — so a league the evidence test was holding back had a
+// control that did nothing. Waiting for a score to separate before you can
+// touch the switch is the wrong default when you already know the season
+// opened tonight. SKPRESEASON
 var SK_MR_EXCLUDE_KEY = 'sk_mr_exclude_v1';
 
-function skMrExcluded() {
+function skMrOverrides() {
   try {
     var raw = localStorage.getItem(SK_MR_EXCLUDE_KEY);
-    return raw ? (JSON.parse(raw) || {}) : {};
+    var o = raw ? (JSON.parse(raw) || {}) : {};
+    // The old format stored `1` to mean excluded. Read it as 'off' so an
+    // existing setting survives the change rather than silently flipping.
+    for (var k in o) { if (o.hasOwnProperty(k) && o[k] === 1) o[k] = 'off'; }
+    return o;
   } catch (e) { return {}; }
 }
 
-function skMrToggleLeague(key) {
-  var ex = skMrExcluded();
-  if (ex[key]) delete ex[key]; else ex[key] = 1;
-  try { localStorage.setItem(SK_MR_EXCLUDE_KEY, JSON.stringify(ex)); } catch (e) {}
+// Kept for callers that only care about exclusions.
+function skMrExcluded() {
+  var o = skMrOverrides(), out = {};
+  for (var k in o) { if (o.hasOwnProperty(k) && o[k] === 'off') out[k] = 1; }
+  return out;
+}
+
+// Flip to the opposite of what the row currently does. When that lands back
+// on what the automatic rule would have chosen, the override is REMOVED
+// rather than pinned — so a league forced on in October goes back to
+// governing itself once it's obviously playing, and nothing accumulates in
+// storage that would surprise anyone next year.
+function skMrToggleLeague(key, autoOn) {
+  var o = skMrOverrides();
+  var auto = (autoOn === true || autoOn === 'true');
+  var cur = (o[key] === 'on') ? true : (o[key] === 'off') ? false : auto;
+  var want = !cur;
+  if (want === auto) delete o[key];
+  else o[key] = want ? 'on' : 'off';
+  try { localStorage.setItem(SK_MR_EXCLUDE_KEY, JSON.stringify(o)); } catch (e) {}
   if (typeof mrRenderBody === 'function') mrRenderBody();
 }
 
 // One test both the automatic and the manual rule feed into.
 function skMrCounts(row) {
   if (!row) return false;
-  var ex = skMrExcluded();
-  if (ex[row.key]) return false;
+  var o = skMrOverrides();
+  if (o[row.key] === 'off') return false;
+  if (o[row.key] === 'on') return true;
   return skSeasonStarted(row);
-}
-
-// Forget an exclusion on a league that has nothing to exclude.
-//
-// The switch was drawn on every row, but skMrCounts holds back anything with
-// no results whatever the switch says — so tapping one of those flipped the
-// stored flag and the label while the switch itself never moved. Only leagues
-// with results could actually toggle, which is why exactly one of them
-// behaved and the rest looked broken.
-//
-// The flags those dead taps left behind are the real hazard: they would sit
-// in storage until the season opened and then quietly exclude a league that
-// was now playing, for a reason nobody would remember choosing. So they are
-// cleared as soon as they are seen to be meaningless. SKPRESEASON
-function skMrDropStaleExclude(key) {
-  var ex = skMrExcluded();
-  if (!ex[key]) return false;
-  delete ex[key];
-  try { localStorage.setItem(SK_MR_EXCLUDE_KEY, JSON.stringify(ex)); } catch (e) {}
-  return true;
 }
 
 function mrSeasonRec(row) {
@@ -119824,17 +119859,15 @@ function mrCollect() {
         // Evidence decides the reason, not the switch — a league with nothing
         // played is held back whether or not it was ever tapped.
         var _played = (typeof skSeasonStarted === 'function') ? skSeasonStarted(row) : true;
-        if (!_played && typeof skMrDropStaleExclude === 'function') {
-          skMrDropStaleExclude(row.key);
-        }
+        var _ov = (typeof skMrOverrides === 'function') ? skMrOverrides()[row.key] : null;
         if (!bk.detail) bk.detail = [];
         bk.detail.push({ name: (row.name || row.key), key: row.key,
                          fmt: (typeof extFormatKey === 'function') ? extFormatKey(row) : '',
                          rec: '\u2014',
-                         src: _played ? 'excluded by you' : 'nothing played yet',
+                         src: (_ov === 'off') ? 'switched off by you'
+                              : (_played ? 'switched off by you' : 'nothing played yet'),
                          n: 0, weeks: null, raw: '', week: '\u2014', pre: true,
-                         // Only a league with results has anything to switch.
-                         switchable: _played });
+                         auto: _played });
         continue;
       }
       bk.leagues++;
@@ -119852,7 +119885,8 @@ function mrCollect() {
         // Still worth listing, so it's visibly excluded rather than
         // silently missing from the trace. MGRREC2
         if (!bk.detail) bk.detail = [];
-        bk.detail.push({ name: (row.name || row.key), key: row.key, switchable: true,
+        bk.detail.push({ name: (row.name || row.key), key: row.key,
+                         auto: (typeof skSeasonStarted === 'function') ? skSeasonStarted(row) : true,
                          fmt: fmt, rec: '\u2014',
                          src: pl ? ('season-long \u00b7 ' + _mrPlaceFmt(pl))
                                  : 'season-long, no record',
@@ -119875,7 +119909,7 @@ function mrCollect() {
       bk.detail.push({
         name: (row.name || row.key),
         key: row.key,
-        switchable: true,
+        auto: (typeof skSeasonStarted === 'function') ? skSeasonStarted(row) : true,
         fmt: fmt || '?',
         rec: rec ? (rec.w + '-' + rec.l + '-' + rec.t) : '\u2014',
         src: rec ? (rec.src || '?') : 'none',
@@ -120116,11 +120150,11 @@ function _mrDetailHtml(det) {
       // The switch. A counted league can be turned off; one held back for
       // having played nothing can be forced on, for a platform whose
       // standings don't report anything Skipper recognises as evidence.
-      // A switch only where one can move. A league with nothing played gets a
-      // small hollow dot instead: it says "waiting", and cannot be tapped into
-      // implying otherwise. SKPRESEASON
-      ((dt.key && dt.switchable !== false)
-        ? '<button onclick="skMrToggleLeague(\'' + slEsc(String(dt.key).replace(/\\/g, '')) + '\')" ' +
+      // Every row gets a switch, and it works both ways — a league can be
+      // forced on before it has produced anything to detect. SKPRESEASON
+      (dt.key
+        ? '<button onclick="skMrToggleLeague(\'' + slEsc(String(dt.key).replace(/\\/g, '')) + '\',' +
+          (dt.auto ? 'true' : 'false') + ')" ' +
           'aria-label="' + (on ? 'Exclude' : 'Include') + ' this league" ' +
           'style="flex:0 0 26px;height:15px;margin-top:2px;border-radius:999px;cursor:pointer;' +
             'border:1px solid ' + (on ? 'rgba(74,222,128,0.5)' : 'rgba(255,255,255,0.18)') + ';' +
@@ -120130,10 +120164,7 @@ function _mrDetailHtml(det) {
               'width:10px;height:10px;border-radius:50%;background:' +
               (on ? '#4ade80' : 'rgba(255,255,255,0.35)') + ';"></span>' +
           '</button>'
-        : '<span title="waiting on its first game" style="flex:0 0 26px;height:15px;' +
-            'margin-top:2px;display:flex;align-items:center;justify-content:center;">' +
-            '<span style="width:7px;height:7px;border-radius:50%;' +
-              'border:1px solid rgba(255,255,255,0.22);"></span></span>') +
+        : '<span style="flex:0 0 26px;"></span>') +
       '<div style="flex:1;min-width:0;">' +
         '<div style="display:flex;align-items:baseline;gap:8px;">' +
           '<span style="flex:1;min-width:0;font-size:11.5px;color:rgba(255,255,255,0.8);' +
@@ -120153,9 +120184,10 @@ function _mrDetailHtml(det) {
     '</div>';
   }
   h += '<div style="font-size:9px;line-height:1.5;color:rgba(255,255,255,0.28);margin-top:7px;">' +
-    'The switch decides whether a league feeds the figures above. A league ' +
-    'showing a hollow dot has played nothing yet \u2014 there is no result to ' +
-    'include, so it has no switch until its first game.</div>';
+    'The switch decides whether a league feeds the figures above. Leagues ' +
+    'turn on by themselves once they have played something \u2014 flip one ' +
+    'early and it counts from tonight; flip it back and Skipper takes over ' +
+    'again.</div>';
   return h + '</div>';
 }
 
