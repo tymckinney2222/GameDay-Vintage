@@ -32636,7 +32636,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-08-09 12:34 UTC';
+var SK_BUILD = '2026-08-09 12:44 UTC';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -119902,6 +119902,163 @@ function espMatchupRecord(row) {
 // worse season than 4th of 16 — so they're also carried as a percentile,
 // (total - rank) / (total - 1): first is 1.000, last is 0.000, and the two
 // leagues can then be averaged against each other honestly.
+// ── SEASON ARCHIVE ── SKARCHIVE ──
+// A probe against ESPN's leagueHistory came back 404 on every league and every
+// year, so past finishes are not something the platforms will hand over. They
+// don't need to. Skipper already sees every league's standings while the
+// season is live, and it already keeps a rolling daily snapshot for points
+// leagues — so the finish can simply be RECORDED when it happens and kept.
+//
+// One row per league per season: where I came, out of how many, in what.
+// Written once and then left alone, because a finish is a fact about a season
+// that ended and must not drift when next year's league reuses the same key.
+//
+// Yahoo is excluded for the same reason it is excluded from the records above:
+// its data comes through a different path with its own terms.
+var SK_ARCH_PREFIX = 'sk_arch_v1_';
+
+function _skArchKey(leagueKey, season) {
+  return SK_ARCH_PREFIX + leagueKey + '_' + season;
+}
+
+// Every archived season, newest first.
+function skListArchive() {
+  var out = [], i, k;
+  try {
+    for (i = 0; i < localStorage.length; i++) {
+      k = localStorage.key(i);
+      if (!k || k.indexOf(SK_ARCH_PREFIX) !== 0) continue;
+      try {
+        var v = JSON.parse(localStorage.getItem(k));
+        if (v && v.season != null) out.push(v);
+      } catch (e) {}
+    }
+  } catch (e) { return []; }
+  out.sort(function (a, b) {
+    return (Number(b.season) - Number(a.season)) ||
+           String(a.leagueName || '').localeCompare(String(b.leagueName || ''));
+  });
+  return out;
+}
+
+// Capture one league's finish. Returns the record written, or null with a
+// reason on window._skArchReason.
+function skArchiveLeague(row, force) {
+  window._skArchReason = '';
+  if (!row) { window._skArchReason = 'no league'; return null; }
+  if (row.provider === 'yahoo') { window._skArchReason = 'yahoo excluded'; return null; }
+  var season = row.season || (row.rosters && row.rosters.season) || null;
+  if (!season) { window._skArchReason = 'no season on the league'; return null; }
+
+  var pl = (typeof mrPlacing === 'function') ? mrPlacing(row) : null;
+  if (!pl) { window._skArchReason = 'no rank yet'; return null; }
+
+  var key = _skArchKey(row.key, season);
+  // Never overwrite. A finish already recorded is history; re-running the
+  // capture next August must not quietly replace last year's medal with this
+  // year's mid-season position. Only an explicit force does that.
+  if (!force) {
+    try {
+      var existing = localStorage.getItem(key);
+      if (existing) { window._skArchReason = 'already archived'; return null; }
+    } catch (e) {}
+  }
+
+  var st = row.standings || {};
+  var rec = {
+    leagueKey: row.key,
+    provider: row.provider || 'espn',
+    sport: String(row.sport || '').toLowerCase(),
+    season: Number(season),
+    leagueName: row.name || row.leagueName || '',
+    teamName: st.teamName || '',
+    rank: pl.rank,
+    size: pl.total,
+    record: st.record || '',
+    pf: (st.pf != null) ? st.pf : null,
+    at: new Date().toISOString()
+  };
+  try { localStorage.setItem(key, JSON.stringify(rec)); }
+  catch (e) { window._skArchReason = 'storage full'; return null; }
+  return rec;
+}
+
+// Has this league's season finished? Used for the automatic capture, which
+// only ever runs when there is nothing left to play.
+function skSeasonIsOver(row) {
+  try {
+    if (typeof espSeasonClock !== 'function') return false;
+    var c = espSeasonClock(row);
+    // A clock exists only DURING the season; once past the end it is null,
+    // which is indistinguishable from preseason. So the window itself decides.
+    if (typeof _espSeasonWindow !== 'function') return false;
+    var w = _espSeasonWindow(String(row.sport || '').toLowerCase(), row.season);
+    if (!w || !w.endMs) return false;
+    return Date.now() > w.endMs;
+  } catch (e) { return false; }
+}
+
+// Called on sync. Silent, and only for leagues whose season has actually
+// ended — a mid-season run records nothing.
+function skMaybeArchiveAll() {
+  var n = 0;
+  try {
+    var rows = (typeof extSyncedLeagues === 'function') ? extSyncedLeagues() : [];
+    for (var i = 0; i < rows.length; i++) {
+      if (!skSeasonIsOver(rows[i])) continue;
+      if (skArchiveLeague(rows[i])) n++;
+    }
+  } catch (e) {}
+  return n;
+}
+
+// Manual capture, for a season that ended before Skipper was watching it or
+// one the automatic check missed.
+function skArchiveNow() {
+  var rows = [], i, wrote = 0, skipped = 0;
+  try { rows = (typeof extSyncedLeagues === 'function') ? extSyncedLeagues() : []; } catch (e) {}
+  for (i = 0; i < rows.length; i++) {
+    if (skArchiveLeague(rows[i])) wrote++; else skipped++;
+  }
+  if (typeof skToast === 'function') {
+    skToast(wrote ? ('Archived ' + wrote + ' league' + (wrote === 1 ? '' : 's') +
+                     (skipped ? (' \u00b7 ' + skipped + ' skipped') : ''))
+                  : 'Nothing new to archive');
+  }
+  if (typeof mrRenderBody === 'function') mrRenderBody();
+}
+
+// Which seasons have anything archived, newest first.
+function skArchiveYears() {
+  var seen = {}, out = [], all = skListArchive(), i;
+  for (i = 0; i < all.length; i++) {
+    var y = String(all[i].season);
+    if (!seen[y]) { seen[y] = 1; out.push(all[i].season); }
+  }
+  out.sort(function (a, b) { return b - a; });
+  return out;
+}
+
+// Medal counts. A finish only counts as a medal if the league was big enough
+// for the place to mean something — third of three is last, not bronze — so
+// the minimum size scales with the place.
+var SK_MEDAL_MIN = { 1: 2, 2: 4, 3: 6 };
+
+function skTrophyCase(season) {
+  var all = skListArchive(), out = { 1: [], 2: [], 3: [], total: 0, seasons: {} }, i;
+  for (i = 0; i < all.length; i++) {
+    var a = all[i];
+    if (season != null && String(a.season) !== String(season)) continue;
+    out.seasons[a.season] = 1;
+    var place = Number(a.rank);
+    if (place < 1 || place > 3) continue;
+    if (a.size < (SK_MEDAL_MIN[place] || 99)) continue;
+    out[place].push(a);
+    out.total++;
+  }
+  return out;
+}
+
 function mrPlacing(row) {
   if (!row) return null;
   var rank = null, total = null;
@@ -120262,9 +120419,140 @@ function _mrPct(o, wk) {
   return p.toFixed(3).replace(/^0/, '');
 }
 
+// The trophy case, and the year it is showing. SKARCHIVE
+//
+// Lives inside Manager Record because it answers the same question the rest of
+// that panel does — how have I actually done — just over seasons rather than
+// weeks. The year selector governs the case only; the records above it are
+// live figures for the current season and have no archived counterpart yet.
+var _skTrophyYear = null;   // null = every season
+
+function skSetTrophyYear(y) {
+  _skTrophyYear = (y === '' || y == null) ? null : Number(y);
+  if (typeof mrRenderBody === 'function') mrRenderBody();
+}
+
+function _skTrophyHtml() {
+  var years = skArchiveYears();
+  var mono = 'font-family:var(--sk-font-mono,monospace);';
+  var h = '<div style="background:var(--sk-bg-card,rgba(255,255,255,0.03));' +
+    'border:1px solid rgba(255,255,255,0.07);border-radius:12px;padding:14px;margin:0 0 10px;">';
+
+  h += '<div style="display:flex;align-items:baseline;gap:10px;margin:0 0 10px;">' +
+    '<span style="flex:1;font-family:\'Playfair Display\',serif;font-size:19px;' +
+      'color:rgba(255,255,255,0.92);">Trophy case</span>';
+  if (years.length) {
+    h += '<select onchange="skSetTrophyYear(this.value)" ' +
+      'style="padding:4px 8px;border-radius:7px;border:1px solid rgba(255,255,255,0.14);' +
+      'background:rgba(255,255,255,0.04);color:rgba(255,255,255,0.85);font-size:11px;' +
+      'font-family:inherit;-webkit-appearance:none;">' +
+      '<option value=""' + (_skTrophyYear == null ? ' selected' : '') + '>All seasons</option>';
+    for (var y = 0; y < years.length; y++) {
+      h += '<option value="' + years[y] + '"' +
+        (String(_skTrophyYear) === String(years[y]) ? ' selected' : '') + '>' +
+        years[y] + '</option>';
+    }
+    h += '</select>';
+  }
+  h += '</div>';
+
+  if (!years.length) {
+    // Nothing captured yet is the normal state on day one, so say what to do
+    // rather than showing an empty shelf.
+    h += '<div style="font-size:11.5px;line-height:1.6;color:rgba(255,255,255,0.42);">' +
+      'Nothing archived yet. A league\u2019s finish is captured automatically once ' +
+      'its season ends \u2014 nothing platforms provide, so Skipper records it ' +
+      'while it can still see the standings. Use ARCHIVE NOW for a season that ' +
+      'has already finished.</div>' +
+      _skArchiveBtn();
+    return h + '</div>';
+  }
+
+  var t = skTrophyCase(_skTrophyYear);
+  var medals = [
+    { p: 1, icon: '\ud83e\udd47', label: 'FIRST' },
+    { p: 2, icon: '\ud83e\udd48', label: 'SECOND' },
+    { p: 3, icon: '\ud83e\udd49', label: 'THIRD' }
+  ];
+
+  h += '<div style="display:flex;gap:8px;margin:0 0 10px;">';
+  for (var m = 0; m < medals.length; m++) {
+    var md = medals[m], n = t[md.p].length;
+    h += '<div style="flex:1;text-align:center;padding:10px 4px;border-radius:10px;' +
+      'background:' + (n ? 'rgba(234,179,8,0.07)' : 'rgba(255,255,255,0.02)') + ';' +
+      'border:1px solid ' + (n ? 'rgba(234,179,8,0.25)' : 'rgba(255,255,255,0.05)') + ';">' +
+      '<div style="font-size:20px;line-height:1;opacity:' + (n ? '1' : '0.25') + '">' +
+        md.icon + '</div>' +
+      '<div style="' + mono + 'font-size:19px;font-weight:800;margin-top:3px;color:' +
+        (n ? 'var(--sk-gold,#eab308)' : 'rgba(255,255,255,0.25)') + ';">' + n + '</div>' +
+      '<div style="font-size:8px;letter-spacing:0.12em;color:rgba(255,255,255,0.32);' +
+        'margin-top:1px;">' + md.label + '</div>' +
+    '</div>';
+  }
+  h += '</div>';
+
+  if (!t.total) {
+    h += '<div style="font-size:11px;line-height:1.55;color:rgba(255,255,255,0.35);">' +
+      'No podium finishes' + (_skTrophyYear ? (' in ' + _skTrophyYear) : ' yet') +
+      '. Seasons are archived; they just haven\u2019t gone your way.</div>';
+  } else {
+    for (var mm = 0; mm < medals.length; mm++) {
+      var mp = medals[mm];
+      for (var i = 0; i < t[mp.p].length; i++) {
+        var a = t[mp.p][i];
+        h += '<div style="display:flex;align-items:baseline;gap:8px;padding:5px 0;' +
+          'border-bottom:1px solid rgba(255,255,255,0.04);">' +
+          '<span style="flex:0 0 20px;font-size:13px;">' + mp.icon + '</span>' +
+          '<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;' +
+            'white-space:nowrap;font-size:12.5px;color:rgba(255,255,255,0.85);">' +
+            slEsc(a.leagueName || a.leagueKey) + '</span>' +
+          '<span style="' + mono + 'font-size:10px;color:rgba(255,255,255,0.4);">' +
+            a.season + '</span>' +
+          '<span style="' + mono + 'font-size:10px;color:rgba(255,255,255,0.55);' +
+            'flex:0 0 62px;text-align:right;">' +
+            (typeof _skOrdinal === 'function' ? _skOrdinal(a.rank) : a.rank) +
+            ' of ' + a.size + '</span>' +
+        '</div>';
+      }
+    }
+  }
+
+  // Everything archived that ISN'T a medal, so the case shows the whole record
+  // rather than only the good years.
+  var allArch = skListArchive(), other = 0;
+  for (var q = 0; q < allArch.length; q++) {
+    if (_skTrophyYear != null && String(allArch[q].season) !== String(_skTrophyYear)) continue;
+    var pr = Number(allArch[q].rank);
+    if (pr >= 1 && pr <= 3 && allArch[q].size >= (SK_MEDAL_MIN[pr] || 99)) continue;
+    other++;
+  }
+  h += '<div style="font-size:9px;line-height:1.5;color:rgba(255,255,255,0.28);margin-top:8px;">' +
+    t.total + ' podium finish' + (t.total === 1 ? '' : 'es') +
+    (other ? (' \u00b7 ' + other + ' other season' + (other === 1 ? '' : 's') + ' archived') : '') +
+    '. A place only counts as a medal when the league was big enough for it to ' +
+    'mean something \u2014 third of three is last, not bronze.</div>';
+  h += _skArchiveBtn();
+  return h + '</div>';
+}
+
+function _skArchiveBtn() {
+  return '<div style="display:flex;align-items:center;gap:9px;margin-top:10px;">' +
+    '<button onclick="skArchiveNow()" style="padding:6px 13px;border-radius:999px;' +
+      'border:1px solid rgba(255,255,255,0.16);background:none;' +
+      'color:rgba(255,255,255,0.55);font-size:9.5px;font-weight:700;' +
+      'letter-spacing:0.06em;">ARCHIVE NOW</button>' +
+    '<span style="font-size:9px;color:rgba(255,255,255,0.28);">' +
+      'captures every synced league\u2019s current standing for its season, ' +
+      'and never overwrites one already recorded</span>' +
+  '</div>';
+}
+
 function mrRenderBody() {
   var body = document.getElementById('mrBody');
   if (!body) return;
+  // Record any league whose season has ended. Silent, idempotent, and only
+  // ever fires past the season's end date. SKARCHIVE
+  try { if (typeof skMaybeArchiveAll === 'function') skMaybeArchiveAll(); } catch (e) {}
   var data = mrCollect();
   mrArchive(data);
   var g = data.grand;
@@ -120555,6 +120843,10 @@ function mrRenderBody() {
       if (dd) for (var di = 0; di < dd.length; di++) det.push(dd[di]);
     }
   }
+  // The trophy case sits above the per-league list: seasons finished, then
+  // seasons in progress. SKARCHIVE
+  if (typeof _skTrophyHtml === 'function') h += _skTrophyHtml();
+
   if (det.length) {
     h += '<div style="background:var(--sk-bg-card,rgba(255,255,255,0.03));' +
       'border:1px solid rgba(255,255,255,0.07);border-radius:12px;padding:14px;margin:0 0 10px;">' +
