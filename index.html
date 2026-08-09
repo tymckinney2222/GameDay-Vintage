@@ -26610,34 +26610,6 @@
   <div class="pw-body" id="nbrBody"></div>
 </div>
 
-<!-- League history probe. ESPLEAGUEHIST -->
-<div class="pw-overlay" id="lhOverlay">
-  <div class="pp-header">
-    <div>
-      <div class="pp-eyebrow">ESPN</div>
-      <h2 class="pp-title">League History</h2>
-    </div>
-    <button class="pp-close" onclick="closeLeagueHistory()" aria-label="Close">
-      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-    </button>
-  </div>
-  <div class="pw-body" id="lhBody"></div>
-</div>
-
-<!-- NHL stat-id probe. Temporary. ESPNHLIDPROBE -->
-<div class="pw-overlay" id="nidOverlay">
-  <div class="pp-header">
-    <div>
-      <div class="pp-eyebrow">NHL</div>
-      <h2 class="pp-title">Stat ID Probe</h2>
-    </div>
-    <button class="pp-close" onclick="closeNhlIdProbe()" aria-label="Close">
-      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-    </button>
-  </div>
-  <div class="pw-body" id="nidBody"></div>
-</div>
-
 <!-- Injury Board — pickup scanner. Probe build. INJTOOL -->
 <div class="pw-overlay" id="injOverlay">
   <div class="pp-header">
@@ -32575,16 +32547,6 @@ function renderLeagueDrawerBody() {
     '<div class="ld-tool-icon">\ud83e\ude79</div>' +
     '<div class="ld-tool-name">Injury Board</div>' +
   '</div>';
-  // ESPLEAGUEHIST
-  html += '<div class="ld-tool-item" onclick="openLeagueHistory(); closeLeagueDrawer();">' +
-    '<div class="ld-tool-icon">\ud83c\udfc6</div>' +
-    '<div class="ld-tool-name">League History</div>' +
-  '</div>';
-  // ESPNHLIDPROBE — temporary; remove once the NHL ids are named.
-  html += '<div class="ld-tool-item" onclick="openNhlIdProbe(); closeLeagueDrawer();">' +
-    '<div class="ld-tool-icon">\ud83c\udfd2</div>' +
-    '<div class="ld-tool-name">NHL Stat ID Probe</div>' +
-  '</div>';
   html += '</div>'; // .ld-tools-body
   // SKBUILD
   html += '<div style="padding:14px 16px 4px;font-size:8.5px;letter-spacing:0.08em;' +
@@ -32636,7 +32598,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-08-09 12:44 UTC';
+var SK_BUILD = '2026-08-09 12:58 UTC';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -116920,590 +116882,6 @@ function _nbrRgba(hex, a) {
   return 'rgba(' + ch(0) + ',' + ch(2) + ',' + ch(4) + ',' + a + ')';
 }
 
-// ── LEAGUE HISTORY PROBE ── ESPLEAGUEHIST ──
-// Two asks land on the same missing piece: a Manager Record broken out by
-// season, and a trophy case counting first through third. Both need one thing
-// the app has never fetched — where you FINISHED in each league in each past
-// season. Nothing in Skipper reaches a past season of a LEAGUE; the draft
-// board reaches past seasons of PLAYERS, which is a different endpoint.
-//
-// ESPN keeps a renewed league's earlier years under a leagueHistory path, and
-// the draft board already established that ESPN puts the season in the URL
-// rather than behind a header filter. So this is very likely reachable. Very
-// likely is not the same as verified, and building a trophy case on an
-// unverified shape is how the last several rounds went, so this fetches and
-// reports rather than assuming.
-//
-// The output is deliberately the trophy data itself: every season it can
-// find, the size of the league, and where you came. If that comes back
-// populated, both features are a rendering job on data already in hand.
-var _lhState = { loading: false, err: '', rows: null };
-
-function openLeagueHistory() {
-  var ov = document.getElementById('lhOverlay');
-  if (!ov) return;
-  ov.classList.add('open');
-  if (!_lhState.rows && !_lhState.loading) _lhLoad();
-  else _lhRender();
-}
-function closeLeagueHistory() {
-  var ov = document.getElementById('lhOverlay');
-  if (ov) ov.classList.remove('open');
-}
-
-// One league, one season. Returns a description of what came back rather than
-// throwing, so a 404 on one year reads as "no history that far back" instead
-// of sinking the whole run.
-function _lhFetchSeason(sv, year) {
-  var url = ESP_BASE + sv.game + '/leagueHistory/' + sv.id +
-    '?seasonId=' + year + '&view=mTeam&view=mSettings';
-  return fetch(url, { credentials: 'omit' })
-    .then(function (r) {
-      if (!r.ok) return { year: year, err: 'HTTP ' + r.status };
-      return r.json().then(function (j) {
-        // leagueHistory answers with an ARRAY of league objects, one per
-        // season asked for — unlike the current-season endpoint, which
-        // answers with a single object. Handle both rather than assume.
-        var lg = (Object.prototype.toString.call(j) === '[object Array]') ? j[0] : j;
-        if (!lg) return { year: year, err: 'empty' };
-        var teams = lg.teams || [];
-        if (!teams.length) return { year: year, err: 'no teams' };
-        var mine = null, i;
-        for (i = 0; i < teams.length; i++) {
-          if (String(teams[i].id) === String(sv.teamId)) mine = teams[i];
-        }
-        var rank = null, src = '';
-        if (mine) {
-          // Where the finish might live. Reported rather than picked, so the
-          // right field is chosen from evidence next time.
-          if (mine.rankFinal != null) { rank = mine.rankFinal; src = 'rankFinal'; }
-          else if (mine.playoffSeed != null) { rank = mine.playoffSeed; src = 'playoffSeed'; }
-          else if (mine.currentProjectedRank != null) {
-            rank = mine.currentProjectedRank; src = 'currentProjectedRank';
-          }
-        }
-        var keys = [];
-        if (mine) { for (i in mine) { if (mine.hasOwnProperty(i)) keys.push(i); } }
-        return {
-          year: year, err: '', size: teams.length,
-          name: (lg.settings && lg.settings.name) || '',
-          rank: rank, rankSrc: src,
-          found: !!mine,
-          teamKeys: keys.join(' ')
-        };
-      });
-    })['catch'](function (e) {
-      return { year: year, err: (e && e.message) ? e.message : 'failed' };
-    });
-}
-
-function _lhLoad() {
-  _lhState.loading = true;
-  _lhState.err = '';
-  _lhRender();
-  var saved = (typeof espState !== 'undefined' && espState.leagues) ? espState.leagues : [];
-  if (!saved.length) {
-    _lhState.loading = false;
-    _lhState.err = 'no ESPN leagues saved';
-    _lhRender();
-    return;
-  }
-  // Five years back is enough to show whether history exists at all without
-  // firing dozens of requests at a league that was created this year.
-  var thisYear = new Date().getFullYear() + 1;
-  var years = [];
-  for (var y = thisYear - 1; y >= thisYear - 5; y--) years.push(y);
-
-  var jobs = [];
-  for (var i = 0; i < saved.length; i++) {
-    (function (sv) {
-      jobs.push(Promise.all(years.map(function (yr) {
-        return _lhFetchSeason(sv, yr);
-      })).then(function (seasons) {
-        return { id: sv.id, game: sv.game, teamId: sv.teamId,
-                 label: sv.name || ('league ' + sv.id), seasons: seasons };
-      }));
-    })(saved[i]);
-  }
-  Promise.all(jobs).then(function (res) {
-    _lhState.loading = false;
-    _lhState.rows = res;
-    _lhRender();
-  })['catch'](function (e) {
-    _lhState.loading = false;
-    _lhState.err = (e && e.message) ? e.message : 'request failed';
-    _lhRender();
-  });
-}
-
-function _lhLines() {
-  var L = [], i, j;
-  L.push('ESPN LEAGUE HISTORY PROBE');
-  L.push(new Date().toString());
-  L.push('');
-  for (i = 0; i < (_lhState.rows || []).length; i++) {
-    var r = _lhState.rows[i];
-    L.push('=== ' + r.label + '  (' + r.game + ' / ' + r.id + ', my team ' + r.teamId + ') ===');
-    for (j = 0; j < r.seasons.length; j++) {
-      var s = r.seasons[j];
-      if (s.err) { L.push('  ' + s.year + '  -- ' + s.err); continue; }
-      L.push('  ' + s.year + '  teams ' + s.size +
-        '  me ' + (s.found ? 'found' : 'NOT ON THIS ROSTER') +
-        '  rank ' + (s.rank == null ? 'none' : s.rank) +
-        (s.rankSrc ? (' (' + s.rankSrc + ')') : ''));
-      if (s.found && !s.rank) L.push('      team keys: ' + s.teamKeys);
-    }
-    L.push('');
-  }
-  return L;
-}
-
-function _lhSave() {
-  var lines = _lhLines();
-  if (lines.length < 4) return;
-  var blob = new Blob([lines.join('\r\n')], { type: 'text/plain;charset=utf-8' });
-  var url = URL.createObjectURL(blob);
-  var a = document.createElement('a');
-  a.href = url;
-  a.download = 'esp-leaguehistory-' +
-    new Date().toISOString().slice(0, 19).replace(/[:T]/g, '') + '.txt';
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  setTimeout(function () { URL.revokeObjectURL(url); }, 1500);
-}
-
-function _lhRender() {
-  var body = document.getElementById('lhBody');
-  if (!body) return;
-  var mono = 'font-family:var(--sk-font-mono,monospace);font-size:10px;line-height:1.6;';
-
-  if (_lhState.loading) {
-    body.innerHTML = '<div style="' + mono + 'color:rgba(255,255,255,0.5)">' +
-      'Asking every saved league for its last five seasons\u2026</div>';
-    return;
-  }
-  if (_lhState.err) {
-    body.innerHTML = '<div style="' + mono + 'color:#f87171">' + slEsc(_lhState.err) + '</div>';
-    return;
-  }
-  if (!_lhState.rows) { body.innerHTML = ''; return; }
-
-  var h = '', i, j, hits = 0;
-  for (i = 0; i < _lhState.rows.length; i++) {
-    for (j = 0; j < _lhState.rows[i].seasons.length; j++) {
-      if (!_lhState.rows[i].seasons[j].err) hits++;
-    }
-  }
-  h += '<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">' +
-    '<span style="' + mono + 'color:' + (hits ? '#4ade80' : '#f87171') + ';flex:1">' +
-      hits + ' season' + (hits === 1 ? '' : 's') + ' returned data</span>' +
-    '<button onclick="_lhSave()" style="padding:6px 14px;border-radius:8px;' +
-      'border:1px solid rgba(74,222,128,0.45);background:rgba(74,222,128,0.10);' +
-      'color:#4ade80;font-size:10px;font-weight:800;letter-spacing:0.08em">' +
-      'EXPORT .TXT</button>' +
-  '</div>';
-
-  for (i = 0; i < _lhState.rows.length; i++) {
-    var r = _lhState.rows[i];
-    h += '<div style="font-size:11px;font-weight:800;color:#fbbf24;margin:14px 0 3px">' +
-      slEsc(r.label) + '</div>';
-    h += '<div style="' + mono + 'color:rgba(255,255,255,0.35);margin-bottom:3px">' +
-      slEsc(r.game) + ' / ' + slEsc(r.id) + ' \u00b7 my team ' + slEsc(r.teamId) + '</div>';
-    for (j = 0; j < r.seasons.length; j++) {
-      var s = r.seasons[j];
-      if (s.err) {
-        h += '<div style="' + mono + 'color:rgba(255,255,255,0.28)">' + s.year +
-          '  \u2014 ' + slEsc(s.err) + '</div>';
-        continue;
-      }
-      var medal = (s.rank === 1) ? '\ud83e\udd47' : (s.rank === 2) ? '\ud83e\udd48'
-                : (s.rank === 3) ? '\ud83e\udd49' : '';
-      h += '<div style="' + mono + 'color:rgba(255,255,255,0.8)">' + s.year +
-        '  ' + s.size + ' teams  ' +
-        (s.found ? ('finished ' + (s.rank == null ? '?' : s.rank) + ' ' + medal) : 'not on this roster') +
-        (s.rankSrc ? ('  <span style="color:rgba(255,255,255,0.3)">' + s.rankSrc + '</span>') : '') +
-        '</div>';
-      if (s.found && !s.rank) {
-        h += '<div style="' + mono + 'color:rgba(251,191,36,0.6);padding-left:12px">' +
-          'no rank field \u2014 team keys: ' + slEsc(s.teamKeys) + '</div>';
-      }
-    }
-  }
-
-  h += '<div style="font-size:9.5px;line-height:1.55;color:rgba(255,255,255,0.3);' +
-    'margin-top:16px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.08)">' +
-    'If seasons come back with a finishing rank, both asks are unblocked from ' +
-    'the same data: Manager Record gains a per-season breakdown, and the ' +
-    'trophy case counts first, second and third. A league created this year ' +
-    'will legitimately show nothing, which is why the year and the reason are ' +
-    'printed for every attempt rather than just the successes.</div>';
-  body.innerHTML = h;
-}
-
-// ── NHL STAT-ID PROBE ── ESPNHLIDPROBE ──
-// The categories league is preseason, so every value on screen is 0 and there
-// is nothing to match ids against. Waiting for October isn't necessary though:
-// ESPN serves PRIOR SEASON actuals keyed by the SAME stat ids, through the
-// path-walking trick the draft board already proved (the season lives in the
-// URL, not in a header filter — see the notes above dbpFetchHistChunk).
-//
-// So the probe pulls a handful of players whose real seasons are a matter of
-// record and prints their id->value map. An id showing 51 for MacKinnon is
-// goals; one showing 140 is points. That identifies the ids by evidence
-// rather than by assuming ESPN's numbering, which is exactly how the MLB
-// mapping got settled — and how the two that were guessed got settled WRONG
-// the first time.
-//
-// Deliberately reads a whole map rather than testing a hypothesis: the point
-// is to see every id the league scores, including the ones nobody has thought
-// to guess.
-var _nidState = { loading: false, err: '', rows: null, year: null };
-
-// Known, checkable seasons. Chosen because their lines are lopsided enough
-// that no two categories can be confused: a 51-goal 140-point year cannot be
-// mistaken for an assist total, and a goaltender's numbers share no magnitude
-// with a skater's.
-// Chosen for SHAPE rather than for exact totals, which is what makes this
-// work without me having to remember anyone's season to the digit. A
-// full-season scorer's points sit near 2000 while his blocks sit near 50;
-// a centre's rebounds dwarf his assists and a lead guard's do the opposite.
-// Those magnitudes name the categories on sight, and the two extremes
-// cross-check each other: whichever id is large for the big man and small
-// for the guard is rebounds, and the reverse is assists.
-//
-// A goaltender does the same job in hockey — his numbers share no magnitude
-// with a skater's, which separates the goaltending categories cleanly.
-var NID_SPORTS = [
-  // Hockey came back EMPTY on the first run, and basketball came back with
-  // two players I hadn't asked for — Doncic and Hachimura rather than Jokic
-  // and Davis. Both symptoms are the same cause: hardcoded athlete ids that
-  // I did not actually know. ESPN happily returns whoever owns the id, or
-  // nothing at all.
-  //
-  // So the ids come from the league itself now. Whatever is on a synced
-  // roster is guaranteed to exist in that sport, and taking several gives the
-  // contrast the identification needs. ESPNHLIDPROBE
-  { sport: 'NHL', label: 'HOCKEY', players: [], fromRoster: 'nhl' },
-  { sport: 'NBA', label: 'BASKETBALL', players: [], fromRoster: 'nba' }
-];
-// Flattened for the fetch; the sport grouping is only for display.
-// Rebuilt on demand, because the roster-sourced lists are filled in at fetch
-// time rather than declared up front. ESPNHLIDPROBE
-function _nidKnown() {
-  var out = [], i, j;
-  for (i = 0; i < NID_SPORTS.length; i++) {
-    for (j = 0; j < NID_SPORTS[i].players.length; j++) {
-      var p = NID_SPORTS[i].players[j];
-      out.push({ id: p.id, name: p.name, note: p.note, sport: NID_SPORTS[i].sport });
-    }
-  }
-  return out;
-}
-
-// Athlete ids from a synced league of this sport. Rosters are the one place
-// ids are guaranteed valid — they came from ESPN in the first place. Takes a
-// spread across the roster rather than the first few, since two players from
-// the same line tell you less than a scorer and a goaltender. ESPNHLIDPROBE
-function _nidRosterIds(sport, want) {
-  var out = [], seen = {};
-  try {
-    var rows = (typeof extSyncedLeagues === 'function') ? extSyncedLeagues() : [];
-    for (var i = 0; i < rows.length; i++) {
-      var r = rows[i];
-      if (!r || r.provider !== 'espn') continue;
-      if (String(r.sport || '').toLowerCase() !== sport) continue;
-      var byTeam = (r.rosters && r.rosters.byTeam) || null;
-      if (!byTeam) continue;
-      for (var tk in byTeam) {
-        if (!byTeam.hasOwnProperty(tk)) continue;
-        var items = (byTeam[tk] && byTeam[tk].items) || [];
-        for (var q = 0; q < items.length; q++) {
-          var pid = items[q] && items[q].playerId;
-          if (pid == null || seen[String(pid)]) continue;
-          seen[String(pid)] = 1;
-          out.push({ id: pid, name: items[q].name || ('id ' + pid),
-                     slot: items[q].slot || '' });
-        }
-      }
-    }
-  } catch (e) { return []; }
-  // Spread across the list so the sample isn't all one position.
-  if (out.length <= want) return out;
-  var picked = [], step = Math.floor(out.length / want);
-  for (var n = 0; n < want; n++) picked.push(out[n * step]);
-  return picked;
-}
-
-function openNhlIdProbe() {
-  var ov = document.getElementById('nidOverlay');
-  if (!ov) return;
-  ov.classList.add('open');
-  if (!_nidState.rows && !_nidState.loading) _nidLoad();
-  else _nidRender();
-}
-function closeNhlIdProbe() {
-  var ov = document.getElementById('nidOverlay');
-  if (ov) ov.classList.remove('open');
-}
-
-function _nidLoad() {
-  if (typeof dbpFetchHistChunk !== 'function') {
-    _nidState.err = 'draft-board history fetch not available';
-    _nidRender();
-    return;
-  }
-  _nidState.loading = true;
-  _nidState.err = '';
-  _nidRender();
-  // The season BEFORE the current one, which is the most recent completed
-  // set of actuals.
-  var yr = 2026;
-  _nidState.year = yr;
-  // One call per sport: the endpoint is keyed by game code, so hockey and
-  // basketball ids cannot be asked for together. A sport that fails is
-  // reported rather than sinking the other. ESPNHLIDPROBE
-  var jobs = NID_SPORTS.map(function (sp) {
-    // Roster-sourced where configured, so the ids are certain to exist.
-    if (sp.fromRoster) {
-      sp.players = _nidRosterIds(sp.fromRoster, 6).map(function (p) {
-        return { id: p.id, name: p.name,
-                 note: 'from your roster' + (p.slot ? (' \u00b7 ' + p.slot) : '') };
-      });
-    }
-    var ids = sp.players.map(function (p) { return p.id; });
-    if (!ids.length) {
-      return Promise.resolve({ sport: sp.sport, label: sp.label, players: [],
-        err: 'no synced ' + sp.sport + ' league with rosters loaded' });
-    }
-    return dbpFetchHistChunk(sp.sport, yr, ids, 'nid' + sp.sport)
-      .then(function (players) {
-        return { sport: sp.sport, label: sp.label, players: players || [], err: '' };
-      })['catch'](function (e) {
-        return { sport: sp.sport, label: sp.label, players: [],
-                 err: (e && e.message) ? e.message : 'failed' };
-      });
-  });
-  Promise.all(jobs).then(function (res) {
-    _nidState.loading = false;
-    _nidState.rows = res;
-    _nidRender();
-  })['catch'](function (e) {
-    _nidState.loading = false;
-    _nidState.err = (e && e.message) ? e.message : 'request failed';
-    _nidRender();
-  });
-}
-
-// Every (statSourceId, statSplitTypeId) block a player carries, with its full
-// id->value map. Source 0 is actuals; anything else is a projection and is
-// labelled as such rather than dropped, so a block that looks wrong can be
-// recognised instead of silently missing.
-function _nidBlocks(p) {
-  var pl = (p && (p.player || p)) || {};
-  var st = pl.stats || [];
-  var out = [], i;
-  for (i = 0; i < st.length; i++) {
-    var e = st[i] || {};
-    var m = e.stats || {};
-    var n = 0, k;
-    for (k in m) { if (m.hasOwnProperty(k)) n++; }
-    if (!n) continue;
-    out.push({
-      src: e.statSourceId, split: e.statSplitTypeId,
-      season: e.seasonId, applied: e.appliedTotal,
-      map: m, n: n
-    });
-  }
-  return out;
-}
-
-// The probe's findings as plain text, and a download using the same flow the
-// valuesByStat probe uses. That one has an export button and this one didn't,
-// so the export button is what got tapped — twice. A probe nobody can get the
-// output OUT of is a probe that doesn't get run. ESPNHLIDPROBE
-function _nidLines() {
-  var L = [], gi, i, j, k;
-  L.push('NHL / NBA STAT ID PROBE');
-  L.push(new Date().toString());
-  L.push('season ' + _nidState.year + ' actuals');
-  L.push('');
-  for (gi = 0; gi < (_nidState.rows || []).length; gi++) {
-    var grp = _nidState.rows[gi];
-    L.push('=== ' + grp.label + ' ===');
-    if (grp.err) { L.push('  failed: ' + grp.err); L.push(''); continue; }
-    if (!grp.players.length) { L.push('  no players returned'); L.push(''); continue; }
-    for (i = 0; i < grp.players.length; i++) {
-      var p = grp.players[i];
-      var pl = (p && (p.player || p)) || {};
-      var nm = pl.fullName || pl.name || ('id ' + (pl.id != null ? pl.id : '?'));
-      L.push('  ' + nm);
-      var _kn2 = _nidKnown();
-      for (j = 0; j < _kn2.length; j++) {
-        if (String(_kn2[j].id) === String(pl.id)) L.push('    ' + _kn2[j].note);
-      }
-      var blocks = _nidBlocks(p);
-      if (!blocks.length) { L.push('    no stat blocks'); continue; }
-      for (j = 0; j < blocks.length; j++) {
-        var b = blocks[j];
-        var isActual = (b.src === 0);
-        L.push('    src ' + b.src + ' split ' + b.split + ' season ' + b.season +
-          (isActual ? '  <- ACTUAL' : '  (projection - ignore)') + '  ' + b.n + ' stats');
-        if (!isActual) continue;
-        var keys = [];
-        for (k in b.map) { if (b.map.hasOwnProperty(k)) keys.push(k); }
-        keys.sort(function (x, y) { return Number(x) - Number(y); });
-        var line = [];
-        for (k = 0; k < keys.length; k++) {
-          var v = b.map[keys[k]];
-          var vs = (typeof v === 'number') ? (Math.round(v * 1000) / 1000) : v;
-          line.push('#' + keys[k] + '=' + vs);
-        }
-        for (k = 0; k < line.length; k += 6) {
-          L.push('      ' + line.slice(k, k + 6).join('  '));
-        }
-      }
-      L.push('');
-    }
-  }
-  return L;
-}
-
-function _nidSave() {
-  var lines = _nidLines();
-  if (lines.length < 5) return;
-  var blob = new Blob([lines.join('\r\n')], { type: 'text/plain;charset=utf-8' });
-  var url = URL.createObjectURL(blob);
-  var a = document.createElement('a');
-  a.href = url;
-  a.download = 'esp-statids-' +
-    new Date().toISOString().slice(0, 19).replace(/[:T]/g, '') + '.txt';
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  setTimeout(function () { URL.revokeObjectURL(url); }, 1500);
-}
-
-function _nidRender() {
-  var body = document.getElementById('nidBody');
-  if (!body) return;
-  var mono = 'font-family:var(--sk-font-mono,monospace);font-size:10px;line-height:1.55;';
-
-  if (_nidState.loading) {
-    body.innerHTML = '<div style="' + mono + 'color:rgba(255,255,255,0.5)">Fetching ' +
-      (_nidState.year || '') + ' actuals\u2026</div>';
-    return;
-  }
-  if (_nidState.err) {
-    body.innerHTML = '<div style="' + mono + 'color:#f87171">FAILED: ' +
-      slEsc(_nidState.err) + '</div>' +
-      '<button onclick="_nidState.rows=null;_nidLoad()" style="margin-top:14px;' +
-      'padding:8px 16px;border-radius:8px;border:1px solid rgba(255,255,255,0.15);' +
-      'background:none;color:rgba(255,255,255,0.7);font-size:11px">RETRY</button>';
-    return;
-  }
-  if (!_nidState.rows) { body.innerHTML = ''; return; }
-
-  var h = '', gi, i, j, k;
-  var totalPlayers = 0;
-  for (gi = 0; gi < _nidState.rows.length; gi++) totalPlayers += _nidState.rows[gi].players.length;
-  h += '<div style="display:flex;align-items:center;gap:10px;margin-bottom:4px">' +
-    '<span style="' + mono + 'color:#4ade80;flex:1">' + totalPlayers +
-      ' players \u00b7 ' + _nidState.year + ' actuals</span>' +
-    '<button onclick="_nidSave()" style="padding:6px 14px;border-radius:8px;' +
-      'border:1px solid rgba(74,222,128,0.45);background:rgba(74,222,128,0.10);' +
-      'color:#4ade80;font-size:10px;font-weight:800;letter-spacing:0.08em">' +
-      'EXPORT .TXT</button>' +
-  '</div>';
-
-  for (gi = 0; gi < _nidState.rows.length; gi++) {
-    var grp = _nidState.rows[gi];
-    h += '<div style="font-size:10px;font-weight:800;letter-spacing:0.16em;' +
-      'color:rgba(255,255,255,0.5);margin:18px 0 2px;padding-bottom:3px;' +
-      'border-bottom:1px solid rgba(255,255,255,0.12)">' + slEsc(grp.label) + '</div>';
-    if (grp.err) {
-      h += '<div style="' + mono + 'color:#f87171">failed: ' + slEsc(grp.err) + '</div>';
-      continue;
-    }
-    if (!grp.players.length) {
-      // Name the endpoint and the ids. Blaming the season was wrong once
-      // already: hockey was being asked of the BASKETBALL endpoint because
-      // dbpGameFor compared against a lowercase literal, and the empty
-      // result looked like missing data rather than a wrong URL.
-      // ESPNHLIDPROBE
-      var gcode = (typeof dbpGameFor === 'function') ? dbpGameFor(grp.sport) : '?';
-      var askedIds = [];
-      for (i = 0; i < NID_SPORTS.length; i++) {
-        if (NID_SPORTS[i].sport === grp.sport) {
-          askedIds = NID_SPORTS[i].players.map(function (q) { return q.id; });
-        }
-      }
-      h += '<div style="' + mono + 'color:rgba(255,255,255,0.5)">No players came back.<br>' +
-        'endpoint: ' + slEsc(gcode) + ' \u00b7 season ' + _nidState.year + '<br>' +
-        'asked for ' + askedIds.length + ' ids: ' +
-        slEsc(askedIds.slice(0, 6).join(', ')) + '</div>';
-      continue;
-    }
-    for (i = 0; i < grp.players.length; i++) {
-      var p = grp.players[i];
-      var pl = (p && (p.player || p)) || {};
-      var nm = pl.fullName || pl.name || ('id ' + (pl.id != null ? pl.id : '?'));
-      var known = '';
-      var _kn = _nidKnown();
-      for (j = 0; j < _kn.length; j++) {
-        if (String(_kn[j].id) === String(pl.id)) known = _kn[j].note;
-      }
-      h += '<div style="font-size:11px;font-weight:800;letter-spacing:0.06em;' +
-        'color:#fbbf24;margin:14px 0 2px">' + slEsc(nm) + '</div>';
-      if (known) {
-        h += '<div style="' + mono + 'color:rgba(255,255,255,0.4);margin-bottom:4px">' +
-          slEsc(known) + '</div>';
-      }
-      var blocks = _nidBlocks(p);
-      if (!blocks.length) {
-        h += '<div style="' + mono + 'color:rgba(255,255,255,0.35)">no stat blocks</div>';
-        continue;
-      }
-      for (j = 0; j < blocks.length; j++) {
-        var b = blocks[j];
-        var isActual = (b.src === 0);
-        h += '<div style="' + mono + 'color:' +
-          (isActual ? 'rgba(255,255,255,0.55)' : 'rgba(255,255,255,0.25)') + '">' +
-          'src ' + b.src + ' split ' + b.split + ' season ' + b.season +
-          (isActual ? '  \u2190 ACTUAL' : '  (projection \u2014 ignore)') +
-          '  \u00b7 ' + b.n + ' stats</div>';
-        if (!isActual) continue;
-        var keys = [];
-        for (k in b.map) { if (b.map.hasOwnProperty(k)) keys.push(k); }
-        keys.sort(function (x, y) { return Number(x) - Number(y); });
-        var line = [];
-        for (k = 0; k < keys.length; k++) {
-          var v = b.map[keys[k]];
-          var vs = (typeof v === 'number') ? (Math.round(v * 1000) / 1000) : v;
-          line.push('#' + keys[k] + '=' + vs);
-        }
-        for (k = 0; k < line.length; k += 5) {
-          h += '<div style="' + mono + 'color:rgba(255,255,255,0.8);padding-left:8px">' +
-            slEsc(line.slice(k, k + 5).join('  ')) + '</div>';
-        }
-      }
-    }
-  }
-
-  h += '<div style="font-size:9.5px;line-height:1.55;color:rgba(255,255,255,0.3);' +
-    'margin-top:18px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.08)">' +
-    'Screenshot this. The ids are named by MAGNITUDE, so nobody has to ' +
-    'remember a season to the digit: whichever id reads near 2000 for a ' +
-    'scorer is points, whichever is large for the big man and small for the ' +
-    'guard is rebounds, and the reverse is assists. Values between 0 and 1 ' +
-    'are the percentage categories. The goaltender does the same job in ' +
-    'hockey \u2014 his numbers share no magnitude with a skater\u2019s, which ' +
-    'separates W, GAA and SV%. That settles the labels, the group split and ' +
-    'which categories are lower-is-better, in one pass.</div>';
-
-  body.innerHTML = h;
-}
-
 // ─────────────────────────────────────────────────────────────────
 // INJURY BOARD — stash-candidate scanner. INJTOOL
 // ─────────────────────────────────────────────────────────────────
@@ -119965,16 +119343,32 @@ function skArchiveLeague(row, force) {
   }
 
   var st = row.standings || {};
+  // The league's format decides what "record" even means. Head-to-head has a
+  // W-L-T; season-points and roto have no matchup record at all and are
+  // described by points-for and the finish instead. Recording the format
+  // alongside the numbers means the trophy case can say the right thing per
+  // league rather than showing an em-dash and leaving it unexplained.
+  var fmt = (typeof extFormatKey === 'function') ? extFormatKey(row) : '';
+  var sr = null;
+  if (fmt !== 'point' && fmt !== 'roto' && typeof mrSeasonRec === 'function') {
+    try {
+      var r0 = mrSeasonRec(row);
+      if (r0 && !r0.unusable) sr = r0.w + '-' + r0.l + '-' + r0.t;
+    } catch (e) {}
+  }
   var rec = {
     leagueKey: row.key,
     provider: row.provider || 'espn',
     sport: String(row.sport || '').toLowerCase(),
+    fmt: fmt || '',
     season: Number(season),
     leagueName: row.name || row.leagueName || '',
-    teamName: st.teamName || '',
+    teamName: st.teamName || (row.myTeamName || ''),
     rank: pl.rank,
     size: pl.total,
-    record: st.record || '',
+    // The computed matchup record where the format has one, otherwise
+    // whatever the platform's own standings string said.
+    record: sr || st.record || '',
     pf: (st.pf != null) ? st.pf : null,
     at: new Date().toISOString()
   };
@@ -120500,18 +119894,37 @@ function _skTrophyHtml() {
       var mp = medals[mm];
       for (var i = 0; i < t[mp.p].length; i++) {
         var a = t[mp.p][i];
-        h += '<div style="display:flex;align-items:baseline;gap:8px;padding:5px 0;' +
-          'border-bottom:1px solid rgba(255,255,255,0.04);">' +
-          '<span style="flex:0 0 20px;font-size:13px;">' + mp.icon + '</span>' +
-          '<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;' +
-            'white-space:nowrap;font-size:12.5px;color:rgba(255,255,255,0.85);">' +
-            slEsc(a.leagueName || a.leagueKey) + '</span>' +
-          '<span style="' + mono + 'font-size:10px;color:rgba(255,255,255,0.4);">' +
-            a.season + '</span>' +
-          '<span style="' + mono + 'font-size:10px;color:rgba(255,255,255,0.55);' +
-            'flex:0 0 62px;text-align:right;">' +
-            (typeof _skOrdinal === 'function' ? _skOrdinal(a.rank) : a.rank) +
-            ' of ' + a.size + '</span>' +
+        // Which TEAM won it, and the record where the format has one. A
+        // season-points or roto league has no W-L to show, so it gets its
+        // points-for instead rather than an unexplained dash. SKARCHIVE
+        var noRec = (a.fmt === 'point' || a.fmt === 'roto');
+        var recTxt = '';
+        if (!noRec && a.record) recTxt = a.record;
+        else if (a.pf != null) recTxt = Math.round(a.pf) + ' pts';
+        else if (noRec) recTxt = (a.fmt === 'roto') ? 'roto' : 'season points';
+        h += '<div style="padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.04);">' +
+          '<div style="display:flex;align-items:baseline;gap:8px;">' +
+            '<span style="flex:0 0 20px;font-size:13px;">' + mp.icon + '</span>' +
+            '<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;' +
+              'white-space:nowrap;font-size:12.5px;color:rgba(255,255,255,0.85);">' +
+              slEsc(a.leagueName || a.leagueKey) + '</span>' +
+            '<span style="' + mono + 'font-size:10px;color:rgba(255,255,255,0.4);">' +
+              a.season + '</span>' +
+            '<span style="' + mono + 'font-size:10px;color:rgba(255,255,255,0.6);' +
+              'flex:0 0 60px;text-align:right;">' +
+              (typeof _skOrdinal === 'function' ? _skOrdinal(a.rank) : a.rank) +
+              ' of ' + a.size + '</span>' +
+          '</div>' +
+          '<div style="display:flex;align-items:baseline;gap:6px;padding-left:28px;' +
+            'font-size:9.5px;color:rgba(255,255,255,0.34);' + mono + '">' +
+            (a.teamName ? ('<span style="color:rgba(255,255,255,0.5)">' +
+              slEsc(a.teamName) + '</span>') : '') +
+            (a.teamName && recTxt ? '<span style="opacity:0.4"> \u00b7 </span>' : '') +
+            (recTxt ? slEsc(recTxt) : '') +
+            '<span style="flex:1"></span>' +
+            '<span style="opacity:0.7">' + slEsc(String(a.sport || '').toUpperCase()) +
+              ' \u00b7 ' + slEsc(a.provider) + '</span>' +
+          '</div>' +
         '</div>';
       }
     }
