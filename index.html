@@ -32604,7 +32604,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-08-12 03:35 UTC';
+var SK_BUILD = '2026-08-12 03:50 UTC';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -112974,19 +112974,48 @@ async function _resolveEspnAthleteId(sportKey, name, teamAbbr) {
   if (_espnIdCache.hasOwnProperty(key)) return _espnIdCache[key];
   if (_espnIdInflight[key]) return _espnIdInflight[key];
 
+  // Query variants, tried in order. ESPN's search matches on the literal
+  // string, so a provider that spells a name differently returns NOTHING and
+  // the good comparison key below never gets a candidate to compare.
+  //
+  // Fantrax sends "KAndre Miller"; ESPN's index has "K'Andre Miller". The
+  // apostrophe is the whole difference. Rather than guess where one belongs,
+  // the retry drops to the SURNAME alone — which is unaffected by any
+  // punctuation in the first name and still narrow enough to identify a
+  // player once _pmNameKey (which DOES fold apostrophes) filters the
+  // candidates. FTXAPOS
+  var _queries = [searchName];
+  var _sn = String(searchName).trim().split(/\s+/);
+  if (_sn.length > 1) {
+    var _sur = _sn[_sn.length - 1];
+    if (_sur.length > 2) _queries.push(_sur);
+  }
+
   var pr = (async function() {
     try {
-      var url = 'https://site.web.api.espn.com/apis/common/v3/search?query=' +
-        encodeURIComponent(searchName) + '&limit=12&type=player';
-      var res = await fetch(url);
+      var res = null, data = null, _qi = 0;
+      for (_qi = 0; _qi < _queries.length; _qi++) {
+        var url = 'https://site.web.api.espn.com/apis/common/v3/search?query=' +
+          encodeURIComponent(_queries[_qi]) + '&limit=12&type=player';
+        res = await fetch(url);
+        if (!res.ok) break;
+        data = await res.json();
+        // Stop at the first query that returns anything at all; the
+        // name-key comparison downstream decides whether it is the right
+        // player, so a surname query returning ten people is fine.
+        var _got = (data && ((data.results && data.results.length) ||
+                             (data.items && data.items.length)));
+        if (_got) break;
+      }
+      var _resOk = res;
       // Don't poison the cache on a transient HTTP failure (e.g. ESPN rate-
       // limiting a burst of lookups — common when a full NHL roster resolves
       // every player at once for both the daily line AND season stats). Caching
       // null here would blank that player for the whole session; a later render
       // retries instead. Only a SUCCESSFUL response with no candidate is a real
       // "no such player" miss worth caching.
-      if (!res.ok) { return null; }
-      var data = await res.json();
+      if (!_resOk || !_resOk.ok) { return null; }
+      if (!data) { _espnIdCache[key] = null; return null; }
       // ESPN's real shape: data.results[] is a list of GROUPS, each with a
       // contents[] of items. Players also sometimes come back flat in
       // data.items. Flatten both into a single candidate list.
@@ -136994,6 +137023,79 @@ function _ftxLiveFor(SPORT, name) {
   return null;
 }
 
+// Season stats for the roster tab. ── FTXSEASONROW ──
+//
+// The stats modal already fetches these through _skFetchEspnSeasonStats,
+// which caches per league key — so asking here warms the same cache and the
+// modal opens instantly afterwards rather than fetching twice.
+//
+// Fires once per league per session. The roster tab renders synchronously, so
+// the result arrives later and repaints, exactly as the live slate does.
+var _ftxSeasonAsked = {};
+
+function _ftxEnsureSeason(row, myTeam) {
+  var lk = String(row.key || '');
+  if (!lk || _ftxSeasonAsked[lk]) return;
+  if (typeof _skFetchEspnSeasonStats !== 'function') return;
+  var SPORT = String(row.sport || '').toUpperCase();
+  var sportKey = SPORT.toLowerCase();
+  if (typeof _ESPN_SPORT_CFG === 'undefined' || !_ESPN_SPORT_CFG[sportKey]) return;
+
+  var items = (myTeam && myTeam.items) || [];
+  var players = [];
+  for (var i = 0; i < items.length && i < 40; i++) {
+    var it = items[i] || {};
+    var res = _extRosterItemName(it, SPORT);
+    if (!res.name || res.name === '?' || res.unresolved) continue;
+    // The DISPLAY name, first-last — the resolver searches ESPN on it, and
+    // "Miller, KAndre" is not a string ESPN will ever match.
+    players.push({
+      playerKey: String(it.id || it.playerId || res.name),
+      name: _ftxDisplayName(res.name), pos: res.pos,
+      team: res.team || '', teamAbbr: res.team || ''
+    });
+  }
+  if (!players.length) return;
+  _ftxSeasonAsked[lk] = 1;
+
+  _skFetchEspnSeasonStats(sportKey, lk, players).then(function () {
+    try {
+      var pane = (typeof _espRosterPane === 'function') ? _espRosterPane() : null;
+      if (pane && typeof _extRosterPaneHtml === 'function') {
+        pane.innerHTML = _extRosterPaneHtml(row, row.myTeamIds || {});
+      }
+    } catch (e) {}
+  })['catch'](function () {});
+}
+
+// One player's season line out of that cache, formatted for display.
+function _ftxSeasonFor(row, rawName, pos) {
+  try {
+    var lk = String(row.key || '');
+    var cache = (typeof _skSeasonStatsCache !== 'undefined') ? _skSeasonStatsCache[lk] : null;
+    var by = cache && cache.byPlayerKey;
+    if (!by) return '';
+    var sportKey = String(row.sport || '').toLowerCase();
+    // The cache is keyed by playerKey, which for these rosters is the id
+    // where one exists and the RAW name otherwise — so both are tried.
+    var flat = by[rawName] || by[_ftxDisplayName(rawName)];
+    if (!flat) {
+      // Fall back to a name-key sweep, which folds the punctuation that
+      // caused this whole class of miss in the first place.
+      var want = (typeof _pmNameKey === 'function') ? _pmNameKey(_ftxDisplayName(rawName)) : '';
+      if (want) {
+        for (var k in by) {
+          if (!by.hasOwnProperty(k)) continue;
+          if ((typeof _pmNameKey === 'function' ? _pmNameKey(k) : k) === want) { flat = by[k]; break; }
+        }
+      }
+    }
+    if (!flat) return '';
+    return (typeof _formatEspnSeasonLine === 'function')
+      ? _formatEspnSeasonLine(sportKey, flat, pos || '') : '';
+  } catch (e) { return ''; }
+}
+
 // ── FANTRAX ROSTER ── FTXROSTER ──
 // Fantrax fell through to the compact two-column list — name on the left,
 // position on the right — while Sleeper and ESPN each got a rich builder.
@@ -137039,6 +137141,11 @@ function _ftxRosterRowsHtml(row, myTeam) {
   // background and the pane repainted ONCE when it arrives. Guarded against
   // repainting forever: the fetch itself caches for a minute, and the repaint
   // only fires when this pass had no live data to show. FTXLIVE
+  // Season stats for the same roster, so a player with no game tonight still
+  // shows a line. Cached per league by the shared fetcher, so opening the
+  // stats modal afterwards costs nothing. FTXSEASONROW
+  if (typeof _ftxEnsureSeason === 'function') _ftxEnsureSeason(row, myTeam);
+
   if (typeof _ftxFetchLive === 'function' && FTX_LIVE_CFG[SPORT] &&
       !_ftxLiveCache[SPORT] && !_ftxLiveInflight[SPORT]) {
     _ftxFetchLive(SPORT).then(function () {
@@ -137129,19 +137236,24 @@ function _ftxRosterRowsHtml(row, myTeam) {
         '<div style="flex:1;min-width:0;">' +
           '<div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' +
             'font-size:12.5px;color:#fff;">' + slEsc(_disp) + '</div>' +
-          // Tonight's line, when the player's game has started. Nothing at
-          // all otherwise — a season total belongs in the stats modal, not
-          // under every name on the roster. FTXLIVE
-          (_lv
-            ? '<div style="font-family:var(--sk-font-mono,monospace);font-size:9px;' +
-              'color:rgba(255,255,255,0.42);margin-top:1px;overflow:hidden;' +
-              'text-overflow:ellipsis;white-space:nowrap;">' +
-              (typeof _skSeasonLineHtml === 'function' ? _skSeasonLineHtml(_lv.line) : slEsc(_lv.line)) +
-              '<span style="color:' + (_lv.live ? '#ef4444' : 'rgba(255,255,255,0.28)') +
-                ';margin-left:5px;font-size:8px;letter-spacing:0.08em;">' +
-                (_lv.live ? 'LIVE' : 'FINAL') + '</span>' +
-              '</div>'
-            : '') +
+          // Tonight's line when the player's game has started, the season
+          // line the rest of the time. The live figure REPLACES the season
+          // one rather than sitting beside it — two numbers for the same
+          // player invites reading the wrong one. FTXLIVE / FTXSEASONROW
+          (function () {
+            var body = _lv ? _lv.line : _ftxSeasonFor(row, e.res.name, e.res.pos);
+            if (!body) return '';
+            return '<div style="font-family:var(--sk-font-mono,monospace);font-size:9px;' +
+              'color:rgba(255,255,255,' + (_lv ? '0.5' : '0.35') + ');margin-top:1px;' +
+              'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' +
+              (typeof _skSeasonLineHtml === 'function' ? _skSeasonLineHtml(body) : slEsc(body)) +
+              (_lv
+                ? '<span style="color:' + (_lv.live ? '#ef4444' : 'rgba(255,255,255,0.28)') +
+                  ';margin-left:5px;font-size:8px;letter-spacing:0.08em;">' +
+                  (_lv.live ? 'LIVE' : 'FINAL') + '</span>'
+                : '') +
+            '</div>';
+          })() +
         '</div>' +
         (abbr
           ? '<span style="font-family:var(--sk-font-mono,monospace);font-size:9.5px;' +
