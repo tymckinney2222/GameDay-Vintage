@@ -32604,7 +32604,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-08-12 04:05 UTC';
+var SK_BUILD = '2026-08-12 04:16 UTC';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -112993,8 +112993,9 @@ async function _resolveEspnAthleteId(sportKey, name, teamAbbr) {
 
   var pr = (async function() {
     try {
-      var res = null, data = null, _qi = 0;
+      var res = null, data = null, _qi = 0, _usedQuery = searchName;
       for (_qi = 0; _qi < _queries.length; _qi++) {
+        _usedQuery = _queries[_qi];
         var url = 'https://site.web.api.espn.com/apis/common/v3/search?query=' +
           encodeURIComponent(_queries[_qi]) + '&limit=12&type=player';
         res = await fetch(url);
@@ -113067,11 +113068,22 @@ async function _resolveEspnAthleteId(sportKey, name, teamAbbr) {
       }
       // Prefer: exact-name AND right sport → right sport → exact name → first.
       // Compare via pKey (accent-folded, role-tag-stripped) on both sides.
-      var match = cands.find(function(r) {
+      // A BROAD query (surname only) may return a dozen unrelated players, so
+      // the loose fallbacks below — "first one in the right sport", "first one
+      // at all" — become actively dangerous: searching "Miller" would happily
+      // return some other NHL Miller and show his stats under K'Andre's name.
+      // Silently wrong is worse than blank, so a broad query accepts ONLY an
+      // exact name-key match (which folds the apostrophe that caused the
+      // fallback in the first place). FTXAPOS
+      var _broad = (_usedQuery !== searchName);
+      var _exact = cands.find(function(r) {
         return _pmNameKey(r.displayName || r.name || '') === pKey && inSport(r);
-      }) || cands.find(function(r) { return inSport(r); })
-         || cands.find(function(r) { return _pmNameKey(r.displayName || r.name || '') === pKey; })
-         || cands[0];
+      }) || cands.find(function(r) {
+        return _pmNameKey(r.displayName || r.name || '') === pKey;
+      });
+      var match = _broad
+        ? _exact
+        : (_exact || cands.find(function(r) { return inSport(r); }) || cands[0]);
       var id = match ? idOf(match) : null;
       _espnIdCache[key] = id;
       return id;
@@ -137021,15 +137033,69 @@ function _ftxLiveFor(SPORT, name) {
   return null;
 }
 
+// Club colour for a SPECIFIC sport, not whatever sport is currently active.
+// ── FTXCOLOR ──
+//
+// _skTeamColor keys off _skActiveSport, which is right for the stadium modes
+// and wrong for a roster: BOS is Bruins gold in hockey and Celtics green in
+// basketball, and LA, NY and CHI collide the same way. Opening an NBA Fantrax
+// roster while an NHL league happened to be active would paint every shared
+// abbreviation in the other sport's colours.
+function _ftxColorFor(abbr, SPORT) {
+  var a = String(abbr || '').toUpperCase();
+  if (!a) return null;
+  try {
+    if (SPORT === 'NBA' && typeof nbaArenaTheme === 'function') {
+      var nt = nbaArenaTheme(a);
+      if (nt && nt.accent) return nt.accent;
+    }
+    if (SPORT === 'NHL' && typeof nhlArenaTheme === 'function') {
+      var ht = nhlArenaTheme(a);
+      if (ht && ht.accent) return ht.accent;
+    }
+    // Baseball and anything else fall back to the shared lookup, which is
+    // MLB-first and correct for those.
+    if (typeof _skTeamColor === 'function') return _skTeamColor(a);
+  } catch (e) {}
+  return null;
+}
+
+// My team ids for an ext league, with the Fantrax fallback. ── FTXMYIDS ──
+//
+// Fantrax rows frequently DON'T carry row.myTeamIds — the ownership map has to
+// be derived from the raw payload by _fxMyTeamIds. Every existing caller knows
+// this and writes `row.myTeamIds || _fxMyTeamIds(row.raw || {})`.
+//
+// The background repaints wrote `row.myTeamIds || {}` instead. On a Fantrax
+// league that is an EMPTY map, so the pane found no team of mine and replaced
+// a perfectly good roster with "Could not identify your team" the moment the
+// stats fetch came back.
+function _extMyIds(row) {
+  if (!row) return {};
+  if (row.myTeamIds) return row.myTeamIds;
+  try {
+    if (typeof _fxMyTeamIds === 'function') return _fxMyTeamIds(row.raw || {}) || {};
+  } catch (e) {}
+  return {};
+}
+
 // Season stats for the roster tab. ── FTXSEASONROW ──
 //
-// The stats modal already fetches these through _skFetchEspnSeasonStats,
-// which caches per league key — so asking here warms the same cache and the
-// modal opens instantly afterwards rather than fetching twice.
+// Keyed by NAME, in a cache this module owns.
 //
-// Fires once per league per session. The roster tab renders synchronously, so
-// the result arrives later and repaints, exactly as the live slate does.
+// The first attempt read _skSeasonStatsCache[leagueKey], which is simply not
+// where these land — _skFetchEspnSeasonStats caches under
+// _espnSeasonCache[sport|teamKey] and RETURNS the entry. So every lookup
+// missed and not one player showed a season line. Reading the resolved value
+// rather than reaching into someone else's cache also means this keeps
+// working if that internal ever moves.
+//
+// Name-keyed rather than playerKey-keyed on purpose: byPlayerKey is keyed by
+// whatever id the roster item happened to carry, and the roster row only has
+// a name to look up with. _pmNameKey folds the punctuation — the same fold
+// that makes K'Andre Miller match KAndre Miller.
 var _ftxSeasonAsked = {};
+var _ftxSeasonByName = {};   // leagueKey -> { nameKey: flatStats }
 
 function _ftxEnsureSeason(row, myTeam) {
   var lk = String(row.key || '');
@@ -137056,91 +137122,42 @@ function _ftxEnsureSeason(row, myTeam) {
   if (!players.length) return;
   _ftxSeasonAsked[lk] = 1;
 
-  _skFetchEspnSeasonStats(sportKey, lk, players).then(function () {
+  _skFetchEspnSeasonStats(sportKey, lk, players).then(function (entry) {
     try {
+      var by = (entry && entry.byPlayerKey) || null;
+      if (by) {
+        // Re-key from playerKey to name key, using the very list that was
+        // sent — the only place both are known together.
+        var map = {};
+        for (var q = 0; q < players.length; q++) {
+          var flat = by[players[q].playerKey];
+          if (!flat) continue;
+          var nk = (typeof _pmNameKey === 'function')
+            ? _pmNameKey(players[q].name) : String(players[q].name).toLowerCase();
+          if (nk) map[nk] = flat;
+        }
+        _ftxSeasonByName[lk] = map;
+      }
       var pane = (typeof _espRosterPane === 'function') ? _espRosterPane() : null;
       if (pane && typeof _extRosterPaneHtml === 'function') {
-        // FTXMYIDS — passing row.myTeamIds here is what blanked the roster.
         pane.innerHTML = _extRosterPaneHtml(row, _extMyIds(row));
       }
     } catch (e) {}
   })['catch'](function () {});
 }
 
-// One player's season line out of that cache, formatted for display.
+// One player's season line, formatted for display.
 function _ftxSeasonFor(row, rawName, pos) {
   try {
-    var lk = String(row.key || '');
-    var cache = (typeof _skSeasonStatsCache !== 'undefined') ? _skSeasonStatsCache[lk] : null;
-    var by = cache && cache.byPlayerKey;
-    if (!by) return '';
-    var sportKey = String(row.sport || '').toLowerCase();
-    // The cache is keyed by playerKey, which for these rosters is the id
-    // where one exists and the RAW name otherwise — so both are tried.
-    var flat = by[rawName] || by[_ftxDisplayName(rawName)];
-    if (!flat) {
-      // Fall back to a name-key sweep, which folds the punctuation that
-      // caused this whole class of miss in the first place.
-      var want = (typeof _pmNameKey === 'function') ? _pmNameKey(_ftxDisplayName(rawName)) : '';
-      if (want) {
-        for (var k in by) {
-          if (!by.hasOwnProperty(k)) continue;
-          if ((typeof _pmNameKey === 'function' ? _pmNameKey(k) : k) === want) { flat = by[k]; break; }
-        }
-      }
-    }
+    var map = _ftxSeasonByName[String(row.key || '')];
+    if (!map) return '';
+    var nk = (typeof _pmNameKey === 'function')
+      ? _pmNameKey(_ftxDisplayName(rawName)) : String(rawName).toLowerCase();
+    var flat = nk ? map[nk] : null;
     if (!flat) return '';
     return (typeof _formatEspnSeasonLine === 'function')
-      ? _formatEspnSeasonLine(sportKey, flat, pos || '') : '';
+      ? _formatEspnSeasonLine(String(row.sport || '').toLowerCase(), flat, pos || '') : '';
   } catch (e) { return ''; }
-}
-
-// My team ids for an ext league, with the Fantrax fallback. ── FTXMYIDS ──
-//
-// Fantrax rows frequently DON'T carry row.myTeamIds — the ownership map has to
-// be derived from the raw payload by _fxMyTeamIds. Every existing caller knows
-// this and writes `row.myTeamIds || _fxMyTeamIds(row.raw || {})`; there is
-// even a comment elsewhere warning about it.
-//
-// My background repaints wrote `row.myTeamIds || {}` instead. On a Fantrax
-// league that is an EMPTY map, so the pane found no team of mine and replaced
-// a perfectly good roster with "Could not identify your team" the moment the
-// stats fetch came back. The roster wasn't failing to load — it loaded, then
-// my own repaint wiped it.
-function _extMyIds(row) {
-  if (!row) return {};
-  if (row.myTeamIds) return row.myTeamIds;
-  try {
-    if (typeof _fxMyTeamIds === 'function') return _fxMyTeamIds(row.raw || {}) || {};
-  } catch (e) {}
-  return {};
-}
-
-// Club colour for a SPECIFIC sport, not whatever sport is currently active.
-// ── FTXCOLOR ──
-//
-// _skTeamColor keys off _skActiveSport, which is right for the stadium modes
-// and wrong for a roster: BOS is Bruins gold in hockey and Celtics green in
-// basketball, and LA, NY and CHI collide the same way. Opening an NBA Fantrax
-// roster while an NHL league happened to be active would paint every shared
-// abbreviation in the other sport's colours.
-function _ftxColorFor(abbr, SPORT) {
-  var a = String(abbr || '').toUpperCase();
-  if (!a) return null;
-  try {
-    if (SPORT === 'NBA' && typeof nbaArenaTheme === 'function') {
-      var nt = nbaArenaTheme(a);
-      if (nt && nt.accent) return nt.accent;
-    }
-    if (SPORT === 'NHL' && typeof nhlArenaTheme === 'function') {
-      var ht = nhlArenaTheme(a);
-      if (ht && ht.accent) return ht.accent;
-    }
-    // Baseball and anything else fall back to the shared lookup, which is
-    // MLB-first and correct for those.
-    if (typeof _skTeamColor === 'function') return _skTeamColor(a);
-  } catch (e) {}
-  return null;
 }
 
 // ── FANTRAX ROSTER ── FTXROSTER ──
