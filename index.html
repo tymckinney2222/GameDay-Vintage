@@ -32604,7 +32604,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-08-12 03:58 UTC';
+var SK_BUILD = '2026-08-12 04:05 UTC';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -137060,7 +137060,8 @@ function _ftxEnsureSeason(row, myTeam) {
     try {
       var pane = (typeof _espRosterPane === 'function') ? _espRosterPane() : null;
       if (pane && typeof _extRosterPaneHtml === 'function') {
-        pane.innerHTML = _extRosterPaneHtml(row, row.myTeamIds || {});
+        // FTXMYIDS — passing row.myTeamIds here is what blanked the roster.
+        pane.innerHTML = _extRosterPaneHtml(row, _extMyIds(row));
       }
     } catch (e) {}
   })['catch'](function () {});
@@ -137094,11 +137095,32 @@ function _ftxSeasonFor(row, rawName, pos) {
   } catch (e) { return ''; }
 }
 
-// Club colour for a SPECIFIC sport, rather than whatever sport is currently
-// active. ── FTXCOLOR ──
+// My team ids for an ext league, with the Fantrax fallback. ── FTXMYIDS ──
+//
+// Fantrax rows frequently DON'T carry row.myTeamIds — the ownership map has to
+// be derived from the raw payload by _fxMyTeamIds. Every existing caller knows
+// this and writes `row.myTeamIds || _fxMyTeamIds(row.raw || {})`; there is
+// even a comment elsewhere warning about it.
+//
+// My background repaints wrote `row.myTeamIds || {}` instead. On a Fantrax
+// league that is an EMPTY map, so the pane found no team of mine and replaced
+// a perfectly good roster with "Could not identify your team" the moment the
+// stats fetch came back. The roster wasn't failing to load — it loaded, then
+// my own repaint wiped it.
+function _extMyIds(row) {
+  if (!row) return {};
+  if (row.myTeamIds) return row.myTeamIds;
+  try {
+    if (typeof _fxMyTeamIds === 'function') return _fxMyTeamIds(row.raw || {}) || {};
+  } catch (e) {}
+  return {};
+}
+
+// Club colour for a SPECIFIC sport, not whatever sport is currently active.
+// ── FTXCOLOR ──
 //
 // _skTeamColor keys off _skActiveSport, which is right for the stadium modes
-// but wrong for a roster: BOS is Bruins gold in hockey and Celtics green in
+// and wrong for a roster: BOS is Bruins gold in hockey and Celtics green in
 // basketball, and LA, NY and CHI collide the same way. Opening an NBA Fantrax
 // roster while an NHL league happened to be active would paint every shared
 // abbreviation in the other sport's colours.
@@ -137162,16 +137184,14 @@ function _ftxRosterRowsHtml(row, myTeam) {
   var items = myTeam.items || [];
   var i;
 
+  // The roster tab renders synchronously, so the live slate is fetched in the
+  // background and the pane repainted ONCE when it arrives. Guarded against
+  // repainting forever: the fetch itself caches for a minute, and the repaint
+  // only fires when this pass had no live data to show. FTXLIVE
   // Background enrichment: season stats and tonight's slate. Both are
-  // optional decoration on a roster that must render regardless.
-  //
-  // This whole block used to run bare, and it referenced FTX_LIVE_CFG and
-  // _ftxLiveCache without guarding them. _extRosterPaneHtml has no try/catch,
-  // so ANY throw here took out the entire pane and the caller fell back to
-  // "could not identify your team" — a roster of real names replaced by an
-  // error, because a stat lookup wasn't ready. Names are the point of this
-  // view; stats are the garnish, and the garnish must never eat the meal.
-  // FTXSAFE
+  // optional decoration on a roster that must render regardless, so each is
+  // wrapped — the names are the point of this view and a stat lookup must
+  // never be able to take them down. FTXSAFE
   try {
     if (typeof _ftxEnsureSeason === 'function') _ftxEnsureSeason(row, myTeam);
   } catch (eS) {}
@@ -137182,11 +137202,10 @@ function _ftxRosterRowsHtml(row, myTeam) {
         !_ftxLiveCache[SPORT] && !_ftxLiveInflight[SPORT]) {
       _ftxFetchLive(SPORT).then(function () {
         try {
-          // _espRosterPane is the existing locator — it walks the detail body
-          // for the pane tagged data-extpane="roster".
           var pane = (typeof _espRosterPane === 'function') ? _espRosterPane() : null;
           if (pane && typeof _extRosterPaneHtml === 'function') {
-            pane.innerHTML = _extRosterPaneHtml(row, row.myTeamIds || {});
+            // _extMyIds, NOT row.myTeamIds — see FTXMYIDS. FTXMYIDS
+            pane.innerHTML = _extRosterPaneHtml(row, _extMyIds(row));
           }
         } catch (e) {}
       })['catch'](function () {});
@@ -137361,10 +137380,9 @@ function _extRosterPaneHtml(row, myIds) {
                           myTeam.items[0] && myTeam.items[0].slot);
         if (_espRich) html += _espRosterRowsHtml(row, myTeam);
         // Fantrax gets its own builder too. FTXROSTER
-        //
-        // Wrapped: if the rich builder fails for any reason the pane falls
-        // through to the compact list below rather than showing an error.
-        // A plain list of names beats no roster at all. FTXSAFE
+        // Wrapped: if the rich builder fails the pane falls through to the
+        // compact list below rather than showing an error. A plain list of
+        // names beats no roster at all. FTXSAFE
         var _ftxRich = !!(row.provider === 'fantrax' && typeof _ftxRosterRowsHtml === 'function');
         if (_ftxRich) {
           try {
@@ -137494,7 +137512,11 @@ function extOpenLeague(key) {
       for (var pi = 0; pi < panes.length; pi++) {
         var pn = panes[pi].getAttribute('data-extpane');
         if (pn === 'roster' && typeof _extRosterPaneHtml === 'function') {
-          panes[pi].innerHTML = _extRosterPaneHtml(row, row.myTeamIds || {});
+          // Same latent bug as the background repaints: a Fantrax row has no
+          // myTeamIds and the ownership map has to come from raw. This one
+          // fires on a tab re-render rather than the first paint, which is
+          // why it hadn't been noticed. FTXMYIDS
+          panes[pi].innerHTML = _extRosterPaneHtml(row, _extMyIds(row));
         } else if (pn === 'weekgames' && panes[pi].innerHTML &&
                    panes[pi].innerHTML.indexOf('Tap to load') === -1 &&
                    typeof slLoadWeekGames === 'function') {
