@@ -32598,7 +32598,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-08-09 23:13 UTC';
+var SK_BUILD = '2026-08-12 03:15 UTC';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -135946,10 +135946,17 @@ function extLoadPlayerIds(sport, done) {
 function _extRosterItemName(it, SPORT) {
   var nm = it.name || it.playerName || it.player || null;
   var pos = it.position || it.pos || '';
+  var team = it.team || it.teamShort || it.proTeam || '';
   var unresolved = false;
+  var id = it.playerId || it.id || '';
+  var pidDict = (fxState.playerIdCache && fxState.playerIdCache[SPORT]) || null;
+  // The dictionary is consulted for the TEAM even when the name came inline,
+  // because _fxParsePlayerIds has always stored { name, pos, team } and only
+  // the first two were ever read. That dropped field is the whole reason the
+  // Fantrax roster looked like a bare list: a pro team abbreviation is the
+  // key to the club logo and colour Skipper already has. FTXROSTER
+  if (!team && id && pidDict && pidDict[id] && pidDict[id].team) team = pidDict[id].team;
   if (!nm) {
-    var id = it.playerId || it.id || '';
-    var pidDict = (fxState.playerIdCache && fxState.playerIdCache[SPORT]) || null;
     var adpDict = (fxState.adpNameById && fxState.adpNameById[SPORT]) || null;
     if (id && pidDict && pidDict[id]) {
       nm = pidDict[id].name;
@@ -135961,7 +135968,7 @@ function _extRosterItemName(it, SPORT) {
       unresolved = !!id;
     }
   }
-  return { name: String(nm), pos: String(pos), unresolved: unresolved };
+  return { name: String(nm), pos: String(pos), team: String(team), unresolved: unresolved };
 }
 
 // Roster pane HTML for the external detail view. Reusable so the pane
@@ -136744,6 +136751,143 @@ function _slpRosterRowsHtml(row, myTeam, sport) {
   return html;
 }
 
+// ── FANTRAX ROSTER ── FTXROSTER ──
+// Fantrax fell through to the compact two-column list — name on the left,
+// position on the right — while Sleeper and ESPN each got a rich builder.
+// That looked like an API limitation. It mostly wasn't.
+//
+// getPlayerIds ALREADY parses a pro team for every player: _fxParsePlayerIds
+// stores { name, pos, team } and _extRosterItemName was reading the name and
+// position out of it and dropping the team on the floor. Recovering that one
+// field is what makes the rest possible, because a pro team abbreviation is
+// the key to the logo and the colour that Skipper already has for every NHL,
+// NBA and MLB club from the ESPN work.
+//
+// What Fantrax genuinely does NOT give: lineup slots (so no starters/bench
+// split), and headshots. The slot absence is real and is why this groups by
+// POSITION instead — which is arguably better for a roto or season-points
+// league anyway, where there is no weekly lineup to set.
+function _ftxTeamOf(it, SPORT) {
+  return String(_extRosterItemName(it, SPORT).team || '').toUpperCase();
+}
+
+// Position groups, per sport, in the order a roster is usually read.
+var FTX_POS_ORDER = {
+  NHL: ['C', 'LW', 'RW', 'F', 'D', 'G'],
+  NBA: ['PG', 'SG', 'SF', 'PF', 'C', 'G', 'F'],
+  MLB: ['C', '1B', '2B', '3B', 'SS', 'OF', 'DH', 'SP', 'RP', 'P'],
+  NFL: ['QB', 'RB', 'WR', 'TE', 'K', 'DEF']
+};
+
+function _ftxPosGroup(pos, SPORT) {
+  var p = String(pos || '').toUpperCase().split(/[,/]/)[0].replace(/\s/g, '');
+  if (!p) return '?';
+  var order = FTX_POS_ORDER[SPORT] || [];
+  for (var i = 0; i < order.length; i++) if (order[i] === p) return p;
+  return p;
+}
+
+function _ftxRosterRowsHtml(row, myTeam) {
+  var SPORT = String(row.sport || '').toUpperCase();
+  var items = myTeam.items || [];
+  var i;
+
+  // Group by position, keeping the sport's natural order and putting
+  // anything unrecognised at the end rather than dropping it.
+  var groups = {}, order = [];
+  for (i = 0; i < items.length; i++) {
+    var it = items[i] || {};
+    var res = _extRosterItemName(it, SPORT);
+    var g = _ftxPosGroup(res.pos, SPORT);
+    if (!groups[g]) { groups[g] = []; order.push(g); }
+    groups[g].push({ it: it, res: res, team: _ftxTeamOf(it, SPORT) });
+  }
+  var known = FTX_POS_ORDER[SPORT] || [];
+  order.sort(function (a, b) {
+    var ia = known.indexOf(a), ib = known.indexOf(b);
+    if (ia < 0) ia = 99; if (ib < 0) ib = 99;
+    return ia - ib || String(a).localeCompare(String(b));
+  });
+
+  var html = '';
+  for (var oi = 0; oi < order.length; oi++) {
+    var key = order[oi], list = groups[key];
+    html += '<div style="display:flex;align-items:baseline;gap:7px;margin:' +
+      (oi ? '13px' : '4px') + ' 0 4px;padding-bottom:3px;' +
+      'border-bottom:1px solid rgba(255,255,255,0.08);">' +
+      '<span style="font-size:9.5px;font-weight:800;letter-spacing:0.14em;' +
+        'color:rgba(255,255,255,0.55);">' + slEsc(key) + '</span>' +
+      '<span style="flex:1;"></span>' +
+      '<span style="font-family:var(--sk-font-mono,monospace);font-size:9px;' +
+        'color:rgba(255,255,255,0.25);">' + list.length + '</span>' +
+    '</div>';
+
+    for (i = 0; i < list.length; i++) {
+      var e = list[i];
+      var abbr = e.team;
+      // The colour and the logo both come from what Skipper already knows
+      // about the pro club — nothing new is fetched.
+      var col = (abbr && typeof _skTeamColor === 'function') ? _skTeamColor(abbr) : null;
+      // _vtLogoUrl is the existing builder for the ESPN CDN team-logo path,
+      // and it wants the league UPPERCASE. It already handles the CDN's
+      // quirks, so reusing it beats writing a second URL builder that would
+      // drift from the first.
+      var logo = (abbr && typeof _vtLogoUrl === 'function') ? _vtLogoUrl(SPORT, abbr) : '';
+
+      html += '<div style="display:flex;align-items:center;gap:9px;padding:7px 4px;' +
+        'border-bottom:1px solid rgba(255,255,255,0.04);">' +
+        // A colour bar rather than a plain row: it makes a roster scannable
+        // by club, which is how you actually spot stacking or a bye-heavy
+        // week.
+        '<span style="flex:0 0 3px;height:22px;border-radius:2px;background:' +
+          (col || 'rgba(255,255,255,0.12)') + ';"></span>' +
+        (logo
+          ? '<img src="' + slEsc(logo) + '" alt="" style="width:19px;height:19px;' +
+            'flex:0 0 19px;object-fit:contain;" onerror="this.style.display=\'none\'">'
+          : '<span style="flex:0 0 19px;"></span>') +
+        '<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;' +
+          'white-space:nowrap;font-size:12.5px;color:#fff;">' +
+          slEsc(_ftxDisplayName(e.res.name)) + '</span>' +
+        (abbr
+          ? '<span style="font-family:var(--sk-font-mono,monospace);font-size:9.5px;' +
+            'color:' + (col || 'rgba(255,255,255,0.4)') + ';flex:0 0 auto;">' +
+            slEsc(abbr) + '</span>'
+          : '') +
+        '<span style="font-family:var(--sk-font-mono,monospace);font-size:9.5px;' +
+          'color:rgba(255,255,255,0.35);flex:0 0 46px;text-align:right;">' +
+          slEsc(e.res.pos || '') + '</span>' +
+      '</div>';
+    }
+  }
+
+  var missing = 0;
+  for (i = 0; i < items.length; i++) {
+    if (!_ftxTeamOf(items[i] || {}, SPORT)) missing++;
+  }
+  html += '<div style="font-size:9px;line-height:1.5;color:rgba(255,255,255,0.26);margin-top:8px;">' +
+    'Grouped by position \u2014 Fantrax sends no lineup slots, so there is no ' +
+    'starters and bench split to show. Club colours and logos come from the ' +
+    'pro team Fantrax does send.' +
+    (missing ? (' ' + missing + ' player' + (missing === 1 ? ' has' : 's have') +
+      ' no club yet; that fills in when the player dictionary loads.') : '') +
+    '</div>';
+  return html;
+}
+
+// "Kochetkov, Pyotr" reads worse than "Pyotr Kochetkov" and is only that way
+// because Fantrax sorts on surname. Flipped for display, carefully: only on a
+// single comma, and suffixes stay put.
+function _ftxDisplayName(name) {
+  var s = String(name || '');
+  var c = s.indexOf(',');
+  if (c < 0 || s.indexOf(',', c + 1) >= 0) return s;
+  var last = s.slice(0, c).trim(), first = s.slice(c + 1).trim();
+  if (!last || !first) return s;
+  // A trailing "Jr." or "III" belongs after the surname, not in front of it.
+  if (/^(jr|sr|ii|iii|iv|v)\.?$/i.test(first)) return s;
+  return first + ' ' + last;
+}
+
 function _extRosterPaneHtml(row, myIds) {
   var SPORT = String(row.sport || '').toUpperCase();
   var html = '';
@@ -136772,7 +136916,10 @@ function _extRosterPaneHtml(row, myIds) {
         var _espRich = !!(row.provider === 'espn' && typeof _espRosterRowsHtml === 'function' &&
                           myTeam.items[0] && myTeam.items[0].slot);
         if (_espRich) html += _espRosterRowsHtml(row, myTeam);
-        for (var ri = 0; !_slpRich && !_espRich && ri < myTeam.items.length && ri < 40; ri++) {
+        // Fantrax gets its own builder too. FTXROSTER
+        var _ftxRich = !!(row.provider === 'fantrax' && typeof _ftxRosterRowsHtml === 'function');
+        if (_ftxRich) html += _ftxRosterRowsHtml(row, myTeam);
+        for (var ri = 0; !_slpRich && !_espRich && !_ftxRich && ri < myTeam.items.length && ri < 40; ri++) {
           var it = myTeam.items[ri] || {};
           var res = _extRosterItemName(it, SPORT);
           var _tap = (_rTap && res.name && res.name !== '?')
