@@ -27870,7 +27870,13 @@ function _vtLogoUrl(league, abbr) {
   if (!slug) return '';
   var a = abbr.toLowerCase();
   // ESPN CDN quirks: Athletics still resolve under the legacy oak file.
-  var fix = { ath: 'oak', wsh: 'wsh' };
+  // Provider abbreviations that differ from the ESPN CDN's filenames. The
+  // NHL entries came from a Fantrax roster: it says SJS, TBL, LAK and NJD
+  // where ESPN files sj, tb, la and nj. A wrong key here is a silent 404 and
+  // a missing logo, not an error. FTXABBR
+  var fix = { ath: 'oak', wsh: 'wsh',
+              sjs: 'sj', tbl: 'tb', lak: 'la', njd: 'nj',
+              cbj: 'cbj', vgk: 'vgk', wpg: 'wpg' };
   a = fix[a] || a;
   return 'https://a.espncdn.com/i/teamlogos/' + slug + '/500/' + a + '.png';
 }
@@ -32598,7 +32604,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-08-12 03:15 UTC';
+var SK_BUILD = '2026-08-12 03:24 UTC';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -135459,7 +135465,10 @@ function _fxLineupFill(row, bodyEl, headEl) {
     if (!res.name || res.name === '?' || res.unresolved) continue;
     players.push({
       playerKey: String(it.id || it.playerId || res.name),
-      name: res.name, pos: res.pos, team: it.team || '', teamAbbr: it.team || ''
+      // res.team resolves through the player dictionary; it.team alone is
+      // usually empty, which is why the modal had no clubs at all. FTXSTATS
+      name: res.name, pos: res.pos,
+      team: res.team || it.team || '', teamAbbr: res.team || it.team || ''
     });
   }
   var note = '<div style="color:rgba(255,255,255,0.3);font-size:9.5px;line-height:1.6;margin-top:16px">' +
@@ -135468,7 +135477,8 @@ function _fxLineupFill(row, bodyEl, headEl) {
   if (!_ESPN_SPORT_CFG[sportKey]) {
     var basic = '';
     for (var b = 0; b < players.length; b++) {
-      basic += _extLineupRowHtml(players[b].name, players[b].pos, '', null, '#34d399', false);
+      basic += _extLineupRowHtml(_ftxDisplayName(players[b].name), players[b].pos, '',
+        null, '#34d399', false, _ftxClubChip(players[b].teamAbbr, SPORT));
     }
     bodyEl.innerHTML = basic +
       '<div style="color:rgba(255,255,255,0.3);font-size:9.5px;line-height:1.6;margin-top:16px">' +
@@ -135491,8 +135501,17 @@ function _fxLineupFill(row, bodyEl, headEl) {
     for (var p = 0; p < players.length; p++) {
       var line = by[players[p].playerKey];
       if (line) hit++;
-      out += _extLineupRowHtml(players[p].name, players[p].pos,
-        line ? _skSeasonLineHtml(line) : '', null, '#34d399', false);
+      // byPlayerKey holds a FLAT STAT OBJECT, not a display string.
+      // _skSeasonLineHtml stringifies whatever it is handed, so passing the
+      // object straight in printed "[object Object]" under every player.
+      // _formatEspnSeasonLine is the step that turns the object into a line —
+      // it is what the ESPN roster pane calls, and it was missing here.
+      // FTXSTATS
+      var _fLine = (line && typeof _formatEspnSeasonLine === 'function')
+        ? _formatEspnSeasonLine(sportKey, line, players[p].pos) : '';
+      out += _extLineupRowHtml(_ftxDisplayName(players[p].name), players[p].pos,
+        _fLine ? _skSeasonLineHtml(_fLine) : '', null, '#34d399', false,
+        _ftxClubChip(players[p].teamAbbr, SPORT));
     }
     bodyEl.innerHTML =
       '<div style="color:rgba(255,255,255,0.42);font-size:10px;letter-spacing:0.12em;margin-bottom:4px">ROSTER \u00b7 ' +
@@ -136751,6 +136770,24 @@ function _slpRosterRowsHtml(row, myTeam, sport) {
   return html;
 }
 
+// A small club badge for the lineup modal rows — the same information the
+// roster tab shows, in the shape _extLineupRowHtml already accepts. FTXSTATS
+function _ftxClubChip(abbr, SPORT) {
+  var a = String(abbr || '').toUpperCase();
+  if (!a) return '';
+  var col = null;
+  if (typeof _skTeamColor === 'function') {
+    try { col = _skTeamColor(a); } catch (eC) { col = null; }
+  }
+  var logo = (typeof _vtLogoUrl === 'function') ? _vtLogoUrl(String(SPORT || '').toUpperCase(), a) : '';
+  return '<span style="display:inline-flex;align-items:center;gap:3px;flex-shrink:0;">' +
+    (logo ? '<img src="' + slEsc(logo) + '" alt="" style="width:13px;height:13px;' +
+            'object-fit:contain;" onerror="this.style.display=\'none\'">' : '') +
+    '<span style="font-family:var(--sk-font-mono,monospace);font-size:9px;color:' +
+      (col || 'rgba(255,255,255,0.4)') + ';">' + slEsc(a) + '</span>' +
+  '</span>';
+}
+
 // ── FANTRAX ROSTER ── FTXROSTER ──
 // Fantrax fell through to the compact two-column list — name on the left,
 // position on the right — while Sleeper and ESPN each got a rich builder.
@@ -136827,14 +136864,32 @@ function _ftxRosterRowsHtml(row, myTeam) {
       var abbr = e.team;
       // The colour and the logo both come from what Skipper already knows
       // about the pro club — nothing new is fetched.
-      var col = (abbr && typeof _skTeamColor === 'function') ? _skTeamColor(abbr) : null;
+      // Guarded: _skTeamColor reaches into per-sport theme tables, and a
+      // roster is not worth losing to a missing colour. FTXROSTER
+      var col = null;
+      if (abbr && typeof _skTeamColor === 'function') {
+        try { col = _skTeamColor(abbr); } catch (eC) { col = null; }
+      }
       // _vtLogoUrl is the existing builder for the ESPN CDN team-logo path,
       // and it wants the league UPPERCASE. It already handles the CDN's
       // quirks, so reusing it beats writing a second URL builder that would
       // drift from the first.
       var logo = (abbr && typeof _vtLogoUrl === 'function') ? _vtLogoUrl(SPORT, abbr) : '';
 
-      html += '<div style="display:flex;align-items:center;gap:9px;padding:7px 4px;' +
+      // Tap to open the player card, same as Sleeper and ESPN. Only where a
+      // card can actually be built: it needs a real name and a sport the
+      // card supports, so an unresolved id stays inert rather than opening
+      // an empty card. FTXCARD
+      var _disp = _ftxDisplayName(e.res.name);
+      var _canTap = !!(_disp && _disp !== '?' && !e.res.unresolved &&
+                       (SPORT === 'NHL' || SPORT === 'NBA') &&
+                       typeof slOpenPlayerCard === 'function');
+      html += '<div' + (_canTap
+          ? (' onclick="slOpenPlayerCard(\'' + _jsStr(_disp) + '\',\'' + _jsStr(abbr) +
+             '\',\'' + _jsStr(e.res.pos || '') + '\',\'' + _jsStr(SPORT.toLowerCase()) + '\')"' +
+             ' style="cursor:pointer;')
+          : ' style="') +
+        'display:flex;align-items:center;gap:9px;padding:7px 4px;' +
         'border-bottom:1px solid rgba(255,255,255,0.04);">' +
         // A colour bar rather than a plain row: it makes a roster scannable
         // by club, which is how you actually spot stacking or a bye-heavy
@@ -136854,8 +136909,11 @@ function _ftxRosterRowsHtml(row, myTeam) {
             slEsc(abbr) + '</span>'
           : '') +
         '<span style="font-family:var(--sk-font-mono,monospace);font-size:9.5px;' +
-          'color:rgba(255,255,255,0.35);flex:0 0 46px;text-align:right;">' +
+          'color:rgba(255,255,255,0.35);flex:0 0 40px;text-align:right;">' +
           slEsc(e.res.pos || '') + '</span>' +
+        (_canTap
+          ? '<span style="flex:0 0 8px;color:rgba(255,255,255,0.2);font-size:11px;">\u203a</span>'
+          : '<span style="flex:0 0 8px;"></span>') +
       '</div>';
     }
   }
