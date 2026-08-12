@@ -32604,7 +32604,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-08-12 03:50 UTC';
+var SK_BUILD = '2026-08-12 03:58 UTC';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -136853,10 +136853,8 @@ function _slpRosterRowsHtml(row, myTeam, sport) {
 function _ftxClubChip(abbr, SPORT) {
   var a = String(abbr || '').toUpperCase();
   if (!a) return '';
-  var col = null;
-  if (typeof _skTeamColor === 'function') {
-    try { col = _skTeamColor(a); } catch (eC) { col = null; }
-  }
+  var col = (typeof _ftxColorFor === 'function')
+    ? _ftxColorFor(a, String(SPORT || '').toUpperCase()) : null;
   var logo = (typeof _vtLogoUrl === 'function') ? _vtLogoUrl(String(SPORT || '').toUpperCase(), a) : '';
   return '<span style="display:inline-flex;align-items:center;gap:3px;flex-shrink:0;">' +
     (logo ? '<img src="' + slEsc(logo) + '" alt="" style="width:13px;height:13px;' +
@@ -137096,6 +137094,33 @@ function _ftxSeasonFor(row, rawName, pos) {
   } catch (e) { return ''; }
 }
 
+// Club colour for a SPECIFIC sport, rather than whatever sport is currently
+// active. ── FTXCOLOR ──
+//
+// _skTeamColor keys off _skActiveSport, which is right for the stadium modes
+// but wrong for a roster: BOS is Bruins gold in hockey and Celtics green in
+// basketball, and LA, NY and CHI collide the same way. Opening an NBA Fantrax
+// roster while an NHL league happened to be active would paint every shared
+// abbreviation in the other sport's colours.
+function _ftxColorFor(abbr, SPORT) {
+  var a = String(abbr || '').toUpperCase();
+  if (!a) return null;
+  try {
+    if (SPORT === 'NBA' && typeof nbaArenaTheme === 'function') {
+      var nt = nbaArenaTheme(a);
+      if (nt && nt.accent) return nt.accent;
+    }
+    if (SPORT === 'NHL' && typeof nhlArenaTheme === 'function') {
+      var ht = nhlArenaTheme(a);
+      if (ht && ht.accent) return ht.accent;
+    }
+    // Baseball and anything else fall back to the shared lookup, which is
+    // MLB-first and correct for those.
+    if (typeof _skTeamColor === 'function') return _skTeamColor(a);
+  } catch (e) {}
+  return null;
+}
+
 // ── FANTRAX ROSTER ── FTXROSTER ──
 // Fantrax fell through to the compact two-column list — name on the left,
 // position on the right — while Sleeper and ESPN each got a rich builder.
@@ -137137,29 +137162,36 @@ function _ftxRosterRowsHtml(row, myTeam) {
   var items = myTeam.items || [];
   var i;
 
-  // The roster tab renders synchronously, so the live slate is fetched in the
-  // background and the pane repainted ONCE when it arrives. Guarded against
-  // repainting forever: the fetch itself caches for a minute, and the repaint
-  // only fires when this pass had no live data to show. FTXLIVE
-  // Season stats for the same roster, so a player with no game tonight still
-  // shows a line. Cached per league by the shared fetcher, so opening the
-  // stats modal afterwards costs nothing. FTXSEASONROW
-  if (typeof _ftxEnsureSeason === 'function') _ftxEnsureSeason(row, myTeam);
-
-  if (typeof _ftxFetchLive === 'function' && FTX_LIVE_CFG[SPORT] &&
-      !_ftxLiveCache[SPORT] && !_ftxLiveInflight[SPORT]) {
-    _ftxFetchLive(SPORT).then(function () {
-      try {
-        // _espRosterPane is the existing locator — it walks the detail body
-        // for the pane tagged data-extpane="roster". There is no element with
-        // a fixed id, so guessing one would have silently never repainted.
-        var pane = (typeof _espRosterPane === 'function') ? _espRosterPane() : null;
-        if (pane && typeof _extRosterPaneHtml === 'function') {
-          pane.innerHTML = _extRosterPaneHtml(row, row.myTeamIds || {});
-        }
-      } catch (e) {}
-    });
-  }
+  // Background enrichment: season stats and tonight's slate. Both are
+  // optional decoration on a roster that must render regardless.
+  //
+  // This whole block used to run bare, and it referenced FTX_LIVE_CFG and
+  // _ftxLiveCache without guarding them. _extRosterPaneHtml has no try/catch,
+  // so ANY throw here took out the entire pane and the caller fell back to
+  // "could not identify your team" — a roster of real names replaced by an
+  // error, because a stat lookup wasn't ready. Names are the point of this
+  // view; stats are the garnish, and the garnish must never eat the meal.
+  // FTXSAFE
+  try {
+    if (typeof _ftxEnsureSeason === 'function') _ftxEnsureSeason(row, myTeam);
+  } catch (eS) {}
+  try {
+    if (typeof _ftxFetchLive === 'function' &&
+        typeof FTX_LIVE_CFG !== 'undefined' && FTX_LIVE_CFG[SPORT] &&
+        typeof _ftxLiveCache !== 'undefined' &&
+        !_ftxLiveCache[SPORT] && !_ftxLiveInflight[SPORT]) {
+      _ftxFetchLive(SPORT).then(function () {
+        try {
+          // _espRosterPane is the existing locator — it walks the detail body
+          // for the pane tagged data-extpane="roster".
+          var pane = (typeof _espRosterPane === 'function') ? _espRosterPane() : null;
+          if (pane && typeof _extRosterPaneHtml === 'function') {
+            pane.innerHTML = _extRosterPaneHtml(row, row.myTeamIds || {});
+          }
+        } catch (e) {}
+      })['catch'](function () {});
+    }
+  } catch (eL) {}
 
   // Group by position, keeping the sport's natural order and putting
   // anything unrecognised at the end rather than dropping it.
@@ -137196,12 +137228,8 @@ function _ftxRosterRowsHtml(row, myTeam) {
       var abbr = e.team;
       // The colour and the logo both come from what Skipper already knows
       // about the pro club — nothing new is fetched.
-      // Guarded: _skTeamColor reaches into per-sport theme tables, and a
-      // roster is not worth losing to a missing colour. FTXROSTER
-      var col = null;
-      if (abbr && typeof _skTeamColor === 'function') {
-        try { col = _skTeamColor(abbr); } catch (eC) { col = null; }
-      }
+      // Sport-specific, so an NBA roster never wears hockey colours. FTXCOLOR
+      var col = (typeof _ftxColorFor === 'function') ? _ftxColorFor(abbr, SPORT) : null;
       // _vtLogoUrl is the existing builder for the ESPN CDN team-logo path,
       // and it wants the league UPPERCASE. It already handles the CDN's
       // quirks, so reusing it beats writing a second URL builder that would
@@ -137213,7 +137241,10 @@ function _ftxRosterRowsHtml(row, myTeam) {
       // card supports, so an unresolved id stays inert rather than opening
       // an empty card. FTXCARD
       var _disp = _ftxDisplayName(e.res.name);
-      var _lv = (typeof _ftxLiveFor === 'function') ? _ftxLiveFor(SPORT, e.res.name) : null;
+      var _lv = null;
+      try {
+        if (typeof _ftxLiveFor === 'function') _lv = _ftxLiveFor(SPORT, e.res.name);
+      } catch (eV) { _lv = null; }
       var _canTap = !!(_disp && _disp !== '?' && !e.res.unresolved &&
                        (SPORT === 'NHL' || SPORT === 'NBA') &&
                        typeof slOpenPlayerCard === 'function');
@@ -137241,7 +137272,10 @@ function _ftxRosterRowsHtml(row, myTeam) {
           // one rather than sitting beside it — two numbers for the same
           // player invites reading the wrong one. FTXLIVE / FTXSEASONROW
           (function () {
-            var body = _lv ? _lv.line : _ftxSeasonFor(row, e.res.name, e.res.pos);
+            var body = '';
+            try {
+              body = _lv ? _lv.line : _ftxSeasonFor(row, e.res.name, e.res.pos);
+            } catch (eB) { body = ''; }
             if (!body) return '';
             return '<div style="font-family:var(--sk-font-mono,monospace);font-size:9px;' +
               'color:rgba(255,255,255,' + (_lv ? '0.5' : '0.35') + ');margin-top:1px;' +
@@ -137327,8 +137361,21 @@ function _extRosterPaneHtml(row, myIds) {
                           myTeam.items[0] && myTeam.items[0].slot);
         if (_espRich) html += _espRosterRowsHtml(row, myTeam);
         // Fantrax gets its own builder too. FTXROSTER
+        //
+        // Wrapped: if the rich builder fails for any reason the pane falls
+        // through to the compact list below rather than showing an error.
+        // A plain list of names beats no roster at all. FTXSAFE
         var _ftxRich = !!(row.provider === 'fantrax' && typeof _ftxRosterRowsHtml === 'function');
-        if (_ftxRich) html += _ftxRosterRowsHtml(row, myTeam);
+        if (_ftxRich) {
+          try {
+            html += _ftxRosterRowsHtml(row, myTeam);
+          } catch (eF) {
+            _ftxRich = false;
+            if (typeof console !== 'undefined' && console.warn) {
+              console.warn('[ftx] rich roster failed, using compact list', eF);
+            }
+          }
+        }
         for (var ri = 0; !_slpRich && !_espRich && !_ftxRich && ri < myTeam.items.length && ri < 40; ri++) {
           var it = myTeam.items[ri] || {};
           var res = _extRosterItemName(it, SPORT);
