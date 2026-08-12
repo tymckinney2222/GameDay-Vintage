@@ -32604,7 +32604,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-08-12 03:24 UTC';
+var SK_BUILD = '2026-08-12 03:35 UTC';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -134460,11 +134460,39 @@ function _fxExtractMatchupScores(data) {
       var a = m.away || {}, h = m.home || {};
       var aScore = (a.score != null) ? a.score : ((a.points != null) ? a.points : ((a.fantasyPoints != null) ? a.fantasyPoints : (a.total != null ? a.total : null)));
       var hScore = (h.score != null) ? h.score : ((h.points != null) ? h.points : ((h.fantasyPoints != null) ? h.fantasyPoints : (h.total != null ? h.total : null)));
-      games.push({
+      // A CATEGORIES league scores a W-L-T tally, not a point total, and the
+      // card's cats branch reads awayRec/awayWins to render it the way the
+      // ESPN card does. The extractor only ever parsed a numeric score, so a
+      // Fantrax cats league could never light up that branch no matter what
+      // came back. Field names are unconfirmed for cats, so every plausible
+      // spelling is tried and a tally is only claimed when one is actually
+      // present. FTXCARDSCORE
+      function tally(side) {
+        var w = (side.wins != null) ? side.wins
+              : (side.catWins != null) ? side.catWins
+              : (side.categoriesWon != null) ? side.categoriesWon : null;
+        var lo = (side.losses != null) ? side.losses
+               : (side.catLosses != null) ? side.catLosses
+               : (side.categoriesLost != null) ? side.categoriesLost : null;
+        var ti = (side.ties != null) ? side.ties
+               : (side.catTies != null) ? side.catTies
+               : (side.categoriesTied != null) ? side.categoriesTied : null;
+        if (w == null && lo == null) return null;
+        return { w: Number(w) || 0, l: Number(lo) || 0, t: Number(ti) || 0 };
+      }
+      var aT = tally(a), hT = tally(h);
+      var gm = {
         awayId: a.id || a.teamId || '', homeId: h.id || h.teamId || '',
         away: a.name || a.teamName || '?', home: h.name || h.teamName || '?',
         awayScore: aScore, homeScore: hScore
-      });
+      };
+      if (aT && hT) {
+        gm.awayRec = aT.w + '-' + aT.l + '-' + aT.t;
+        gm.homeRec = hT.w + '-' + hT.l + '-' + hT.t;
+        gm.awayWins = aT.w;
+        gm.homeWins = hT.w;
+      }
+      games.push(gm);
     }
     return { period: period, games: games };
   } catch (e) { return null; }
@@ -135494,10 +135522,18 @@ function _fxLineupFill(row, bodyEl, headEl) {
   // Reuses the shared batch pipeline: id resolution and stat fetches are
   // both capped at 3 concurrent, which is what keeps a 20+ player roster
   // from flooding the connection pool.
-  _skFetchEspnSeasonStats(sportKey, row.key, players).then(function(entry) {
+  // Both in flight together: the live slate is one scoreboard call plus a
+  // box score per started game, and waiting for it avoids painting season
+  // numbers and then flipping them to live a moment later. A failure here
+  // resolves null and the season line stands. FTXLIVE
+  Promise.all([
+    _skFetchEspnSeasonStats(sportKey, row.key, players),
+    (typeof _ftxFetchLive === 'function') ? _ftxFetchLive(SPORT) : null
+  ]).then(function (both) {
+    var entry = both[0];
     if (_extLineupOpenKey !== row.key) return;
     var by = (entry && entry.byPlayerKey) || {};
-    var out = '', hit = 0;
+    var out = '', hit = 0, liveHit = 0;
     for (var p = 0; p < players.length; p++) {
       var line = by[players[p].playerKey];
       if (line) hit++;
@@ -135507,16 +135543,29 @@ function _fxLineupFill(row, bodyEl, headEl) {
       // _formatEspnSeasonLine is the step that turns the object into a line —
       // it is what the ESPN roster pane calls, and it was missing here.
       // FTXSTATS
+      // Tonight's line if this player's game has started, the season line
+      // otherwise. A live figure is what a manager actually wants at 8pm,
+      // and a season total answers a different question. FTXLIVE
+      var _lv = (typeof _ftxLiveFor === 'function') ? _ftxLiveFor(SPORT, players[p].name) : null;
       var _fLine = (line && typeof _formatEspnSeasonLine === 'function')
         ? _formatEspnSeasonLine(sportKey, line, players[p].pos) : '';
+      var _shown = _lv ? _lv.line : _fLine;
+      if (_lv) liveHit++;
       out += _extLineupRowHtml(_ftxDisplayName(players[p].name), players[p].pos,
-        _fLine ? _skSeasonLineHtml(_fLine) : '', null, '#34d399', false,
+        (_shown ? _skSeasonLineHtml(_shown) : '') +
+        (_lv
+          ? '<span style="color:' + (_lv.live ? '#ef4444' : 'rgba(255,255,255,0.3)') +
+            ';font-size:8.5px;letter-spacing:0.08em;margin-left:5px;">' +
+            (_lv.live ? 'LIVE' : 'FINAL') + '</span>'
+          : ''),
+        null, '#34d399', false,
         _ftxClubChip(players[p].teamAbbr, SPORT));
     }
     bodyEl.innerHTML =
       '<div style="color:rgba(255,255,255,0.42);font-size:10px;letter-spacing:0.12em;margin-bottom:4px">ROSTER \u00b7 ' +
-      players.length + '<span style="float:right">' + hit + ' WITH ESPN STATS</span></div>' +
-      out + note;
+      players.length + '<span style="float:right">' +
+      (liveHit ? (liveHit + ' PLAYING TODAY') : (hit + ' WITH ESPN STATS')) +
+      '</span></div>' + out + note;
   }).catch(function() {
     if (_extLineupOpenKey !== row.key) return;
     bodyEl.innerHTML = '<div style="color:#f87171;font-size:12px">Couldn\u2019t load ESPN stats. Close and reopen to retry.</div>';
@@ -136788,6 +136837,163 @@ function _ftxClubChip(abbr, SPORT) {
   '</span>';
 }
 
+// ── LIVE IN-GAME STATS ── FTXLIVE ──
+// The Fantrax roster and its stats modal show ESPN SEASON stats, because
+// Fantrax itself publishes no per-player numbers at all. Season totals are
+// the right answer on an off day and the wrong one while games are running:
+// what a manager wants at 8pm is what their skaters have done TONIGHT.
+//
+// Nothing new has to be invented. ESPN's scoreboard endpoint already gives
+// today's games for a league, and the summary endpoint gives a full box score
+// per game — both are already used elsewhere in Skipper for the stadium
+// modes. So: find today's games, pull their box scores once, and index every
+// player's line by name. A roster then looks itself up.
+//
+// Deliberately keyed by NAME. Fantrax player ids are Fantrax's own and share
+// nothing with ESPN's, and the roster only ever resolves to a name — the same
+// basis the season-stat path already matches on.
+var _ftxLiveCache = {};      // sport -> { at, byName }
+var _ftxLiveInflight = {};
+
+var FTX_LIVE_CFG = {
+  NHL: { sport: 'hockey',     slug: 'nhl' },
+  NBA: { sport: 'basketball', slug: 'nba' },
+  MLB: { sport: 'baseball',   slug: 'mlb' },
+  NFL: { sport: 'football',   slug: 'nfl' }
+};
+
+function _ftxLiveKey(name) {
+  return String(name || '')
+    .toLowerCase()
+    .replace(/[.'`\u2019-]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// "Kochetkov, Pyotr" and "Pyotr Kochetkov" have to land on the same key, or a
+// Fantrax roster can never match an ESPN box score.
+function _ftxLiveKeys(name) {
+  var out = [], base = String(name || '');
+  out.push(_ftxLiveKey(base));
+  var c = base.indexOf(',');
+  if (c > 0 && base.indexOf(',', c + 1) < 0) {
+    out.push(_ftxLiveKey(base.slice(c + 1).trim() + ' ' + base.slice(0, c).trim()));
+  }
+  return out;
+}
+
+// Today's live/finished games for a sport, with every player's line indexed
+// by name. Cached for a minute: a roster of 24 asking individually would be
+// 24 identical fetches.
+function _ftxFetchLive(SPORT) {
+  var cfg = FTX_LIVE_CFG[SPORT];
+  if (!cfg) return Promise.resolve(null);
+  var hit = _ftxLiveCache[SPORT];
+  if (hit && (Date.now() - hit.at) < 60000) return Promise.resolve(hit);
+  if (_ftxLiveInflight[SPORT]) return _ftxLiveInflight[SPORT];
+
+  var base = 'https://site.api.espn.com/apis/site/v2/sports/' + cfg.sport + '/' + cfg.slug;
+  var p = fetch(base + '/scoreboard')
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (sb) {
+      var events = (sb && sb.events) || [];
+      var live = [];
+      for (var i = 0; i < events.length; i++) {
+        var ev = events[i] || {};
+        var st = ((ev.status || {}).type || {});
+        // Anything that has started — in progress or final. A game yet to
+        // begin has no stats to contribute and is skipped rather than
+        // fetched.
+        if (st.state === 'pre') continue;
+        live.push({ id: ev.id, state: st.state, detail: st.shortDetail || '' });
+      }
+      if (!live.length) return { at: Date.now(), byName: {}, games: 0, anyLive: false };
+      // Cap the fan-out. A full NHL slate is ~16 games; more than that means
+      // something unexpected and is not worth flooding the connection pool.
+      live = live.slice(0, 16);
+      return Promise.all(live.map(function (g) {
+        return fetch(base + '/summary?event=' + g.id)
+          .then(function (r) { return r.ok ? r.json() : null; })
+          .then(function (j) { return { g: g, j: j }; })
+          ['catch'](function () { return { g: g, j: null }; });
+      })).then(function (results) {
+        var byName = {}, anyLive = false, n = 0;
+        for (var q = 0; q < results.length; q++) {
+          if (results[q].g.state === 'in') anyLive = true;
+          var parsed = _ftxParseBox(results[q].j, SPORT, results[q].g);
+          for (var k in parsed) {
+            if (parsed.hasOwnProperty(k) && !byName[k]) { byName[k] = parsed[k]; n++; }
+          }
+        }
+        return { at: Date.now(), byName: byName, games: results.length,
+                 anyLive: anyLive, players: n };
+      });
+    })
+    ['catch'](function () { return null; })
+    .then(function (res) {
+      delete _ftxLiveInflight[SPORT];
+      if (res) _ftxLiveCache[SPORT] = res;
+      return res;
+    });
+  _ftxLiveInflight[SPORT] = p;
+  return p;
+}
+
+// One game's box score, flattened to name -> { line, live, detail }.
+//
+// ESPN nests boxscore.players as team -> statistics groups -> athletes, with
+// the labels living on the GROUP rather than on each athlete. So labels and
+// values are zipped per group, which also means a goaltender's group and a
+// skater's group each keep their own labels instead of colliding.
+function _ftxParseBox(j, SPORT, g) {
+  var out = {};
+  try {
+    var teams = ((j || {}).boxscore || {}).players || [];
+    for (var t = 0; t < teams.length; t++) {
+      var groups = teams[t].statistics || [];
+      for (var s = 0; s < groups.length; s++) {
+        var grp = groups[s] || {};
+        var labels = grp.labels || grp.names || [];
+        var ath = grp.athletes || [];
+        for (var a = 0; a < ath.length; a++) {
+          var row = ath[a] || {};
+          var who = (row.athlete || {});
+          var nm = who.displayName || who.shortName || '';
+          if (!nm) continue;
+          var vals = row.stats || [];
+          var bits = [];
+          for (var v = 0; v < labels.length && v < vals.length; v++) {
+            var lb = String(labels[v] || '');
+            var vl = String(vals[v] == null ? '' : vals[v]);
+            if (!lb || vl === '' || vl === '0' || vl === '--') continue;
+            bits.push(vl + ' ' + lb);
+          }
+          if (!bits.length) continue;
+          var keys = _ftxLiveKeys(nm);
+          for (var kk = 0; kk < keys.length; kk++) {
+            if (keys[kk] && !out[keys[kk]]) {
+              out[keys[kk]] = { line: bits.join('\u0001'), live: (g.state === 'in'),
+                                detail: g.detail || '' };
+            }
+          }
+        }
+      }
+    }
+  } catch (e) { return out; }
+  return out;
+}
+
+// Look a roster player up in whatever the last fetch produced.
+function _ftxLiveFor(SPORT, name) {
+  var c = _ftxLiveCache[SPORT];
+  if (!c || !c.byName) return null;
+  var keys = _ftxLiveKeys(name);
+  for (var i = 0; i < keys.length; i++) {
+    if (c.byName[keys[i]]) return c.byName[keys[i]];
+  }
+  return null;
+}
+
 // ── FANTRAX ROSTER ── FTXROSTER ──
 // Fantrax fell through to the compact two-column list — name on the left,
 // position on the right — while Sleeper and ESPN each got a rich builder.
@@ -136828,6 +137034,25 @@ function _ftxRosterRowsHtml(row, myTeam) {
   var SPORT = String(row.sport || '').toUpperCase();
   var items = myTeam.items || [];
   var i;
+
+  // The roster tab renders synchronously, so the live slate is fetched in the
+  // background and the pane repainted ONCE when it arrives. Guarded against
+  // repainting forever: the fetch itself caches for a minute, and the repaint
+  // only fires when this pass had no live data to show. FTXLIVE
+  if (typeof _ftxFetchLive === 'function' && FTX_LIVE_CFG[SPORT] &&
+      !_ftxLiveCache[SPORT] && !_ftxLiveInflight[SPORT]) {
+    _ftxFetchLive(SPORT).then(function () {
+      try {
+        // _espRosterPane is the existing locator — it walks the detail body
+        // for the pane tagged data-extpane="roster". There is no element with
+        // a fixed id, so guessing one would have silently never repainted.
+        var pane = (typeof _espRosterPane === 'function') ? _espRosterPane() : null;
+        if (pane && typeof _extRosterPaneHtml === 'function') {
+          pane.innerHTML = _extRosterPaneHtml(row, row.myTeamIds || {});
+        }
+      } catch (e) {}
+    });
+  }
 
   // Group by position, keeping the sport's natural order and putting
   // anything unrecognised at the end rather than dropping it.
@@ -136881,6 +137106,7 @@ function _ftxRosterRowsHtml(row, myTeam) {
       // card supports, so an unresolved id stays inert rather than opening
       // an empty card. FTXCARD
       var _disp = _ftxDisplayName(e.res.name);
+      var _lv = (typeof _ftxLiveFor === 'function') ? _ftxLiveFor(SPORT, e.res.name) : null;
       var _canTap = !!(_disp && _disp !== '?' && !e.res.unresolved &&
                        (SPORT === 'NHL' || SPORT === 'NBA') &&
                        typeof slOpenPlayerCard === 'function');
@@ -136900,9 +137126,23 @@ function _ftxRosterRowsHtml(row, myTeam) {
           ? '<img src="' + slEsc(logo) + '" alt="" style="width:19px;height:19px;' +
             'flex:0 0 19px;object-fit:contain;" onerror="this.style.display=\'none\'">'
           : '<span style="flex:0 0 19px;"></span>') +
-        '<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;' +
-          'white-space:nowrap;font-size:12.5px;color:#fff;">' +
-          slEsc(_ftxDisplayName(e.res.name)) + '</span>' +
+        '<div style="flex:1;min-width:0;">' +
+          '<div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' +
+            'font-size:12.5px;color:#fff;">' + slEsc(_disp) + '</div>' +
+          // Tonight's line, when the player's game has started. Nothing at
+          // all otherwise — a season total belongs in the stats modal, not
+          // under every name on the roster. FTXLIVE
+          (_lv
+            ? '<div style="font-family:var(--sk-font-mono,monospace);font-size:9px;' +
+              'color:rgba(255,255,255,0.42);margin-top:1px;overflow:hidden;' +
+              'text-overflow:ellipsis;white-space:nowrap;">' +
+              (typeof _skSeasonLineHtml === 'function' ? _skSeasonLineHtml(_lv.line) : slEsc(_lv.line)) +
+              '<span style="color:' + (_lv.live ? '#ef4444' : 'rgba(255,255,255,0.28)') +
+                ';margin-left:5px;font-size:8px;letter-spacing:0.08em;">' +
+                (_lv.live ? 'LIVE' : 'FINAL') + '</span>' +
+              '</div>'
+            : '') +
+        '</div>' +
         (abbr
           ? '<span style="font-family:var(--sk-font-mono,monospace);font-size:9.5px;' +
             'color:' + (col || 'rgba(255,255,255,0.4)') + ';flex:0 0 auto;">' +
