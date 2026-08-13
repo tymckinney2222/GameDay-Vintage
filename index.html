@@ -32604,7 +32604,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-08-13 01:51 UTC';
+var SK_BUILD = '2026-08-13 01:59 UTC';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -64779,11 +64779,61 @@ function _extCollectFantasyHub() {
   return out;
 }
 
-function _extUpdateFhubButton(btnId, countId) {
+// Make sure the Fantrax name dictionary is loaded for every synced Fantrax
+// league, then call back. ── FTXFHUBLOAD ──
+//
+// A Fantrax roster item is only { playerId, slot, starter }; the name lives in
+// getPlayerIds, which is fetched LAZILY and cached in memory only. Stadium
+// mode never asked for it, and the hub button is evaluated once when the rink
+// renders — so on a cold open there were no names to match, the button hid
+// itself, and nothing ever re-evaluated it. Visiting the roster tab first
+// loaded the dictionary but did not make the button reconsider.
+//
+// This asks for whatever is missing and reports whether anything actually
+// arrived, so the caller can re-run itself exactly once rather than looping.
+function _extEnsureFtxNames(done) {
+  var need = [], seen = {};
+  try {
+    var list = (typeof extSyncedLeagues === 'function') ? extSyncedLeagues() : [];
+    for (var i = 0; i < list.length; i++) {
+      var row = list[i];
+      if (!row || row.provider !== 'fantrax') continue;
+      var SPORT = String(row.sport || '').toUpperCase();
+      if (!SPORT || seen[SPORT]) continue;
+      if (fxState.playerIdCache && fxState.playerIdCache[SPORT]) continue;
+      seen[SPORT] = 1;
+      need.push(SPORT);
+    }
+  } catch (e) {}
+  if (!need.length) { if (done) done(false); return; }
+  var left = need.length, any = false;
+  for (var q = 0; q < need.length; q++) {
+    (function (sp) {
+      if (typeof extLoadPlayerIds !== 'function') { if (--left === 0 && done) done(any); return; }
+      extLoadPlayerIds(sp, function (ok) {
+        if (ok) any = true;
+        if (--left === 0 && done) done(any);
+      });
+    })(need[q]);
+  }
+}
+
+function _extUpdateFhubButton(btnId, countId, _retried) {
   try {
     var btn = document.getElementById(btnId);
     if (!btn) return;
     var players = _extCollectFantasyHub();
+    // Nothing found, and a Fantrax dictionary is still missing? Fetch it and
+    // try once more. Guarded by _retried so a genuinely empty hub settles
+    // rather than retrying forever. FTXFHUBLOAD
+    if (!players.length && !_retried && typeof _extEnsureFtxNames === 'function') {
+      _extEnsureFtxNames(function (loaded) {
+        if (loaded) {
+          try { if (typeof _extDotCache !== 'undefined') _extDotCache = null; } catch (eD) {}
+          _extUpdateFhubButton(btnId, countId, true);
+        }
+      });
+    }
     if (players.length) {
       var ct = document.getElementById(countId);
       if (ct) ct.textContent = players.length;
@@ -64796,12 +64846,23 @@ function _extUpdateFhubButton(btnId, countId) {
   } catch (e) {}
 }
 
+var _extFhubRetried = false;   // FTXFHUBLOAD
 function openExtFantasyHub() {
   var modal = document.getElementById('extFhubModal');
   var body = document.getElementById('extFhubBody');
   var sub = document.getElementById('extFhubSub');
   if (!modal || !body) return;
   var players = _extCollectFantasyHub();
+  // Same one-shot recovery as the button. FTXFHUBLOAD
+  if (!players.length && !_extFhubRetried && typeof _extEnsureFtxNames === 'function') {
+    _extFhubRetried = true;
+    _extEnsureFtxNames(function (loaded) {
+      if (loaded) {
+        try { if (typeof _extDotCache !== 'undefined') _extDotCache = null; } catch (eD) {}
+        openExtFantasyHub();
+      }
+    });
+  }
   var ctx = _crsActiveStadiumPlayers();
   var game = ctx ? ctx.game : null;
 
@@ -64813,8 +64874,36 @@ function openExtFantasyHub() {
   }
 
   if (!players.length) {
+    // Say WHY it is empty. "No players in this game" was indistinguishable
+    // from "the index is broken", which cost several rounds of guessing.
+    // FTXFHUBLOAD
+    var diag = '';
+    try {
+      var ll = (typeof extSyncedLeagues === 'function') ? extSyncedLeagues() : [];
+      var nF = 0, nS = 0, noDict = [], noRoster = 0, idxN = 0;
+      for (var d = 0; d < ll.length; d++) {
+        var r = ll[d];
+        if (r.provider === 'fantrax') nF++; else if (r.provider === 'sleeper') nS++; else continue;
+        if (!r.rosters || !r.rosters.byTeam) { noRoster++; continue; }
+        if (r.provider === 'fantrax') {
+          var SP = String(r.sport || '').toUpperCase();
+          if (!(fxState.playerIdCache && fxState.playerIdCache[SP]) && noDict.indexOf(SP) < 0) {
+            noDict.push(SP);
+          }
+        }
+      }
+      try { idxN = _extFhubIndex().n; } catch (eI) {}
+      diag = '<div style="margin-top:12px;font-size:9.5px;line-height:1.6;' +
+        'color:rgba(255,255,255,0.3);font-family:var(--sk-font-mono,monospace)">' +
+        nS + ' sleeper \u00b7 ' + nF + ' fantrax synced<br>' +
+        idxN + ' players indexed' +
+        (noRoster ? ('<br>' + noRoster + ' league(s) with no roster loaded') : '') +
+        (noDict.length ? ('<br>name dictionary missing: ' + slEsc(noDict.join(', '))) : '') +
+        '</div>';
+    } catch (eX) {}
     body.innerHTML = '<div class="crs-fhub-empty">None of your Sleeper or Fantrax players are ' +
-      'in this game.<br><br>Leagues that haven\u2019t drafted yet have no roster to match against.</div>';
+      'in this game.<br><br>Leagues that haven\u2019t drafted yet have no roster to match against.' +
+      diag + '</div>';
   } else {
     var html = '';
     for (var i = 0; i < players.length; i++) {
