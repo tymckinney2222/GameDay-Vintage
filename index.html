@@ -32604,7 +32604,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-08-12 04:16 UTC';
+var SK_BUILD = '2026-08-13 01:29 UTC';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -112960,6 +112960,63 @@ function _espnIdKey(sportKey, name, teamAbbr) {
   return sportKey + '|' + String(name || '').toLowerCase().trim() + '|' + String(teamAbbr || '').toUpperCase();
 }
 
+// Spelling variants of a name to try against ESPN's search. ── FTXAPOS ──
+//
+// ESPN matches on the literal string, so a provider that spells a name
+// differently gets zero results and the (correct, punctuation-folding)
+// comparison downstream never sees a candidate.
+//
+// The first attempt at this retried on the SURNAME alone. Too blunt: "Miller"
+// across every sport, capped at twelve, is Von Miller and Bode Miller and a
+// dozen others — K'Andre is nowhere near the top, so the search legitimately
+// came back without him.
+//
+// The precise fix is to put the apostrophe BACK. An internal capital after a
+// one or two letter prefix is exactly the signature of a dropped one:
+// KAndre -> K'Andre, OReilly -> O'Reilly, KeBryan -> Ke'Bryan. Mc and Mac are
+// excluded by name, because McDavid and MacKinnon match that shape and must
+// not become Mc'David.
+//
+// Order matters: exact spelling first, then reconstructions, surname last as
+// a genuine long shot. Every one is still gated by the exact-name-key check
+// downstream, so a broad query can never return the wrong player.
+function _pmNameVariants(name) {
+  var raw = String(name || '').trim();
+  if (!raw) return [];
+  var out = [raw], seen = {};
+  seen[raw.toLowerCase()] = 1;
+
+  function add(v) {
+    if (!v) return;
+    var k = v.toLowerCase();
+    if (seen[k]) return;
+    seen[k] = 1;
+    out.push(v);
+  }
+
+  var words = raw.split(/\s+/), i;
+
+  var rebuilt = [];
+  for (i = 0; i < words.length; i++) {
+    var w = words[i];
+    if (/^(mc|mac)/i.test(w)) { rebuilt.push(w); continue; }
+    var m = /^([A-Za-z]{1,2})([A-Z][a-z]+)$/.exec(w);
+    rebuilt.push(m ? (m[1] + "'" + m[2]) : w);
+  }
+  add(rebuilt.join(' '));
+
+  // The reverse, for a provider that KEEPS the apostrophe where ESPN drops it.
+  if (raw.indexOf("'") >= 0 || raw.indexOf('\u2019') >= 0) {
+    add(raw.replace(/['\u2019]/g, ''));
+  }
+
+  if (words.length > 1) {
+    var sur = words[words.length - 1];
+    if (sur.length > 2) add(sur);
+  }
+  return out;
+}
+
 async function _resolveEspnAthleteId(sportKey, name, teamAbbr) {
   if (!name) return null;
   var cfg = _ESPN_SPORT_CFG[sportKey];
@@ -112984,12 +113041,8 @@ async function _resolveEspnAthleteId(sportKey, name, teamAbbr) {
   // punctuation in the first name and still narrow enough to identify a
   // player once _pmNameKey (which DOES fold apostrophes) filters the
   // candidates. FTXAPOS
-  var _queries = [searchName];
-  var _sn = String(searchName).trim().split(/\s+/);
-  if (_sn.length > 1) {
-    var _sur = _sn[_sn.length - 1];
-    if (_sur.length > 2) _queries.push(_sur);
-  }
+  var _queries = (typeof _pmNameVariants === 'function')
+    ? _pmNameVariants(searchName) : [searchName];
 
   var pr = (async function() {
     try {
