@@ -5109,6 +5109,56 @@
     flex: 1; max-width: 120px; height: 7px; border-radius: 4px;
     background: linear-gradient(90deg, #1a2740 0%, #b45309 55%, #dc2626 100%);
   }
+  /* ── DUE UP NEXT ── FWDUEUP ───────────────────────────────────────
+     Next three hitters for the side currently in the field. Sits directly
+     under the sticky score block, so it reads as part of the game state
+     rather than as another card. */
+  .crs-dueup {
+    padding: 8px 10px 9px;
+    border-bottom: var(--crs-div, 1px solid rgba(255,255,255,0.07));
+  }
+  .crs-dueup-hd {
+    display: flex; align-items: center; gap: 6px; margin-bottom: 6px;
+    font-family: 'Barlow Condensed', sans-serif; font-size: 9px;
+    font-weight: 800; letter-spacing: 0.16em; text-transform: uppercase;
+  }
+  .crs-dueup-hd .du-lbl  { color: rgba(255,255,255,0.42); }
+  .crs-dueup-hd .du-abbr { color: var(--du-accent, #fff); }
+  .crs-dueup-hd .du-when {
+    margin-left: auto; letter-spacing: 0.10em; color: rgba(255,255,255,0.30);
+  }
+  .crs-dueup-logo {
+    width: 16px; height: 16px; object-fit: contain; flex-shrink: 0;
+    filter: drop-shadow(0 1px 2px rgba(0,0,0,0.5));
+  }
+  .crs-dueup-row {
+    display: flex; align-items: baseline; gap: 7px;
+    padding: 4px 8px; border-radius: 5px; margin-bottom: 3px;
+    background: rgba(255,255,255,0.025);
+    border-left: 2px solid var(--du-accent, rgba(255,255,255,0.25));
+  }
+  .crs-dueup-row:last-child { margin-bottom: 0; }
+  .crs-dueup-row.mine { background: rgba(255,255,255,0.055); }
+  .du-spot {
+    font-family: 'Barlow Condensed', sans-serif; font-size: 10px; font-weight: 800;
+    color: rgba(255,255,255,0.30); min-width: 9px; flex-shrink: 0;
+  }
+  .du-name {
+    font-family: 'Barlow Condensed', sans-serif; font-weight: 700;
+    font-size: 13px; letter-spacing: 0.03em; color: #fff;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    cursor: pointer; text-decoration: underline;
+    text-decoration-color: rgba(255,255,255,0.15);
+  }
+  .crs-dueup-row.mine .du-name {
+    color: var(--du-accent, #fff); font-weight: 800;
+  }
+  .du-pos { font-size: 8.5px; color: rgba(255,255,255,0.25); flex-shrink: 0; }
+  .du-line {
+    margin-left: auto; flex-shrink: 0; font-size: 10px;
+    color: rgba(255,255,255,0.45); white-space: nowrap;
+  }
+
   /* ── TEAM FORM CARD ───────────────────────────────────────────────
      Replaces the inning heatmap. One row per team on a team-color
      gradient: logo + name, then record / win% / streak / run diff.
@@ -32625,7 +32675,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-08-15 21:40 UTC';
+var SK_BUILD = '2026-08-16 00:20 UTC';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -63433,6 +63483,163 @@ function _crsBuildOnDeck(bx, ls, game, divHtml) {
     '</div>' + divHtml;
 }
 
+// The format itself, from a boxscore batting stat block. Split out so the
+// NOW BATTING nameplate and the DUE UP strip can never drift apart in how
+// they read a line. Returns '' before the player's first plate appearance.
+// FWDUEUP
+function _fwBatLineFromStats(gb) {
+  if (!gb || !(gb.atBats > 0 || gb.baseOnBalls > 0)) return '';
+  var ab  = gb.atBats      || 0;
+  var h   = gb.hits        || 0;
+  var parts = [h + '-' + ab];
+  if ((gb.homeRuns    || 0) > 0) parts.push(gb.homeRuns    + ' HR');
+  if ((gb.triples     || 0) > 0) parts.push(gb.triples     + ' 3B');
+  if ((gb.doubles     || 0) > 0) parts.push(gb.doubles     + ' 2B');
+  if ((gb.rbi         || 0) > 0) parts.push(gb.rbi         + ' RBI');
+  if ((gb.baseOnBalls || 0) > 0) parts.push(gb.baseOnBalls + ' BB');
+  if ((gb.strikeOuts  || 0) > 0) parts.push(gb.strikeOuts  + ' K');
+  if ((gb.stolenBases || 0) > 0) parts.push(gb.stolenBases + ' SB');
+  return parts.join(', ');
+}
+
+// ── DUE UP NEXT (baseball stadium) ── FWDUEUP ──
+// The next three hitters for the team currently IN THE FIELD — i.e. who
+// leads off the half-inning about to start. The live feed hands you
+// onDeck/inHole for the team already batting and nothing at all for the
+// other side, so this is derived.
+//
+// Everything needed is already in fenwayLiveData; no extra fetch.
+//
+// The method is BATTING-ORDER SPOT arithmetic, not player-id walking:
+//
+//   1. Find that side's most recent plate appearance in playByPlay.
+//   2. Read that batter's `battingOrder` code from the boxscore — 500 is the
+//      5th spot, 501 is a substitute occupying the 5th spot — so spot is
+//      code/100 either way.
+//   3. Next three spots are +1, +2, +3, wrapping at the end of the order.
+//   4. Resolve each SPOT back through teams[side].battingOrder, which always
+//      lists the CURRENT occupant of each spot.
+//
+// Step 4 is the whole reason for going through spots. Walking ids forward
+// from the last batter would show a player who has since been lifted, and
+// would lose a pinch-hitter who has already taken over a spot further down.
+// Resolving by spot is correct in both directions for free.
+//
+// Returns null — and the strip renders nothing — when lineups aren't posted
+// yet, or when this side demonstrably has no next at-bat.
+function _fwDueUpNext(bx, pbp, fieldSide, ls) {
+  if (!bx || !bx.teams || !fieldSide) return null;
+  var team = bx.teams[fieldSide];
+  if (!team) return null;
+  var order = team.battingOrder || [];
+  var players = team.players || {};
+  var n = order.length;
+  if (!n) return null;   // lineups not posted yet
+
+  // Certain dead end: the home side is in the field in the ninth or later
+  // and already ahead, so it will never come to bat. Every other late-game
+  // shape is still undecided and gets the strip.
+  try {
+    var sched = Number((ls && ls.scheduledInnings) || 9) || 9;
+    var inn = Number(ls && ls.currentInning) || 0;
+    var aR = Number(((ls && ls.teams && ls.teams.away) || {}).runs) || 0;
+    var hR = Number(((ls && ls.teams && ls.teams.home) || {}).runs) || 0;
+    if (fieldSide === 'home' && inn >= sched && hR > aR) return null;
+  } catch (eG) {}
+
+  // The half-inning this side bats in.
+  var wantHalf = (fieldSide === 'away') ? 'top' : 'bottom';
+  var lastId = null;
+  try {
+    var all = (pbp && pbp.allPlays) || [];
+    for (var i = all.length - 1; i >= 0 && lastId == null; i--) {
+      var pl = all[i] || {};
+      var half = String((pl.about && pl.about.halfInning) || '').toLowerCase();
+      if (half !== wantHalf) continue;
+      var bid = pl.matchup && pl.matchup.batter && pl.matchup.batter.id;
+      if (bid != null) lastId = bid;
+    }
+  } catch (eP) { lastId = null; }
+
+  // Spot of that last batter. 0 means "hasn't batted yet", which correctly
+  // makes the next three 1-2-3.
+  var lastSpot = 0;
+  if (lastId != null) {
+    var lp = players['ID' + lastId];
+    var code = lp ? parseInt(lp.battingOrder, 10) : NaN;
+    if (!isNaN(code) && code > 0) lastSpot = Math.floor(code / 100);
+    if (!lastSpot) {
+      // Fall back to position in the order array if the code is absent.
+      for (var q = 0; q < n; q++) {
+        if (String(order[q]) === String(lastId)) { lastSpot = q + 1; break; }
+      }
+    }
+  }
+
+  var out = [];
+  for (var k = 1; k <= 3 && k <= n; k++) {
+    var spot = ((lastSpot - 1 + k) % n) + 1;
+    var pid = order[spot - 1];
+    var p = players['ID' + pid];
+    if (!p || !p.person) continue;
+    out.push({
+      spot: spot,
+      mlbId: p.person.id || pid,
+      name: p.person.fullName || '',
+      pos: (p.position && p.position.abbreviation) || '',
+      line: _fwBatLineFromStats((p.stats && p.stats.batting) || null),
+      avg: ((p.seasonStats && p.seasonStats.batting && p.seasonStats.batting.avg) || '')
+    });
+  }
+  if (!out.length) return null;
+  return { side: fieldSide, batters: out };
+}
+
+// The strip. Header names the team and the half-inning they're walking into,
+// then one row per hitter: order spot, name, today's line. Names tap through
+// to the same hitter card the box score opens, and carry the same ownership
+// dots, because a hitter about to bat is exactly when you want to know you
+// own him. FWDUEUP
+function _fwBuildDueUpStrip(bx, pbp, ls, game, isTop, awayAccent, homeAccent) {
+  var fieldSide = isTop ? 'home' : 'away';
+  var due = _fwDueUpNext(bx, pbp, fieldSide, ls);
+  if (!due) return '';
+  var t = (fieldSide === 'home') ? game.home : game.away;
+  var accent = (fieldSide === 'home') ? homeAccent : awayAccent;
+  var abbr = t.abbr || t.name || '';
+  var logo = t.logo || '';
+
+  // Which half-inning they're due up in: the fielding home team bats in the
+  // bottom of THIS inning; the fielding away team bats in the top of the NEXT.
+  var inn = Number(ls && ls.currentInning) || 0;
+  var whenTxt = '';
+  if (inn) whenTxt = isTop ? ('BOT ' + inn) : ('TOP ' + (inn + 1));
+
+  var h = '<div class="crs-dueup" style="--du-accent:' + accent + '">';
+  h += '<div class="crs-dueup-hd">' +
+    (logo ? '<img class="crs-dueup-logo" src="' + logo + '" alt="" loading="lazy" ' +
+            'onerror="this.style.display=\'none\'">' : '') +
+    '<span class="du-lbl">DUE UP</span>' +
+    '<span class="du-abbr">' + skEscapeMaybe(abbr) + '</span>' +
+    (whenTxt ? '<span class="du-when">' + skEscapeMaybe(whenTxt) + '</span>' : '') +
+    '</div>';
+  for (var i = 0; i < due.batters.length; i++) {
+    var b = due.batters[i];
+    var safeName = String(b.name || '').replace(/'/g, "\\'");
+    var dots = (typeof extOwnDots === 'function') ? extOwnDots(b.name) : '';
+    var mine = (typeof _skOwnsPlayerByName === 'function' && _skOwnsPlayerByName(b.name));
+    h += '<div class="crs-dueup-row' + (mine ? ' mine' : '') + '">' +
+      '<span class="du-spot">' + b.spot + '</span>' +
+      '<span class="du-name" onclick="event.stopPropagation();openCrsHitterModal(\'' +
+        safeName + '\',\'' + due.side + '\')">' + skEscapeMaybe(b.name) + '</span>' +
+      (b.pos ? '<span class="du-pos">' + skEscapeMaybe(b.pos) + '</span>' : '') +
+      dots +
+      '<span class="du-line">' + skEscapeMaybe(b.line || (b.avg ? b.avg : '')) + '</span>' +
+    '</div>';
+  }
+  return h + '</div>';
+}
+
 // Build a compact today's-game stat line for a batter (e.g. "1-1, 1 RBI,
 // 1 SB") from the live boxscore, for the NOW BATTING nameplate. Returns ''
 // if the player hasn't had a plate appearance yet. `bx` is the boxscore,
@@ -63447,18 +63654,7 @@ function _fwBatterGameLine(bx, side, fullName) {
       gb = (p.stats && p.stats.batting) || null;
     }
   });
-  if (!gb || !(gb.atBats > 0 || gb.baseOnBalls > 0)) return '';
-  var ab  = gb.atBats      || 0;
-  var h   = gb.hits        || 0;
-  var parts = [h + '-' + ab];
-  if ((gb.homeRuns    || 0) > 0) parts.push(gb.homeRuns    + ' HR');
-  if ((gb.triples     || 0) > 0) parts.push(gb.triples     + ' 3B');
-  if ((gb.doubles     || 0) > 0) parts.push(gb.doubles     + ' 2B');
-  if ((gb.rbi         || 0) > 0) parts.push(gb.rbi         + ' RBI');
-  if ((gb.baseOnBalls || 0) > 0) parts.push(gb.baseOnBalls + ' BB');
-  if ((gb.strikeOuts  || 0) > 0) parts.push(gb.strikeOuts  + ' K');
-  if ((gb.stolenBases || 0) > 0) parts.push(gb.stolenBases + ' SB');
-  return parts.join(', ');
+  return _fwBatLineFromStats(gb);
 }
 
 // Build the Skipper FP block for stadium card (pitcher or batter).
@@ -68728,6 +68924,17 @@ function renderFenwayCoors() {
   }
 
   html += '</div>'; // end crs-frozen (sticky region)
+
+  // ── DUE UP NEXT ── FWDUEUP ──
+  // First thing under the sticky score block, so it's on screen at rest.
+  // Deliberately OUTSIDE crs-frozen: the sticky header already carries the
+  // linescore and the form card, and three more rows pinned there would eat
+  // a quarter of the phone before any box score showed.
+  // Live games only — there is no next half-inning otherwise.
+  if (isLive && (game.league === 'MLB' || game.league === 'MiLB')) {
+    var _duHtml = _fwBuildDueUpStrip(bx, pbp, ls, game, isTop, awayAccent, homeAccent);
+    if (_duHtml) html += _duHtml;
+  }
 
   // ── PITCHER DECISIONS (final games only) ─────────────────────────
   if (game.state === 'post' && bx.teams) {
