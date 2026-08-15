@@ -32604,7 +32604,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-08-15 17:20 UTC';
+var SK_BUILD = '2026-08-15 19:05 UTC';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -64466,6 +64466,7 @@ function _espFhubRowsFor(at, idx) {
       teamName: (row.standings && row.standings.teamName) || refs[r].teamName || '',   // FHUBTEAM
       teamLogo: _espFhubLogo(row),
       catHtml: _espFhubStatHtml(row, it),
+      game: (typeof _espGameCode === 'function') ? _espGameCode(row) : 'flb',   // ESPFFLWIN
       fp: (!cats && w && w.total != null) ? Math.round(Number(w.total) * 10) / 10 : null,
       isCats: cats,
       slot: it.slot || '',
@@ -64570,9 +64571,15 @@ function openEspFantasyHub() {
         '</div>' + rowsHtml +
       '</div>';
     }
+    // Every league in this hub is rostered from the game on screen, so they
+    // share one sport and one period word. ESPFFLWIN
+    var _hg = (players[0] && players[0].rows && players[0].rows[0])
+      ? players[0].rows[0].game : '';
     body.innerHTML = html +
       '<div style="color:rgba(255,255,255,0.25);font-size:9.5px;text-align:center;padding:8px 0 2px;">' +
-      'ESPN Fantasy \u00b7 today\u2019s totals</div>';
+      'ESPN Fantasy \u00b7 ' +
+      ((typeof espPeriodWord === 'function') ? espPeriodWord(_hg) : 'today') +
+      '\u2019s totals</div>';
   }
   modal.classList.add('open');
 }
@@ -127390,6 +127397,29 @@ var ESP_SLOTS = { flb: {}, fba: {}, fhl: {}, ffl: {} };
 // on its own and the drafted roster confirms it, with Olave rendering as a
 // starter.
 //
+// ── Display order ── ESPNFLSLOT ──
+// Ascending slot id is the right order in baseball by luck: C, 1B, 2B, 3B,
+// SS, OF, UTIL, P is exactly 0,1,2,3,4,5,12,13. Football does not get that
+// gift — FLEX is 23, so sorting by id alone dropped it BELOW D/ST and K,
+// which is not where ESPN's own app puts it. This is the app's order, and
+// it is consulted only for the sports listed; everything else keeps the
+// ascending-id sort it was verified under.
+var ESP_SLOT_ORDER = {
+  ffl: [0, 1, 2, 3, 4, 5, 6, 7, 23, 16, 17, 18, 19,
+        8, 9, 10, 11, 12, 13, 14, 15]
+};
+// Rank for the sort. An id the order doesn't name sorts after every one it
+// does, by its own id, so an unmapped slot lands predictably at the end
+// instead of colliding with position 0.
+function _espSlotRank(game, slotId) {
+  var ord = ESP_SLOT_ORDER[game];
+  if (!ord) return Number(slotId) || 0;
+  for (var i = 0; i < ord.length; i++) {
+    if (Number(ord[i]) === Number(slotId)) return i;
+  }
+  return ord.length + (Number(slotId) || 0);
+}
+//
 // Note on NHL and ESP_START_UNIVERSAL: basketball needed slot 11 rescued
 // because every player is UTIL-eligible there, so UTIL fell into the
 // intersection alongside bench and IR. Hockey does not appear to need the
@@ -127507,6 +127537,44 @@ function _espResolveDayFlags(row, game) {
   return n;
 }
 
+// A census of the stat entries ESPN actually shipped, taken while the raw
+// payload is still in hand. espRosters throws that payload away the moment
+// it returns, and holding 1.5MB per league to answer one question is not a
+// trade worth making — this is a few hundred bytes instead.
+//
+// It exists because of the one question a phone genuinely cannot ask. With
+// no devtools there is no way to open a payload and see which
+// (statSourceId, statSplitTypeId) pairs a sport uses, and football turned
+// out not to use the day split that MLB, NBA and NHL do. Rather than assert
+// an id from memory, the week window walks a ladder and this reports what it
+// landed on — so the claim can be checked against the real feed instead of
+// believed. ESPSPLITCENSUS
+function _espStatCensus(j) {
+  var out = {}, i, k, n, s;
+  var teams = (j && j.teams) || [];
+  for (i = 0; i < teams.length; i++) {
+    var ents = ((teams[i] || {}).roster || {}).entries || [];
+    for (k = 0; k < ents.length; k++) {
+      var st = ((((ents[k] || {}).playerPoolEntry || {}).player) || {}).stats || [];
+      for (n = 0; n < st.length; n++) {
+        var e = st[n] || {};
+        var key = 'src' + e.statSourceId + ' split' + e.statSplitTypeId +
+                  ' ' + e.seasonId;
+        var c = out[key];
+        if (!c) c = out[key] = { n: 0, periods: {}, applied: 0, statted: 0 };
+        c.n++;
+        var pid = (e.scoringPeriodId == null) ? '-' : String(e.scoringPeriodId);
+        c.periods[pid] = (c.periods[pid] || 0) + 1;
+        if (e.appliedTotal != null) c.applied++;
+        for (s in (e.stats || {})) {
+          if (e.stats.hasOwnProperty(s)) { c.statted++; break; }
+        }
+      }
+    }
+  }
+  return out;
+}
+
 function espRosters(j, game, scoredIds, sport) {
   if (!j || !j.teams || !j.teams.length) return null;
   var universal = _espUniversalSlots(j);
@@ -127540,7 +127608,7 @@ function espRosters(j, game, scoredIds, sport) {
         ? espTodayGame(pl, todayIds, todayAbbrs, proMap)
         : { known: false, hasGame: null, order: null };
       var wins = (typeof espBuildWindows === 'function')
-        ? espBuildWindows(pl, j.seasonId, j.scoringPeriodId, scoredIds || []) : null;
+        ? espBuildWindows(pl, j.seasonId, j.scoringPeriodId, scoredIds || [], game) : null;
       items.push({
         playerId: String(e.playerId || pl.id || ''),
         // ESPN identifies the real-life club by NUMBER only; the
@@ -127574,12 +127642,15 @@ function espRosters(j, game, scoredIds, sport) {
         injury: inj
       });
     }
-    // Starters first, then slot order. For MLB that ascending slot id
-    // happens to be exactly the app's order: C, 1B, 2B, 3B, SS, OF,
-    // UTIL, P, then bench.
+    // Starters first, then the sport's own slot order. For MLB that
+    // ascending slot id happens to be exactly the app's order: C, 1B, 2B,
+    // 3B, SS, OF, UTIL, P, then bench. Football needs the explicit order
+    // above, because FLEX is slot 23. ESPNFLSLOT
     items.sort(function (a, b) {
       var d = (b.starter ? 1 : 0) - (a.starter ? 1 : 0);
       if (d) return d;
+      var r = _espSlotRank(game, a.slotId) - _espSlotRank(game, b.slotId);
+      if (r) return r;
       return (a.slotId || 0) - (b.slotId || 0);
     });
     byTeam[String(t.id)] = { teamName: espTeamName(t), items: items };
@@ -127589,6 +127660,9 @@ function espRosters(j, game, scoredIds, sport) {
     // Needed to key the pro-team abbreviation map, which is per sport AND
     // per season. ESPPROTEAM
     season: (j.seasonId != null) ? j.seasonId : null,
+    // A few hundred bytes describing the feed the windows above were built
+    // from, so the Roster tab can show its work. ESPSPLITCENSUS
+    splits: _espStatCensus(j),
     byTeam: byTeam
   };
 }
@@ -127766,7 +127840,15 @@ function _espRosterRowsHtml(row, myTeam) {
   // what you open a roster to see mid-slate is what's happening now.
   // ESPNSLICE2K
   var winKey = row._espWin || 'today';
-  var win = espWindowByKey(winKey);
+  // A window this sport doesn't offer would render an empty column above a
+  // picker with nothing selected — football drops the rolling day windows,
+  // so a key carried over from another league has to fall back. ESPFFLWIN
+  var _wlist = espWindows(game), _wok = false, _wi;
+  for (_wi = 0; _wi < _wlist.length; _wi++) {
+    if (_wlist[_wi].key === winKey) _wok = true;
+  }
+  if (!_wok) winKey = 'today';
+  var win = espWindowByKey(winKey, game);
   // Categories leagues have no fantasy points, so the FP/AVG column would
   // be a wall of zeros and dashes. Stat lines still populate normally,
   // including the daily window. ESPNSLICE2I
@@ -127803,10 +127885,10 @@ function _espRosterRowsHtml(row, myTeam) {
     '<select onchange="espSetWindow(\'' + _espJs(row.key) + '\', this.value)" ' +
       'style="flex:1;min-width:0;padding:7px 8px;border-radius:7px;' +
       'border:1px solid rgba(255,255,255,0.14);background:#0a0e17;color:#fff;font-size:12.5px;">';
-  for (i = 0; i < ESP_WINDOWS.length; i++) {
-    html += '<option value="' + ESP_WINDOWS[i].key + '"' +
-      (ESP_WINDOWS[i].key === winKey ? ' selected' : '') + '>' +
-      slEsc(ESP_WINDOWS[i].label) + '</option>';
+  for (i = 0; i < _wlist.length; i++) {
+    html += '<option value="' + _wlist[i].key + '"' +
+      (_wlist[i].key === winKey ? ' selected' : '') + '>' +
+      slEsc(_wlist[i].label) + '</option>';
   }
   html += '</select></div>';
   html += '<div style="display:flex;align-items:baseline;gap:8px;padding:0 0 4px;' +
@@ -127909,16 +127991,96 @@ function _espRosterRowsHtml(row, myTeam) {
   }
   html += '<div style="color:rgba(255,255,255,0.3);font-size:10px;margin-top:10px;' +
           'line-height:1.5;">' + slEsc(win.label) + (cats ? ' category stats' : ' fantasy points') +
-          (!cats && winKey !== 'today' ? ' \u00b7 green is today' : '') +
+          (!cats && winKey !== 'today' ? ' \u00b7 green is ' + espPeriodWord(game) : '') +
           ' \u00b7 tap a player for their card' +
-          '<br>IP in innings notation \u00b7 second number is points per game.' +
+          // Innings notation is a baseball sentence, and there is no IP on a
+          // football roster. ESPFFLWIN
+          (game === 'flb' ? '<br>IP in innings notation \u00b7 second number is points per game.'
+                          : '<br>Second number is points per game.') +
           (winKey === 'today'
             ? '<br><span id="espLiveNote">' +
               (espLiveStamp(row) ? 'live \u00b7 updated ' + slEsc(espLiveStamp(row))
                                  : 'refreshing\u2026') + '</span>'
             : '') +
-          '</div>';
+          // Shows its work: which stat feeds ESPN actually shipped, and which
+          // one the current-period window resolved against. ESPSPLITCENSUS
+          ((row.rosters && row.rosters.splits)
+            ? '<br><span onclick="espToggleSplits()" style="cursor:pointer;' +
+              'text-decoration:underline;color:rgba(255,255,255,0.42);">ESPN stat feed</span>'
+            : '') +
+          '</div>' +
+          ((row.rosters && row.rosters.splits)
+            ? '<div id="espSplitPanel" style="display:none;">' +
+              _espSplitPanelHtml(row.rosters, game) + '</div>'
+            : '');
   return html;
+}
+
+// Toggle for the stat-feed panel. Takes no argument: only one roster pane is
+// ever on screen. ESPSPLITCENSUS
+function espToggleSplits() {
+  var el = document.getElementById('espSplitPanel');
+  if (!el) return;
+  el.style.display = (el.style.display === 'none') ? 'block' : 'none';
+}
+
+// The panel itself. Every line is measured off the payload — nothing here is
+// a claim about what ESPN "should" send, which is the whole point of it.
+// ESPSPLITCENSUS
+function _espSplitPanelHtml(rs, game) {
+  var cen = (rs && rs.splits) || {};
+  var period = (rs && rs.period != null) ? rs.period : null;
+  var season = (rs && rs.season != null) ? String(rs.season) : '';
+  var keys = [], k, i;
+  for (k in cen) { if (cen.hasOwnProperty(k)) keys.push(k); }
+  keys.sort();
+  if (!keys.length) return '';
+
+  // Which feed does the current-period window actually match? Source 0 is
+  // ESPN's actuals, so a src0 split carrying an entry stamped with THIS
+  // period is the rung the ladder will stop on.
+  var hit = '', hitAlt = '';
+  for (i = 0; i < keys.length; i++) {
+    var c0 = cen[keys[i]];
+    if (keys[i].indexOf('src0 ') !== 0) continue;
+    if (season && keys[i].indexOf(' ' + season) < 0) continue;
+    if (period == null || !c0.periods[String(period)]) continue;
+    if (!hit) hit = keys[i]; else if (!hitAlt) hitAlt = keys[i];
+  }
+  var wlbl = espWindowByKey('today', game).label.toUpperCase();
+
+  var out = '<div style="margin-top:8px;padding:8px 10px;border-radius:8px;' +
+    'background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);' +
+    'font-family:var(--sk-font-mono,monospace);font-size:9.5px;line-height:1.7;' +
+    'color:rgba(255,255,255,0.55);">';
+  out += '<div style="color:rgba(255,255,255,0.75);font-weight:700;">' +
+    slEsc(String(game).toUpperCase()) + ' \u00b7 season ' + slEsc(season) +
+    ' \u00b7 ' + (period == null ? 'no period' : 'period ' + period) + '</div>';
+  out += '<div style="margin:4px 0 6px;color:' +
+    (hit ? '#4ade80' : 'rgba(255,255,255,0.45)') + ';">' +
+    (hit
+      ? wlbl + ' resolves to ' + slEsc(hit) + (hitAlt ? ' (also ' + slEsc(hitAlt) + ')' : '')
+      : wlbl + ' has no actual entries for this period yet') +
+    '</div>';
+  for (i = 0; i < keys.length; i++) {
+    var c = cen[keys[i]];
+    var ps = [], pk, np = 0;
+    for (pk in c.periods) {
+      if (!c.periods.hasOwnProperty(pk)) continue;
+      np++;
+      if (ps.length < 8) ps.push(pk);
+    }
+    ps.sort(function (a, b) { return Number(a) - Number(b); });
+    out += '<div>' + slEsc(keys[i]) + ' \u00b7 ' + c.n + ' rows \u00b7 ' +
+      c.statted + ' w/stats \u00b7 ' + c.applied + ' w/total' +
+      '<br><span style="color:rgba(255,255,255,0.32);">&nbsp;&nbsp;periods ' +
+      slEsc(ps.join(',')) + (np > ps.length ? '\u2026(' + np + ')' : '') +
+      '</span></div>';
+  }
+  out += '<div style="margin-top:6px;color:rgba(255,255,255,0.32);">' +
+    'src0 actual \u00b7 src1 projected. Split 5 is the day split in MLB/NBA/NHL; ' +
+    'football keeps its per-week rows under a different one.</div>';
+  return out + '</div>';
 }
 
 // ── ESPN SLICE 2e (stat windows + stat lines) ── ESPNSLICE2E ──
@@ -128254,20 +128416,68 @@ var ESP_WINDOWS = [
   { key: 'prev',   label: 'Last Year',  src: 0, split: 0, prevSeason: 1 },
   { key: 'proj',   label: 'Projected',  src: 1, split: 0 }
 ];
-function espWindowByKey(k) {
-  for (var i = 0; i < ESP_WINDOWS.length; i++) if (ESP_WINDOWS[i].key === k) return ESP_WINDOWS[i];
-  return ESP_WINDOWS[4];
+// ── Football's own picker ── ESPFFLWIN ──
+// A football scoring period is a WEEK, not a day, and that breaks this list
+// in two separate ways.
+//
+// First, the rolling day windows are dropped rather than relabelled. Splits
+// 1, 2 and 3 are 7/15/30-DAY ranges in the sports that play most nights.
+// Football's per-period entries live under a split of their own, so "7 Day"
+// was matching every week ESPN has shipped, summing them, and presenting a
+// whole season under a one-week heading. Season, Last Year and Projected are
+// season-total lookups and carry over untouched.
+//
+// Second, splitAlt — and it is a LADDER, not an assertion. The day split
+// that serves MLB, NBA and NHL returns nothing for football, and there was
+// no football payload to read the real id off, so the week window tries the
+// candidates in order and takes the FIRST that yields entries. It never sums
+// across two, and it lands on the right id whichever it turns out to be. The
+// scoringPeriodId filter still applies at every rung, so a season-total row
+// (which carries period 0) can never be mistaken for a week.
+//
+// Scoped to football deliberately. In baseball split 1 IS the 7-day window,
+// and letting a player who simply didn't play today fall through to it would
+// report a week's stats as a day's — a wrong number rather than a dash.
+var ESP_WINDOWS_FFL = [
+  { key: 'today',  label: 'This Week', src: 0, split: 5, splitAlt: [1, 0], useCur: 1 },
+  { key: 'season', label: 'Season',    src: 0, split: 0 },
+  { key: 'prev',   label: 'Last Year', src: 0, split: 0, prevSeason: 1 },
+  { key: 'proj',   label: 'Projected', src: 1, split: 0 }
+];
+function espWindows(game) {
+  return (game === 'ffl') ? ESP_WINDOWS_FFL : ESP_WINDOWS;
 }
+function espWindowByKey(k, game) {
+  var list = espWindows(game), i;
+  for (i = 0; i < list.length; i++) if (list[i].key === k) return list[i];
+  for (i = 0; i < list.length; i++) if (list[i].key === 'season') return list[i];
+  return list[0];
+}
+
+// "Today" is a daily-sport word. A football scoring period is a WEEK, so
+// every sentence built around it has to read differently there. ESPFFLWIN
+var ESP_PERIOD_WORD = { ffl: 'this week' };
+function espPeriodWord(game) { return ESP_PERIOD_WORD[game] || 'today'; }
 
 // Precompute every window per player, trimmed to the league's SCORED
 // stat ids. Keeping all ~80 raw stats x 7 windows x 20 players in memory
 // would be wasteful; the scored handful is what the row actually shows.
-function espBuildWindows(pl, season, period, scoredIds) {
+function espBuildWindows(pl, season, period, scoredIds, game) {
   var out = {}, i, w, e, k;
-  for (i = 0; i < ESP_WINDOWS.length; i++) {
-    w = ESP_WINDOWS[i];
+  var list = espWindows(game);
+  for (i = 0; i < list.length; i++) {
+    w = list[i];
     var sn = w.prevSeason ? (Number(season) - 1) : season;
-    var es = espStatEntries(pl, w.src, w.split, sn, w.useCur ? period : null);
+    var per = w.useCur ? period : null;
+    var es = espStatEntries(pl, w.src, w.split, sn, per);
+    // First candidate split that yields anything wins, so nothing is ever
+    // summed across two different splits. ESPFFLWIN
+    if (!es.length && w.splitAlt) {
+      for (var sa = 0; sa < w.splitAlt.length; sa++) {
+        es = espStatEntries(pl, w.src, w.splitAlt[sa], sn, per);
+        if (es.length) break;
+      }
+    }
     if (!es.length) { out[w.key] = null; continue; }
     var st = {}, fp = null, total = null, n, j, ak;
     for (n = 0; n < es.length; n++) {
@@ -128465,7 +128675,7 @@ function espIsPitcherSlot(it, game) {
 }
 
 // Top scoring bat and arm for today, from the starters only.
-function espTopToday(rosters, teamId) {
+function espTopToday(rosters, teamId, game) {
   var t = rosters && rosters.byTeam && rosters.byTeam[String(teamId)];
   if (!t || !t.items) return null;
   var bat = null, pit = null;
@@ -128475,11 +128685,22 @@ function espTopToday(rosters, teamId) {
     var w = it.windows && it.windows.today;
     if (!w || w.total == null) continue;
     var cand = { name: it.name, pts: Number(w.total), id: it.playerId };
-    if (espIsPitcherSlot(it)) { if (!pit || cand.pts > pit.pts) pit = cand; }
+    if (espIsPitcherSlot(it, game)) { if (!pit || cand.pts > pit.pts) pit = cand; }
     else { if (!bat || cand.pts > bat.pts) bat = cand; }
   }
   if (!bat && !pit) return null;
   return { bat: bat, pit: pit };
+}
+
+// The two halves of the top-scorer line. BAT and ARM are baseball words —
+// on a football roster the leader was being introduced as a batter. Only
+// baseball splits its lineup at all (espIsPitcherSlot is scoped to it), so
+// everywhere else there is one leader and one label. ESPTOPLBL
+var ESP_TOP_LABEL = { flb: ['BAT', 'ARM'] };
+function _espTopLabel(game, isPitcher) {
+  var m = ESP_TOP_LABEL[game];
+  if (!m) return 'TOP';
+  return isPitcher ? m[1] : m[0];
 }
 
 function _espTopTodayHtml(l, accent) {
@@ -128489,7 +128710,7 @@ function _espTopTodayHtml(l, accent) {
   var myId = null;
   for (var k in (l.myTeamIds || {})) { if (l.myTeamIds.hasOwnProperty(k)) { myId = k; break; } }
   if (!myId) return '';
-  var top = espTopToday(l.rosters, myId);
+  var top = espTopToday(l.rosters, myId, 'flb');
   if (!top) return '';
   function bit(lbl, p) {
     if (!p) return '';
@@ -129620,11 +129841,11 @@ function _espLineupFill(row, bodyEl, headEl) {
 
   var top = espTopToday(row.rosters, (function () {
     for (var q in myIds) { if (myIds.hasOwnProperty(q)) return q; } return null;
-  })());
+  })(), game);
   if (top && (top.bat || top.pit)) {
     var tb = [];
-    if (top.bat) tb.push('BAT ' + top.bat.name + ' ' + (top.bat.pts > 0 ? '+' : '') + top.bat.pts);
-    if (top.pit) tb.push('ARM ' + top.pit.name + ' ' + (top.pit.pts > 0 ? '+' : '') + top.pit.pts);
+    if (top.bat) tb.push(_espTopLabel(game, false) + ' ' + top.bat.name + ' ' + (top.bat.pts > 0 ? '+' : '') + top.bat.pts);
+    if (top.pit) tb.push(_espTopLabel(game, true) + ' ' + top.pit.name + ' ' + (top.pit.pts > 0 ? '+' : '') + top.pit.pts);
     out += '<div style="text-align:center;color:rgba(255,255,255,0.5);font-size:10px;' +
       'letter-spacing:0.06em;margin:-6px 0 12px">' + slEsc(tb.join('   \u00b7   ')) + '</div>';
   }
@@ -129645,8 +129866,12 @@ function _espLineupFill(row, bodyEl, headEl) {
   if (bench) out += '<div style="color:rgba(255,255,255,0.4);font-size:10px;letter-spacing:0.12em;' +
     'margin:14px 0 2px">BENCH<span style="float:right">' + nB + '</span></div>' + bench;
   out += '<div style="color:rgba(255,255,255,0.3);font-size:9.5px;line-height:1.6;margin-top:16px">' +
-    'Today\u2019s fantasy points, straight from ESPN\u2019s own per-player totals. ' +
-    'A dash means ESPN hasn\u2019t opened that player\u2019s day yet \u2014 usually ' +
+    // "Today" and "day" are daily-sport words; a football scoring period is
+    // a week. ESPFFLWIN
+    (game === 'ffl' ? 'This week\u2019s' : 'Today\u2019s') +
+    ' fantasy points, straight from ESPN\u2019s own per-player totals. ' +
+    'A dash means ESPN hasn\u2019t opened that player\u2019s ' +
+    (game === 'ffl' ? 'week' : 'day') + ' yet \u2014 usually ' +
     (ESP_FIRST_EVENT[game] || ESP_FIRST_EVENT.flb) + '.</div>';
   bodyEl.innerHTML = out;
 }
