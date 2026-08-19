@@ -32817,7 +32817,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-08-16 14:10 UTC';
+var SK_BUILD = '2026-08-16 15:00 UTC';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -128195,14 +128195,12 @@ function espLiveScores(j, standingsRows, rosters, cats, row) {
         for (kk in aS) {
           if (!aS.hasOwnProperty(kk)) continue;
           if (catIds && !catIds[kk]) continue;
-          rws.push({
-            id: kk,
-            mine: (aL[kk] != null) ? aL[kk] : _espStatVal(aS[kk]),
-            opp: (hL[kk] != null) ? hL[kk] : _espStatVal(hS[kk]),
-            // Carried so espCatTally scores it with the right sport's
-            // direction flags. ESPSPORTFLAG
-            game: _cbGame
-          });
+          // Same builder the grid uses, so the scoreboard row and the grid
+          // below it can't report different records for the same matchup.
+          // This loop used to construct its own rows and knew nothing about
+          // the ineligible rule, which is exactly how it came to show
+          // 11-4-3 against the grid's 8-3-7. ESPCATROW
+          rws.push(_espCatRow(kk, aS[kk], hS[kk], aL, hL, _cbGame));
         }
         if (rws.length) {
           var tl = espCatTally(rws);
@@ -131023,6 +131021,31 @@ function _espStatResult(v) {
 // ineligible until tomorrow's payload. That is a day's lag on a boundary
 // that is crossed once per matchup, and it errs toward ESPN's own displayed
 // answer rather than away from it.
+// One category row, built one way. ── ESPCATROW ──
+//
+// The tally was computed in TWO places from two hand-rolled row loops: the
+// grid in espCatBreakdown, and the league scoreboard in espLiveScores. Adding
+// the ineligible rule to the first fixed the grid's summary strip and left
+// the scoreboard row and the Today card still reading 4-11-3 against the
+// grid's own 3-8-7 — the same league disagreeing with itself two inches
+// apart on the same screen.
+//
+// So the row is constructed here and nowhere else. A rule added to the
+// verdict now reaches every surface that shows a category record.
+function _espCatRow(id, myEntry, opEntry, myLive, opLive, game) {
+  var pm = _espStatVal(myEntry);
+  var po = _espStatVal(opEntry);
+  var mv = (myLive && myLive[id] != null) ? myLive[id] : pm;
+  var ov = (opLive && opLive[id] != null) ? opLive[id] : po;
+  // Ineligible for either side means ESPN counts it for neither. ESPCATINEL
+  var inel = _espInelFlag(myEntry) || _espInelFlag(opEntry);
+  return {
+    id: id, mine: mv, opp: ov, inel: inel,
+    result: inel ? 'TIE' : espCatResult(id, mv, ov, game),
+    preMine: pm, preOpp: po, game: game
+  };
+}
+
 function _espInelFlag(v) {
   return !!(v && typeof v === 'object' && v.ineligible === true);
 }
@@ -131095,26 +131118,17 @@ function espCatBreakdown(j, row) {
       // — both states were being computed here and only the live one
       // survived. Diffing the two results is what tells you whether today
       // actually moved anything. ESPCATFLIP
-      var pm = _espStatVal(ms ? ms[k] : null);
-      var po = _espStatVal(os ? os[k] : null);
-      var mv = (myLive[k] != null) ? myLive[k] : pm;
-      var ov = (opLive[k] != null) ? opLive[k] : po;
-      // ESPN counts a category for nobody while either side is ineligible,
-      // so the verdict is a tie regardless of the numbers. ESPCATINEL
-      var inel = _espInelFlag(ms ? ms[k] : null) || _espInelFlag(os ? os[k] : null);
-      rows.push({ id: k, mine: mv, opp: ov,
-                  result: inel ? 'TIE' : espCatResult(k, mv, ov, _cbGame),
-                  inel: inel,
-                  preMine: pm, preOpp: po,
-                  wasResult: espCatResult(k, pm, po, _cbGame), game: _cbGame,
-                  // ESPN's OWN verdict for this category, and the raw entry it
-                  // came from. Neither is used to render — they exist so the
-                  // probe can show where our tally departs from theirs.
-                  // ESPCATPROBE
-                  espnResult: _espStatResult(ms ? ms[k] : null),
-                  espnInel: _espInel(ms ? ms[k] : null) + '/' + _espInel(os ? os[k] : null),
-                  rawMine: _espRawBrief(ms ? ms[k] : null),
-                  rawOpp: _espRawBrief(os ? os[k] : null) });
+      var _me = ms ? ms[k] : null, _oe = os ? os[k] : null;
+      var _r = _espCatRow(k, _me, _oe, myLive, opLive, _cbGame);   // ESPCATROW
+      _r.wasResult = espCatResult(k, _r.preMine, _r.preOpp, _cbGame);
+      // ESPN's OWN verdict for this category, and the raw entry it came from.
+      // Neither is used to render — they exist so the probe can show where
+      // our tally departs from theirs. ESPCATPROBE
+      _r.espnResult = _espStatResult(_me);
+      _r.espnInel = _espInel(_me) + '/' + _espInel(_oe);
+      _r.rawMine = _espRawBrief(_me);
+      _r.rawOpp = _espRawBrief(_oe);
+      rows.push(_r);
     }
     if (!rows.length) return null;
     // cumulativeScore's own W-L-T, straight from ESPN, kept beside the tally
