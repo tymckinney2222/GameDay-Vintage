@@ -32817,7 +32817,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-08-16 11:15 UTC';
+var SK_BUILD = '2026-08-16 12:30 UTC';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -130999,6 +130999,23 @@ function _espStatResult(v) {
   return '';
 }
 
+// A one-line rendering of a raw scoreByStat entry, for the probe. The VALUE
+// shape of these entries has never been confirmed on a real payload — the
+// reader above guesses at score/value/result — so this prints whatever keys
+// are actually there rather than the two or three we assume. ESPCATPROBE
+function _espRawBrief(v) {
+  if (v == null) return 'null';
+  if (typeof v !== 'object') return String(v);
+  var out = [], k;
+  for (k in v) {
+    if (!v.hasOwnProperty(k)) continue;
+    var val = v[k];
+    if (val != null && typeof val === 'object') val = '{..}';
+    out.push(k + '=' + val);
+  }
+  return out.length ? out.join(' ') : '{}';
+}
+
 function espCatBreakdown(j, row) {
   // The sport, so the direction flags apply to the right one. ESPSPORTFLAG
   var _cbGame = (typeof _espGameCode === 'function') ? _espGameCode(row) : 'flb';
@@ -131051,10 +131068,25 @@ function espCatBreakdown(j, row) {
       var ov = (opLive[k] != null) ? opLive[k] : po;
       rows.push({ id: k, mine: mv, opp: ov, result: espCatResult(k, mv, ov, _cbGame),
                   preMine: pm, preOpp: po,
-                  wasResult: espCatResult(k, pm, po, _cbGame), game: _cbGame });
+                  wasResult: espCatResult(k, pm, po, _cbGame), game: _cbGame,
+                  // ESPN's OWN verdict for this category, and the raw entry it
+                  // came from. Neither is used to render — they exist so the
+                  // probe can show where our tally departs from theirs.
+                  // ESPCATPROBE
+                  espnResult: _espStatResult(ms ? ms[k] : null),
+                  rawMine: _espRawBrief(ms ? ms[k] : null),
+                  rawOpp: _espRawBrief(os ? os[k] : null) });
     }
     if (!rows.length) return null;
+    // cumulativeScore's own W-L-T, straight from ESPN, kept beside the tally
+    // this file computes. ESPCATPROBE
+    var _mc = mine.cumulativeScore || {}, _oc = opp.cumulativeScore || {};
+    var espnRec = (_mc.wins != null || _mc.losses != null || _mc.ties != null)
+      ? { w: _mc.wins, l: _mc.losses, t: _mc.ties,
+          ow: _oc.wins, ol: _oc.losses, ot: _oc.ties }
+      : null;
     return { rows: rows, period: period, live: !!(myToday || opToday),
+             espnRec: espnRec,
              tally: espCatTally(rows) };
   }
   return null;
@@ -131230,7 +131262,48 @@ function _espCatBreakdownHtml(row) {
   }
   h += '</div>';
 
-  h += '<div style="color:rgba(255,255,255,0.28);font-size:9.5px;line-height:1.5;margin:8px 0 0;">' +
+  // ── Footer, and the probe behind it ── ESPCATPROBE ──
+  // Tap it to see where this file's tally departs from ESPN's own. It prints
+  // ESPN's cumulativeScore record beside the computed one, then every
+  // category whose verdict differs, then the raw shape of one entry so the
+  // fields ESPN actually sends can be read off a phone with no devtools.
+  var _pl = [];
+  _pl.push(cb.espnRec
+    ? ('ESPN cumulativeScore: ' + cb.espnRec.w + '-' + cb.espnRec.l + '-' + cb.espnRec.t +
+       '  (opp ' + cb.espnRec.ow + '-' + cb.espnRec.ol + '-' + cb.espnRec.ot + ')')
+    : 'ESPN cumulativeScore: absent');
+  _pl.push('computed here:        ' + cb.tally.w + '-' + cb.tally.l + '-' + cb.tally.t +
+    '  (' + cb.rows.length + ' cats)');
+  var _diff = [], _blank = 0, _ri, _r;
+  for (_ri = 0; _ri < cb.rows.length; _ri++) {
+    _r = cb.rows[_ri];
+    if (!_r.espnResult) { _blank++; continue; }
+    if (_r.espnResult !== _r.result) {
+      _diff.push('  ' + (espStatName(game, _r.id) || ('#' + _r.id)) +
+        ': ours=' + (_r.result || '-') + ' espn=' + _r.espnResult +
+        '  (' + _r.mine + ' vs ' + _r.opp + ')');
+    }
+  }
+  _pl.push('');
+  if (_blank === cb.rows.length) {
+    _pl.push('No per-category result in payload (' + _blank + ' cats) \u2014');
+    _pl.push('every verdict here is computed by comparing values.');
+  } else if (_diff.length) {
+    _pl.push('Verdict differs on ' + _diff.length + ' of ' + cb.rows.length + ':');
+    _pl = _pl.concat(_diff);
+  } else {
+    _pl.push('Every verdict agrees with ESPN.');
+  }
+  _pl.push('');
+  _pl.push('raw entry shape (' + (espStatName(game, cb.rows[0].id) || cb.rows[0].id) + '):');
+  _pl.push('  mine: ' + cb.rows[0].rawMine);
+  _pl.push('  opp:  ' + cb.rows[0].rawOpp);
+  var _probeTxt = _pl.join('\n')
+    .replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n');
+
+  h += '<div style="color:rgba(255,255,255,0.28);font-size:9.5px;line-height:1.5;margin:8px 0 0;' +
+    'cursor:pointer;text-decoration:underline;text-decoration-color:rgba(255,255,255,0.15);" ' +
+    'onclick="if(typeof skToast===\'function\')skToast(\'' + _probeTxt + '\')">' +
     (cb.live
       ? 'Includes today \u00b7 AVG / WHIP / ERA rebuilt from components'
       : 'Through the last completed day') + '</div>';
