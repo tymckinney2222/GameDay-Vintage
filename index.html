@@ -32817,7 +32817,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-08-16 13:20 UTC';
+var SK_BUILD = '2026-08-16 14:10 UTC';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -131003,6 +131003,30 @@ function _espStatResult(v) {
 // { ineligible, rank, result, score }. This reads the flag that decides
 // whether ESPN counts the category at all — the open question is whether the
 // pitching rate categories its app renders in italics carry it. ESPCATPROBE
+// Does ESPN count this category at all? ── ESPCATINEL ──
+//
+// CONFIRMED off a live payload: each scoreByStat entry is
+// { ineligible, rank, result, score }, and in the R.B.I. league five of
+// eighteen categories came back ineligible=true — WHIP, K/9, K/BB, ERA and
+// home runs allowed. Every one of them is pitching, and ESPN's own app
+// renders exactly those five in italics and scores them as TIES. That is the
+// minimum-innings rule: until a staff has thrown enough, its rate categories
+// don't count for anybody.
+//
+// Applying it reproduces ESPN's record exactly. The grid computed 4-11-3
+// where the app showed 3-8-7; tying the five ineligible categories converts
+// one win and three losses, giving 3-8-7 on my side and 8-3-7 on theirs —
+// both sides, to the category.
+//
+// The flag rides on the same completed-period snapshot as everything else in
+// scoreByStat, so a category that qualifies DURING today still reads
+// ineligible until tomorrow's payload. That is a day's lag on a boundary
+// that is crossed once per matchup, and it errs toward ESPN's own displayed
+// answer rather than away from it.
+function _espInelFlag(v) {
+  return !!(v && typeof v === 'object' && v.ineligible === true);
+}
+
 function _espInel(v) {
   if (v && typeof v === 'object' && v.ineligible != null) return v.ineligible ? 'Y' : 'n';
   return '?';
@@ -131075,7 +131099,12 @@ function espCatBreakdown(j, row) {
       var po = _espStatVal(os ? os[k] : null);
       var mv = (myLive[k] != null) ? myLive[k] : pm;
       var ov = (opLive[k] != null) ? opLive[k] : po;
-      rows.push({ id: k, mine: mv, opp: ov, result: espCatResult(k, mv, ov, _cbGame),
+      // ESPN counts a category for nobody while either side is ineligible,
+      // so the verdict is a tie regardless of the numbers. ESPCATINEL
+      var inel = _espInelFlag(ms ? ms[k] : null) || _espInelFlag(os ? os[k] : null);
+      rows.push({ id: k, mine: mv, opp: ov,
+                  result: inel ? 'TIE' : espCatResult(k, mv, ov, _cbGame),
+                  inel: inel,
                   preMine: pm, preOpp: po,
                   wasResult: espCatResult(k, pm, po, _cbGame), game: _cbGame,
                   // ESPN's OWN verdict for this category, and the raw entry it
@@ -131121,19 +131150,24 @@ function espCatBreakdown(j, row) {
 // side classes say which side is MINE; the outcome classes tint the winner
 // and wash the row toward it. Ties drop to 55% opacity so the live
 // categories stand out.
-function _espCatRowHtml(id, game, mine, opp, result) {
+function _espCatRowHtml(id, game, mine, opp, result, inel) {
   var cls = 'fy-cat-row left-side';       // ME is always the left column
   if (result === 'WIN') cls += ' mine-wins';
   else if (result === 'LOSS') cls += ' mine-loses';
   else cls += ' tied neutral';
   var lbl = espStatName(game, id) || ('#' + id);
+  // Not counted yet: ESPN italicises these and so does this, because a row
+  // showing 0.93 against 0.00 and scoring as a tie looks like a bug unless
+  // the styling says otherwise. No arrow either — nothing was won.
+  // ESPCATINEL
+  var inelStyle = inel ? ' style="font-style:italic;opacity:0.62;"' : '';
   // The arrow sits against the centre on the winning side and points out at
   // the value that won it, so the eye lands on the number that matters.
-  var lArrow = (result === 'WIN')
+  var lArrow = (!inel && result === 'WIN')
     ? '<span class="fy-cat-arrow">\u25c0</span>' : '';
-  var rArrow = (result === 'LOSS')
+  var rArrow = (!inel && result === 'LOSS')
     ? '<span class="fy-cat-arrow">\u25b6</span>' : '';
-  return '<div class="' + cls + '">' +
+  return '<div class="' + cls + '"' + inelStyle + '>' +
     '<div class="fy-cat-side left">' +
       '<span class="fy-cat-val">' +
         (mine != null ? slEsc(espStatFmt(id, mine, game)) : '\u2014') + '</span>' +
@@ -131141,7 +131175,10 @@ function _espCatRowHtml(id, game, mine, opp, result) {
     '</div>' +
     '<div class="fy-cat-name">' +
       '<span class="fy-cat-name-text">' + slEsc(lbl) + '</span>' +
-      (result === 'TIE' ? '<span class="fy-cat-tie-tag">TIE</span>' : '') +
+      (inel
+        ? '<span class="fy-cat-tie-tag" title="ESPN hasn\u2019t qualified this ' +
+          'category yet \u2014 it counts as a tie for both sides">N/A</span>'
+        : (result === 'TIE' ? '<span class="fy-cat-tie-tag">TIE</span>' : '')) +
     '</div>' +
     '<div class="fy-cat-side right">' +
       rArrow +
@@ -131268,7 +131305,7 @@ function _espCatBreakdownHtml(row) {
         'color:rgba(255,255,255,0.3);padding:' + (i ? '12px' : '2px') + ' 2px 4px;">' +
         _grpLabel(grp) + '</div>';
     }
-    h += _espCatRowHtml(r.id, game, r.mine, r.opp, r.result);
+    h += _espCatRowHtml(r.id, game, r.mine, r.opp, r.result, r.inel);   // ESPCATINEL
   }
   h += '</div>';
 
@@ -131308,6 +131345,8 @@ function _espCatBreakdownHtml(row) {
   _pl.push('raw entry shape (' + (espStatName(game, cb.rows[0].id) || cb.rows[0].id) + '):');
   _pl.push('  mine: ' + cb.rows[0].rawMine);
   _pl.push('  opp:  ' + cb.rows[0].rawOpp);
+  var _inelN = 0;
+  for (_ri = 0; _ri < cb.rows.length; _ri++) if (cb.rows[_ri].inel) _inelN++;
   var _probeTxt = _pl.join('\n')
     .replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n');
 
@@ -131316,7 +131355,13 @@ function _espCatBreakdownHtml(row) {
     'onclick="if(typeof skToast===\'function\')skToast(\'' + _probeTxt + '\')">' +
     (cb.live
       ? 'Includes today \u00b7 AVG / WHIP / ERA rebuilt from components'
-      : 'Through the last completed day') + '</div>';
+      : 'Through the last completed day') +
+    // ESPCATINEL — a record with seven ties needs to say where they came from.
+    (_inelN
+      ? (' \u00b7 ' + _inelN + ' categor' + (_inelN === 1 ? 'y' : 'ies') +
+         ' not yet qualified, tied for both sides')
+      : '') +
+    '</div>';
 
   // The season-vs-league-average table used to sit here. Removed on request:
   // it answered a different question from the one this pane is for — this
@@ -131520,6 +131565,10 @@ function espCatResult(id, mine, opp, game) {
 function espCatTally(rows) {
   var w = 0, l = 0, t = 0;
   for (var i = 0; i < rows.length; i++) {
+    // Ineligible outranks the numbers: ESPN scores it a tie whatever the two
+    // values say, and this is the difference between our record and the one
+    // the app shows. ESPCATINEL
+    if (rows[i].inel) { t++; continue; }
     // Each row carries the sport it came from, so a caller cannot supply the
     // wrong one by omission. ESPSPORTFLAG
     var r = espCatResult(rows[i].id, rows[i].mine, rows[i].opp, rows[i].game);
