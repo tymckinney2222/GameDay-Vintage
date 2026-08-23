@@ -32817,7 +32817,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-08-16 15:00 UTC';
+var SK_BUILD = '2026-08-16 16:20 UTC';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -64091,7 +64091,8 @@ function _crsEspnFpHtml(playerName, divHtml) {
   try {
     var idx = _espFhubIndex();
     if (!idx || !idx.n) return '';
-    rows = _espFhubRowsFor({ name: playerName }, idx);
+    rows = _espFhubRowsFor({ name: playerName }, idx,
+      (typeof _extStadiumSport === 'function') ? _extStadiumSport() : '');   // FHUBSPORT
   } catch (e) { return ''; }
   if (!rows || !rows.length) return '';
 
@@ -65044,7 +65045,12 @@ function _espFhubIndex() {
       if (!it || !it.playerId) continue;
       // Carry the team's own name from the roster payload, as a fallback for
       // when the standings sync hasn't landed yet. CRSESPFP
+      //
+      // sport rides along so a same-name player from another sport can be
+      // rejected — the ESPN hub had the identical collision the Sleeper one
+      // did. FHUBSPORT
       var ref = { row: row, item: it,
+                  sport: String(row.sport || '').toUpperCase(),
                   teamName: (row.rosters.byTeam[teamKey] || {}).teamName || '' };
       if (!byId[String(it.playerId)]) byId[String(it.playerId)] = [];
       byId[String(it.playerId)].push(ref);
@@ -65096,15 +65102,19 @@ function _espFhubLogo(row) {
 // ESPN rows for one stadium athlete. Same row SHAPE as the Yahoo hub so
 // one renderer can serve both, but the two never share a card — Yahoo's
 // terms ask that their fantasy data not be commingled. ESPNFHUB3
-function _espFhubRowsFor(at, idx) {
+function _espFhubRowsFor(at, idx, sport) {
   var rows = [];
   if (!at || !idx || !idx.n) return rows;
   var refs = null;
-  if (at.espnId && idx.byId[String(at.espnId)]) refs = idx.byId[String(at.espnId)];
+  if (at.espnId && idx.byId[String(at.espnId)]) {
+    refs = _extFhubBySport(idx.byId[String(at.espnId)], sport);   // FHUBSPORT
+  }
   if (!refs) {
     var norm = (typeof _skNormalizeName === 'function')
       ? _skNormalizeName(at.name || '') : String(at.name || '').toLowerCase();
-    if (norm && idx.byName[norm]) refs = idx.byName[norm];
+    if (norm && idx.byName[norm]) {
+      refs = _extFhubBySport(idx.byName[norm], sport);            // FHUBSPORT
+    }
   }
   if (!refs) return rows;
   for (var r = 0; r < refs.length; r++) {
@@ -65249,17 +65259,26 @@ function _espCollectFantasyHub() {
   if (!ctx || !ctx.athletes || !ctx.athletes.length) return out;
   var idx = _espFhubIndex();
   if (!idx.n) return out;
+  // FHUBSPORT — which sport's stadium is open.
+  var _espFhubSport = (typeof _extStadiumSport === 'function') ? _extStadiumSport() : '';
 
   var seen = {};
   for (var a = 0; a < ctx.athletes.length; a++) {
     var at = ctx.athletes[a];
     var refs = null;
-    // Exact id join wherever the stadium is ESPN-sourced.
-    if (at.espnId && idx.byId[String(at.espnId)]) refs = idx.byId[String(at.espnId)];
+    // Exact id join wherever the stadium is ESPN-sourced. Both routes are
+    // sport-gated: this collector kept its own copy of the match rather than
+    // calling _espFhubRowsFor, so scoping only that one would have left the
+    // collision alive right here. FHUBSPORT
+    if (at.espnId && idx.byId[String(at.espnId)]) {
+      refs = _extFhubBySport(idx.byId[String(at.espnId)], _espFhubSport);
+    }
     if (!refs) {
       var norm = (typeof _skNormalizeName === 'function')
         ? _skNormalizeName(at.name || '') : String(at.name || '').toLowerCase();
-      if (norm && idx.byName[norm]) refs = idx.byName[norm];
+      if (norm && idx.byName[norm]) {
+        refs = _extFhubBySport(idx.byName[norm], _espFhubSport);
+      }
     }
     if (!refs || !refs.length) continue;
     var dedupe = at.espnId ? ('id:' + at.espnId) : ('nm:' + (at.name || ''));
@@ -65267,7 +65286,7 @@ function _espCollectFantasyHub() {
     seen[dedupe] = 1;
 
     // One row builder, shared with nothing Yahoo. ESPNFHUB3
-    var rows = _espFhubRowsFor(at, idx), total = null, lineup = null;
+    var rows = _espFhubRowsFor(at, idx, _espFhubSport), total = null, lineup = null;   // FHUBSPORT
     for (var r = 0; r < rows.length; r++) {
       if (rows[r].fp != null) total = (total || 0) + rows[r].fp;
       if (!lineup && rows[r].lineup) lineup = rows[r].lineup;
@@ -65305,6 +65324,38 @@ function _espCollectFantasyHub() {
 //             roster slot instead of inventing a number.
 var EXT_FHUB_PROVIDERS = { sleeper: '#fbbf24', fantrax: '#34d399' };
 
+// ── Cross-sport name collision ── FHUBSPORT ──
+// Both hubs matched a stadium athlete to a rostered player by NORMALISED
+// NAME, with nothing checking that the two were even playing the same sport.
+// José Alvarado is a Phillies reliever and also a Knicks guard, so opening a
+// Phillies game surfaced the basketball one from a Sleeper NBA league —
+// wearing a Phillies cap, listed as P, and on a roster that has never
+// contained him.
+//
+// The espnId path is safe on its own (ESPN athlete ids are one namespace
+// across every sport) but it is scoped too, so one rule covers both routes
+// rather than one route quietly relying on a property of ESPN's id scheme.
+//
+// A falsy sport means the caller could not determine one — no overlay open,
+// say — and the gate opens rather than closing, because filtering everything
+// out would turn "I don't know" into "nothing matches".
+function _extSportMatches(refSport, wantSport) {
+  if (!wantSport) return true;
+  if (!refSport) return true;   // league without a sport: don't hide it
+  return String(refSport).toUpperCase() === String(wantSport).toUpperCase();
+}
+
+// Drop refs from another sport. Shared by both hubs so the rule cannot be
+// applied in one and forgotten in the other. FHUBSPORT
+function _extFhubBySport(refs, sport) {
+  if (!refs || !refs.length || !sport) return refs;
+  var out = [], i;
+  for (i = 0; i < refs.length; i++) {
+    if (_extSportMatches(refs[i].sport, sport)) out.push(refs[i]);
+  }
+  return out.length ? out : null;
+}
+
 function _extFhubIndex() {
   var byId = {}, byName = {}, n = 0;
   if (typeof extSyncedLeagues !== 'function') return { byId: byId, byName: byName, n: 0 };
@@ -65341,7 +65392,10 @@ function _extFhubIndex() {
       // never affected. FTXFHUBID
       var pid = (it && (it.playerId || it.id)) || '';
       if (!it || !pid) continue;
-      var ref = { row: row, item: it };
+      // The league's sport rides on the ref so a match can be rejected on
+      // it. Without this a basketball José Alvarado answered a baseball
+      // stadium's lookup. FHUBSPORT
+      var ref = { row: row, item: it, sport: SPORT };
       if (it.espnId) {
         var ek = String(it.espnId);
         if (!byId[ek]) byId[ek] = [];
@@ -65381,15 +65435,19 @@ function _extFhubIndex() {
   return { byId: byId, byName: byName, n: n };
 }
 
-function _extFhubRowsFor(at, idx) {
+function _extFhubRowsFor(at, idx, sport) {
   var rows = [];
   if (!at || !idx || !idx.n) return rows;
   var refs = null;
-  if (at.espnId && idx.byId[String(at.espnId)]) refs = idx.byId[String(at.espnId)];
+  if (at.espnId && idx.byId[String(at.espnId)]) {
+    refs = _extFhubBySport(idx.byId[String(at.espnId)], sport);   // FHUBSPORT
+  }
   if (!refs) {
     var norm = (typeof _skNormalizeName === 'function')
       ? _skNormalizeName(at.name || '') : String(at.name || '').toLowerCase();
-    if (norm && idx.byName[norm]) refs = idx.byName[norm];
+    if (norm && idx.byName[norm]) {
+      refs = _extFhubBySport(idx.byName[norm], sport);            // FHUBSPORT
+    }
   }
   if (!refs) return rows;
   for (var r = 0; r < refs.length; r++) {
@@ -65422,11 +65480,14 @@ function _extCollectFantasyHub() {
   if (!ctx || !ctx.athletes || !ctx.athletes.length) return out;
   var idx = _extFhubIndex();
   if (!idx.n) return out;
+  // Which sport's stadium is open, so a same-name player from another sport
+  // can't answer this lookup. FHUBSPORT
+  var _fhubSport = (typeof _extStadiumSport === 'function') ? _extStadiumSport() : '';
 
   var seen = {};
   for (var a = 0; a < ctx.athletes.length; a++) {
     var at = ctx.athletes[a];
-    var rows = _extFhubRowsFor(at, idx);
+    var rows = _extFhubRowsFor(at, idx, _fhubSport);   // FHUBSPORT
     if (!rows.length) continue;
     var key = at.espnId ? ('id:' + at.espnId) : ('nm:' + (at.name || ''));
     if (seen[key]) continue;
