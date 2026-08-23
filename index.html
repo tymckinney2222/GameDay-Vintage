@@ -32817,7 +32817,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-08-16 16:20 UTC';
+var SK_BUILD = '2026-08-16 17:30 UTC';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -42446,7 +42446,11 @@ function _extractPitcherSeasonLine(statsArr) {
 // [{ leagueName, leagueKey, myTeamKey, logoUrl, isPoints, fp }] with blank-logo
 // entries dropped. fp is today's fantasy points EARNED in that league, but only
 // for points leagues (headpoint) — cats leagues get fp:null (no single number).
-function _skPlayerFantasyLogos(playerName) {
+// sport is optional and scopes the match the same way the provider dots are
+// scoped. Yahoo had the identical cross-sport collision — a name index with
+// no sport on it — and fyFullRosters already carries r.sport from the roster
+// load, so the fix costs nothing but the comparison. OWNDOTSPORT
+function _skPlayerFantasyLogos(playerName, sport) {
   if (typeof fyFullRosters === 'undefined' || !fyFullRosters || !fyFullRosters.length) return [];
   if (typeof _skNormalizeName !== 'function') return [];
   var normName = _skNormalizeName(playerName);
@@ -42455,6 +42459,9 @@ function _skPlayerFantasyLogos(playerName) {
   var out = [];
   fyFullRosters.forEach(function(r) {
     if (_skNormalizeName(r.name) !== normName) return;
+    // OWNDOTSPORT — a league of another sport is a different player.
+    if (typeof _extSportMatches === 'function' &&
+        !_extSportMatches(r.sport, sport)) return;
     if (!r.myTeamLogo) return;                 // no avatar set for this team
     var k = r.leagueKey || r.myTeamKey || r.leagueName;
     if (seen[k]) return;                       // one badge per league
@@ -42512,10 +42519,14 @@ function _skOpenLeagueFromCard(leagueKey) {
   }
 }
 
-function _skFantasyLogosStripHtml(playerName) {
+function _skFantasyLogosStripHtml(playerName, sport) {
   try {
     if (typeof _skPlayerFantasyLogos !== 'function') return '';
-    var fl = _skPlayerFantasyLogos(playerName);
+    // OWNDOTSPORT — falls back to the open stadium when the caller is silent.
+    if (sport == null) {
+      sport = (typeof _extStadiumSport === 'function') ? _extStadiumSport() : '';
+    }
+    var fl = _skPlayerFantasyLogos(playerName, sport);
     if (!fl || !fl.length) return '';
     var chips = fl.map(function(f) {
       var t = (f.leagueName || 'Fantasy').replace(/"/g, '&quot;');
@@ -48510,6 +48521,11 @@ function _extDotIndex() {
         // roster must not light a dot.
         // Same Fantrax ownership problem as the hub index. FTXMYIDS
         var myIds = (typeof _extMyIds === 'function') ? _extMyIds(row) : (row.myTeamIds || {});
+        // The league's sport. Every entry is filed UNDER it, because a name
+        // alone is not an identity: José Alvarado pitches for the Phillies and
+        // also plays for the Knicks, and a flat name index gave the baseball
+        // one a dot for a basketball roster. OWNDOTSPORT
+        var SPORT = String(row.sport || '').toUpperCase();
         var teamKey = null;
         for (k in row.rosters.byTeam) {
           if (row.rosters.byTeam.hasOwnProperty(k) && myIds[k]) { teamKey = k; break; }
@@ -48528,7 +48544,7 @@ function _extDotIndex() {
           var rawNm = it.name || '';
           if (!rawNm && typeof _extRosterItemName === 'function') {
             try {
-              rawNm = (_extRosterItemName(it, String(row.sport || '').toUpperCase()) || {}).name || '';
+              rawNm = (_extRosterItemName(it, SPORT) || {}).name || '';
             } catch (eD) {}
           }
           if (rawNm === '?') rawNm = '';
@@ -48542,7 +48558,8 @@ function _extDotIndex() {
             var nm = _extDotNorm(forms[fj]);
             if (!nm) continue;
             if (!byName[nm]) byName[nm] = {};
-            byName[nm][prov] = 1;
+            if (!byName[nm][SPORT]) byName[nm][SPORT] = {};
+            byName[nm][SPORT][prov] = 1;   // OWNDOTSPORT
             added = true;
           }
           if (added) n++;
@@ -48552,7 +48569,8 @@ function _extDotIndex() {
           if (it.espnId) {
             var ek = String(it.espnId);
             if (!byId[ek]) byId[ek] = {};
-            byId[ek][prov] = 1;
+            if (!byId[ek][SPORT]) byId[ek][SPORT] = {};
+            byId[ek][SPORT][prov] = 1;   // OWNDOTSPORT
           }
         }
       }
@@ -48562,16 +48580,49 @@ function _extDotIndex() {
   return _extDotCache;
 }
 
+// Flatten one index entry — { SPORT: { provider: 1 } } — into the providers
+// that roster him IN THE SPORT ASKED ABOUT. Returns null when none do, so
+// callers can keep using a simple truthiness test. OWNDOTSPORT
+//
+// A falsy sport means the caller could not determine one, and an entry filed
+// under a league with no sport can't be judged either; both open the gate
+// rather than closing it, because hiding on "don't know" is a worse failure
+// than the collision this exists to prevent.
+function _extDotProvs(entry, sport) {
+  if (!entry) return null;
+  var out = null, sk, pk;
+  for (sk in entry) {
+    if (!entry.hasOwnProperty(sk)) continue;
+    if (typeof _extSportMatches === 'function' && !_extSportMatches(sk, sport)) continue;
+    for (pk in entry[sk]) {
+      if (!entry[sk].hasOwnProperty(pk)) continue;
+      if (!out) out = {};
+      out[pk] = 1;
+    }
+  }
+  return out;
+}
+
 // Dots for one player, or '' when none of the three roster him. espnId is
 // optional and preferred when present.
-function extOwnDots(name, espnId) {
+//
+// sport is optional and scopes the match. Omitted, it falls back to whichever
+// stadium overlay is open, so a caller that forgets it still behaves — but
+// every caller in this file names it, because they all know their sport
+// statically and an explicit argument can't go stale. OWNDOTSPORT
+function extOwnDots(name, espnId, sport) {
   var idx = _extDotIndex();
   if (!idx.n) return '';
+  if (sport == null) {
+    sport = (typeof _extStadiumSport === 'function') ? _extStadiumSport() : '';
+  }
   var hit = null;
-  if (espnId && idx.byId[String(espnId)]) hit = idx.byId[String(espnId)];
+  if (espnId && idx.byId[String(espnId)]) {
+    hit = _extDotProvs(idx.byId[String(espnId)], sport);
+  }
   if (!hit) {
     var nm = _extDotNorm(name);
-    if (nm) hit = idx.byName[nm];
+    if (nm && idx.byName[nm]) hit = _extDotProvs(idx.byName[nm], sport);
   }
   if (!hit) return '';
   // Fixed order, never a for...in over hit: enumeration order is not
@@ -48593,9 +48644,11 @@ function extOwnDots(name, espnId) {
     names.join(' + ') + ' roster">' + out + '</span>';
 }
 
-function _skOwnsPlayerByName(name) {
+function _skOwnsPlayerByName(name, sport) {
   if (typeof _skPlayerFantasyLogos === 'function') {
-    var fl = _skPlayerFantasyLogos(name);
+    // OWNDOTSPORT — see _skPlayerFantasyLogos. Omitting sport keeps the old
+    // cross-sport behaviour, so an unnamed caller is no worse off than before.
+    var fl = _skPlayerFantasyLogos(name, sport);
     return !!(fl && fl.length);
   }
   return false;
@@ -48631,7 +48684,7 @@ function _milbResolveGameOwned(game) {
             var entry = players['ID' + appeared[i]];
             var person = entry && entry.person;
             var nm = person && (person.fullName || person.boxscoreName);
-            if (nm && _skOwnsPlayerByName(nm)) { owned = true; break; }
+            if (nm && _skOwnsPlayerByName(nm, 'MLB')) { owned = true; break; }   // OWNDOTSPORT
           }
         });
       }
@@ -52889,11 +52942,11 @@ function renderFieldBoxScore(data, game) {
         // this player in any fantasy league (same as MLB/NBA/NHL stadium boxes).
         var _fdDisplay = athlete.displayName || athlete.shortName || '';
         var _fdShown = athlete.shortName || athlete.displayName || '?';
-        var _fdMine = (typeof _skOwnsPlayerByName === 'function' && _skOwnsPlayerByName(_fdDisplay));
+        var _fdMine = (typeof _skOwnsPlayerByName === 'function' && _skOwnsPlayerByName(_fdDisplay, 'NFL'));
         var _fdName = _fdMine
           ? '<span style="color:' + (side.color || '#f5c518') + ';font-weight:800">' + _fdShown + '</span>'
           : _fdShown;
-        html += '<tr' + (_fdMine ? ' class="gym-bx-mine"' : '') + onclick + '><td>' + _fdName + ' <span style="color:rgba(255,255,255,0.2);font-size:9px">' + pos + '</span>' + (typeof extOwnDots === 'function' ? extOwnDots(_fdDisplay, athlete.id) : '') + '</td>';
+        html += '<tr' + (_fdMine ? ' class="gym-bx-mine"' : '') + onclick + '><td>' + _fdName + ' <span style="color:rgba(255,255,255,0.2);font-size:9px">' + pos + '</span>' + (typeof extOwnDots === 'function' ? extOwnDots(_fdDisplay, athlete.id, 'NFL') : '') + '</td>';
         filtered.forEach(function(s) { html += '<td>' + (s != null ? s : '-') + '</td>'; });
         html += '</tr>';
       });
@@ -54656,12 +54709,12 @@ function renderRinkBoxScore(data, game) {
         // this player (match on the full display name). Mirrors MLB/NBA.
         var _rkDisplay = athlete.displayName || athlete.shortName || '';
         var _rkShown = athlete.shortName || athlete.displayName || '?';
-        var _rkMine = (typeof _skOwnsPlayerByName === 'function' && _skOwnsPlayerByName(_rkDisplay));
+        var _rkMine = (typeof _skOwnsPlayerByName === 'function' && _skOwnsPlayerByName(_rkDisplay, 'NHL'));
         var _rkCol = _rkMine ? ((side.label === game.home.abbr) ? hc : ac) : '';
         var _rkName = _rkMine
           ? '<span style="color:' + _rkCol + ';font-weight:800">' + _rkShown + '</span>'
           : _rkShown;
-        html += '<tr' + (_rkMine ? ' class="gym-bx-mine"' : '') + onclick + '><td>' + _rkName + ' <span style="color:rgba(255,255,255,0.2);font-size:9px">' + pos + '</span>' + (typeof extOwnDots === 'function' ? extOwnDots(_rkDisplay, athlete.id) : '') + '</td>';
+        html += '<tr' + (_rkMine ? ' class="gym-bx-mine"' : '') + onclick + '><td>' + _rkName + ' <span style="color:rgba(255,255,255,0.2);font-size:9px">' + pos + '</span>' + (typeof extOwnDots === 'function' ? extOwnDots(_rkDisplay, athlete.id, 'NHL') : '') + '</td>';
         // Splice the computed Points cell in at the same position as the
         // header, when this is a skater group with a G/A pair.
         var _rowCells = filtered.slice();
@@ -57282,13 +57335,13 @@ function renderGymBoxScore(data, game, isV) {
       var onclick = p.id ? ' onclick="' + (isV ? 'openVintagePlayer' : 'openBoxScorePlayer') + '(\'' + p.id + '\',\'' + game.league + '\')" style="cursor:pointer"' : '';
       // "Your guy" highlight — tint the name in the team color when you roster
       // this player in any fantasy league (same as MLB stadium box scores).
-      var _gMine = (typeof _skOwnsPlayerByName === 'function' && _skOwnsPlayerByName(p.fullName || p.name));
+      var _gMine = (typeof _skOwnsPlayerByName === 'function' && _skOwnsPlayerByName(p.fullName || p.name, 'NBA'));
       var _gCol = _gMine ? (side.color || '#f5c518') : '';
       var _gName = _gMine
         ? '<span style="color:' + _gCol + ';font-weight:800">' + p.name + '</span>'
         : p.name;
       html += '<tr' + (_gMine ? ' class="gym-bx-mine"' : '') + onclick + '>';
-      html += '<td>' + _gName + ' <span style="color:rgba(255,255,255,0.2);font-size:9px">' + p.pos + '</span>' + (typeof extOwnDots === 'function' ? extOwnDots(p.fullName || p.name, p.id) : '') + '</td>';
+      html += '<td>' + _gName + ' <span style="color:rgba(255,255,255,0.2);font-size:9px">' + p.pos + '</span>' + (typeof extOwnDots === 'function' ? extOwnDots(p.fullName || p.name, p.id, 'NBA') : '') + '</td>';
       cols.forEach(function(c) {
         var val = p.statMap[c];
         // Accumulate totals for numeric columns
@@ -62904,7 +62957,7 @@ function _liveABRunnerChip(runner, baseLbl, inScoring, teamCol) {
   var nm = _liveABShortName(runner.fullName || runner.name || '');
   if (!nm) return '';
   var dots = (typeof extOwnDots === 'function')
-    ? extOwnDots(runner.fullName || runner.name || '') : '';
+    ? extOwnDots(runner.fullName || runner.name || '', null, 'MLB') : '';
   return '<span class="fw-liveab-runner' + (inScoring ? ' scoring' : '') + '"' +
     ' style="--rn-col:' + (teamCol || '#f0d89a') + '">' +
     '<span class="fw-liveab-runner-base">' + baseLbl + '</span>' +
@@ -63985,8 +64038,8 @@ function _fwBuildDueUpStrip(bx, pbp, ls, game, isTop, awayAccent, homeAccent) {
   for (var i = 0; i < due.batters.length; i++) {
     var b = due.batters[i];
     var safeName = String(b.name || '').replace(/'/g, "\\'");
-    var dots = (typeof extOwnDots === 'function') ? extOwnDots(b.name) : '';
-    var mine = (typeof _skOwnsPlayerByName === 'function' && _skOwnsPlayerByName(b.name));
+    var dots = (typeof extOwnDots === 'function') ? extOwnDots(b.name, null, 'MLB') : '';
+    var mine = (typeof _skOwnsPlayerByName === 'function' && _skOwnsPlayerByName(b.name, 'MLB'));
     h += '<div class="crs-dueup-row' + (mine ? ' mine' : '') + '">' +
       '<span class="du-spot">' + b.spot + '</span>' +
       '<span class="du-name" onclick="event.stopPropagation();openCrsHitterModal(\'' +
@@ -70658,7 +70711,7 @@ function renderFenwayBoxScore(bx, game) {
       batCols.forEach(function(c) { totals[c.key] = 0; });
       
       batters.forEach(function(b) {
-        var _bMine = (typeof _skOwnsPlayerByName === 'function' && _skOwnsPlayerByName(b.name));
+        var _bMine = (typeof _skOwnsPlayerByName === 'function' && _skOwnsPlayerByName(b.name, 'MLB'));
         // A batting-order ending in 00 is a starter; 01/02/… is a sub. Subs
         // get an indented, muted, italic name so it reads as "replaced the
         // starter above," mirroring the scorecard grid.
@@ -70677,7 +70730,7 @@ function renderFenwayBoxScore(bx, game) {
         var _bNameTd = _bIsSub
           ? '<td style="padding-left:18px;font-style:italic;color:rgba(255,255,255,0.55)">'
           : '<td>';
-        html += '<tr' + (_bMine ? ' class="fw-box-mine"' : '') + (_bIsSub ? ' style="background:rgba(255,255,255,0.02)"' : '') + '>' + _bNameTd + nameHtml + ' <span style="color:rgba(255,255,255,0.25);font-size:9px">' + b.pos + '</span>' + (typeof extOwnDots === 'function' ? extOwnDots(b.name) : '') + batBadge + batT100 + '</td>';
+        html += '<tr' + (_bMine ? ' class="fw-box-mine"' : '') + (_bIsSub ? ' style="background:rgba(255,255,255,0.02)"' : '') + '>' + _bNameTd + nameHtml + ' <span style="color:rgba(255,255,255,0.25);font-size:9px">' + b.pos + '</span>' + (typeof extOwnDots === 'function' ? extOwnDots(b.name, null, 'MLB') : '') + batBadge + batT100 + '</td>';
         batCols.forEach(function(c) {
           var val = b.stats[c.key];
           // For AVG: MLB Stats API per-game `stats.batting` doesn't include
@@ -70732,7 +70785,7 @@ function renderFenwayBoxScore(bx, game) {
         else if (p.stats.saves && parseInt(p.stats.saves) > 0) note = ' <span style="color:#FFB347">SV</span>';
         else if (p.stats.holds && parseInt(p.stats.holds) > 0) note = ' <span style="color:rgba(242,233,208,0.4)">H</span>';
         
-        var _pMine = (typeof _skOwnsPlayerByName === 'function' && _skOwnsPlayerByName(p.name));
+        var _pMine = (typeof _skOwnsPlayerByName === 'function' && _skOwnsPlayerByName(p.name, 'MLB'));
         var _pCol = _pMine ? (side.accent || '#f5c518') : '';
         var _pNameStyle = 'cursor:pointer;text-decoration:underline;text-decoration-color:rgba(255,255,255,0.15)' +
           (_pMine ? ';color:' + _pCol + ';font-weight:800;text-decoration-color:' + _pCol : '');
@@ -70740,7 +70793,7 @@ function renderFenwayBoxScore(bx, game) {
           : (_pMine ? '<span style="color:' + _pCol + ';font-weight:800">' + p.name + '</span>' : p.name);
         var pitBadge = _fwStandoutBadgeHtml(_fwStandoutBadge(game, p.pid));
         var pitT100 = _mlbTop100BadgeHtml(_mlbTop100Badge(p.pid));
-        html += '<tr' + (_pMine ? ' class="fw-box-mine"' : '') + '><td>' + pNameHtml + note + (typeof extOwnDots === 'function' ? extOwnDots(p.name) : '') + pitBadge + pitT100 + '</td>';
+        html += '<tr' + (_pMine ? ' class="fw-box-mine"' : '') + '><td>' + pNameHtml + note + (typeof extOwnDots === 'function' ? extOwnDots(p.name, null, 'MLB') : '') + pitBadge + pitT100 + '</td>';
         pitCols.forEach(function(c) {
           var val = p.stats[c.key];
           // ERA: per-game pitching stats from MLB Stats API don't include
@@ -118405,14 +118458,19 @@ function _injAthleteId(a) {
 function _injIsMine(name) {
   if (!name) return false;
   try {
-    if (typeof _skOwnsPlayerByName === 'function' && _skOwnsPlayerByName(name)) return true;
+    if (typeof _skOwnsPlayerByName === 'function' &&
+        _skOwnsPlayerByName(name, 'MLB')) return true;   // OWNDOTSPORT
   } catch (e) {}
   try {
     if (typeof _extDotIndex === 'function') {
       var idx = _extDotIndex();
       var nm = (typeof _skNormalizeName === 'function')
         ? _skNormalizeName(name) : String(name).toLowerCase();
-      if (nm && idx && idx.byName && idx.byName[nm]) return true;
+      // The entry is now { SPORT: { provider: 1 } }, so a bare truthiness
+      // test would count a basketball roster as owning a pitcher. This board
+      // is baseball. OWNDOTSPORT
+      if (nm && idx && idx.byName && typeof _extDotProvs === 'function' &&
+          _extDotProvs(idx.byName[nm], 'MLB')) return true;
     }
   } catch (e) {}
   return false;
