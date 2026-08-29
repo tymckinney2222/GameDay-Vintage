@@ -34356,15 +34356,42 @@ function buildQuarterStrip(game, accentHex) {
 
   // Regulation period count + column label by sport.
   var _lg = game.league;
+  var _isVB = (_lg === 'NCAAWVB');
   var regCount, periodLabel;
   if (_lg === 'NHL') {
     regCount = 3; periodLabel = 'P';
+  } else if (_isVB) {
+    // A match is best-of-5 and the fifth set IS the decider, so there is no
+    // overtime column to add — five is the ceiling, not regulation. VBSETSTRIP
+    regCount = 5; periodLabel = 'S';
   } else {
     regCount = 4; periodLabel = 'Q'; // football + basketball + default
   }
 
-  var hasOT = numQ > regCount;
+  var hasOT = !_isVB && numQ > regCount;
   var regQ = Math.min(numQ, regCount);
+
+  // ── Which side took each set ── VBSETSTRIP ──
+  // Every volleyball set ends with points on both sides, so the "did they
+  // score here" test the other sports use would bold every cell. What matters
+  // instead is who WON the set, which needs both teams' columns together —
+  // hence precomputing here rather than inside the per-team row.
+  //
+  // A set is finished at the cap AND two clear points: 25-24 has reached 25
+  // but is still in play, 27-25 is over. Same rule the court overlay uses.
+  var _setWinA = [], _setWinH = [];
+  if (_isVB) {
+    for (var vi = 0; vi < regQ; vi++) {
+      var _av = awayQ[vi], _hv = homeQ[vi];
+      if (_av == null || _hv == null) { _setWinA.push(false); _setWinH.push(false); continue; }
+      var _cap = (typeof _vbSetCap === 'function')
+        ? _vbSetCap(vi + 1, regCount)
+        : ((vi + 1 >= regCount) ? 15 : 25);
+      var _done = (Math.max(_av, _hv) >= _cap && Math.abs(_av - _hv) >= 2);
+      _setWinA.push(_done && _av > _hv);
+      _setWinH.push(_done && _hv > _av);
+    }
+  }
 
   // Color treatment matches the inning strip. Source the per-team accent
   // from the curated identity colors each sport uses on the scoreboard,
@@ -34410,9 +34437,12 @@ function buildQuarterStrip(game, accentHex) {
   var thCells = '<th class="inn-team-label"></th>';
   for (var i = 0; i < regQ; i++) thCells += '<th>' + periodLabel + (i + 1) + '</th>';
   if (hasOT) thCells += '<th>OT</th>';
-  thCells += '<th class="inn-total">F</th>';
+  // The total column carries sets won for volleyball, not a points total, so
+  // it gets S rather than F. game.away.score is already the set count on the
+  // scoreboard feed, which is what the row total reads below. VBSETSTRIP
+  thCells += '<th class="inn-total">' + (_isVB ? 'S' : 'F') + '</th>';
 
-  function teamRowQ(abbr, logoUrl, qs, totalScore, ink, isWinner) {
+  function teamRowQ(abbr, logoUrl, qs, totalScore, ink, isWinner, setWins) {
     // Team identity cell: prefer the logo (vintage scorecards read cleaner with
     // the mark than the abbr); fall back to the abbr text when no logo resolves.
     var labelInner = logoUrl
@@ -34421,8 +34451,16 @@ function buildQuarterStrip(game, accentHex) {
     var cells = '<td class="inn-team-label">' + labelInner + '</td>';
     for (var i = 0; i < regQ; i++) {
       var val = qs[i];
-      var txt = val != null ? (val === 0 ? '-' : val) : '\u00B7';
-      var isScoring = val != null && val > 0;
+      var txt, isScoring;
+      if (_isVB) {
+        // Show the set score as played — a 0 here means no data, not a blank
+        // period, and volleyball has no scoreless set to dash out.
+        txt = (val != null) ? val : '\u00B7';
+        isScoring = !!(setWins && setWins[i]);
+      } else {
+        txt = val != null ? (val === 0 ? '-' : val) : '\u00B7';
+        isScoring = val != null && val > 0;
+      }
       var cellStyle = isScoring ? ' style="color:' + ink + ';font-weight:900"' : '';
       cells += '<td class="' + (isScoring ? 'inn-scored' : '') + '"' + cellStyle + '>' + txt + '</td>';
     }
@@ -34459,8 +34497,8 @@ function buildQuarterStrip(game, accentHex) {
     '<table class="card-inning-table card-qstrip">' +
       '<thead><tr>' + thCells + '</tr></thead>' +
       '<tbody>' +
-        teamRowQ(game.away.abbr, _aLogoQ, awayQ, awayTotal, awayInk, awayWin) +
-        teamRowQ(game.home.abbr, _hLogoQ, homeQ, homeTotal, homeInk, homeWin) +
+        teamRowQ(game.away.abbr, _aLogoQ, awayQ, awayTotal, awayInk, awayWin, _setWinA) +
+        teamRowQ(game.home.abbr, _hLogoQ, homeQ, homeTotal, homeInk, homeWin, _setWinH) +
       '</tbody>' +
     '</table>' +
   '</div>';
@@ -35306,16 +35344,20 @@ function renderCards() {
         })()}
         ${(() => {
           if (isPre || !(g.scoreFlow?.length > 1)) return '';
-          // Vintage baseball and football replace the sparkline with their
-          // box-score strip (innings / quarters) — the strip already carries
-          // the scoring flow, so the sparkline is redundant and the space
-          // reads cleaner without it. Keep the sparkline everywhere else
-          // (dark mode, or vintage NBA/NHL).
-          const _vtStripSport = _isVintageNow && (g.league === 'MLB' || g.league === 'MiLB' || g.league === 'NFL' || g.league === 'NCAAFB' || g.league === 'NHL' || g.league === 'NBA' || g.league === 'WNBA' || g.league === 'GLEAGUE' || g.league === 'NBASL' || g.league === 'NCAAMB');
+          // Vintage sports replace the sparkline with their box-score strip
+          // (innings / quarters / sets) — the strip already carries the scoring
+          // flow, so the sparkline is redundant and the space reads cleaner
+          // without it.
+          //
+          // Volleyball joins that list. Its sparkline plots cumulative point
+          // differential ACROSS sets, which for this sport is actively
+          // misleading: a team that lost 25-27, 25-27 has a flat line and no
+          // sets, while the set strip shows exactly what happened. VBSETSTRIP
+          const _vtStripSport = _isVintageNow && (g.league === 'MLB' || g.league === 'MiLB' || g.league === 'NFL' || g.league === 'NCAAFB' || g.league === 'NHL' || g.league === 'NBA' || g.league === 'WNBA' || g.league === 'GLEAGUE' || g.league === 'NBASL' || g.league === 'NCAAMB' || g.league === 'NCAAWVB');
           return _vtStripSport ? '' : buildSparkline(g);
         })()}
         ${(_isVintageNow && !isPre && (g.league === 'MLB' || g.league === 'MiLB')) ? buildInningStrip(g, homeAccentHex) : ''}
-        ${(_isVintageNow && !isPre && (g.league === 'NFL' || g.league === 'NCAAFB' || g.league === 'NHL' || g.league === 'NBA' || g.league === 'WNBA' || g.league === 'GLEAGUE' || g.league === 'NBASL' || g.league === 'NCAAMB')) ? buildQuarterStrip(g, homeAccentHex) : ''}
+        ${(_isVintageNow && !isPre && (g.league === 'NFL' || g.league === 'NCAAFB' || g.league === 'NHL' || g.league === 'NBA' || g.league === 'WNBA' || g.league === 'GLEAGUE' || g.league === 'NBASL' || g.league === 'NCAAMB' || g.league === 'NCAAWVB')) ? buildQuarterStrip(g, homeAccentHex) : ''}
         ${(_isVintageNow && isLive && (g.league === 'MLB' || g.league === 'MiLB')) ? buildBaseOutCount(g, homeAccentHex) : ''}
         ${(isLive && (g.currPitcher || g.currBatter))
           ? `<div class="card-matchup-now">
@@ -41917,22 +41959,37 @@ function fetchCourtData(game) {
 // not, which is why the poll positions never appeared. So the game object —
 // built from the scoreboard and already in hand — is the primary source, and
 // the summary competitor is only a fallback in case ESPN starts including it.
-function _courtRankInfo(comp, side) {
+function _courtRankInfo(comp, side, league) {
   if (side && side.rank && side.rank.current) return side.rank;
   if (typeof _espRankInfo === 'function') {
     var fromSummary = _espRankInfo(comp);
     if (fromSummary) return fromSummary;
   }
+  // ── Third source ── VBRANK ──
+  // Neither of the above fires for volleyball: ESPN leaves ranks[] off the
+  // volleyball scoreboard and off the summary competitor. But the CARDS show
+  // #14 / #13 fine, because they read _t25RankIndex — built from the separate
+  // rankings feed that the Top 25 board already prefetches. Same source, so
+  // the overlay agrees with the card that opened it.
+  //
+  // That feed carries a position only, no previous week, so there is no poll
+  // movement arrow on this path. A number with no arrow is correct here;
+  // inventing a previous would not be.
+  var _lg = league || (typeof courtGame !== 'undefined' && courtGame && courtGame.league) || null;
+  if (_lg && side && typeof getTeamRank === 'function') {
+    var n = getTeamRank(_lg, side);
+    if (n != null && n >= 1 && n <= 25) return { current: n, previous: null, poll: null };
+  }
   return null;
 }
 
-function _courtRankNum(comp, side) {
-  var info = _courtRankInfo(comp, side);
+function _courtRankNum(comp, side, league) {
+  var info = _courtRankInfo(comp, side, league);
   return info ? info.current : null;
 }
 
-function _courtRankChip(comp, accent, side) {
-  var r = _courtRankInfo(comp, side);   // ESPRANK
+function _courtRankChip(comp, accent, side, league) {
+  var r = _courtRankInfo(comp, side, league);   // ESPRANK
   if (!r) return '';
   var cur = r.current;
   if (cur == null || cur > 25) return '';
@@ -42101,7 +42158,7 @@ function renderCourt() {
     '<div class="court-team">' +
       _cLogo(aLogo, game.away, 'court-crest') +
       '<div class="court-abbr" style="color:' + aR + '">' + esc(game.away.abbr) +
-        _courtRankChip(aC, aR, game.away) + '</div>' +
+        _courtRankChip(aC, aR, game.away, game.league) + '</div>' +
       '<div class="court-sets" style="color:' + aR + '">' + aSets + '</div>' +
       '<div class="court-rec">' + esc(game.away.record || '') + '</div>' +
     '</div>' +
@@ -42112,7 +42169,7 @@ function renderCourt() {
     '<div class="court-team right">' +
       _cLogo(hLogo, game.home, 'court-crest') +
       '<div class="court-abbr" style="color:' + hR + '">' +
-        _courtRankChip(hC, hR, game.home) + esc(game.home.abbr) + '</div>' +
+        _courtRankChip(hC, hR, game.home, game.league) + esc(game.home.abbr) + '</div>' +
       '<div class="court-sets" style="color:' + hR + '">' + hSets + '</div>' +
       '<div class="court-rec">' + esc(game.home.record || '') + '</div>' +
     '</div>' +
@@ -42158,13 +42215,32 @@ function renderCourt() {
 
   // ── SET MOMENTUM — the same shape as the gym's quarter bars ──
   var rows = '';
+  var _needA0 = v.needed - v.aWon, _needH0 = v.needed - v.hWon;
   for (i = 0; i < v.sets.length; i++) {
     var st = v.sets[i];
     var mx = Math.max(st.a, st.h, 1);
     var aW = Math.round(st.a / mx * 100), hW = Math.round(st.h / mx * 100);
-    var tag = st.live ? '<span class="court-mtag live">IN PLAY</span>'
-            : st.deuce ? '<span class="court-mtag deuce">DEUCE</span>'
-            : (st.n >= v.bestOf ? '<span class="court-mtag dec">DECIDER</span>' : '');
+    var tag;
+    if (st.live) {
+      // A live set can be several things at once. Show IN PLAY for the state,
+      // then at most one escalation, strongest first: a point that ends the
+      // MATCH outranks one that ends the set, which outranks deuce. VBLIVESET
+      tag = '<span class="court-mtag live">IN PLAY</span>';
+      var _aSP = (st.aToSet === 1), _hSP = (st.hToSet === 1);
+      var _aMP = _aSP && (_needA0 === 1), _hMP = _hSP && (_needH0 === 1);
+      if (_aMP || _hMP) {
+        tag += '<span class="court-mtag deuce">' +
+          esc((_aMP ? game.away.abbr : game.home.abbr)) + ' MATCH POINT</span>';
+      } else if (_aSP || _hSP) {
+        tag += '<span class="court-mtag deuce">' +
+          esc((_aSP ? game.away.abbr : game.home.abbr)) + ' SET POINT</span>';
+      } else if (st.liveDeuce) {
+        tag += '<span class="court-mtag deuce">DEUCE</span>';
+      }
+    } else {
+      tag = st.deuce ? '<span class="court-mtag deuce">DEUCE</span>'
+          : (st.n >= v.bestOf ? '<span class="court-mtag dec">DECIDER</span>' : '');
+    }
     rows += '<div class="court-mrow">' +
       '<span class="court-mlbl">S' + st.n + tag + '</span>' +
       '<div class="court-mside away">' +
@@ -42205,6 +42281,29 @@ function renderCourt() {
         '<span class="court-totv right" style="color:' + (v.hPts >= v.aPts ? hR : 'rgba(255,255,255,0.4)') + '">' + v.hPts + '</span>' +
       '</div>' +
     '</div>';
+
+  // ── Win probability ── VBWINPROB ──
+  // Rendered as a two-sided bar rather than a chart, to sit in the same visual
+  // language as SET MOMENTUM and TOTAL POINTS above it. Absent once the match
+  // is decided, and until enough points are on the board to mean anything.
+  var _wp = (typeof _vbWinProb === 'function') ? _vbWinProb(v) : null;
+  if (_wp) {
+    var _aPct = Math.round(_wp.a * 100), _hPct = 100 - _aPct;
+    // Keep 99/1 from rendering as 100/0 — a live match is never certain.
+    if (_aPct >= 100) { _aPct = 99; _hPct = 1; }
+    if (_aPct <= 0) { _aPct = 1; _hPct = 99; }
+    h += '<div class="court-sect">\u25d0 WIN PROBABILITY</div>' +
+      '<div class="court-sect-body" style="border-bottom:' + div + '">' +
+        '<div class="court-tot">' +
+          '<span class="court-totv" style="color:' + (_aPct >= _hPct ? aR : 'rgba(255,255,255,0.4)') + '">' + _aPct + '%</span>' +
+          '<div class="court-tottrack"><div class="court-totbar" style="width:' +
+            _aPct + '%;background:' + aAcc + ';margin-left:auto"></div></div>' +
+          '<div class="court-tottrack"><div class="court-totbar" style="width:' +
+            _hPct + '%;background:' + hAcc + '"></div></div>' +
+          '<span class="court-totv right" style="color:' + (_hPct >= _aPct ? hR : 'rgba(255,255,255,0.4)') + '">' + _hPct + '%</span>' +
+        '</div>' +
+      '</div>';
+  }
 
   // ── Tale of the tape ── VBCOURT ──
   // Every row here is squeezed out of the set scores, because that is all the
@@ -42249,6 +42348,43 @@ function renderCourt() {
     var aNeed = v.needed - v.aWon, hNeed = v.needed - v.hWon;
     tape.push(['TO CLINCH',
       _tapeTeam(true) + ' ' + aNeed + ' \u00b7 ' + _tapeTeam(false) + ' ' + hNeed, true]);
+
+    // TO CLINCH counts SETS. This counts POINTS, which is the number you
+    // actually want while a rally is going on — and the one no scoreboard
+    // shows. VBLIVESET
+    var _lv = null;
+    for (var _li = 0; _li < v.sets.length; _li++) { if (v.sets[_li].live) { _lv = v.sets[_li]; break; } }
+    if (_lv && _lv.aToSet != null) {
+      tape.push(['TO WIN SET ' + _lv.n,
+        _tapeTeam(true) + ' ' + _lv.aToSet + ' \u00b7 ' + _tapeTeam(false) + ' ' + _lv.hToSet, true]);
+    }
+
+    // ── Reverse sweep watch ── VBSWEEP ──
+    // Down 0-2 in a best-of-five and still alive. The existing COMEBACK row
+    // only fires after the match ends, so the most gripping stretch of a
+    // volleyball match had nothing marking it while it was happening.
+    if (v.bestOf >= 5 && (v.aWon === 0 || v.hWon === 0)) {
+      var _trailAway = (v.aWon === 0 && v.hWon >= 2);
+      var _trailHome = (v.hWon === 0 && v.aWon >= 2);
+      if (_trailAway || _trailHome) {
+        tape.push(['REVERSE SWEEP',
+          _tapeTeam(_trailAway) + ' needs 3 straight', true]);
+      }
+    } else if (v.bestOf >= 5) {
+      // Already partway there: trailed 0-2, has since taken at least one.
+      var _s = v.sets;
+      if (_s.length >= 3 && !_s[0].live && !_s[1].live) {
+        var _awayLost2 = _s[0].hWin && _s[1].hWin;
+        var _homeLost2 = _s[0].aWin && _s[1].aWin;
+        if (_awayLost2 && v.aWon >= 1) {
+          tape.push(['REVERSE SWEEP',
+            _tapeTeam(true) + ' ' + (v.aWon === 2 ? 'forcing a 5th' : 'one set back'), true]);
+        } else if (_homeLost2 && v.hWon >= 1) {
+          tape.push(['REVERSE SWEEP',
+            _tapeTeam(false) + ' ' + (v.hWon === 2 ? 'forcing a 5th' : 'one set back'), true]);
+        }
+      }
+    }
   }
 
   // Overall control. Distinct from avg margin: this weights a long grinding
@@ -42278,11 +42414,16 @@ function renderCourt() {
   tape.push(['DEUCE SETS', String(v.deuces)]);
 
   // The one bit of narrative the set ORDER carries: a winner who lost the
-  // opener had to come back for it.
+  // opener had to come back for it. Dropping the first TWO and still winning
+  // is a different animal and gets named as such. VBSWEEP
   if (v.decided && v.sets.length && !v.sets[0].live) {
     var winnerIsAway = v.aWon > v.hWon;
     var lostOpener = winnerIsAway ? v.sets[0].hWin : v.sets[0].aWin;
-    if (lostOpener) {
+    var lostTwo = lostOpener && v.sets.length > 1 && !v.sets[1].live &&
+      (winnerIsAway ? v.sets[1].hWin : v.sets[1].aWin);
+    if (lostTwo) {
+      tape.push(['REVERSE SWEEP', _tapeTeam(winnerIsAway) + ' from 0\u20132 down', true]);
+    } else if (lostOpener) {
       tape.push(['COMEBACK', _tapeTeam(winnerIsAway) + ' after dropping set 1', true]);
     }
   }
@@ -42357,6 +42498,78 @@ function _vbNum(ls) {
 }
 
 // Everything the ladder needs, or null when there are no sets to show.
+// ── Match win probability ── VBWINPROB ──
+// Set scores are all ESPN gives, so the model is built entirely from them.
+// Three stages, each doing one job:
+//
+//   1. rally edge   Point share across the match, shrunk toward even early on.
+//                   Ten points into a match, a 7-3 lead means very little.
+//   2. current set  A race: A needs `aToSet` points, H needs `hToSet`, each
+//                   rally won with probability q. Exact via DP, not a guess.
+//   3. the match    A race again, one level up: sets instead of points, each
+//                   set won with probability p.
+//
+// Deliberately NOT modelled: serve rotation, substitutions, timeouts, who is
+// on the floor. None of it is in the feed, and a model that pretends to know
+// them would just be decorated noise.
+function _vbRace(needA, needH, q) {
+  // P(A reaches needA successes before H reaches needH), per-trial prob q.
+  if (needA <= 0) return 1;
+  if (needH <= 0) return 0;
+  var prev = [], cur = [], i, j;
+  // f[i][j] = A needs i, H needs j. Rows built up from i = 0.
+  for (j = 0; j <= needH; j++) prev.push(1);   // i === 0 -> A already there
+  for (i = 1; i <= needA; i++) {
+    cur = [0];                                  // j === 0 -> H already there
+    for (j = 1; j <= needH; j++) {
+      cur.push(q * prev[j] + (1 - q) * cur[j - 1]);
+    }
+    prev = cur;
+  }
+  return prev[needH];
+}
+
+function _vbWinProb(v) {
+  if (!v || !v.sets.length) return null;
+  if (v.decided) return null;                   // nothing left to forecast
+
+  var totalPts = v.aPts + v.hPts;
+  if (totalPts < 12) return null;               // too early to say anything
+
+  // 1 — rally edge, shrunk toward even while the sample is small.
+  var rawQ = v.aPts / totalPts;
+  var wq = Math.min(1, totalPts / 90);
+  var q = 0.5 + wq * (rawQ - 0.5);
+  q = Math.max(0.20, Math.min(0.80, q));
+
+  // Per-set probability from the same edge, over a nominal 25-point race, then
+  // shrunk again by how many sets we have actually seen. A single set is thin
+  // evidence; three sets is a pattern.
+  var played = 0, k;
+  for (k = 0; k < v.sets.length; k++) { if (!v.sets[k].live) played++; }
+  var pSetRaw = _vbRace(25, 25, q);
+  var wp = played / (played + 1.2);
+  var p = 0.5 + wp * (pSetRaw - 0.5);
+  p = Math.max(0.05, Math.min(0.95, p));
+
+  // 2 — the set currently on the floor, if there is one.
+  var liveSet = null;
+  for (k = 0; k < v.sets.length; k++) { if (v.sets[k].live) { liveSet = v.sets[k]; break; } }
+
+  var needA = v.needed - v.aWon, needH = v.needed - v.hWon;
+  var aProb;
+  if (liveSet && liveSet.aToSet != null) {
+    var pCur = _vbRace(liveSet.aToSet, liveSet.hToSet, q);
+    // 3 — win the live set, or lose it and win from one set further back.
+    aProb = pCur * _vbRace(needA - 1, needH, p) +
+            (1 - pCur) * _vbRace(needA, needH - 1, p);
+  } else {
+    aProb = _vbRace(needA, needH, p);
+  }
+  aProb = Math.max(0.005, Math.min(0.995, aProb));
+  return { a: aProb, h: 1 - aProb, q: q, p: p };
+}
+
 function _vbSets(data, game) {
   var header = data && data.header && data.header.competitions && data.header.competitions[0];
   if (!header) return null;
@@ -42395,13 +42608,31 @@ function _vbSets(data, game) {
     var done = (hi >= cap && margin >= 2);
     var aWin = done && a > h, hWin = done && h > a;
     var deuce = done && (hi > cap);
+
+    // ── Live set state ── VBLIVESET ──
+    // Points still needed to take the set: reach the cap AND lead by two,
+    // whichever demands more. At 9-6 that is 16 more; at 24-24 it is 2; at
+    // 24-26 it is 4. Never below 1 for a set still in play.
+    //
+    // The deuce flag above only describes a FINISHED set, so a live set sitting
+    // at 24-24 — the most dramatic moment in volleyball — was rendering as a
+    // plain IN PLAY. liveDeuce covers that: both sides one point from the cap
+    // or beyond, nobody yet clear by two.
+    var aToSet = null, hToSet = null, liveDeuce = false;
+    if (!done) {
+      aToSet = Math.max(cap - a, h + 2 - a, 1);
+      hToSet = Math.max(cap - h, a + 2 - h, 1);
+      liveDeuce = (Math.min(a, h) >= cap - 1);
+    }
+
     aPts += a; hPts += h;
     if (aWin) aWon++;
     if (hWin) hWon++;
     if (deuce) deuces++;
     sets.push({
       n: setNo, a: a, h: h, aWin: aWin, hWin: hWin,
-      margin: margin, deuce: deuce, cap: cap, live: !done
+      margin: margin, deuce: deuce, cap: cap, live: !done,
+      aToSet: aToSet, hToSet: hToSet, liveDeuce: liveDeuce   // VBLIVESET
     });
   }
   if (!sets.length) return null;
