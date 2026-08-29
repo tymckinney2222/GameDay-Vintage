@@ -52594,16 +52594,16 @@ function nflStadiumTheme(abbr) {
 // `team` ref. We take the last play of the last completed drive (or the
 // flat plays array as a fallback). Returns null if nothing usable, so the
 // field simply renders without a ball rather than guessing.
-function _fwFinalBallPos(data) {
+function _fwFinalBallPos(data, game) {
   if (!data) return null;
-  var lastPlay = null;
+  var lastPlay = null, lastDrive = null;
   try {
     // Prefer drives.previous (ordered); take the final drive's final play.
     var prev = (data.drives && data.drives.previous) || null;
     if (prev && prev.length) {
       for (var d = prev.length - 1; d >= 0 && !lastPlay; d--) {
         var pls = prev[d].plays || [];
-        if (pls.length) lastPlay = pls[pls.length - 1];
+        if (pls.length) { lastPlay = pls[pls.length - 1]; lastDrive = prev[d]; }
       }
     }
     // Fallback: flat plays array.
@@ -52613,13 +52613,25 @@ function _fwFinalBallPos(data) {
   } catch (e) { return null; }
   if (!lastPlay) return null;
 
-  // ESPN encodes end position as end.yardLine (0–100 absolute). Some
-  // payloads use start.yardLine when end is absent. Guard the range.
   var end = lastPlay.end || lastPlay.start || null;
   if (!end) return null;
-  var yl = (end.yardLine != null) ? Number(end.yardLine) : null;
-  if (yl == null || isNaN(yl) || yl < 0 || yl > 100) return null;
-  return yl;
+
+  // Same resolver the live path uses, so a frozen final field can't disagree
+  // with the field it was showing a snap earlier. The drive names the offence,
+  // which is all _fwAbsSpot needs for its yardsToEndzone tier. FWSPOTFIX
+  var possTeam = '';
+  try {
+    var dTm = (lastDrive && lastDrive.team) || null;
+    var dAb = dTm ? (dTm.abbreviation || dTm.abbrev || dTm.abbr || '') : '';
+    if (dAb && game) {
+      if (dAb === ((game.away && game.away.abbr) || '')) possTeam = 'away';
+      else if (dAb === ((game.home && game.home.abbr) || '')) possTeam = 'home';
+    }
+  } catch (e2) {}
+
+  return _fwAbsSpot(end, possTeam,
+    (game && game.away && game.away.abbr) || '',
+    (game && game.home && game.home.abbr) || '');
 }
 
 // ── Vintage football field graphic ──────────────────────────────────
@@ -52683,6 +52695,54 @@ function _fwLastPlayRef(data) {
   return play ? { play: play, drive: drive } : null;
 }
 
+// ── Absolute field spot ── FWSPOTFIX ──
+// Converts an ESPN play start/end node into the 0..100 the field graphic
+// wants: 0 = the AWAY goal line (drawn left), 100 = the HOME goal line
+// (drawn right).
+//
+// This was previously read straight off `yardLine` as if it were already in
+// that frame. It isn't — ESPN measures yardLine from the HOME goal line, so
+// every spot came out mirrored. TCU on their own 32 (a real case) arrived as
+// 32, which the field drew and the strip labelled as UNC 32, on the wrong
+// half of the field entirely.
+//
+// Three tiers, most trustworthy first, because the raw-yardLine polarity is
+// the one thing here that's inferred rather than self-describing:
+//   1. possessionText ("TCU 32") names the half outright — no inference at all.
+//   2. yardsToEndzone is the distance to the end zone the offence is
+//      attacking, so possession alone resolves it.
+//   3. yardLine, flipped. Last resort.
+function _fwAbsSpot(node, possTeam, awayAbbr, homeAbbr) {
+  if (!node) return null;
+  function _norm(x) { return String(x || '').toUpperCase().replace(/[^A-Z0-9]/g, ''); }
+
+  // 1 — ESPN spells the spot out, abbreviation included.
+  var pt = node.possessionText || '';
+  if (pt) {
+    var m = String(pt).match(/^(.*?)(\d{1,2})\s*$/);
+    if (m) {
+      var ab = _norm(m[1]);
+      var n = Number(m[2]);
+      if (ab && !isNaN(n) && n >= 0 && n <= 50) {
+        if (awayAbbr && ab === _norm(awayAbbr)) return n;
+        if (homeAbbr && ab === _norm(homeAbbr)) return 100 - n;
+      }
+    }
+  }
+
+  // 2 — distance to the end zone being attacked, plus who's attacking it.
+  var yte = (node.yardsToEndzone != null) ? Number(node.yardsToEndzone) : null;
+  if (yte != null && !isNaN(yte) && yte >= 0 && yte <= 100 && possTeam) {
+    // Away drives toward 100, home drives toward 0.
+    return (possTeam === 'away') ? (100 - yte) : yte;
+  }
+
+  // 3 — raw yardLine, measured from the home goal line, so flip it.
+  var yl = (node.yardLine != null) ? Number(node.yardLine) : null;
+  if (yl != null && !isNaN(yl) && yl >= 0 && yl <= 100) return 100 - yl;
+  return null;
+}
+
 function _fwSituationFromPlays(data) {
   if (!data) return null;
   var _ref = _fwLastPlayRef(data);   // FWLASTPLAY
@@ -52703,7 +52763,10 @@ function _fwSituationFromPlays(data) {
     : ((last.start && last.start.team && last.start.team.id != null)
         ? String(last.start.team.id) : null);
   if (dn == null && yl == null) return null;
-  return { down: dn, distance: dist, ballAbs: yl, possession: teamId };
+  // `node` rides along so the caller can resolve the absolute spot AFTER it
+  // knows which side has the ball — _fwAbsSpot needs possession, and that
+  // isn't settled until renderFieldStadium compares ids. FWSPOTFIX
+  return { down: dn, distance: dist, node: e, possession: teamId };
 }
 
 // "ARI 35" from an absolute spot. Past midfield the number counts back down,
@@ -52718,7 +52781,7 @@ function _fwSpotText(ballAbs, awayAbbr, homeAbbr) {
 
 function _fwFieldGraphic(opts) {
   // opts: { awayAbbr, homeAbbr, awayColor, homeColor, yardLine, possTeam,
-  //         isRedzone, ballAbs }
+  //         isRedzone, ballAbs, down, distance, league, isLive }
   var awayAbbr = opts.awayAbbr || 'AWAY';
   var homeAbbr = opts.homeAbbr || 'HOME';
   var awayColor = opts.awayColor || '#888';
@@ -52728,6 +52791,37 @@ function _fwFieldGraphic(opts) {
   // playing field), 53.3 tall (NFL width). We render end zones as 10 units.
   var W = 120, H = 53.3, EZ = 10, PF = 100;
   var fieldGreen = '#1f4a2c', fieldGreenAlt = '#22522f', lineWhite = 'rgba(255,255,255,0.85)';
+
+  // ── FWFIELDFURN — drive direction, to-gain spot, red-zone band ──────
+  // ballAbs runs 0 (AWAY goal line, drawn left) … 100 (HOME goal line, drawn
+  // right), so the away offence attacks toward 100 and the home offence
+  // attacks toward 0. Everything directional below hangs off this one sign.
+  var _possTeam = opts.possTeam || '';
+  var _dir = (_possTeam === 'away') ? 1 : (_possTeam === 'home' ? -1 : 0);
+  var _dist = (opts.distance != null) ? Number(opts.distance) : null;
+  if (_dist != null && (isNaN(_dist) || _dist <= 0)) _dist = null;
+  var _ballAbsN = (opts.ballAbs != null) ? Number(opts.ballAbs) : null;
+  if (_ballAbsN != null && (isNaN(_ballAbsN) || _ballAbsN < 0 || _ballAbsN > 100)) _ballAbsN = null;
+
+  // To-gain spot. Suppressed on goal-to-go: when the sticks would sit in or
+  // past the end zone the GOAL LINE is the line to gain, and broadcasts stop
+  // drawing a separate one rather than painting it on top of the paint.
+  var _toGain = null;
+  if (_dir !== 0 && _dist != null && _ballAbsN != null) {
+    var _tg = _ballAbsN + _dir * _dist;
+    if (_tg > 0 && _tg < 100) _toGain = _tg;
+  }
+
+  // Red-zone band = the defending 20, i.e. the 20 yards in front of the goal
+  // line the offence is attacking.
+  var _rzStart = null;
+  if (opts.isRedzone && _dir !== 0) _rzStart = (_dir === 1) ? 80 : 0;
+
+  // College hashes sit 20 yards off each sideline; NFL hashes are pulled in
+  // to 23.58 (70'9"). Same field, very different look — and CFB people notice.
+  var _lg = String(opts.league || 'NFL').toUpperCase();
+  var _isCollege = (_lg.indexOf('NCAA') === 0 || _lg === 'CFB');
+  var _hashOff = _isCollege ? 20 : 23.58;
 
   var s = '';
   s += '<svg viewBox="0 0 ' + W + ' ' + H + '" style="width:100%;height:auto;display:block" preserveAspectRatio="xMidYMid meet">';
@@ -52740,14 +52834,39 @@ function _fwFieldGraphic(opts) {
     }
   }
 
+  // Red-zone band. Sits over the mow stripes but under every painted line so
+  // the yard numbers and hashes still read cleanly through it. FWFIELDFURN
+  if (_rzStart != null) {
+    s += '<defs><linearGradient id="fwRz" x1="0" y1="0" x2="1" y2="0">' +
+         '<stop offset="0%" stop-color="#ff3b1f" stop-opacity="' + (_dir === 1 ? 0.05 : 0.30) + '"/>' +
+         '<stop offset="100%" stop-color="#ff3b1f" stop-opacity="' + (_dir === 1 ? 0.30 : 0.05) + '"/>' +
+         '</linearGradient></defs>';
+    s += '<rect x="' + (EZ + _rzStart) + '" y="0" width="20" height="' + H + '" fill="url(#fwRz)"/>';
+  }
+
   // End zones, team-colored, with names rotated vertically.
+  //
+  // The abbreviations sit on a dy offset rather than plain baseline anchoring.
+  // text-anchor centres the text along its own reading direction, but the
+  // baseline is the BOTTOM of the glyphs — and once rotated, "below the
+  // baseline" points at the end line. So the letters were growing back toward
+  // the uprights and covering them. Half a cap height (~0.72em at font-size 5)
+  // pushes the glyph body to the true middle of the end zone, which clears the
+  // goal post on both sides. Same dy for both: rotate(-90) maps +y to +x and
+  // rotate(90) maps +y to -x, so one value moves each inward.
+  //
+  // 3.0 is measured, not guessed: cap height renders at 3.51 units here, and
+  // this centres the glyph body in the space between the uprights and the goal
+  // line — 2.14 units of clearance to the post, 2.11 to the goal line, matched
+  // at both ends of the field. FWEZTEXT
+  var _ezDy = 3.0;
   function ezHex(c){ return c; }
   s += '<rect x="0" y="0" width="' + EZ + '" height="' + H + '" fill="' + ezHex(awayColor) + '" opacity="0.85"/>';
   s += '<rect x="' + (EZ + PF) + '" y="0" width="' + EZ + '" height="' + H + '" fill="' + ezHex(homeColor) + '" opacity="0.85"/>';
-  s += '<text x="' + (EZ / 2) + '" y="' + (H / 2) + '" fill="rgba(255,255,255,0.95)" ' +
+  s += '<text x="' + (EZ / 2) + '" y="' + (H / 2) + '" dy="' + _ezDy + '" fill="rgba(255,255,255,0.95)" ' +
        'font-family="Barlow Condensed,sans-serif" font-weight="800" font-size="5" letter-spacing="0.5" ' +
        'text-anchor="middle" transform="rotate(-90 ' + (EZ / 2) + ' ' + (H / 2) + ')">' + awayAbbr + '</text>';
-  s += '<text x="' + (EZ + PF + EZ / 2) + '" y="' + (H / 2) + '" fill="rgba(255,255,255,0.95)" ' +
+  s += '<text x="' + (EZ + PF + EZ / 2) + '" y="' + (H / 2) + '" dy="' + _ezDy + '" fill="rgba(255,255,255,0.95)" ' +
        'font-family="Barlow Condensed,sans-serif" font-weight="800" font-size="5" letter-spacing="0.5" ' +
        'text-anchor="middle" transform="rotate(90 ' + (EZ + PF + EZ / 2) + ' ' + (H / 2) + ')">' + homeAbbr + '</text>';
 
@@ -52775,6 +52894,40 @@ function _fwFieldGraphic(opts) {
   s += '<line x1="' + EZ + '" y1="0" x2="' + EZ + '" y2="' + H + '" stroke="#fff" stroke-width="0.5"/>';
   s += '<line x1="' + (EZ + PF) + '" y1="0" x2="' + (EZ + PF) + '" y2="' + H + '" stroke="#fff" stroke-width="0.5"/>';
 
+  // ── Goal posts ── FWFIELDFURN ──
+  // Top-down, an upright reads as the crossbar (18'6" = 6.17 yards) sitting on
+  // the end line with the gooseneck stem reaching back toward the field. Drawn
+  // just inside x=0 / x=W so the stroke isn't clipped by the viewBox edge.
+  var _gpHalf = 3.08, _gpMid = H / 2, _gpGold = '#f5c518';
+  function goalPost(endX, stemDir) {
+    var g = '';
+    // Crossbar across the end line.
+    g += '<line x1="' + endX + '" y1="' + (_gpMid - _gpHalf) + '" x2="' + endX + '" y2="' + (_gpMid + _gpHalf) +
+         '" stroke="' + _gpGold + '" stroke-width="0.55" stroke-linecap="round" opacity="0.9"/>';
+    // Uprights, as short nubs off each end of the bar.
+    g += '<line x1="' + endX + '" y1="' + (_gpMid - _gpHalf) + '" x2="' + (endX + stemDir * 1.1) + '" y2="' + (_gpMid - _gpHalf) +
+         '" stroke="' + _gpGold + '" stroke-width="0.45" stroke-linecap="round" opacity="0.9"/>';
+    g += '<line x1="' + endX + '" y1="' + (_gpMid + _gpHalf) + '" x2="' + (endX + stemDir * 1.1) + '" y2="' + (_gpMid + _gpHalf) +
+         '" stroke="' + _gpGold + '" stroke-width="0.45" stroke-linecap="round" opacity="0.9"/>';
+    // Gooseneck stem back into the end zone.
+    g += '<line x1="' + endX + '" y1="' + _gpMid + '" x2="' + (endX + stemDir * 1.6) + '" y2="' + _gpMid +
+         '" stroke="' + _gpGold + '" stroke-width="0.4" stroke-linecap="round" opacity="0.75"/>';
+    return g;
+  }
+  s += goalPost(1.0, 1);
+  s += goalPost(W - 1.0, -1);
+
+  // ── Pylons ── FWFIELDFURN ──
+  // Eight of them: where each goal line and each end line meets a sideline.
+  var _pyX = [0.35, EZ, EZ + PF, W - 0.35];
+  var _pyY = [0.3, H - 0.9];
+  _pyX.forEach(function(pxv) {
+    _pyY.forEach(function(pyv) {
+      s += '<rect x="' + (pxv - 0.3) + '" y="' + pyv + '" width="0.6" height="0.6" rx="0.15" ' +
+           'fill="#ff7a1a" opacity="0.95"/>';
+    });
+  });
+
   // Yard numbers (10..50..10) near top and bottom, upright.
   var nums = [ [10,'1 0'],[20,'2 0'],[30,'3 0'],[40,'4 0'],[50,'5 0'],[60,'4 0'],[70,'3 0'],[80,'2 0'],[90,'1 0'] ];
   nums.forEach(function(n){
@@ -52785,12 +52938,14 @@ function _fwFieldGraphic(opts) {
          'font-weight="800" font-size="4.5" text-anchor="middle" transform="rotate(180 ' + xx + ' ' + (H - 7.5) + ')">' + n[1] + '</text>';
   });
 
-  // Hash marks along both hash rows.
+  // Hash marks along both hash rows. Row position is league-dependent
+  // (_hashOff above): college 20 yards off the sideline, NFL 23.58. FWFIELDFURN
+  var _hTop = _hashOff, _hBot = H - _hashOff;
   for (var hy = 1; hy < 100; hy++) {
     if (hy % 5 === 0) continue; // skip where yard lines are
     var hx = EZ + hy;
-    s += '<line x1="' + hx + '" y1="19" x2="' + hx + '" y2="20.5" stroke="rgba(255,255,255,0.5)" stroke-width="0.15"/>';
-    s += '<line x1="' + hx + '" y1="' + (H - 20.5) + '" x2="' + hx + '" y2="' + (H - 19) + '" stroke="rgba(255,255,255,0.5)" stroke-width="0.15"/>';
+    s += '<line x1="' + hx + '" y1="' + (_hTop - 0.75) + '" x2="' + hx + '" y2="' + (_hTop + 0.75) + '" stroke="rgba(255,255,255,0.5)" stroke-width="0.15"/>';
+    s += '<line x1="' + hx + '" y1="' + (_hBot - 0.75) + '" x2="' + hx + '" y2="' + (_hBot + 0.75) + '" stroke="rgba(255,255,255,0.5)" stroke-width="0.15"/>';
   }
 
   // Midfield home-team logo at the 50, larger and semi-transparent so
@@ -52801,6 +52956,32 @@ function _fwFieldGraphic(opts) {
          '" width="' + midSz + '" height="' + midSz + '" preserveAspectRatio="xMidYMid meet" opacity="0.30"/>';
   }
 
+  // ── To-gain line ── FWFIELDFURN ──
+  // The yellow first-down line, drawn the way a broadcast does it: the sticks
+  // get yellow, the line of scrimmage below gets blue. Only appears when we
+  // have a real down & distance and the spot isn't goal-to-go (see _toGain).
+  if (_toGain != null) {
+    var tgx = EZ + _toGain;
+    s += '<line x1="' + tgx + '" y1="0" x2="' + tgx + '" y2="' + H + '" stroke="#ffd23f" ' +
+         'stroke-width="0.55" opacity="0.95"/>';
+    // Down & distance flag riding the top of the line.
+    if (opts.down) {
+      var _dSuf = (opts.down === 1) ? 'ST' : (opts.down === 2 ? 'ND' : (opts.down === 3 ? 'RD' : 'TH'));
+      var _dLbl = opts.down + _dSuf + ' & ' + _dist;
+      var _fw = 1.55 * String(_dLbl).length + 2.4;
+      // Flag hangs on the ATTACKING side of the sticks — downfield, away from
+      // the line of scrimmage — so it never sits on top of the ball or the LOS.
+      var _fx = tgx + (_dir === 1 ? 0.6 : -(_fw + 0.6));
+      // Keep the flag inside the field of play at both ends.
+      if (_fx < EZ + 0.4) _fx = EZ + 0.4;
+      if (_fx + _fw > EZ + PF - 0.4) _fx = EZ + PF - 0.4 - _fw;
+      s += '<rect x="' + _fx + '" y="1.1" width="' + _fw + '" height="4" rx="0.7" fill="#ffd23f" opacity="0.95"/>';
+      s += '<text x="' + (_fx + _fw / 2) + '" y="4.25" fill="#14200a" font-family="Barlow Condensed,sans-serif" ' +
+           'font-weight="800" font-size="2.9" letter-spacing="0.12" text-anchor="middle">' +
+           _dLbl.replace(/&/g, '&amp;') + '</text>';
+    }
+  }
+
   // Ball placement. ballAbs is an absolute 0..100 field position (0 = away
   // end zone goal line, 100 = home end zone goal line). If null, no ball.
   var ballAbs = opts.ballAbs;
@@ -52808,8 +52989,24 @@ function _fwFieldGraphic(opts) {
     var bx = EZ + ballAbs;
     var by = H / 2;
     var ballColor = opts.isRedzone ? '#ff3b1f' : '#8a5a2b';
-    // Line of scrimmage marker.
-    s += '<line x1="' + bx + '" y1="2" x2="' + bx + '" y2="' + (H - 2) + '" stroke="#ffd23f" stroke-width="0.4" opacity="0.9"/>';
+    // Line of scrimmage marker. Blue, because yellow now belongs to the
+    // to-gain line above — same colour language as the broadcast. When there
+    // is no to-gain line to distinguish it from (final games, no down data)
+    // it stays the original yellow so a frozen field reads as it always did.
+    // Blue whenever we know who has it and it's live — including goal-to-go,
+    // where there is no separate to-gain line to contrast against. Only a
+    // frozen field with no possession falls back to the original yellow.
+    var _losColor = (_dir !== 0 && opts.isLive) ? '#3d8bff' : '#ffd23f';
+    s += '<line x1="' + bx + '" y1="2" x2="' + bx + '" y2="' + (H - 2) + '" stroke="' + _losColor + '" stroke-width="0.4" opacity="0.9"/>';
+    // Direction of attack — a small chevron ahead of the ball, so which way
+    // the offence is going never has to be inferred from the score header.
+    if (_dir !== 0 && opts.isLive) {
+      var _cvx = bx + _dir * 4.2;
+      var _cw = _dir * 1.5;
+      s += '<path d="M' + _cvx + ',' + (H / 2 - 1.5) + ' L' + (_cvx + _cw) + ',' + (H / 2) +
+           ' L' + _cvx + ',' + (H / 2 + 1.5) + '" fill="none" stroke="rgba(255,255,255,0.75)" ' +
+           'stroke-width="0.4" stroke-linecap="round" stroke-linejoin="round"/>';
+    }
     // Football (ellipse + laces).
     s += '<g transform="translate(' + bx + ' ' + by + ')">';
     s += '<ellipse rx="2.4" ry="1.5" fill="' + ballColor + '" stroke="#f4e6c8" stroke-width="0.25"/>';
@@ -53135,6 +53332,68 @@ function _fwBuildScoringTimeline(data, game, awayAccent, homeAccent, divStyle) {
   return html;
 }
 
+// ── AP / Coaches poll rank badge ── FWRANK ──
+// The scoreboard feed carries ranks[] and parseGames already distills it to
+// side.rank via _espRankInfo, so this is purely presentation. Returns '' for
+// unranked teams and for every league that has no polls, which means callers
+// can concatenate it unconditionally — NFL/NBA/NHL simply get nothing.
+//
+// `movement` adds the week-over-week poll delta. Lower is better, so a DROP in
+// the number is a RISE in the poll; the arrow follows the poll, not the digit.
+function _fwRankBadge(side, opts) {
+  var r = side && side.rank;
+  if (!r || r.current == null || r.current < 1 || r.current > 25) return '';
+  var o = opts || {};
+  var sz = o.size || 10;
+  var mv = '';
+  if (o.movement && r.previous != null && r.previous > 0 && r.previous !== r.current) {
+    var up = r.current < r.previous;
+    mv = '<span style="color:' + (up ? '#4ade80' : '#f87171') + ';font-size:' + (sz - 2) +
+      'px;margin-left:2px">' + (up ? '\u25b2' : '\u25bc') + Math.abs(r.previous - r.current) + '</span>';
+  }
+  return '<span style="font-family:\'Barlow Condensed\',sans-serif;font-size:' + sz +
+    'px;font-weight:900;color:#f5d000;letter-spacing:0.04em;margin-right:3px;white-space:nowrap"' +
+    (r.poll ? ' title="' + _esc(String(r.poll)) + ' #' + r.current + '"' : '') +
+    '>#' + r.current + mv + '</span>';
+}
+
+// ── Score header status label ── FWSTATUS ──
+// The old label was clock + ' · Q' + period, which reads "0:00 · Q2" at the
+// half and "Q5" in overtime — both technically true and neither what anyone
+// calls it. ESPN's status type carries the real state, so prefer that and keep
+// the clock arithmetic only as a fallback for when the type is missing.
+function _fwPeriodLabel(period) {
+  if (!period) return '';
+  if (period <= 4) return 'Q' + period;
+  return (period > 5) ? ('OT' + (period - 4)) : 'OT';
+}
+function _fwStatusLabel(header, game, period, clock, isLive, isFinal) {
+  var t = (header && header.status && header.status.type) || {};
+  var nm = String(t.name || t.id || '').toUpperCase();
+
+  if (isFinal) {
+    // A game that needed overtime should say so on the scoreboard.
+    if (period > 4) return (period > 5) ? ('FINAL/' + (period - 4) + 'OT') : 'FINAL/OT';
+    return 'FINAL';
+  }
+  if (!isLive) return game.statusDetail || t.shortDetail || '';
+
+  var qL = _fwPeriodLabel(period);
+  if (nm.indexOf('HALFTIME') > -1) return 'HALFTIME';
+  if (nm.indexOf('END_PERIOD') > -1) return qL ? ('END ' + qL) : 'END OF PERIOD';
+  if (nm.indexOf('DELAY') > -1) return 'DELAYED';
+  if (nm.indexOf('SUSPEND') > -1) return 'SUSPENDED';
+
+  // Fallback when ESPN gives no usable type: an expired clock is the end of
+  // something, and the end of the 2nd is the half.
+  var expired = (clock === '0:00' || clock === '00:00' || clock === '0.0');
+  if (expired && period === 2) return 'HALFTIME';
+  if (expired && qL) return 'END ' + qL;
+
+  if (!clock) return t.shortDetail || 'LIVE';
+  return qL ? (clock + ' \u00b7 ' + qL) : clock;
+}
+
 function renderFieldStadium() {
   var body = document.getElementById('fieldBody');
   if (!fieldGame || !body) return;
@@ -53184,10 +53443,32 @@ function renderFieldStadium() {
     if (!down && _sitPlay.down != null) down = _sitPlay.down;
     if (!distance && _sitPlay.distance != null) distance = _sitPlay.distance;
     if (!possession && _sitPlay.possession) possession = _sitPlay.possession;
-    ballAbsPlay = _sitPlay.ballAbs;
-    if (!yardLine && ballAbsPlay != null) yardLine = ballAbsPlay;
   }
   var possTeam = String(possession) === String(game.home.id) ? 'home' : (possession ? 'away' : '');
+  // The absolute spot has to wait for possTeam — _fwAbsSpot needs to know who
+  // is attacking which end zone before it can place the ball. FWSPOTFIX
+  if (_sitPlay && _sitPlay.node) {
+    ballAbsPlay = _fwAbsSpot(_sitPlay.node, possTeam, game.away.abbr, game.home.abbr);
+    if (!yardLine && ballAbsPlay != null) yardLine = ballAbsPlay;
+  }
+  // One spot, resolved once. The red-zone test, the BALL ON readout and the
+  // field graphic all have to agree, and they can only do that by reading the
+  // same number. Play node first, situation block as the fallback. FWSPOTFIX
+  var _liveSpot = (ballAbsPlay != null) ? ballAbsPlay
+    : _fwAbsSpot(situation, possTeam, game.away.abbr, game.home.abbr);
+
+  // ── Red zone ── FWREDZONE ──
+  // situation.isRedZone is the flag, but this feed's situation block is
+  // routinely empty — the same absence that made _fwSituationFromPlays
+  // necessary in the first place. So the flag never fires and a 1st-and-goal
+  // from the 9 renders as an ordinary snap at midfield brightness.
+  //
+  // The spot already says everything the flag would: the red zone is the last
+  // 20 yards in front of the end zone the offence is attacking. Trust ESPN's
+  // flag when it's there, derive it when it isn't.
+  if (!isRedzone && isLive && possTeam && _liveSpot != null) {
+    isRedzone = (possTeam === 'home') ? (_liveSpot <= 20) : (_liveSpot >= 80);
+  }
   if (!down && downText) { var dm = downText.match(/(\d)\w+\s*&\s*(\d+)/); if (dm){down=parseInt(dm[1]);distance=parseInt(dm[2]);} }
   var awayTimeouts=3, homeTimeouts=3;
   comps.forEach(function(c){ if(c.homeAway==='away'&&c.timeoutsRemaining!=null)awayTimeouts=c.timeoutsRemaining; if(c.homeAway==='home'&&c.timeoutsRemaining!=null)homeTimeouts=c.timeoutsRemaining; });
@@ -53205,11 +53486,13 @@ function renderFieldStadium() {
   // ── SCORE HEADER ─────────────────────────────────────────────────
   var awayLogo = game.away.logo ? '<img src="'+game.away.logo+'" style="width:32px;height:32px;object-fit:contain;flex-shrink:0">' : '';
   var homeLogo = game.home.logo ? '<img src="'+game.home.logo+'" style="width:32px;height:32px;object-fit:contain;flex-shrink:0">' : '';
-  var statusLabel = isLive ? (clock ? clock + ' · Q'+period : 'LIVE') : isFinal ? 'FINAL' : (game.statusDetail||'');
+  var statusLabel = _fwStatusLabel(header, game, period, clock, isLive, isFinal);   // FWSTATUS
+  var awayRank = _fwRankBadge(game.away, { size: 11, movement: true });             // FWRANK
+  var homeRank = _fwRankBadge(game.home, { size: 11, movement: true });             // FWRANK
   html += '<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px 8px;border-bottom:'+divStyle+'">';
   // Away side
   html += '<div style="display:flex;align-items:center;gap:8px;flex:1">' + awayLogo +
-    '<div><div style="font-family:\'Barlow Condensed\',sans-serif;font-size:11px;font-weight:800;letter-spacing:0.12em;color:'+awayAccent+'">'+game.away.abbr+'</div>' +
+    '<div><div style="font-family:\'Barlow Condensed\',sans-serif;font-size:11px;font-weight:800;letter-spacing:0.12em;color:'+awayAccent+'">'+awayRank+game.away.abbr+'</div>' +
     (isRedzone && possTeam==='away' ? '<div style="font-size:8px;color:#ff2200;letter-spacing:0.10em;font-weight:700">🏈 RED ZONE</div>' : '') +
     '</div></div>';
   // Scores
@@ -53220,7 +53503,7 @@ function renderFieldStadium() {
   html += '</div>';
   // Home side
   html += '<div style="display:flex;align-items:center;gap:8px;flex:1;justify-content:flex-end">' +
-    '<div style="text-align:right"><div style="font-family:\'Barlow Condensed\',sans-serif;font-size:11px;font-weight:800;letter-spacing:0.12em;color:'+homeAccent+'">'+game.home.abbr+'</div>' +
+    '<div style="text-align:right"><div style="font-family:\'Barlow Condensed\',sans-serif;font-size:11px;font-weight:800;letter-spacing:0.12em;color:'+homeAccent+'">'+homeRank+game.home.abbr+'</div>' +
     (isRedzone && possTeam==='home' ? '<div style="font-size:8px;color:#ff2200;letter-spacing:0.10em;font-weight:700">🏈 RED ZONE</div>' : '') +
     '</div>' + homeLogo + '</div>';
   html += '</div>';
@@ -53267,20 +53550,12 @@ function renderFieldStadium() {
     var ballAbs = null;
     try {
       if (isLive) {
-        var rawYL = (situation.yardLine != null) ? Number(situation.yardLine) : null;
-        var absCand = null;
-        if (situation.fieldPositionValue != null) absCand = Number(situation.fieldPositionValue);
-        else if (situation.homeFieldPosition != null) absCand = Number(situation.homeFieldPosition);
-        if (absCand != null && !isNaN(absCand) && absCand >= 0 && absCand <= 100) ballAbs = absCand;
-        // The play-derived spot before the raw yardLine: it is already the
-        // absolute 0..100 the field expects, whereas situation.yardLine is
-        // the number painted on the turf and is ambiguous about which half.
-        // FWSITPLAYS
-        else if (ballAbsPlay != null) ballAbs = ballAbsPlay;
-        else if (rawYL != null && !isNaN(rawYL) && rawYL > 0 && rawYL <= 100) ballAbs = rawYL;
+        // Resolved once, up with the red-zone test, so the graphic and the
+        // readouts can't disagree about where the ball is. FWSPOTFIX
+        ballAbs = _liveSpot;
       } else {
         // Final: pull the last play's end position.
-        ballAbs = _fwFinalBallPos(data);
+        ballAbs = _fwFinalBallPos(data, game);
       }
     } catch (eBall) { ballAbs = null; }
 
@@ -53290,7 +53565,10 @@ function renderFieldStadium() {
       awayColor: awayAccent, homeColor: homeAccent,
       awayLogo: game.away.logo || '', homeLogo: game.home.logo || '',
       yardLine: yardLine, possTeam: possTeam,
-      isRedzone: isRedzone && isLive, ballAbs: ballAbs
+      isRedzone: isRedzone && isLive, ballAbs: ballAbs,
+      // FWFIELDFURN — down & distance drive the to-gain line and the
+      // direction chevron; league picks the hash-mark spacing.
+      down: down, distance: distance, league: game.league, isLive: isLive
     });
     html += '</div>';
   }
@@ -53322,7 +53600,7 @@ function renderFieldStadium() {
     if (down && distance) sitItems.push({ label:'DOWN & DIST', val: down+'<span style="font-size:11px"> & </span>'+distance });
     else if (down)        sitItems.push({ label:'DOWN', val: String(down) });
     // Spot as the field reads it, not a raw 0..100 — "ARI 35", not "65".
-    var _spotAbs = (ballAbsPlay != null) ? ballAbsPlay : (yardLine || null);
+    var _spotAbs = (_liveSpot != null) ? _liveSpot : (yardLine || null);   // FWSPOTFIX
     var _spot = (typeof _fwSpotText === 'function')
       ? _fwSpotText(_spotAbs, game.away.abbr, game.home.abbr) : '';
     if (_spot) sitItems.push({ label:'BALL ON', val: _spot });
@@ -53756,7 +54034,289 @@ function syncScoreboardGame(game, data, badgeEl) {
 }
 
 /* ─── Shared vintage top performers for all scoreboards ─── */
+// ── Football top performers ── FWPERF ──────────────────────────────
+// The generic builder ranks every athlete by yards + TD*20, which is why a
+// punter with 4 boots for 180 yards outranked the quarterback. Football gets
+// a named selection instead of a leaderboard: the guys you'd actually name if
+// someone asked who's playing well.
+//
+//   per team   QB (passing yards), RB (rushing yards), WR (receiving yards),
+//              leading tackler
+//   game-wide  sack leader, takeaway leader
+//
+// Punting, kicking and return groups are never read at all, so specialists
+// can't appear no matter how gaudy their yardage gets.
+
+function _fwGrpKey(sg) {
+  return String((sg && (sg.name || sg.text || sg.displayName)) || '')
+    .toLowerCase().replace(/[^a-z]/g, '');
+}
+
+// Labels are group-scoped and inconsistent between NFL and CFB feeds, so every
+// read goes through an alias list rather than a single hard-coded key. This
+// also keeps 'REC' honest: it is receptions under the receiving group and
+// fumbles recovered under the fumbles group, and those two must never be
+// read from a single map.
+function _fwStatMap(sg, a) {
+  var labels = (sg && sg.labels) || [];
+  var stats = (a && a.stats) || [];
+  var m = {};
+  for (var i = 0; i < labels.length; i++) {
+    m[String(labels[i]).toUpperCase().replace(/\s+/g, '')] = stats[i];
+  }
+  return m;
+}
+function _fwPick(m) {
+  for (var i = 1; i < arguments.length; i++) {
+    var k = String(arguments[i]).toUpperCase().replace(/\s+/g, '');
+    var v = m[k];
+    if (v != null && v !== '' && v !== '-') return v;
+  }
+  return null;
+}
+function _fwNum() {
+  var v = _fwPick.apply(null, arguments);
+  var n = parseStat(v);
+  return isNaN(n) ? 0 : n;
+}
+// Sacks and TFL come through as halves; everything else is whole.
+function _fwFmtNum(n) {
+  var r = Math.round(n * 10) / 10;
+  return (r === Math.round(r)) ? String(Math.round(r)) : String(r);
+}
+
+function _fwFbPerformers(data, game, hideTitle) {
+  var boxPlayers = (data && data.boxscore && data.boxscore.players) || [];
+  if (!boxPlayers.length) return '';
+
+  var ac = vibrant(game.away.color), hc = vibrant(game.home.color);
+  var league = game.league;
+  var sides = [], sackPool = [], takePool = [];
+
+  function mk(ath, side, role, line, rank) {
+    return {
+      id: ath.id, name: ath.shortName || ath.displayName || '?',
+      pos: (ath.position && ath.position.abbreviation) || '',
+      abbr: side.abbr, color: side.color, league: league,
+      role: role, statLine: line, rank: rank,
+      headshot: ath.id ? ('https://a.espncdn.com/combiner/i?img=/i/headshots/' +
+        getHeadshotSlug(league) + '/players/full/' + ath.id + '.png&w=96&h=70') : ''
+    };
+  }
+
+  boxPlayers.forEach(function(teamData, tIdx) {
+    var teamId = teamData.team && teamData.team.id;
+    var isHome = String(teamId) === String(game.home.id) || tIdx === 1;
+    var side = {
+      abbr: isHome ? game.home.abbr : game.away.abbr,
+      color: isHome ? hc : ac,
+      logo: isHome ? game.home.logo : game.away.logo,
+      teamName: isHome ? (game.home.fullName || game.home.name) : (game.away.fullName || game.away.name),
+      isHome: isHome, qb: null, rb: null, wr: null, tkl: null
+    };
+
+    (teamData.statistics || []).forEach(function(sg) {
+      var key = _fwGrpKey(sg);
+      (sg.athletes || []).forEach(function(a) {
+        var ath = a.athlete || {};
+        if (!a.stats || !a.stats.length) return;
+
+        // Player context is registered for EVERY athlete in the box score,
+        // including the specialists we skip below — the player modal reads
+        // this map by id and shouldn't lose entries just because someone
+        // didn't make the performers list.
+        if (ath.id) {
+          window._playerCtx = window._playerCtx || {};
+          if (!window._playerCtx[ath.id]) {
+            window._playerCtx[ath.id] = {
+              name: ath.shortName || ath.displayName || '?',
+              pos: (ath.position && ath.position.abbreviation) || '',
+              jersey: ath.jersey || '',
+              teamAbbr: side.abbr, teamLogo: side.logo, teamColor: side.color,
+              teamName: side.teamName, league: league
+            };
+          }
+        }
+
+        // Specialists stop here. FWPERF
+        if (key === 'punting' || key === 'kicking' || key.indexOf('return') > -1) return;
+
+        var m = _fwStatMap(sg, a);
+
+        if (key === 'passing') {
+          var py = _fwNum(m, 'YDS');
+          if (py === 0 && !_fwPick(m, 'C/ATT', 'CMP/ATT')) return;
+          var pl = [];
+          var ca = _fwPick(m, 'C/ATT', 'CMP/ATT', 'COMP/ATT');
+          if (ca) pl.push(String(ca));
+          pl.push(_fwFmtNum(py) + ' YDS');
+          var ptd = _fwNum(m, 'TD'), pint = _fwNum(m, 'INT');
+          pl.push(_fwFmtNum(ptd) + ' TD');
+          if (pint > 0) pl.push(_fwFmtNum(pint) + ' INT');
+          if (!side.qb || py > side.qb.rank) side.qb = mk(ath, side, 'QB', pl.join(' \u00b7 '), py);
+
+        } else if (key === 'rushing') {
+          var ry = _fwNum(m, 'YDS');
+          var car = _fwNum(m, 'CAR', 'ATT');
+          if (car === 0) return;
+          var rl = [_fwFmtNum(car) + ' CAR', _fwFmtNum(ry) + ' YDS'];
+          var rtd = _fwNum(m, 'TD');
+          if (rtd > 0) rl.push(_fwFmtNum(rtd) + ' TD');
+          if (!side.rb || ry > side.rb.rank) side.rb = mk(ath, side, 'RB', rl.join(' \u00b7 '), ry);
+
+        } else if (key === 'receiving') {
+          var wy = _fwNum(m, 'YDS');
+          var rec = _fwNum(m, 'REC');
+          if (rec === 0) return;
+          var wl = [_fwFmtNum(rec) + ' REC', _fwFmtNum(wy) + ' YDS'];
+          var wtd = _fwNum(m, 'TD');
+          if (wtd > 0) wl.push(_fwFmtNum(wtd) + ' TD');
+          if (!side.wr || wy > side.wr.rank) side.wr = mk(ath, side, 'WR', wl.join(' \u00b7 '), wy);
+
+        } else if (key === 'defensive') {
+          var tot = _fwNum(m, 'TOT', 'TCK', 'TACKLES', 'T');
+          var solo = _fwNum(m, 'SOLO');
+          if (tot === 0 && solo > 0) tot = solo;
+          if (tot > 0) {
+            var dl = [_fwFmtNum(tot) + ' TOT'];
+            if (solo > 0) dl.push(_fwFmtNum(solo) + ' SOLO');
+            var dtfl = _fwNum(m, 'TFL');
+            if (dtfl > 0) dl.push(_fwFmtNum(dtfl) + ' TFL');
+            if (!side.tkl || tot > side.tkl.rank) side.tkl = mk(ath, side, 'TACKLES', dl.join(' \u00b7 '), tot);
+          }
+          var sk = _fwNum(m, 'SACKS', 'SACK', 'SK');
+          if (sk > 0) {
+            var sl = [_fwFmtNum(sk) + ' SACK' + (sk === 1 ? '' : 'S')];
+            var stfl = _fwNum(m, 'TFL');
+            if (stfl > 0) sl.push(_fwFmtNum(stfl) + ' TFL');
+            sackPool.push(mk(ath, side, 'SACKS', sl.join(' \u00b7 '), sk));
+          }
+          // Some feeds put picks on the defensive line rather than in their
+          // own group; both paths feed the same pool and dedupe below.
+          var dint = _fwNum(m, 'INT');
+          if (dint > 0) takePool.push(mk(ath, side, 'TAKEAWAY', _fwFmtNum(dint) + ' INT', dint));
+
+        } else if (key === 'interceptions') {
+          var ic = _fwNum(m, 'INT');
+          if (ic > 0) {
+            var il = [_fwFmtNum(ic) + ' INT'];
+            var iy = _fwNum(m, 'YDS');
+            if (iy > 0) il.push(_fwFmtNum(iy) + ' YDS');
+            var itd = _fwNum(m, 'TD');
+            if (itd > 0) il.push(_fwFmtNum(itd) + ' TD');
+            // A pick six outranks a plain pick without inventing a whole tier.
+            takePool.push(mk(ath, side, 'TAKEAWAY', il.join(' \u00b7 '), ic + (itd > 0 ? 0.5 : 0)));
+          }
+
+        } else if (key === 'fumbles') {
+          // REC here is fumbles RECOVERED, not receptions. A player who also
+          // has a fumble of his own is most likely recovering his own ball,
+          // which is not a takeaway — so only count clean recoveries.
+          var frec = _fwNum(m, 'REC');
+          var fown = _fwNum(m, 'FUM');
+          if (frec > 0 && fown === 0) {
+            // Shaded just under an equal number of picks: a recovery is
+            // partly where the ball bounced, an interception isn't. Without
+            // this the 1-INT / 1-FR tie was settled by iteration order.
+            takePool.push(mk(ath, side, 'TAKEAWAY', _fwFmtNum(frec) + ' FR', frec - 0.1));
+          }
+        }
+      });
+    });
+    sides.push(side);
+  });
+
+  // Away first, to match the reading order everywhere else in the app.
+  sides.sort(function(a, b) { return (a.isHome ? 1 : 0) - (b.isHome ? 1 : 0); });
+
+  // One entry per player, keeping his best claim, then the single leader.
+  function best(pool) {
+    var byId = {}, out = [];
+    pool.forEach(function(p) {
+      var k = String(p.id || p.name);
+      if (!byId[k] || p.rank > byId[k].rank) byId[k] = p;
+    });
+    for (var k2 in byId) { if (byId.hasOwnProperty(k2)) out.push(byId[k2]); }
+    out.sort(function(a, b) { return b.rank - a.rank; });
+    return out.length ? out[0] : null;
+  }
+
+  var sections = [];
+  sides.forEach(function(s) {
+    var rows = [];
+    if (s.qb) rows.push(s.qb);
+    if (s.rb) rows.push(s.rb);
+    if (s.wr) rows.push(s.wr);
+    if (rows.length) sections.push({ title: s.abbr + ' OFFENSE', color: s.color, rows: rows });
+  });
+  var dRows = [];
+  sides.forEach(function(s) { if (s.tkl) dRows.push(s.tkl); });
+  var topSack = best(sackPool);
+  if (topSack) dRows.push(topSack);
+  var topTake = best(takePool);
+  if (topTake) dRows.push(topTake);
+  if (dRows.length) sections.push({ title: 'DEFENSE', color: 'rgba(255,255,255,0.45)', rows: dRows });
+
+  if (!sections.length) return '';
+
+  var html = hideTitle ? '' : '<div style="padding:8px 16px 4px;font-family:Barlow Condensed,sans-serif;font-weight:800;font-size:10px;letter-spacing:2px;color:rgba(255,255,255,0.2);text-transform:uppercase">\u2b50 TOP PERFORMERS</div>';
+
+  function badge(p) {
+    return '<span style="display:inline-block;min-width:34px;text-align:center;' +
+      'font-family:\'Barlow Condensed\',sans-serif;font-size:9px;font-weight:800;letter-spacing:0.10em;' +
+      'padding:2px 5px;border-radius:3px;background:' + p.color + '22;color:' + p.color +
+      ';border:1px solid ' + p.color + '55">' + _esc(p.role) + '</span>';
+  }
+
+  if (hideTitle) {
+    // Modal: sectioned, one full-width row per player.
+    html += '<div style="padding:4px 16px 14px">';
+    sections.forEach(function(sec) {
+      html += '<div style="font-family:\'Barlow Condensed\',sans-serif;font-weight:800;font-size:9px;' +
+        'letter-spacing:0.18em;color:' + sec.color + ';margin:12px 0 6px">' + _esc(sec.title) + '</div>';
+      sec.rows.forEach(function(p) {
+        html += '<div style="display:flex;align-items:center;gap:10px;background:rgba(255,255,255,0.03);' +
+          'border:1px solid rgba(255,255,255,0.06);border-radius:6px;padding:9px 11px;margin-bottom:6px;cursor:pointer" ' +
+          'onclick="openFenwayPlayer(\'' + p.id + '\',\'' + p.league + '\')">';
+        html += '<img src="' + p.headshot + '" style="width:40px;height:40px;border-radius:50%;object-fit:cover;flex-shrink:0" onerror="this.style.display=\'none\'">';
+        html += '<div style="flex:1;min-width:0">';
+        html += '<div style="font-family:Barlow Condensed,sans-serif;font-weight:700;font-size:14px;color:#fff">' + _esc(p.name) + '</div>';
+        html += '<div style="display:flex;align-items:center;gap:6px;margin-top:2px">' + badge(p) +
+          '<span style="font-size:10px;color:' + p.color + ';font-weight:700;letter-spacing:0.06em">' + _esc(p.abbr) + '</span></div>';
+        html += '</div>';
+        html += '<div style="font-family:Share Tech Mono,monospace;font-size:11px;color:rgba(255,255,255,0.65);text-align:right;flex-shrink:0">' + _esc(p.statLine) + '</div>';
+        html += '</div>';
+      });
+    });
+    html += '</div>';
+    return html;
+  }
+
+  // Inline: same picks, kept as the horizontal scroll strip.
+  html += '<div style="display:flex;gap:6px;padding:0 16px 10px;overflow-x:auto">';
+  sections.forEach(function(sec) {
+    sec.rows.forEach(function(p) {
+      html += '<div style="min-width:112px;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.06);' +
+        'border-radius:4px;padding:8px;text-align:center;cursor:pointer;flex-shrink:0" ' +
+        'onclick="openFenwayPlayer(\'' + p.id + '\',\'' + p.league + '\')">';
+      html += '<img src="' + p.headshot + '" style="width:40px;height:40px;border-radius:50%;object-fit:cover;margin-bottom:4px" onerror="this.style.display=\'none\'">';
+      html += '<div style="margin-bottom:3px">' + badge(p) + '</div>';
+      html += '<div style="font-family:Barlow Condensed,sans-serif;font-weight:700;font-size:12px;color:#fff">' + _esc(p.name) + '</div>';
+      html += '<div style="font-size:9px;color:' + p.color + ';font-weight:600">' + _esc(p.abbr) + '</div>';
+      html += '<div style="font-family:Share Tech Mono,monospace;font-size:9px;color:rgba(255,255,255,0.5);margin-top:2px;white-space:nowrap">' + _esc(p.statLine) + '</div>';
+      html += '</div>';
+    });
+  });
+  html += '</div>';
+  return html;
+}
+
 function buildVintagePerformers(data, game, hideTitle) {
+  // Football gets a named selection rather than a yards leaderboard. FWPERF
+  var _fwLg = (game && game.league) || '';
+  if (_fwLg === 'NFL' || _fwLg === 'NCAAFB') {
+    return _fwFbPerformers(data, game, hideTitle);
+  }
   var boxPlayers = data.boxscore?.players || [];
   if (!boxPlayers.length) return '';
   
@@ -71275,6 +71835,37 @@ function _ootApplyDecisions(gameId) {
 // divStyle is passed (the MODERN renderers), the header + strip get the same
 // bottom-border divider those sections use; otherwise the class-based header
 // (VINTAGE) is used.
+// ── Scheduled tip time for the OOT strips ── FWOOTTIME ──
+// g.statusDetail is whatever the upstream builder happened to put there, and
+// the builders disagree: some run the date through fmtLocalGameTime, some pass
+// ESPN's raw type.detail straight through. That's how one card ends up reading
+// "Sat, August 29th at 3:00 PM EDT" while the card beside it says "1:30 PM MDT"
+// — two zones and two levels of verbosity in the same row.
+//
+// So don't trust statusDetail for scheduled games: format g.date here, in the
+// viewer's own zone, every time. The zone name is dropped because it's the
+// viewer's own and identical on every card; the weekday appears only when the
+// game isn't today, which is the only thing the long form was really adding.
+function _fmtOotWhen(g) {
+  if (!g || !g.date) return '';
+  var d = new Date(g.date);
+  if (isNaN(d.getTime())) return '';
+  var t = '';
+  try {
+    t = d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+  } catch (e) { return ''; }
+  if (!t) return '';
+  t = t.replace(/\s+/g, ' ').toUpperCase();
+  var now = new Date();
+  var sameDay = (d.getFullYear() === now.getFullYear() &&
+                 d.getMonth() === now.getMonth() &&
+                 d.getDate() === now.getDate());
+  if (sameDay) return t;
+  var wd = '';
+  try { wd = d.toLocaleDateString('en-US', { weekday: 'short' }).toUpperCase(); } catch (e) {}
+  return wd ? (wd + ' ' + t) : t;
+}
+
 function _buildStadiumOtherGames(games, league, closeCall, divStyle) {
   var html;
   if (divStyle) {
@@ -71292,18 +71883,20 @@ function _buildStadiumOtherGames(games, league, closeCall, divStyle) {
     var hScore = !gPre ? g.home.score : '';
     var aLead = !gPre && aScore > hScore;
     var hLead = !gPre && hScore > aScore;
-    var statusText = gLive ? g.statusDetail : gFinal ? 'FINAL' : (g.statusDetail || '');
+    var statusText = gLive ? g.statusDetail : gFinal ? 'FINAL' : (_fmtOotWhen(g) || g.statusDetail || '');   // FWOOTTIME
     var aLogo = vLogo(g.away.abbr, league, g.away.logo);
     var hLogo = vLogo(g.home.abbr, league, g.home.logo);
     var aLogoHtml = aLogo ? '<img src="' + aLogo + '" class="gym-oot-logo" alt="">' : '';
     var hLogoHtml = hLogo ? '<img src="' + hLogo + '" class="gym-oot-logo" alt="">' : '';
+    var aRk = _fwRankBadge(g.away, { size: 9 });   // FWRANK
+    var hRk = _fwRankBadge(g.home, { size: 9 });   // FWRANK
     html += '<div class="gym-oot-card' + (gLive ? ' gym-oot-live-card' : '') +
       '" onclick="' + closeCall + '();selectGame(\'' + g.id + '\')">';
-    html +=   '<div class="gym-oot-side">' + aLogoHtml +
+    html +=   '<div class="gym-oot-side">' + aRk + aLogoHtml +
                 '<span class="gym-oot-sc' + (aLead ? ' leading' : '') + '">' + aScore + '</span></div>';
     html +=   '<div class="gym-oot-mid">' + (gLive ? '<span class="gym-oot-mid-live-dot"></span>' : '') +
                 '<span class="gym-oot-status' + (gLive ? ' gym-oot-live' : '') + '">' + statusText + '</span></div>';
-    html +=   '<div class="gym-oot-side gym-oot-side-home">' + hLogoHtml +
+    html +=   '<div class="gym-oot-side gym-oot-side-home">' + hRk + hLogoHtml +
                 '<span class="gym-oot-sc' + (hLead ? ' leading' : '') + '">' + hScore + '</span></div>';
     html += '</div>';
   });
@@ -71325,7 +71918,7 @@ function _buildOotGrid(games, league, closeCall, openFn) {
     var hScore = !isPre ? g.home.score : '';
     var aLeading = !isPre && aScore > hScore;
     var hLeading = !isPre && hScore > aScore;
-    var statusText = isLive ? g.statusDetail : isFinal ? 'FINAL' : (g.statusDetail || '');
+    var statusText = isLive ? g.statusDetail : isFinal ? 'FINAL' : (_fmtOotWhen(g) || g.statusDetail || '');   // FWOOTTIME
     var aLogo = vLogo(g.away.abbr, league, g.away.logo);
     var hLogo = vLogo(g.home.abbr, league, g.home.logo);
     var aLogoHtml = aLogo ? '<img src="' + aLogo + '" class="fw-oot-logo" alt="">' : '';
@@ -71333,12 +71926,12 @@ function _buildOotGrid(games, league, closeCall, openFn) {
     var _t200 = _ootGameTop200(g);
     html += '<div class="fw-oot-card' + (isLive ? ' fw-oot-live' : '') + (_t200 ? ' fw-oot-has-prospect' : '') + '" onclick="' + closeCall + ';' + fn + '(\'' + g.id + '\')">';
     html += '<div class="fw-oot-team">';
-    html +=   '<div class="fw-oot-team-left">' + aLogoHtml + '<span class="fw-oot-abbr">' + g.away.abbr + '</span></div>';
+    html +=   '<div class="fw-oot-team-left">' + aLogoHtml + '<span class="fw-oot-abbr">' + _fwRankBadge(g.away, { size: 9 }) + g.away.abbr + '</span></div>';   // FWRANK
     html +=   '<span class="fw-oot-score' + (aLeading ? ' leading' : '') + '">' + aScore + '</span>';
     html += '</div>';
     html += '<hr class="fw-oot-divider">';
     html += '<div class="fw-oot-team">';
-    html +=   '<div class="fw-oot-team-left">' + hLogoHtml + '<span class="fw-oot-abbr">' + g.home.abbr + '</span></div>';
+    html +=   '<div class="fw-oot-team-left">' + hLogoHtml + '<span class="fw-oot-abbr">' + _fwRankBadge(g.home, { size: 9 }) + g.home.abbr + '</span></div>';   // FWRANK
     html +=   '<span class="fw-oot-score' + (hLeading ? ' leading' : '') + '">' + hScore + '</span>';
     html += '</div>';
     html += '<div class="fw-oot-status' + (isLive ? ' fw-oot-live-text' : '') + '">' + statusText + '</div>';
