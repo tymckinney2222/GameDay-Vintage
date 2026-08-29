@@ -41839,9 +41839,18 @@ function renderMLBMatchup(data, game) {
 var courtGame = null;
 var courtData = null;
 var courtInterval = null;
+// Fast retry used when the summary endpoint is lagging the scoreboard. VBSTALE
+var courtStaleRetry = null;
+var courtStaleTries = 0;
 
 function openCourt(game) {
   courtGame = game;
+  // Drop the previous match's payload. Without this, a failed fetch leaves the
+  // old courtData in place, the catch below sees it as truthy and skips the
+  // error message, and the body sits on "Loading…" forever. VBSTALE
+  courtData = null;
+  courtStaleTries = 0;
+  clearTimeout(courtStaleRetry); courtStaleRetry = null;
   var overlay = document.getElementById('courtOverlay');
   if (!overlay) return;
   overlay.classList.add('open');
@@ -41865,6 +41874,7 @@ function openCourt(game) {
 
 function closeCourt() {
   clearInterval(courtInterval); courtInterval = null;
+  clearTimeout(courtStaleRetry); courtStaleRetry = null;   // VBSTALE
   var ov = document.getElementById('courtOverlay');
   if (ov) ov.classList.remove('open');
   if (typeof closeFwOotPanel === 'function') closeFwOotPanel();
@@ -41875,8 +41885,12 @@ function closeCourt() {
 function fetchCourtData(game) {
   var cfg = (typeof LEAGUES === 'object' && LEAGUES) ? LEAGUES[game.league] : null;
   if (!cfg) return;
+  // Cache-bust. The summary endpoint sits behind a CDN that serves college
+  // volleyball stale for minutes at a time — the reason reopening the card a
+  // few times "fixed" it was that a reopen sometimes landed on a fresher edge
+  // node. A unique query param makes every poll a real one. VBSTALE
   fetch('https://site.api.espn.com/apis/site/v2/sports/' + cfg.sport + '/' + cfg.slug +
-        '/summary?event=' + game.id)
+        '/summary?event=' + game.id + '&_=' + Date.now())
     .then(function (r) { return r.ok ? r.json() : null; })
     .then(function (j) {
       // The overlay may have been closed, or swiped to another match, while
@@ -42008,6 +42022,43 @@ function renderCourt() {
   var aSets = v ? v.aWon : (parseInt(game.away.score, 10) || 0);
   var hSets = v ? v.hWon : (parseInt(game.home.score, 10) || 0);
 
+  // ── Summary vs scoreboard freshness ── VBSTALE ──
+  // The game object comes from the scoreboard (same source as the card you
+  // tapped); data comes from the summary endpoint, which is cached separately and
+  // routinely lags on live college volleyball. That mismatch is what put a
+  // 0-0 headline and a first set frozen at 10-8 underneath a status line
+  // correctly reading END OF 2ND — three different moments in one match.
+  //
+  // In volleyball the scoreboard's score IS the set count, so it compares
+  // directly against the sets the summary shows as won. The check is per side,
+  // not on the total: a summary can carry the right NUMBER of finished sets
+  // while crediting one to the wrong team, and a totals-only test would wave
+  // that through.
+  var _sbA = parseInt(game.away.score, 10); if (isNaN(_sbA)) _sbA = null;
+  var _sbH = parseInt(game.home.score, 10); if (isNaN(_sbH)) _sbH = null;
+  var _haveSb = (_sbA != null && _sbH != null);
+  var _summaryBehind = !!(v && _haveSb && (v.aWon < _sbA || v.hWon < _sbH));
+
+  if (_summaryBehind) {
+    aSets = _sbA;
+    hSets = _sbH;
+    // Retry sooner than the 15s poll so this heals itself instead of needing
+    // the close-and-reopen ritual. Capped, so a summary that never catches up
+    // (a finished match ESPN stopped updating) stops spinning and just shows
+    // the grid it has on the next ordinary poll.
+    if (courtStaleTries < 6) {
+      courtStaleTries++;
+      clearTimeout(courtStaleRetry);
+      courtStaleRetry = setTimeout(function () {
+        if (courtGame && String(courtGame.id) === String(game.id)) fetchCourtData(courtGame);
+      }, 2500);
+    } else {
+      _summaryBehind = false;   // give up and render what we have
+    }
+  } else {
+    courtStaleTries = 0;
+  }
+
   // Vintage art where a team has it, ESPN's mark otherwise — the same
   // resolution the gym, rink and field use for their crests. VBCOURT
   var aLogo = (typeof vLogo === 'function')
@@ -42069,6 +42120,14 @@ function renderCourt() {
 
   if (!v) {
     h += '<div class="court-empty">Set scores appear once the first set is under way.</div>';
+    body.innerHTML = h;
+    return;
+  }
+
+  // Headline is correct above; everything below this point is derived from the
+  // lagging summary, so it stays hidden until the two sources agree. VBSTALE
+  if (_summaryBehind) {
+    h += '<div class="court-empty">Set scores are catching up\u2026</div>';
     body.innerHTML = h;
     return;
   }
