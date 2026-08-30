@@ -45990,19 +45990,65 @@ async function fetchPlayerData(athleteId, league) {
   const statsUrl = `https://site.web.api.espn.com/apis/common/v3/sports/${sport}/${slug}/athletes/${athleteId}/stats`;
   const gamelogUrl = `https://site.web.api.espn.com/apis/common/v3/sports/${sport}/${slug}/athletes/${athleteId}/gamelog`;
 
-  let overview = null, statsData = null, gamelogData = null;
+  // ── Bio fallback ── PMBIO ──
+  // renderPlayerModal resolves the title as ctx.name || overview.athlete.name
+  // || '?'. None of the three URLs above carry an athlete node — /overview
+  // returns statistics only — so the card has always depended ENTIRELY on
+  // window._playerCtx being registered by whichever view was clicked.
+  //
+  // A dozen callers open this modal and most never registered it, which is why
+  // a goalie card, and then a skater card, opened titled "?". Patching callers
+  // one at a time keeps missing the next one, so fetch the bio here instead:
+  // one endpoint, every entry point, permanently.
+  //
+  // Only fetched when the context is actually missing a usable name, so the
+  // common path (stadium or team page already cached it) costs nothing extra.
+  const bioUrl = `https://site.web.api.espn.com/apis/common/v3/sports/${sport}/${slug}/athletes/${athleteId}`;
+  const _pmCtx = (window._playerCtx || {})[athleteId] || {};
+  const _needBio = !_pmCtx.name || _pmCtx.name === '?';
+
+  let overview = null, statsData = null, gamelogData = null, bioData = null;
   try {
-    const [ovRes, stRes, glRes] = await Promise.allSettled([
+    const jobs = [
       fetch(overviewUrl).then(r => r.ok ? r.json() : null),
       fetch(statsUrl).then(r => r.ok ? r.json() : null),
       fetch(gamelogUrl).then(r => r.ok ? r.json() : null),
-    ]);
-    overview = ovRes.status === 'fulfilled' ? ovRes.value : null;
-    statsData = stRes.status === 'fulfilled' ? stRes.value : null;
-    gamelogData = glRes.status === 'fulfilled' ? glRes.value : null;
+    ];
+    if (_needBio) jobs.push(fetch(bioUrl).then(r => r.ok ? r.json() : null));
+    const res = await Promise.allSettled(jobs);
+    overview = res[0].status === 'fulfilled' ? res[0].value : null;
+    statsData = res[1].status === 'fulfilled' ? res[1].value : null;
+    gamelogData = res[2].status === 'fulfilled' ? res[2].value : null;
+    bioData = (_needBio && res[3] && res[3].status === 'fulfilled') ? res[3].value : null;
   } catch(e) {
     console.error('Fetch error:', e);
   }
+
+  // Graft the bio onto the overview so renderPlayerModal's EXISTING ovName /
+  // ovPos / ovTeam path picks it up — no change needed at the render end.
+  // Also seed _playerCtx so re-opening the card is instant and themed.
+  try {
+    if (_needBio && bioData) {
+      const _bio = bioData.athlete || bioData;
+      if (_bio && (_bio.displayName || _bio.fullName || _bio.shortName)) {
+        if (!overview) overview = {};
+        if (!overview.athlete) overview.athlete = _bio;
+        const _bt = _bio.team || {};
+        window._playerCtx = window._playerCtx || {};
+        window._playerCtx[athleteId] = {
+          name: _bio.displayName || _bio.fullName || _bio.shortName || '',
+          pos: (_bio.position && (_bio.position.abbreviation || _bio.position.displayName)) || '',
+          jersey: _bio.jersey || '',
+          teamAbbr: _bt.abbreviation || '',
+          teamName: _bt.displayName || _bt.abbreviation || '',
+          teamLogo: (_bt.logos && _bt.logos[0] && _bt.logos[0].href) || '',
+          teamColor: _bt.color ? ('#' + _bt.color) : '',
+          teamId: _bt.id || '',
+          league: league
+        };
+      }
+    }
+  } catch (e) { /* bio is additive — never block the card */ }
 
   if (!overview && !statsData) {
     // ESPN sometimes has no G League profile page for a player whose box-score
@@ -46135,11 +46181,66 @@ function buildScoutingReport(statLabels, statSplits, league, name, pos, teamName
     var stl = p('STL'), blk = p('BLK');
     if (stl > 0 || blk > 0) lines.push('Contributing ' + stl + ' steals and ' + blk + ' blocks defensively.');
   } else if (league === 'NHL') {
-    var g = p('G'), a = p('A'), pts = p('P') || p('PTS'), pm = getStat('+/-'), sog = p('SOG');
-    var gp = p('GP');
-    lines.push(firstName + ' has recorded ' + g + ' goals and ' + a + ' assists for ' + pts + ' points this season with ' + teamName + '.');
-    if (gp > 0) lines.push('Through ' + gp + ' games played.');
-    if (sog > 0) lines.push('Putting ' + sog + ' shots on goal' + (pm ? ' with a ' + pm + ' plus-minus rating' : '') + '.');
+    // ── Goalies get their own report ── PBRGOALIE ──
+    // The skater sentence read "0 goals and 0 assists for 0 points" on every
+    // goalie card, which is true and useless. Detected from the position when
+    // it's there and from the stat columns when it isn't — a goalie line
+    // carries GAA and SV%, a skater's never does.
+    var _isGoalie = /^G$/i.test(String(pos || '').trim()) ||
+      statLabels.indexOf('GAA') !== -1 || statLabels.indexOf('SV%') !== -1;
+
+    // "with ." — the empty clause on the card — came from an absent team name
+    // being concatenated regardless. Build the clause only when there is one.
+    var _forTeam = teamName ? (' for ' + teamName) : '';
+    var _withTeam = teamName ? (' with ' + teamName) : '';
+    function _pk() {
+      for (var i = 0; i < arguments.length; i++) {
+        var v = getStat(arguments[i]);
+        if (v != null && v !== '') return v;
+      }
+      return null;
+    }
+    function _pn() { var v = _pk.apply(null, arguments); var n = parseFloat(v); return isNaN(n) ? 0 : n; }
+
+    if (_isGoalie) {
+      var gw = _pk('WINS', 'W'), gl = _pk('L', 'LOSSES'), gotl = _pk('OTL', 'OT');
+      var gaa = _pk('GAA'), svp = _pk('SV%', 'SVPCT');
+      var ggp = _pn('GP'), ggs = _pn('GS'), gso = _pn('SO', 'SHO');
+      var gsa = _pn('SA'), gsv = _pn('SV', 'SAVES');
+
+      // The record only prints when the parts are actually there — a fabricated
+      // 0-0 would be worse than saying nothing.
+      var recBits = [];
+      if (gw != null && gl != null) {
+        recBits.push(gw + '-' + gl + (gotl != null ? '-' + gotl : ''));
+      }
+      var rateBits = [];
+      if (gaa) rateBits.push('a ' + gaa + ' goals-against average');
+      if (svp) rateBits.push('a ' + svp + ' save percentage');
+
+      if (recBits.length && rateBits.length) {
+        lines.push(firstName + ' is ' + recBits[0] + ' with ' + rateBits.join(' and ') + ' this season' + _forTeam + '.');
+      } else if (recBits.length) {
+        lines.push(firstName + ' is ' + recBits[0] + ' this season' + _forTeam + '.');
+      } else if (rateBits.length) {
+        lines.push(firstName + ' is carrying ' + rateBits.join(' and ') + ' this season' + _forTeam + '.');
+      }
+      if (ggp > 0) {
+        lines.push('Through ' + ggp + ' appearances' + (ggs > 0 ? ' (' + ggs + ' starts)' : '') + '.');
+      }
+      if (gsa > 0 && gsv > 0) {
+        lines.push('Has turned aside ' + gsv + ' of ' + gsa + ' shots faced' +
+          (gso > 0 ? ', with ' + gso + ' shutout' + (gso === 1 ? '' : 's') : '') + '.');
+      } else if (gso > 0) {
+        lines.push('Owns ' + gso + ' shutout' + (gso === 1 ? '' : 's') + ' on the year.');
+      }
+    } else {
+      var g = p('G'), a = p('A'), pts = p('P') || p('PTS'), pm = getStat('+/-'), sog = p('SOG');
+      var gp = p('GP');
+      lines.push(firstName + ' has recorded ' + g + ' goals and ' + a + ' assists for ' + pts + ' points this season' + _withTeam + '.');
+      if (gp > 0) lines.push('Through ' + gp + ' games played.');
+      if (sog > 0) lines.push('Putting ' + sog + ' shots on goal' + (pm ? ' with a ' + pm + ' plus-minus rating' : '') + '.');
+    }
   } else if ((league === 'MLB' || league === 'MiLB') && !isPitcher) {
     var avg = getStat('AVG'), hr = p('HR'), rbi = p('RBI'), ops = getStat('OPS'), h = p('H'), r = p('R'), sb = p('SB');
     var gp = p('GP') || p('G');
@@ -56449,6 +56550,8 @@ function renderRinkStadium() {
 
   // ── PREGAME TEAM STATS ──
   if (game.state === 'pre') {
+    // Skater and goalie leaders above the team comparison. SBLEADCFG
+    html += _sbPregameLeaders(data, game, awayAccent, homeAccent, divStyle);
     if (typeof _fetchEspnTeamStats === 'function') _fetchEspnTeamStats(game, renderRinkStadium);
     var _rkTs = _espnTeamStatsPanel(game, homeAccent, awayAccent, _NHL_TSTATS_ROWS);
     if (_rkTs) html += _rkTs;
@@ -56579,6 +56682,27 @@ function _rinkBuildGoalieSection(data, game, homeAccent, awayAccent, divStyle) {
         if (id && !window._rinkSeasonAvgCache[id] && !window._rinkSeasonAvgCache['_f_'+id]) {
           fetchRinkPlayerSeason(id);
         }
+        // ── Goalie player context ── TPPLAYERCTX ──
+        // The skater panel has always registered this; the goalie section
+        // never did, so a goalie card opened from anywhere showed "?" for the
+        // name. Same shape and the same don't-overwrite rule.
+        if (id) {
+          window._playerCtx = window._playerCtx || {};
+          if (!window._playerCtx[id]) {
+            var _gIsHome = (side === 'home');
+            window._playerCtx[id] = {
+              name: athlete.displayName || name,
+              pos: (athlete.position && athlete.position.abbreviation) || 'G',
+              jersey: athlete.jersey || '',
+              teamAbbr: _gIsHome ? game.home.abbr : game.away.abbr,
+              teamLogo: _gIsHome ? game.home.logo : game.away.logo,
+              teamColor: _gIsHome ? homeAccent : awayAccent,
+              teamName: _gIsHome ? (game.home.fullName || game.home.name)
+                                 : (game.away.fullName || game.away.name),
+              league: 'NHL'
+            };
+          }
+        }
         goalies[side] = { id: id, name: name, sm: sm, athlete: athlete };
       });
     });
@@ -56586,7 +56710,7 @@ function _rinkBuildGoalieSection(data, game, homeAccent, awayAccent, divStyle) {
   if (!goalies.away && !goalies.home) return '';
 
   function goalieCard(g, accent, abbr) {
-    if (!g) return '<div style="flex:1;background:rgba(255,255,255,0.03);border-radius:4px;padding:8px 10px;border:1px solid rgba(255,255,255,0.06)"><div style="color:rgba(255,255,255,0.28);font-size:10px;letter-spacing:0.12em">—</div></div>';
+    if (!g) return '<div style="flex:1;min-width:0;background:rgba(255,255,255,0.03);border-radius:4px;padding:9px 11px;border:1px solid rgba(255,255,255,0.06)"><div style="color:rgba(255,255,255,0.28);font-size:12px;letter-spacing:0.12em">—</div></div>';
     var sm = g.sm;
     var sv = sm['SV'] || sm['SAVES'] || '—';
     var sa = sm['SA'] || sm['SHOTSAGAINST'] || '—';
@@ -56594,13 +56718,26 @@ function _rinkBuildGoalieSection(data, game, homeAccent, awayAccent, divStyle) {
     var ga = sm['GA'] || sm['GOALSAGAINST'] || '0';
     var toi = sm['TOI'] || sm['TIMEICETIME'] || '';
     var season = (g.id && window._rinkSeasonAvgCache[g.id]) || null;
-    var html = '<div style="flex:1;background:rgba(255,255,255,0.03);border-radius:4px;padding:8px 10px;border:1px solid rgba(255,255,255,0.07);font-family:\'Barlow Condensed\',sans-serif">';
-    html += '<div style="font-size:9px;font-weight:800;color:' + accent + ';letter-spacing:0.14em;margin-bottom:2px">' + abbr + ' · G</div>';
-    html += '<div style="font-size:15px;font-weight:900;color:#fff;letter-spacing:0.04em;margin-bottom:4px">' + g.name.toUpperCase() + '</div>';
+    // ── Larger + readable ── RINKGOALIEREAD ──
+    // Matches the skater panel treatment. Two cards share the row, so each has
+    // roughly half the screen: sizes go up but the save line keeps its figures
+    // in near-white with dim units, which reads bigger than it measures and
+    // leaves room. min-width:0 lets the flex children actually shrink instead
+    // of forcing the row wider than the screen.
+    var gAcc = (typeof vibrant === 'function') ? vibrant(accent, 0.68) : accent;
+    var _gv = 'color:rgba(255,255,255,0.95);font-weight:900';
+    var _gu = 'color:rgba(255,255,255,0.55);font-weight:600';
+    var html = '<div style="flex:1;min-width:0;background:rgba(255,255,255,0.03);border-radius:4px;padding:9px 11px;border:1px solid rgba(255,255,255,0.07);font-family:\'Barlow Condensed\',sans-serif">';
+    html += '<div style="font-size:10px;font-weight:800;color:' + gAcc + ';letter-spacing:0.14em;margin-bottom:3px">' + abbr + ' · G</div>';
+    html += '<div style="font-size:17px;font-weight:900;color:#fff;letter-spacing:0.03em;margin-bottom:5px;line-height:1.1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + g.name.toUpperCase() + '</div>';
     // Game stats
-    html += '<div style="font-size:12px;font-weight:700;color:' + accent + '">' + sv + '/' + sa + ' SV · ' + (svp !== '—' ? svp : '—') + '</div>';
-    if (ga !== '0' && ga !== '—') html += '<div style="font-size:10px;color:#f87171;letter-spacing:0.06em;margin-top:1px">' + ga + ' GA</div>';
-    if (toi) html += '<div style="font-size:9px;color:rgba(255,255,255,0.28);margin-top:1px">' + toi + ' TOI</div>';
+    html += '<div style="font-size:15px;font-weight:700;line-height:1.3">' +
+      '<span style="' + _gv + '">' + sv + '/' + sa + '</span>' +
+      '<span style="' + _gu + '"> SV</span>' +
+      '<span style="color:rgba(255,255,255,0.25)"> \u00b7 </span>' +
+      '<span style="' + _gv + '">' + (svp !== '\u2014' ? svp : '\u2014') + '</span></div>';
+    if (ga !== '0' && ga !== '\u2014') html += '<div style="font-size:12px;color:#f87171;letter-spacing:0.06em;margin-top:2px;font-weight:700">' + ga + ' GA</div>';
+    if (toi) html += '<div style="font-size:11px;color:rgba(255,255,255,0.42);margin-top:2px;letter-spacing:0.06em">' + toi + ' TOI</div>';
     // Season stats
     if (season) {
       var sParts = [];
@@ -56608,15 +56745,24 @@ function _rinkBuildGoalieSection(data, game, homeAccent, awayAccent, divStyle) {
       if (season.gaa!=null) sParts.push(season.gaa.toFixed(2)+' GAA');
       if (season.svp!=null) sParts.push(season.svp.toFixed ? season.svp.toFixed(3) : season.svp+' SV%');
       if (season.so!=null&&season.so>0) sParts.push(season.so+' SO');
-      if (sParts.length) html += '<div style="font-size:9px;color:rgba(255,255,255,0.35);margin-top:5px;letter-spacing:0.06em">SEASON: ' + sParts.join(' · ') + '</div>';
+      // Season line wraps in a half-width card, so it gets a line-height
+      // rather than being squeezed to fit on one row. RINKGOALIEREAD
+      // Each stat is kept whole so the line breaks BETWEEN them — otherwise a
+      // half-width card wraps mid-stat and prints "3.05" above "GAA".
+      if (sParts.length) {
+        var sWrapped = sParts.map(function (t) {
+          return '<span style="white-space:nowrap">' + t + '</span>';
+        });
+        html += '<div style="font-size:11.5px;color:rgba(255,255,255,0.48);margin-top:6px;letter-spacing:0.05em;line-height:1.45">SEASON: ' + sWrapped.join(' \u00b7 ') + '</div>';
+      }
     } else if (g.id) {
-      html += '<div style="font-size:9px;color:rgba(255,255,255,0.20);margin-top:5px;font-style:italic">Loading season stats…</div>';
+      html += '<div style="font-size:11.5px;color:rgba(255,255,255,0.28);margin-top:6px;font-style:italic">Loading season stats…</div>';
     }
     html += '</div>';
     return html;
   }
 
-  return '<div style="padding:6px 16px 4px;font-family:\'Barlow Condensed\',sans-serif;font-size:9px;font-weight:800;letter-spacing:0.16em;color:rgba(255,255,255,0.55);border-bottom:' + divStyle + '">🥅 GOALTENDERS</div>' +
+  return '<div style="padding:6px 16px 4px;font-family:\'Barlow Condensed\',sans-serif;font-size:10px;font-weight:800;letter-spacing:0.16em;color:rgba(255,255,255,0.55);border-bottom:' + divStyle + '">🥅 GOALTENDERS</div>' +
     '<div style="display:flex;gap:8px;padding:8px 12px 10px;border-bottom:' + divStyle + '">' +
       goalieCard(goalies.away, awayAccent, game.away.abbr) +
       goalieCard(goalies.home, homeAccent, game.home.abbr) +
@@ -56765,9 +56911,13 @@ function _rinkBuildSkaterPanel(data, game, homeAccent, awayAccent, divStyle) {
   html += '<div class="rink-chip-scroll" style="display:flex;gap:7px;padding:6px 12px;overflow-x:auto;scrollbar-width:none;border-bottom:' + divStyle + '">';
   skaters.slice(0,14).forEach(function(s) {
     var isActive = feat && s.name === feat.name;
-    html += '<div style="flex-shrink:0;padding:7px 12px;border-radius:3px;cursor:pointer;font-family:\'Barlow Condensed\',sans-serif;font-size:13px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;border:1px solid ' + (isActive?s.teamAccent:'rgba(255,255,255,0.12)') + ';background:' + (isActive?'rgba(255,255,255,0.08)':'rgba(255,255,255,0.03)') + ';color:' + (isActive?s.teamAccent:'rgba(255,255,255,0.45)') + '" onclick="rinkSelectPlayer(\'' + s.name.replace(/'/g,"\\'") + '\')">' +
+    // Active chip uses the lifted accent for the same reason the panel does.
+    var chipInk = isActive
+      ? ((typeof vibrant === 'function') ? vibrant(s.teamAccent, 0.68) : s.teamAccent)
+      : 'rgba(255,255,255,0.55)';
+    html += '<div style="flex-shrink:0;padding:7px 12px;border-radius:3px;cursor:pointer;font-family:\'Barlow Condensed\',sans-serif;font-size:15px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;border:1px solid ' + (isActive?chipInk:'rgba(255,255,255,0.12)') + ';background:' + (isActive?'rgba(255,255,255,0.08)':'rgba(255,255,255,0.03)') + ';color:' + chipInk + '" onclick="rinkSelectPlayer(\'' + s.name.replace(/'/g,"\\'") + '\')">' +
       s.lastName + (typeof _skRosterPillMark === 'function' ? _skRosterPillMark(s.name) : '') +
-      '<div style="font-size:11px;color:rgba(255,255,255,0.28);margin-top:3px">' + s.g + 'G ' + s.a + 'A ' + s.sog + 'SOG</div>' +
+      '<div style="font-size:12.5px;color:rgba(255,255,255,0.45);margin-top:3px;white-space:nowrap">' + s.g + 'G ' + s.a + 'A ' + s.sog + 'SOG</div>' +
       '</div>';
   });
   html += '</div>';
@@ -56775,20 +56925,37 @@ function _rinkBuildSkaterPanel(data, game, homeAccent, awayAccent, divStyle) {
   // Featured skater panel
   if (feat) {
     var fc = feat.teamAccent;
+    // ── Readable + larger ── RINKFEATREAD ──
+    // Matches the basketball player panel. A dark team accent (Florida navy,
+    // Carolina against near-black) sits at roughly the panel's own luminance,
+    // so the stat line was legible only because the eye filled it in. The
+    // vibrant() lift clears 4.5:1 while keeping the hue.
+    var fcR = (typeof vibrant === 'function') ? vibrant(fc, 0.68) : fc;
     var season = (feat.id && window._rinkSeasonAvgCache[feat.id]) || null;
     html += '<div style="padding:8px 16px 6px;border-bottom:' + divStyle + ';font-family:\'Barlow Condensed\',sans-serif">';
     html += '<div style="font-size:10px;font-weight:700;letter-spacing:0.14em;color:rgba(255,255,255,0.35)">' + feat.teamAbbr + (feat.pos?' · '+feat.pos:'') + (pinned?' · PINNED':'') + '</div>';
-    html += '<div style="font-size:26px;font-weight:900;letter-spacing:0.04em;text-transform:uppercase;color:' + fc + ';line-height:1.1">' + feat.name + '</div>';
+    html += '<div style="font-size:26px;font-weight:900;letter-spacing:0.04em;text-transform:uppercase;color:' + fcR + ';line-height:1.1">' + feat.name + '</div>';
     // Game line
+    var _rv = 'color:rgba(255,255,255,0.95);font-weight:900';
+    var _ru = 'color:rgba(255,255,255,0.58);font-weight:600';
+    function _rstat(v, unit) {
+      return '<span style="' + _rv + '">' + v + '</span>' +
+             (unit ? '<span style="' + _ru + '">' + unit + '</span>' : '');
+    }
     var gParts = [];
-    if (feat.g) gParts.push('<strong>' + feat.g + 'G</strong>');
-    if (feat.a) gParts.push('<strong>' + feat.a + 'A</strong>');
-    gParts.push(feat.sog + ' SOG');
-    if (feat.pm && feat.pm !== '0') gParts.push((parseFloat(feat.pm)>0?'+':'') + feat.pm);
-    if (feat.pim) gParts.push(feat.pim + ' PIM');
-    if (feat.bs) gParts.push(feat.bs + ' BS');
-    html += '<div style="font-size:13px;font-weight:700;color:' + fc + ';margin-top:4px">GAME: ' + gParts.join(' · ') + '</div>';
-    if (feat.toi) html += '<div style="font-size:9px;color:rgba(255,255,255,0.28);letter-spacing:0.10em;margin-top:1px">' + feat.toi + ' TOI</div>';
+    if (feat.g) gParts.push(_rstat(feat.g, 'G'));
+    if (feat.a) gParts.push(_rstat(feat.a, 'A'));
+    gParts.push(_rstat(feat.sog, ' SOG'));
+    if (feat.pm && feat.pm !== '0') gParts.push(_rstat((parseFloat(feat.pm)>0?'+':'') + feat.pm, ''));
+    if (feat.pim) gParts.push(_rstat(feat.pim, ' PIM'));
+    if (feat.bs) gParts.push(_rstat(feat.bs, ' BS'));
+    // Sized up from 13/9/10, and the FIGURES carry in near-white rather than
+    // the team colour — the data shouldn't depend on how dark a franchise is.
+    // The accent stays on the GAME: label. RINKFEATREAD
+    html += '<div style="font-size:16px;font-weight:700;margin-top:5px;line-height:1.35;color:rgba(255,255,255,0.35)">' +
+      '<span style="color:' + fcR + ';font-weight:800;letter-spacing:0.06em">GAME:</span> ' +
+      gParts.join('<span style="color:rgba(255,255,255,0.25)"> \u00b7 </span>') + '</div>';
+    if (feat.toi) html += '<div style="font-size:11px;color:rgba(255,255,255,0.42);letter-spacing:0.10em;margin-top:2px">' + feat.toi + ' TOI</div>';
     // Season stats
     if (season) {
       var sParts = [];
@@ -56798,9 +56965,9 @@ function _rinkBuildSkaterPanel(data, game, homeAccent, awayAccent, divStyle) {
       if (season.pts!=null) sParts.push(season.pts+'PTS');
       if (season.sog!=null) sParts.push(season.sog+'SOG');
       if (season.pm!=null)  sParts.push((season.pm>0?'+':'')+season.pm);
-      if (sParts.length) html += '<div style="font-size:10px;color:rgba(255,255,255,0.40);margin-top:4px;letter-spacing:0.06em">SEASON: ' + sParts.join(' · ') + '</div>';
+      if (sParts.length) html += '<div style="font-size:12.5px;color:rgba(255,255,255,0.52);margin-top:5px;letter-spacing:0.06em;line-height:1.4">SEASON: ' + sParts.join(' · ') + '</div>';
     } else if (feat.id) {
-      html += '<div style="font-size:10px;color:rgba(255,255,255,0.22);margin-top:4px;font-style:italic;letter-spacing:0.06em">Loading season stats…</div>';
+      html += '<div style="font-size:12.5px;color:rgba(255,255,255,0.30);margin-top:5px;font-style:italic;letter-spacing:0.06em">Loading season stats…</div>';
     }
     // ── Skipper fantasy line — same cross-league FP/cats block MLB uses,
     // now wired into the NHL skater panel so hockey players show their rows. ──
@@ -57865,8 +58032,26 @@ function _espnTeamStatsPanel(game, accent, awayAccent, rows) {
     }
     return '';
   }
+  // Derive a per-game figure from a season total when ESPN gives no average,
+  // and a percentage from its parts when it gives no percentage. Both return
+  // '-' rather than guessing if the inputs aren't there. NHLTSROWS
+  function resolve(obj, r) {
+    var v = pick(obj, r.k);
+    if (v !== '-') return v;
+    if (r.perGame && r.total) {
+      var t = parseFloat(pick(obj, r.total));
+      var gp = parseFloat(pick(obj, ['gamesPlayed', 'GP', 'games']));
+      if (!isNaN(t) && !isNaN(gp) && gp > 0) return (t / gp).toFixed(2);
+    }
+    if (r.ratio) {
+      var n = parseFloat(pick(obj, r.ratio.num));
+      var d = parseFloat(pick(obj, r.ratio.den));
+      if (!isNaN(n) && !isNaN(d) && d > 0) return (n / d * (r.ratio.scale || 1)).toFixed(1);
+    }
+    return '-';
+  }
   rows.forEach(function(r) {
-    var av = pick(a, r.k), hv = pick(h, r.k);
+    var av = resolve(a, r), hv = resolve(h, r);
     var an = parseFloat(av), hn = parseFloat(hv);
     var awayWins = false, homeWins = false;
     if (!isNaN(an) && !isNaN(hn) && an !== hn) {
@@ -57912,15 +58097,26 @@ var _NBA_TSTATS_ROWS = [
   { label: 'Blocks Per Game', k: ['avgBlocks', 'blocks', 'BLK'] },
   { label: 'Turnovers Per Game', k: ['avgTurnovers', 'turnovers', 'TO'], lowerWins: true }
 ];
+// ── NHL team stats ── NHLTSROWS ──
+// The per-game rows previously listed totals as fallback keys — ['avgGoals',
+// 'goals', 'G'] — and ESPN publishes goals but not avgGoals, so the panel
+// printed 246 under a label reading "Goals Per Game". Same for shots at 2295.
+//
+// Totals now live in their own total list, used only to DERIVE the per-game
+// figure by dividing by games played. A total can no longer be shown as though
+// it were an average, whatever ESPN omits.
+//
+// Penalty Minutes is deliberately a season total and labelled as one.
 var _NHL_TSTATS_ROWS = [
-  { label: 'Goals Per Game', k: ['avgGoals', 'goals', 'G'] },
-  { label: 'Goals Against Per Game', k: ['avgGoalsAgainst', 'goalsAgainst', 'GA'], lowerWins: true },
-  { label: 'Power Play %', k: ['powerPlayPct', 'powerPlayPercentage', 'PP%'] },
-  { label: 'Penalty Kill %', k: ['penaltyKillPct', 'penaltyKillPercentage', 'PK%'] },
-  { label: 'Shots Per Game', k: ['avgShots', 'shotsTotal', 'SOG'] },
+  { label: 'Goals Per Game', k: ['avgGoals', 'goalsPerGame'], total: ['goals', 'G'], perGame: true },
+  { label: 'Goals Against Per Game', k: ['avgGoalsAgainst', 'goalsAgainstPerGame'], total: ['goalsAgainst', 'GA'], perGame: true, lowerWins: true },
+  { label: 'Power Play %', k: ['powerPlayPct', 'powerPlayPercentage', 'PP%', 'powerPlayPctg'],
+    ratio: { num: ['powerPlayGoals', 'PPG'], den: ['powerPlayOpportunities', 'powerPlayOpp', 'PPO'], scale: 100 } },
+  { label: 'Penalty Kill %', k: ['penaltyKillPct', 'penaltyKillPercentage', 'PK%', 'penaltyKillPctg'] },
+  { label: 'Shots Per Game', k: ['avgShots', 'shotsPerGame'], total: ['shotsTotal', 'shots', 'SOG'], perGame: true },
   { label: 'Save %', k: ['savePct', 'savePercentage', 'SV%'] },
   { label: 'Faceoff Win %', k: ['faceoffPercent', 'faceoffsWonPct', 'FO%'] },
-  { label: 'Penalty Minutes', k: ['penaltyMinutes', 'avgPenaltyMinutes', 'PIM'], lowerWins: true }
+  { label: 'Penalty Minutes', k: ['penaltyMinutes', 'PIM'], lowerWins: true }
 ];
 var _NFL_TSTATS_ROWS = [
   { label: 'Points Per Game', k: ['avgPointsFor', 'pointsPerGame', 'totalPointsPerGame'] },
@@ -58449,7 +58645,7 @@ function renderGymStadium() {
   if (game.state === 'pre') {
     // Player leaders sit above the team comparison: who, then how the teams
     // stack up. GYMPRELEAD
-    html += _gymPregameLeaders(data, game, awayThemeColor, homeAccent, divStyle);
+    html += _sbPregameLeaders(data, game, awayThemeColor, homeAccent, divStyle);
     if (typeof _fetchEspnTeamStats === 'function') _fetchEspnTeamStats(game, renderGymStadium);
     var _gymTs = _espnTeamStatsPanel(game, homeAccent, awayThemeColor, _NBA_TSTATS_ROWS);
     if (_gymTs) html += _gymTs;
@@ -58785,14 +58981,6 @@ function _gymBenchPoints(data, game, awayAccent, homeAccent, divStyle) {
 //
 // ESPN names these inconsistently across leagues and payloads ("Points Per
 // Game", "Points", "avgPoints", "PTS"), so each row matches on an alias list.
-var _GYM_LEAD_ROWS = [
-  { key: 'PPG', aliases: ['pointspergame', 'points', 'avgpoints', 'pts', 'scoring'] },
-  { key: 'RPG', aliases: ['reboundspergame', 'rebounds', 'avgrebounds', 'reb', 'totalrebounds'] },
-  { key: 'APG', aliases: ['assistspergame', 'assists', 'avgassists', 'ast'] },
-  { key: 'SPG', aliases: ['stealspergame', 'steals', 'avgsteals', 'stl'] },
-  { key: 'BPG', aliases: ['blockspergame', 'blocks', 'avgblocks', 'blk'] }
-];
-
 // ── Season averages as a leaders fallback ── GYMAVGLEAD ──
 // The scoreboard payload often has no leaders node at all — a preseason game
 // carries competitors with "statistics":[] and nothing else — and even when it
@@ -58809,16 +58997,63 @@ var _GYM_LEAD_ROWS = [
 var _gymTeamAvgs = {};      // "teamId_league" -> { PPG:{name,stat}, RPG:… }
 var _gymAvgPending = {};
 
-var _GYM_AVG_CATS = [
-  { key: 'PPG', labels: ['PTS', 'PPG', 'POINTS'] },
-  { key: 'RPG', labels: ['REB', 'RPG', 'REBOUNDS'] },
-  { key: 'APG', labels: ['AST', 'APG', 'ASSISTS'] },
-  { key: 'SPG', labels: ['STL', 'SPG', 'STEALS'] },
-  { key: 'BPG', labels: ['BLK', 'BPG', 'BLOCKS'] }
-];
+// ── Leader categories per sport ── SBLEADCFG ──
+// One row definition serves both lookups: the payload list matches the names
+// ESPN uses in its leaders node, the labels list matches the column
+// headers in a season stat line. Keeping them together is what stops the two
+// sources drifting apart as sports are added.
+//
+// lowerWins marks the categories where the smallest number leads — goals
+// against average being the only one so far.
+var _SB_LEAD_CFG = {
+  BASKETBALL: [
+    { key: 'PPG', payload: ['pointspergame', 'points', 'avgpoints', 'pts', 'scoring'], labels: ['PTS', 'PPG', 'POINTS'], fmt: 'avg' },
+    { key: 'RPG', payload: ['reboundspergame', 'rebounds', 'avgrebounds', 'reb'], labels: ['REB', 'RPG', 'REBOUNDS'], fmt: 'avg' },
+    { key: 'APG', payload: ['assistspergame', 'assists', 'avgassists', 'ast'], labels: ['AST', 'APG', 'ASSISTS'], fmt: 'avg' },
+    { key: 'SPG', payload: ['stealspergame', 'steals', 'avgsteals', 'stl'], labels: ['STL', 'SPG', 'STEALS'], fmt: 'avg' },
+    { key: 'BPG', payload: ['blockspergame', 'blocks', 'avgblocks', 'blk'], labels: ['BLK', 'BPG', 'BLOCKS'], fmt: 'avg' }
+  ],
+  // Hockey leaders are season TOTALS, not averages — 34 goals, not 0.41 a
+  // night — so the same max-wins logic reads correctly without rescaling.
+  HOCKEY: [
+    { key: 'G',   payload: ['goals', 'g'], labels: ['G', 'GOALS'], fmt: 'int' },
+    { key: 'A',   payload: ['assists', 'a'], labels: ['A', 'AST', 'ASSISTS'], fmt: 'int' },
+    { key: 'PTS', payload: ['points', 'pts'], labels: ['PTS', 'P', 'POINTS'], fmt: 'int' },
+    { key: '+/-', payload: ['plusminus', 'plusminusrating'], labels: ['+/-', '+/', 'PLUSMINUS'], fmt: 'signed' },
+    { key: 'PPG', payload: ['powerplaygoals', 'ppg'], labels: ['PPG', 'PP'], fmt: 'int' },
+    { key: 'PIM', payload: ['penaltyminutes', 'pim'], labels: ['PIM'], fmt: 'int' },
+    // Goalies. They sit in the same roster, so a skater simply has no SV%
+    // column and is skipped for these rows.
+    { key: 'SV%', payload: ['savepct', 'savepercentage', 'sv%'], labels: ['SV%', 'SVPCT'], fmt: 'pct3' },
+    { key: 'GAA', payload: ['goalsagainstaverage', 'gaa'], labels: ['GAA'], lowerWins: true, fmt: 'dec2' }
+  ]
+};
 
-function _gymLeadersFromPlayerStats(playerStats) {
+function _sbLeadCfg(league) {
+  return (league === 'NHL') ? _SB_LEAD_CFG.HOCKEY : _SB_LEAD_CFG.BASKETBALL;
+}
+
+// One decimal suits a scoring average and mangles everything hockey: 39 goals
+// is not 39.0, a save percentage is .906 rather than 0.9, and a goals-against
+// average carries two decimals. Format is per category. SBLEADCFG
+function _sbLeadFmt(v, fmt) {
+  if (fmt === 'int') return String(Math.round(v));
+  if (fmt === 'signed') {
+    var n = Math.round(v);
+    return (n > 0 ? '+' : '') + n;
+  }
+  if (fmt === 'dec2') return (Math.round(v * 100) / 100).toFixed(2);
+  if (fmt === 'pct3') {
+    // Hockey writes save percentage without the leading zero.
+    var p = (Math.round(v * 1000) / 1000).toFixed(3);
+    return (p.charAt(0) === '0') ? p.slice(1) : p;
+  }
+  return (Math.round(v * 10) / 10).toFixed(1);   // averages
+}
+
+function _gymLeadersFromPlayerStats(playerStats, cfg) {
   if (!playerStats || !playerStats.length) return null;
+  cfg = cfg || _SB_LEAD_CFG.BASKETBALL;
 
   // Games-played qualifier. Without one, a two-game cameo at 30 a night
   // outranks the actual leader — ESPN's own leaderboards gate the same way.
@@ -58829,9 +59064,10 @@ function _gymLeadersFromPlayerStats(playerStats) {
   var minGp = maxGp > 0 ? (maxGp * 0.4) : 0;
 
   var out = {}, found = false;
-  for (i = 0; i < _GYM_AVG_CATS.length; i++) {
-    var cat = _GYM_AVG_CATS[i];
-    var best = null, bestVal = -1;
+  for (i = 0; i < cfg.length; i++) {
+    var cat = cfg[i];
+    var lower = !!cat.lowerWins;
+    var best = null, bestVal = lower ? Infinity : -1;
     for (j = 0; j < playerStats.length; j++) {
       var p = playerStats[j];
       if (p.dnp || !p.stats || !p.stats.length) continue;
@@ -58848,11 +59084,14 @@ function _gymLeadersFromPlayerStats(playerStats) {
       if (idx === -1) continue;
       var v = parseFloat(p.stats[idx]);
       if (isNaN(v)) continue;
-      if (v > bestVal) { bestVal = v; best = p; }
+      // A zero in a lower-wins category means "never played this role", not a
+      // perfect goals-against average.
+      if (lower && v <= 0) continue;
+      if (lower ? (v < bestVal) : (v > bestVal)) { bestVal = v; best = p; }
     }
     if (best) {
       out[cat.key] = {
-        name: best.name, stat: (Math.round(bestVal * 10) / 10).toFixed(1),
+        name: best.name, stat: _sbLeadFmt(bestVal, cat.fmt),
         athleteId: best.id || null
       };
       found = true;
@@ -58867,7 +59106,7 @@ function _gymTeamAvgs_get(teamId, league) {
   // Warm team-page cache is free — no request at all.
   if (typeof teamPageCache === 'object' && teamPageCache && teamPageCache[ck] &&
       teamPageCache[ck].playerStats) {
-    var derived = _gymLeadersFromPlayerStats(teamPageCache[ck].playerStats);
+    var derived = _gymLeadersFromPlayerStats(teamPageCache[ck].playerStats, _sbLeadCfg(league));
     if (derived) { _gymTeamAvgs[ck] = derived; return derived; }
   }
   return null;
@@ -58943,7 +59182,7 @@ function _gymFetchTeamAvgs(teamId, league, rerenderFn) {
     .then(function (ps) {
       _gymAvgPending[ck] = false;
       if (!ps || !ps.length) return;
-      var derived = _gymLeadersFromPlayerStats(ps);
+      var derived = _gymLeadersFromPlayerStats(ps, _sbLeadCfg(league));
       if (derived) {
         _gymTeamAvgs[ck] = derived;
         if (typeof rerenderFn === 'function') rerenderFn();
@@ -58956,7 +59195,9 @@ function _gymLeadKey(s) {
   return String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
 }
 
-function _gymPregameLeaders(data, game, awayAccent, homeAccent, divStyle) {
+// Shared by the basketball and hockey stadiums — the categories come from
+// _sbLeadCfg, so the only sport-specific thing here is that table. SBLEADCFG
+function _sbPregameLeaders(data, game, awayAccent, homeAccent, divStyle) {
   if (!game || game.state !== 'pre') return '';
 
   // side -> { normalisedCategory: {name, stat, athleteId} }
@@ -59011,12 +59252,26 @@ function _gymPregameLeaders(data, game, awayAccent, homeAccent, divStyle) {
   // re-renders when it lands, the same pattern _fetchEspnTeamStats uses.
   var avgA = _gymTeamAvgs_get(game.away.id, game.league);
   var avgH = _gymTeamAvgs_get(game.home.id, game.league);
-  if (!avgA) _gymFetchTeamAvgs(game.away.id, game.league, renderGymStadium);
-  if (!avgH) _gymFetchTeamAvgs(game.home.id, game.league, renderGymStadium);
+  // Re-render the stadium this game actually belongs to.
+  var _rerender = (game.league === 'NHL')
+    ? (typeof renderRinkStadium === 'function' ? renderRinkStadium : null)
+    : (typeof renderGymStadium === 'function' ? renderGymStadium : null);
+  if (!avgA) _gymFetchTeamAvgs(game.away.id, game.league, _rerender);
+  if (!avgH) _gymFetchTeamAvgs(game.home.id, game.league, _rerender);
   function fromAvg(side, key) {
     var src = (side === 'away') ? avgA : avgH;
     return (src && src[key]) ? src[key] : null;
   }
+
+  // ── Readable stat colour ── SBLEADINK ──
+  // The stat under each name is drawn in the team accent, and a dark one —
+  // Florida's navy, Carolina against black — sits at roughly the panel's own
+  // luminance and reads as a smudge. _stReadableAccent isn't enough here: its
+  // bar is a luminance floor that still leaves dark hues near 2:1. The same
+  // vibrant() lift used for the basketball player panel clears 4.5:1 while
+  // keeping the hue, so the number stays the team's colour and is legible.
+  var awayInk = (typeof vibrant === 'function') ? vibrant(awayAccent, 0.68) : awayAccent;
+  var homeInk = (typeof vibrant === 'function') ? vibrant(homeAccent, 0.68) : homeAccent;
 
   var slug = (typeof getHeadshotSlug === 'function') ? getHeadshotSlug(game.league) : '';
   function cell(p, accent, alignRight) {
@@ -59036,26 +59291,27 @@ function _gymPregameLeaders(data, game, awayAccent, homeAccent, divStyle) {
 
   var rows = '';
   var shown = 0;
-  for (var r = 0; r < _GYM_LEAD_ROWS.length; r++) {
-    var def = _GYM_LEAD_ROWS[r];
+  var cfg = _sbLeadCfg(game.league);   // SBLEADCFG
+  for (var r = 0; r < cfg.length; r++) {
+    var def = cfg[r];
     // Payload first (it's the live/official line), season averages second.
-    var a = find('away', def.aliases) || fromAvg('away', def.key);
-    var h = find('home', def.aliases) || fromAvg('home', def.key);
+    var a = find('away', def.payload) || fromAvg('away', def.key);
+    var h = find('home', def.payload) || fromAvg('home', def.key);
     // A row with neither side is not a row — ESPN doesn't publish every
     // category for every league, and an empty pair says nothing.
     if (!a && !h) continue;
     shown++;
-    rows += '<div class="gym-pl-row">' + cell(a, awayAccent, false) +
+    rows += '<div class="gym-pl-row">' + cell(a, awayInk, false) +
       '<span class="gym-pl-cat">' + def.key + '</span>' +
-      cell(h, homeAccent, true) + '</div>';
+      cell(h, homeInk, true) + '</div>';
   }
   if (!shown) return '';
 
   return '<div class="court-sect" style="padding:6px 16px 4px">\u2605 STAT LEADERS</div>' +
     '<div style="padding:2px 16px 10px;border-bottom:' + divStyle + '">' +
       '<div class="gym-pl-head">' +
-        '<span style="color:' + awayAccent + '">' + _esc(game.away.abbr) + '</span>' +
-        '<span style="color:' + homeAccent + '">' + _esc(game.home.abbr) + '</span>' +
+        '<span style="color:' + awayInk + '">' + _esc(game.away.abbr) + '</span>' +
+        '<span style="color:' + homeInk + '">' + _esc(game.home.abbr) + '</span>' +
       '</div>' + rows +
     '</div>';
 }
@@ -76328,6 +76584,37 @@ function renderTeamPage(data, teamId, league) {
   teamPageCache[ck].tAbbr = tAbbr;
   teamPageCache[ck].tRecord = tRecord;
   teamPageCache[ck].tStanding = tStanding;
+
+  // ── Player context for the card modal ── TPPLAYERCTX ──
+  // Every roster row here is clickable and calls openPlayerModal, but nothing
+  // on this page registered window._playerCtx — the map that modal reads for
+  // name and team. Skaters happened to work because a visit to a hockey
+  // stadium had cached them; goalies were never cached anywhere, so every
+  // goalie card opened titled "?" with no team.
+  //
+  // Registering here fixes it at the source and for EVERY sport, since this is
+  // the page the click comes from. Existing entries are left alone: a stadium
+  // has richer context (live team accent) than this page does.
+  try {
+    var _tpPs = (data && data.playerStats) || [];
+    if (_tpPs.length) {
+      window._playerCtx = window._playerCtx || {};
+      for (var _pi = 0; _pi < _tpPs.length; _pi++) {
+        var _pp = _tpPs[_pi];
+        if (!_pp || !_pp.id || window._playerCtx[_pp.id]) continue;
+        window._playerCtx[_pp.id] = {
+          name: _pp.fullName || _pp.name || '',
+          pos: _pp.pos || '',
+          jersey: _pp.jersey || '',
+          teamAbbr: tAbbr,
+          teamName: tName,
+          teamLogo: tLogo,
+          teamColor: tColor,
+          league: league
+        };
+      }
+    }
+  } catch (e) {}
 
   // Set tab accent color
   var tabs = document.getElementById('tpMainTabs');
