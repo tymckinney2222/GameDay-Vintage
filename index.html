@@ -108478,16 +108478,45 @@ function _skPpFetchGameStats(gamePk, mlbId, position) {
       } else {
         // pitcher stats
         var pitching = box.pitching || {};
-        result.ip = pitching.ip;
-        result.h = pitching.h;
-        result.r = pitching.r;
-        result.er = pitching.er;
-        result.bb = pitching.bb;
-        result.k = pitching.k || pitching.so;
-        result.hr = pitching.hr;
-        result.pitches = pitching.pitches;
+        // ── PPPITCHED ──
+        // Read the proxy's short keys AND the raw MLB Stats API keys, the
+        // same way the batter branch above does. Only the batter side ever
+        // got this treatment; a pitcher line read `pitching.ip` alone, so if
+        // the payload arrived with MLB's own naming (inningsPitched, hits,
+        // earnedRuns, baseOnBalls, strikeOuts) every field came back
+        // undefined and the row silently fell back to season stats.
+        var pickP = function() {
+          for (var i = 0; i < arguments.length; i++) {
+            var v = arguments[i];
+            if (v != null && v !== '') return v;
+          }
+          return null;
+        };
+        result.ip = pickP(pitching.ip, pitching.inningsPitched);
+        result.h = pickP(pitching.h, pitching.hits);
+        result.r = pickP(pitching.r, pitching.runs);
+        result.er = pickP(pitching.er, pitching.earnedRuns);
+        result.bb = pickP(pitching.bb, pitching.baseOnBalls, pitching.walks);
+        result.k = pickP(pitching.k, pitching.so, pitching.strikeOuts, pitching.strikeouts);
+        result.hr = pickP(pitching.hr, pitching.homeRuns);
+        result.pitches = pickP(pitching.pitches, pitching.numberOfPitches, pitching.pitchesThrown);
         result.line = pitching.line;
         result.decision = pitching.decision || pitching.note || '';
+
+        // Same defensive override the batter branch carries: if the line
+        // shows real work — outs recorded, a baserunner allowed, a strikeout,
+        // a pitch thrown, or a decision — then he pitched, whatever the
+        // proxy's `played` flag says. A reliever who enters late is exactly
+        // the case where that flag lags, and a false `played` sends the row
+        // down the pre-game path showing season numbers for a man who has
+        // already thrown two innings. PPPITCHED
+        var toNumP = function(v) { var n = parseFloat(v); return isNaN(n) ? 0 : n; };
+        var pitchedAny = _skIpToFloat(result.ip) > 0 ||
+                         toNumP(result.h) > 0 || toNumP(result.r) > 0 ||
+                         toNumP(result.er) > 0 || toNumP(result.bb) > 0 ||
+                         toNumP(result.k) > 0 || toNumP(result.pitches) > 0 ||
+                         !!String(result.decision || '').trim();
+        if (pitchedAny) result.played = true;
         
         // Compute single-game ERA when we have IP + ER and IP > 0
         if (result.ip && result.er != null) {
