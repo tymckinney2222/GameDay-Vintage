@@ -131260,9 +131260,84 @@ function renderFantasyTicker() {
 }
 
 // Sync ticker - just use the data Skipper already loaded for the cards
+// ── Non-Yahoo leagues in the ticker ── EXTTICK ──
+// The ticker walked skLeagueData, which is the YAHOO cache — so Sleeper,
+// Fantrax and ESPN leagues synced into Skipper never reached the tape even
+// though their live scores were already on the row.
+//
+// Reads liveScores.games, the shape all three external providers normalize
+// to, using the same my-team-in-this-game match mrWeekResult does: find the
+// game containing one of my team ids, then take my side of it. Cats leagues
+// carry awayWins/homeWins instead of scores and are formatted as a tally,
+// matching how the Yahoo cats branch below fills the same fields.
+//
+// No fetches — purely a read of data already enriched onto the rows.
+function _extTickerEntries() {
+  var out = [];
+  var rows = (typeof extSyncedLeagues === 'function') ? extSyncedLeagues() : [];
+  for (var i = 0; i < rows.length; i++) {
+    var row = rows[i];
+    if (!row) continue;
+    var ls = row.liveScores;
+    if (!ls || !ls.games || !ls.games.length) continue;
+    var myIds = row.myTeamIds || {};
+    var g = null, meAway = false, gi;
+    for (gi = 0; gi < ls.games.length; gi++) {
+      var gg = ls.games[gi];
+      if (gg.awayId != null && myIds[String(gg.awayId)]) { g = gg; meAway = true; break; }
+      if (gg.homeId != null && myIds[String(gg.homeId)]) { g = gg; meAway = false; break; }
+    }
+    if (!g) continue;                       // bye week or ids not resolved yet
+
+    var score = '', oppScore = '';
+    if (g.awayWins != null && g.homeWins != null) {
+      // Categories — a tally, same string shape the Yahoo cats path builds.
+      var mw = Number(meAway ? g.awayWins : g.homeWins) || 0;
+      var ow = Number(meAway ? g.homeWins : g.awayWins) || 0;
+      if (!mw && !ow) continue;             // nothing decided yet
+      score = mw + '-' + ow;
+      oppScore = ow + '-' + mw;
+    } else {
+      var ms = meAway ? g.awayScore : g.homeScore;
+      var os = meAway ? g.homeScore : g.awayScore;
+      if (ms == null || os == null) continue;
+      if (!Number(ms) && !Number(os)) continue;   // 0-0, not started
+      score = String(Math.round(Number(ms) * 10) / 10);
+      oppScore = String(Math.round(Number(os) * 10) / 10);
+    }
+
+    var myName = (row.standings && row.standings.name) ||
+                 (meAway ? g.away : g.home) || row.name || '';
+    var oppName = (meAway ? g.home : g.away) || '\u2014';
+    if (!myName) continue;
+    out.push({
+      key: row.key,
+      teamName: myName,
+      score: score,
+      oppScore: oppScore,
+      oppName: oppName,
+      logoUrl: (row.standings && row.standings.logoUrl) || row.logoUrl || '',
+      oppLogoUrl: (meAway ? g.homeLogo : g.awayLogo) || ''
+    });
+  }
+  return out;
+}
+
 function syncSkipperLeaguesToTicker() {
   window.fantasyTickerData = {};
-  
+
+  // External providers first so a Yahoo league can't be crowded out by an
+  // early return when skLeagueData is empty — a Sleeper-only user had an
+  // empty tape for exactly that reason. EXTTICK
+  try {
+    var _ext = _extTickerEntries();
+    for (var _ei = 0; _ei < _ext.length; _ei++) {
+      var _e = _ext[_ei];
+      updateFantasyTickerData(_e.key, _e.teamName, _e.score, _e.oppScore,
+        '', '', _e.logoUrl, _e.oppName, _e.oppLogoUrl);
+    }
+  } catch (e) {}
+
   if (!window.skLeagueData) return;
   
   Object.keys(window.skLeagueData).forEach(function(leagueKey) {
