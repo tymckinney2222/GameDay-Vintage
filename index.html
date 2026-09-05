@@ -34035,7 +34035,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-09-05 SLBRACKET';
+var SK_BUILD = '2026-09-05 FMALL';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -119319,6 +119319,71 @@ function _fmTeamColor(seed, isVintage) {
   return { accent: accent, ink: '#0b0b10' };
 }
 
+// ── All platforms on the Fantasy Matchups board ── FMALL ──
+// The board read only Yahoo (skSyncedLeagues + skLeagueData). Sleeper,
+// Fantrax and ESPN leagues already carry this week's pairing on
+// row.liveScores — the ticker reads it — so each becomes a card here too.
+//
+// Built in the exact {league, matchup} shape _fmCardHTML consumes, so the
+// same scorecard chrome, sort-by-closeness and open-on-tap all apply with
+// no second renderer. Cats leagues use awayWins/homeWins, points use scores,
+// matching the split the ticker already makes.
+function _fmExtPairs() {
+  var out = [];
+  var rows = (typeof extSyncedLeagues === 'function') ? extSyncedLeagues() : [];
+  for (var i = 0; i < rows.length; i++) {
+    var row = rows[i];
+    if (!row) continue;
+    var ls = row.liveScores;
+    if (!ls || !ls.games || !ls.games.length) continue;
+    var myIds = row.myTeamIds || {};
+    var g = null, meAway = false;
+    for (var gi = 0; gi < ls.games.length; gi++) {
+      var gg = ls.games[gi];
+      if (gg.awayId != null && myIds[String(gg.awayId)]) { g = gg; meAway = true; break; }
+      if (gg.homeId != null && myIds[String(gg.homeId)]) { g = gg; meAway = false; break; }
+    }
+    if (!g) continue;   // bye week
+
+    var isCats = (g.awayWins != null && g.homeWins != null);
+    var myName = (row.standings && row.standings.name) || (meAway ? g.away : g.home) || row.name || 'Me';
+    var oppName = (meAway ? g.home : g.away) || 'Opponent';
+    var myLogo = ((typeof extGetMyLogo === 'function') ? (extGetMyLogo(row.key) || '') : '') ||
+      (/^https?:\/\//i.test(String(row.myLogo || '')) ? row.myLogo : '') || '';
+    var oppLogo = (meAway ? g.homeLogo : g.awayLogo) || '';
+
+    var matchup = {
+      hasMatchup: true,
+      scoringType: isCats ? 'head' : 'headpoint',
+      leagueName: row.name || '',
+      week: ls.period != null ? ls.period : null,
+      myTeamKey: row.key,
+      myName: myName, oppName: oppName,
+      myLogo: myLogo, oppLogo: oppLogo,
+      myScore: null, oppScore: null, wins: 0, losses: 0, ties: 0,
+      myProj: null, oppProj: null, myLiveProj: null, oppLiveProj: null
+    };
+    if (isCats) {
+      matchup.wins = Number(meAway ? g.awayWins : g.homeWins) || 0;
+      matchup.losses = Number(meAway ? g.homeWins : g.awayWins) || 0;
+      matchup.ties = Number(g.ties || 0) || 0;
+    } else {
+      var ms = meAway ? g.awayScore : g.homeScore, os = meAway ? g.homeScore : g.awayScore;
+      matchup.myScore = (ms == null) ? null : Number(ms);
+      matchup.oppScore = (os == null) ? null : Number(os);
+      var mp = meAway ? g.awayProj : g.homeProj, op = meAway ? g.homeProj : g.awayProj;
+      if (mp != null) matchup.myProj = Number(mp);
+      if (op != null) matchup.oppProj = Number(op);
+    }
+    out.push({
+      league: { league_key: row.key, name: row.name || '', scoring_type: matchup.scoringType,
+                sport: row.sport || '', provider: row.provider || 'ext', _ext: true },
+      matchup: matchup
+    });
+  }
+  return out;
+}
+
 function _fmEligibleLeagues() {
   if (typeof skSyncedLeagues !== 'function') return [];
   return skSyncedLeagues().filter(function(l) {
@@ -119331,8 +119396,10 @@ function openFantasyMatchups() {
   var ov = document.getElementById('fmOverlay');
   if (!ov) return;
   ov.classList.add('open');
-  // Requires Skipper connected. If not, show a gentle prompt.
-  if (typeof fyTokens === 'undefined' || !fyTokens) {
+  // Requires Skipper connected — unless other platforms are synced, in which
+  // case there's a board to show without Yahoo. FMALL
+  var _hasExt = (typeof extSyncedLeagues === 'function') && extSyncedLeagues().length > 0;
+  if ((typeof fyTokens === 'undefined' || !fyTokens) && !_hasExt) {
     var body0 = document.getElementById('fmBody');
     if (body0) {
       body0.innerHTML = '<div class="fm-empty">Connect Yahoo in Skipper first to see your fantasy matchups.<br><br>' +
@@ -119363,6 +119430,13 @@ function refreshFantasyMatchups() {
   // Render once immediately from whatever's already cached (fast paint),
   // then re-pull in the background and re-render as data lands.
   _fmRender();
+
+  // Other platforms: the three enrichers re-fetch live scores for every
+  // synced Sleeper/Fantrax/ESPN league and repaint when done — hook below
+  // re-renders this board on that repaint while it's open. FMALL
+  try { if (typeof extEnrichFantrax === 'function') extEnrichFantrax(); } catch (e1) {}
+  try { if (typeof slEnrichLeagues === 'function') slEnrichLeagues(); } catch (e2) {}
+  try { if (typeof espEnrichLeagues === 'function') espEnrichLeagues(); } catch (e3) {}
 
   if (!leagues.length || typeof skHydrateLeague !== 'function') {
     if (btn) btn.classList.remove('fm-spinning');
@@ -119477,14 +119551,14 @@ function _fmCardHTML(league, matchup) {
     ? '<div class="card-pennant-header" style="background:' + accent + '">' +
         '<div class="card-pennant-text">' +
           '<span class="card-pennant-nickname" style="color:' + pennantInk + '">' + leagueName + '</span>' +
-          '<span class="card-pennant-sub" style="color:' + pennantInk + '">' + (isPoints ? 'POINTS' : 'CATEGORIES') + ' \u00b7 WEEK ' + (matchup.week || '\u2014') + '</span>' +
+          '<span class="card-pennant-sub" style="color:' + pennantInk + '">' + (isPoints ? 'POINTS' : 'CATEGORIES') + ' \u00b7 WEEK ' + (matchup.week || '\u2014') + (league && league._ext ? ' \u00b7 ' + String(league.provider || '').toUpperCase() : '') + '</span>' +
         '</div>' +
         '<span class="card-pennant-star" style="color:' + pennantInk + '">\u2605</span>' +
       '</div>'
     : '<div class="fm-head" style="border-left:3px solid ' + accent + '">' +
         '<div class="fm-head-text">' +
           '<span class="fm-head-name">' + leagueName + '</span>' +
-          '<span class="fm-head-sub">' + (isPoints ? 'POINTS' : 'CATEGORIES') + ' \u00b7 WEEK ' + (matchup.week || '\u2014') + '</span>' +
+          '<span class="fm-head-sub">' + (isPoints ? 'POINTS' : 'CATEGORIES') + ' \u00b7 WEEK ' + (matchup.week || '\u2014') + (league && league._ext ? ' \u00b7 ' + String(league.provider || '').toUpperCase() : '') + '</span>' +
         '</div>' +
         '<span class="fm-head-star" style="color:' + accent + '">\u2605</span>' +
       '</div>';
@@ -119509,8 +119583,9 @@ function _fmRender() {
   var body = document.getElementById('fmBody');
   if (!body) return;
   var leagues = _fmEligibleLeagues();
+  var extPairs = _fmExtPairs();   // FMALL
 
-  if (!leagues.length) {
+  if (!leagues.length && !extPairs.length) {
     body.innerHTML = '<div class="fm-empty">No head-to-head leagues synced.<br>' +
       'Points and category leagues show here; season-points leagues don\u2019t have a weekly opponent.</div>';
     return;
@@ -119542,6 +119617,14 @@ function _fmRender() {
     // (pre-week, no scores yet) so it sorts as "even" rather than NaN.
     closeness = (total > 0) ? (Math.abs(a - b) / total) : 0;
     ready.push({ league: l, matchup: matchup, closeness: closeness });
+  });
+  // Other platforms join the same list and the same closeness sort. FMALL
+  extPairs.forEach(function (pr) {
+    var m2 = pr.matchup, a2, b2;
+    if (m2.scoringType === 'headpoint') { a2 = m2.myScore || 0; b2 = m2.oppScore || 0; }
+    else { a2 = m2.wins || 0; b2 = m2.losses || 0; }
+    var tot2 = a2 + b2;
+    ready.push({ league: pr.league, matchup: m2, closeness: (tot2 > 0) ? (Math.abs(a2 - b2) / tot2) : 0 });
   });
 
   // Closest first. Stable-ish: ties fall back to league name so order
@@ -119579,6 +119662,12 @@ function _fmRender() {
 function _fmOpenLeague(leagueKey) {
   if (!leagueKey) return;
   closeFantasyMatchups();
+  // Ext keys are prefixed (slp:/fx:/esp:) — route those to their own opener. FMALL
+  if (/^(slp|fx|esp):/.test(String(leagueKey)) && typeof extOpenLeague === 'function') {
+    if (typeof openFantasy === 'function') openFantasy();
+    setTimeout(function () { try { extOpenLeague(leagueKey); } catch (e) {} }, 60);
+    return;
+  }
   if (typeof _skOpenLeagueFromCard === 'function') {
     _skOpenLeagueFromCard(leagueKey);
   } else {
@@ -141635,6 +141724,12 @@ function extSyncedLeagues() {
 // Repaint the Today list if Skipper is currently showing it — used
 // after the registry changes (load complete OR cleared by disconnect).
 function _extRepaintToday() {
+  // If the Fantasy Matchups board is open, fresh ext scores should land
+  // there too — it reads the rows at render time. FMALL
+  try {
+    var _fmOv = document.getElementById('fmOverlay');
+    if (_fmOv && _fmOv.classList.contains('open') && typeof _fmRender === 'function') _fmRender();
+  } catch (e) {}
   try {
     if (typeof skState !== 'undefined' && skState.view === 'today' &&
         typeof skRenderTodayCards === 'function') {
