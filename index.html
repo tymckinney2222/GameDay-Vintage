@@ -796,6 +796,40 @@
   .vintage-mode .card-fbsit.redzone .card-fbsit-dot { background: #b42814; box-shadow: none; }
   .vintage-mode .card-fbsit-rz { color: #b42814; }
 
+  /* ── Games-played board ── GPBOARD ── */
+  .sk-gpb { font-family: var(--sk-font-mono, monospace); font-size: 11px; }
+  .sk-gpb-row {
+    display: flex; align-items: center; gap: 4px; padding: 7px 12px;
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+  }
+  .sk-gpb-row.head {
+    font-size: 9px; letter-spacing: 0.1em; color: rgba(255,255,255,0.4);
+    border-bottom: 1px solid rgba(255,255,255,0.12);
+  }
+  .sk-gpb-row.mine { background: rgba(245,197,24,0.07); }
+  .sk-gpb-team {
+    flex: 1; min-width: 0; font-family: 'Barlow Condensed', sans-serif;
+    font-size: 13px; font-weight: 700; color: rgba(255,255,255,0.85);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .sk-gpb-cell {
+    width: 52px; flex: none; text-align: right; color: rgba(255,255,255,0.75);
+  }
+  .sk-gpb-cell small { color: rgba(255,255,255,0.3); font-size: 9px; }
+  .sk-gpb-cell.near { color: #fbbf24; }
+  .sk-gpb-cell.full { color: #f87171; font-weight: 700; }
+  .sk-gpb-cov {
+    padding: 10px 12px; font-size: 10px; line-height: 1.5;
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+  }
+  .sk-gpb-cov.low { color: #f87171; }
+  .sk-gpb-cov.mid { color: #fbbf24; }
+  .sk-gpb-cov.ok  { color: rgba(255,255,255,0.45); }
+  .sk-gpb-note, .sk-gpb-empty {
+    padding: 10px 12px; font-size: 10px; line-height: 1.5;
+    color: rgba(255,255,255,0.35);
+  }
+
   /* ── GP cap entry sheet ── GPCAP ── */
   .sk-gpcap-body { flex: 1; overflow: auto; padding: 16px 16px 48px; }
   .sk-gpcap-lg {
@@ -92948,7 +92982,9 @@ function skBuildDetailHTML(league) {
   var _hasH2H = (_sct === 'head' || _sct === 'headone' || _sct === 'headpoint');
   var _validTabs = { matchup: 1, standings: 1, roster: 1 };
   if (_hasH2H) { _validTabs.analysis = 1; _validTabs.scoreboard = 1; _validTabs.history = 1; }
-  if (_skIsSeasonPtsMlb(league)) { _validTabs.capwatch = 1; }
+  // GPBOARD — MLB gets Cap Watch, hockey-with-a-cap gets the GP board. Both
+  // live on the same tab because they answer the same question.
+  if (_skIsSeasonPtsMlb(league) || _skIsGpCapLeague(league)) { _validTabs.capwatch = 1; }
   if (!_validTabs[activeTab]) { activeTab = 'matchup'; skState.detailTab = 'matchup'; }
   // "Analysis" tab applies to BOTH cats and points leagues:
   //   • cats:   per-category tier breakdown (locked/contested/out-of-reach)
@@ -93300,7 +93336,11 @@ function skSetDetailTab(tab) {
   if (tab === 'capwatch') {
     var lkCw = skState.activeLeagueKey;
     var leagueCw = (fyLeagues || []).find(function(l) { return l.league_key === lkCw; });
-    if (leagueCw && typeof _skHydrateCapWatch === 'function') {
+    if (leagueCw && typeof _skIsGpCapLeague === 'function' && _skIsGpCapLeague(leagueCw)) {
+      // Hockey: no fetch at all — the board reads caches. GPBOARD
+      try { _skRenderGpBoard(leagueCw, document.getElementById('skCapWatchContent')); }
+      catch (e) {}
+    } else if (leagueCw && typeof _skHydrateCapWatch === 'function') {
       _skHydrateCapWatch(leagueCw, lkCw);
     }
   }
@@ -102540,11 +102580,103 @@ function _skGpMaxByPos(leagueKey) {
   if (per == null) return null;
   var rp = _skRosterPosCache[leagueKey];
   if (!rp || !rp.length) return null;
+  // Keyed UPPERCASE. Usage counts come from selectedPos, which Yahoo returns
+  // as "Util" in settings but uppercases in a lineup — matching them raw made
+  // Util read as zero games used forever. Label kept alongside for display.
+  // GPCAP
   var out = {};
   for (var i = 0; i < rp.length; i++) {
-    if (rp[i].count > 0) out[rp[i].position] = rp[i].count * per;
+    if (rp[i].count > 0) out[String(rp[i].position).toUpperCase()] = rp[i].count * per;
   }
   return out;
+}
+
+// Display label for an uppercase position key, taken from roster_positions so
+// the board reads "Util" rather than "UTIL". GPCAP
+function _skGpPosLabel(leagueKey, upperPos) {
+  var rp = _skRosterPosCache[leagueKey] || [];
+  for (var i = 0; i < rp.length; i++) {
+    if (String(rp[i].position).toUpperCase() === upperPos) return rp[i].position;
+  }
+  return upperPos;
+}
+
+// ── Derived games-played usage ── GPUSE ──
+// Yahoo publishes no GP-per-position counter for hockey, but it does return
+// each player's slot for a given date, and a start in an active slot with a
+// stat line IS a game played. So the count is derivable from data the app
+// already caches.
+//
+// Nothing is fetched here. fetchTeamFpForDate persists every finalized date
+// to localStorage, and the season leaderboard calls it for EVERY team each
+// day the league is opened — so usage accrues on its own with normal use.
+// That also means coverage is a real quantity the board has to report:
+// counting 40 of 60 elapsed days is not the same as knowing the answer.
+//
+// The count is an ESTIMATE and is labelled as one. Baseball's IP came
+// straight from Yahoo and could not drift; this can, if a lineup was edited
+// after a date was cached.
+function _skGpReadCachedMap(teamKey, date) {
+  var memKey = _fpKey(teamKey, date);
+  if (teamFpCache[memKey]) return teamFpCache[memKey];
+  try {
+    var raw = localStorage.getItem(FP_LS_PREFIX + memKey);
+    if (raw) return JSON.parse(raw);
+  } catch (e) {}
+  return null;
+}
+
+// One date -> { position: 1 } for every active slot that actually produced a
+// stat line. A player parked in an active slot on his team's off day has no
+// stats and does NOT burn a game, which is how Yahoo counts it too.
+function _skGpCountDate(fpMap) {
+  var out = {};
+  if (!fpMap) return out;
+  for (var pk in fpMap) {
+    if (!fpMap.hasOwnProperty(pk)) continue;
+    var e = fpMap[pk];
+    if (!e || !_isActiveSlot(e.selectedPos)) continue;
+    var played = false;
+    if (e.stats && typeof e.stats === 'object') {
+      for (var sk in e.stats) { if (e.stats.hasOwnProperty(sk)) { played = true; break; } }
+    }
+    if (!played) continue;
+    var pos = String(e.selectedPos || '').toUpperCase();
+    if (!pos) continue;
+    out[pos] = (out[pos] || 0) + 1;
+  }
+  return out;
+}
+
+function _skGpDateRange(league) {
+  var w = (typeof _skSeasonWindow === 'function') ? _skSeasonWindow(league) : null;
+  if (!w) return [];
+  var out = [];
+  var d = new Date(w.startMs);
+  var stop = Math.min(Date.now(), w.endMs);
+  while (d.getTime() <= stop) {
+    out.push(d.getFullYear() + '-' +
+      String(d.getMonth() + 1).padStart(2, '0') + '-' +
+      String(d.getDate()).padStart(2, '0'));
+    d.setDate(d.getDate() + 1);
+  }
+  return out;
+}
+
+// Usage for one team across the season so far, from cache only.
+function _skGpUsageForTeam(league, teamKey) {
+  var dates = _skGpDateRange(league);
+  var byPos = {}, counted = 0;
+  for (var i = 0; i < dates.length; i++) {
+    var m = _skGpReadCachedMap(teamKey, dates[i]);
+    if (!m) continue;
+    counted++;
+    var day = _skGpCountDate(m);
+    for (var pos in day) {
+      if (day.hasOwnProperty(pos)) byPos[pos] = (byPos[pos] || 0) + day[pos];
+    }
+  }
+  return { byPos: byPos, daysCounted: counted, daysElapsed: dates.length };
 }
 
 // ── Entry sheet ── GPCAP ──
@@ -102637,6 +102769,93 @@ function _skGpCapClear(leagueKey) {
 function _skGpCapClose() {
   var el = document.getElementById('skGpCapSheet');
   if (el && el.parentNode) el.parentNode.removeChild(el);
+}
+
+// ── Games-played board ── GPBOARD ──
+// The hockey answer to Cap Watch: every team's slot usage against the entered
+// maximum. Same question ("who runs out, and when"), different plumbing —
+// the max is hand-entered because Yahoo won't publish it, and the usage is
+// derived because Yahoo won't publish that either.
+function _skIsGpCapLeague(league) {
+  return !!league && league.sport === 'nhl' &&
+         _skGetGpPerSlot(league.league_key) != null;
+}
+
+function _skRenderGpBoard(league, host) {
+  if (!host) return;
+  var lk = league.league_key;
+  var maxByPos = _skGpMaxByPos(lk);
+  if (!maxByPos) {
+    host.innerHTML = '<div class="sk-gpb-empty">Set a games-per-slot number first ' +
+      '\u2014 account menu \u2192 Games-played cap.</div>';
+    return;
+  }
+  var data = skLeagueData[lk];
+  var allTeams = (data && data.allTeams) || {};
+  var teamKeys = Object.keys(allTeams);
+  if (!teamKeys.length) {
+    host.innerHTML = '<div class="sk-gpb-empty">Standings still loading\u2026</div>';
+    return;
+  }
+  var positions = Object.keys(maxByPos);
+  var myKey = data && data.team && data.team.team_key;
+
+  var rows = [], minCoverage = null, maxElapsed = 0;
+  teamKeys.forEach(function (tk) {
+    var u = _skGpUsageForTeam(league, tk);
+    maxElapsed = Math.max(maxElapsed, u.daysElapsed);
+    if (minCoverage == null || u.daysCounted < minCoverage) minCoverage = u.daysCounted;
+    // Worst position = the one closest to its ceiling; that's the one that
+    // freezes first and the only one worth sorting on.
+    var worst = null;
+    positions.forEach(function (pos) {
+      var used = u.byPos[pos] || 0;
+      var mx = maxByPos[pos];
+      if (!mx) return;
+      var pct = used / mx;
+      if (!worst || pct > worst.pct) worst = { pos: pos, used: used, max: mx, pct: pct };
+    });
+    rows.push({ key: tk, name: (allTeams[tk] && allTeams[tk].name) || tk,
+                usage: u, worst: worst, isMine: tk === myKey });
+  });
+  rows.sort(function (a, b) {
+    return ((b.worst && b.worst.pct) || 0) - ((a.worst && a.worst.pct) || 0);
+  });
+
+  var head = '<div class="sk-gpb-row head"><span class="sk-gpb-team">TEAM</span>' +
+    positions.map(function (p) {
+      return '<span class="sk-gpb-cell">' + skEscape(_skGpPosLabel(lk, p)) + '</span>';
+    }).join('') +
+    '</div>';
+
+  var body = rows.map(function (r) {
+    var cells = positions.map(function (pos) {
+      var used = r.usage.byPos[pos] || 0;
+      var mx = maxByPos[pos];
+      var pct = mx ? (used / mx) : 0;
+      var cls = pct >= 1 ? ' full' : (pct >= 0.9 ? ' near' : '');
+      return '<span class="sk-gpb-cell' + cls + '">' + used +
+        '<small>/' + mx + '</small></span>';
+    }).join('');
+    return '<div class="sk-gpb-row' + (r.isMine ? ' mine' : '') + '">' +
+      '<span class="sk-gpb-team">' + skEscape(r.name) + '</span>' + cells + '</div>';
+  }).join('');
+
+  // Coverage is reported, not hidden. A board built from 12 of 60 days is
+  // not wrong so much as not yet informative, and the user has to be able to
+  // tell the difference at a glance.
+  var cov = (maxElapsed > 0)
+    ? Math.round((minCoverage / maxElapsed) * 100) : 0;
+  var covCls = cov >= 90 ? 'ok' : (cov >= 50 ? 'mid' : 'low');
+
+  host.innerHTML =
+    '<div class="sk-gpb-cov ' + covCls + '">Counted from ' + minCoverage + ' of ' +
+      maxElapsed + ' elapsed days (' + cov + '%). ' +
+      'Usage is derived from cached daily lineups, not published by Yahoo \u2014 ' +
+      'treat it as an estimate and spot-check against Team \u2192 Max Games Played.</div>' +
+    '<div class="sk-gpb">' + head + body + '</div>' +
+    '<div class="sk-gpb-note">Coverage grows on its own: opening this league each ' +
+      'day caches every team\u2019s lineup for that date.</div>';
 }
 
 // ── Games-played cap probe ── GPPROBE ──
