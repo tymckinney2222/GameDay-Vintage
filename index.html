@@ -25159,7 +25159,12 @@
   .slwg-d { font-size: 8px; font-weight: 700; color: rgba(255,255,255,0.4); letter-spacing: 0.06em; }
   .slwg-fp { font-size: 11px; font-weight: 800; color: rgba(255,255,255,0.85); line-height: 1.1; }
   .slwg-opp { font-size: 7.5px; color: rgba(255,255,255,0.4); white-space: nowrap;
-              max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+              max-width: 100%; overflow: hidden; text-overflow: ellipsis; min-height: 9px; }
+  .slwg-time { font-size: 7.5px; color: rgba(255,255,255,0.55); white-space: nowrap; }
+  .slwg-cell.live { border-color: #4ade80; }
+  .slwg-cell.live .slwg-fp { color: #4ade80; }
+  .slwg-own { font-size: 9px; font-family: var(--sk-font-mono, monospace);
+              color: rgba(255,255,255,0.4); margin-top: 1px; min-height: 0; }
 
   .slp-w-row {
     display: flex; align-items: center; gap: 10px;
@@ -33983,7 +33988,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-09-05 SLWEEKGRID';
+var SK_BUILD = '2026-09-05 SLWEEKTIME';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -143672,6 +143677,118 @@ function _slwgDow(dateStr) {
   return isNaN(dt.getTime()) ? -1 : dt.getDay();
 }
 
+// ── Game times for the live week ── SLWEEKTIME ──
+// A past week has scores; the live week has scores for games played and
+// nothing for games still to come. Sleeper's card fills those with the tip
+// time. The 7-day schedule lookup built for the H2H answers that here too,
+// keyed by team abbreviation — one cached ESPN call for the whole roster.
+// Only applied when the week being shown is the current one; a preview of a
+// past week has nothing upcoming.
+function _slwgFillTimes(row, paneId, list) {
+  var pane = document.getElementById(paneId);
+  if (!pane || !row) return;
+  var league = String(row.sport || 'nba').toUpperCase();
+  if (typeof _skFetchUpcoming !== 'function') return;
+  _skFetchUpcoming(league, 7).then(function (games) {
+    if (!document.getElementById(paneId)) return;
+    var cells = pane.querySelectorAll('[data-slwg-team]');
+    for (var i = 0; i < cells.length; i++) {
+      var abbr = cells[i].getAttribute('data-slwg-team');
+      var dow = parseInt(cells[i].getAttribute('data-slwg-dow'), 10);
+      // Find this team's game ON that weekday within the upcoming window.
+      var hit = null;
+      for (var g = 0; g < (games || []).length; g++) {
+        var gm = games[g];
+        var h = String((gm.home && gm.home.abbr) || '').toUpperCase();
+        var w = String((gm.away && gm.away.abbr) || '').toUpperCase();
+        if (h !== abbr && w !== abbr) continue;
+        var d = new Date(gm.date);
+        if (isNaN(d.getTime()) || d.getDay() !== dow) continue;
+        hit = { home: (h === abbr), opp: (h === abbr) ? w : h, when: gm.statusDetail || '', state: gm.state };
+        break;
+      }
+      if (!hit) continue;
+      var oppEl = cells[i].querySelector('.slwg-opp');
+      var timeEl = cells[i].querySelector('.slwg-time');
+      if (oppEl && !oppEl.textContent) oppEl.textContent = (hit.home ? 'vs ' : '@ ') + hit.opp;
+      if (timeEl && hit.state === 'pre' && hit.when) timeEl.textContent = hit.when;
+      if (hit.state === 'in') cells[i].className += ' live';
+    }
+  });
+}
+
+// ── Rostered / started percentages ── SLWEEKOWN ──
+// Sleeper's public API publishes NO ownership percentages — trending is
+// add/drop COUNTS, and the player dictionary carries search_rank at best.
+// ESPN's fantasy pool does publish percentOwned and percentStarted, and the
+// Sleeper dictionary gives an espn_id for most NBA players, so where the id
+// maps we can show ESPN's numbers. They are labelled as ESPN's: a different
+// player base than Sleeper's, close enough to be useful, not the same thing.
+//
+// One filtered request for the whole roster — the same kona endpoint the
+// draft board pages through, with an id filter instead of an offset.
+var _slwgOwnCache = {};   // sport -> { byId, t }
+
+function _slwgFetchOwnership(sport, espnIds) {
+  var key = String(sport || 'nba').toLowerCase();
+  var c = _slwgOwnCache[key];
+  var need = [];
+  for (var i = 0; i < espnIds.length; i++) {
+    if (!c || !c.byId || c.byId[espnIds[i]] == null) need.push(espnIds[i]);
+  }
+  if (!need.length && c) return Promise.resolve(c.byId);
+  if (typeof DBP_BASE === 'undefined' || typeof dbpGameFor !== 'function' || typeof dbpSeason !== 'function') {
+    return Promise.resolve((c && c.byId) || {});
+  }
+  var url = DBP_BASE + '/' + dbpGameFor(key) + '/seasons/' + dbpSeason() +
+    '/segments/0/leaguedefaults/3?view=kona_player_info&_own=' + Date.now();
+  var filter = { players: { filterIds: { value: need.map(function (x) { return Number(x); }) },
+                            limit: need.length } };
+  return fetch(url, { cache: 'no-store', headers: { 'X-Fantasy-Filter': JSON.stringify(filter) } })
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (j) {
+      var byId = (c && c.byId) || {};
+      var list = (j && j.players) || [];
+      for (var k = 0; k < list.length; k++) {
+        var pl = list[k] && (list[k].player || list[k]);
+        if (!pl || pl.id == null) continue;
+        var own = pl.ownership || {};
+        byId[String(pl.id)] = {
+          owned: (own.percentOwned != null) ? Math.round(Number(own.percentOwned)) : null,
+          started: (own.percentStarted != null) ? Math.round(Number(own.percentStarted)) : null
+        };
+      }
+      _slwgOwnCache[key] = { byId: byId, t: Date.now() };
+      return byId;
+    }).catch(function () { return (c && c.byId) || {}; });
+}
+
+function _slwgFillOwnership(row, paneId, list) {
+  var pane = document.getElementById(paneId);
+  if (!pane || !row) return;
+  var ids = [], map = {};
+  for (var i = 0; i < (list || []).length; i++) {
+    var p = list[i];
+    if (p && p.espnId) { ids.push(String(p.espnId)); map[String(p.playerId)] = String(p.espnId); }
+  }
+  if (!ids.length) return;
+  _slwgFetchOwnership(row.sport, ids).then(function (byId) {
+    if (!document.getElementById(paneId)) return;
+    var els = pane.querySelectorAll('[data-slwg-own]');
+    for (var e = 0; e < els.length; e++) {
+      var pid = els[e].getAttribute('data-slwg-own');
+      var eid = map[pid];
+      var o = eid && byId[eid];
+      if (!o || (o.owned == null && o.started == null)) continue;
+      els[e].textContent =
+        (o.owned != null ? o.owned + '% rostered' : '') +
+        (o.owned != null && o.started != null ? ' \u00b7 ' : '') +
+        (o.started != null ? o.started + '% start' : '');
+      els[e].title = 'ESPN ownership \u2014 a different player base than Sleeper\u2019s';
+    }
+  });
+}
+
 function slWeekGamesHtml(list, week, isPreview, season) {
   if (!list || !list.length) return '<div class="slp-w-empty">Roster is empty.</div>';
   isPreview = !!isPreview;
@@ -143712,10 +143829,15 @@ function slWeekGamesHtml(list, week, isPreview, season) {
       var gm = p.games[gi];
       var isBest = (gi === bestIdx);
       var oppTxt = gm.opp ? slEsc(String(gm.opp).toUpperCase()) : '';
-      cells += '<div class="slwg-cell' + (isBest ? ' best' : '') + '">' +
+      // data-slwg-team/dow let the live-week time fill find this cell. The
+      // opp span is always emitted so the schedule can fill it when Sleeper's
+      // log had none; the time span only matters for an unplayed game. SLWEEKTIME
+      cells += '<div class="slwg-cell' + (isBest ? ' best' : '') + '"' +
+        (p.team ? ' data-slwg-team="' + slEsc(String(p.team).toUpperCase()) + '" data-slwg-dow="' + dow + '"' : '') + '>' +
         '<span class="slwg-d">' + _SLWG_DOW[dow] + '</span>' +
         '<b class="slwg-fp">' + (gm.fp == null ? '\u2014' : gm.fp.toFixed(1)) + '</b>' +
-        (oppTxt ? '<span class="slwg-opp">' + oppTxt + '</span>' : '') +
+        '<span class="slwg-opp">' + oppTxt + '</span>' +
+        (gm.fp == null ? '<span class="slwg-time"></span>' : '') +
       '</div>';
     }
     // Games the log couldn't date land in a trailing "?" cell rather than
@@ -143739,6 +143861,7 @@ function slWeekGamesHtml(list, week, isPreview, season) {
           '<div class="slwg-name">' + slEsc(p.name) + inj + '</div>' +
           '<div class="slwg-meta">' + (p.pos ? slEsc(p.pos) : '') + (p.team ? ' \u00b7 ' + slEsc(p.team) : '') +
             (played ? ' \u00b7 ' + played + ' gm' : '') + '</div>' +
+          (p.espnId ? '<div class="slwg-own" data-slwg-own="' + slEsc(String(p.playerId)) + '"></div>' : '') +   // SLWEEKOWN
         '</div>' +
         '<div class="slwg-right">' +
           (p.proj != null ? '<span class="slwg-proj">proj ' + p.proj.toFixed(1) + '</span>' : '') +
@@ -143800,7 +143923,7 @@ function slLoadWeekGames(row, paneId, ovSeason, ovWeek) {
       return { name: it.name || String(it.playerId), slot: it.slot || '',
         team: it.team || '', games: games, proj: proj,
         playerId: it.playerId, pos: it.pos || '', inj: it.inj || '',
-        starter: !!it.starter };
+        starter: !!it.starter, espnId: it.espnId || null };   // SLWEEKOWN
     }
     // Actuals and projections come from the same endpoint family and
     // parse identically, so one paced worker fetches both per player.
@@ -143832,6 +143955,13 @@ function slLoadWeekGames(row, paneId, ovSeason, ovWeek) {
     if (p2) {
       p2.innerHTML = slWeekGamesHtml(list, week, preview, season) +
         _slpWeekPreviewBtn(row, preview);
+      // Deferred fills, after the markup is live. Times only make sense for
+      // the live week (a preview is a past week with nothing upcoming);
+      // ownership applies to either. SLWEEKTIME / SLWEEKOWN
+      setTimeout(function () {
+        try { if (!preview) _slwgFillTimes(row, paneId, list); } catch (e) {}
+        try { _slwgFillOwnership(row, paneId, list); } catch (e2) {}
+      }, 0);
     }
   }).catch(function() {
     var p3 = document.getElementById(paneId);
