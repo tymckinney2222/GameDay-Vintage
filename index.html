@@ -823,6 +823,15 @@
   .sk-rc-note { padding: 9px 13px 11px; font-size: 9.5px; line-height: 1.5;
                 color: rgba(255,255,255,0.35); }
 
+  /* ── Fantasy Matchups sport filter ── FMSORT ── */
+  .fm-filter { display: flex; gap: 6px; padding: 0 16px 10px; flex-wrap: wrap; }
+  .fm-filter:empty { display: none; }
+  .fm-pill { padding: 6px 14px; border-radius: 999px; font-size: 10px; font-weight: 800;
+             letter-spacing: 0.12em; font-family: 'Barlow Condensed', sans-serif;
+             background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.12);
+             color: rgba(255,255,255,0.55); cursor: pointer; }
+  .fm-pill.on { background: rgba(251,191,36,0.14); border-color: #fbbf24; color: #fbbf24; }
+
   /* ── Playoff bracket ── SLBRACKET ── */
   .slb-toggle { display: flex; gap: 6px; margin: 0 0 12px; }
   .slb-pill { flex: 1; padding: 8px 6px; border-radius: 8px; font-size: 10px; font-weight: 800;
@@ -27648,6 +27657,9 @@
       </button>
     </div>
   </div>
+  <!-- Sport filter — FMSORT. Built by _fmFilterHtml() from the sports that
+       actually have a card, so it never offers a sport with nothing in it. -->
+  <div class="fm-filter" id="fmFilter"></div>
   <div class="fm-body" id="fmBody">
     <div class="pp-loading">Loading your matchups\u2026</div>
   </div>
@@ -34035,7 +34047,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-09-05 FMALL';
+var SK_BUILD = '2026-09-05 FMSORT';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -119384,6 +119396,43 @@ function _fmExtPairs() {
   return out;
 }
 
+// ── Sport filter for the board ── FMSORT ──
+// One pill per sport that has a card, plus ALL. Remembered for the session
+// so reopening the board keeps the choice.
+var _fmSport = '';
+var _FM_SPORT_LABEL = { mlb: 'MLB', nfl: 'NFL', nba: 'NBA', nhl: 'NHL' };
+
+function _fmSetSport(sp) {
+  _fmSport = String(sp || '');
+  _fmRender();
+}
+
+function _fmPaintFilter(ready) {
+  var host = document.getElementById('fmFilter');
+  if (!host) return;
+  var seen = {}, sports = [];
+  for (var i = 0; i < ready.length; i++) {
+    var sp = ready[i].sport;
+    if (sp && !seen[sp]) { seen[sp] = 1; sports.push(sp); }
+  }
+  // If the remembered sport no longer has any card, fall back to all so the
+  // board can't be filtered into emptiness.
+  if (_fmSport && !seen[_fmSport]) _fmSport = '';
+  if (sports.length < 2) { host.innerHTML = ''; return; }
+  var order = ['mlb', 'nfl', 'nba', 'nhl'];
+  sports.sort(function (a, b) {
+    var ia = order.indexOf(a), ib = order.indexOf(b);
+    return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+  });
+  var html = '<button class="fm-pill' + (!_fmSport ? ' on' : '') + '" onclick="_fmSetSport(\'\')">ALL</button>';
+  for (var k = 0; k < sports.length; k++) {
+    var s2 = sports[k];
+    html += '<button class="fm-pill' + (_fmSport === s2 ? ' on' : '') + '" onclick="_fmSetSport(\'' + s2 + '\')">' +
+      (_FM_SPORT_LABEL[s2] || s2.toUpperCase()) + '</button>';
+  }
+  host.innerHTML = html;
+}
+
 function _fmEligibleLeagues() {
   if (typeof skSyncedLeagues !== 'function') return [];
   return skSyncedLeagues().filter(function(l) {
@@ -119616,7 +119665,11 @@ function _fmRender() {
     // 0 = dead even (closest); 1 = blowout. Guard the zero-total case
     // (pre-week, no scores yet) so it sorts as "even" rather than NaN.
     closeness = (total > 0) ? (Math.abs(a - b) / total) : 0;
-    ready.push({ league: l, matchup: matchup, closeness: closeness });
+    // FMSORT — a 0-0 has closeness 0 and was sorting to the TOP as the
+    // "closest" matchup. Flag whether anything has happened yet so those
+    // drop to the bottom instead.
+    ready.push({ league: l, matchup: matchup, closeness: closeness, hasResult: total > 0,
+                 sport: String(l.sport || '').toLowerCase() });
   });
   // Other platforms join the same list and the same closeness sort. FMALL
   extPairs.forEach(function (pr) {
@@ -119624,12 +119677,23 @@ function _fmRender() {
     if (m2.scoringType === 'headpoint') { a2 = m2.myScore || 0; b2 = m2.oppScore || 0; }
     else { a2 = m2.wins || 0; b2 = m2.losses || 0; }
     var tot2 = a2 + b2;
-    ready.push({ league: pr.league, matchup: m2, closeness: (tot2 > 0) ? (Math.abs(a2 - b2) / tot2) : 0 });
+    ready.push({ league: pr.league, matchup: m2, closeness: (tot2 > 0) ? (Math.abs(a2 - b2) / tot2) : 0,
+                 hasResult: tot2 > 0, sport: String(pr.league.sport || '').toLowerCase() });
   });
 
-  // Closest first. Stable-ish: ties fall back to league name so order
-  // doesn't jitter between renders.
+  // The filter row lists the sports that actually have a card. FMSORT
+  _fmPaintFilter(ready);
+  // Read the choice AFTER painting: the painter resets it to ALL when the
+  // remembered sport has no card, and the board must honour that reset.
+  var wantSport = _fmSport;
+  if (wantSport) {
+    ready = ready.filter(function (it) { return it.sport === wantSport; });
+  }
+
+  // Results first, then closest first. Stable-ish: ties fall back to league
+  // name so order doesn't jitter between renders. FMSORT
   ready.sort(function(x, y) {
+    if (x.hasResult !== y.hasResult) return x.hasResult ? -1 : 1;
     if (x.closeness !== y.closeness) return x.closeness - y.closeness;
     var xn = (x.league && x.league.name) || '';
     var yn = (y.league && y.league.name) || '';
