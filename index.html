@@ -102388,6 +102388,112 @@ function _prevDateStr(dateStr) {
 // league's own week count keyed off the current Yahoo/game week), so any pace
 // number derived from this matches the "your pace" figure shown there. Returns
 // a positive number, or null if it can't be established / it's too early.
+// ── Games-played cap probe ── GPPROBE ──
+// Cap Watch exists because a probe confirmed where Yahoo hides the IP cap:
+//   settings[1].max_innings_pitched, and team stat_id 50 for usage.
+// Hockey caps games played PER POSITION (C/LW/RW/D/Util/G), so the same
+// board needs two unknowns answered: where the per-position maximums live,
+// and whether per-team usage is exposed at all.
+//
+// Run from the console:  skProbeGpCaps('466.l.12345')
+// Prints a compact summary and leaves the raw payloads on
+// window._skGpProbe for inspection.
+function skProbeGpCaps(leagueKey) {
+  if (!leagueKey) { console.log('[gp-probe] pass a league_key'); return; }
+  window._skGpProbe = { leagueKey: leagueKey };
+
+  function scanForCaps(node, path, hits, depth) {
+    if (!node || depth > 8) return;
+    if (typeof node === 'object') {
+      for (var k in node) {
+        if (!node.hasOwnProperty(k)) continue;
+        var v = node[k];
+        // Anything that smells like a cap: games/innings maximums, or a
+        // roster position carrying a count of its own.
+        if (/max.*(game|inning)|games.*max|position_max/i.test(k)) {
+          hits.push({ path: path + '.' + k, value: v });
+        }
+        if (v && typeof v === 'object') scanForCaps(v, path + '.' + k, hits, depth + 1);
+      }
+    }
+  }
+
+  fyApi('/league/' + leagueKey + '/settings').then(function (r) {
+    window._skGpProbe.settings = r;
+    var hits = [];
+    scanForCaps(r, 'settings', hits, 0);
+    console.log('── LEAGUE SETTINGS ──');
+    if (hits.length) {
+      hits.forEach(function (h) { console.log('   ' + h.path + ' = ' + JSON.stringify(h.value)); });
+    } else {
+      console.log('   no max-games/innings key found anywhere in settings');
+    }
+    // Roster positions, which is where a per-position cap would most
+    // plausibly hang.
+    try {
+      var sBlocks = r.fantasy_content.league[1].settings;
+      for (var i = 0; i < sBlocks.length; i++) {
+        var rp = sBlocks[i] && sBlocks[i].roster_positions;
+        if (!rp) continue;
+        console.log('── ROSTER POSITIONS ──');
+        for (var j = 0; j < rp.length; j++) {
+          var pos = rp[j] && rp[j].roster_position;
+          if (pos) console.log('   ' + JSON.stringify(pos));
+        }
+      }
+    } catch (e) { console.log('   (roster_positions not readable: ' + e.message + ')'); }
+    return fyApi('/league/' + leagueKey + '/teams/stats;type=season');
+  }).then(function (r2) {
+    window._skGpProbe.teamStats = r2;
+    console.log('── TEAM SEASON STATS (first team) ──');
+    try {
+      var t0 = r2.fantasy_content.league[1].teams['0'].team;
+      var stats = t0[1].team_stats.stats;
+      console.log('   ' + stats.length + ' stats returned; ids and values:');
+      var line = [];
+      for (var i = 0; i < stats.length; i++) {
+        line.push(stats[i].stat.stat_id + '=' + stats[i].stat.value);
+      }
+      console.log('   ' + line.join('  '));
+      console.log('   (looking for per-position games-played counters here)');
+    } catch (e) {
+      console.log('   could not read team_stats: ' + e.message);
+    }
+    console.log('── raw payloads on window._skGpProbe ──');
+  }).catch(function (e) {
+    console.log('[gp-probe] failed: ' + ((e && e.message) || e));
+  });
+}
+
+// ── Sport-aware season window ── SEASONWIN ──
+// Everything below used a hardcoded 03-25 -> 09-27 window, which is baseball's
+// calendar applied to every sport. An NHL or NBA league starting in October
+// got weeks measured from the PREVIOUS March, so a season-points hockey league
+// divided its points by ~78 weeks instead of ~22 — Pace per Week and Catch the
+// Leaders' "need X/wk" were wrong by that factor.
+//
+// Winter sports also span two calendar years: Yahoo's league.season is the
+// STARTING year (2025 means 2025-26), so the end date belongs to season + 1.
+//
+// Football is excluded here — it has its own week-based path that is already
+// correct and far more precise than a calendar guess.
+var _SK_SEASON_WINDOWS = {
+  mlb:  { start: '-03-25', end: '-09-27', spans: false },
+  nhl:  { start: '-10-07', end: '-04-15', spans: true  },
+  nba:  { start: '-10-21', end: '-04-13', spans: true  }
+};
+
+function _skSeasonWindow(league) {
+  var yr = parseInt((league && league.season) || (new Date()).getFullYear(), 10);
+  if (isNaN(yr)) yr = (new Date()).getFullYear();
+  var sport = String((league && league.sport) || 'mlb').toLowerCase();
+  var w = _SK_SEASON_WINDOWS[sport] || _SK_SEASON_WINDOWS.mlb;
+  var startMs = new Date(yr + w.start + 'T00:00:00').getTime();
+  var endMs = new Date((w.spans ? (yr + 1) : yr) + w.end + 'T23:59:59').getTime();
+  if (isNaN(startMs) || isNaN(endMs) || endMs <= startMs) return null;
+  return { startMs: startMs, endMs: endMs };
+}
+
 function _skWeeksElapsedForLeague(league) {
   var _isNfl = (typeof _skIsNflLeague === 'function') && _skIsNflLeague(league);
   if (_isNfl) {
@@ -102408,11 +102514,14 @@ function _skWeeksElapsedForLeague(league) {
     if (!_cw || isNaN(_cw)) _cw = 1;
     return Math.max(1, _cw - 1);
   }
-  var yr = league && league.season ? league.season : (new Date()).getFullYear();
-  var startMs = new Date(yr + '-03-25T00:00:00').getTime();
-  var nowMs = Date.now();
-  if (isNaN(startMs)) return null;
-  var we = (nowMs - startMs) / (1000 * 60 * 60 * 24 * 7);
+  // SEASONWIN — sport-aware, and CLAMPED to the season's own length so an
+  // offseason view doesn't keep inflating the divisor forever.
+  var _w = _skSeasonWindow(league);
+  if (!_w) return null;
+  var WEEK = 1000 * 60 * 60 * 24 * 7;
+  var we = (Date.now() - _w.startMs) / WEEK;
+  var full = (_w.endMs - _w.startMs) / WEEK;
+  if (we > full) we = full;
   if (we < 1) return null; // too early for a meaningful per-week rate
   return we;
 }
@@ -102513,8 +102622,11 @@ function skBuildCatchTheLeaders(rows, myKey, league) {
     paceSubTail = ' weeks left \u00b7 ' + NFL_TOTAL + '-week season \u00b7 ';
   } else {
     var yr = league && league.season ? league.season : (new Date()).getFullYear();
-    var startMs = new Date(yr + '-03-25T00:00:00').getTime();
-    var endMs   = new Date(yr + '-09-27T23:59:59').getTime();
+    // SEASONWIN — same sport-aware window Pace uses, so the two can't
+    // disagree about how much season is left.
+    var _cw2 = _skSeasonWindow(league);
+    var startMs = _cw2 ? _cw2.startMs : NaN;
+    var endMs   = _cw2 ? _cw2.endMs : NaN;
     var nowMs   = Date.now();
     if (isNaN(startMs) || isNaN(endMs)) return '';
     var MS_WK = 1000 * 60 * 60 * 24 * 7;
