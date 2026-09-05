@@ -796,6 +796,51 @@
   .vintage-mode .card-fbsit.redzone .card-fbsit-dot { background: #b42814; box-shadow: none; }
   .vintage-mode .card-fbsit-rz { color: #b42814; }
 
+  /* ── GP cap entry sheet ── GPCAP ── */
+  .sk-gpcap-body { flex: 1; overflow: auto; padding: 16px 16px 48px; }
+  .sk-gpcap-lg {
+    font-family: 'Barlow Condensed', sans-serif; font-size: 19px; font-weight: 800;
+    color: #fff; margin-bottom: 8px;
+  }
+  .sk-gpcap-note {
+    font-size: 12px; line-height: 1.55; color: rgba(255,255,255,0.55); margin: 0 0 16px;
+  }
+  .sk-gpcap-note b { color: rgba(255,255,255,0.85); }
+  .sk-gpcap-lbl {
+    display: block; font-size: 10px; font-weight: 800; letter-spacing: 0.12em;
+    color: rgba(255,255,255,0.45); margin-bottom: 6px;
+  }
+  .sk-gpcap-input {
+    width: 100%; box-sizing: border-box; padding: 12px 14px; font-size: 17px;
+    font-family: var(--sk-font-mono, monospace); color: #fff;
+    background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.16);
+    border-radius: 6px;
+  }
+  .sk-gpcap-preview { margin-top: 18px; }
+  .sk-gpcap-hd {
+    font-size: 10px; font-weight: 800; letter-spacing: 0.12em;
+    color: rgba(255,255,255,0.4); margin-bottom: 6px;
+  }
+  .sk-gpcap-row {
+    display: flex; align-items: center; gap: 10px; padding: 7px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+    font-family: 'Barlow Condensed', sans-serif; font-size: 14px; color: #fff;
+  }
+  .sk-gpcap-row span:first-child { width: 46px; font-weight: 800; }
+  .sk-gpcap-mult {
+    flex: 1; font-family: var(--sk-font-mono, monospace); font-size: 11px;
+    color: rgba(255,255,255,0.4);
+  }
+  .sk-gpcap-row b { font-family: var(--sk-font-mono, monospace); font-size: 14px; color: #f5c518; }
+  .sk-gpcap-check, .sk-gpcap-empty {
+    font-size: 11px; line-height: 1.5; color: rgba(255,255,255,0.35); margin-top: 10px;
+  }
+  .sk-gpcap-clear {
+    margin-top: 22px; background: none; border: 1px solid rgba(255,255,255,0.16);
+    color: rgba(255,255,255,0.55); border-radius: 5px; padding: 9px 14px;
+    font-size: 11px; letter-spacing: 0.06em; cursor: pointer;
+  }
+
   /* ── GP cap probe sheet ── GPPROBE ── */
   .sk-gpprobe {
     position: fixed; inset: 0; z-index: 100000;
@@ -27720,6 +27765,11 @@
     <button class="sk-account-item" onclick="openManagerRecord(); skCloseAccountMenu();">
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 21h8"/><path d="M12 17v4"/><path d="M7 4h10v5a5 5 0 01-10 0z"/><path d="M17 5h3v2a3 3 0 01-3 3"/><path d="M7 5H4v2a3 3 0 003 3"/></svg>
       <span>Manager record</span>
+    </button>
+    <!-- GPCAP -->
+    <button class="sk-account-item" onclick="skOpenGpCapSheet(); skCloseAccountMenu();">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V10"/><path d="M12 20V4"/><path d="M20 20v-6"/></svg>
+      <span>Games-played cap (this league)</span>
     </button>
     <!-- GPPROBE — on-screen diagnostic, no devtools needed -->
     <button class="sk-account-item" onclick="skProbeGpCaps(); skCloseAccountMenu();">
@@ -102420,6 +102470,175 @@ function _prevDateStr(dateStr) {
 // league's own week count keyed off the current Yahoo/game week), so any pace
 // number derived from this matches the "your pace" figure shown there. Returns
 // a positive number, or null if it can't be established / it's too early.
+// ── Games-played caps, entered by hand ── GPCAP ──
+// The probe settled it: Yahoo's API exposes NO games-played maximum for
+// hockey — not at the league level and not on roster_positions — and the team
+// stats are the scoring categories only, with no GP-per-position counter.
+// Baseball gets Cap Watch because max_innings_pitched and stat_id 50 are both
+// published; hockey has neither.
+//
+// But the number is trivially regular: every position's max is its slot count
+// times a single per-slot figure (C has 2 slots and a 190 max, D has 4 and
+// 380 — 95 per slot in both cases). So we store ONE number per league, read
+// off the Yahoo app once, and derive the rest from roster_positions, which
+// the API does return.
+//
+// Stored per league, never guessed: an absent value means "unknown" and every
+// consumer must treat that differently from zero.
+var _SK_GP_CAP_PREFIX = 'gdhq_gpcap_';
+var _skRosterPosCache = {};   // leagueKey -> [{position,count,starting}]
+
+function _skGetGpPerSlot(leagueKey) {
+  try {
+    var v = localStorage.getItem(_SK_GP_CAP_PREFIX + leagueKey);
+    if (v == null || v === '') return null;
+    var n = parseFloat(v);
+    return (isNaN(n) || n <= 0) ? null : n;
+  } catch (e) { return null; }
+}
+function _skSetGpPerSlot(leagueKey, n) {
+  try {
+    if (n == null || n === '' || isNaN(parseFloat(n)) || parseFloat(n) <= 0) {
+      localStorage.removeItem(_SK_GP_CAP_PREFIX + leagueKey);
+      return true;
+    }
+    localStorage.setItem(_SK_GP_CAP_PREFIX + leagueKey, String(parseFloat(n)));
+    return true;
+  } catch (e) { return false; }
+}
+
+// roster_positions, cached per league. Only the STARTING positions matter —
+// bench and IR slots have no games-played cap attached to them.
+function _skFetchRosterPositions(leagueKey) {
+  if (_skRosterPosCache[leagueKey]) return Promise.resolve(_skRosterPosCache[leagueKey]);
+  return fyApi('/league/' + leagueKey + '/settings').then(function (r) {
+    var out = [];
+    try {
+      var blocks = r.fantasy_content.league[1].settings;
+      for (var i = 0; i < blocks.length; i++) {
+        var rp = blocks[i] && blocks[i].roster_positions;
+        if (!rp) continue;
+        for (var j = 0; j < rp.length; j++) {
+          var pos = rp[j] && rp[j].roster_position;
+          if (!pos || !pos.position) continue;
+          if (String(pos.is_starting_position) !== '1') continue;
+          out.push({ position: pos.position,
+                     count: parseInt(pos.count, 10) || 0,
+                     type: pos.position_type || '' });
+        }
+      }
+    } catch (e) {}
+    _skRosterPosCache[leagueKey] = out;
+    return out;
+  }).catch(function () { return []; });
+}
+
+// { position -> max games } for a league, or null when the per-slot number
+// hasn't been entered or the roster shape isn't cached yet.
+function _skGpMaxByPos(leagueKey) {
+  var per = _skGetGpPerSlot(leagueKey);
+  if (per == null) return null;
+  var rp = _skRosterPosCache[leagueKey];
+  if (!rp || !rp.length) return null;
+  var out = {};
+  for (var i = 0; i < rp.length; i++) {
+    if (rp[i].count > 0) out[rp[i].position] = rp[i].count * per;
+  }
+  return out;
+}
+
+// ── Entry sheet ── GPCAP ──
+// Reuses the probe sheet's chrome. Shows the derived maximums live as you
+// type, so a wrong number is obvious against the Yahoo app before saving.
+function skOpenGpCapSheet(leagueKey) {
+  if (!leagueKey) {
+    leagueKey = (typeof skState !== 'undefined' && skState) ? skState.activeLeagueKey : null;
+  }
+  if (!leagueKey) {
+    _skGpProbeShow('Open a league first \u2014 caps are stored per league.');
+    return;
+  }
+  var lg = (typeof fyLeagues !== 'undefined' && fyLeagues)
+    ? fyLeagues.filter(function (l) { return l.league_key === leagueKey; })[0] : null;
+
+  _skFetchRosterPositions(leagueKey).then(function () {
+    var old = document.getElementById('skGpCapSheet');
+    if (old && old.parentNode) old.parentNode.removeChild(old);
+    var cur = _skGetGpPerSlot(leagueKey);
+    var wrap = document.createElement('div');
+    wrap.id = 'skGpCapSheet';
+    wrap.className = 'sk-gpprobe';
+    wrap.innerHTML =
+      '<div class="sk-gpprobe-bar">' +
+        '<span class="sk-gpprobe-title">GAMES-PLAYED CAP</span>' +
+        '<button class="sk-gpprobe-btn" onclick="_skGpCapSave(\'' + leagueKey + '\')">SAVE</button>' +
+        '<button class="sk-gpprobe-btn" onclick="_skGpCapClose()">CLOSE</button>' +
+      '</div>' +
+      '<div class="sk-gpcap-body">' +
+        '<div class="sk-gpcap-lg">' + skEscape((lg && lg.name) || leagueKey) + '</div>' +
+        '<p class="sk-gpcap-note">Yahoo doesn\u2019t publish this through the API, so it goes in by ' +
+          'hand \u2014 once per league. On the Yahoo app open <b>Team \u2192 Max Games Played</b> and ' +
+          'read the <b>Max</b> column for a single-slot position such as C. Divide by that position\u2019s ' +
+          'slot count to get games per slot (C showing 190 across 2 slots means <b>95</b>).</p>' +
+        '<label class="sk-gpcap-lbl">Games per roster slot</label>' +
+        '<input id="skGpCapInput" class="sk-gpcap-input" type="number" inputmode="numeric" ' +
+          'min="1" step="1" value="' + (cur == null ? '' : cur) + '" ' +
+          'oninput="_skGpCapPreview(\'' + leagueKey + '\')" placeholder="e.g. 95">' +
+        '<div id="skGpCapPreview" class="sk-gpcap-preview"></div>' +
+        '<button class="sk-gpcap-clear" onclick="_skGpCapClear(\'' + leagueKey + '\')">Clear stored value</button>' +
+      '</div>';
+    document.body.appendChild(wrap);
+    _skGpCapPreview(leagueKey);
+  });
+}
+
+function _skGpCapPreview(leagueKey) {
+  var el = document.getElementById('skGpCapPreview');
+  var inp = document.getElementById('skGpCapInput');
+  if (!el) return;
+  var per = inp ? parseFloat(inp.value) : NaN;
+  var rp = _skRosterPosCache[leagueKey] || [];
+  if (!rp.length) { el.innerHTML = '<div class="sk-gpcap-empty">Roster positions unavailable.</div>'; return; }
+  if (isNaN(per) || per <= 0) {
+    el.innerHTML = '<div class="sk-gpcap-empty">Enter a number to see the derived maximums.</div>';
+    return;
+  }
+  var rows = '';
+  for (var i = 0; i < rp.length; i++) {
+    if (!rp[i].count) continue;
+    rows += '<div class="sk-gpcap-row"><span>' + skEscape(rp[i].position) + '</span>' +
+      '<span class="sk-gpcap-mult">' + rp[i].count + ' \u00d7 ' + per + '</span>' +
+      '<b>' + (rp[i].count * per) + '</b></div>';
+  }
+  el.innerHTML = '<div class="sk-gpcap-hd">DERIVED MAXIMUMS</div>' + rows +
+    '<div class="sk-gpcap-check">Compare these against the Max column in Yahoo. ' +
+    'If they don\u2019t match, the per-slot number is wrong.</div>';
+}
+
+function _skGpCapSave(leagueKey) {
+  var inp = document.getElementById('skGpCapInput');
+  var v = inp ? inp.value : '';
+  if (_skSetGpPerSlot(leagueKey, v)) {
+    if (typeof skToast === 'function') {
+      skToast(_skGetGpPerSlot(leagueKey) == null ? 'Cap cleared.' : 'Cap saved.');
+    }
+    _skGpCapClose();
+  } else if (typeof skToast === 'function') {
+    skToast('Couldn\u2019t save \u2014 storage unavailable.');
+  }
+}
+function _skGpCapClear(leagueKey) {
+  var inp = document.getElementById('skGpCapInput');
+  if (inp) inp.value = '';
+  _skSetGpPerSlot(leagueKey, null);
+  _skGpCapPreview(leagueKey);
+  if (typeof skToast === 'function') skToast('Cap cleared.');
+}
+function _skGpCapClose() {
+  var el = document.getElementById('skGpCapSheet');
+  if (el && el.parentNode) el.parentNode.removeChild(el);
+}
+
 // ── Games-played cap probe ── GPPROBE ──
 // Cap Watch exists because a probe confirmed where Yahoo hides the IP cap:
 //   settings[1].max_innings_pitched, and team stat_id 50 for usage.
