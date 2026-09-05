@@ -856,6 +856,15 @@
   .slh-pos { font-weight: 700; }
   .slh-inj { margin-left: 5px; font-size: 8.5px; font-weight: 800; color: #f87171;
              letter-spacing: 0.06em; }
+  .slh-game { font-size: 9.5px; margin-top: 2px; color: rgba(255,255,255,0.45);
+              white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .slh-game.none { color: rgba(255,255,255,0.25); }
+  /* A locked game reads gold — the same accent the app uses for "mine" — so
+     the eye lands on it before the number does. SLH2HGAME */
+  .slh-game.locked { color: #fbbf24; font-weight: 700; }
+  .slh-lock { font-size: 9px; margin-right: 3px; }
+  .slh-side.locked .slh-name { color: #fbbf24; }
+  .slh-side.locked .slh-hs { box-shadow: 0 0 0 2px #fbbf24; }
   .slh-fp { font-family: var(--sk-font-mono, monospace); font-size: 12px; font-weight: 700;
             color: rgba(255,255,255,0.35); margin-top: 2px; }
   .slh-fp.pos { color: #4ade80; }
@@ -33937,7 +33946,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-09-05 SLH2H';
+var SK_BUILD = '2026-09-05 SLH2HGAME';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -144317,6 +144326,93 @@ function _slpMyOpponentId(row, myIds) {
   return null;
 }
 
+// ── Next game + lock ── SLH2HGAME ──
+// Sleeper's card shows each starter's next game and whether it's locked. The
+// app's allGames is only the selected day's slate, so "next game" needs the
+// week ahead: one ESPN scoreboard call for a 7-day range, run through the
+// same parseGames normaliser everything else uses, cached for ten minutes.
+//
+// LOCKED means the game has started or finished — ESPN state 'in' or 'post'.
+// That's the conventional fantasy meaning: once tip-off happens the player's
+// points for that game are what they are. Sleeper's own manual "lock-in"
+// feature, if this league uses it, is a separate flag the API may or may not
+// expose; this highlights the game-state lock, which is true regardless.
+var _skUpcomingCache = {};   // league -> { games, t }
+
+function _skFetchUpcoming(league, days) {
+  var key = String(league || 'NBA');
+  var c = _skUpcomingCache[key];
+  if (c && c.t > Date.now() - 10 * 60 * 1000) return Promise.resolve(c.games);
+  var cfg = (typeof LEAGUES !== 'undefined' && LEAGUES) ? LEAGUES[key] : null;
+  if (!cfg) return Promise.resolve([]);
+  function ymd(d) {
+    return d.getFullYear() + String(d.getMonth() + 1).padStart(2, '0') + String(d.getDate()).padStart(2, '0');
+  }
+  var a = new Date(), b = new Date();
+  b.setDate(b.getDate() + (days || 7));
+  var url = 'https://site.api.espn.com/apis/site/v2/sports/' + cfg.sport + '/' + cfg.slug +
+    '/scoreboard?dates=' + ymd(a) + '-' + ymd(b) + '&limit=400';
+  return fetch(url).then(function (r) { return r.ok ? r.json() : null; }).then(function (data) {
+    var games = (data && data.events && typeof parseGames === 'function')
+      ? parseGames(data.events, key) : [];
+    _skUpcomingCache[key] = { games: games, t: Date.now() };
+    return games;
+  }).catch(function () { return []; });
+}
+
+// First game on or after now involving this team abbreviation.
+function _skNextGameFor(games, abbr) {
+  var A = String(abbr || '').toUpperCase();
+  if (!A) return null;
+  var best = null;
+  for (var i = 0; i < (games || []).length; i++) {
+    var g = games[i];
+    var h = String((g.home && g.home.abbr) || '').toUpperCase();
+    var w = String((g.away && g.away.abbr) || '').toUpperCase();
+    if (h !== A && w !== A) continue;
+    var t = new Date(g.date).getTime();
+    if (isNaN(t)) continue;
+    // A game that's live or final today still counts — it IS the current game.
+    if (!best || t < best.t) best = { t: t, g: g, home: (h === A) };
+  }
+  if (!best) return null;
+  var g2 = best.g;
+  var opp = best.home ? (g2.away && g2.away.abbr) : (g2.home && g2.home.abbr);
+  var state = String(g2.state || 'pre');
+  var locked = (state === 'in' || state === 'post');
+  return { opp: opp || '?', home: best.home, when: g2.statusDetail || '', state: state, locked: locked };
+}
+
+function _slpH2hGameLine(ng) {
+  if (!ng) return '<div class="slh-game none">no game this week</div>';
+  var txt = (ng.home ? 'vs ' : '@ ') + slEsc(ng.opp) + (ng.when ? ' \u00b7 ' + slEsc(ng.when) : '');
+  var cls = 'slh-game' + (ng.locked ? ' locked' : '');
+  // Glyph only — the gold colour already says locked, and the word crowded
+  // the opponent and time out of a 150px column.
+  var badge = ng.locked ? '<span class="slh-lock">\ud83d\udd12</span>' : '';
+  return '<div class="' + cls + '">' + badge + txt + '</div>';
+}
+
+function _slpH2hFillGames(row) {
+  var host = document.getElementById('slpH2h');
+  if (!host) return;
+  var league = String(row.sport || 'nba').toUpperCase();
+  _skFetchUpcoming(league, 7).then(function (games) {
+    if (!document.getElementById('slpH2h')) return;
+    var els = host.querySelectorAll('[data-slh-team]');
+    for (var i = 0; i < els.length; i++) {
+      var abbr = els[i].getAttribute('data-slh-team');
+      var ng = _skNextGameFor(games, abbr);
+      els[i].innerHTML = _slpH2hGameLine(ng);
+      // Lift the lock onto the whole side so the row reads as locked at a glance.
+      var side = els[i].parentNode && els[i].parentNode.parentNode;
+      if (side && side.className && side.className.indexOf('slh-side') > -1) {
+        if (ng && ng.locked) side.className += ' locked';
+      }
+    }
+  });
+}
+
 function _slpH2hSide(it, sport, right) {
   if (!it || !it.playerId) {
     return '<div class="slh-side' + (right ? ' r' : '') + '"><div class="slh-name dim">Empty</div></div>';
@@ -144331,6 +144427,8 @@ function _slpH2hSide(it, sport, right) {
     '<div class="slh-main">' +
       '<div class="slh-name">' + slEsc(it.name || String(it.playerId)) + inj + '</div>' +
       '<div class="slh-sub">' + pos + team + '</div>' +
+      (it.team ? '<div class="slh-gamewrap" data-slh-team="' + slEsc(String(it.team).toUpperCase()) + '">' +
+                 '<div class="slh-game none">\u2026</div></div>' : '') +   // SLH2HGAME
       '<div class="slh-fp" data-slh-pid="' + slEsc(String(it.playerId)) + '">\u2014</div>' +
     '</div>' +
   '</div>';
@@ -145278,7 +145376,10 @@ function extOpenLeague(key) {
         var _h2h = _slpH2hHtml(row, myIds, accent);
         if (_h2h) {
           matchupHtml += _h2h;
-          setTimeout(function () { try { _slpH2hFill(row); } catch (e) {} }, 0);
+          setTimeout(function () {
+            try { _slpH2hFill(row); } catch (e) {}
+            try { _slpH2hFillGames(row); } catch (e2) {}   // SLH2HGAME
+          }, 0);
         }
       } catch (e) { try { console.error('Sleeper H2H:', e); } catch (e2) {} }
     }
