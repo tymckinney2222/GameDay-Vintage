@@ -796,6 +796,16 @@
   .vintage-mode .card-fbsit.redzone .card-fbsit-dot { background: #b42814; box-shadow: none; }
   .vintage-mode .card-fbsit-rz { color: #b42814; }
 
+  /* ── Capped-team pitching deduction ── IPCAPFP ── */
+  .sk-lb-capped {
+    display: inline-block; margin-left: 6px; font-size: 9px; font-weight: 700;
+    letter-spacing: 0.04em; color: #f87171; opacity: 0.85; white-space: nowrap;
+  }
+  .sk-lb-capnote {
+    padding: 4px 16px 0; font-size: 9.5px; line-height: 1.45;
+    color: rgba(255,255,255,0.38);
+  }
+
   /* ── Volleyball recent form ── VBFORM ── */
   .vb-form-wrap { display: flex; gap: 14px; }
   .vb-form-side { flex: 1; min-width: 0; }
@@ -89122,10 +89132,12 @@ function skLoadSeasonLeaderboard(league) {
 
   // Per-team FP results, keyed by team_key. Filled as fetches resolve.
   var fpByTeam = {};
+  var pitFpByTeam = {};   // IPCAPFP — the pitching share of each team's day
   skSeasonLbState = {
     leagueKey: leagueKey,
     date: anchorDate,
     fpByTeam: fpByTeam,
+    pitFpByTeam: pitFpByTeam,
     teamKeys: teamKeys,
   };
 
@@ -89147,16 +89159,28 @@ function skLoadSeasonLeaderboard(league) {
         if ((skDetailDate || _todayDateString()) !== dateAtStart) return;
         // Sum the active-only FP contributions (matches Yahoo's matchup
         // totaling — bench/IL doesn't count in season-pts scoring).
-        var total = 0;
+        var total = 0, pitFp = 0;
         if (fpMap) {
           Object.keys(fpMap).forEach(function(pk) {
             var entry = fpMap[pk];
             if (entry && entry.fp != null && _isActiveSlot(entry.selectedPos)) {
               total += entry.fp;
+              // Split out the pitching half. Every FP entry carries
+              // positionType ('P'/'B') plus eligibility, so _skRosterIsPitcher
+              // classifies it without another request — the entry just needs
+              // displayPos aliased to the field the parser actually sets.
+              // IPCAPFP
+              if (_skRosterIsPitcher({
+                    positionType: entry.positionType,
+                    displayPos: entry.displayPosition,
+                    selectedPos: entry.selectedPos })) {
+                pitFp += entry.fp;
+              }
             }
           });
         }
         fpByTeam[_tk] = total;
+        skSeasonLbState.pitFpByTeam[_tk] = pitFp;   // IPCAPFP
         // Progressive render — repaint leaderboard with whatever's
         // landed so far. Shows live progress instead of waiting.
         skRenderSeasonLeaderboard(league);
@@ -89218,6 +89242,28 @@ function skRenderSeasonLeaderboard(league) {
       isMine: k === myKey,
     };
   });
+
+  // ── Discount a capped team's pitching ── IPCAPFP ──
+  // Once a team is out of innings, Yahoo stops adding its pitching to the
+  // season total — those points are scored but they don't count. Showing the
+  // raw daily FP therefore overstates what a rival will actually bank, which
+  // is the number that matters when you're chasing them.
+  //
+  // So for a team with no innings left, show total minus pitching and keep
+  // the discarded amount visible rather than silently shrinking their day.
+  // Only applied when Cap Watch has actually run: unknown is not zero, and
+  // guessing here would understate a team that still has innings.
+  var _pitFp = (skSeasonLbState && skSeasonLbState.pitFpByTeam) || {};
+  var _anyCapped = false;
+  rows.forEach(function(r) {
+    r.pitFp = _pitFp[r.key];
+    r.capped = _skIsIpCapped(league.league_key, r.key);
+    if (r.capped && r.fp != null && r.pitFp != null && r.pitFp !== 0) {
+      r.rawFp = r.fp;
+      r.fp = r.fp - r.pitFp;
+      _anyCapped = true;
+    }
+  });
   rows.sort(function(a, b) { return a.rank - b.rank; });
 
   // Find max FP for bar normalization. Skip nulls (still loading) and
@@ -89236,7 +89282,12 @@ function skRenderSeasonLeaderboard(league) {
       fpStr = '<span class="sk-season-lb-fp loading">…</span>';
       barWidth = 0;
     } else {
-      fpStr = '<span class="sk-season-lb-fp">' + r.fp.toFixed(1) + '</span>';
+      fpStr = '<span class="sk-season-lb-fp">' + r.fp.toFixed(1) + '</span>' +
+        (r.rawFp != null
+          ? '<span class="sk-lb-capped" title="Out of innings \u2014 ' +
+            r.pitFp.toFixed(1) + ' pitching pts won\u2019t count">\u2212' +
+            r.pitFp.toFixed(1) + ' IP</span>'
+          : '');   // IPCAPFP
       barWidth = r.fp > 0 ? Math.max(2, (r.fp / maxFp) * 100) : 0;
     }
     var rankBadge = r.rank < 999 ? skOrdinal(r.rank) : '—';
@@ -94752,7 +94803,25 @@ function _skUpdateMatchupApBadges(leagueKey) {
 // Pace uses the MLB games-elapsed fraction (games played ÷ 162), which is
 // more accurate than calendar days given off-days and the All-Star break.
 var _SK_IP_STAT_ID = '50';
-var _skCapWatchCache = {};   // leagueKey → { html, t }
+var _skCapWatchCache = {};   // leagueKey → { html, t, ipByTeam, maxIp }
+
+// ── Has this team run out of innings? ── IPCAPFP ──
+// Returns innings remaining, or null when Cap Watch hasn't run for this
+// league yet — null means "don't know", which callers must treat differently
+// from zero. A capped team's pitchers keep producing fantasy points that
+// Yahoo will not add to its season total, so anything projecting forward has
+// to know the difference.
+function _skIpRemaining(leagueKey, teamKey) {
+  var c = _skCapWatchCache[leagueKey];
+  if (!c || !c.ipByTeam || c.maxIp == null) return null;
+  var ip = c.ipByTeam[teamKey];
+  if (ip == null || isNaN(ip)) return null;
+  return c.maxIp - ip;
+}
+function _skIsIpCapped(leagueKey, teamKey) {
+  var rem = _skIpRemaining(leagueKey, teamKey);
+  return (rem != null && rem <= 0);
+}
 // Per-league projected IP-cap freeze dates, populated by _skBuildCapPlan when it
 // computes the rivals' cap-out estimates. Catch the Leaders reads this so its
 // freeze-adjusted catch math uses the EXACT same dates the Cap Watch panel shows
@@ -95169,7 +95238,17 @@ async function _skBuildCapWatch(league, leagueKey, host) {
   // rate-limit / fetch failure), skip caching so the next open retries fresh
   // rather than serving zeros for 5 minutes.
   var anyIp = teams.some(function(t) { return t.ip > 0; });
-  if (anyIp) _skCapWatchCache[leagueKey] = { html: host.innerHTML, t: Date.now() };
+  if (anyIp) {
+    // ── Keep the NUMBERS, not just the markup ── IPCAPFP ──
+    // The cache held rendered HTML only, so nothing outside this view could
+    // ask "does this team have innings left". The Daily FP board needs
+    // exactly that, and re-deriving it would mean re-fetching every team's
+    // pitching totals. Same freshness stamp as the html it ships with.
+    var _ipByTeam = {};
+    teams.forEach(function(t) { if (t && t.key) _ipByTeam[t.key] = t.ip; });
+    _skCapWatchCache[leagueKey] = { html: host.innerHTML, t: Date.now(),
+                                    ipByTeam: _ipByTeam, maxIp: maxIp };
+  }
 
   // The render above populated _skFreezeCache (via _skBuildCapPlan). If the
   // standings view is mounted, repaint it once so Catch the Leaders can show
