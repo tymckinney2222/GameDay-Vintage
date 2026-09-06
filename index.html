@@ -49113,8 +49113,24 @@ function _pmBuildStatsRegion(st, groupKey) {
 // has a current/most-recent-season row, and return labels + a Season row +
 // a Career row so the KPIs, season table, and press box report all populate.
 // Returns null if /stats can't supply a usable season line either.
-function _pmSeasonFromStatsData(statsData, curYr, prevYr) {
-  var cats = (typeof _skCareerCategories === 'function') ? _skCareerCategories(statsData) : null;
+// True when a season stat row carries no actual data — every cell is empty or
+// one of ESPN's placeholder dashes. Deliberately does NOT treat "0" or "0.0"
+// as blank: a player who suited up and recorded nothing has a real zero line,
+// and hiding that would be a false statement of fact. BLANKSEASON
+function _pmRowIsAllBlank(vals) {
+  if (!vals || !vals.length) return true;
+  for (var i = 0; i < vals.length; i++) {
+    var v = vals[i];
+    if (v == null) continue;
+    var s = String(v).trim();
+    if (s === '' || s === '-' || s === '--' || s === '---' ||
+        s === '\u2013' || s === '\u2014' || s === '.---' || s === '.--') continue;
+    return false; // found a real value
+  }
+  return true;
+}
+
+function _pmSeasonFromStatsData(statsData, curYr, prevYr) {  var cats = (typeof _skCareerCategories === 'function') ? _skCareerCategories(statsData) : null;
   if (!cats || !cats.length) return null;
   // Score each category by how many stats its most-recent season row carries,
   // so a receiver's Receiving line wins over an empty Passing line.
@@ -49591,7 +49607,15 @@ function renderPlayerModal(athleteId, overview, statsData, gamelogData, league, 
   // tab while the Career tab (which reads /stats) showed full rows. Rebuild the
   // season labels + splits from /stats so the Stats tab, KPIs, and press box
   // report populate. Skip MLB (its two-way/augment pipeline owns extraction).
-  if (league !== 'MLB' && (!statValues.length || !statLabels.length)) {
+  //
+  // An ALL-BLANK row counts as no row. ESPN returns a full-width season split
+  // of em-dashes for a player whose current season hasn't started (or who
+  // changed teams), so statValues was non-empty and this fallback never fired —
+  // the Stats table showed a row of dashes and every KPI tile was filtered out
+  // as blank, which is why two players at the same position got different
+  // cards. Zeros are NOT blank: a real zero is real data. BLANKSEASON
+  if (league !== 'MLB' && (!statValues.length || !statLabels.length ||
+                           _pmRowIsAllBlank(statValues))) {
     var _fb = _pmSeasonFromStatsData(statsData, curYr, prevYr);
     if (_fb && _fb.labels.length && _fb.seasonStats.length) {
       statLabels = _fb.labels;
@@ -49613,16 +49637,22 @@ function renderPlayerModal(athleteId, overview, statsData, gamelogData, league, 
     kpiKeys = PLAYER_KPI[league] || [];
   }
   if (statLabels.length && statValues.length) {
-    kpiHtml = '<div class="pm-kpis">';
+    // Skip placeholder cells and emit nothing at all when no key survives —
+    // this path previously accepted any non-null value, so an ESPN dash row
+    // produced a row of hollow "—" tiles (or an empty .pm-kpis wrapper still
+    // taking up vertical space). Matches _pmBuildStatsRegion. BLANKSEASON
+    var _kpiCells2 = [];
     kpiKeys.forEach(function(key) {
       var idx = statLabels.findIndex(function(l) { return l.toUpperCase() === key.toUpperCase(); });
-      if (idx !== -1 && statValues[idx] != null) {
-        kpiHtml += '<div class="pm-kpi" style="border-color:' + teamColor + '30">' +
-          '<div class="pm-kpi-val" style="color:' + _kpiValColor(teamColor) + '">' + statValues[idx] + '</div>' +
-          '<div class="pm-kpi-label">' + statLabels[idx] + '</div></div>';
-      }
+      if (idx === -1) return;
+      var v2 = statValues[idx];
+      if (v2 == null) return;
+      if (_pmRowIsAllBlank([v2])) return;
+      _kpiCells2.push('<div class="pm-kpi" style="border-color:' + teamColor + '30">' +
+        '<div class="pm-kpi-val" style="color:' + _kpiValColor(teamColor) + '">' + v2 + '</div>' +
+        '<div class="pm-kpi-label">' + statLabels[idx] + '</div></div>');
     });
-    kpiHtml += '</div>';
+    if (_kpiCells2.length) kpiHtml = '<div class="pm-kpis">' + _kpiCells2.join('') + '</div>';
   }
 
   // Build L10 Trend — pass both endpoints + season stats for comparison
