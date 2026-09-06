@@ -34164,7 +34164,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-09-05 PPTIME';
+var SK_BUILD = '2026-09-05 MINWATCH2';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -60041,6 +60041,21 @@ function _gymLeadersFromPlayerStats(playerStats, cfg) {
   return found ? out : null;
 }
 
+// Per-player season rows for a team, from either source. MINWATCH2
+var _gymTeamPlayerRows = {};
+function _gymTeamPlayerRows_get(teamId, league) {
+  var ck = String(teamId) + '_' + league;
+  if (_gymTeamPlayerRows[ck]) return _gymTeamPlayerRows[ck];
+  try {
+    if (typeof teamPageCache === 'object' && teamPageCache && teamPageCache[ck] &&
+        teamPageCache[ck].playerStats && teamPageCache[ck].playerStats.length) {
+      _gymTeamPlayerRows[ck] = teamPageCache[ck].playerStats;
+      return _gymTeamPlayerRows[ck];
+    }
+  } catch (e) {}
+  return null;
+}
+
 function _gymTeamAvgs_get(teamId, league) {
   var ck = teamId + '_' + league;
   if (_gymTeamAvgs[ck]) return _gymTeamAvgs[ck];
@@ -60058,7 +60073,9 @@ function _gymTeamAvgs_get(teamId, league) {
 // once per team and only when a pregame stadium actually needs it.
 function _gymFetchTeamAvgs(teamId, league, rerenderFn) {
   var ck = teamId + '_' + league;
-  if (_gymTeamAvgs[ck] || _gymAvgPending[ck]) return;
+  // Skip only when BOTH products are cached: the leaders summary for the
+  // pregame panel and the per-player rows for Minutes Watch. MINWATCH2
+  if ((_gymTeamAvgs[ck] && _gymTeamPlayerRows[ck]) || _gymAvgPending[ck]) return;
   var cfg = (typeof LEAGUES === 'object' && LEAGUES) ? LEAGUES[league] : null;
   if (!cfg || !teamId) return;
   _gymAvgPending[ck] = true;
@@ -60123,11 +60140,16 @@ function _gymFetchTeamAvgs(teamId, league, rerenderFn) {
     .then(function (ps) {
       _gymAvgPending[ck] = false;
       if (!ps || !ps.length) return;
+      // Keep the per-player rows too — the leaders object below is a
+      // summary, and Minutes Watch needs an individual's MIN. MINWATCH2
+      _gymTeamPlayerRows[ck] = ps;
       var derived = _gymLeadersFromPlayerStats(ps, _sbLeadCfg(league));
       if (derived) {
         _gymTeamAvgs[ck] = derived;
-        if (typeof rerenderFn === 'function') rerenderFn();
       }
+      // Re-render whether or not leaders derived: the rows alone are enough
+      // for the minutes panel.
+      if (typeof rerenderFn === 'function') rerenderFn();
     })
     .catch(function () { _gymAvgPending[ck] = false; });
 }
@@ -60182,7 +60204,10 @@ function _mwElapsedFrac(game) {
 
 // Season MPG for a player from the team-averages cache; null when not loaded.
 function _mwSeasonMpg(teamId, league, playerId, playerName) {
-  var rows = (typeof _gymTeamAvgs_get === 'function') ? _gymTeamAvgs_get(teamId, league) : null;
+  // MINWATCH2 — _gymTeamAvgs_get returns the LEADERS summary, not rows; this
+  // was iterating an object with no length and returning null forever, which
+  // read as "avg loading…" on every player. Rows come from the new accessor.
+  var rows = (typeof _gymTeamPlayerRows_get === 'function') ? _gymTeamPlayerRows_get(teamId, league) : null;
   if (!rows || !rows.length) return null;
   for (var i = 0; i < rows.length; i++) {
     var r = rows[i];
@@ -60192,9 +60217,10 @@ function _mwSeasonMpg(teamId, league, playerId, playerName) {
     var labels = r.playerLabels || [];
     var idx = labels.indexOf('MIN');
     if (idx === -1) idx = labels.indexOf('MPG');
-    if (idx === -1) return null;
+    if (idx === -1) idx = labels.indexOf('MINUTES');
+    if (idx === -1) return 'none';   // rows exist but carry no minutes column
     var v = parseFloat(r.stats[idx]);
-    return isNaN(v) ? null : v;
+    return isNaN(v) ? 'none' : v;
   }
   return null;
 }
@@ -60216,11 +60242,13 @@ function _gymMinutesWatch(allPlayers, game, awayAccent, homeAccent, divStyle, re
     if (!mark) continue;
     var tid = p.isHome ? (game.home && game.home.id) : (game.away && game.away.id);
     var tonight = _mwMinutes(p.minStr);
-    var mpg = _mwSeasonMpg(tid, game.league || 'NBA', p.id, p.fullName || p.name);
-    if (mpg == null && typeof _gymFetchTeamAvgs === 'function' && tid) {
+    var mpgRaw = _mwSeasonMpg(tid, game.league || 'NBA', p.id, p.fullName || p.name);
+    var noAvg = (mpgRaw === 'none');
+    var mpg = (typeof mpgRaw === 'number') ? mpgRaw : null;
+    if (mpgRaw == null && typeof _gymFetchTeamAvgs === 'function' && tid) {
       _gymFetchTeamAvgs(tid, game.league || 'NBA', rerenderFn);
     }
-    mine.push({ p: p, mark: mark, tonight: tonight, mpg: mpg });
+    mine.push({ p: p, mark: mark, tonight: tonight, mpg: mpg, noAvg: noAvg });
   }
   if (!mine.length) return '';
 
@@ -60245,7 +60273,7 @@ function _gymMinutesWatch(allPlayers, game, awayAccent, homeAccent, divStyle, re
     var verdict, vcls;
     if (t == null) { verdict = 'no minutes yet'; vcls = 'dim'; }
     else if (blowout && delta != null && delta < -3) { verdict = 'SITTING \u00b7 blowout'; vcls = 'sit'; }
-    else if (delta == null) { verdict = 'avg loading\u2026'; vcls = 'dim'; }
+    else if (delta == null) { verdict = it.noAvg ? 'no season avg' : 'avg loading\u2026'; vcls = 'dim'; }
     else if (game.state === 'post') { verdict = (delta >= 0 ? '+' : '') + delta.toFixed(1) + ' vs avg'; vcls = delta >= 0 ? 'up' : 'dn'; }
     else { verdict = (delta >= 0 ? '+' : '') + delta.toFixed(1) + ' vs pace'; vcls = delta >= 0 ? 'up' : 'dn'; }
 
