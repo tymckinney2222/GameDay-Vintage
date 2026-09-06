@@ -34225,7 +34225,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-09-06 STORAGE';
+var SK_BUILD = '2026-09-06 FPT7D';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -38438,6 +38438,108 @@ var FP_LS_PREFIX = 'fp_v4_';
 // evict the oldest dates first; anything evicted re-fetches on demand.
 var FP_LS_MAX = 140;
 
+// ── Daily totals, not full rosters ── FPTOTALS ──
+// A cached fp_v4_ entry is the whole roster: eleven fields plus a stats
+// object for ~26 players, about 7 KB. The Vs-the-League grid needs exactly
+// one number out of that — the team's daily total — and it needs it for
+// EVERY team in the league, every day. Four teams for a week cost 200 KB
+// to answer 28 questions that fit in a kilobyte.
+//
+// So totals get their own store: one number per team per day, ~40 bytes.
+// The full roster is still cached for the surfaces that need per-player
+// detail (Week Contributors, lineup views) — but only for teams whose
+// detail is ever actually shown.
+var FPT_LS_PREFIX = 'fpt_v1_';
+var FPT_LS_MAX = 400;         // backstop only — the date purge below is the real limit
+var _fptMem = {};
+
+// Pipe separator on purpose: every dated cache in the app uses
+// <prefix><teamKey>|<date>, and _purgeOldFpCachesByDate finds the date with
+// lastIndexOf('|'). An underscore here would have made these invisible to
+// the date sweep — capped only by count, at a ceiling sized for a season.
+// FPT7D
+function _fptKey(teamKey, date) { return FPT_LS_PREFIX + teamKey + '|' + date; }
+
+function _fptGet(teamKey, date) {
+  var k = _fptKey(teamKey, date);
+  if (_fptMem[k] !== undefined) return _fptMem[k];
+  try {
+    var raw = localStorage.getItem(k);
+    if (raw == null) return undefined;
+    var v = parseFloat(raw);
+    if (isNaN(v)) return undefined;
+    _fptMem[k] = v;
+    return v;
+  } catch (e) { return undefined; }
+}
+
+function _fptSet(teamKey, date, total) {
+  if (total == null || isNaN(total)) return;
+  var k = _fptKey(teamKey, date);
+  _fptMem[k] = total;
+  // Only persist settled days. Today's total is still moving, and a
+  // half-finished number cached forever is worse than no cache.
+  try {
+    if (date >= _todayDateString()) return;
+    localStorage.setItem(k, String(Math.round(total * 10) / 10));
+  } catch (e) {
+    try { _fptTrim(Math.floor(FPT_LS_MAX / 2)); localStorage.setItem(k, String(Math.round(total * 10) / 10)); } catch (e2) {}
+  }
+}
+
+function _fptTrim(target) {
+  var keys = [];
+  try {
+    for (var i = 0; i < localStorage.length; i++) {
+      var k = localStorage.key(i);
+      if (k && k.indexOf(FPT_LS_PREFIX) === 0) keys.push(k);
+    }
+  } catch (e) { return 0; }
+  var max = target || FPT_LS_MAX;
+  if (keys.length <= max) return 0;
+  keys.sort(function (a, b) {
+    var da = a.slice(a.lastIndexOf('|') + 1), db = b.slice(b.lastIndexOf('|') + 1);
+    return da < db ? -1 : (da > db ? 1 : 0);
+  });
+  var drop = keys.length - max, n = 0;
+  for (var d = 0; d < drop; d++) { try { localStorage.removeItem(keys[d]); n++; delete _fptMem[keys[d]]; } catch (e2) {} }
+  return n;
+}
+
+// ── Totals are a 7-day feature ── FPT7D ──
+// The grid only ever shows one week; nothing reads a total older than the
+// week you're looking at. So they expire by DATE and do it themselves, on
+// render — a cache that needs a button pressed to stay small is a cache
+// that grows. 21 days keeps this week, last week, and a little slack for
+// navigating back, and still costs under 10 KB for a 12-team league.
+var FPT_KEEP_DAYS = 21;
+
+function _fptPurgeOld(days) {
+  var keep = days || FPT_KEEP_DAYS;
+  var cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - keep);
+  var cs = cutoff.getFullYear() + '-' + String(cutoff.getMonth() + 1).padStart(2, '0') +
+           '-' + String(cutoff.getDate()).padStart(2, '0');
+  var n = 0;
+  try {
+    for (var i = localStorage.length - 1; i >= 0; i--) {
+      var k = localStorage.key(i);
+      if (!k || k.indexOf(FPT_LS_PREFIX) !== 0) continue;
+      var bar = k.lastIndexOf('|');
+      if (bar < 0) { localStorage.removeItem(k); n++; continue; }   // legacy '_' key
+      var d = k.slice(bar + 1);
+      if (d && d.length === 10 && d < cs) { localStorage.removeItem(k); delete _fptMem[k]; n++; }
+    }
+  } catch (e) {}
+  return n;
+}
+
+// Drop a persisted full-roster entry, keeping the in-memory copy for this
+// session. Used when the grid fetched a team purely to total it. FPTOTALS
+function _fpDropPersisted(teamKey, date) {
+  try { localStorage.removeItem(FP_LS_PREFIX + _fpKey(teamKey, date)); } catch (e) {}
+}
+
 function _fpCacheTrim(target) {
   var keys = [];
   try {
@@ -38555,6 +38657,7 @@ function _purgeOldFpCachesByDate(cutoffDays) {
   // ESPECIALLY now that the all-play feature fetches EVERY team's data, not
   // just yours — they're the real quota growers. Purge old dates across all.
   var prefixes = [FP_LS_PREFIX, 'sk_player_stats_v1_'];
+  if (typeof FPT_LS_PREFIX === 'string') prefixes.push(FPT_LS_PREFIX);   // FPT7D
   if (typeof SK_CATS_LS_PREFIX === 'string') prefixes.push(SK_CATS_LS_PREFIX);
   if (typeof SK_TEAM_STATS_LS_PREFIX === 'string') prefixes.push(SK_TEAM_STATS_LS_PREFIX);
   var removed = 0;
@@ -90614,7 +90717,12 @@ function skRenderVsLeague() {
 
   var teamKeys = Object.keys(data.allTeams).filter(function (k) { return k !== myKey; });
   var stateKey = lk + '|' + anchor;
-  if (_vslState.key !== stateKey) _vslState = { key: stateKey, cells: {}, pending: 0 };
+  if (_vslState.key !== stateKey) {
+    _vslState = { key: stateKey, cells: {}, pending: 0 };
+    // Drop totals outside the retention window whenever the grid changes
+    // week or league — the feature cleans up after itself. FPT7D
+    try { _fptPurgeOld(); } catch (e) {}
+  }
 
   // Kick fetches for anything not cached. fetchTeamFpForDate caches in
   // memory + localStorage, so repeated calls are free once landed.
@@ -90623,6 +90731,10 @@ function skRenderVsLeague() {
     dates.forEach(function (d) {
       var ck = tk + '|' + d;
       if (_vslState.cells[ck] !== undefined) return;
+      // Compact totals cache first — one number, ~40 bytes, versus a 7 KB
+      // roster we'd only sum anyway. FPTOTALS
+      var t = _fptGet(tk, d);
+      if (t !== undefined) { _vslState.cells[ck] = t; return; }
       need.push({ tk: tk, d: d, ck: ck });
     });
   });
@@ -90633,7 +90745,14 @@ function skRenderVsLeague() {
       if (idx >= need.length) return;
       var it = need[idx++];
       fetchTeamFpForDate(it.tk, it.d).then(function (m) {
-        _vslState.cells[it.ck] = _vslSum(m);
+        var tot = _vslSum(m);
+        _vslState.cells[it.ck] = tot;
+        _fptSet(it.tk, it.d, tot);   // FPTOTALS — keep the number, drop the roster
+        // The grid asked about somebody else's team. Their per-player detail
+        // is never rendered anywhere, so persisting 7 KB of it is pure cost:
+        // release the full roster and keep the 40-byte total. My own team
+        // stays cached — Week Contributors reads it.
+        if (it.tk !== myKey) _fpDropPersisted(it.tk, it.d);
       }).catch(function () {
         _vslState.cells[it.ck] = null;
       }).then(function () {
@@ -147423,6 +147542,7 @@ function skExtTodayCardsHtml() {
 function _skStorageGroups() {
   var groups = [
     { id: 'fpday',   label: 'FP day caches (fp_v4_)',        test: function(k) { return k.indexOf('fp_v4_') === 0; } },
+    { id: 'fptot',   label: 'Daily totals (fpt_v1_)',        test: function(k) { return k.indexOf('fpt_v1_') === 0; } },
     { id: 'pstats',  label: 'Player stat caches',            test: function(k) { return k.indexOf('sk_player_stats_v1_') === 0; } },
     { id: 'fpstale', label: 'Stale FP versions (fp_v1-3_)',  test: function(k) { return /^fp_v\d+_/.test(k) && k.indexOf('fp_v4_') !== 0; } },
     { id: 'catsros', label: 'Cats roster caches',            test: function(k) { return k.indexOf('sk_cats_roster_v1_') === 0; } },
@@ -147602,6 +147722,7 @@ function skStorageCleanup(aggressive) {
   try { _dbpSweepPools(aggressive); } catch (e) {}
   // FP caches also capped by count, not only by date. STORAGE
   try { _fpCacheTrim(aggressive ? 60 : FP_LS_MAX); } catch (e) {}
+  try { _fptPurgeOld(aggressive ? 7 : FPT_KEEP_DAYS); _fptTrim(FPT_LS_MAX); } catch (e) {}   // FPT7D
   // Date-trim the |YYYY-MM-DD-keyed cache families the report exposed
   // as silent accumulators (same key shape as the FP day caches).
   try {
