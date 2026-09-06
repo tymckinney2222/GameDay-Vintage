@@ -128125,6 +128125,27 @@ function skTrophyCase(season) {
 // Same shape mrPlacing returns, so the section renders it without change.
 // Rank and size come from the standings the app already caches: my team's
 // rank, and the team count in the league.
+// True for a Yahoo guillotine ("Death") league. Yahoo reports these as
+// scoring_type 'head', identical to a normal H2H league, so every record
+// pipeline treated them as H2H and folded their empty matchups into the
+// football W-L. There ARE no matchups — it's last-team-standing, judged on
+// where you finish, exactly like season points. MGRGUIL
+function _mrIsGuillotineLeague(lg) {
+  if (!lg) return false;
+  var sport = String(lg.sport || '').toLowerCase();
+  if (sport !== 'nfl') return false;   // the only guillotine sport
+  if (lg.is_guillotine) return true;
+  try {
+    if (typeof _skGuillotineCache !== 'undefined' &&
+        _skGuillotineCache[lg.league_key] === true) return true;
+  } catch (e) {}
+  try {
+    if (typeof skLeagueData === 'object' && skLeagueData &&
+        skLeagueData[lg.league_key] && skLeagueData[lg.league_key].is_guillotine) return true;
+  } catch (e2) {}
+  return false;
+}
+
 function mrYahooPlacings() {
   var out = { places: {}, rotos: {} };   // sport -> [placing]
   var leagues = [];
@@ -128144,6 +128165,11 @@ function mrYahooPlacings() {
     // Only the two formats with no W-L. Everything else already has a record
     // in the tables above and must not be double-counted here.
     var bucketName = (st === 'point') ? 'places' : (st === 'roto' ? 'rotos' : '');
+    // Guillotine is a third: Yahoo labels it 'head', but there are no matchups
+    // and no W-L — the only thing that describes the season is where you
+    // finished. Same treatment as season points, which is where the ESPN
+    // guillotine league already lands. MGRGUIL
+    if (!bucketName && _mrIsGuillotineLeague(lg)) bucketName = 'places';
     if (!bucketName) continue;
 
     var ld = (typeof skLeagueData === 'object' && skLeagueData)
@@ -128445,6 +128471,11 @@ function mrYahooSeason() {
     var st = lg.scoring_type;
     var isPts = (st === 'headpoint');
     var isCats = (st === 'head' || st === 'headone');
+    // Guillotine looks like cats H2H by scoring_type alone, so it was being
+    // queued for a matchup-history fetch that returns nothing and counted as a
+    // league still loading — leaving the football season record permanently
+    // "pending". It has no matchup record to contribute. MGRGUIL
+    if (_mrIsGuillotineLeague(lg)) continue;
     if (!isPts && !isCats) continue;      // roto / season-long: no matchup record
     var sport = String(lg.sport || 'other').toLowerCase();
     if (!out[sport]) out[sport] = { w: 0, l: 0, t: 0, n: 0 };
@@ -129543,8 +129574,16 @@ function _mdBuildRollup() {
     var s = bySport[sport];
     s.leagueCount++;
     var st = lg.scoring_type;
-    var isCatsH2H = (st === 'head' || st === 'headone');
-    var isPtsH2H = (st === 'headpoint');
+    // Guillotine leagues report 'head' but have no opponent and no matchup
+    // history, so they must not enter ANY H2H tally — not the cats/pts league
+    // counts, not the matchup fetch, and not the current-week record, where
+    // their empty week was collapsing to a tie and padding the football week
+    // line with results that were never played. They keep their leagueCount
+    // (they are real leagues) and are described by their finish instead, over
+    // in the season-points section. MGRGUIL
+    var isGuil = _mrIsGuillotineLeague(lg);
+    var isCatsH2H = !isGuil && (st === 'head' || st === 'headone');
+    var isPtsH2H = !isGuil && (st === 'headpoint');
     var isRoto = (st === 'roto');
     var isH2H = isCatsH2H || isPtsH2H;
     if (isCatsH2H) s.catsLeagueCount++;
