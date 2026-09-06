@@ -69913,6 +69913,114 @@ function _crsBuildPitchSeq(pbp, batterName, liveAbName) {
 // fieldGame/fieldData (all ESPN summary
 // shape: data.boxscore.players[][tIdx].statistics[].athletes[]). Returns
 // { game, athletes: [{ name, pos, teamAbbr, teamLogo, accent }] } or null.
+
+// ── PREGAME ROSTER FALLBACK ── CRSPREROST ──
+// ESPN's summary endpoint carries no boxscore.players until a game actually
+// starts, so the NBA/NHL/NFL walk below produced an EMPTY athlete list for
+// every scheduled game — and all three Fantasy Hub buttons hide themselves on
+// an empty list. That's why the hubs appeared on a finished game and vanished
+// on Thursday's opener. MLB never had the problem because Fenway reads the MLB
+// Stats API, which publishes both clubs' rosters before first pitch.
+//
+// The fallback pulls each club's /teams/{id}/roster — the same endpoint the
+// team page and _gymFetchTeamAvgs already use — and builds the IDENTICAL
+// athlete shape, espnId included, so the exact ESPN-fantasy id join and the
+// Yahoo/Fantrax name join both keep working unchanged. Cached per league+team
+// for the session. _crsActiveStadiumPlayers is synchronous, so a cache miss
+// fires the fetch and returns what it has; when the fetch lands it re-runs the
+// hub buttons for whichever stadium is still open.
+var _crsPreRosterCache = {};
+var _crsPreRosterPending = {};
+
+// Re-run the Fantasy Hub buttons for the open ESPN-summary stadium. Called
+// only when a pregame roster fetch lands — the button updaters are cheap and
+// re-entrant, and each one re-renders its own modal if it happens to be open.
+function _crsRefreshFhubButtons() {
+  var sets = [
+    ['fieldOverlay', 'field'],
+    ['rinkOverlay', 'rink'],
+    ['gymOverlay', 'gym']
+  ];
+  for (var i = 0; i < sets.length; i++) {
+    var el = document.getElementById(sets[i][0]);
+    if (!el || !el.classList || !el.classList.contains('open')) continue;
+    var p = sets[i][1];
+    try {
+      if (typeof _crsUpdateFhubButton === 'function') _crsUpdateFhubButton(p + 'FhubBtn', p + 'FhubBtnCount');
+      if (typeof _espUpdateFhubButton === 'function') _espUpdateFhubButton(p + 'EspFhubBtn', p + 'EspFhubBtnCount');
+      if (typeof _extUpdateFhubButton === 'function') _extUpdateFhubButton(p + 'ExtFhubBtn', p + 'ExtFhubBtnCount');
+    } catch (e) {}
+    return;
+  }
+}
+
+function _crsFetchPregameRosters(cfg, missing) {
+  for (var i = 0; i < missing.length; i++) {
+    (function (m) {
+      if (_crsPreRosterPending[m.ck]) return;
+      _crsPreRosterPending[m.ck] = 1;
+      var url = 'https://site.api.espn.com/apis/site/v2/sports/' + cfg.sport + '/' + cfg.slug +
+        '/teams/' + m.id + '/roster';
+      fetch(url).then(function (r) { return r.ok ? r.json() : null; }).then(function (rd) {
+        var people = [];
+        function take(a) {
+          if (!a || !a.id) return;
+          people.push({
+            id: String(a.id),
+            name: a.displayName || a.fullName || a.shortName || a.name || '',
+            pos: (a.position && (a.position.abbreviation || a.position.name)) || ''
+          });
+        }
+        // ESPN returns athletes either as position groups ({items:[…]}) or as
+        // a flat list, depending on sport. Handle both, same as the team page.
+        var grps = (rd && rd.athletes) || [];
+        for (var g = 0; g < grps.length; g++) {
+          var grp = grps[g];
+          if (grp && grp.items) { for (var k = 0; k < grp.items.length; k++) take(grp.items[k]); }
+          else take(grp);
+        }
+        _crsPreRosterCache[m.ck] = people;
+        _crsPreRosterPending[m.ck] = 0;
+        if (people.length) _crsRefreshFhubButtons();
+      }).catch(function () { _crsPreRosterPending[m.ck] = 0; });
+    })(missing[i]);
+  }
+}
+
+// Build the athlete list for a game from cached team rosters. Returns null
+// when nothing is cached yet (and kicks off the fetches).
+function _crsPregameRosterList(game) {
+  if (!game || !game.league) return null;
+  var cfg = (typeof LEAGUES === 'object' && LEAGUES) ? LEAGUES[game.league] : null;
+  if (!cfg || !cfg.sport || !cfg.slug) return null;
+  var sides = ['away', 'home'];
+  var out = [], missing = [], i;
+  for (i = 0; i < sides.length; i++) {
+    var side = sides[i];
+    var tm = game[side] || {};
+    if (!tm.id) continue;
+    var ck = game.league + '|' + tm.id;
+    var rows = _crsPreRosterCache[ck];
+    if (!rows) { missing.push({ id: tm.id, ck: ck }); continue; }
+    var accent = '#a78bfa';
+    try {
+      var hAcc = (stTheme(game.home.abbr, game.home.fullName || game.home.name) || {}).accent || '#fff';
+      var aAcc = (stTheme(game.away.abbr, game.away.fullName || game.away.name) || {}).accent || '#fff';
+      accent = _teamColorFor(tm.abbr, side === 'away', side === 'away' ? hAcc : aAcc,
+        tm.fullName || tm.name) || accent;
+    } catch (e) {}
+    for (var r = 0; r < rows.length; r++) {
+      if (!rows[r].name) continue;
+      out.push({
+        name: rows[r].name, pos: rows[r].pos, teamAbbr: tm.abbr,
+        teamLogo: tm.logo, accent: accent, espnId: rows[r].id
+      });
+    }
+  }
+  if (missing.length) _crsFetchPregameRosters(cfg, missing);
+  return out.length ? out : null;
+}
+
 function _crsActiveStadiumPlayers() {
   // Which stadium overlay is actually OPEN is the source of truth — not just
   // "which global is non-null". fenwayGame/fenwayLiveData are never cleared on
@@ -70000,6 +70108,13 @@ function _crsActiveStadiumPlayers() {
         });
       });
     });
+    // No boxscore athletes — a scheduled game (or a summary that hasn't filled
+    // in yet). Fall back to the published team rosters so the hubs work before
+    // kickoff, matching how Fenway behaves pregame. CRSPREROST
+    if (!list.length) {
+      var _preList = _crsPregameRosterList(espnGame);
+      if (_preList && _preList.length) list = _preList;
+    }
     return { game: espnGame, athletes: list };
   }
 
@@ -106539,9 +106654,23 @@ function fetchNflWeekSchedule(week, seasonYear) {
       var kickoff = ev.date;
       var win = _skNflGameWindow(kickoff);
       var comps = (ev.competitions && ev.competitions[0] && ev.competitions[0].competitors) || [];
+      // Carry the opponent and home/away alongside the window, so the roster
+      // tab can show "@ SEA · Thu 6:20p" on rows that have no stat line yet.
+      // Existing readers only touch .window/.kickoff and are unaffected.
+      // NFLOPPLINE
+      var abbrs = [], homes = [];
       comps.forEach(function(c) {
-        var ab = c && c.team && (c.team.abbreviation || c.team.abbrev);
-        if (ab) map[String(ab).toLowerCase()] = { window: win, kickoff: kickoff };
+        abbrs.push((c && c.team && (c.team.abbreviation || c.team.abbrev)) || '');
+        homes.push(!!(c && c.homeAway === 'home'));
+      });
+      comps.forEach(function(c, ci) {
+        var ab = abbrs[ci];
+        if (!ab) return;
+        var oi = (ci === 0) ? 1 : 0;
+        map[String(ab).toLowerCase()] = {
+          window: win, kickoff: kickoff,
+          opp: abbrs[oi] || '', isHome: homes[ci]
+        };
       });
     });
     _skNflSchedCache[ck] = { map: map, _ts: Date.now() };
@@ -107865,6 +107994,47 @@ var skCurrentFpMap = null;
 // currently-viewed NFL league. Read by skUpdateRosterLinesInPlace to format
 // each row's stat line. Reset on every render so it doesn't bleed leagues.
 var skCurrentNflStatsMeta = null;
+// This week's NFL schedule (ESPN abbr → {opp, isHome, kickoff}) for the
+// currently-viewed league. Lets a roster row that has no stat line yet show
+// its matchup instead of a bare em-dash — the football answer to MLB's
+// "no game" / "pre-game" wording, which football never had. Reset per render.
+// NFLOPPLINE
+var skCurrentNflSchedMap = null;
+
+// "@ SEA · Thu 6:20p" / "vs SEA · Sun 11:00a" / "BYE" for one club, in the
+// user's own timezone. Returns '' when the schedule hasn't loaded yet, so the
+// row keeps its em-dash rather than claiming a bye that may not exist.
+function _skNflRosterMatchupLine(teamAbbr) {
+  if (!skCurrentNflSchedMap) return '';
+  var raw = String(teamAbbr || '').trim();
+  if (!raw) return '';
+  var espn = (typeof _nflEspnAbbr === 'function') ? _nflEspnAbbr(raw) : raw.toLowerCase();
+  var g = skCurrentNflSchedMap[String(espn).toLowerCase()];
+  if (!g) {
+    // Team isn't in this week's schedule. That's a real bye only when the map
+    // is actually complete — a short map means a partial fetch or an abbr the
+    // normalizer doesn't cover, and calling that a bye would be a false
+    // statement of fact. Fall back to the dash instead.
+    var n = 0;
+    for (var k in skCurrentNflSchedMap) {
+      if (Object.prototype.hasOwnProperty.call(skCurrentNflSchedMap, k)) n++;
+    }
+    return (n >= 16) ? 'BYE' : '';
+  }
+  var side = g.isHome ? 'vs ' : '@ ';
+  var out = side + String(g.opp || '').toUpperCase();
+  if (g.kickoff) {
+    var d = new Date(g.kickoff);
+    if (!isNaN(d.getTime())) {
+      var DOW = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+      var h = d.getHours(), m = d.getMinutes();
+      var ap = h >= 12 ? 'p' : 'a';
+      var h12 = h % 12; if (h12 === 0) h12 = 12;
+      out += ' \u00b7 ' + DOW[d.getDay()] + ' ' + h12 + ':' + (m < 10 ? '0' : '') + m + ap;
+    }
+  }
+  return out;
+}
 
 // ── Empty roster slots (Skipper roster tab) ─────────────────────────
 // The roster only lists players Yahoo returns, so an open lineup spot
@@ -107992,6 +108162,7 @@ function skRenderDetailRoster(league, players) {
   // this is a points league and we have a team_key to fetch with.
   skCurrentFpMap = null;
   skCurrentNflStatsMeta = null;
+  skCurrentNflSchedMap = null;   // NFLOPPLINE
 
   var active = players.filter(function(p) { return !p.isBench && !p.isIL; });
   var bench = players.filter(function(p) { return p.isBench; });
@@ -108107,11 +108278,19 @@ function skRenderDetailRoster(league, players) {
         var _nflSettingsP = leagueSettingsCache[league.league_key]
           ? Promise.resolve(leagueSettingsCache[league.league_key])
           : ensureLeagueSettings(league.league_key);
-        Promise.all([fetchTeamFpForWeek(teamKey, nflWeek, league.current_week), _nflSettingsP]).then(function(res) {
+        // The week schedule rides along so rows with no stats yet can show
+        // "@ SEA · Thu 6:20p" instead of a bare dash. It may resolve null —
+        // the line builder then leaves the dash alone. NFLOPPLINE
+        Promise.all([
+          fetchTeamFpForWeek(teamKey, nflWeek, league.current_week),
+          _nflSettingsP,
+          fetchNflWeekSchedule(nflWeek, league.season || '')
+        ]).then(function(res) {
           if (skState.activeLeagueKey !== leagueKeyAtStart) return;
           if (skNflWeek !== nflWeek) return; // user stepped to another week
           skCurrentFpMap = res[0] || null;
           skCurrentNflStatsMeta = (res[1] && res[1].stats) || {};
+          skCurrentNflSchedMap = res[2] || null;
           skUpdateRosterLinesInPlace(players, targetDate);
         });
       } else if (skDetailFpMode === 'season') {
@@ -108557,7 +108736,13 @@ function skRenderLineHTML(player, line, fpMap) {
   // status words like "did not play" / "no game" are muted; bare em-
   // dash is also muted.
   var cls = 'sk-roster-line';
-  var isStatusWord = (lineText === 'did not pitch' || lineText === 'did not play' ||
+  // NFL rows with no stats yet carry a matchup instead ("@ SEA · Thu 6:20p",
+  // "BYE"). That's schedule text, not production, so it gets the same muted
+  // treatment as MLB's "no game" / "pre-game". NFLOPPLINE
+  var _isNflSched = (lineText === 'BYE' ||
+                     lineText.indexOf('@ ') === 0 || lineText.indexOf('vs ') === 0);
+  var isStatusWord = _isNflSched ||
+                     (lineText === 'did not pitch' || lineText === 'did not play' ||
                       lineText === 'no game' || lineText === 'pre-game' ||
                       lineText === 'not yet' || lineText === '—');
   if (isStatusWord) {
@@ -109655,6 +109840,12 @@ function skUpdateRosterLinesInPlace(players, targetDate) {
     if (_ulIsNfl) {
       var nflEntry = skCurrentFpMap && skCurrentFpMap[p.playerKey];
       line = (nflEntry && nflEntry.stats) ? _skBuildNflStatLine(nflEntry.stats, skCurrentNflStatsMeta, p.selectedPos) : null;
+      // No stats for this scoring period yet — show the week's matchup rather
+      // than a bare dash. Empty string means the schedule hasn't landed, in
+      // which case the dash is still the honest answer. NFLOPPLINE
+      if (!line && typeof _skNflRosterMatchupLine === 'function') {
+        line = _skNflRosterMatchupLine(p.teamAbbr) || null;
+      }
     } else if (_ulSport === 'nba' || _ulSport === 'nhl') {
       // NBA/NHL: pre-built cat-stat HTML from Yahoo's date stats (p._lineHtml).
       line = (p._line != null && p._line !== '') ? p._line : null;
@@ -109827,6 +110018,13 @@ function skBuildRosterGroup(label, players, league, hasLiveStats) {
       // HTML stamped onto p._line by the roster's hydration pass). Seed it on
       // initial render so a warm cache paints immediately instead of a dash.
       if (p._line != null && p._line !== '') line = p._line;
+    }
+    // NFL: same source as the in-place updater, so any re-render that happens
+    // after the schedule has landed (week step, group collapse) keeps the
+    // matchup line instead of reverting to a dash. On a cold first paint
+    // skCurrentNflSchedMap is still null and this is a no-op. NFLOPPLINE
+    if (!line && _rgSport === 'nfl' && typeof _skNflRosterMatchupLine === 'function') {
+      line = _skNflRosterMatchupLine(p.teamAbbr) || '';
     }
     var _rowIsHtmlLine = ((_rgSport === 'nba' || _rgSport === 'nhl') && p._lineHtml === true && !!line);
     var rendered = skRenderLineHTML(p, line, skCurrentFpMap);
