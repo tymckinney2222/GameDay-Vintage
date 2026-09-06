@@ -34225,7 +34225,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-09-06 FXENGINE';
+var SK_BUILD = '2026-09-06 STORAGE';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -38430,6 +38430,47 @@ var teamFpInflight = {};    // memKey → in-flight promise (dedup)
 // (injury code), statusFull, isStarting (today's lineup confirmation),
 // and battingOrder. Bumped so old entries refresh with these fields.
 var FP_LS_PREFIX = 'fp_v4_';
+// ── FP cache ceiling ── STORAGE ──
+// One entry per team per day. The Vs-the-League grid multiplies that by the
+// league size, so a week of a 12-team league is ~84 entries and they never
+// expired by count — only by the cleanup's date cutoff, which a user has to
+// press. 2.6 MB of a 10 MB origin quota was the result. Cap the count and
+// evict the oldest dates first; anything evicted re-fetches on demand.
+var FP_LS_MAX = 140;
+
+function _fpCacheTrim(target) {
+  var keys = [];
+  try {
+    for (var i = 0; i < localStorage.length; i++) {
+      var k = localStorage.key(i);
+      if (k && k.indexOf(FP_LS_PREFIX) === 0) keys.push(k);
+    }
+  } catch (e) { return 0; }
+  var max = target || FP_LS_MAX;
+  if (keys.length <= max) return 0;
+  // Key tail is the date, so a plain sort puts the oldest first.
+  keys.sort(function (a, b) {
+    var da = a.slice(a.lastIndexOf('_') + 1), db = b.slice(b.lastIndexOf('_') + 1);
+    return da < db ? -1 : (da > db ? 1 : 0);
+  });
+  var drop = keys.length - max, n = 0;
+  for (var d = 0; d < drop; d++) { try { localStorage.removeItem(keys[d]); n++; } catch (e2) {} }
+  return n;
+}
+
+// A write that hits the quota should make room and retry once, not fail
+// silently and leave the cache permanently cold. STORAGE
+function _fpSafeSet(key, val) {
+  try { localStorage.setItem(key, val); return true; }
+  catch (e) {
+    try {
+      _fpCacheTrim(Math.floor(FP_LS_MAX / 2));
+      if (typeof dbpCacheDropAll === 'function') dbpCacheDropAll();
+      localStorage.setItem(key, val);
+      return true;
+    } catch (e2) { return false; }
+  }
+}
 // TTL for "today" entries in teamFpCache + skCatsRosterCache. Past
 // dates cache forever (immutable), but today's entries reflect live
 // game state and need to refresh as games progress. 5 minutes is a
@@ -38644,10 +38685,10 @@ async function fetchTeamFpForDate(teamKey, date) {
       // localStorage would cache a bad result permanently.
       var _hasData = Object.keys(byKey).length > 0;
       if (isImmutable && _hasData) {
-        try {
-          localStorage.setItem(lsKey, JSON.stringify(byKey));
-        } catch (e) {
-          console.warn('[fp] localStorage write failed for ' + lsKey, e);
+        // STORAGE — quota-aware: makes room and retries rather than failing
+        // silently and leaving this date permanently uncached.
+        if (!_fpSafeSet(lsKey, JSON.stringify(byKey))) {
+          console.warn('[fp] localStorage write failed for ' + lsKey);
         }
       }
       return byKey;
@@ -38702,8 +38743,9 @@ async function fetchTeamFpForWeek(teamKey, week, currentWeek) {
       }
       teamFpWeekCache[memKey] = byKey;
       if (isPastWeek) {
-        try { localStorage.setItem(lsKey, JSON.stringify(byKey)); }
-        catch (e) { console.warn('[fp] week localStorage write failed for ' + lsKey, e); }
+        if (!_fpSafeSet(lsKey, JSON.stringify(byKey))) {   // STORAGE
+          console.warn('[fp] week localStorage write failed for ' + lsKey);
+        }
       }
       return byKey;
     } catch (e) {
@@ -84664,7 +84706,7 @@ async function skFetchCatsRosterForDate(teamKey, dateStr) {
       }
       skCatsRosterCache[memKey] = out;
       if (isPastDate) {
-        try { localStorage.setItem(lsKey, JSON.stringify(out)); } catch (e) {}
+        _fpSafeSet(lsKey, JSON.stringify(out));   // STORAGE
       }
       return out;
     } catch (e) {
@@ -84887,7 +84929,7 @@ async function skFetchTeamDailyCatTotals(teamKey, dateStr) {
       // Require both a clean response and at least one parsed stat.
       var _statsOk = !(data && data.error) && Object.keys(out.num).length > 0;
       if (isImmutable && _statsOk) {
-        try { localStorage.setItem(lsKey, JSON.stringify(out)); } catch (e) {}
+        _fpSafeSet(lsKey, JSON.stringify(out));   // STORAGE
       }
       return out;
     } catch (e) {
@@ -108730,7 +108772,7 @@ function _skFetchTeamPlayerStats(teamKey, dateStr) {
       // API returned an error or unexpected structure; caching it would
       // permanently show "No player stats for this date yet."
       if (isImmutablePs && out.length > 0) {
-        try { localStorage.setItem(lsKey, JSON.stringify(out)); } catch (e) {}
+        _fpSafeSet(lsKey, JSON.stringify(out));   // STORAGE
       }
       return out;
     } catch (e) {
@@ -122662,6 +122704,11 @@ function dbpCachePurgeStale(sport, season) {
       // Only this sport+season's other depths. Another sport's pool, or a
       // past season's, is not ours to delete.
       if (k.indexOf(DBP_CACHE_PREFIX + sport + '_' + season + '_d') === 0) kill.push(k);
+      // Pre-depth key format — gdhq_dbpool_v1_nhl_2026 with no _d suffix.
+      // Nothing has read these since the depth went into the key, and one of
+      // them is a megabyte. The old purge only matched the _d form, so they
+      // sat forever. STORAGE
+      else if (k === DBP_CACHE_PREFIX + sport + '_' + season) kill.push(k);
     }
     for (i = 0; i < kill.length; i++) localStorage.removeItem(kill[i]);
   } catch (e) { /* a storage that won't enumerate is not worth failing over */ }
@@ -146844,7 +146891,7 @@ function _fxDayBase(id, rows) {
       if (rows[i].teamId && rows[i].points != null) base[rows[i].teamId] = Number(rows[i].points) || 0;
     }
     stored = { date: today, base: base };
-    try { localStorage.setItem(lsKey, JSON.stringify(stored)); } catch (e) {}
+    _fpSafeSet(lsKey, JSON.stringify(stored));   // STORAGE
   }
   return stored.base || {};
 }
@@ -147385,6 +147432,11 @@ function _skStorageGroups() {
     { id: 'pts',     label: 'Points snapshots',              test: function(k) { return k.indexOf('pts_snap_v1_') === 0; } },
     { id: 'prov',    label: 'Provider logins (Sleeper/Fantrax)', test: function(k) { return k.indexOf('gdhq_sleeper_') === 0 || k.indexOf('gdhq_fantrax_') === 0 || k === 'sk_ext_synced_v1'; } },
     { id: 'sk',      label: 'Skipper settings / misc (sk_*)', test: function(k) { return k.indexOf('sk_') === 0; } },
+    // Pools were the single biggest consumer and were invisible inside
+    // "everything else", which is why cleanup looked like it did nothing.
+    // Named and swept now. STORAGE
+    { id: 'dbpool',  label: 'Draft board pools (re-fetchable)', test: function(k) { return k.indexOf('gdhq_dbpool_') === 0; } },
+    { id: 'gdhq',    label: 'Other GameDay caches (gdhq_*)',  test: function(k) { return k.indexOf('gdhq_') === 0; } },
     { id: 'spp',     label: 'SPP LMP Dashboard (shared origin)', test: function(k) { return k.indexOf('mcpRtHist_') === 0 || k.indexOf('spp') === 0 || k.indexOf('SPP') === 0; } },
     { id: 'other',   label: 'Everything else on this origin', test: function() { return true; } }
   ];
@@ -147508,6 +147560,32 @@ function skRenderStorageReport() {
 // Run the same purge ladder the snapshot writers use — plus the cache
 // families the storage report surfaced (cats rosters, team stats,
 // stale settings versions) — then re-render so freed space is visible.
+// Sweep draft-board pools. STORAGE
+function _dbpSweepPools(all) {
+  if (typeof DBP_CACHE_PREFIX === 'undefined') return 0;
+  var keepSport = null, keepSeason = null;
+  try {
+    keepSport = (typeof _dbpSport !== 'undefined') ? _dbpSport : null;
+    keepSeason = (typeof dbpSeason === 'function') ? dbpSeason() : null;
+  } catch (e) {}
+  var kill = [], n = 0;
+  try {
+    for (var i = 0; i < localStorage.length; i++) {
+      var k = localStorage.key(i);
+      if (!k || k.indexOf(DBP_CACHE_PREFIX) !== 0) continue;
+      if (all) { kill.push(k); continue; }
+      // Standard: keep only the current sport+season at the current depth.
+      var cur = (keepSport && keepSeason && typeof dbpCacheKey === 'function')
+        ? dbpCacheKey(keepSport, keepSeason) : null;
+      if (cur && k === cur) continue;
+      kill.push(k);
+    }
+    for (var d = 0; d < kill.length; d++) { localStorage.removeItem(kill[d]); n++; }
+  } catch (e2) {}
+  return n;
+}
+function dbpCacheDropAll() { return _dbpSweepPools(true); }
+
 function skStorageCleanup(aggressive) {
   var days = aggressive ? 14 : CATS_SNAP_TTL_DAYS;
   try { _purgedOldFpCaches = false; _purgeOldFpCaches(); } catch (e) {}
@@ -147515,6 +147593,15 @@ function skStorageCleanup(aggressive) {
   try { _purgeOldCatsSnapshots(); } catch (e) {}
   try { _purgeOldPtsSnapshots(); } catch (e) {}
   try { _purgeOldFpCachesByDate(days); } catch (e) {}
+  // ── The biggest consumer was never swept ── STORAGE ──
+  // Draft-board pools are ~1.3 MB each and landed in "everything else", which
+  // neither button touched — which is why cleanup freed so little. Standard
+  // drops pools for other sports/seasons and any legacy no-depth key.
+  // Aggressive drops them all: they re-fetch on demand and only the draft
+  // board reads them.
+  try { _dbpSweepPools(aggressive); } catch (e) {}
+  // FP caches also capped by count, not only by date. STORAGE
+  try { _fpCacheTrim(aggressive ? 60 : FP_LS_MAX); } catch (e) {}
   // Date-trim the |YYYY-MM-DD-keyed cache families the report exposed
   // as silent accumulators (same key shape as the FP day caches).
   try {
