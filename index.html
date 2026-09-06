@@ -34164,7 +34164,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-09-05 MINWATCH2';
+var SK_BUILD = '2026-09-05 MINWATCH3';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -56350,7 +56350,11 @@ function buildVintagePerformers(data, game, hideTitle) {
           if (g > 0) parts.push(g + 'G');
           var assists = parseStat(statMap['A'] || '0');
           if (assists > 0) parts.push(assists + 'A');
-          if (statMap['SOG']) parts.push(statMap['SOG'] + 'SOG');
+          // ESPN's skater labels carry shots under S; a SOG column, when it
+          // appears at all, reads 0 — so a two-goal night showed "0SOG". Same
+          // preference the rink skater parse already uses. PERFSOG
+          var _sogV = (statMap['S'] != null && statMap['S'] !== '') ? statMap['S'] : statMap['SOG'];
+          if (_sogV != null && _sogV !== '' && parseStat(_sogV) > 0) parts.push(_sogV + 'SOG');
           statLine = parts.slice(0, 3).join(' ');
         } else if (league === 'MLB' || league === 'MiLB') {
           var parts = [];
@@ -60203,7 +60207,44 @@ function _mwElapsedFrac(game) {
 }
 
 // Season MPG for a player from the team-averages cache; null when not loaded.
+// A player who's in tonight's box but not on the team's current roster rows
+// (traded since, or the roster fetch is a season out of date) gets his own
+// overview lookup — one request, cached by id. MINWATCH3
+var _mwPlayerMpg = {};      // playerId -> number | 'none'
+var _mwPlayerPending = {};
+
+function _mwFetchPlayerMpg(league, playerId, rerenderFn) {
+  var id = String(playerId || '');
+  if (!id || _mwPlayerMpg[id] != null || _mwPlayerPending[id]) return;
+  var cfg = (typeof LEAGUES === 'object' && LEAGUES) ? LEAGUES[league] : null;
+  if (!cfg) return;
+  _mwPlayerPending[id] = true;
+  fetch('https://site.web.api.espn.com/apis/common/v3/sports/' + cfg.sport + '/' + cfg.slug +
+        '/athletes/' + id + '/overview')
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (o) {
+      _mwPlayerPending[id] = false;
+      var val = 'none';
+      try {
+        var st = o && o.statistics;
+        var splits = st && st.splits && st.splits[0];
+        var labels = (st && st.labels) || [];
+        var idx = labels.indexOf('MIN');
+        if (idx === -1) idx = labels.indexOf('MPG');
+        if (splits && splits.stats && idx > -1) {
+          var v = parseFloat(splits.stats[idx]);
+          if (!isNaN(v)) val = v;
+        }
+      } catch (e) {}
+      _mwPlayerMpg[id] = val;
+      if (typeof rerenderFn === 'function') rerenderFn();
+    })
+    .catch(function () { _mwPlayerPending[id] = false; _mwPlayerMpg[id] = 'none'; });
+}
+
 function _mwSeasonMpg(teamId, league, playerId, playerName) {
+  // Per-player cache first — covers the traded-since case. MINWATCH3
+  if (playerId && _mwPlayerMpg[String(playerId)] != null) return _mwPlayerMpg[String(playerId)];
   // MINWATCH2 — _gymTeamAvgs_get returns the LEADERS summary, not rows; this
   // was iterating an object with no length and returning null forever, which
   // read as "avg loading…" on every player. Rows come from the new accessor.
@@ -60222,7 +60263,9 @@ function _mwSeasonMpg(teamId, league, playerId, playerName) {
     var v = parseFloat(r.stats[idx]);
     return isNaN(v) ? 'none' : v;
   }
-  return null;
+  // Rows exist but he isn't in them — not "loading", "not on this roster".
+  // The caller fetches his overview directly. MINWATCH3
+  return 'missing';
 }
 
 function _mwOwnedMark(p) {
@@ -60247,6 +60290,10 @@ function _gymMinutesWatch(allPlayers, game, awayAccent, homeAccent, divStyle, re
     var mpg = (typeof mpgRaw === 'number') ? mpgRaw : null;
     if (mpgRaw == null && typeof _gymFetchTeamAvgs === 'function' && tid) {
       _gymFetchTeamAvgs(tid, game.league || 'NBA', rerenderFn);
+    } else if (mpgRaw === 'missing' && p.id) {
+      // On the box but not the roster rows (traded since) — fetch him
+      // directly. MINWATCH3
+      _mwFetchPlayerMpg(game.league || 'NBA', p.id, rerenderFn);
     }
     mine.push({ p: p, mark: mark, tonight: tonight, mpg: mpg, noAvg: noAvg });
   }
