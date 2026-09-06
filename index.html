@@ -928,6 +928,12 @@
   .slh-note { padding: 8px 12px 10px; font-size: 9.5px; line-height: 1.5;
               color: rgba(255,255,255,0.3); }
 
+  /* ── Fantrax calculated FP ── FXENGINE ── */
+  .ftx-fp { margin-left: 6px; font-family: var(--sk-font-mono, monospace); font-size: 9.5px;
+            font-weight: 800; color: #34d399; letter-spacing: 0.02em; }
+  .ftx-calc { font-style: normal; margin-left: 4px; font-size: 7.5px; font-weight: 700;
+              letter-spacing: 0.1em; color: rgba(255,255,255,0.3); vertical-align: middle; }
+
   /* ── Vs the League grid ── VSLEAGUE ── */
   .sk-vsl { margin: 12px 0 0; border-radius: 12px; background: rgba(255,255,255,0.03);
             border: 1px solid rgba(255,255,255,0.07); overflow: hidden; }
@@ -34219,7 +34225,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-09-06 FXCODES';
+var SK_BUILD = '2026-09-06 FXENGINE';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -70289,11 +70295,20 @@ function _extFhubRowsFor(at, idx, sport) {
   if (!refs) return rows;
   for (var r = 0; r < refs.length; r++) {
     var row = refs[r].row, it = refs[r].item;
-    var fp = null;
+    var fp = null, calc = false, calcTitle = '';
     if (row.provider === 'sleeper' && row._slPP) {
       // Sleeper only — its items really do carry playerId. FTXFHUBID
       var v = row._slPP[String(it.playerId || it.id || '')];
       if (v != null) fp = Math.round(Number(v) * 10) / 10;
+    } else if (row.provider === 'fantrax' && row.scoring && typeof _fxStadiumStatMap === 'function') {
+      // Fantrax publishes no per-player FP; score this game's box line with
+      // the league's own settings. The hub already knows the ESPN athlete
+      // id, so no name matching is needed here. FXENGINE
+      var sm = _fxStadiumStatMap(at.espnId);
+      if (sm) {
+        var res = _fxScoreStatMap(sport, row.scoring, sm.statMap, sm.pos);
+        if (res) { fp = Math.round(res.fp * 10) / 10; calc = true; calcTitle = _fxScoreTitle(res); }
+      }
     }
     rows.push({
       provider: row.provider,
@@ -70301,7 +70316,8 @@ function _extFhubRowsFor(at, idx, sport) {
       leagueName: row.name || row.key,
       teamLogo: (typeof extGetMyLogo === 'function') ? (extGetMyLogo(row.key) || '') : '',
       fp: fp,
-      noFp: row.provider === 'fantrax',
+      calc: calc, calcTitle: calcTitle,
+      noFp: row.provider === 'fantrax' && !calc,
       slot: it.slot || '',
       starter: !!it.starter,
       injury: it.injury ? String(it.injury).toUpperCase() : ''
@@ -70583,9 +70599,11 @@ function openExtFantasyHub() {
         var right;
         if (fr.fp != null) {
           var fpStr = (fr.fp > 0 ? '+' : '') + fr.fp.toFixed(1);
-          right = '<span class="crs-fhub-fp" style="color:' +
-            (fr.fp > 0 ? col : fr.fp < 0 ? '#f87171' : 'rgba(255,255,255,0.35)') + '">' +
-            fpStr + ' FP</span>';
+          // A calculated figure carries a small "calc" mark and a tooltip with
+          // the arithmetic — it's ours, not the platform's. FXENGINE
+          right = '<span class="crs-fhub-fp"' + (fr.calc ? ' title="' + slEsc(fr.calcTitle || '') + '"' : '') +
+            ' style="color:' + (fr.fp > 0 ? col : fr.fp < 0 ? '#f87171' : 'rgba(255,255,255,0.35)') + '">' +
+            fpStr + ' FP' + (fr.calc ? '<i class="ftx-calc">calc</i>' : '') + '</span>';
         } else if (fr.noFp) {
           // Fantrax exposes team scores only, so this says what it knows.
           right = '<span class="crs-fhub-fp" style="color:rgba(255,255,255,0.3);font-size:9.5px">' +
@@ -104134,6 +104152,111 @@ var _FX_ESPN_DERIVED = {
     THREE_POINT_PERCENTAGE: 'box: 3PT made/att'
   }
 };
+
+// ── Fantrax live FP engine ── FXENGINE ──
+// Fantrax publishes no per-player daily stats, so fantasy points are
+// computed here: an ESPN box line (label -> value) scored against the
+// league's own scoringItems through the alias table the probe validated.
+//
+// Scope, deliberately: what the box carries. Goalie decisions and PP/SH
+// points come in later passes with their own verification. A category this
+// pass can't score is reported in the breakdown, never silently zeroed.
+//
+// Groups: a scoring system has one group per position class (Skaters /
+// Goalies for hockey). A goalie is scored by the goalie group — his ASSISTS
+// are worth 1 there, not the skater 2. Basketball has one group.
+function _fxIsGoaliePos(pos) { return /^G$/i.test(String(pos || '').trim()); }
+
+function _fxGroupFor(scoring, sport, pos) {
+  if (!scoring || !scoring.groups || !scoring.groups.length) return null;
+  if (scoring.groups.length === 1) return scoring.groups[0];
+  var wantGoalie = (String(sport).toUpperCase() === 'NHL') && _fxIsGoaliePos(pos);
+  for (var i = 0; i < scoring.groups.length; i++) {
+    var nm = String(scoring.groups[i].name || '').toLowerCase();
+    var isG = /goal/.test(nm);
+    if (wantGoalie === isG) return scoring.groups[i];
+  }
+  return scoring.groups[0];
+}
+
+// Read one alias target out of a stat map. "FG:made" splits an "11-20".
+function _fxStatValue(statMap, target) {
+  if (!statMap) return null;
+  var parts = String(target).split(':');
+  var raw = statMap[parts[0]];
+  if (raw == null || raw === '') return null;
+  if (parts[1]) {
+    var ma = String(raw).split('-');
+    if (ma.length < 2) return null;
+    var v = parseFloat(parts[1] === 'made' ? ma[0] : ma[1]);
+    return isNaN(v) ? null : v;
+  }
+  var n = parseFloat(String(raw).replace('+', ''));
+  return isNaN(n) ? null : n;
+}
+
+// -> { fp, scored:[{code,pts,val,contrib}], unscored:[code] } or null when
+// the league has no scoring or the box carries nothing scorable.
+function _fxScoreStatMap(sport, scoring, statMap, pos) {
+  var grp = _fxGroupFor(scoring, sport, pos);
+  if (!grp || !statMap) return null;
+  var alias = _FX_ESPN_ALIAS[String(sport).toUpperCase()] || {};
+  var fp = 0, scored = [], unscored = [], any = false;
+  for (var i = 0; i < grp.cats.length; i++) {
+    var c = grp.cats[i];
+    var code = _fxCodeNorm(c.abbr || c.name);
+    var pts = Number(c.pts);
+    if (isNaN(pts)) continue;
+    var target = alias[code];
+    if (!target) { unscored.push(code); continue; }
+    var val = _fxStatValue(statMap, target);
+    if (val == null) continue;   // label absent from this box — not a zero
+    any = true;
+    var contrib = val * pts;
+    fp += contrib;
+    if (val) scored.push({ code: code, pts: pts, val: val, contrib: contrib });
+  }
+  if (!any) return null;
+  return { fp: Math.round(fp * 100) / 100, scored: scored, unscored: unscored };
+}
+
+// Stat map for an ESPN athlete id from whichever stadium box is open.
+function _fxStadiumStatMap(espnId) {
+  var id = String(espnId || '');
+  if (!id) return null;
+  var boxes = [];
+  try { if (typeof gymData !== 'undefined' && gymData) boxes.push({ d: gymData }); } catch (e) {}
+  try { if (typeof rinkData !== 'undefined' && rinkData) boxes.push({ d: rinkData }); } catch (e2) {}
+  try { if (typeof fieldData !== 'undefined' && fieldData) boxes.push({ d: fieldData }); } catch (e3) {}
+  for (var b = 0; b < boxes.length; b++) {
+    var teams = ((boxes[b].d || {}).boxscore || {}).players || [];
+    for (var t = 0; t < teams.length; t++) {
+      var groups = teams[t].statistics || [];
+      for (var g = 0; g < groups.length; g++) {
+        var labels = groups[g].labels || [];
+        var aths = groups[g].athletes || [];
+        for (var a = 0; a < aths.length; a++) {
+          var who = aths[a].athlete || {};
+          if (String(who.id) !== id) continue;
+          var m = {};
+          var vals = aths[a].stats || [];
+          for (var i = 0; i < labels.length && i < vals.length; i++) m[String(labels[i])] = vals[i];
+          return { statMap: m, pos: (who.position && who.position.abbreviation) || '' };
+        }
+      }
+    }
+  }
+  return null;
+}
+
+// Compact "how this number was built" for a tooltip. FXENGINE
+function _fxScoreTitle(res) {
+  if (!res) return '';
+  var bits = res.scored.map(function (x) { return x.val + ' ' + x.code.replace(/_/g, ' ').toLowerCase() + ' \u00d7 ' + x.pts; });
+  var t = bits.join(' + ');
+  if (res.unscored.length) t += ' \u00b7 not scored: ' + res.unscored.join(', ');
+  return t;
+}
 
 function skProbeFantraxScoring() {
   var lines = [];
@@ -144392,7 +144515,15 @@ function _fxLineupFill(row, bodyEl, headEl) {
           ? '<span style="color:' + (_lv.live ? '#ef4444' : 'rgba(255,255,255,0.3)') +
             ';font-size:8.5px;letter-spacing:0.08em;margin-left:5px;">' +
             (_lv.live ? 'LIVE' : 'FINAL') + '</span>'
-          : ''),
+          : '') +
+        // FXENGINE — calculated FP in the lineup modal too
+        (function () {
+          if (!_lv || !_lv.statMap || !row || !row.scoring || typeof _fxScoreStatMap !== 'function') return '';
+          var res = _fxScoreStatMap(SPORT, row.scoring, _lv.statMap, _lv.pos || players[p].pos);
+          if (!res) return '';
+          return '<span class="ftx-fp" title="' + slEsc(_fxScoreTitle(res)) + '">' +
+            (res.fp >= 0 ? '+' : '') + res.fp.toFixed(1) + ' FP</span>';
+        })(),
         null, '#34d399', false,
         _ftxClubChip(players[p].teamAbbr, SPORT));
     }
@@ -146203,8 +146334,13 @@ function _ftxParseBox(j, SPORT, g) {
           var keys = _ftxLiveKeys(nm);
           for (var kk = 0; kk < keys.length; kk++) {
             if (keys[kk] && !out[keys[kk]]) {
+              // statMap + pos let the FP engine score this line; the display
+              // string stays as it was. FXENGINE
+              var _sm = {};
+              for (var _v = 0; _v < labels.length && _v < vals.length; _v++) _sm[String(labels[_v] || '')] = vals[_v];
               out[keys[kk]] = { line: bits.join('\u0001'), live: (g.state === 'in'),
-                                detail: g.detail || '' };
+                                detail: g.detail || '', statMap: _sm,
+                                pos: (who.position && who.position.abbreviation) || '' };
             }
           }
         }
@@ -146516,6 +146652,15 @@ function _ftxRosterRowsHtml(row, myTeam) {
                   ';margin-left:5px;font-size:8px;letter-spacing:0.08em;">' +
                   (_lv.live ? 'LIVE' : 'FINAL') + '</span>'
                 : '') +
+              // Calculated FP for tonight, from the same box line, scored by
+              // this league's own settings. FXENGINE
+              (function () {
+                if (!_lv || !_lv.statMap || !row.scoring || typeof _fxScoreStatMap !== 'function') return '';
+                var res = _fxScoreStatMap(SPORT, row.scoring, _lv.statMap, _lv.pos || e.res.pos);
+                if (!res) return '';
+                return '<span class="ftx-fp" title="' + slEsc(_fxScoreTitle(res)) + '">' +
+                  (res.fp >= 0 ? '+' : '') + res.fp.toFixed(1) + ' FP</span>';
+              })() +
             '</div>';
           })() +
         '</div>' +
