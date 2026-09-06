@@ -28098,6 +28098,11 @@
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V10"/><path d="M12 20V4"/><path d="M20 20v-6"/></svg>
       <span>Games-played cap (this league)</span>
     </button>
+    <!-- FXPROBE — Fantrax scoring vs ESPN box coverage -->
+    <button class="sk-account-item" onclick="skProbeFantraxScoring(); skCloseAccountMenu();">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16v16H4z"/><path d="M4 10h16M10 4v16"/></svg>
+      <span>Probe Fantrax scoring coverage</span>
+    </button>
     <!-- PPPROBE — reads the open rink game -->
     <button class="sk-account-item" onclick="skProbeRinkStats(); skCloseAccountMenu();">
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
@@ -34214,7 +34219,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-09-06 VSLEAGUE';
+var SK_BUILD = '2026-09-06 FXPROBE';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -43282,7 +43287,7 @@ function _vbCommonOpponents(aGames, hGames) {
   return out;
 }
 
-// Rendered under LAST 3, and only when there is actually overlap — an empty
+// Rendered under LAST 7, and only when there is actually overlap — an empty
 // "Common Opponents" header is worse than no header. VBCOMMON
 function _vbCommonPanel(game, aAll, hAll, aAcc, hAcc, div) {
   var common = _vbCommonOpponents(aAll, hAll);
@@ -43317,7 +43322,11 @@ function _vbFormPanel(game, aAcc, hAcc, div) {
   if (!aRec) _vbFetchForm(game.away.id, game.league, renderCourt);
   if (!hRec) _vbFetchForm(game.home.id, game.league, renderCourt);
   var aAll = (aRec && aRec.games) || [], hAll = (hRec && hRec.games) || [];
-  var aF = aAll.slice(0, 3), hF = hAll.slice(0, 3);
+  // Seven, not three — the whole schedule is cached for the streak and
+  // common-opponent math, so this is only how much of it the panel shows.
+  // Pregame court has the room, and a week of results reads as form where
+  // three reads as noise. VBFORM7
+  var aF = aAll.slice(0, 7), hF = hAll.slice(0, 7);
   // Nothing yet, or genuinely no played games — say nothing rather than
   // render an empty frame.
   if (!aF.length && !hF.length) return '';
@@ -43366,7 +43375,7 @@ function _vbFormPanel(game, aAcc, hAcc, div) {
     return out;
   }
 
-  return '<div class="court-sect">\u25f7 LAST 3</div>' +
+  return '<div class="court-sect">\u25f7 LAST 7</div>' +   // VBFORM7
     '<div class="court-sect-body" style="border-bottom:' + div + '">' +
       '<div class="vb-form-wrap">' +
         '<div class="vb-form-side">' + head(game.away.abbr, aAcc, aRec, aStreak) +
@@ -104059,6 +104068,94 @@ function _skRenderGpBoard(league, host) {
     '<div class="sk-gpb">' + head + body + '</div>' +
     '<div class="sk-gpb-note">Coverage grows on its own: opening this league each ' +
       'day caches every team\u2019s lineup for that date.</div>';
+}
+
+// ── Fantrax scoring coverage probe ── FXPROBE ──
+// Fantrax exposes no per-player daily stats, so live FP has to be computed:
+// each rostered player's ESPN box line scored against the league's own
+// scoringItems. Whether that's worth building depends on how much of the
+// league's scoring lives in stats an ESPN box actually carries. This walks
+// every synced Fantrax points league and reports, category by category:
+// mapped to an ESPN label, derivable from the box + game state, or not in
+// the box at all — with the share of total scoring each bucket represents.
+//
+// The alias tables are the actual work of the feature; the probe is how
+// they get validated against a real league before any UI depends on them.
+var _FX_ESPN_ALIAS = {
+  NHL: {
+    // skaters — ESPN box labels
+    G: 'G', A: 'A', PTS: 'P', P: 'P', '+/-': '+/-', PM: '+/-', PIM: 'PIM',
+    SOG: 'S', SHOTS: 'S', S: 'S', HIT: 'HT', HITS: 'HT', HT: 'HT',
+    BLK: 'BS', BS: 'BS', BLOCKS: 'BS', TK: 'TK', TKA: 'TK', GV: 'GV', GVA: 'GV',
+    FW: 'FW', FOW: 'FW', FL: 'FL', FOL: 'FL', TOI: 'TOI', SHFT: 'SHFT', SHF: 'SHFT',
+    PPTOI: 'PPTOI', SHTOI: 'SHTOI',
+    // goalies — ESPN goalie box labels
+    GA: 'GA', SA: 'SA', SV: 'SV', SAVES: 'SV', 'SV%': 'SV%', SVP: 'SV%'
+  },
+  NBA: {
+    PTS: 'PTS', REB: 'REB', AST: 'AST', STL: 'STL', BLK: 'BLK', TO: 'TO', TOV: 'TO',
+    OREB: 'OREB', DREB: 'DREB', PF: 'PF', MIN: 'MIN', '+/-': '+/-',
+    // made/attempted split out of ESPN's "m-a" strings
+    '3PM': '3PT:made', '3PTM': '3PT:made', '3PA': '3PT:att', '3PTA': '3PT:att',
+    FGM: 'FG:made', FGA: 'FG:att', FTM: 'FT:made', FTA: 'FT:att'
+  }
+};
+// Derivable from the box plus game state, not read straight off a label.
+var _FX_ESPN_DERIVED = {
+  NHL: { W: 'goalie win (final + team won + started)', L: 'goalie loss', OTL: 'OT loss',
+         SO: 'shutout (GA 0, full TOI)', GAA: 'GA / TOI', GS: 'goalie start',
+         PPP: 'needs PPG+PPA — not in the skater box', GWG: 'not in the box',
+         SHP: 'not in the box', SHG: 'not in the box', SHA: 'not in the box',
+         PPG: 'not in the box', PPA: 'not in the box' },
+  NBA: { DD: 'double-double from the line', TD: 'triple-double from the line',
+         'FG%': 'FG made/att', 'FT%': 'FT made/att', '3P%': '3PT made/att' }
+};
+
+function skProbeFantraxScoring() {
+  var lines = [];
+  function say(t) { lines.push(t); }
+  var rows = (typeof extLeagues !== 'undefined' && extLeagues) ? extLeagues : [];
+  var fx = rows.filter(function (r) { return r && r.provider === 'fantrax'; });
+  if (!fx.length) { _skGpProbeShow('No Fantrax leagues synced.'); return; }
+  var anyPts = false;
+  fx.forEach(function (row) {
+    var fmt = (typeof extFormatKey === 'function') ? extFormatKey(row) : '';
+    var sport = String(row.sport || '').toUpperCase();
+    say('\u2500\u2500 ' + (row.name || row.key) + ' \u2500\u2500');
+    say('sport: ' + sport + '   format: ' + (fmt || '?'));
+    if (!row.scoring || !row.scoring.groups) { say('  (scoring not loaded yet \u2014 open the league once, then re-run)'); say(''); return; }
+    if (fmt !== 'headpoint' && fmt !== 'point') { say('  categories league \u2014 skipped (points leagues only)'); say(''); return; }
+    anyPts = true;
+    var alias = _FX_ESPN_ALIAS[sport] || {};
+    var derived = _FX_ESPN_DERIVED[sport] || {};
+    var mapped = 0, deriv = 0, missing = 0, total = 0;
+    var mList = [], dList = [], xList = [];
+    row.scoring.groups.forEach(function (g) {
+      g.cats.forEach(function (c) {
+        var code = String(c.abbr || c.name || '').toUpperCase();
+        var w = Math.abs(Number(c.pts) || 0);
+        total += w;
+        var tag = code + ' (' + (c.pts != null ? c.pts : '?') + ')';
+        if (alias[code]) { mapped += w; mList.push(tag + ' \u2192 ' + alias[code]); }
+        else if (derived[code]) {
+          if (/not in the/.test(derived[code])) { missing += w; xList.push(tag + ' \u2014 ' + derived[code]); }
+          else { deriv += w; dList.push(tag + ' \u2014 ' + derived[code]); }
+        } else { missing += w; xList.push(tag + ' \u2014 unknown code'); }
+      });
+    });
+    function pct(n) { return total ? Math.round(n / total * 100) + '%' : '\u2014'; }
+    say('  coverage by weight: mapped ' + pct(mapped) + ' \u00b7 derivable ' + pct(deriv) + ' \u00b7 not in box ' + pct(missing));
+    say('  READ STRAIGHT OFF THE BOX (' + mList.length + ')');
+    mList.forEach(function (l) { say('    ' + l); });
+    say('  DERIVABLE (' + dList.length + ')');
+    dList.forEach(function (l) { say('    ' + l); });
+    say('  NOT AVAILABLE (' + xList.length + ')');
+    xList.forEach(function (l) { say('    ' + l); });
+    say('');
+  });
+  if (!anyPts) say('(no points leagues with scoring loaded)');
+  say('Weight = |points per unit|, summed. It says which categories matter, not how often they occur.');
+  _skGpProbeShow(lines.join('\n'));
 }
 
 // ── Rink stat probe ── PPPROBE ──
