@@ -928,6 +928,35 @@
   .slh-note { padding: 8px 12px 10px; font-size: 9.5px; line-height: 1.5;
               color: rgba(255,255,255,0.3); }
 
+  /* ── Vs the League grid ── VSLEAGUE ── */
+  .sk-vsl { margin: 12px 0 0; border-radius: 12px; background: rgba(255,255,255,0.03);
+            border: 1px solid rgba(255,255,255,0.07); overflow: hidden; }
+  .sk-vsl-head { display: flex; align-items: baseline; justify-content: space-between; padding: 12px 14px 8px; }
+  .sk-vsl-title { font-family: 'Barlow Condensed', sans-serif; font-size: 11px; font-weight: 800;
+                  letter-spacing: 0.16em; color: rgba(255,255,255,0.5); }
+  .sk-vsl-rec { font-family: var(--sk-font-mono, monospace); font-size: 12px; color: rgba(255,255,255,0.5); }
+  .sk-vsl-rec b { font-size: 16px; color: var(--sk-gold, #f5c518); }
+  .sk-vsl-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .sk-vsl-tbl { border-collapse: collapse; width: 100%; min-width: 100%;
+                font-family: var(--sk-font-mono, monospace); font-size: 10px; }
+  .sk-vsl-tbl th, .sk-vsl-tbl td { padding: 6px 2px; text-align: right; white-space: nowrap; }
+  .vsl-h th { font-size: 8.5px; letter-spacing: 0.1em; color: rgba(255,255,255,0.35); font-weight: 700;
+              border-bottom: 1px solid rgba(255,255,255,0.1); }
+  .vsl-h th.today { color: var(--sk-gold, #f5c518); }
+  .vsl-t { text-align: left !important; padding-left: 12px !important; max-width: 92px;
+           overflow: hidden; text-overflow: ellipsis; color: rgba(255,255,255,0.8);
+           font-family: 'Barlow Condensed', sans-serif; font-size: 12.5px; font-weight: 700; }
+  .vsl-r { border-bottom: 1px solid rgba(255,255,255,0.05); }
+  .vsl-r.opp { background: rgba(245,197,24,0.07); }
+  .vsl-tag { margin-left: 6px; font-size: 8px; font-weight: 900; letter-spacing: 0.1em;
+             color: var(--sk-gold, #f5c518); }
+  .vsl-c.up { color: #4ade80; } .vsl-c.dn { color: #f87171; } .vsl-c.ev { color: rgba(255,255,255,0.5); }
+  .vsl-c.pend { color: rgba(255,255,255,0.2); }
+  /* TOT is the column that matters; pin it so a horizontal scroll can't hide it. */
+  .vsl-c.tot, .vsl-h th:last-child { font-weight: 800; padding-right: 10px !important; padding-left: 6px !important;
+    border-left: 1px solid rgba(255,255,255,0.08); position: sticky; right: 0; background: #0f1219; }
+  .sk-vsl-note { padding: 8px 14px 10px; font-size: 9.5px; line-height: 1.5; color: rgba(255,255,255,0.35); }
+
   /* ── Basketball performers by team/category ── NBAPERF ── */
   .nbp-team { display: flex; align-items: center; gap: 8px; padding: 12px 16px 6px; }
   .nbp-logo { width: 20px; height: 20px; object-fit: contain; }
@@ -34185,7 +34214,7 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-09-05 NBAPERF2';
+var SK_BUILD = '2026-09-06 VSLEAGUE';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -90460,11 +90489,148 @@ function skRenderFpChart() {
   }
 
   // Render the companion win-probability charts from the same data.
-  try { skRenderDailyWinProb(); } catch (eWpd) {}
+  // VSLEAGUE — the probability blocks are gone from this tab; the grid takes
+  // their place. skRenderDailyWinProb still exists for any other caller.
+  try { skRenderVsLeague(); } catch (eVsl) { try { console.error('Vs League:', eVsl); } catch (e2) {} }
   try { skRenderWeeklyWinProb(); } catch (eWpw) {}
 }
 
 // ── Daily live win-probability (points leagues) ─────────────────────
+// ── VS THE LEAGUE · THIS WEEK ── VSLEAGUE ──
+// Each cell is my daily total minus that team's. TOT is the week margin.
+// The headline is my would-be record against every team this week — the
+// number that separates a strong week from a soft opponent.
+//
+// Data: fetchTeamFpForDate per team per day. The season leaderboard already
+// calls it for every team on the days you open the league, and finalized
+// days persist in localStorage, so most cells are cached. Missing ones are
+// fetched through the same paced worker and painted as they land.
+var _vslState = { key: null, cells: {}, pending: 0 };
+
+function _vslDayLabel(dateStr) {
+  var p2 = String(dateStr).split('-');
+  if (p2.length !== 3) return dateStr;
+  var d = new Date(parseInt(p2[0], 10), parseInt(p2[1], 10) - 1, parseInt(p2[2], 10));
+  return ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][d.getDay()];
+}
+
+function _vslSum(fpMap) {
+  if (!fpMap) return null;
+  var t = 0, any = false;
+  for (var pk in fpMap) {
+    if (!fpMap.hasOwnProperty(pk)) continue;
+    var e = fpMap[pk];
+    if (e && e.fp != null && _isActiveSlot(e.selectedPos)) { t += e.fp; any = true; }
+  }
+  return any ? t : 0;
+}
+
+function skRenderVsLeague() {
+  var host = document.getElementById('skVslBody');
+  if (!host) return;
+  var lk = skState.activeLeagueKey;
+  var data = skLeagueData[lk];
+  if (!data || !data.matchup || !data.matchup.myTeamKey || !data.allTeams) {
+    host.innerHTML = '<div class="sk-fpchart-loading">Waiting for standings\u2026</div>';
+    return;
+  }
+  var myKey = data.matchup.myTeamKey, oppKey = data.matchup.oppTeamKey;
+  var anchor = (skCurrentWeeklyFp && skCurrentWeeklyFp.anchorDate) || _todayDateString();
+  var dates = _weekDaysForDate(anchor);
+  var today = _todayDateString();
+  // Only days that have happened. Future days would be all zeros dressed as
+  // ties.
+  dates = dates.filter(function (d) { return d <= today; });
+  if (!dates.length) { host.innerHTML = '<div class="sk-fpchart-loading">Week hasn\u2019t started.</div>'; return; }
+
+  var teamKeys = Object.keys(data.allTeams).filter(function (k) { return k !== myKey; });
+  var stateKey = lk + '|' + anchor;
+  if (_vslState.key !== stateKey) _vslState = { key: stateKey, cells: {}, pending: 0 };
+
+  // Kick fetches for anything not cached. fetchTeamFpForDate caches in
+  // memory + localStorage, so repeated calls are free once landed.
+  var need = [];
+  [myKey].concat(teamKeys).forEach(function (tk) {
+    dates.forEach(function (d) {
+      var ck = tk + '|' + d;
+      if (_vslState.cells[ck] !== undefined) return;
+      need.push({ tk: tk, d: d, ck: ck });
+    });
+  });
+  if (need.length) {
+    _vslState.pending += need.length;
+    var idx = 0;
+    function pump() {
+      if (idx >= need.length) return;
+      var it = need[idx++];
+      fetchTeamFpForDate(it.tk, it.d).then(function (m) {
+        _vslState.cells[it.ck] = _vslSum(m);
+      }).catch(function () {
+        _vslState.cells[it.ck] = null;
+      }).then(function () {
+        _vslState.pending--;
+        // Repaint every few cells so the grid fills visibly, and once at the end.
+        if (_vslState.pending === 0 || (_vslState.pending % 6) === 0) _vslPaint(host, dates, myKey, oppKey, teamKeys, data);
+        pump();
+      });
+    }
+    for (var w = 0; w < 3; w++) pump();   // three in flight, like the Week tab
+  }
+  _vslPaint(host, dates, myKey, oppKey, teamKeys, data);
+}
+
+function _vslPaint(host, dates, myKey, oppKey, teamKeys, data) {
+  if (!document.getElementById('skVslBody')) return;
+  var cells = _vslState.cells;
+  function my(d) { var v = cells[myKey + '|' + d]; return (v === undefined) ? undefined : v; }
+  var rows = [], wins = 0, losses = 0, ties = 0, margins = [];
+  teamKeys.forEach(function (tk) {
+    var t = data.allTeams[tk] || {};
+    var dayCells = '', tot = 0, anyDay = false, complete = true;
+    dates.forEach(function (d) {
+      var m = my(d), th = cells[tk + '|' + d];
+      if (m === undefined || th === undefined) { dayCells += '<td class="vsl-c pend">\u00b7</td>'; complete = false; return; }
+      if (m == null || th == null) { dayCells += '<td class="vsl-c pend">\u2014</td>'; complete = false; return; }
+      var diff = m - th;
+      tot += diff; anyDay = true;
+      var cls = diff > 0 ? 'up' : (diff < 0 ? 'dn' : 'ev');
+      dayCells += '<td class="vsl-c ' + cls + '">' + (diff > 0 ? '+' : '') + Math.round(diff) + '</td>';
+    });
+    var totCell;
+    if (!anyDay) totCell = '<td class="vsl-c pend">\u00b7</td>';
+    else {
+      var tcls = tot > 0 ? 'up' : (tot < 0 ? 'dn' : 'ev');
+      totCell = '<td class="vsl-c tot ' + tcls + '">' + (tot > 0 ? '+' : '') + Math.round(tot) + '</td>';
+      if (complete) { if (tot > 0) wins++; else if (tot < 0) losses++; else ties++; margins.push(tot); }
+    }
+    rows.push({ html: '<tr class="vsl-r' + (tk === oppKey ? ' opp' : '') + '">' +
+      '<td class="vsl-t">' + skEscape(t.name || tk) + (tk === oppKey ? '<span class="vsl-tag">OPP</span>' : '') + '</td>' +
+      dayCells + totCell + '</tr>', tot: anyDay ? tot : -Infinity });
+  });
+  // Best week for me at the top — the teams I'd have beaten by most.
+  rows.sort(function (a, b) { return b.tot - a.tot; });
+
+  var head = '<tr class="vsl-h"><th class="vsl-t">TEAM</th>' +
+    dates.map(function (d) { return '<th class="vsl-c' + (d === _todayDateString() ? ' today' : '') + '">' + _vslDayLabel(d) + '</th>'; }).join('') +
+    '<th class="vsl-c">TOT</th></tr>';
+  host.innerHTML = '<div class="sk-vsl-scroll"><table class="sk-vsl-tbl">' + head +
+    rows.map(function (r) { return r.html; }).join('') + '</table></div>' +
+    '<div class="sk-vsl-note">Each cell is your daily total minus theirs \u2014 green ahead, red behind. ' +
+      'TOT is the week margin. The record counts only teams with every day loaded.' +
+      (_vslState.pending > 0 ? ' Filling in\u2026' : '') + '</div>';
+
+  var rec = document.getElementById('skVslRec');
+  if (rec) {
+    var decided = wins + losses + ties;
+    if (!decided) rec.textContent = '';
+    else {
+      var avg = margins.reduce(function (a, b) { return a + b; }, 0) / margins.length;
+      rec.innerHTML = '<b>' + wins + '\u2013' + losses + (ties ? '\u2013' + ties : '') + '</b>' +
+        '<span> \u00b7 ' + (avg >= 0 ? '+' : '') + avg.toFixed(0) + ' avg</span>';
+    }
+  }
+}
+
 function skRenderDailyWinProb() {
   var wrap = document.getElementById('skWinProbDaily');
   if (!wrap) return;
@@ -93751,23 +93917,18 @@ function skBuildDetailHTML(league) {
       '    <div class="sk-fpchart-loading">Loading week…</div>' +
       '  </div>' +
       '</div>' +
-      // Live daily win-probability + intraday swing chart (points leagues).
-      // Populated by skRenderDailyWinProb from current totals + projections.
-      '<div class="sk-wpd" id="skWinProbDaily" style="display:none">' +
-      '  <div class="sk-wpd-head">' +
-      '    <div class="sk-wpd-title">TODAY · WIN PROBABILITY</div>' +
-      '    <div class="sk-wpd-pct" id="skWpdPct">—</div>' +
+      // ── VS THE LEAGUE ── VSLEAGUE ──
+      // Replaces the two win-probability blocks (the Analysis tab already
+      // owns that question). This answers a different one: was it a good
+      // week, or just a good matchup? Your daily total against every team's,
+      // with your would-be record vs the league. Filled by skRenderVsLeague
+      // from the same per-team daily FP the season leaderboard caches.
+      '<div class="sk-vsl" id="skVsLeague">' +
+      '  <div class="sk-vsl-head">' +
+      '    <div class="sk-vsl-title">VS THE LEAGUE \u00b7 THIS WEEK</div>' +
+      '    <div class="sk-vsl-rec" id="skVslRec"></div>' +
       '  </div>' +
-      '  <div class="sk-wpd-track"><div class="sk-wpd-fill" id="skWpdFill"></div></div>' +
-      '  <div class="sk-wpd-sub" id="skWpdSub"></div>' +
-      '</div>' +
-      // Weekly win-probability line — one point per day, today live.
-      '<div class="sk-wpw" id="skWinProbWeek" style="display:none">' +
-      '  <div class="sk-wpw-head">' +
-      '    <div class="sk-wpw-title">WIN PROBABILITY · BY DAY</div>' +
-      '    <div class="sk-wpw-cur" id="skWpwCur"></div>' +
-      '  </div>' +
-      '  <div class="sk-wpw-body" id="skWpwBody"></div>' +
+      '  <div class="sk-vsl-body" id="skVslBody"><div class="sk-fpchart-loading">Loading\u2026</div></div>' +
       '</div>';
     // Contributors card — empty initial shell, populated by
     // skRenderWeekContributors once teamFpCache has data.
