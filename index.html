@@ -88178,6 +88178,19 @@ function skOpenDetail(leagueKey) {
   if (typeof _skEnrichGuillotine === 'function') {
     try { _skEnrichGuillotine(_odLg); } catch (e) {}
   }
+  // The Bracket tab is gated on playoff_start_week, which lives in league
+  // settings. If those haven't been fetched yet the tab would be missing on
+  // first paint and only appear on a later open, so warm them and re-render
+  // once they land. No-op when already cached. YBRACKET
+  try {
+    if (_odLg && typeof ensureLeagueSettings === 'function' &&
+        typeof leagueSettingsCache !== 'undefined' && !leagueSettingsCache[leagueKey]) {
+      ensureLeagueSettings(leagueKey).then(function() {
+        if (skState.activeLeagueKey !== leagueKey) return;
+        try { skRenderDetail(leagueKey); } catch (e2) {}
+      })['catch'](function() {});
+    }
+  } catch (e3) {}
   // Reset to Matchup tab on every league open — preserves the muscle
   // memory of what users see today (matchup as the headline view).
   // Tab choice doesn't persist across leagues; each open is a fresh
@@ -88712,6 +88725,13 @@ async function ensureLeagueSettings(leagueKey) {
         if (s.num_playoff_consolation_teams != null && playoff.consolation == null) {
           var npc = parseInt(s.num_playoff_consolation_teams, 10);
           if (!isNaN(npc) && npc >= 0) playoff.consolation = npc;
+        }
+        // Reseeding changes what a bracket can honestly claim: with it on,
+        // Yahoo re-pairs by seed after each round, so round 2 can't be drawn
+        // from round 1's winners until the week actually resolves. YBRACKET
+        if (s.uses_playoff_reseeding != null && playoff.reseeding == null) {
+          playoff.reseeding = (s.uses_playoff_reseeding == 1 ||
+                               s.uses_playoff_reseeding === true);
         }
         // Stat categories — drives the cats stat-name lookup AND the
         // Wire mode daily cat-winner computation. We need sort_order
@@ -94393,6 +94413,9 @@ function skBuildDetailHTML(league) {
   // GPBOARD — MLB gets Cap Watch, hockey-with-a-cap gets the GP board. Both
   // live on the same tab because they answer the same question.
   if (_skHasCapTab(league)) { _validTabs.capwatch = 1; }   // GPTAB
+  // Bracket appears only once the postseason has started. YBRACKET
+  var _hasBracketTab = (typeof _ybHasBracketTab === 'function') && _ybHasBracketTab(league);
+  if (_hasBracketTab) { _validTabs.bracket = 1; }
   if (!_validTabs[activeTab]) { activeTab = 'matchup'; skState.detailTab = 'matchup'; }
   // "Analysis" tab applies to BOTH cats and points leagues:
   //   • cats:   per-category tier breakdown (locked/contested/out-of-reach)
@@ -94429,6 +94452,10 @@ function skBuildDetailHTML(league) {
       : '') +
     '<button class="sk-detail-tab' + (activeTab === 'standings' ? ' active' : '') +
       '" onclick="skSetDetailTab(\'standings\')">Standings</button>' +
+    (_hasBracketTab
+      ? '<button class="sk-detail-tab' + (activeTab === 'bracket' ? ' active' : '') +
+          '" onclick="skSetDetailTab(\'bracket\')">Bracket</button>'
+      : '') +   // YBRACKET
     (_skHasCapTab(league)
       ? '<button class="sk-detail-tab' + (activeTab === 'capwatch' ? ' active' : '') +
           '" onclick="skSetDetailTab(\'capwatch\')">' +
@@ -94543,6 +94570,15 @@ function skBuildDetailHTML(league) {
       (activeTab !== 'standings' ? ' style="display:none"' : '') + '>' +
       '<div id="skStandingsContent">' + standingsHTML + '</div>' +
     '</div>' +
+    // Playoff bracket, reconstructed from each playoff week's scoreboard.
+    // Hydrated lazily on first tab activation. YBRACKET
+    (_hasBracketTab
+      ? '<div class="sk-detail-pane" data-pane="bracket"' +
+          (activeTab !== 'bracket' ? ' style="display:none"' : '') + '>' +
+          '<div class="sk-detail-section-head"><span>Playoff Bracket</span></div>' +
+          '<div id="skYbBracketPane"><div class="slb-empty">Loading bracket\u2026</div></div>' +
+        '</div>'
+      : '') +
     // Guillotine panes — survival board, chop line (danger zone), graveyard
     // (elimination timeline). Only present for guillotine leagues.
     (_isGuil
@@ -94770,6 +94806,11 @@ function skSetDetailTab(tab) {
   // we skip the fetch; _skHydrateHistory handles its own dedup.
   if (tab === 'history') {
     _skHydrateHistory();
+  }
+  // Bracket pane: lazy-build from the playoff weeks' scoreboards. ybFetchBracket
+  // caches per league, so re-opening the tab is instant. YBRACKET
+  if (tab === 'bracket' && typeof ybLoadBracket === 'function') {
+    ybLoadBracket(skState.activeLeagueKey, 'skYbBracketPane');
   }
   // Adds pane: lazy-load the leaguewide weekly-adds board on first open.
   if (tab === 'adds') {
@@ -98005,6 +98046,17 @@ function _skParseScoreboardMatchups(data) {
       var status = mu.status || '';
       var winnerKey = mu.winner_team_key || null;
       var isTied = (mu.is_tied == 1);
+      // Playoff flags. Yahoo publishes no bracket resource, so these two
+      // booleans plus the week number are the ONLY things that distinguish a
+      // postseason matchup from a regular-season one — they're what the
+      // bracket is reconstructed from. Both can arrive on the matchup itself
+      // or nested under its '0' wrapper, same as elsewhere. YBRACKET
+      var _mIsPlayoffs = mu.is_playoffs;
+      if (_mIsPlayoffs == null && mu['0']) _mIsPlayoffs = mu['0'].is_playoffs;
+      var _mIsConsol = mu.is_consolation;
+      if (_mIsConsol == null && mu['0']) _mIsConsol = mu['0'].is_consolation;
+      var _mWeek = mu.week;
+      if (_mWeek == null && mu['0']) _mWeek = mu['0'].week;
       var tc = mu['0'] && mu['0'].teams;
       if (!tc) continue;
 
@@ -98065,10 +98117,201 @@ function _skParseScoreboardMatchups(data) {
         teams: teamsArr,
         winnerKey: winnerKey,
         isTied: isTied,
+        // YBRACKET — additive; existing readers ignore these.
+        isPlayoffs: (_mIsPlayoffs == 1 || _mIsPlayoffs === true),
+        isConsolation: (_mIsConsol == 1 || _mIsConsol === true),
+        week: (_mWeek != null ? parseInt(_mWeek, 10) : null),
       });
     }
   } catch (e) { console.warn('[scoreboard] parse error', e); }
   return out;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// YAHOO PLAYOFF BRACKET ── YBRACKET ──
+// ──────────────────────────────────────────────────────────────────
+// Yahoo publishes no bracket resource — the Fantasy API stops at
+// league/team/player with settings, standings and scoreboard as
+// subresources. But a playoff week's scoreboard IS that round of the
+// bracket: each matchup carries is_playoffs / is_consolation, settings
+// carry playoff_start_week, and standings carry the seeds. So the tree
+// is reconstructed rather than fetched.
+//
+// Rounds are derived as (week - playoff_start_week + 1). Only weeks that
+// have actually been scheduled are fetched, so later rounds appear as
+// they're played instead of being projected — which is the honest render
+// when uses_playoff_reseeding is on, since Yahoo re-pairs by seed after
+// each round and a projected round 2 would frequently be wrong.
+//
+// Output is deliberately Sleeper-shaped ({r, m, t1, t2, w, l, p}) so the
+// existing slBracketHtml renderer draws it — same columns, BYE cards and
+// connectors, no second bracket implementation to maintain. Byes fall out
+// of that renderer for free: a team appearing in round 2 with no round-1
+// match is drawn with a BYE card.
+var _ybCache = {};      // leagueKey -> { winners: [], losers: [], meta: {} }
+var _ybSideSel = {};    // leagueKey -> 'winners' | 'losers'
+var _ybInflight = {};   // leagueKey -> Promise
+
+// Playoff config for a league, or null when settings haven't landed.
+function _ybPlayoffCfg(league) {
+  if (!league || !league.league_key) return null;
+  var sc = (typeof leagueSettingsCache !== 'undefined' && leagueSettingsCache)
+    ? leagueSettingsCache[league.league_key] : null;
+  var pl = (sc && sc.playoff) || null;
+  if (!pl || !pl.startWeek) return null;
+  var end = parseInt(league.end_week, 10);
+  var cur = parseInt(league.current_week, 10);
+  if (isNaN(end) || end < pl.startWeek) end = pl.startWeek + 2;   // typical 3-week postseason
+  return {
+    startWeek: pl.startWeek,
+    endWeek: end,
+    currentWeek: isNaN(cur) ? pl.startWeek : cur,
+    numTeams: pl.numTeams || 0,
+    consolation: pl.consolation || 0,
+    reseeding: !!pl.reseeding
+  };
+}
+
+// Does this league get a Bracket tab? H2H only (season-points and roto have
+// no playoff matchups), and only once the postseason has actually begun —
+// an empty bracket tab all regular season is just clutter.
+function _ybHasBracketTab(league) {
+  if (!league) return false;
+  var st = league.scoring_type;
+  if (st !== 'head' && st !== 'headone' && st !== 'headpoint') return false;
+  if (typeof _mrIsGuillotineLeague === 'function' && _mrIsGuillotineLeague(league)) return false;
+  var cfg = _ybPlayoffCfg(league);
+  if (!cfg) return false;
+  return cfg.currentWeek >= cfg.startWeek;
+}
+
+// Fetch every scheduled playoff week and assemble both sides of the tree.
+function ybFetchBracket(leagueKey) {
+  if (_ybInflight[leagueKey]) return _ybInflight[leagueKey];
+  var league = (fyLeagues || []).find(function(l) { return l.league_key === leagueKey; });
+  var cfg = _ybPlayoffCfg(league);
+  if (!cfg) return Promise.resolve(null);
+
+  // Only weeks that exist. A future round has no matchups to report, and
+  // inventing one would be a projection dressed as a result.
+  var last = Math.min(cfg.endWeek, cfg.currentWeek);
+  var weeks = [];
+  for (var w = cfg.startWeek; w <= last; w++) weeks.push(w);
+  if (!weeks.length) return Promise.resolve(null);
+
+  var p = Promise.all(weeks.map(function(wk) {
+    return fyApi('/league/' + leagueKey + '/scoreboard;week=' + wk + ';out=matchups')
+      .then(function(res) { return { week: wk, rows: _skParseScoreboardMatchups(res) }; })
+      .catch(function() { return { week: wk, rows: [] }; });
+  })).then(function(results) {
+    var winners = [], losers = [], mid = 1;
+    results.sort(function(a, b) { return a.week - b.week; });
+    for (var i = 0; i < results.length; i++) {
+      var wkNum = results[i].week;
+      var rows = results[i].rows || [];
+      for (var j = 0; j < rows.length; j++) {
+        var m = rows[j];
+        if (!m.isPlayoffs && !m.isConsolation) continue;   // regular season
+        var t = m.teams || [];
+        if (t.length < 2) continue;
+        var winKey = m.winnerKey || null;
+        var loseKey = null;
+        if (winKey) loseKey = (String(t[0].teamKey) === String(winKey)) ? t[1].teamKey : t[0].teamKey;
+        var entry = {
+          r: (wkNum - cfg.startWeek + 1),
+          m: mid++,
+          t1: t[0].teamKey, t2: t[1].teamKey,
+          w: winKey, l: loseKey, p: null,
+          week: wkNum,
+          live: !m.complete,
+          pts1: t[0].pts, pts2: t[1].pts
+        };
+        if (m.isConsolation) losers.push(entry); else winners.push(entry);
+      }
+    }
+    // Championship label. Only claimed when the final round has exactly one
+    // championship-side match — with a 3rd-place game running the same week
+    // Yahoo gives no way to tell them apart, and guessing would put the
+    // trophy on the wrong game.
+    _ybMarkFinal(winners, 1);
+    _ybMarkFinal(losers, null);
+    var out = { winners: winners, losers: losers, meta: cfg, ts: Date.now() };
+    _ybCache[leagueKey] = out;
+    _ybInflight[leagueKey] = null;
+    return out;
+  })['catch'](function() { _ybInflight[leagueKey] = null; return null; });
+
+  _ybInflight[leagueKey] = p;
+  return p;
+}
+
+function _ybMarkFinal(list, place) {
+  if (place == null || !list || !list.length) return;
+  var maxR = 0, i;
+  for (i = 0; i < list.length; i++) if (list[i].r > maxR) maxR = list[i].r;
+  var finals = [];
+  for (i = 0; i < list.length; i++) if (list[i].r === maxR) finals.push(list[i]);
+  if (finals.length === 1) finals[0].p = place;
+}
+
+// Standings shaped the way slBracketHtml expects, so seeds and logos resolve.
+function _ybBracketRow(leagueKey) {
+  var ld = (typeof skLeagueData === 'object' && skLeagueData)
+    ? (skLeagueData[leagueKey] || {}) : {};
+  var all = ld.allTeams || {};
+  var standingsAll = [], myIds = {};
+  for (var k in all) {
+    if (!all.hasOwnProperty(k)) continue;
+    var t = all[k] || {};
+    standingsAll.push({
+      teamId: k,
+      teamName: t.name || '?',
+      avatar: t.logoUrl || '',
+      rank: parseInt(t.rank, 10) || null
+    });
+  }
+  var myKey = ld.team && ld.team.team_key;
+  if (myKey) myIds[myKey] = true;
+  return { key: leagueKey, standingsAll: standingsAll, myTeamIds: myIds };
+}
+
+function ybBracketSide(leagueKey, paneId, side) {
+  ybLoadBracket(leagueKey, paneId, side);
+}
+
+function ybLoadBracket(leagueKey, paneId, side) {
+  var pane = document.getElementById(paneId || 'skYbBracketPane');
+  if (!pane) return;
+  side = side || _ybSideSel[leagueKey] || 'winners';
+  _ybSideSel[leagueKey] = side;
+
+  function render(data) {
+    var p2 = document.getElementById(paneId || 'skYbBracketPane');
+    if (!p2) return;
+    if (!data) {
+      p2.innerHTML = '<div class="slb-empty">Playoff settings haven\'t loaded yet. ' +
+        'Reopen this league in a moment.</div>';
+      return;
+    }
+    var list = (side === 'losers') ? data.losers : data.winners;
+    var reseedNote = data.meta && data.meta.reseeding
+      ? ' This league reseeds after each round, so later rounds fill in as they\u2019re played rather than being projected.'
+      : '';
+    p2.innerHTML = slBracketHtml(_ybBracketRow(leagueKey), list || [], side,
+      paneId || 'skYbBracketPane', {
+        handler: 'ybBracketSide',
+        emptyWinners: 'No playoff matchups yet. This fills in once Yahoo posts week ' +
+          ((data.meta && data.meta.startWeek) || '?') + '.',
+        emptyLosers: 'No consolation bracket. Not every league runs one \u2014 this one is set to ' +
+          ((data.meta && data.meta.consolation) || 0) + ' consolation teams.',
+        note: 'Seeds from the standings. Rounds are built from each playoff week\u2019s scoreboard.' + reseedNote
+      });
+  }
+
+  var cached = _ybCache[leagueKey];
+  if (cached) { render(cached); return; }
+  pane.innerHTML = '<div class="slb-empty">Loading bracket\u2026</div>';
+  ybFetchBracket(leagueKey).then(render)['catch'](function() { render(null); });
 }
 
 function _skParseAllTeamScores(data) {
@@ -144330,18 +144573,23 @@ function slBracketSide(leagueKey, paneId, side) {
   if (row) slLoadBracket(row, paneId, side);
 }
 
-function slBracketHtml(row, bracket, side, paneId) {
+function slBracketHtml(row, bracket, side, paneId, opts) {
   side = side || 'winners';
+  // Provider hooks. Sleeper calls this with no opts and behaves exactly as
+  // before; Yahoo passes its own toggle handler and copy so the one renderer
+  // serves both instead of a second bracket implementation. YBRACKET
+  opts = opts || {};
+  var _fn = opts.handler || 'slBracketSide';
   var toggle = '<div class="slb-toggle">' +
-    '<button class="slb-pill' + (side === 'winners' ? ' on' : '') + '" onclick="slBracketSide(\'' + _jsStr(row.key) + '\',\'' + _jsStr(paneId || 'skExtBracketPane') + '\',\'winners\')">\ud83c\udfc6 CHAMPIONSHIP</button>' +
-    '<button class="slb-pill' + (side === 'losers' ? ' on' : '') + '" onclick="slBracketSide(\'' + _jsStr(row.key) + '\',\'' + _jsStr(paneId || 'skExtBracketPane') + '\',\'losers\')">\ud83d\udebd TOILET BOWL</button>' +
+    '<button class="slb-pill' + (side === 'winners' ? ' on' : '') + '" onclick="' + _fn + '(\'' + _jsStr(row.key) + '\',\'' + _jsStr(paneId || 'skExtBracketPane') + '\',\'winners\')">\ud83c\udfc6 CHAMPIONSHIP</button>' +
+    '<button class="slb-pill' + (side === 'losers' ? ' on' : '') + '" onclick="' + _fn + '(\'' + _jsStr(row.key) + '\',\'' + _jsStr(paneId || 'skExtBracketPane') + '\',\'losers\')">\ud83d\udebd TOILET BOWL</button>' +
   '</div>';
 
   if (!bracket || !bracket.length) {
     return toggle + '<div class="slb-empty">' +
       (side === 'losers'
-        ? 'No consolation bracket yet. Sleeper seeds it when the playoffs start; some leagues don\u2019t run one at all.'
-        : 'The playoff bracket appears here once the season reaches the playoffs and Sleeper seeds it.') +
+        ? (opts.emptyLosers || 'No consolation bracket yet. Sleeper seeds it when the playoffs start; some leagues don\u2019t run one at all.')
+        : (opts.emptyWinners || 'The playoff bracket appears here once the season reaches the playoffs and Sleeper seeds it.')) +
       '</div>';
   }
 
@@ -144473,9 +144721,9 @@ function slBracketHtml(row, bracket, side, paneId) {
 
   return toggle +
     '<div class="slb-scroll"><div class="slb-grid">' + cols + '</div></div>' +
-    '<div class="slb-note">' + (side === 'losers'
+    '<div class="slb-note">' + (opts.note || (side === 'losers'
       ? 'Consolation bracket. The bottom of it is the toilet bowl \u2014 last place decided on the field.'
-      : 'Seeds from the standings. Byes are shown where a seed skips the first round.') + '</div>';
+      : 'Seeds from the standings. Byes are shown where a seed skips the first round.')) + '</div>';
 }
 
 // Open the shared NBA/NHL player card from a Sleeper player. Sleeper's
