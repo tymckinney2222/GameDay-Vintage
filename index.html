@@ -6648,6 +6648,38 @@
     white-space: normal; overflow-wrap: anywhere; flex-shrink: 0;
     max-width: 132px; line-height: 1.25;
   }
+  /* ── Hub grouped by fantasy team ── FXHUBGRP ── */
+  .fxh-badge {
+    flex-shrink: 0; margin-left: 6px; padding: 2px 5px; border-radius: 4px;
+    border: 1px solid rgba(255,255,255,0.14); background: rgba(255,255,255,0.05);
+    font-family: var(--sk-font-mono, monospace); font-size: 7.5px;
+    letter-spacing: 0.08em; color: rgba(255,255,255,0.45);
+  }
+  .fxh-lgsub {
+    display: flex; align-items: baseline; gap: 8px; margin: 1px 0 7px;
+    font-family: var(--sk-font-mono, monospace); font-size: 9px;
+    color: rgba(255,255,255,0.35);
+  }
+  .fxh-lgcount { margin-left: auto; color: rgba(255,255,255,0.28); flex-shrink: 0; }
+  /* Category production for the whole team in this game — the cats/roto
+     equivalent of the FP headline, since those leagues have no points. */
+  .fxh-lgcats {
+    display: flex; flex-wrap: wrap; gap: 3px 10px; margin: 0 0 8px;
+    padding-bottom: 7px; border-bottom: 1px solid rgba(255,255,255,0.06);
+  }
+  .fxh-lgcat {
+    font-family: var(--sk-font-mono, monospace); font-size: 9.5px;
+    color: rgba(255,255,255,0.4);
+  }
+  .fxh-lgcat b { color: #34d399; font-weight: 700; }
+  .fxh-pname {
+    flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; font-weight: 600; color: rgba(255,255,255,0.9);
+  }
+  /* A benched player is still shown — you want to know he's yours and sitting
+     — but he contributed nothing to the total above, so he reads quieter. */
+  .crs-fhub-row.fxh-bench { opacity: 0.5; }
+
   .crs-fhub-cats { flex: 1; min-width: 0; overflow: hidden; }
   /* Fantrax categories-league stat line — the league's own categories, read
      off the same box the FP engine uses. No FP exists in a cats league, so
@@ -70941,7 +70973,7 @@ function _extFhubRowsFor(at, idx, sport) {
   if (!refs) return rows;
   for (var r = 0; r < refs.length; r++) {
     var row = refs[r].row, it = refs[r].item;
-    var fp = null, calc = false, calcTitle = '', catLine = '';
+    var fp = null, calc = false, calcTitle = '', catLine = '', _sm = null;
     if (row.provider === 'sleeper' && row._slPP) {
       // Sleeper only — its items really do carry playerId. FTXFHUBID
       var v = row._slPP[String(it.playerId || it.id || '')];
@@ -70959,9 +70991,19 @@ function _extFhubRowsFor(at, idx, sport) {
         if (!calc && typeof _fxCatStatLine === 'function') {
           catLine = _fxCatStatLine(sport, row.scoring, sm.statMap, sm.pos, sm.ctx);
         }
+        _sm = sm;
       }
     }
     rows.push({
+      // League context, so the hub can group by fantasy team instead of by
+      // player. The lg field references the synced league row — cheaper and
+      // less brittle than copying six fields, and it carries the scoring
+      // system a per-league category total needs. FXHUBGRP
+      lgKey: row.key,
+      lg: row,
+      statMap: _sm ? _sm.statMap : null,
+      statPos: _sm ? _sm.pos : '',
+      statCtx: _sm ? _sm.ctx : null,
       provider: row.provider,
       teamName: (row.standings && row.standings.teamName) || '',
       leagueName: row.name || row.key,
@@ -71158,6 +71200,137 @@ function _extUpdateFhubButton(btnId, countId, _retried) {
 }
 
 var _extFhubRetried = false;   // FTXFHUBLOAD
+// ══════════════════════════════════════════════════════════════════
+// HUB GROUPED BY FANTASY TEAM ── FXHUBGRP ──
+// ──────────────────────────────────────────────────────────────────
+// The hub is opened FROM A GAME, so the question it should answer is "what is
+// this game doing for each of my teams" — not "who here is mine". Grouping by
+// player made the second question easy and the first impossible: the FP a game
+// is worth to one league was scattered across every player card, so it could
+// never be totalled.
+//
+// This inverts player→leagues into league→players. Nothing upstream changes;
+// the collectors already carry everything needed.
+//
+// The totals are the point. A points league gets the FP this game is worth to
+// it; a categories or roto league gets the category production, aggregated
+// with the same rate-aware arithmetic the roto board uses (a team's FG% is
+// summed makes over summed attempts, never a mean of percentages).
+function _extFhubByLeague(players) {
+  var byKey = {}, order = [];
+  for (var i = 0; i < players.length; i++) {
+    var pl = players[i];
+    for (var j = 0; j < (pl.rows || []).length; j++) {
+      var fr = pl.rows[j];
+      var k = fr.lgKey || fr.leagueName || ('_' + j);
+      if (!byKey[k]) {
+        byKey[k] = {
+          key: k, lg: fr.lg || null, provider: fr.provider,
+          leagueName: fr.leagueName || '', teamName: fr.teamName || '',
+          teamLogo: fr.teamLogo || '', entries: []
+        };
+        order.push(k);
+      }
+      byKey[k].entries.push({
+        name: pl.name, pos: pl.pos, teamAbbr: pl.teamAbbr,
+        proLogo: pl.teamLogo || '', accent: pl.accent || '',
+        injury: pl.injury || '', row: fr
+      });
+    }
+  }
+
+  var out = [];
+  for (var o = 0; o < order.length; o++) {
+    var g = byKey[order[o]];
+    var lg = g.lg;
+    g.sport = String((lg && lg.sport) || '').toUpperCase();
+    g.fmt = (lg && typeof extFormatKey === 'function') ? extFormatKey(lg) : '';
+
+    // Benched players don't score, so they don't count toward the total. But
+    // only filter when the provider actually told us who's active — otherwise
+    // every row would read as benched and the total would be zero.
+    var anyFlag = false, e;
+    for (e = 0; e < g.entries.length; e++) {
+      if (g.entries[e].row.starter === true) { anyFlag = true; break; }
+    }
+    var live = [];
+    for (e = 0; e < g.entries.length; e++) {
+      if (!anyFlag || g.entries[e].row.starter === true) live.push(g.entries[e]);
+    }
+    g.activeN = live.length;
+    g.benchN = g.entries.length - live.length;
+
+    // Points: sum the FP. allCalc drives the decimal precision, same rule as
+    // the per-row figures. FXPREC
+    var tot = null, nFp = 0, nCalc = 0;
+    for (e = 0; e < live.length; e++) {
+      var fp = live[e].row.fp;
+      if (fp == null) continue;
+      tot = (tot == null ? 0 : tot) + fp;
+      nFp++;
+      if (live[e].row.calc) nCalc++;
+    }
+    g.total = (tot == null) ? null : Math.round(tot * 100) / 100;
+    g.allCalc = (nFp > 0 && nFp === nCalc);
+
+    // Categories / roto: aggregate this game's production for the league's own
+    // categories, reusing the roto board's aggregator so rates are right.
+    g.catTotals = null;
+    try {
+      if (lg && lg.scoring && typeof _fxScoringIsPoints === 'function' &&
+          !_fxScoringIsPoints(lg.scoring) && typeof _fxRotoCats === 'function' &&
+          typeof _fxRotoTeamTotals === 'function') {
+        var cats = _fxRotoCats(lg);
+        var maps = [];
+        for (e = 0; e < live.length; e++) {
+          var sm = live[e].row.statMap;
+          if (!sm) continue;
+          if (g.sport === 'NHL' && live[e].row.statCtx && typeof _fxNhlDerived === 'function') {
+            var dv = _fxNhlDerived(sm, live[e].row.statPos, live[e].row.statCtx), cp = {}, kk;
+            for (kk in sm) { if (sm.hasOwnProperty(kk)) cp[kk] = sm[kk]; }
+            for (kk in dv) { if (dv.hasOwnProperty(kk)) cp[kk] = dv[kk]; }
+            sm = cp;
+          }
+          maps.push(sm);
+        }
+        if (cats.length && maps.length) {
+          var totals = _fxRotoTeamTotals(g.sport, cats, maps);
+          var bits = [];
+          for (var c = 0; c < cats.length; c++) {
+            var v = totals[cats[c].target];
+            if (v == null) continue;
+            var rc = (_FX_RATE_CATS[g.sport] || {})[cats[c].target];
+            if (rc) {
+              var rt = Number(v).toFixed(rc.dp);
+              if (rc.strip0) rt = rt.replace(/^0/, '');
+              bits.push({ label: cats[c].label, value: rt });
+            } else if (v) {
+              bits.push({ label: cats[c].label, value: Math.round(v * 100) / 100 });
+            }
+          }
+          if (bits.length) g.catTotals = bits;
+        }
+      }
+    } catch (eCT) {}
+    out.push(g);
+  }
+
+  // Most valuable league first. A points league sorts on what the game is
+  // worth to it; leagues with no total fall back to how many of your players
+  // are in the game, which is the same question one layer coarser.
+  out.sort(function (a, b) {
+    var av = (a.total == null) ? -1e9 : a.total;
+    var bv = (b.total == null) ? -1e9 : b.total;
+    if (av !== bv) return bv - av;
+    if (a.activeN !== b.activeN) return b.activeN - a.activeN;
+    return String(a.leagueName).localeCompare(String(b.leagueName));
+  });
+  return out;
+}
+
+var _FX_FMT_BADGE = { headpoint: 'H2H PTS', point: 'SEASON PTS', head: 'H2H CATS',
+                      roto: 'ROTO', headone: 'H2H CATS' };
+
 function openExtFantasyHub() {
   var modal = document.getElementById('extFhubModal');
   var body = document.getElementById('extFhubBody');
@@ -71261,101 +71434,90 @@ function openExtFantasyHub() {
       'in this game.<br><br>Leagues that haven\u2019t drafted yet have no roster to match against.' +
       diag + '</div>';
   } else {
+    // ── Grouped by fantasy team ── FXHUBGRP ──
+    var groups = _extFhubByLeague(players);
     var html = '';
-    for (var i = 0; i < players.length; i++) {
-      var pl = players[i];
-      var totalTag = '';
-      if (pl.total != null) {
-        var tStr = (pl.total > 0 ? '+' : '') + pl.total.toFixed(1);
-        var tCol = pl.total > 0 ? '#fbbf24' : pl.total < 0 ? '#f87171' : 'rgba(255,255,255,0.4)';
-        // The headline matches the rows beneath it: two decimals only when
-        // every FP-bearing row that fed it was calculated, so a mixed
-        // Sleeper+Fantrax total doesn't claim precision it doesn't have. FXPREC
-        try {
-          var _nFp = 0, _nCalc = 0;
-          for (var _ti = 0; _ti < pl.rows.length; _ti++) {
-            if (pl.rows[_ti].fp == null) continue;
-            _nFp++;
-            if (pl.rows[_ti].calc) _nCalc++;
-          }
-          if (_nFp > 0 && _nFp === _nCalc) {
-            tStr = (pl.total > 0 ? '+' : '') + pl.total.toFixed(2);
-          }
-        } catch (eTc) {}
-        totalTag = '<span class="crs-fhub-card-total" style="color:' + tCol + '">' + tStr + ' FP</span>';
+    for (var gi = 0; gi < groups.length; gi++) {
+      var g = groups[gi];
+      var col = EXT_FHUB_PROVIDERS[g.provider] || '#888';
+
+      // Headline: what this game is worth to THIS team. Two decimals only
+      // when every figure feeding it was calculated. FXPREC
+      var headTag = '';
+      if (g.total != null) {
+        var tStr = (g.total > 0 ? '+' : '') + g.total.toFixed(g.allCalc ? 2 : 1);
+        var tCol = g.total > 0 ? '#fbbf24' : g.total < 0 ? '#f87171' : 'rgba(255,255,255,0.4)';
+        headTag = '<span class="crs-fhub-card-total" style="color:' + tCol + '">' + tStr + ' FP</span>';
       }
-      var badges = '';
-      if (pl.injury) {
-        badges += '<span class="crs-fhub-badge crs-fhub-badge-inj">' + slEsc(pl.injury) + '</span>';
-      }
-      // One dot per platform this player is rostered on.
-      var dots = '<span style="font-size:8.5px;margin-left:6px;">';
-      for (var pk in pl.provs) {
-        if (pl.provs.hasOwnProperty(pk)) {
-          dots += '<span style="color:' + (EXT_FHUB_PROVIDERS[pk] || '#888') + '">\u25cf</span>';
+
+      var badge = _FX_FMT_BADGE[g.fmt] || '';
+      var lgName = g.leagueName.length > 26 ? g.leagueName.slice(0, 25) + '\u2026' : g.leagueName;
+
+      // Category production for a cats or roto league — the equivalent of the
+      // FP headline, since those leagues have no fantasy points at all.
+      var catStrip = '';
+      if (g.catTotals) {
+        var cb = '';
+        for (var ct = 0; ct < g.catTotals.length; ct++) {
+          cb += '<span class="fxh-lgcat"><b>' + slEsc(String(g.catTotals[ct].value)) + '</b> ' +
+            slEsc(g.catTotals[ct].label) + '</span>';
         }
+        catStrip = '<div class="fxh-lgcats">' + cb + '</div>';
       }
-      dots += '</span>';
 
       var rowsHtml = '';
-      for (var j = 0; j < pl.rows.length; j++) {
-        var fr = pl.rows[j];
-        var col = EXT_FHUB_PROVIDERS[fr.provider] || '#888';
-        var label = fr.teamName || fr.leagueName || '';
-        var lname = label.length > 22 ? label.slice(0, 21) + '\u2026' : label;
+      for (var ei = 0; ei < g.entries.length; ei++) {
+        var en = g.entries[ei];
+        var fr = en.row;
         var right;
         if (fr.fp != null) {
           // Calculated rows print to two decimals so they can be checked
           // against Fantrax cent-for-cent; published rows keep one. FXPREC
           var fpStr = (fr.fp > 0 ? '+' : '') + fr.fp.toFixed(fr.calc ? 2 : 1);
-          // A calculated figure carries a small "calc" mark and a tooltip with
-          // the arithmetic — it's ours, not the platform's. FXENGINE
           // FXTIP — data-tip, not title=: a long press on Android opens text
-          // selection rather than a tooltip, so the arithmetic was unreachable
-          // on the device this actually runs on. Tap toggles it instead.
+          // selection rather than a tooltip.
           right = '<span class="crs-fhub-fp"' +
             (fr.calc ? ' data-tip="' + slEsc(fr.calcTitle || '') +
                        '" onclick="event.stopPropagation();_fxTipTap(this)"' : '') +
             ' style="color:' + (fr.fp > 0 ? col : fr.fp < 0 ? '#f87171' : 'rgba(255,255,255,0.35)') + '">' +
             fpStr + ' FP' + (fr.calc ? '<i class="ftx-calc">calc</i>' : '') + '</span>';
         } else if (fr.noFp) {
-          // A categories league has no FP at all, so the status stands alone
-          // in the FP column rather than beside it. FXACTIVE
           right = '';
         } else {
           right = '<span class="crs-fhub-fp" style="color:rgba(255,255,255,0.3)">0.0 FP</span>';
         }
-        rowsHtml += '<div class="crs-fhub-row" style="border-left:2px solid ' + col + ';padding-left:6px">' +
-          (fr.teamLogo
-            ? '<img class="crs-fhub-row-logo" src="' + fr.teamLogo + '" alt="" onerror="this.style.display=\'none\'">'
+        var benched = (fr.starter === false);
+        rowsHtml += '<div class="crs-fhub-row' + (benched ? ' fxh-bench' : '') +
+            '" style="border-left:2px solid ' + (en.accent || col) + ';padding-left:6px">' +
+          (en.proLogo
+            ? '<img class="crs-fhub-row-logo" src="' + en.proLogo + '" alt="" onerror="this.style.display=\'none\'">'
             : '<span class="crs-fhub-row-logo-ph"></span>') +
-          '<span class="crs-fhub-lname">' + slEsc(lname) +
-            (fr.slot ? '<span style="opacity:0.45"> \u00b7 ' + slEsc(fr.slot) + '</span>' : '') + '</span>' +
+          '<span class="fxh-pname">' + slEsc(en.name) +
+            (fr.slot ? '<span style="opacity:0.45"> \u00b7 ' + slEsc(fr.slot) + '</span>' : '') +
+            (en.injury ? '<span class="crs-fhub-badge crs-fhub-badge-inj">' + slEsc(en.injury) + '</span>' : '') +
+          '</span>' +
           '<span class="crs-fhub-cats">' +
-            (fr.catLine
-              // Already HTML, and every value/label inside it was escaped as
-              // it was built. FXCATS
-              ? '<span class="fx-catline">' + fr.catLine + '</span>'
-              : '') + '</span>' + right +
-          // Lineup status sits OUTSIDE the FP column so it shows on every
-          // Fantrax row. It used to live in the no-FP branch, which meant a
-          // points league — where the FP renders instead — never showed
-          // whether the player was even in the lineup. That's backwards:
-          // knowing a 4.15 came from a benched player is the whole point.
-          // FXACTIVE
+            (fr.catLine ? '<span class="fx-catline">' + fr.catLine + '</span>' : '') +
+          '</span>' + right +
           (fr.statusLabel
             ? '<span class="fx-status' + (fr.starter ? ' on' : '') + '">' +
               slEsc(fr.statusLabel) + '</span>'
             : '') +
         '</div>';
       }
-      html += '<div class="crs-fhub-card" style="--fhub-accent:' + (pl.accent || '#fbbf24') + '">' +
+
+      html += '<div class="crs-fhub-card" style="--fhub-accent:' + col + '">' +
         '<div class="crs-fhub-card-top">' +
-          (pl.teamLogo ? '<img class="crs-fhub-card-logo" src="' + pl.teamLogo + '" alt="" onerror="this.style.display=\'none\'">' : '') +
-          '<span class="crs-fhub-card-name">' + slEsc(pl.name) + '</span>' + dots + badges +
-          (pl.pos ? '<span class="crs-fhub-card-pos">' + slEsc(pl.pos) + '</span>' : '') +
-          totalTag +
-        '</div>' + rowsHtml +
+          (g.teamLogo ? '<img class="crs-fhub-card-logo" src="' + g.teamLogo + '" alt="" onerror="this.style.display=\'none\'">' : '') +
+          '<span class="crs-fhub-card-name">' + slEsc(g.teamName || lgName) + '</span>' +
+          (badge ? '<span class="fxh-badge">' + slEsc(badge) + '</span>' : '') +
+          headTag +
+        '</div>' +
+        '<div class="fxh-lgsub">' + slEsc(lgName) +
+          '<span class="fxh-lgcount">' + g.activeN + ' in this game' +
+            (g.benchN ? (' \u00b7 ' + g.benchN + ' benched') : '') + '</span>' +
+        '</div>' +
+        catStrip + rowsHtml +
       '</div>';
     }
     body.innerHTML = html +
