@@ -148452,26 +148452,82 @@ function _ftxRosterRowsHtml(row, myTeam) {
     }
   } catch (eL) {}
 
-  // Group by position, keeping the sport's natural order and putting
-  // anything unrecognised at the end rather than dropping it.
-  var groups = {}, order = [];
+  // ── Lineup status, then position ── FXROSTERSPLIT ──
+  // Fantrax DOES send a status on every roster item — ACTIVE / RESERVE /
+  // INJURED_RESERVE, confirmed by the roster probe. The note at the bottom of
+  // this pane used to say the opposite and group by position alone, which
+  // made it impossible to see which players were actually in the lineup and
+  // therefore which ones feed the daily totals.
+  //
+  // A provider that sends nothing still gets the old flat, position-only
+  // grouping: the status headers only appear when there is a status to show.
+  var FTX_STATUS_ORDER = ['ACTIVE', 'RESERVE', 'INJURED_RESERVE'];
+  var FTX_STATUS_LABEL = { ACTIVE: 'ACTIVE', RESERVE: 'RESERVE',
+                           INJURED_RESERVE: 'INJURED RESERVE', '_': 'ROSTER' };
+  var FTX_STATUS_COLOR = { ACTIVE: 'var(--sk-gold,#f5c518)',
+                           RESERVE: 'rgba(255,255,255,0.42)',
+                           INJURED_RESERVE: '#f87171', '_': 'rgba(255,255,255,0.42)' };
+
+  var byStatus = {}, statusOrder = [], anyStatus = false;
   for (i = 0; i < items.length; i++) {
-    var it = items[i] || {};
-    var res = _extRosterItemName(it, SPORT);
-    var g = _ftxPosGroup(res.pos, SPORT);
-    if (!groups[g]) { groups[g] = []; order.push(g); }
-    groups[g].push({ it: it, res: res, team: _ftxTeamOf(it, SPORT) });
+    var it0 = items[i] || {};
+    var st0 = String(it0.status || '').toUpperCase();
+    if (st0) anyStatus = true; else st0 = '_';
+    if (!byStatus[st0]) { byStatus[st0] = []; statusOrder.push(st0); }
+    byStatus[st0].push(it0);
   }
-  var known = FTX_POS_ORDER[SPORT] || [];
-  order.sort(function (a, b) {
-    var ia = known.indexOf(a), ib = known.indexOf(b);
-    if (ia < 0) ia = 99; if (ib < 0) ib = 99;
+  statusOrder.sort(function (a, b) {
+    var ia = FTX_STATUS_ORDER.indexOf(a), ib = FTX_STATUS_ORDER.indexOf(b);
+    if (ia < 0) ia = 90; if (ib < 0) ib = 90;
     return ia - ib || String(a).localeCompare(String(b));
   });
 
-  var html = '';
-  for (var oi = 0; oi < order.length; oi++) {
-    var key = order[oi], list = groups[key];
+  // Flat render plan so the existing row loop is untouched: one entry per
+  // position group, tagged with the status section it belongs to.
+  var plan = [];
+  for (var si = 0; si < statusOrder.length; si++) {
+    var sKey = statusOrder[si];
+    var sItems = byStatus[sKey];
+    // Group by position, keeping the sport's natural order and putting
+    // anything unrecognised at the end rather than dropping it.
+    var groups = {}, order = [];
+    for (i = 0; i < sItems.length; i++) {
+      var it = sItems[i] || {};
+      var res = _extRosterItemName(it, SPORT);
+      var g = _ftxPosGroup(res.pos, SPORT);
+      if (!groups[g]) { groups[g] = []; order.push(g); }
+      groups[g].push({ it: it, res: res, team: _ftxTeamOf(it, SPORT) });
+    }
+    var known = FTX_POS_ORDER[SPORT] || [];
+    order.sort(function (a, b) {
+      var ia = known.indexOf(a), ib = known.indexOf(b);
+      if (ia < 0) ia = 99; if (ib < 0) ib = 99;
+      return ia - ib || String(a).localeCompare(String(b));
+    });
+    for (var oj = 0; oj < order.length; oj++) {
+      plan.push({ status: sKey, statusCount: sItems.length,
+                  pos: order[oj], list: groups[order[oj]] });
+    }
+  }
+
+  var html = '', _prevStatus = null;
+  for (var oi = 0; oi < plan.length; oi++) {
+    var key = plan[oi].pos, list = plan[oi].list;
+    if (anyStatus && plan[oi].status !== _prevStatus) {
+      _prevStatus = plan[oi].status;
+      var _sc = FTX_STATUS_COLOR[_prevStatus] || 'rgba(255,255,255,0.42)';
+      html += '<div style="display:flex;align-items:baseline;gap:7px;margin:' +
+        (oi ? '18px' : '2px') + ' 0 2px;padding:4px 0 4px;' +
+        'border-bottom:1px solid ' + (_prevStatus === 'ACTIVE'
+          ? 'rgba(245,197,24,0.35)' : 'rgba(255,255,255,0.06)') + ';">' +
+        '<span style="font-family:\'Barlow Condensed\',sans-serif;font-size:11px;' +
+          'font-weight:800;letter-spacing:0.18em;color:' + _sc + ';">' +
+          slEsc(FTX_STATUS_LABEL[_prevStatus] || _prevStatus) + '</span>' +
+        '<span style="flex:1;"></span>' +
+        '<span style="font-family:var(--sk-font-mono,monospace);font-size:9px;' +
+          'color:rgba(255,255,255,0.3);">' + plan[oi].statusCount + '</span>' +
+      '</div>';
+    }
     html += '<div style="display:flex;align-items:baseline;gap:7px;margin:' +
       (oi ? '13px' : '4px') + ' 0 4px;padding-bottom:3px;' +
       'border-bottom:1px solid rgba(255,255,255,0.08);">' +
@@ -148580,9 +148636,13 @@ function _ftxRosterRowsHtml(row, myTeam) {
     if (!_ftxTeamOf(items[i] || {}, SPORT)) missing++;
   }
   html += '<div style="font-size:9px;line-height:1.5;color:rgba(255,255,255,0.26);margin-top:8px;">' +
-    'Grouped by position \u2014 Fantrax sends no lineup slots, so there is no ' +
-    'starters and bench split to show. Club colours and logos come from the ' +
-    'pro team Fantrax does send.' +
+    (anyStatus
+      ? 'Split by lineup status, then position. Only ACTIVE players count ' +
+        'toward the daily totals. Club colours and logos come from the pro ' +
+        'team Fantrax sends.'
+      : 'Grouped by position \u2014 this league sent no lineup status, so ' +
+        'there is no active and reserve split to show. Club colours and logos ' +
+        'come from the pro team Fantrax does send.') +
     (missing ? (' ' + missing + ' player' + (missing === 1 ? ' has' : 's have') +
       ' no club yet; that fills in when the player dictionary loads.') : '') +
     '</div>';
