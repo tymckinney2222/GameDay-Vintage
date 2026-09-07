@@ -6561,6 +6561,12 @@
     white-space: normal; overflow: hidden;
     display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
   }
+  /* Values carry the same green as a calculated FP figure so the numbers are
+     findable at a glance; labels and separators stay muted so the line reads
+     as data rather than as a wall of mono text. FXCATS */
+  .fx-catv { color: #34d399; font-weight: 700; font-style: normal; }
+  .fx-catsep { color: rgba(255,255,255,0.22); }
+  .fx-catmiss { color: rgba(255,255,255,0.32); }
   .crs-fhub-fp {
     font-family: 'Barlow Condensed', sans-serif; font-weight: 700; font-size: 11px;
     white-space: nowrap; flex-shrink: 0; letter-spacing: 0.04em;
@@ -70769,6 +70775,32 @@ function _extFhubIndex() {
   return { byId: byId, byName: byName, n: n };
 }
 
+// ── Fantrax lineup status ── FXACTIVE ──
+// Confirmed by the roster probe across two NHL leagues: every rosterItem
+// carries a status field (ACTIVE | RESERVE | INJURED_RESERVE) and a position
+// (F | D | G). Nothing named "starter" is sent, which is why every Fantrax
+// player read as bench: it.starter was always undefined.
+//
+// Returns true/false, or undefined when the item carries no status at all,
+// so a caller can tell "this player is benched" from "this provider didn't
+// say". Applies to every Fantrax league in every sport, not one league.
+function _fxItemIsActive(it) {
+  if (!it) return undefined;
+  var st = String(it.status || '').toUpperCase();
+  if (st) return st === 'ACTIVE';
+  if (it.starter === true || it.starter === false) return it.starter;
+  return undefined;
+}
+
+// Short label for the same field: what to show beside a bench row.
+function _fxItemStatusLabel(it) {
+  var st = String((it && it.status) || '').toUpperCase();
+  if (st === 'ACTIVE') return 'active';
+  if (st === 'INJURED_RESERVE') return 'IR';
+  if (st === 'RESERVE') return 'reserve';
+  return (it && it.starter) ? 'starting' : 'bench';
+}
+
 function _extFhubRowsFor(at, idx, sport) {
   var rows = [];
   if (!at || !idx || !idx.n) return rows;
@@ -70815,8 +70847,9 @@ function _extFhubRowsFor(at, idx, sport) {
       calc: calc, calcTitle: calcTitle,
       catLine: catLine,   // FXCATS
       noFp: row.provider === 'fantrax' && !calc,
-      slot: it.slot || '',
-      starter: !!it.starter,
+      slot: it.slot || it.position || '',
+      starter: _fxItemIsActive(it) === true,          // FXACTIVE
+      statusLabel: _fxItemStatusLabel(it),            // FXACTIVE
       injury: it.injury ? String(it.injury).toUpperCase() : ''
     });
   }
@@ -71164,8 +71197,12 @@ function openExtFantasyHub() {
             fpStr + ' FP' + (fr.calc ? '<i class="ftx-calc">calc</i>' : '') + '</span>';
         } else if (fr.noFp) {
           // Fantrax exposes team scores only, so this says what it knows.
-          right = '<span class="crs-fhub-fp" style="color:rgba(255,255,255,0.3);font-size:9.5px">' +
-            (fr.starter ? 'starting' : 'bench') + '</span>';
+          // Fantrax's own words, from the status field the probe found — a
+          // reserve and an IR stash are different situations and reading
+          // "bench" for both (and for actives) was simply wrong. FXACTIVE
+          right = '<span class="crs-fhub-fp" style="color:' +
+            (fr.starter ? 'rgba(52,211,153,0.75)' : 'rgba(255,255,255,0.3)') +
+            ';font-size:9.5px">' + slEsc(fr.statusLabel || (fr.starter ? 'active' : 'bench')) + '</span>';
         } else {
           right = '<span class="crs-fhub-fp" style="color:rgba(255,255,255,0.3)">0.0 FP</span>';
         }
@@ -71177,8 +71214,10 @@ function openExtFantasyHub() {
             (fr.slot ? '<span style="opacity:0.45"> \u00b7 ' + slEsc(fr.slot) + '</span>' : '') + '</span>' +
           '<span class="crs-fhub-cats">' +
             (fr.catLine
-              ? '<span class="fx-catline">' + slEsc(fr.catLine) + '</span>'
-              : '') + '</span>' + right +   // FXCATS
+              // Already HTML, and every value/label inside it was escaped as
+              // it was built. FXCATS
+              ? '<span class="fx-catline">' + fr.catLine + '</span>'
+              : '') + '</span>' + right +
         '</div>';
       }
       html += '<div class="crs-fhub-card" style="--fhub-accent:' + (pl.accent || '#fbbf24') + '">' +
@@ -105453,9 +105492,12 @@ function _fxDayTotals(sport, scoring, entries) {
 // already get this treatment; Fantrax didn't, because its settings parse
 // dropped every point-less category before anything downstream saw it.
 //
-// Returns a string like "1 G · 1 BS · 12:41 TOI", or '' when the box carries
-// none of the league's categories. Zeros are omitted so the line reads as a
-// contribution rather than a scorecard — matching the Yahoo cats stat line.
+// Returns HTML like "<b>1</b> G · <b>1</b> BS · <b>12:41</b> TOI", or '' when
+// the box carries none of the league's categories. Zeros are omitted so the
+// line reads as a contribution rather than a scorecard — matching the Yahoo
+// cats stat line. Values are wrapped so they can carry the same green as a
+// calculated FP figure, which is what makes the number findable at a glance
+// rather than buried in a run of mono text. FXCATS
 // Display label for a category. Fantrax names its categories with long codes
 // ("INDIVIDUAL_FACEOFFS_WON"), which is unreadable in a one-line stat line and
 // pushed everything after the second category off the end. The ESPN box label
@@ -105506,11 +105548,11 @@ function _fxCatStatLine(sport, scoring, statMap, pos, ctx) {
     var disp = statMap[String(target).split(':')[0]];
     if (typeof disp === 'string' && disp.indexOf(':') !== -1) {
       if (disp === '0:00') continue;
-      bits.push(disp + ' ' + label);
+      bits.push('<b class="fx-catv">' + slEsc(disp) + '</b> ' + slEsc(label));
       continue;
     }
     if (!raw) continue;                          // a zero is not a contribution
-    bits.push(raw + ' ' + label);
+    bits.push('<b class="fx-catv">' + slEsc(String(raw)) + '</b> ' + slEsc(label));
   }
   // Categories this league counts that the box couldn't answer. Named rather
   // than dropped, so a mapping gap is visible on screen instead of looking
@@ -105518,10 +105560,11 @@ function _fxCatStatLine(sport, scoring, statMap, pos, ctx) {
   // "can't map" list. FXCATS
   if (missed.length) {
     _fxCatStatLine._lastMissed = missed;
-    bits.push('unmapped: ' + missed.slice(0, 4).join(', ') +
-      (missed.length > 4 ? ' +' + (missed.length - 4) : ''));
+    bits.push('<span class="fx-catmiss">unmapped: ' +
+      slEsc(missed.slice(0, 4).join(', ')) +
+      (missed.length > 4 ? ' +' + (missed.length - 4) : '') + '</span>');
   }
-  return bits.join(' \u00b7 ');
+  return bits.join('<span class="fx-catsep"> \u00b7 </span>');
 }
 
 // Stat map for an ESPN athlete id from whichever stadium box is open.
@@ -146167,7 +146210,8 @@ function _fxLineupFill(row, bodyEl, headEl, _retried) {
       // starting. Whether Fantrax populates these is what the roster probe
       // answers; until it does, _fxStarterSet falls back to counting
       // everyone and says so. FXDAYTOT
-      slot: it.slot || it.position || '', starter: it.starter
+      slot: it.slot || it.position || '',
+      starter: _fxItemIsActive(it), status: it.status || ''   // FXACTIVE
     });
   }
   var note = '<div style="color:rgba(255,255,255,0.3);font-size:9.5px;line-height:1.6;margin-top:16px">' +
