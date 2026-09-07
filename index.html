@@ -105429,7 +105429,12 @@ var _FX_RATE_CATS = {
 
 function _fxDayTotals(sport, scoring, entries) {
   var SPORT = String(sport || '').toUpperCase();
-  if (!scoring || !scoring.groups || !entries || !entries.length) return [];
+  // No entries is a valid state, not a reason to bail: on an off day the
+  // league still has its categories and every one of them is legitimately at
+  // zero. Only a missing scoring system means there's nothing to show.
+  // FXDAYTOT
+  if (!scoring || !scoring.groups || !scoring.groups.length) return [];
+  entries = entries || [];
   var alias = _FX_ESPN_ALIAS[SPORT] || {};
   var rates = _FX_RATE_CATS[SPORT] || {};
   var sums = {};      // ESPN target -> summed number
@@ -105437,6 +105442,22 @@ function _fxDayTotals(sport, scoring, entries) {
   var order = [], seenCode = {};
 
   function addComp(name, v) { comps[name] = (comps[name] || 0) + v; }
+
+  // The category list comes from the LEAGUE, not from who happened to play —
+  // union of every group, in the league's own order. That's what lets the
+  // strip show its full set of categories at zero on an off day instead of
+  // rendering nothing and looking broken. FXDAYTOT
+  for (var gi = 0; gi < scoring.groups.length; gi++) {
+    var gcats = (scoring.groups[gi] || {}).cats || [];
+    for (var ci = 0; ci < gcats.length; ci++) {
+      var gcode = _fxCodeNorm(gcats[ci].abbr || gcats[ci].name);
+      var gtarget = alias[gcode];
+      if (!gtarget || seenCode[gtarget]) continue;
+      seenCode[gtarget] = 1;
+      order.push(gtarget);
+    }
+  }
+  if (!order.length) return [];
 
   for (var e = 0; e < entries.length; e++) {
     var en = entries[e] || {};
@@ -105456,14 +105477,12 @@ function _fxDayTotals(sport, scoring, entries) {
       var v = parseFloat(String(sm[nm] == null ? '' : sm[nm]));
       if (!isNaN(v)) addComp(nm, v);
     });
-    // The league's own categories.
-    var grp = _fxGroupFor(scoring, SPORT, en.pos);
-    if (!grp || !grp.cats) continue;
-    for (var i = 0; i < grp.cats.length; i++) {
-      var code = _fxCodeNorm(grp.cats[i].abbr || grp.cats[i].name);
-      var target = alias[code];
-      if (!target) continue;
-      if (!seenCode[target]) { seenCode[target] = 1; order.push(target); }
+    // Whatever this player contributed to any of the league's categories. A
+    // goalie's assist counts toward the team's assists, and a skater simply
+    // has no SV column, so summing every ordered target across everyone is
+    // both simpler and more correct than filtering by position group.
+    for (var i = 0; i < order.length; i++) {
+      var target = order[i];
       if (rates[target]) continue;              // recomputed below
       var raw = _fxStatValue(sm, target);
       if (raw == null) {
@@ -105481,15 +105500,20 @@ function _fxDayTotals(sport, scoring, entries) {
     var t = order[o];
     var label = _fxCatLabel(t, t);
     if (rates[t]) {
+      // A rate with no denominator is genuinely unknown, not zero — nobody
+      // has faced a shot, so there IS no save percentage. An em-dash says
+      // that; a "0.000" would be a false statement. FXDAYTOT
       var rv = rates[t].fn(comps);
-      if (rv == null) continue;
+      if (rv == null) { out.push({ label: label, value: '\u2014' }); continue; }
       var txt = rv.toFixed(rates[t].dp);
       if (rates[t].strip0) txt = txt.replace(/^0/, '');
       out.push({ label: label, value: txt });
       continue;
     }
-    if (sums[t] == null) continue;
-    var v2 = sums[t];
+    // A counting stat with nothing recorded IS zero — the category is shown
+    // at 0 rather than omitted, so the strip always displays the league's
+    // full category set.
+    var v2 = (sums[t] == null) ? 0 : sums[t];
     // A summed clock reads back as minutes, which is the useful form for a
     // day's total ice time.
     if (t === 'TOI' || t === 'PPTOI' || t === 'SHTOI' || t === 'ESTOI') {
@@ -146322,34 +146346,44 @@ function _fxLineupFill(row, bodyEl, headEl, _retried) {
     // Scoped to starters when the roster tells us who they are, and to
     // everyone when it doesn't — labelled either way, so the number is never
     // ambiguous about what it counted.
-    var _starters = [], _anyFlag = false, _de;
-    for (_de = 0; _de < _dayEntries.length; _de++) {
-      if (_dayEntries[_de].starter === true || _dayEntries[_de].starter === false) _anyFlag = true;
+    //
+    // Both of these read off the FULL ROSTER, not off who happened to play.
+    // Deriving them from today's entries meant that on a day with no games
+    // there were no entries, so the strip concluded Fantrax had sent no
+    // lineup slots and said so — a false statement about the provider on
+    // every off day. FXDAYTOT
+    var _starters = [], _anyFlag = false, _de, _rosterStarters = 0;
+    for (_de = 0; _de < players.length; _de++) {
+      if (players[_de].starter === true || players[_de].starter === false) {
+        _anyFlag = true;
+        if (players[_de].starter) _rosterStarters++;
+      }
     }
     for (_de = 0; _de < _dayEntries.length; _de++) {
       if (!_anyFlag || _dayEntries[_de].starter) _starters.push(_dayEntries[_de]);
     }
     var _totHtml = '';
     if (row.scoring && typeof _fxDayTotals === 'function') {
-      var _tots = _starters.length ? _fxDayTotals(SPORT, row.scoring, _starters) : [];
+      var _tots = _fxDayTotals(SPORT, row.scoring, _starters);
       var _cells = '';
       for (var _t = 0; _t < _tots.length; _t++) {
         _cells += '<div class="fx-daytot-cell"><div class="fx-daytot-v">' +
           slEsc(String(_tots[_t].value)) + '</div><div class="fx-daytot-l">' +
           slEsc(_tots[_t].label) + '</div></div>';
       }
-      // Rendered even with nothing to show. An empty strip on an off day says
-      // "nobody has played yet"; no strip at all is indistinguishable from the
-      // feature not existing, which is exactly how it read the first time.
+      // The category set comes from the league, so it renders at zero on an
+      // off day rather than vanishing. Only a league whose categories map to
+      // nothing at all falls through to a message.
       if (!_cells) {
         _cells = '<div class="fx-daytot-empty">' +
-          (_dayEntries.length
-            ? 'No categories from this league in today\u2019s box scores yet.'
-            : 'No starters have played yet today.') + '</div>';
+          'None of this league\u2019s categories map to an ESPN box column yet.' +
+          '</div>';
       }
       _totHtml = '<div class="fx-daytot">' +
-        '<div class="fx-daytot-head">TODAY \u00b7 ' + _starters.length +
-          (_anyFlag ? ' STARTER' : ' PLAYER') + (_starters.length === 1 ? '' : 'S') +
+        '<div class="fx-daytot-head">TODAY \u00b7 ' +
+          (_anyFlag
+            ? (_starters.length + ' OF ' + _rosterStarters + ' STARTERS PLAYING')
+            : (_starters.length + ' PLAYER' + (_starters.length === 1 ? '' : 'S'))) +
           (_anyFlag ? '' : '<span class="fx-daytot-note">all rostered \u2014 no lineup slots from Fantrax</span>') +
         '</div><div class="fx-daytot-row">' + _cells + '</div></div>';
     }
