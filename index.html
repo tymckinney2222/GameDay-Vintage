@@ -29320,6 +29320,15 @@ function _vtLogoUrl(league, abbr) {
   var slug = slugMap[league];
   if (!slug) return '';
   var a = abbr.toLowerCase();
+  // NBA has its own well-tested abbreviation map (_NBA_YAHOO_TO_ESPN), which
+  // already knows uta→utah, no→no, pho→phx, sa→sas, ny→nyk, gs→gsw and the
+  // rest. Duplicating a subset of it here is how Utah ended up requesting
+  // nba/500/uta.png — a silent 404 and a missing logo. Delegate instead.
+  // FTXABBR2
+  if (league === 'NBA' && typeof _nbaTeamLogo === 'function') {
+    var nbaUrl = _nbaTeamLogo(abbr);
+    if (nbaUrl) return nbaUrl;
+  }
   // ESPN CDN quirks: Athletics still resolve under the legacy oak file.
   // Provider abbreviations that differ from the ESPN CDN's filenames. The
   // NHL entries came from a Fantrax roster: it says SJS, TBL, LAK and NJD
@@ -123673,6 +123682,23 @@ function _pmNameVariants(name) {
   return out;
 }
 
+// Provider abbreviation -> the slug ESPN's team endpoints answer to. NBA has
+// a full tested map; NHL needs the same handful of corrections the logo
+// builder makes (Fantrax says SJS/TBL/LAK/NJD, ESPN answers to sj/tb/la/nj).
+// There is no _nhlEspnAbbr in this build — the NFL one is similarly named and
+// is a different thing. FTXROSTERID
+var _ESPN_NHL_SLUG_FIX = { sjs: 'sj', tbl: 'tb', lak: 'la', njd: 'nj',
+                           uta: 'utah', ath: 'oak' };
+function _espnTeamSlug(sportKey, abbr) {
+  var a = String(abbr || '').toLowerCase();
+  if (!a) return '';
+  if (sportKey === 'nba' && typeof _NBA_YAHOO_TO_ESPN === 'object' && _NBA_YAHOO_TO_ESPN) {
+    return _NBA_YAHOO_TO_ESPN[String(abbr).toUpperCase()] || a;
+  }
+  if (sportKey === 'nhl') return _ESPN_NHL_SLUG_FIX[a] || a;
+  return a;
+}
+
 async function _resolveEspnAthleteId(sportKey, name, teamAbbr) {
   if (!name) return null;
   var cfg = _ESPN_SPORT_CFG[sportKey];
@@ -123796,10 +123822,45 @@ async function _resolveEspnAthleteId(sportKey, name, teamAbbr) {
         }
       }
 
-      // No variant matched by name. Fall back ONLY on the literal query's
-      // candidates: a surname-only query may return a dozen unrelated people,
-      // and "first NHL player named Miller" would show someone else's season
-      // under K'Andre's name. Silently wrong is worse than blank. FTXAPOS
+      // ── Team-roster fallback ── FTXROSTERID ──
+      // ESPN's search is fuzzy and inconsistent for punctuated names — this
+      // is the third time K'Andre Miller has slipped through it. When the pro
+      // team is known, his club's roster is a DETERMINISTIC list of exactly
+      // the right few dozen people, and matching a normalized name inside it
+      // cannot pick the wrong player the way a surname search can. The same
+      // /teams/{abbr}/roster endpoint the stadium hub already uses; ESPN
+      // accepts the abbreviation in place of the numeric id.
+      if (teamAbbr) {
+        try {
+          var _slug = _espnTeamSlug(sportKey, teamAbbr);
+          var _rr = await fetch('https://site.api.espn.com/apis/site/v2/sports/' +
+            cfg.sport + '/' + cfg.slug + '/teams/' + encodeURIComponent(_slug) + '/roster');
+          if (_rr && _rr.ok) {
+            var _rd = await _rr.json();
+            var _people = [];
+            function _takeA(a2) { if (a2 && a2.id) _people.push(a2); }
+            var _grps = (_rd && _rd.athletes) || [];
+            for (var _g2 = 0; _g2 < _grps.length; _g2++) {
+              var _gg = _grps[_g2];
+              if (_gg && _gg.items) { for (var _i2 = 0; _i2 < _gg.items.length; _i2++) _takeA(_gg.items[_i2]); }
+              else _takeA(_gg);
+            }
+            for (var _p2 = 0; _p2 < _people.length; _p2++) {
+              var _nm2 = _people[_p2].displayName || _people[_p2].fullName || '';
+              if (_pmNameKey(_nm2) === pKey) {
+                var _rid = String(_people[_p2].id);
+                _espnIdCache[key] = _rid;
+                return _rid;
+              }
+            }
+          }
+        } catch (eRos) {}
+      }
+
+      // Still nothing. Fall back ONLY on the literal query's candidates: a
+      // surname-only query may return a dozen unrelated people, and "first
+      // NHL player named Miller" would show someone else's season under
+      // K'Andre's name. Silently wrong is worse than blank. FTXAPOS
       var _lc = _literalCands || [];
       var match = _lc.find(function(r) { return inSport(r); }) || _lc[0] || null;
       var id = match ? idOf(match) : null;
