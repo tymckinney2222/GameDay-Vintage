@@ -58747,6 +58747,40 @@ function renderRinkBoxScore(data, game) {
         if (isNaN(av)) av = 0;
         return gv + av;
       }
+
+      // ── Play-by-play columns ── PBPBOX ──
+      // ESPN's skater box has PPTOI and SHTOI but no PP/SH scoring, and the
+      // goalie box has no assist column at all. All of it is in the plays
+      // array, so the same index the FP engine uses fills the gap here.
+      //
+      // Columns are added only when SOMEBODY in the group has one, matching
+      // how this table already drops all-zero columns — most nights nothing
+      // is added and the table stays exactly as wide as it is now.
+      var _pbpIdx = (typeof _fxNhlPbpIndex === 'function') ? _fxNhlPbpIndex(data) : null;
+      var _isGoalieGrp = (_gRaw === -1 && _aRaw === -1);
+      function _pbpOf(ath) {
+        if (!_pbpIdx || !ath || ath.id == null) return null;
+        return _pbpIdx[String(ath.id)] || { g: 0, a: 0, ppg: 0, ppa: 0, shg: 0, sha: 0 };
+      }
+      // Candidate extra columns for this group.
+      var _xCols = [];
+      if (_pbpIdx) {
+        var _cand = _isGoalieGrp
+          ? [{ label: 'A', key: 'a' }]                    // a goalie's assist
+          : [{ label: 'PPG', key: 'ppg' }, { label: 'PPA', key: 'ppa' },
+             { label: 'SHG', key: 'shg' }, { label: 'SHA', key: 'sha' }];
+        for (var _ci = 0; _ci < _cand.length; _ci++) {
+          var _any = false;
+          for (var _ai = 0; _ai < athletes.length; _ai++) {
+            var _pv2 = _pbpOf(athletes[_ai].athlete);
+            if (_pv2 && _pv2[_cand[_ci].key] > 0) { _any = true; break; }
+          }
+          if (_any) _xCols.push(_cand[_ci]);
+        }
+      }
+      if (_xCols.length) {
+        for (var _xi = 0; _xi < _xCols.length; _xi++) labels.push(_xCols[_xi].label);
+      }
       
       var typeName = (statGroup.type || statGroup.name || 'players').toUpperCase();
       if (typeName === 'SKATING') typeName = 'SKATERS';
@@ -58779,6 +58813,13 @@ function renderRinkBoxScore(data, game) {
           var _pv = _pointsFor(stats);
           _rowCells = _rowCells.slice(0, _pInsertAt).concat([_pv != null ? _pv : '-']).concat(_rowCells.slice(_pInsertAt));
         }
+        // PBPBOX — appended in the same order as the headers above.
+        if (_xCols.length) {
+          var _rp = _pbpOf(athlete);
+          for (var _rx = 0; _rx < _xCols.length; _rx++) {
+            _rowCells.push(_rp ? _rp[_xCols[_rx].key] : '-');
+          }
+        }
         _rowCells.forEach(function(s) { html += '<td>' + (s != null ? s : '-') + '</td>'; });
         html += '</tr>';
       });
@@ -58791,6 +58832,19 @@ function renderRinkBoxScore(data, game) {
         if (_pInsertAt !== -1) {
           var _tp = _pointsFor(totals);
           filteredTotals = filteredTotals.slice(0, _pInsertAt).concat([_tp != null ? _tp : '-']).concat(filteredTotals.slice(_pInsertAt));
+        }
+        // PBPBOX — team totals for the derived columns, summed across the
+        // group's own athletes rather than read from ESPN (which never sent
+        // these columns in the first place).
+        if (_xCols.length) {
+          for (var _tx = 0; _tx < _xCols.length; _tx++) {
+            var _sum = 0;
+            for (var _ti2 = 0; _ti2 < athletes.length; _ti2++) {
+              var _tv = _pbpOf(athletes[_ti2].athlete);
+              if (_tv) _sum += (_tv[_xCols[_tx].key] || 0);
+            }
+            filteredTotals.push(_sum);
+          }
         }
         html += '<tr class="gym-bx-totals"><td>TOTALS</td>';
         filteredTotals.forEach(function(t) { html += '<td>' + (t || '-') + '</td>'; });
@@ -105075,12 +105129,25 @@ function _fxScoreStatMap(sport, scoring, statMap, pos, ctx) {
 // Returns null when there is no plays array (pre-game, or a summary that
 // hasn't filled in) so those categories keep reading "no data" rather than
 // being reported as a false zero.
-function _fxNhlPbpFor(summary, athleteId) {
-  if (!summary || !athleteId) return null;
+// Whole-game index: athleteId -> { g, a, ppg, ppa, shg, sha }. Built once and
+// cached on the summary object, because the per-player walk was O(plays) per
+// lookup — fine for two hub cards, wasteful for a 40-skater box score. Returns
+// null when there is no plays array, which callers treat as "no data" rather
+// than as zeros. FXPBP
+function _fxNhlPbpIndex(summary) {
+  if (!summary) return null;
+  // Keyed on play count so a live game that gains plays rebuilds rather than
+  // serving a stale index.
+  var _n = (summary.plays && summary.plays.length) || 0;
+  if (summary._fxPbpIdx !== undefined && summary._fxPbpN === _n) return summary._fxPbpIdx;
   var plays = summary.plays;
-  if (!plays || !plays.length) return null;
-  var id = String(athleteId);
-  var out = { g: 0, a: 0, ppg: 0, ppa: 0, shg: 0, sha: 0 };
+  if (!plays || !plays.length) { summary._fxPbpIdx = null; summary._fxPbpN = _n; return null; }
+  var idx = {};
+  function bucket(id) {
+    var k = String(id);
+    if (!idx[k]) idx[k] = { g: 0, a: 0, ppg: 0, ppa: 0, shg: 0, sha: 0 };
+    return idx[k];
+  }
   for (var i = 0; i < plays.length; i++) {
     var pl = plays[i];
     if (!pl || pl.scoringPlay !== true) continue;
@@ -105096,16 +105163,29 @@ function _fxNhlPbpFor(summary, athleteId) {
     var parts = pl.participants || [];
     for (var q = 0; q < parts.length; q++) {
       var ath = parts[q] && parts[q].athlete;
-      if (!ath || String(ath.id) !== id) continue;
+      if (!ath || ath.id == null) continue;
       var ty = String(parts[q].type || '').toLowerCase();
       if (ty === 'scorer') {
-        out.g++; if (isPP) out.ppg++; else if (isSH) out.shg++;
+        var bs = bucket(ath.id);
+        bs.g++; if (isPP) bs.ppg++; else if (isSH) bs.shg++;
       } else if (ty === 'assister') {
-        out.a++; if (isPP) out.ppa++; else if (isSH) out.sha++;
+        var ba = bucket(ath.id);
+        ba.a++; if (isPP) ba.ppa++; else if (isSH) ba.sha++;
       }
     }
   }
-  return out;
+  summary._fxPbpIdx = idx;
+  summary._fxPbpN = _n;
+  return idx;
+}
+
+function _fxNhlPbpFor(summary, athleteId) {
+  if (!athleteId) return null;
+  var idx = _fxNhlPbpIndex(summary);
+  if (!idx) return null;
+  // Present in the index means he figured in a scoring play; absent means he
+  // didn't, which IS zero — the plays array is complete for the game.
+  return idx[String(athleteId)] || { g: 0, a: 0, ppg: 0, ppa: 0, shg: 0, sha: 0 };
 }
 
 // Goalie-decision context for ONE team out of an ESPN summary. FXGOALIE
