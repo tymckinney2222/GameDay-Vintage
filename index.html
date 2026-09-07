@@ -928,6 +928,32 @@
   .slh-note { padding: 8px 12px 10px; font-size: 9.5px; line-height: 1.5;
               color: rgba(255,255,255,0.3); }
 
+  /* ── Today's category totals ── FXDAYTOT ── */
+  .fx-daytot {
+    background: rgba(52,211,153,0.06); border: 1px solid rgba(52,211,153,0.18);
+    border-radius: 9px; padding: 8px 10px 9px; margin: 0 0 10px;
+  }
+  .fx-daytot-head {
+    font-family: 'Barlow Condensed', sans-serif; font-size: 9px; font-weight: 800;
+    letter-spacing: 0.14em; color: #34d399; margin-bottom: 7px;
+  }
+  .fx-daytot-note {
+    float: right; font-weight: 600; letter-spacing: 0.04em;
+    color: rgba(255,255,255,0.3); text-transform: none;
+  }
+  .fx-daytot-row {
+    display: flex; flex-wrap: wrap; gap: 4px 14px;
+  }
+  .fx-daytot-cell { min-width: 34px; }
+  .fx-daytot-v {
+    font-family: var(--sk-font-mono, monospace); font-size: 13px;
+    font-weight: 700; color: #fff; line-height: 1.15;
+  }
+  .fx-daytot-l {
+    font-family: var(--sk-font-mono, monospace); font-size: 8px;
+    letter-spacing: 0.06em; color: rgba(255,255,255,0.4);
+  }
+
   /* ── Fantrax calculated FP ── FXENGINE ── */
   .ftx-fp { margin-left: 6px; font-family: var(--sk-font-mono, monospace); font-size: 9.5px;
             font-weight: 800; color: #34d399; letter-spacing: 0.02em; }
@@ -28140,6 +28166,11 @@
     <button class="sk-account-item" onclick="skOpenGpCapSheet(); skCloseAccountMenu();">
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V10"/><path d="M12 20V4"/><path d="M20 20v-6"/></svg>
       <span>Games-played cap (this league)</span>
+    </button>
+    <!-- FXROSTERPROBE — what a Fantrax roster item actually carries -->
+    <button class="sk-account-item" onclick="skProbeFantraxRoster(); skCloseAccountMenu();">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>
+      <span>Probe Fantrax roster items</span>
     </button>
     <!-- FXPROBE — Fantrax scoring vs ESPN box coverage -->
     <button class="sk-account-item" onclick="skProbeFantraxScoring(); skCloseAccountMenu();">
@@ -104942,6 +104973,10 @@ var _FX_ESPN_ALIAS = {
     GOALIE_LOSSES: '_L', LOSSES: '_L', L: '_L',
     OVERTIME_LOSSES: '_OTL', OTL: '_OTL', OT_LOSSES: '_OTL',
     SHUTOUTS: '_SO', SHUTOUT: '_SO', SHO: '_SO',
+    // GAA is a RATE, not a box column — ESPN sends GA and TOI and leaves the
+    // arithmetic to you. Both inputs are right there in the goalie line, so
+    // it's computed rather than reported as unmappable. FXGAA
+    GOALS_AGAINST_AVERAGE: '_GAA', GAA: '_GAA',
     // Derived from play-by-play. No box score carries the strength split, but
     // every ESPN play does. FXPBP
     POWER_PLAY_GOALS: '_PPG', POWER_PLAY_ASSISTS: '_PPA', POWER_PLAY_POINTS: '_PPP',
@@ -105029,6 +105064,17 @@ function _fxIsGoaliePos(pos) { return /^G$/i.test(String(pos || '').trim()); }
 // keys stay absent and the category continues to read as unscored.
 //
 // ctx: { final, ot, won, goalieCount } for the goalie's OWN team.
+// "59:41" -> 59.683 minutes. Returns null for anything that isn't a clock,
+// so a caller can tell "no time played" from "not a time value". FXGAA
+function _fxClockMinutes(v) {
+  var s = String(v == null ? '' : v).trim();
+  if (s.indexOf(':') === -1) return null;
+  var p = s.split(':');
+  var m = parseFloat(p[0]), sec = parseFloat(p[1]);
+  if (isNaN(m) || isNaN(sec)) return null;
+  return m + (sec / 60);
+}
+
 function _fxNhlDerived(statMap, pos, ctx) {
   var out = {};
   if (!ctx || !statMap) return out;
@@ -105052,6 +105098,16 @@ function _fxNhlDerived(statMap, pos, ctx) {
   // ── Goalie decision ── FXGOALIE ── final games only.
   if (!ctx.final) return out;
   if (!_fxIsGoaliePos(pos)) return out;
+
+  // GAA — pure arithmetic on this goalie's own line, so it does NOT depend on
+  // the sole-goalie check below. A reliever who allowed 2 in 20 minutes has a
+  // real GAA even though the decision isn't his. FXGAA
+  var _gaN = parseFloat(String(statMap.GA == null ? '' : statMap.GA));
+  var _mins = _fxClockMinutes(statMap.TOI);
+  if (!isNaN(_gaN) && _mins != null && _mins > 0) {
+    out._GAA = Math.round((_gaN * 60 / _mins) * 100) / 100;
+  }
+
   if (ctx.goalieCount !== 1) return out;   // can't attribute the decision
   if (ctx.won) { out._W = 1; out._L = 0; out._OTL = 0; }
   else if (ctx.ot) { out._W = 0; out._L = 0; out._OTL = 1; }
@@ -105289,6 +105345,105 @@ function _fxNhlCtxFor(summary, teamId, stateHint, detailHint, athleteId) {
   } catch (e) { return null; }
 }
 
+// ── Daily category totals ── FXDAYTOT ──
+// Sums today's stats across a roster for the categories THIS league counts.
+//
+// The part that matters: rate categories must not be averaged from per-player
+// rates. A goalie with a 1.00 GAA over 60 minutes and one with a 6.00 GAA over
+// 10 minutes do not average to 3.50 — the team's GAA is total goals against
+// over total minutes, and the same holds for SV% and FO%. So counting stats
+// are summed, and every rate is recomputed from its own summed components.
+//
+// entries: [{ statMap, pos, ctx }]. Returns [{ label, value }] in the
+// league's own category order, or [] when nothing applies.
+var _FX_RATE_CATS = {
+  NHL: {
+    '_GAA': { parts: ['GA', 'TOI'], fn: function (n) {
+      return (n.TOI > 0) ? (n.GA * 60 / n.TOI) : null; }, dp: 2 },
+    'SV%':  { parts: ['SV', 'SA'],  fn: function (n) {
+      return (n.SA > 0) ? (n.SV / n.SA) : null; }, dp: 3, strip0: true },
+    'FO%':  { parts: ['FW', 'FL'],  fn: function (n) {
+      return ((n.FW + n.FL) > 0) ? (n.FW / (n.FW + n.FL) * 100) : null; }, dp: 1 }
+  },
+  NBA: {
+    'FG:made': null, 'FT:made': null, '3PT:made': null
+  }
+};
+
+function _fxDayTotals(sport, scoring, entries) {
+  var SPORT = String(sport || '').toUpperCase();
+  if (!scoring || !scoring.groups || !entries || !entries.length) return [];
+  var alias = _FX_ESPN_ALIAS[SPORT] || {};
+  var rates = _FX_RATE_CATS[SPORT] || {};
+  var sums = {};      // ESPN target -> summed number
+  var comps = {};     // raw component sums used by the rate formulas
+  var order = [], seenCode = {};
+
+  function addComp(name, v) { comps[name] = (comps[name] || 0) + v; }
+
+  for (var e = 0; e < entries.length; e++) {
+    var en = entries[e] || {};
+    var sm = en.statMap;
+    if (!sm) continue;
+    if (SPORT === 'NHL' && en.ctx && typeof _fxNhlDerived === 'function') {
+      var d = _fxNhlDerived(sm, en.pos, en.ctx), c2 = {}, kk;
+      for (kk in sm) { if (sm.hasOwnProperty(kk)) c2[kk] = sm[kk]; }
+      for (kk in d) { if (d.hasOwnProperty(kk)) c2[kk] = d[kk]; }
+      sm = c2;
+    }
+    // Components for the rate formulas, always, whether or not the league
+    // counts them as categories of their own.
+    var mins = _fxClockMinutes(sm.TOI);
+    if (mins != null) addComp('TOI', mins);
+    ['GA', 'SV', 'SA', 'FW', 'FL'].forEach(function (nm) {
+      var v = parseFloat(String(sm[nm] == null ? '' : sm[nm]));
+      if (!isNaN(v)) addComp(nm, v);
+    });
+    // The league's own categories.
+    var grp = _fxGroupFor(scoring, SPORT, en.pos);
+    if (!grp || !grp.cats) continue;
+    for (var i = 0; i < grp.cats.length; i++) {
+      var code = _fxCodeNorm(grp.cats[i].abbr || grp.cats[i].name);
+      var target = alias[code];
+      if (!target) continue;
+      if (!seenCode[target]) { seenCode[target] = 1; order.push(target); }
+      if (rates[target]) continue;              // recomputed below
+      var raw = _fxStatValue(sm, target);
+      if (raw == null) {
+        // Clock categories sum as time, not as a number.
+        var cm = _fxClockMinutes(sm[String(target).split(':')[0]]);
+        if (cm != null) sums[target] = (sums[target] || 0) + cm;
+        continue;
+      }
+      sums[target] = (sums[target] || 0) + raw;
+    }
+  }
+
+  var out = [];
+  for (var o = 0; o < order.length; o++) {
+    var t = order[o];
+    var label = _fxCatLabel(t, t);
+    if (rates[t]) {
+      var rv = rates[t].fn(comps);
+      if (rv == null) continue;
+      var txt = rv.toFixed(rates[t].dp);
+      if (rates[t].strip0) txt = txt.replace(/^0/, '');
+      out.push({ label: label, value: txt });
+      continue;
+    }
+    if (sums[t] == null) continue;
+    var v2 = sums[t];
+    // A summed clock reads back as minutes, which is the useful form for a
+    // day's total ice time.
+    if (t === 'TOI' || t === 'PPTOI' || t === 'SHTOI' || t === 'ESTOI') {
+      out.push({ label: label, value: Math.round(v2) + 'm' });
+      continue;
+    }
+    out.push({ label: label, value: (Math.round(v2 * 100) / 100) });
+  }
+  return out;
+}
+
 // ── Category stat line ── FXCATS ──
 // A Fantrax categories league has no fantasy points to compute — the
 // categories ARE the scoring. But the same alias table that maps a category
@@ -105311,7 +105466,7 @@ function _fxNhlCtxFor(summary, teamId, stateHint, detailHint, athleteId) {
 var _FX_CAT_LABEL = {
   '_W': 'W', '_L': 'L', '_OTL': 'OTL', '_SO': 'SHO',
   '_PPG': 'PPG', '_PPA': 'PPA', '_PPP': 'PPP',
-  '_SHG': 'SHG', '_SHA': 'SHA', '_SHP': 'SHP',
+  '_SHG': 'SHG', '_SHA': 'SHA', '_SHP': 'SHP', '_GAA': 'GAA',
   '3PT:made': '3PM', '3PT:att': '3PA', 'FG:made': 'FGM', 'FG:att': 'FGA',
   'FT:made': 'FTM', 'FT:att': 'FTA'
 };
@@ -105414,6 +105569,72 @@ function _fxScoreTitle(res) {
   if (res.unscored && res.unscored.length) t += ' \u00b7 can\u2019t map: ' + res.unscored.join(', ');
   if (res.nodata && res.nodata.length) t += ' \u00b7 no data: ' + res.nodata.join(', ');
   return t;
+}
+
+// ── Fantrax roster item probe ── FXROSTERPROBE ──
+// The hub reads it.starter and it.slot, and both come straight off Fantrax's
+// rosterItems with no parsing — which means if Fantrax names them something
+// else, every player reads as "bench" and no summary can be scoped to the
+// players who are actually starting. Rather than guess at the field name,
+// this dumps every key on a real roster item with a sample value, plus a
+// count of distinct values per key so a status/slot field is obvious.
+function skProbeFantraxRoster() {
+  var lines = [];
+  function say(t) { lines.push(t); }
+  var rows = (typeof extLeagues !== 'undefined' && extLeagues) ? extLeagues : [];
+  var fx = rows.filter(function (r) { return r && r.provider === 'fantrax'; });
+  if (!fx.length) { _skGpProbeShow('No Fantrax leagues synced.'); return; }
+  var shown = 0;
+  fx.forEach(function (row) {
+    if (shown >= 2) return;
+    say('\u2500\u2500 ' + (row.name || row.key) + ' \u2500\u2500');
+    if (!row.rosters || !row.rosters.byTeam) {
+      say('  (rosters not loaded \u2014 open the league once, then re-run)'); say(''); return;
+    }
+    var myIds = row.myTeamIds || (typeof _fxMyTeamIds === 'function' ? _fxMyTeamIds(row.raw || {}) : {});
+    var teamKey = null, k;
+    for (k in row.rosters.byTeam) {
+      if (row.rosters.byTeam.hasOwnProperty(k) && myIds[k]) { teamKey = k; break; }
+    }
+    if (!teamKey) { for (k in row.rosters.byTeam) { teamKey = k; break; } }
+    var items = ((row.rosters.byTeam[teamKey] || {}).items) || [];
+    say('team: ' + teamKey + '   items: ' + items.length +
+        '   period: ' + (row.rosters.period != null ? row.rosters.period : '?'));
+    if (!items.length) { say(''); return; }
+    shown++;
+
+    // Key inventory with distinct values — a status or slot field shows up as
+    // a small set of repeated strings, which is exactly what we're hunting.
+    var keys = {}, vals = {};
+    for (var i = 0; i < items.length; i++) {
+      for (var kk in items[i]) {
+        if (!items[i].hasOwnProperty(kk)) continue;
+        keys[kk] = (keys[kk] || 0) + 1;
+        var v = items[i][kk];
+        if (v && typeof v === 'object') v = JSON.stringify(v).slice(0, 80);
+        var sv = String(v);
+        if (!vals[kk]) vals[kk] = {};
+        if (Object.keys(vals[kk]).length < 12) vals[kk][sv] = (vals[kk][sv] || 0) + 1;
+      }
+    }
+    say('');
+    say('  keys (count) \u2192 distinct values seen');
+    for (var k2 in keys) {
+      if (!keys.hasOwnProperty(k2)) continue;
+      var dv = [];
+      for (var vv in vals[k2]) { if (vals[k2].hasOwnProperty(vv)) dv.push(vv + '\u00d7' + vals[k2][vv]); }
+      say('    ' + k2 + ' (' + keys[k2] + ')  ' + dv.slice(0, 10).join(' | '));
+    }
+    say('');
+    say('  first three items in full:');
+    for (var q = 0; q < items.length && q < 3; q++) {
+      say('    ' + JSON.stringify(items[q]).slice(0, 400));
+    }
+    say('');
+  });
+  say('Looking for: whichever key separates active slots (F/D/G) from a');
+  say('reserve or bench value. That is what scopes a daily total to starters.');
+  _skGpProbeShow(lines.join('\n'));
 }
 
 function skProbeFantraxScoring() {
@@ -145941,7 +146162,12 @@ function _fxLineupFill(row, bodyEl, headEl, _retried) {
       // res.team resolves through the player dictionary; it.team alone is
       // usually empty, which is why the modal had no clubs at all. FTXSTATS
       name: res.name, pos: res.pos,
-      team: res.team || it.team || '', teamAbbr: res.team || it.team || ''
+      team: res.team || it.team || '', teamAbbr: res.team || it.team || '',
+      // Carried so the daily summary can be scoped to who's actually
+      // starting. Whether Fantrax populates these is what the roster probe
+      // answers; until it does, _fxStarterSet falls back to counting
+      // everyone and says so. FXDAYTOT
+      slot: it.slot || it.position || '', starter: it.starter
     });
   }
   var note = '<div style="color:rgba(255,255,255,0.3);font-size:9.5px;line-height:1.6;margin-top:16px">' +
@@ -145982,7 +146208,7 @@ function _fxLineupFill(row, bodyEl, headEl, _retried) {
     var entry = both[0];
     if (_extLineupOpenKey !== row.key) return;
     var by = (entry && entry.byPlayerKey) || {};
-    var out = '', hit = 0, liveHit = 0;
+    var out = '', hit = 0, liveHit = 0, _dayEntries = [];   // FXDAYTOT
     for (var p = 0; p < players.length; p++) {
       var line = by[players[p].playerKey];
       if (line) hit++;
@@ -145999,7 +146225,15 @@ function _fxLineupFill(row, bodyEl, headEl, _retried) {
       var _fLine = (line && typeof _formatEspnSeasonLine === 'function')
         ? _formatEspnSeasonLine(sportKey, line, players[p].pos) : '';
       var _shown = _lv ? _lv.line : _fLine;
-      if (_lv) liveHit++;
+      if (_lv) {
+        liveHit++;
+        // FXDAYTOT — one entry per player with a line today.
+        if (_lv.statMap) {
+          _dayEntries.push({ statMap: _lv.statMap, pos: _lv.pos || players[p].pos,
+                             ctx: _lv.ctx, starter: players[p].starter,
+                             slot: players[p].slot });
+        }
+      }
       out += _extLineupRowHtml(_ftxDisplayName(players[p].name), players[p].pos,
         (_shown ? _skSeasonLineHtml(_shown) : '') +
         (_lv
@@ -146022,11 +146256,39 @@ function _fxLineupFill(row, bodyEl, headEl, _retried) {
         null, '#34d399', false,
         _ftxClubChip(players[p].teamAbbr, SPORT));
     }
+    // ── Today's totals ── FXDAYTOT ──
+    // Scoped to starters when the roster tells us who they are, and to
+    // everyone when it doesn't — labelled either way, so the number is never
+    // ambiguous about what it counted.
+    var _starters = [], _anyFlag = false, _de;
+    for (_de = 0; _de < _dayEntries.length; _de++) {
+      if (_dayEntries[_de].starter === true || _dayEntries[_de].starter === false) _anyFlag = true;
+    }
+    for (_de = 0; _de < _dayEntries.length; _de++) {
+      if (!_anyFlag || _dayEntries[_de].starter) _starters.push(_dayEntries[_de]);
+    }
+    var _totHtml = '';
+    if (_starters.length && row.scoring && typeof _fxDayTotals === 'function') {
+      var _tots = _fxDayTotals(SPORT, row.scoring, _starters);
+      if (_tots.length) {
+        var _cells = '';
+        for (var _t = 0; _t < _tots.length; _t++) {
+          _cells += '<div class="fx-daytot-cell"><div class="fx-daytot-v">' +
+            slEsc(String(_tots[_t].value)) + '</div><div class="fx-daytot-l">' +
+            slEsc(_tots[_t].label) + '</div></div>';
+        }
+        _totHtml = '<div class="fx-daytot">' +
+          '<div class="fx-daytot-head">TODAY \u00b7 ' + _starters.length +
+            (_anyFlag ? ' STARTER' : ' PLAYER') + (_starters.length === 1 ? '' : 'S') +
+            (_anyFlag ? '' : '<span class="fx-daytot-note">all rostered \u2014 no lineup slots from Fantrax</span>') +
+          '</div><div class="fx-daytot-row">' + _cells + '</div></div>';
+      }
+    }
     bodyEl.innerHTML =
       '<div style="color:rgba(255,255,255,0.42);font-size:10px;letter-spacing:0.12em;margin-bottom:4px">ROSTER \u00b7 ' +
       players.length + '<span style="float:right">' +
       (liveHit ? (liveHit + ' PLAYING TODAY') : (hit + ' WITH ESPN STATS')) +
-      '</span></div>' + out + note;
+      '</span></div>' + _totHtml + out + note;
   }).catch(function() {
     if (_extLineupOpenKey !== row.key) return;
     bodyEl.innerHTML = '<div style="color:#f87171;font-size:12px">Couldn\u2019t load ESPN stats. Close and reopen to retry.</div>';
