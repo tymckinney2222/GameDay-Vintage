@@ -928,6 +928,37 @@
   .slh-note { padding: 8px 12px 10px; font-size: 9.5px; line-height: 1.5;
               color: rgba(255,255,255,0.3); }
 
+  /* ── Roto board ── FXROTO2 ── */
+  .fxr-check {
+    font-family: var(--sk-font-mono, monospace); font-size: 10px; line-height: 1.5;
+    color: rgba(255,255,255,0.45); background: rgba(248,113,113,0.07);
+    border: 1px solid rgba(248,113,113,0.22); border-radius: 8px;
+    padding: 7px 9px; margin: 2px 0 10px;
+  }
+  .fxr-check.ok { background: rgba(52,211,153,0.07); border-color: rgba(52,211,153,0.25); }
+  .fxr-check b { color: #fff; font-weight: 700; }
+  .fxr-head, .fxr-row {
+    display: flex; align-items: center; gap: 6px;
+    padding: 6px 2px; border-bottom: 1px solid rgba(255,255,255,0.05);
+    font-family: var(--sk-font-mono, monospace); font-size: 11px;
+  }
+  .fxr-head {
+    font-size: 8.5px; letter-spacing: 0.12em; color: rgba(255,255,255,0.3);
+    border-bottom-color: rgba(255,255,255,0.12);
+  }
+  .fxr-cat { flex: 0 0 54px; color: rgba(255,255,255,0.75); font-weight: 700; }
+  .fxr-cat i { font-style: normal; color: rgba(255,255,255,0.3); margin-left: 2px; }
+  .fxr-val { flex: 0 0 62px; text-align: right; color: #fff; }
+  .fxr-rank { flex: 0 0 46px; text-align: right; color: var(--sk-gold, #f5c518); font-weight: 700; }
+  .fxr-rank em { font-style: normal; font-size: 8.5px; color: rgba(255,255,255,0.3); }
+  .fxr-pts { flex: 0 0 38px; text-align: right; color: #34d399; font-weight: 700; }
+  .fxr-gap { flex: 1; min-width: 0; text-align: right; font-size: 9.5px; }
+  .fxr-gap .up { color: rgba(52,211,153,0.8); margin-left: 7px; }
+  .fxr-gap .dn { color: rgba(248,113,113,0.75); margin-left: 7px; }
+  .fxr-note {
+    font-size: 9px; line-height: 1.55; color: rgba(255,255,255,0.28); margin-top: 10px;
+  }
+
   /* ── Today's category totals ── FXDAYTOT ── */
   .fx-daytot {
     background: rgba(52,211,153,0.06); border: 1px solid rgba(52,211,153,0.18);
@@ -105216,18 +105247,39 @@ function _fxGroupFor(scoring, sport, pos) {
   return scoring.groups[0];
 }
 
+// A "FG:made" target splits an "11-20" box cell. ESPN's SEASON overview
+// doesn't use that form though — it sends FGM and FGA as their own labels —
+// so a split target that finds no combined cell falls back to the direct one.
+// Without this every made/attempted category reads zero on season stats,
+// which is exactly what the roto board consumes. FXSPLITFB
+var _FX_SPLIT_FALLBACK = {
+  'FG:made': 'FGM', 'FG:att': 'FGA',
+  'FT:made': 'FTM', 'FT:att': 'FTA',
+  '3PT:made': '3PM', '3PT:att': '3PA'
+};
+
 // Read one alias target out of a stat map. "FG:made" splits an "11-20".
 function _fxStatValue(statMap, target) {
   if (!statMap) return null;
   var parts = String(target).split(':');
   var raw = statMap[parts[0]];
-  if (raw == null || raw === '') return null;
   if (parts[1]) {
-    var ma = String(raw).split('-');
-    if (ma.length < 2) return null;
-    var v = parseFloat(parts[1] === 'made' ? ma[0] : ma[1]);
-    return isNaN(v) ? null : v;
+    if (raw != null && raw !== '') {
+      var ma = String(raw).split('-');
+      if (ma.length >= 2) {
+        var v = parseFloat(parts[1] === 'made' ? ma[0] : ma[1]);
+        if (!isNaN(v)) return v;
+      }
+    }
+    // FXSPLITFB — season shape: FGM / FGA as separate labels.
+    var fb = _FX_SPLIT_FALLBACK[String(target)];
+    if (fb && statMap[fb] != null && statMap[fb] !== '') {
+      var fv = parseFloat(String(statMap[fb]).replace('+', ''));
+      return isNaN(fv) ? null : fv;
+    }
+    return null;
   }
+  if (raw == null || raw === '') return null;
   var n = parseFloat(String(raw).replace('+', ''));
   return isNaN(n) ? null : n;
 }
@@ -105642,6 +105694,318 @@ function _fxDayFpTotals(sport, scoring, entries, groupsHint) {
     groups.push({ label: order[o], fp: Math.round(byGroup[order[o]] * 100) / 100 });
   }
   return { total: Math.round(total * 100) / 100, groups: groups };
+}
+
+// ══════════════════════════════════════════════════════════════════
+// ROTO BOARD ── FXROTO2 ──
+// ──────────────────────────────────────────────────────────────────
+// Roto is not scored on stat × value. Every team is RANKED in every
+// category, those ranks become points (1..N), and the sum is the standing.
+// So a per-player fantasy figure is meaningless here and the only useful
+// question is a relative one: where do I rank, and how far am I from the
+// team above and below in each category.
+//
+// Fantrax's standings payload carries only {teamName, teamId, gamesBack,
+// rank, points, winPercentage} — no per-category anything (confirmed by
+// probe). So category totals are RECONSTRUCTED: every team's roster is
+// already in row.rosters.byTeam, the league's categories are in row.scoring,
+// and ESPN season stats give each player's line.
+//
+// That reconstruction drifts, and the drift is honest and knowable:
+//   • players are attributed to whoever holds them NOW, not who held them
+//     when the stats were earned — every trade and waiver claim misattributes
+//   • season totals include days a player sat on a bench or an IR slot
+//   • games caps, where a league runs one
+//
+// Which is why the board CHECKS ITSELF. Fantrax's points column is truth
+// for the total, so the reconstructed total is compared against it and the
+// delta is shown. Exact means the category board can be acted on; a wide
+// delta means it is directional only, and it says so rather than pretending.
+
+// Lower is better for these ranking targets, so the sort inverts. Keyed on
+// the ESPN target the alias resolves to, not the provider's category name.
+var _FX_ROTO_LOWER = { 'TO': 1, 'GA': 1, '_GAA': 1, '_L': 1, '_OTL': 1, 'FL': 1, 'GV': 1 };
+
+// The league's categories as ranking targets, in the league's own order.
+function _fxRotoCats(row) {
+  var SPORT = String(row.sport || '').toUpperCase();
+  var alias = _FX_ESPN_ALIAS[SPORT] || {};
+  var out = [], seen = {};
+  var groups = (row.scoring && row.scoring.groups) || [];
+  for (var g = 0; g < groups.length; g++) {
+    var cats = groups[g].cats || [];
+    for (var c = 0; c < cats.length; c++) {
+      var code = _fxCodeNorm(cats[c].abbr || cats[c].name);
+      var target = alias[code];
+      if (!target || seen[target]) continue;
+      seen[target] = 1;
+      out.push({ code: code, target: target, label: _fxCatLabel(target, code),
+                 lower: !!_FX_ROTO_LOWER[target] });
+    }
+  }
+  return out;
+}
+
+// Sum one team's season lines into a number per ranking target. Rates are
+// recomputed from summed components — the same rule the daily totals use, and
+// for the same reason: a team's FG% is total makes over total attempts, not
+// the mean of ten players' percentages.
+function _fxRotoTeamTotals(SPORT, cats, statMaps) {
+  var rates = _FX_RATE_CATS[SPORT] || {};
+  var parts = _FX_RATE_PARTS[SPORT] || { plain: [], clock: [], split: {} };
+  var sums = {}, comps = {}, i, j;
+  function addComp(n, v) { comps[n] = (comps[n] || 0) + v; }
+  for (i = 0; i < statMaps.length; i++) {
+    var sm = statMaps[i];
+    if (!sm) continue;
+    (parts.clock || []).forEach(function (nm) {
+      var cm = _fxClockMinutes(sm[nm]);
+      if (cm != null) addComp(nm, cm);
+    });
+    (parts.plain || []).forEach(function (nm) {
+      var v = parseFloat(String(sm[nm] == null ? '' : sm[nm]));
+      if (!isNaN(v)) addComp(nm, v);
+    });
+    for (var sp in (parts.split || {})) {
+      if (!parts.split.hasOwnProperty(sp)) continue;
+      var mv = _fxStatValue(sm, sp + ':made'), av = _fxStatValue(sm, sp + ':att');
+      if (mv != null) addComp(parts.split[sp][0], mv);
+      if (av != null) addComp(parts.split[sp][1], av);
+    }
+    for (j = 0; j < cats.length; j++) {
+      var t = cats[j].target;
+      if (rates[t]) continue;
+      var raw = _fxStatValue(sm, t);
+      if (raw == null) continue;
+      sums[t] = (sums[t] || 0) + raw;
+    }
+  }
+  var out = {};
+  for (j = 0; j < cats.length; j++) {
+    var tg = cats[j].target;
+    if (rates[tg]) { out[tg] = rates[tg].fn(comps); continue; }
+    out[tg] = (sums[tg] == null) ? 0 : Math.round(sums[tg] * 1000) / 1000;
+  }
+  return out;
+}
+
+// Rank every team in one category and award roto points. Ties SHARE the
+// average of the ranks they occupy, which is how roto scores them — two teams
+// tied for 3rd of 10 each take 7.5, not 8 and 7.
+function _fxRotoRankOne(teams, target, lower) {
+  var n = teams.length;
+  var rows = [];
+  for (var i = 0; i < n; i++) {
+    rows.push({ i: i, v: (teams[i].totals || {})[target] });
+  }
+  rows.sort(function (a, b) {
+    var av = a.v, bv = b.v;
+    // A team with no value at all sorts last whichever way the category runs.
+    if (av == null && bv == null) return 0;
+    if (av == null) return 1;
+    if (bv == null) return -1;
+    return lower ? (av - bv) : (bv - av);
+  });
+  var pts = new Array(n), rank = new Array(n);
+  var k = 0;
+  while (k < rows.length) {
+    var m = k;
+    while (m + 1 < rows.length && rows[m + 1].v === rows[k].v && rows[k].v != null) m++;
+    // Ranks k..m are tied; roto splits the points they jointly occupy.
+    var sum = 0;
+    for (var q = k; q <= m; q++) sum += (n - q);
+    var share = sum / (m - k + 1);
+    for (q = k; q <= m; q++) { pts[rows[q].i] = share; rank[rows[q].i] = k + 1; }
+    k = m + 1;
+  }
+  return { pts: pts, rank: rank, order: rows };
+}
+
+// Build the whole board. One _skFetchEspnSeasonStats call per team (cached by
+// that function per sport+teamKey), so re-opening the tab is free. FXROTO2
+function _fxRotoBuild(row, onProgress) {
+  var SPORT = String(row.sport || '').toUpperCase();
+  var sportKey = String(row.sport || '').toLowerCase();
+  var cats = _fxRotoCats(row);
+  if (!cats.length) return Promise.resolve({ error: 'no-cats' });
+  if (!row.rosters || !row.rosters.byTeam) return Promise.resolve({ error: 'no-rosters' });
+
+  var myIds = row.myTeamIds || (typeof _fxMyTeamIds === 'function' ? _fxMyTeamIds(row.raw || {}) : {});
+  var teams = [], tk;
+  for (tk in row.rosters.byTeam) {
+    if (!row.rosters.byTeam.hasOwnProperty(tk)) continue;
+    var t = row.rosters.byTeam[tk] || {};
+    var players = [], items = t.items || [];
+    for (var i = 0; i < items.length; i++) {
+      var res = _extRosterItemName(items[i] || {}, SPORT);
+      if (!res.name || res.name === '?' || res.unresolved) continue;
+      players.push({ playerKey: String(items[i].id || res.name), name: res.name,
+                     teamAbbr: res.team || '' });
+    }
+    teams.push({ teamId: tk, name: t.teamName || tk, mine: !!myIds[tk],
+                 players: players, totals: null, resolved: 0 });
+  }
+  if (!teams.length) return Promise.resolve({ error: 'no-rosters' });
+
+  var doneN = 0;
+  return Promise.all(teams.map(function (tm) {
+    // teamKey is the season-stat cache key, so each Fantrax team caches
+    // separately and a repeat open costs nothing.
+    return _skFetchEspnSeasonStats(sportKey, row.key + '|' + tm.teamId, tm.players)
+      .then(function (entry) {
+        var by = (entry && entry.byPlayerKey) || {};
+        var maps = [];
+        for (var p = 0; p < tm.players.length; p++) {
+          var fl = by[tm.players[p].playerKey];
+          if (fl) { maps.push(fl); tm.resolved++; }
+        }
+        tm.totals = _fxRotoTeamTotals(SPORT, cats, maps);
+      })
+      ['catch'](function () { tm.totals = null; })
+      .then(function () {
+        doneN++;
+        if (onProgress) { try { onProgress(doneN, teams.length); } catch (e) {} }
+      });
+  })).then(function () {
+    // Rank every category, accumulate roto points.
+    var pts = {}, rank = {}, order = {};
+    for (var c = 0; c < cats.length; c++) {
+      var r = _fxRotoRankOne(teams, cats[c].target, cats[c].lower);
+      pts[cats[c].target] = r.pts;
+      rank[cats[c].target] = r.rank;
+      order[cats[c].target] = r.order;
+    }
+    for (var ti = 0; ti < teams.length; ti++) {
+      var tot = 0;
+      for (c = 0; c < cats.length; c++) tot += (pts[cats[c].target][ti] || 0);
+      teams[ti].roto = Math.round(tot * 10) / 10;
+    }
+    // Ground truth for MY total, straight from Fantrax. The reconstruction is
+    // measured against it rather than presented as fact. FXROTO2
+    var actual = null;
+    try {
+      var ap = (row.standings && row.standings.points);
+      if (ap != null && !isNaN(parseFloat(ap))) actual = parseFloat(ap);
+    } catch (eA) {}
+    return { cats: cats, teams: teams, pts: pts, rank: rank, order: order,
+             actual: actual, sport: SPORT };
+  });
+}
+
+function _fxRotoFmt(v, target) {
+  if (v == null) return '\u2014';
+  var rates = _FX_RATE_CATS[String(_fxRotoFmt._sport || '').toUpperCase()] || {};
+  if (rates[target]) {
+    var txt = Number(v).toFixed(rates[target].dp);
+    return rates[target].strip0 ? txt.replace(/^0/, '') : txt;
+  }
+  return String(Math.round(Number(v) * 100) / 100);
+}
+
+function _fxRotoHtml(d) {
+  if (!d) return '<div class="slb-empty">Couldn\u2019t build the board.</div>';
+  if (d.error === 'no-cats') {
+    return '<div class="slb-empty">This league\u2019s categories haven\u2019t loaded yet. ' +
+      'Reopen the league in a moment.</div>';
+  }
+  if (d.error === 'no-rosters') {
+    return '<div class="slb-empty">Rosters haven\u2019t loaded yet \u2014 open the Roster tab once, then come back.</div>';
+  }
+  _fxRotoFmt._sport = d.sport;
+  var mine = null, i;
+  for (i = 0; i < d.teams.length; i++) if (d.teams[i].mine) mine = d.teams[i];
+  if (!mine) mine = d.teams[0];
+  var myIdx = d.teams.indexOf(mine);
+  var n = d.teams.length;
+
+  // Reconstruction check — the honest header. FXROTO2
+  var head = '';
+  var est = mine.roto;
+  if (d.actual != null) {
+    var diff = Math.round((est - d.actual) * 10) / 10;
+    var ok = Math.abs(diff) < 0.05;
+    head = '<div class="fxr-check' + (ok ? ' ok' : '') + '">' +
+      '<b>' + est.toFixed(1) + '</b> reconstructed \u00b7 <b>' + d.actual.toFixed(1) +
+      '</b> from Fantrax \u00b7 ' +
+      (ok ? 'exact'
+          : ((diff > 0 ? '+' : '') + diff.toFixed(1) + ' off \u2014 treat the board as directional')) +
+      '</div>';
+  } else {
+    head = '<div class="fxr-check">' + est.toFixed(1) + ' reconstructed \u00b7 ' +
+      'no Fantrax total to check against yet</div>';
+  }
+
+  var rows = '';
+  for (var c = 0; c < d.cats.length; c++) {
+    var cat = d.cats[c], t = cat.target;
+    var ord = d.order[t], myRank = d.rank[t][myIdx], myPts = d.pts[t][myIdx];
+    var myVal = (mine.totals || {})[t];
+    // Position in the sorted order, so the neighbours are the teams actually
+    // above and below me in THIS category.
+    var pos = -1;
+    for (i = 0; i < ord.length; i++) if (ord[i].i === myIdx) { pos = i; break; }
+    var up = (pos > 0) ? ord[pos - 1] : null;
+    var dn = (pos >= 0 && pos < ord.length - 1) ? ord[pos + 1] : null;
+    // The gaps are the whole point of a roto board: what it costs to gain a
+    // rank point, and what it costs to lose one.
+    function gap(other) {
+      if (!other || other.v == null || myVal == null) return null;
+      return Math.abs(Number(other.v) - Number(myVal));
+    }
+    var gUp = gap(up), gDn = gap(dn);
+    rows += '<div class="fxr-row">' +
+      '<span class="fxr-cat">' + slEsc(cat.label) + (cat.lower ? '<i>\u2193</i>' : '') + '</span>' +
+      '<span class="fxr-val">' + slEsc(_fxRotoFmt(myVal, t)) + '</span>' +
+      '<span class="fxr-rank">' + myRank + '<em>/' + n + '</em></span>' +
+      '<span class="fxr-pts">' + (Math.round(myPts * 10) / 10) + '</span>' +
+      '<span class="fxr-gap">' +
+        (gUp != null ? '<span class="up">\u25b2 ' + slEsc(_fxRotoFmt(gUp, t)) + '</span>' : '<span class="up">\u2014</span>') +
+        (gDn != null ? '<span class="dn">\u25bc ' + slEsc(_fxRotoFmt(gDn, t)) + '</span>' : '<span class="dn">\u2014</span>') +
+      '</span>' +
+    '</div>';
+  }
+
+  var unresolved = 0, totalP = 0;
+  for (i = 0; i < d.teams.length; i++) {
+    unresolved += (d.teams[i].players.length - d.teams[i].resolved);
+    totalP += d.teams[i].players.length;
+  }
+
+  return head +
+    '<div class="fxr-head">' +
+      '<span class="fxr-cat">CAT</span><span class="fxr-val">TOTAL</span>' +
+      '<span class="fxr-rank">RANK</span><span class="fxr-pts">PTS</span>' +
+      '<span class="fxr-gap">GAP \u25b2 / \u25bc</span></div>' +
+    rows +
+    '<div class="fxr-note">' +
+      'Category totals are rebuilt from every team\u2019s current roster and ESPN season ' +
+      'stats \u2014 Fantrax publishes no per-category standings. Players count for whoever ' +
+      'holds them NOW, so trades and waiver claims misattribute production, and bench days ' +
+      'are included. That is why the total above is checked against Fantrax\u2019s own.' +
+      (unresolved ? (' ' + unresolved + ' of ' + totalP + ' rostered players had no ESPN season line.') : '') +
+    '</div>';
+}
+
+function fxLoadRoto(leagueKey, paneId) {
+  var pane = document.getElementById(paneId || 'skFxRotoPane');
+  if (!pane) return;
+  var row = null, list = (typeof extLeagues !== 'undefined' && extLeagues) ? extLeagues : [];
+  for (var i = 0; i < list.length; i++) if (list[i] && list[i].key === leagueKey) { row = list[i]; break; }
+  if (!row) return;
+  if (row._rotoBoard) { pane.innerHTML = _fxRotoHtml(row._rotoBoard); return; }
+  pane.innerHTML = '<div class="slb-empty">Building the board\u2026</div>';
+  _fxRotoBuild(row, function (done, total) {
+    var p2 = document.getElementById(paneId || 'skFxRotoPane');
+    if (p2) p2.innerHTML = '<div class="slb-empty">Building the board\u2026 ' +
+      done + ' of ' + total + ' teams</div>';
+  }).then(function (d) {
+    if (!d.error) row._rotoBoard = d;
+    var p3 = document.getElementById(paneId || 'skFxRotoPane');
+    if (p3) p3.innerHTML = _fxRotoHtml(d);
+  })['catch'](function () {
+    var p4 = document.getElementById(paneId || 'skFxRotoPane');
+    if (p4) p4.innerHTML = '<div class="slb-empty">Couldn\u2019t build the board. Close and reopen to retry.</div>';
+  });
 }
 
 // ── Category stat line ── FXCATS ──
@@ -149358,6 +149722,10 @@ function extOpenLeague(key) {
         ? '<button class="sk-detail-tab" data-exttab="matchup" onclick="extSetDetailTab(\'matchup\')">Matchup</button>'
         : '') +
       '<button class="sk-detail-tab" data-exttab="standings" onclick="extSetDetailTab(\'standings\')">Standings</button>' +
+      // Roto board — Fantrax roto leagues only. FXROTO2
+      ((row.provider === 'fantrax' && typeof extFormatKey === 'function' && extFormatKey(row) === 'roto')
+        ? '<button class="sk-detail-tab" data-exttab="roto" onclick="extSetDetailTab(\'roto\')">Roto</button>'
+        : '') +
       '<button class="sk-detail-tab" data-exttab="roster" onclick="extSetDetailTab(\'roster\')">Roster</button>' +
       (row.provider === 'fantrax'
         ? '<button class="sk-detail-tab" data-exttab="draft" onclick="extSetDetailTab(\'draft\')">Draft</button>'
@@ -149377,6 +149745,10 @@ function extOpenLeague(key) {
     '</div>' +
     (isH2H ? '<div class="sk-detail-pane" data-extpane="matchup">' + matchupHtml + '</div>' : '') +
     '<div class="sk-detail-pane" data-extpane="standings" style="display:none">' + standingsHtml + '</div>' +
+    ((row.provider === 'fantrax' && typeof extFormatKey === 'function' && extFormatKey(row) === 'roto')
+      ? '<div class="sk-detail-pane" data-extpane="roto" style="display:none">' +
+        '<div id="skFxRotoPane"><div class="slb-empty">Opening\u2026</div></div></div>'
+      : '') +   // FXROTO2
     '<div class="sk-detail-pane" data-extpane="roster" id="skExtRosterPane" style="display:none">' + rosterHtml + '</div>' +
     (row.provider === 'fantrax'
       ? '<div class="sk-detail-pane" data-extpane="draft" id="skExtAdpPane" style="display:none"><div style="color:rgba(255,255,255,0.4);font-size:12px;">Tap to load ADP\u2026</div></div>'
@@ -149420,6 +149792,11 @@ function extSetDetailTab(id) {
   var panes = body.querySelectorAll('[data-extpane]');
   for (var j = 0; j < panes.length; j++) {
     panes[j].style.display = (panes[j].getAttribute('data-extpane') === id) ? 'block' : 'none';
+  }
+  // Roto board is lazy and expensive — one season-stat fetch per team — so it
+  // only builds when the tab is opened, and caches on the row. FXROTO2
+  if (id === 'roto' && typeof fxLoadRoto === 'function') {
+    fxLoadRoto(mast ? mast.getAttribute('data-ext-key') : '', 'skFxRotoPane');
   }
   // Draft tab is lazy — the sport-wide ADP list only fetches when the
   // tab is actually opened (once per sport per session).
