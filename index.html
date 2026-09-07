@@ -145735,8 +145735,24 @@ function _slLineupFill(row, bodyEl, headEl) {
   });
 }
 
-// FANTRAX body — ESPN season stats, no fantasy points (see header note).
-function _fxLineupFill(row, bodyEl, headEl) {
+// Fetch a Fantrax league's scoring system on demand. The enrichment pass sets
+// row.scoring when a league is opened; the lineup modal can be reached before
+// that has happened, and without it the FP column silently doesn't render.
+// Same endpoint and parse the FP Projector already uses. FTXPREFLIGHT
+function _fxEnsureScoring(row, cb) {
+  if (!row || row.scoring || typeof fxFetchJson !== 'function' ||
+      String(row.key || '').indexOf('ftx:') !== 0) { if (cb) cb(false); return; }
+  var id = String(row.key).slice(4);
+  fxFetchJson('https://www.fantrax.com/fxea/general/getLeagueInfo?leagueId=' +
+    encodeURIComponent(id) + '&excludePlayerInfo=true')
+    .then(function (data) {
+      row.scoring = (typeof _fxExtractScoring === 'function') ? _fxExtractScoring(data || {}) : null;
+      if (cb) cb(!!row.scoring);
+    })['catch'](function () { if (cb) cb(false); });
+}
+
+// FANTRAX body — ESPN stats, live lines and calculated FP.
+function _fxLineupFill(row, bodyEl, headEl, _retried) {
   var sportKey = String(row.sport || '').toLowerCase();
   var myIds = row.myTeamIds || _fxMyTeamIds(row.raw || {});
   var myTeam = null;
@@ -145753,6 +145769,39 @@ function _fxLineupFill(row, bodyEl, headEl) {
 
   var SPORT = String(row.sport || '').toUpperCase();
   var items = myTeam.items;
+
+  // ── Preflight ── FTXPREFLIGHT ──
+  // Two things this modal needs are loaded lazily elsewhere: the Fantrax
+  // player-name dictionary (previously only fetched when the Roster tab was
+  // opened) and the league's scoring system (set by the enrichment pass on
+  // league open). Missing either produced an instruction to go somewhere else
+  // first, or a silently absent FP column. Both are one call away, so fetch
+  // them here and re-enter. _retried stops a genuinely unresolvable roster
+  // from looping.
+  if (!_retried) {
+    var _needNames = false;
+    try {
+      for (var _pf = 0; _pf < items.length && _pf < 40; _pf++) {
+        var _r0 = _extRosterItemName(items[_pf] || {}, SPORT);
+        if (!_r0 || !_r0.name || _r0.name === '?' || _r0.unresolved) { _needNames = true; break; }
+      }
+    } catch (ePF) {}
+    var _needScoring = !row.scoring;
+    if (_needNames || _needScoring) {
+      bodyEl.innerHTML = '<div style="color:rgba(255,255,255,0.45);font-size:12px">Loading league data\u2026</div>';
+      var _left = (_needNames ? 1 : 0) + (_needScoring ? 1 : 0);
+      var _go = function () {
+        if (--_left > 0) return;
+        if (_extLineupOpenKey !== row.key) return;   // user moved on
+        _fxLineupFill(row, bodyEl, headEl, true);
+      };
+      if (_needNames && typeof _extEnsureFtxNames === 'function') _extEnsureFtxNames(_go);
+      else if (_needNames) _go();
+      if (_needScoring) _fxEnsureScoring(row, _go);
+      return;
+    }
+  }
+
   var players = [];
   for (var i = 0; i < items.length && i < 40; i++) {
     var it = items[i] || {};
@@ -145767,7 +145816,8 @@ function _fxLineupFill(row, bodyEl, headEl) {
     });
   }
   var note = '<div style="color:rgba(255,255,255,0.3);font-size:9.5px;line-height:1.6;margin-top:16px">' +
-    'Fantrax\u2019s API exposes no per-player fantasy points \u2014 only team-level scores \u2014 so these are ESPN season stats, not this period\u2019s FP.</div>';
+    'Fantrax exposes no per-player fantasy points, so FP here is calculated from the ESPN box line ' +
+    'and play-by-play against this league\u2019s own scoring settings. Players with no game today show season stats.</div>';
 
   if (!_ESPN_SPORT_CFG[sportKey]) {
     var basic = '';
@@ -145781,7 +145831,10 @@ function _fxLineupFill(row, bodyEl, headEl) {
     return;
   }
   if (!players.length) {
-    bodyEl.innerHTML = '<div style="color:rgba(255,255,255,0.45);font-size:12px">Player names haven\u2019t resolved yet \u2014 open the league\u2019s Roster tab once, then reopen this.</div>';
+    // Reached only AFTER the preflight already fetched the dictionary, so
+    // this is a real resolution failure rather than a load-order problem.
+    // FTXPREFLIGHT
+    bodyEl.innerHTML = '<div style="color:rgba(255,255,255,0.45);font-size:12px">Couldn\u2019t resolve any player names for this roster. Fantrax\u2019s player dictionary may be unavailable right now \u2014 close and reopen to retry.</div>';
     return;
   }
 
