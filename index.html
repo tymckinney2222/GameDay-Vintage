@@ -105075,7 +105075,13 @@ var _FX_ESPN_ALIAS = {
     THREE_POINTERS_MADE: '3PT:made', THREE_POINT_FIELD_GOALS_MADE: '3PT:made',
     THREE_POINTERS_ATTEMPTED: '3PT:att', FIELD_GOALS_MADE: 'FG:made', FIELD_GOALS_ATTEMPTED: 'FG:att',
     FREE_THROWS_MADE: 'FT:made', FREE_THROWS_ATTEMPTED: 'FT:att',
-    PTS: 'PTS', REB: 'REB', AST: 'AST', STL: 'STL', BLK: 'BLK', TO: 'TO', '3PM': '3PT:made'
+    PTS: 'PTS', REB: 'REB', AST: 'AST', STL: 'STL', BLK: 'BLK', TO: 'TO', '3PM': '3PT:made',
+    // Percentages are derived from summed makes/attempts, not read as a
+    // column — see _FX_RATE_CATS.NBA. FXDAYFP
+    FIELD_GOAL_PERCENTAGE: '_FGP', FG_PERCENTAGE: '_FGP', 'FG%': '_FGP',
+    FREE_THROW_PERCENTAGE: '_FTP', FT_PERCENTAGE: '_FTP', 'FT%': '_FTP',
+    THREE_POINT_PERCENTAGE: '_3PP', '3P%': '_3PP', 'THREE_POINT_PCT': '_3PP',
+    MINUTES_PLAYED: 'MIN', MIN: 'MIN'
   }
 };
 // Derivable — from the box plus game state, or from play-by-play. The
@@ -105439,9 +105445,26 @@ var _FX_RATE_CATS = {
     'FO%':  { parts: ['FW', 'FL'],  fn: function (n) {
       return ((n.FW + n.FL) > 0) ? (n.FW / (n.FW + n.FL) * 100) : null; }, dp: 1 }
   },
+  // Basketball percentages are rates too, and for the same reason: a 1-for-1
+  // night and a 4-for-12 night do not average to a meaningful FG%. Summed
+  // makes and attempts, then divided. The stub that used to sit here mapped
+  // three keys to null, which read as configuration but did nothing.
   NBA: {
-    'FG:made': null, 'FT:made': null, '3PT:made': null
+    '_FGP': { parts: ['FGM', 'FGA'], fn: function (n) {
+      return (n.FGA > 0) ? (n.FGM / n.FGA * 100) : null; }, dp: 1 },
+    '_FTP': { parts: ['FTM', 'FTA'], fn: function (n) {
+      return (n.FTA > 0) ? (n.FTM / n.FTA * 100) : null; }, dp: 1 },
+    '_3PP': { parts: ['TPM', 'TPA'], fn: function (n) {
+      return (n.TPA > 0) ? (n.TPM / n.TPA * 100) : null; }, dp: 1 }
   }
+};
+
+// Which raw components each sport needs summed for its rate formulas. Read
+// straight off the box labels; "11-20" split pairs are handled below.
+var _FX_RATE_PARTS = {
+  NHL: { plain: ['GA', 'SV', 'SA', 'FW', 'FL'], clock: ['TOI'], split: {} },
+  NBA: { plain: [], clock: ['MIN'],
+         split: { FG: ['FGM', 'FGA'], FT: ['FTM', 'FTA'], '3PT': ['TPM', 'TPA'] } }
 };
 
 function _fxDayTotals(sport, scoring, entries) {
@@ -105487,13 +105510,24 @@ function _fxDayTotals(sport, scoring, entries) {
       sm = c2;
     }
     // Components for the rate formulas, always, whether or not the league
-    // counts them as categories of their own.
-    var mins = _fxClockMinutes(sm.TOI);
-    if (mins != null) addComp('TOI', mins);
-    ['GA', 'SV', 'SA', 'FW', 'FL'].forEach(function (nm) {
+    // counts them as categories of their own. Sport-driven so basketball's
+    // made/attempted pairs are collected the same way hockey's saves are.
+    var _rp = _FX_RATE_PARTS[SPORT] || { plain: [], clock: [], split: {} };
+    (_rp.clock || []).forEach(function (nm) {
+      var cmv = _fxClockMinutes(sm[nm]);
+      if (cmv != null) addComp(nm, cmv);
+    });
+    (_rp.plain || []).forEach(function (nm) {
       var v = parseFloat(String(sm[nm] == null ? '' : sm[nm]));
       if (!isNaN(v)) addComp(nm, v);
     });
+    for (var _sp in (_rp.split || {})) {
+      if (!_rp.split.hasOwnProperty(_sp)) continue;
+      var madeV = _fxStatValue(sm, _sp + ':made');
+      var attV = _fxStatValue(sm, _sp + ':att');
+      if (madeV != null) addComp(_rp.split[_sp][0], madeV);
+      if (attV != null) addComp(_rp.split[_sp][1], attV);
+    }
     // Whatever this player contributed to any of the league's categories. A
     // goalie's assist counts toward the team's assists, and a skater simply
     // has no SV column, so summing every ordered target across everyone is
@@ -105542,6 +105576,21 @@ function _fxDayTotals(sport, scoring, entries) {
   return out;
 }
 
+// Does this scoring system award points at all? Data-driven rather than
+// reading a format string, so it's right for every Fantrax format in every
+// sport — H2H points, season points, NBA, NHL — without a list to maintain.
+// A categories league has pts null on every category. FXDAYFP
+function _fxScoringIsPoints(scoring) {
+  if (!scoring || !scoring.groups) return false;
+  for (var g = 0; g < scoring.groups.length; g++) {
+    var cats = (scoring.groups[g] || {}).cats || [];
+    for (var c = 0; c < cats.length; c++) {
+      if (cats[c] && cats[c].pts != null && !isNaN(Number(cats[c].pts))) return true;
+    }
+  }
+  return false;
+}
+
 // ── Daily fantasy points, by position group ── FXDAYFP ──
 // The category totals answer "what did my lineup do"; this answers "what did
 // it score". Points leagues only — in a categories league _fxScoreStatMap
@@ -105552,22 +105601,31 @@ function _fxDayTotals(sport, scoring, entries) {
 // subtotals line up with how the roster is displayed. Rounded once at the
 // end: summing pre-rounded per-player figures drifts by a cent or two over a
 // full lineup, and this number is meant to be checkable against Fantrax.
-function _fxDayFpTotals(sport, scoring, entries) {
-  if (!scoring || !entries || !entries.length) return null;
+function _fxDayFpTotals(sport, scoring, entries, groupsHint) {
+  // Gated on the SCORING, not on whether anyone played. A points league on an
+  // off day still has a fantasy-points total — it's zero — and hiding the line
+  // until games start made it look like the feature wasn't there at all.
+  // A categories league has no points to award and gets no line, ever.
+  if (!_fxScoringIsPoints(scoring)) return null;
   if (typeof _fxScoreStatMap !== 'function') return null;
-  var total = 0, any = false, byGroup = {}, order = [];
+  entries = entries || [];
+  var total = 0, byGroup = {}, order = [];
+  // Seed every position group the lineup contains, so an off day shows
+  // F / D / G at 0.00 rather than an empty line.
+  for (var h = 0; h < (groupsHint || []).length; h++) {
+    var gh = groupsHint[h] || '?';
+    if (byGroup[gh] == null) { byGroup[gh] = 0; order.push(gh); }
+  }
   for (var i = 0; i < entries.length; i++) {
     var en = entries[i] || {};
     if (!en.statMap) continue;
     var res = _fxScoreStatMap(sport, scoring, en.statMap, en.pos, en.ctx);
     if (!res || res.fp == null) continue;
-    any = true;
     total += res.fp;
     var g = en.grp || '?';
     if (byGroup[g] == null) { byGroup[g] = 0; order.push(g); }
     byGroup[g] += res.fp;
   }
-  if (!any) return null;
   var known = (typeof FTX_POS_ORDER !== 'undefined' && FTX_POS_ORDER[String(sport).toUpperCase()]) || [];
   order.sort(function (a, b) {
     var ia = known.indexOf(a), ib = known.indexOf(b);
@@ -105607,6 +105665,7 @@ var _FX_CAT_LABEL = {
   '_W': 'W', '_L': 'L', '_OTL': 'OTL', '_SO': 'SHO',
   '_PPG': 'PPG', '_PPA': 'PPA', '_PPP': 'PPP',
   '_SHG': 'SHG', '_SHA': 'SHA', '_SHP': 'SHP', '_GAA': 'GAA',
+  '_FGP': 'FG%', '_FTP': 'FT%', '_3PP': '3P%',
   '3PT:made': '3PM', '3PT:att': '3PA', 'FG:made': 'FGM', 'FG:att': 'FGA',
   'FT:made': 'FTM', 'FT:att': 'FTA'
 };
@@ -146510,10 +146569,19 @@ function _fxLineupFill(row, bodyEl, headEl, _retried) {
           '</div>';
       }
       // FP line — points leagues only; a cats league returns null and this
-      // whole block is skipped. FXDAYFP
+      // whole block is skipped. The position groups come from the ACTIVE
+      // ROSTER, not from who played, so an off day shows F/D/G at 0.00
+      // rather than a bare total. FXDAYFP
       var _fpHtml = '';
+      var _grpHint = [], _seenG = {};
+      for (var _gh = 0; _gh < players.length; _gh++) {
+        if (_anyFlag && players[_gh].starter !== true) continue;
+        var _gk = (typeof _ftxPosGroup === 'function')
+          ? _ftxPosGroup(players[_gh].pos, SPORT) : String(players[_gh].pos || '?');
+        if (_gk && !_seenG[_gk]) { _seenG[_gk] = 1; _grpHint.push(_gk); }
+      }
       var _fpT = (typeof _fxDayFpTotals === 'function')
-        ? _fxDayFpTotals(SPORT, row.scoring, _starters) : null;
+        ? _fxDayFpTotals(SPORT, row.scoring, _starters, _grpHint) : null;
       if (_fpT) {
         var _gBits = '';
         for (var _g = 0; _g < _fpT.groups.length; _g++) {
