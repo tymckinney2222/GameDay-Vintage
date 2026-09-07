@@ -957,6 +957,23 @@
     font-family: var(--sk-font-mono, monospace); font-size: 9.5px;
     color: rgba(255,255,255,0.32); line-height: 1.5;
   }
+  /* FP total + per-position subtotals. Sits under the category cells with a
+     rule between, because it answers a different question than they do:
+     what the lineup SCORED, not what it did. FXDAYFP */
+  .fx-daytot-fp {
+    display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px;
+    margin-top: 8px; padding-top: 7px;
+    border-top: 1px solid rgba(52,211,153,0.16);
+  }
+  .fx-daytot-fptot {
+    font-family: var(--sk-font-mono, monospace); font-size: 15px;
+    font-weight: 700; color: var(--sk-gold, #f5c518); letter-spacing: 0.01em;
+  }
+  .fx-daytot-fpgrp {
+    font-family: var(--sk-font-mono, monospace); font-size: 9.5px;
+    color: rgba(255,255,255,0.38); letter-spacing: 0.04em;
+  }
+  .fx-daytot-fpgrp b { color: #34d399; font-weight: 700; }
 
   /* ── Fantrax calculated FP ── FXENGINE ── */
   .ftx-fp { margin-left: 6px; font-family: var(--sk-font-mono, monospace); font-size: 9.5px;
@@ -105525,6 +105542,45 @@ function _fxDayTotals(sport, scoring, entries) {
   return out;
 }
 
+// ── Daily fantasy points, by position group ── FXDAYFP ──
+// The category totals answer "what did my lineup do"; this answers "what did
+// it score". Points leagues only — in a categories league _fxScoreStatMap
+// returns null for every player (there are no point values to apply), so
+// this returns null too and the strip simply doesn't show an FP line.
+//
+// Grouping is by Fantrax's own F/D/G rather than ESPN's C/LW/RW, so the
+// subtotals line up with how the roster is displayed. Rounded once at the
+// end: summing pre-rounded per-player figures drifts by a cent or two over a
+// full lineup, and this number is meant to be checkable against Fantrax.
+function _fxDayFpTotals(sport, scoring, entries) {
+  if (!scoring || !entries || !entries.length) return null;
+  if (typeof _fxScoreStatMap !== 'function') return null;
+  var total = 0, any = false, byGroup = {}, order = [];
+  for (var i = 0; i < entries.length; i++) {
+    var en = entries[i] || {};
+    if (!en.statMap) continue;
+    var res = _fxScoreStatMap(sport, scoring, en.statMap, en.pos, en.ctx);
+    if (!res || res.fp == null) continue;
+    any = true;
+    total += res.fp;
+    var g = en.grp || '?';
+    if (byGroup[g] == null) { byGroup[g] = 0; order.push(g); }
+    byGroup[g] += res.fp;
+  }
+  if (!any) return null;
+  var known = (typeof FTX_POS_ORDER !== 'undefined' && FTX_POS_ORDER[String(sport).toUpperCase()]) || [];
+  order.sort(function (a, b) {
+    var ia = known.indexOf(a), ib = known.indexOf(b);
+    if (ia < 0) ia = 99; if (ib < 0) ib = 99;
+    return ia - ib || String(a).localeCompare(String(b));
+  });
+  var groups = [];
+  for (var o = 0; o < order.length; o++) {
+    groups.push({ label: order[o], fp: Math.round(byGroup[order[o]] * 100) / 100 });
+  }
+  return { total: Math.round(total * 100) / 100, groups: groups };
+}
+
 // ── Category stat line ── FXCATS ──
 // A Fantrax categories league has no fantasy points to compute — the
 // categories ARE the scoring. But the same alias table that maps a category
@@ -146380,7 +146436,13 @@ function _fxLineupFill(row, bodyEl, headEl, _retried) {
         if (_lv.statMap) {
           _dayEntries.push({ statMap: _lv.statMap, pos: _lv.pos || players[p].pos,
                              ctx: _lv.ctx, starter: players[p].starter,
-                             slot: players[p].slot });
+                             slot: players[p].slot,
+                             // Fantrax's own F/D/G, not ESPN's C/LW/RW — the
+                             // FP subtotals group the way the roster does.
+                             // FXDAYFP
+                             grp: (typeof _ftxPosGroup === 'function')
+                               ? _ftxPosGroup(players[p].pos, SPORT)
+                               : String(players[p].pos || '?') });
         }
       }
       out += _extLineupRowHtml(_ftxDisplayName(players[p].name), players[p].pos,
@@ -146447,13 +146509,29 @@ function _fxLineupFill(row, bodyEl, headEl, _retried) {
           'None of this league\u2019s categories map to an ESPN box column yet.' +
           '</div>';
       }
+      // FP line — points leagues only; a cats league returns null and this
+      // whole block is skipped. FXDAYFP
+      var _fpHtml = '';
+      var _fpT = (typeof _fxDayFpTotals === 'function')
+        ? _fxDayFpTotals(SPORT, row.scoring, _starters) : null;
+      if (_fpT) {
+        var _gBits = '';
+        for (var _g = 0; _g < _fpT.groups.length; _g++) {
+          _gBits += '<span class="fx-daytot-fpgrp">' + slEsc(_fpT.groups[_g].label) +
+            ' <b>' + (_fpT.groups[_g].fp >= 0 ? '+' : '') +
+            _fpT.groups[_g].fp.toFixed(2) + '</b></span>';
+        }
+        _fpHtml = '<div class="fx-daytot-fp">' +
+          '<span class="fx-daytot-fptot">' + (_fpT.total >= 0 ? '+' : '') +
+            _fpT.total.toFixed(2) + ' FP</span>' + _gBits + '</div>';
+      }
       _totHtml = '<div class="fx-daytot">' +
         '<div class="fx-daytot-head">TODAY \u00b7 ' +
           (_anyFlag
             ? (_starters.length + ' OF ' + _rosterStarters + ' STARTERS PLAYING')
             : (_starters.length + ' PLAYER' + (_starters.length === 1 ? '' : 'S'))) +
           (_anyFlag ? '' : '<span class="fx-daytot-note">all rostered \u2014 no lineup slots from Fantrax</span>') +
-        '</div><div class="fx-daytot-row">' + _cells + '</div></div>';
+        '</div><div class="fx-daytot-row">' + _cells + '</div>' + _fpHtml + '</div>';
     }
     bodyEl.innerHTML =
       '<div style="color:rgba(255,255,255,0.42);font-size:10px;letter-spacing:0.12em;margin-bottom:4px">ROSTER \u00b7 ' +
