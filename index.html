@@ -45606,14 +45606,22 @@ function _skMyTeamName(leagueKey) {
   } catch (e) { return ''; }
 }
 
-function _buildSkipperFpRows(playerName, includeEmpty) {
+function _buildSkipperFpRows(playerName, includeEmpty, sportFilter) {
   if (typeof fyFullRosters === 'undefined' || !fyFullRosters || !fyFullRosters.length) return [];
   if (typeof _skNormalizeName !== 'function' || typeof _todayDateString !== 'function') return [];
   var normName = _skNormalizeName(playerName);
   var todayStr = _todayDateString();
+  // Optional sport scope. Matching on name alone allowed a Yahoo NFL roster
+  // to answer a COLLEGE game's lookup whenever the two shared a name, so a
+  // college linebacker showed up in the hub carrying an NFL league's rows.
+  // Callers that know which sport is on screen pass it; callers that don't get
+  // the old unscoped behavior. Leagues with no sport recorded are never hidden.
+  // FHUBCFB
+  var _sportFilter = sportFilter ? String(sportFilter).toLowerCase() : '';
   var rows = [];
   fyFullRosters.forEach(function(r) {
     if (_skNormalizeName(r.name) !== normName) return;
+    if (_sportFilter && r.sport && String(r.sport).toLowerCase() !== _sportFilter) return;
     // teamFpCache is populated for all leagues by the fyAutoLoadAllRosters
     // pre-fetch. Both points and cats use the same endpoint so the stats
     // object is identical — only the rendering differs.
@@ -69039,7 +69047,10 @@ function _fwBatterGameLine(bx, side, fullName) {
 // crs-season chrome, showing one row per league the player appears in.
 function _crsSkipperFpHtml(playerName, divHtml) {
   if (typeof _buildSkipperFpRows !== 'function') return '';
-  var rows = _buildSkipperFpRows(playerName);
+  // Same sport scope as the hub — the card sits in the same stadium and must
+  // not claim a same-name player from another sport. FHUBCFB
+  var _cardSport = (typeof _extStadiumSport === 'function') ? _extStadiumSport() : '';
+  var rows = _buildSkipperFpRows(playerName, false, _cardSport);
   if (!rows.length) return '';
   var inner = '';
   rows.forEach(function(fr) {
@@ -70670,13 +70681,40 @@ function _extCollectFantasyHub() {
 // _crsActiveStadiumPlayers returns { game, athletes } and that game object is
 // the raw feed shape with no reliable .league, so asking the OPEN OVERLAY is
 // the same source of truth that function itself uses.
+// Normalize an ESPN stadium league key to the sport token the fantasy rows
+// use. NCAAFB is the one that actually bites: Yahoo/ESPN/Sleeper football
+// leagues are 'cfb' for college and 'nfl' for pro, and calling a college game
+// "NFL" is what allowed an NFL player to answer a college game's lookup. FHUBCFB
+function _fhubSportToken(leagueKey) {
+  var k = String(leagueKey || '').toUpperCase();
+  if (k === 'NCAAFB') return 'CFB';
+  if (k === 'NCAAMB') return 'CBB';
+  if (k === 'NCAAWB') return 'CWBB';
+  return k;
+}
+
 function _extStadiumSport() {
   try {
     var map = { fwOverlay: 'MLB', rinkOverlay: 'NHL', gymOverlay: 'NBA', fieldOverlay: 'NFL' };
+    // The overlay a game opens in is NOT the same thing as its sport. One
+    // field overlay serves both NFL and college football, and the gym serves
+    // NBA, WNBA, G League and college hoops — so the overlay id alone
+    // mislabels every non-flagship game as its flagship sport. Read the open
+    // game's own league where we have it, and keep the id as a fallback for
+    // when the game global hasn't been set yet. FHUBCFB
+    var games = {
+      fwOverlay: (typeof fenwayGame !== 'undefined') ? fenwayGame : null,
+      rinkOverlay: (typeof rinkGame !== 'undefined') ? rinkGame : null,
+      gymOverlay: (typeof gymGame !== 'undefined') ? gymGame : null,
+      fieldOverlay: (typeof fieldGame !== 'undefined') ? fieldGame : null
+    };
     for (var id in map) {
       if (!map.hasOwnProperty(id)) continue;
       var el = document.getElementById(id);
-      if (el && el.classList && el.classList.contains('open')) return map[id];
+      if (!(el && el.classList && el.classList.contains('open'))) continue;
+      var g = games[id];
+      if (g && g.league) return _fhubSportToken(g.league);
+      return map[id];
     }
   } catch (e) {}
   return '';
@@ -70939,6 +70977,10 @@ function _crsCollectFantasyHub() {
   if (!ctx || !ctx.athletes || !ctx.athletes.length) return out;
 
   var seen = {}; // de-dupe by normalized name
+  // Which sport is actually on screen. The ESPN and Fantrax hubs have been
+  // sport-gated since FHUBSPORT; this collector never was, which is why the
+  // cross-sport match surfaced here first. FHUBCFB
+  var _hubSport = (typeof _extStadiumSport === 'function') ? _extStadiumSport() : '';
   ctx.athletes.forEach(function(at) {
     var nm = at.name;
     if (!nm) return;
@@ -70946,7 +70988,7 @@ function _crsCollectFantasyHub() {
     if (seen[norm]) return;
     // Yahoo rows only. ESPN has its own hub — Yahoo's terms ask that their
     // fantasy data not be commingled with other providers. ESPNFHUB3
-    var rows = _buildSkipperFpRows(nm, true); // includeEmpty: show every rostered league
+    var rows = _buildSkipperFpRows(nm, true, _hubSport); // includeEmpty: show every rostered league
     if (!rows.length) return;
     seen[norm] = true;
     // Total FP across point leagues (cats rows have fp == null).
