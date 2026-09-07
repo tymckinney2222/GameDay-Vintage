@@ -948,6 +948,9 @@
   }
   .fxr-cat { flex: 0 0 54px; color: rgba(255,255,255,0.75); font-weight: 700; }
   .fxr-cat i { font-style: normal; color: rgba(255,255,255,0.3); margin-left: 2px; }
+  /* Category weight, shown only when the league actually weights. FXWEIGHT */
+  .fxr-w { font-style: normal; font-size: 8px; color: var(--sk-gold, #f5c518);
+           margin-left: 3px; opacity: 0.75; }
   .fxr-val { flex: 0 0 62px; text-align: right; color: #fff; }
   .fxr-rank { flex: 0 0 46px; text-align: right; color: var(--sk-gold, #f5c518); font-weight: 700; }
   .fxr-rank em { font-style: normal; font-size: 8.5px; color: rgba(255,255,255,0.3); }
@@ -105786,7 +105789,9 @@ function _fxRotoCats(row) {
       if (!target || seen[target]) continue;
       seen[target] = 1;
       out.push({ code: code, target: target, label: _fxCatLabel(target, code),
-                 lower: !!_FX_ROTO_LOWER[target] });
+                 lower: !!_FX_ROTO_LOWER[target],
+                 // 1 unless the league weights its categories. FXWEIGHT
+                 weight: (cats[c].weight != null ? Number(cats[c].weight) : 1) });
     }
   }
   return out;
@@ -105931,7 +105936,13 @@ function _fxRotoBuild(row, onProgress) {
     }
     for (var ti = 0; ti < teams.length; ti++) {
       var tot = 0;
-      for (c = 0; c < cats.length; c++) tot += (pts[cats[c].target][ti] || 0);
+      // Rank points are multiplied by the category's weight, so first place in
+      // PTS (1.5) really is worth half again what first in FG% (1.0) is.
+      // Unweighted leagues carry weight 1 throughout and are unchanged.
+      // FXWEIGHT
+      for (c = 0; c < cats.length; c++) {
+        tot += (pts[cats[c].target][ti] || 0) * (cats[c].weight == null ? 1 : cats[c].weight);
+      }
       teams[ti].roto = Math.round(tot * 10) / 10;
     }
     // Ground truth for MY total, straight from Fantrax. The reconstruction is
@@ -106026,7 +106037,9 @@ function _fxRotoHtml(d) {
     }
     var gUp = gap(up), gDn = gap(dn);
     rows += '<div class="fxr-row">' +
-      '<span class="fxr-cat">' + slEsc(cat.label) + (cat.lower ? '<i>\u2193</i>' : '') + '</span>' +
+      '<span class="fxr-cat">' + slEsc(cat.label) + (cat.lower ? '<i>\u2193</i>' : '') +
+        ((cat.weight != null && cat.weight !== 1)
+          ? '<em class="fxr-w">\u00d7' + cat.weight + '</em>' : '') + '</span>' +
       '<span class="fxr-val">' + slEsc(_fxRotoFmt(myVal, t)) + '</span>' +
       // Before anything has been played there is no standing to report. A
       // tied field is mathematically 5.5 points and rank 1 for everyone, but
@@ -106034,7 +106047,9 @@ function _fxRotoHtml(d) {
       // the board look like it disagreed with Fantrax, which reports 0.
       // FXROTOPRE2
       '<span class="fxr-rank">' + (_played ? (myRank + '<em>/' + n + '</em>') : '\u2014') + '</span>' +
-      '<span class="fxr-pts">' + (_played ? (Math.round(myPts * 10) / 10) : '\u2014') + '</span>' +
+      '<span class="fxr-pts">' +
+        (_played ? (Math.round(myPts * (cat.weight == null ? 1 : cat.weight) * 10) / 10) : '\u2014') +
+      '</span>' +
       '<span class="fxr-gap">' +
         (gUp != null ? '<span class="up">\u25b2 ' + slEsc(_fxRotoFmt(gUp, t)) + '</span>' : '<span class="up">\u2014</span>') +
         (gDn != null ? '<span class="dn">\u25bc ' + slEsc(_fxRotoFmt(gDn, t)) + '</span>' : '<span class="dn">\u2014</span>') +
@@ -106513,6 +106528,21 @@ function skProbeFantraxScoring() {
     // than by points, since a category carries no point value.
     var _isCats = (fmt !== 'headpoint' && fmt !== 'point');
     if (_isCats) say('  CATEGORIES league \u2014 no FP; coverage below is for the stat line.');
+    // ── Weight hunt ── FXWEIGHT ──
+    // The rules page shows a Weight column but cfg.points is null for this
+    // league, so the weight is under some other key. This dumps the FIRST
+    // config object verbatim plus whatever the candidate reader found, so the
+    // real key is read off the payload instead of guessed at.
+    if (row.scoring._rawCfg) {
+      say('  raw config[0]: ' + row.scoring._rawCfg);
+      var _wl = [];
+      row.scoring.groups.forEach(function (g0) {
+        g0.cats.forEach(function (c0) {
+          if (c0.weight != null && c0.weight !== 1) _wl.push((c0.abbr || c0.name) + '=' + c0.weight);
+        });
+      });
+      say('  weights found: ' + (_wl.length ? _wl.join(' ') : '(none \u2014 all defaulting to 1)'));
+    }
     anyPts = true;
     var alias = _FX_ESPN_ALIAS[sport] || {};
     var derived = _FX_ESPN_DERIVED[sport] || {};
@@ -145586,6 +145616,23 @@ function _fxExtractInfo(data) {
 // within a group wins (leagues scoring flex by slot have uniform
 // values, so dupes are identical; if a league ever differs by
 // position, first-wins keeps the parse deterministic).
+// Pull a category weight off a Fantrax scoring config. Candidate keys, in
+// order, then 1 — which reproduces unweighted roto exactly, so a league that
+// carries no weights is unaffected and a wrong guess can only ever fall back
+// to today's behaviour rather than invent a number. FXWEIGHT
+var _FX_WEIGHT_KEYS = ['weight', 'multiplier', 'factor', 'scoringWeight',
+                       'categoryWeight', 'weighting', 'value'];
+function _fxCfgWeight(cfg) {
+  if (!cfg) return 1;
+  for (var i = 0; i < _FX_WEIGHT_KEYS.length; i++) {
+    var v = cfg[_FX_WEIGHT_KEYS[i]];
+    if (v == null || v === '') continue;
+    var n = parseFloat(v);
+    if (!isNaN(n) && n > 0) return n;
+  }
+  return 1;
+}
+
 function _fxExtractScoring(data) {
   var out = null;
   try {
@@ -145618,7 +145665,21 @@ function _fxExtractScoring(data) {
         // no FP (correct) and no categories either (not correct). Keep it with
         // pts null and a cat flag; the FP scorer already skips a non-numeric
         // pts, so nothing starts being scored that shouldn't be. FXCATS
-        cats.push({ abbr: abbr, name: nm, pts: isNaN(pv) ? null : pv, cat: isNaN(pv) });
+        cats.push({ abbr: abbr, name: nm, pts: isNaN(pv) ? null : pv, cat: isNaN(pv),
+                    // ── Weighted roto ── FXWEIGHT ──
+                    // Anarchy's rules page shows a Weight column (PTS 1.5,
+                    // AST 1.2, TO 1 …), so a rank point is not worth the same
+                    // in every category. The weight is NOT in cfg.points —
+                    // that's null for this league, which is what keeps it
+                    // classified as categories rather than points — so it
+                    // lives under some other key. Candidates are read in
+                    // order and it defaults to 1, which is exactly the
+                    // unweighted behaviour we had before. The probe below
+                    // dumps the raw config so the real key can be confirmed
+                    // rather than guessed at forever.
+                    weight: _fxCfgWeight(cfg) });
+        // First config's raw shape, kept for the probe. FXWEIGHT
+        if (!out._rawCfg) { try { out._rawCfg = JSON.stringify(cfg).slice(0, 400); } catch (eR) {} }
       }
       if (cats.length) out.groups.push({ name: String(gname), cats: cats });
     }
