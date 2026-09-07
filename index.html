@@ -122810,51 +122810,39 @@ async function _resolveEspnAthleteId(sportKey, name, teamAbbr) {
 
   var pr = (async function() {
     try {
+      // Try each variant until one produces a MATCH — not until one produces
+      // rows. Stopping at "returned something" is what broke K'Andre Miller
+      // again: ESPN's search is fuzzy, so the literal "KAndre Miller" comes
+      // back with other Millers rather than empty, the loop declared victory,
+      // and the apostrophe variant that would have found him was never tried.
+      // Worse, the loose fallback below then had a candidate list to pick
+      // from, so a near-miss could return SOMEBODY ELSE'S id.
+      //
+      // Candidates from the literal query are kept aside: only that query
+      // earns the loose "first one in the right sport" fallback, because only
+      // it was specific enough for a near-miss to be trustworthy. FTXAPOS
       var res = null, data = null, _qi = 0, _usedQuery = searchName;
-      for (_qi = 0; _qi < _queries.length; _qi++) {
-        _usedQuery = _queries[_qi];
-        var url = 'https://site.web.api.espn.com/apis/common/v3/search?query=' +
-          encodeURIComponent(_queries[_qi]) + '&limit=12&type=player';
-        res = await fetch(url);
-        if (!res.ok) break;
-        data = await res.json();
-        // Stop at the first query that returns anything at all; the
-        // name-key comparison downstream decides whether it is the right
-        // player, so a surname query returning ten people is fine.
-        var _got = (data && ((data.results && data.results.length) ||
-                             (data.items && data.items.length)));
-        if (_got) break;
-      }
-      var _resOk = res;
-      // Don't poison the cache on a transient HTTP failure (e.g. ESPN rate-
-      // limiting a burst of lookups — common when a full NHL roster resolves
-      // every player at once for both the daily line AND season stats). Caching
-      // null here would blank that player for the whole session; a later render
-      // retries instead. Only a SUCCESSFUL response with no candidate is a real
-      // "no such player" miss worth caching.
-      if (!_resOk || !_resOk.ok) { return null; }
-      if (!data) { _espnIdCache[key] = null; return null; }
-      // ESPN's real shape: data.results[] is a list of GROUPS, each with a
-      // contents[] of items. Players also sometimes come back flat in
-      // data.items. Flatten both into a single candidate list.
-      var cands = [];
-      if (data && Array.isArray(data.results)) {
-        data.results.forEach(function(group) {
-          var gtype = (group && group.type || '').toLowerCase();
-          (group && group.contents || []).forEach(function(item) {
-            var itype = (item.type || gtype || '').toLowerCase();
-            if (itype === 'player' || itype === 'athlete' || itype === '') cands.push(item);
-          });
-        });
-      }
-      if (!cands.length && data && Array.isArray(data.items)) {
-        data.items.forEach(function(item) {
-          var t = (item.type || '').toLowerCase();
-          if (t !== 'team') cands.push(item);
-        });
-      }
-      if (!cands.length) { _espnIdCache[key] = null; return null; }
+      var _literalCands = null, _anyOk = false;
 
+      function _flatten(d) {
+        var cands = [];
+        if (d && Array.isArray(d.results)) {
+          d.results.forEach(function(group) {
+            var gtype = (group && group.type || '').toLowerCase();
+            (group && group.contents || []).forEach(function(item) {
+              var itype = (item.type || gtype || '').toLowerCase();
+              if (itype === 'player' || itype === 'athlete' || itype === '') cands.push(item);
+            });
+          });
+        }
+        if (!cands.length && d && Array.isArray(d.items)) {
+          d.items.forEach(function(item) {
+            var t = (item.type || '').toLowerCase();
+            if (t !== 'team') cands.push(item);
+          });
+        }
+        return cands;
+      }
       // League/sport lives in leagues[0].abbreviation (e.g. "NHL"/"NBA"),
       // with older fallbacks. cfg.match holds the accepted tokens.
       function leagueOf(r) {
@@ -122883,26 +122871,47 @@ async function _resolveEspnAthleteId(sportKey, name, teamAbbr) {
         }
         return id ? String(id) : null;
       }
-      // Prefer: exact-name AND right sport → right sport → exact name → first.
-      // Compare via pKey (accent-folded, role-tag-stripped) on both sides.
-      // A BROAD query (surname only) may return a dozen unrelated players, so
-      // the loose fallbacks below — "first one in the right sport", "first one
-      // at all" — become actively dangerous: searching "Miller" would happily
-      // return some other NHL Miller and show his stats under K'Andre's name.
-      // Silently wrong is worse than blank, so a broad query accepts ONLY an
-      // exact name-key match (which folds the apostrophe that caused the
-      // fallback in the first place). FTXAPOS
-      var _broad = (_usedQuery !== searchName);
-      var _exact = cands.find(function(r) {
-        return _pmNameKey(r.displayName || r.name || '') === pKey && inSport(r);
-      }) || cands.find(function(r) {
-        return _pmNameKey(r.displayName || r.name || '') === pKey;
-      });
-      var match = _broad
-        ? _exact
-        : (_exact || cands.find(function(r) { return inSport(r); }) || cands[0]);
+      // Exact name-key match (accent- and apostrophe-folded on both sides),
+      // preferring the right sport. This is the only thing that stops a
+      // variant query and it's checked against EVERY variant in turn.
+      function _exactIn(cands) {
+        return cands.find(function(r) {
+          return _pmNameKey(r.displayName || r.name || '') === pKey && inSport(r);
+        }) || cands.find(function(r) {
+          return _pmNameKey(r.displayName || r.name || '') === pKey;
+        });
+      }
+
+      for (_qi = 0; _qi < _queries.length; _qi++) {
+        _usedQuery = _queries[_qi];
+        var url = 'https://site.web.api.espn.com/apis/common/v3/search?query=' +
+          encodeURIComponent(_usedQuery) + '&limit=12&type=player';
+        res = await fetch(url);
+        // Don't poison the cache on a transient HTTP failure (e.g. ESPN rate-
+        // limiting a burst of lookups). Caching null here would blank that
+        // player for the whole session; a later render retries instead.
+        if (!res || !res.ok) return null;
+        _anyOk = true;
+        data = await res.json();
+        var cands = _flatten(data);
+        if (_qi === 0) _literalCands = cands;
+        if (!cands.length) continue;
+        var hit = _exactIn(cands);
+        if (hit) {
+          var hid = idOf(hit);
+          _espnIdCache[key] = hid;
+          return hid;
+        }
+      }
+
+      // No variant matched by name. Fall back ONLY on the literal query's
+      // candidates: a surname-only query may return a dozen unrelated people,
+      // and "first NHL player named Miller" would show someone else's season
+      // under K'Andre's name. Silently wrong is worse than blank. FTXAPOS
+      var _lc = _literalCands || [];
+      var match = _lc.find(function(r) { return inSport(r); }) || _lc[0] || null;
       var id = match ? idOf(match) : null;
-      _espnIdCache[key] = id;
+      if (_anyOk) _espnIdCache[key] = id;
       return id;
     } catch (e) {
       // Transient (network) — don't poison the cache; allow a retry later.
