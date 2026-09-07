@@ -6522,6 +6522,15 @@
     max-width: 132px; line-height: 1.25;
   }
   .crs-fhub-cats { flex: 1; min-width: 0; overflow: hidden; }
+  /* Fantrax categories-league stat line — the league's own categories, read
+     off the same box the FP engine uses. No FP exists in a cats league, so
+     this is the whole answer to "what did he do for me tonight". FXCATS */
+  .fx-catline {
+    font-family: var(--sk-font-mono, monospace); font-size: 9px;
+    color: rgba(255,255,255,0.55); letter-spacing: 0.01em;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    display: block;
+  }
   .crs-fhub-fp {
     font-family: 'Barlow Condensed', sans-serif; font-weight: 700; font-size: 11px;
     white-space: nowrap; flex-shrink: 0; letter-spacing: 0.04em;
@@ -70742,7 +70751,7 @@ function _extFhubRowsFor(at, idx, sport) {
   if (!refs) return rows;
   for (var r = 0; r < refs.length; r++) {
     var row = refs[r].row, it = refs[r].item;
-    var fp = null, calc = false, calcTitle = '';
+    var fp = null, calc = false, calcTitle = '', catLine = '';
     if (row.provider === 'sleeper' && row._slPP) {
       // Sleeper only — its items really do carry playerId. FTXFHUBID
       var v = row._slPP[String(it.playerId || it.id || '')];
@@ -70755,6 +70764,11 @@ function _extFhubRowsFor(at, idx, sport) {
       if (sm) {
         var res = _fxScoreStatMap(sport, row.scoring, sm.statMap, sm.pos, sm.ctx);   // FXGOALIE
         if (res) { fp = Math.round(res.fp * 100) / 100; calc = true; calcTitle = _fxScoreTitle(res); }
+        // Categories league: no FP exists to compute, but the league's own
+        // categories can still be shown from the same box line. FXCATS
+        if (!calc && typeof _fxCatStatLine === 'function') {
+          catLine = _fxCatStatLine(sport, row.scoring, sm.statMap, sm.pos, sm.ctx);
+        }
       }
     }
     rows.push({
@@ -70764,6 +70778,7 @@ function _extFhubRowsFor(at, idx, sport) {
       teamLogo: (typeof extGetMyLogo === 'function') ? (extGetMyLogo(row.key) || '') : '',
       fp: fp,
       calc: calc, calcTitle: calcTitle,
+      catLine: catLine,   // FXCATS
       noFp: row.provider === 'fantrax' && !calc,
       slot: it.slot || '',
       starter: !!it.starter,
@@ -71125,7 +71140,10 @@ function openExtFantasyHub() {
             : '<span class="crs-fhub-row-logo-ph"></span>') +
           '<span class="crs-fhub-lname">' + slEsc(lname) +
             (fr.slot ? '<span style="opacity:0.45"> \u00b7 ' + slEsc(fr.slot) + '</span>' : '') + '</span>' +
-          '<span class="crs-fhub-cats"></span>' + right +
+          '<span class="crs-fhub-cats">' +
+            (fr.catLine
+              ? '<span class="fx-catline">' + slEsc(fr.catLine) + '</span>'
+              : '') + '</span>' + right +   // FXCATS
         '</div>';
       }
       html += '<div class="crs-fhub-card" style="--fhub-accent:' + (pl.accent || '#fbbf24') + '">' +
@@ -104927,7 +104945,15 @@ var _FX_ESPN_ALIAS = {
     SHORT_HANDED_GOALS: '_SHG', SHORT_HANDED_ASSISTS: '_SHA', SHORT_HANDED_POINTS: '_SHP',
     SHG: '_SHG', SHA: '_SHA', SHP: '_SHP',
     // short forms, in case a league exports them
-    G: 'G', A: 'A', PTS: 'P', PIM: 'PIM', SOG: 'S', HIT: 'HT', BLK: 'BS', GA: 'GA', SV: 'SV'
+    G: 'G', A: 'A', PTS: 'P', PIM: 'PIM', SOG: 'S', HIT: 'HT', BLK: 'BS', GA: 'GA', SV: 'SV',
+    // Identity forms — a provider that names a category with ESPN's own box
+    // label ("BS", "HT", "TOI") previously fell through to "can't map" and
+    // silently dropped out of both the FP total and the category line. The
+    // unit test on the cats line surfaced this: a blocked shot went missing
+    // from a league that counts blocks. FXCATS
+    P: 'P', S: 'S', HT: 'HT', BS: 'BS', TK: 'TK', GV: 'GV',
+    FW: 'FW', FL: 'FL', TOI: 'TOI', SHFT: 'SHFT', PPTOI: 'PPTOI', SHTOI: 'SHTOI',
+    SA: 'SA', 'SV%': 'SV%', '+/-': '+/-', PLUSMINUS: '+/-',
   },
   NBA: {
     POINTS: 'PTS', REBOUNDS: 'REB', ASSISTS: 'AST', STEALS: 'STL', BLOCKS: 'BLK',
@@ -105084,7 +105110,11 @@ function _fxScoreStatMap(sport, scoring, statMap, pos, ctx) {
   for (var i = 0; i < grp.cats.length; i++) {
     var c = grp.cats[i];
     var code = _fxCodeNorm(c.abbr || c.name);
-    var pts = Number(c.pts);
+    // A categories league's cats carry pts null. Number(null) is 0, NOT NaN,
+    // so the old isNaN guard admitted every category at zero points — a
+    // cats league would have reported a calculated "+0.00 FP" instead of
+    // falling through to its category line. Check for null explicitly. FXCATS
+    var pts = (c.pts == null) ? NaN : Number(c.pts);
     if (isNaN(pts)) continue;
     var target = alias[code];
     if (!target) { unscored.push(code); continue; }
@@ -105253,6 +105283,53 @@ function _fxNhlCtxFor(summary, teamId, stateHint, detailHint, athleteId) {
     }
     return { final: true, ot: !!ot, won: !!won, goalieCount: goalieCount, pbp: pbp };
   } catch (e) { return null; }
+}
+
+// ── Category stat line ── FXCATS ──
+// A Fantrax categories league has no fantasy points to compute — the
+// categories ARE the scoring. But the same alias table that maps a category
+// to an ESPN box label for points leagues works just as well here, so the hub
+// can show exactly the stats THIS league counts, in the league's own order,
+// rather than a generic line or nothing at all. Yahoo and ESPN cats leagues
+// already get this treatment; Fantrax didn't, because its settings parse
+// dropped every point-less category before anything downstream saw it.
+//
+// Returns a string like "1 G · 1 BS · 12:41 TOI", or '' when the box carries
+// none of the league's categories. Zeros are omitted so the line reads as a
+// contribution rather than a scorecard — matching the Yahoo cats stat line.
+function _fxCatStatLine(sport, scoring, statMap, pos, ctx) {
+  if (!scoring || !statMap) return '';
+  var grp = _fxGroupFor(scoring, sport, pos);
+  if (!grp || !grp.cats || !grp.cats.length) return '';
+  // Same derived values the scorer gets, so a cats league that counts wins or
+  // power-play goals shows them too. FXPBP / FXGOALIE
+  if (String(sport).toUpperCase() === 'NHL' && ctx && typeof _fxNhlDerived === 'function') {
+    var _d = _fxNhlDerived(statMap, pos, ctx);
+    var _copy = {}, _k;
+    for (_k in statMap) { if (statMap.hasOwnProperty(_k)) _copy[_k] = statMap[_k]; }
+    for (_k in _d) { if (_d.hasOwnProperty(_k)) _copy[_k] = _d[_k]; }
+    statMap = _copy;
+  }
+  var alias = _FX_ESPN_ALIAS[String(sport).toUpperCase()] || {};
+  var bits = [];
+  for (var i = 0; i < grp.cats.length; i++) {
+    var c = grp.cats[i];
+    var code = _fxCodeNorm(c.abbr || c.name);
+    var target = alias[code];
+    if (!target) continue;                       // no ESPN equivalent
+    var raw = _fxStatValue(statMap, target);
+    if (raw == null) continue;                   // box has no such column
+    // Clock-style values (TOI) keep their string form; counts drop at zero.
+    var disp = statMap[String(target).split(':')[0]];
+    if (typeof disp === 'string' && disp.indexOf(':') !== -1) {
+      if (disp === '0:00') continue;
+      bits.push(disp + ' ' + (c.abbr || code));
+      continue;
+    }
+    if (!raw) continue;                          // a zero is not a contribution
+    bits.push(raw + ' ' + (c.abbr || code));
+  }
+  return bits.join(' \u00b7 ');
 }
 
 // Stat map for an ESPN athlete id from whichever stadium box is open.
@@ -144402,8 +144479,14 @@ function _fxExtractScoring(data) {
         if (seen[dk]) continue;
         seen[dk] = 1;
         var pv = (cfg.points != null) ? parseFloat(cfg.points) : NaN;
-        if (isNaN(pv)) continue;
-        cats.push({ abbr: abbr, name: nm, pts: pv });
+        // A CATEGORY league's configs carry no points value — the category is
+        // whole scoring unit. Dropping those left out.groups empty and the
+        // whole parse returned null, so a cats league looked to the rest of
+        // the app exactly like a league whose settings had failed to load:
+        // no FP (correct) and no categories either (not correct). Keep it with
+        // pts null and a cat flag; the FP scorer already skips a non-numeric
+        // pts, so nothing starts being scored that shouldn't be. FXCATS
+        cats.push({ abbr: abbr, name: nm, pts: isNaN(pv) ? null : pv, cat: isNaN(pv) });
       }
       if (cats.length) out.groups.push({ name: String(gname), cats: cats });
     }
