@@ -28202,6 +28202,11 @@
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V10"/><path d="M12 20V4"/><path d="M20 20v-6"/></svg>
       <span>Games-played cap (this league)</span>
     </button>
+    <!-- FXSTANDPROBE — does Fantrax send per-category roto ranks? -->
+    <button class="sk-account-item" onclick="skProbeFantraxStandings(); skCloseAccountMenu();">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V8M10 20V4M16 20v-9M22 20H2"/></svg>
+      <span>Probe Fantrax standings (roto/cats)</span>
+    </button>
     <!-- FXROSTERPROBE — what a Fantrax roster item actually carries -->
     <button class="sk-account-item" onclick="skProbeFantraxRoster(); skCloseAccountMenu();">
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>
@@ -105778,6 +105783,100 @@ function _fxScoreTitle(res) {
 // players who are actually starting. Rather than guess at the field name,
 // this dumps every key on a real roster item with a sample value, plus a
 // count of distinct values per key so a status/slot field is obvious.
+// ── Fantrax standings probe ── FXSTANDPROBE ──
+// A roto league is not scored on stat × value — it is scored on RANKS. Each
+// team is ranked in every category, those ranks become points, and the sum is
+// the standing. So the question that decides how a roto view can be built is:
+// does Fantrax's standings payload carry per-category totals and ranks, or
+// only the final points column?
+//
+// If it does, the whole roto picture is a render away. If it doesn't, the
+// category totals have to be reconstructed from every team's roster, which
+// drifts from Fantrax's official numbers the moment a transaction or a
+// lineup lock is involved. Worth knowing which before building either.
+function skProbeFantraxStandings() {
+  var lines = [];
+  function say(t) { lines.push(t); }
+  var rows = (typeof extLeagues !== 'undefined' && extLeagues) ? extLeagues : [];
+  var fx = rows.filter(function (r) { return r && r.provider === 'fantrax'; });
+  if (!fx.length) { _skGpProbeShow('No Fantrax leagues synced.'); return; }
+
+  var pending = 0, done = 0;
+  fx.forEach(function (row) {
+    var fmt = (typeof extFormatKey === 'function') ? extFormatKey(row) : '';
+    // Roto and categories leagues are the interesting ones; a points league
+    // has nothing per-category to carry.
+    if (fmt !== 'roto' && fmt !== 'head') return;
+    pending++;
+    var id = String(row.key || '').slice(4);
+    fxFetchJson('https://www.fantrax.com/fxea/general/getStandings?leagueId=' +
+      encodeURIComponent(id))
+      .then(function (data) {
+        say('\u2500\u2500 ' + (row.name || row.key) + ' \u2500\u2500');
+        say('sport: ' + String(row.sport || '?').toUpperCase() + '   format: ' + fmt);
+        var arr = null;
+        if (Object.prototype.toString.call(data) === '[object Array]') arr = data;
+        else if (data && Object.prototype.toString.call(data.standings) === '[object Array]') arr = data.standings;
+        else if (data && data.standings && Object.prototype.toString.call(data.standings.rows) === '[object Array]') arr = data.standings.rows;
+
+        // Top-level shape first — a category block may live beside the rows
+        // rather than inside them.
+        var tk = [];
+        if (data && typeof data === 'object' && !Array.isArray(data)) {
+          for (var k in data) {
+            if (!data.hasOwnProperty(k)) continue;
+            var v = data[k];
+            tk.push(k + ':' + (Array.isArray(v) ? ('array[' + v.length + ']')
+                    : (v && typeof v === 'object') ? 'object' : typeof v));
+          }
+        }
+        say('top-level: ' + (tk.length ? tk.join('  ') : '(array)'));
+        if (!arr || !arr.length) {
+          say('  no standings rows found');
+          say(JSON.stringify(data).slice(0, 700));
+          say('');
+        } else {
+          say('rows: ' + arr.length);
+          say('first row in full:');
+          say('  ' + JSON.stringify(arr[0]).slice(0, 900));
+          say('');
+          // Anything that looks like per-category data, anywhere.
+          var hits = [];
+          (function scan(node, path, depth) {
+            if (!node || depth > 5 || typeof node !== 'object' || hits.length > 25) return;
+            for (var k2 in node) {
+              if (!node.hasOwnProperty(k2)) continue;
+              if (/categor|stat|rank|points?By|scores?By|cat[A-Z_]/i.test(k2)) {
+                var v2 = node[k2];
+                hits.push(path + '.' + k2 + ' = ' +
+                  ((v2 && typeof v2 === 'object') ? JSON.stringify(v2).slice(0, 200) : JSON.stringify(v2)));
+              }
+              if (node[k2] && typeof node[k2] === 'object') scan(node[k2], path + '.' + k2, depth + 1);
+            }
+          })(arr[0], 'row0', 0);
+          say('category-ish fields on row 0:');
+          if (!hits.length) say('  (none \u2014 standings carry the total only)');
+          for (var h = 0; h < hits.length; h++) say('  ' + hits[h]);
+          say('');
+        }
+      })
+      ['catch'](function (e) {
+        say('\u2500\u2500 ' + (row.name || row.key) + ' \u2500\u2500');
+        say('  fetch failed: ' + (e && e.message ? e.message : 'unknown'));
+        say('');
+      })
+      .then(function () {
+        done++;
+        if (done >= pending) {
+          say('If per-category totals and ranks are here, a roto board is a render.');
+          say('If only a total is here, they have to be rebuilt from rosters.');
+          _skGpProbeShow(lines.join('\n'));
+        }
+      });
+  });
+  if (!pending) _skGpProbeShow('No Fantrax roto or categories leagues synced yet.');
+}
+
 function skProbeFantraxRoster() {
   var lines = [];
   function say(t) { lines.push(t); }
