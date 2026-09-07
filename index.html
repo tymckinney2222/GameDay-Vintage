@@ -104866,6 +104866,12 @@ var _FX_ESPN_ALIAS = {
     GOALIE_LOSSES: '_L', LOSSES: '_L', L: '_L',
     OVERTIME_LOSSES: '_OTL', OTL: '_OTL', OT_LOSSES: '_OTL',
     SHUTOUTS: '_SO', SHUTOUT: '_SO', SHO: '_SO',
+    // Derived from play-by-play. No box score carries the strength split, but
+    // every ESPN play does. FXPBP
+    POWER_PLAY_GOALS: '_PPG', POWER_PLAY_ASSISTS: '_PPA', POWER_PLAY_POINTS: '_PPP',
+    PPG: '_PPG', PPA: '_PPA', PPP: '_PPP',
+    SHORT_HANDED_GOALS: '_SHG', SHORT_HANDED_ASSISTS: '_SHA', SHORT_HANDED_POINTS: '_SHP',
+    SHG: '_SHG', SHA: '_SHA', SHP: '_SHP',
     // short forms, in case a league exports them
     G: 'G', A: 'A', PTS: 'P', PIM: 'PIM', SOG: 'S', HIT: 'HT', BLK: 'BS', GA: 'GA', SV: 'SV'
   },
@@ -104885,15 +104891,21 @@ var _FX_ESPN_ALIAS = {
 // PPG/PPA/SHG/SHA are recoverable even though the skater box omits them.
 var _FX_ESPN_DERIVED = {
   NHL: {
-    GOALIE_WINS: 'game state: final, team won, goalie of record',
-    WINS: 'game state: final, team won, goalie of record',
-    GOALIE_LOSSES: 'game state', LOSSES: 'game state', OVERTIME_LOSSES: 'game state',
-    SHUTOUTS: 'box: GA 0 with full TOI on a final',
+    // DONE — implemented in _fxNhlDerived / _fxNhlPbpFor. Left here as the
+    // record of where each category's value actually comes from. FXPBP
+    GOALIE_WINS: 'DONE game state: final, sole goalie, team won',
+    WINS: 'DONE game state: final, sole goalie, team won',
+    GOALIE_LOSSES: 'DONE game state', LOSSES: 'DONE game state',
+    OVERTIME_LOSSES: 'DONE game state: Final/OT or Final/SO',
+    SHUTOUTS: 'DONE box: GA 0, sole goalie, on a final',
+    GOALIE_ASSISTS: 'DONE play-by-play: participants type=assister',
     GOALS_AGAINST_AVERAGE: 'box: GA / TOI', GOALIE_STARTS: 'box: TOI > 0',
-    POWER_PLAY_GOALS: 'play-by-play: PP scoring plays', POWER_PLAY_ASSISTS: 'play-by-play: PP scoring plays',
-    POWER_PLAY_POINTS: 'play-by-play: PP scoring plays',
-    SHORT_HANDED_GOALS: 'play-by-play: SH scoring plays', SHORT_HANDED_ASSISTS: 'play-by-play: SH scoring plays',
-    SHORT_HANDED_POINTS: 'play-by-play: SH scoring plays',
+    POWER_PLAY_GOALS: 'DONE play-by-play: strength + participants',
+    POWER_PLAY_ASSISTS: 'DONE play-by-play: strength + participants',
+    POWER_PLAY_POINTS: 'DONE play-by-play: PPG + PPA',
+    SHORT_HANDED_GOALS: 'DONE play-by-play: strength + participants',
+    SHORT_HANDED_ASSISTS: 'DONE play-by-play: strength + participants',
+    SHORT_HANDED_POINTS: 'DONE play-by-play: SHG + SHA',
     GAME_WINNING_GOALS: 'play-by-play: final + scoring order',
     HAT_TRICKS: 'box: G >= 3'
   },
@@ -104935,7 +104947,26 @@ function _fxIsGoaliePos(pos) { return /^G$/i.test(String(pos || '').trim()); }
 // ctx: { final, ot, won, goalieCount } for the goalie's OWN team.
 function _fxNhlDerived(statMap, pos, ctx) {
   var out = {};
-  if (!ctx || !ctx.final || !statMap) return out;
+  if (!ctx || !statMap) return out;
+
+  // ── From play-by-play ── FXPBP ──
+  // Applies live as well as final, to any position. Power-play and
+  // short-handed splits appear in NO box score, so they're always taken from
+  // here. Goals and assists are DIFFERENT: the skater box already carries G
+  // and A, and counting them twice would be worse than not having them, so
+  // play-by-play only ever FILLS A GAP the box left — which in practice means
+  // goalies, whose group has no G/A/P columns at all.
+  var pbp = ctx.pbp;
+  if (pbp) {
+    out._PPG = pbp.ppg; out._PPA = pbp.ppa; out._PPP = pbp.ppg + pbp.ppa;
+    out._SHG = pbp.shg; out._SHA = pbp.sha; out._SHP = pbp.shg + pbp.sha;
+    if (statMap.A == null || statMap.A === '') out.A = pbp.a;
+    if (statMap.G == null || statMap.G === '') out.G = pbp.g;
+    if (statMap.P == null || statMap.P === '') out.P = pbp.g + pbp.a;
+  }
+
+  // ── Goalie decision ── FXGOALIE ── final games only.
+  if (!ctx.final) return out;
   if (!_fxIsGoaliePos(pos)) return out;
   if (ctx.goalieCount !== 1) return out;   // can't attribute the decision
   if (ctx.won) { out._W = 1; out._L = 0; out._OTL = 0; }
@@ -105029,17 +105060,70 @@ function _fxScoreStatMap(sport, scoring, statMap, pos, ctx) {
   return { fp: Math.round(fp * 100) / 100, scored: scored, unscored: unscored, nodata: nodata };
 }
 
+// ── Play-by-play scoring stats ── FXPBP ──
+// The probe settled both open questions. ESPN's plays array carries, on every
+// play: a strength object ({id, text, abbreviation} — "Even Strength",
+// id 701) and a participants array whose entries carry athlete.id and a type
+// "scorer" or "assister". So neither prose parsing nor a second source is
+// needed — goals, assists and their strength are all structured, joined by
+// ESPN athlete id.
+//
+// This is how a goalie's assist becomes scorable: the goalie box has no A
+// column at all, but the goalie appears in the scoring play's participants
+// exactly like any skater does.
+//
+// Returns null when there is no plays array (pre-game, or a summary that
+// hasn't filled in) so those categories keep reading "no data" rather than
+// being reported as a false zero.
+function _fxNhlPbpFor(summary, athleteId) {
+  if (!summary || !athleteId) return null;
+  var plays = summary.plays;
+  if (!plays || !plays.length) return null;
+  var id = String(athleteId);
+  var out = { g: 0, a: 0, ppg: 0, ppa: 0, shg: 0, sha: 0 };
+  for (var i = 0; i < plays.length; i++) {
+    var pl = plays[i];
+    if (!pl || pl.scoringPlay !== true) continue;
+    // Shootout "goals" advance the score but credit no player statistically,
+    // so period 5+ is skipped. Regulation is 1-3, overtime is 4.
+    var pnum = pl.period && pl.period.number;
+    if (pnum != null && Number(pnum) > 4) continue;
+    var st = (pl.strength && (pl.strength.abbreviation || pl.strength.text)) || '';
+    // Matched loosely on purpose: the probe only proved "even-strength"
+    // (id 701) first-hand, so power-play and short-handed are matched by word
+    // rather than by an exact abbreviation guessed at.
+    var isPP = /power/i.test(st), isSH = /short/i.test(st);
+    var parts = pl.participants || [];
+    for (var q = 0; q < parts.length; q++) {
+      var ath = parts[q] && parts[q].athlete;
+      if (!ath || String(ath.id) !== id) continue;
+      var ty = String(parts[q].type || '').toLowerCase();
+      if (ty === 'scorer') {
+        out.g++; if (isPP) out.ppg++; else if (isSH) out.shg++;
+      } else if (ty === 'assister') {
+        out.a++; if (isPP) out.ppa++; else if (isSH) out.sha++;
+      }
+    }
+  }
+  return out;
+}
+
 // Goalie-decision context for ONE team out of an ESPN summary. FXGOALIE
 // Returns { final, ot, won, goalieCount } or null when the pieces aren't
 // there — the deriver treats null as "don't derive", never as a zero.
-function _fxNhlCtxFor(summary, teamId, stateHint, detailHint) {
+function _fxNhlCtxFor(summary, teamId, stateHint, detailHint, athleteId) {
   try {
     if (!summary || teamId == null) return null;
     var comp = null;
     try { comp = summary.header.competitions[0]; } catch (e0) {}
     var status = (comp && comp.status) || (summary.header && summary.header.status) || null;
     var state = stateHint || ((status && status.type && status.type.state) || '');
-    if (state !== 'post') return null;      // only a finished game has a decision
+    // Play-by-play stats accrue LIVE, so they're gathered whatever the state.
+    // Only the goalie decision needs a finished game. FXPBP
+    var pbp = _fxNhlPbpFor(summary, athleteId);
+    if (state !== 'post') {
+      return { final: false, ot: false, won: false, goalieCount: 0, pbp: pbp };
+    }
     var detail = String(detailHint ||
       (status && status.type && (status.type.shortDetail || status.type.detail)) || '');
     var period = parseInt((status && status.period), 10);
@@ -105062,7 +105146,7 @@ function _fxNhlCtxFor(summary, teamId, stateHint, detailHint) {
     }
     // ESPN sets a winner flag on finals; scores are the fallback.
     if (won == null && myScore != null && oppScore != null) won = (myScore > oppScore);
-    if (won == null) return null;
+    if (won == null) return { final: false, ot: false, won: false, goalieCount: 0, pbp: pbp };
     // How many goalies this team dressed AND played. The deriver refuses to
     // attribute a decision unless this is exactly one.
     var goalieCount = 0;
@@ -105087,7 +105171,7 @@ function _fxNhlCtxFor(summary, teamId, stateHint, detailHint) {
         }
       }
     }
-    return { final: true, ot: !!ot, won: !!won, goalieCount: goalieCount };
+    return { final: true, ot: !!ot, won: !!won, goalieCount: goalieCount, pbp: pbp };
   } catch (e) { return null; }
 }
 
@@ -105116,7 +105200,7 @@ function _fxStadiumStatMap(espnId) {
           // where the box already tells us. FXGOALIE
           var myTid = (teams[t].team && teams[t].team.id) || null;
           return { statMap: m, pos: (who.position && who.position.abbreviation) || '',
-                   ctx: _fxNhlCtxFor(boxes[b].d, myTid, '', '') };
+                   ctx: _fxNhlCtxFor(boxes[b].d, myTid, '', '', who.id) };   // FXPBP
         }
       }
     }
@@ -147495,7 +147579,7 @@ function _ftxParseBox(j, SPORT, g) {
                                 // summary in hand. FXGOALIE
                                 ctx: (SPORT === 'NHL' && typeof _fxNhlCtxFor === 'function')
                                   ? _fxNhlCtxFor(j, (teams[t].team && teams[t].team.id) || null,
-                                                 g.state, g.detail)
+                                                 g.state, g.detail, who.id)   // FXPBP
                                   : null };
             }
           }
