@@ -958,6 +958,14 @@
     border: 5px solid transparent; border-top-color: #0a0c12; z-index: 60;
     pointer-events: none;
   }
+  /* Flipped below the tag when there's no room above it. FXTIP */
+  .ftx-fp[data-tip].tip-open.tip-below::after {
+    bottom: auto; top: calc(100% + 6px);
+  }
+  .ftx-fp[data-tip].tip-open.tip-below::before {
+    bottom: auto; top: calc(100% + 1px);
+    border-top-color: transparent; border-bottom-color: #0a0c12;
+  }
 
   /* ── Vs the League grid ── VSLEAGUE ── */
   .sk-vsl { margin: 12px 0 0; border-radius: 12px; background: rgba(255,255,255,0.03);
@@ -6549,6 +6557,14 @@
     content: ''; position: absolute; bottom: calc(100% + 1px); right: 10px;
     border: 5px solid transparent; border-top-color: #0a0c12; z-index: 60;
     pointer-events: none;
+  }
+  /* Flipped below the tag when there's no room above it. FXTIP */
+  .crs-fhub-fp[data-tip].tip-open.tip-below::after {
+    bottom: auto; top: calc(100% + 6px);
+  }
+  .crs-fhub-fp[data-tip].tip-open.tip-below::before {
+    bottom: auto; top: calc(100% + 1px);
+    border-top-color: transparent; border-bottom-color: #0a0c12;
   }
   .crs-fhub-empty {
     text-align: center; padding: 40px 24px; color: rgba(255,255,255,0.4);
@@ -43700,8 +43716,21 @@ function _courtSetTip(el) {
   if (!el) return;
   var wasOpen = el.classList.contains('tip-open');
   var open = document.querySelectorAll(_TIP_SEL);
-  for (var i = 0; i < open.length; i++) open[i].classList.remove('tip-open');
-  if (!wasOpen) el.classList.add('tip-open');
+  for (var i = 0; i < open.length; i++) {
+    open[i].classList.remove('tip-open');
+    open[i].classList.remove('tip-below');
+  }
+  if (!wasOpen) {
+    el.classList.add('tip-open');
+    // These tooltips sit ABOVE their tag, which runs off the top of the screen
+    // when the tag is in the first row of a modal — the top card was showing
+    // only its last line. Flip underneath when there isn't room above. The
+    // threshold covers a four-line breakdown plus padding. FXTIP
+    try {
+      var r = el.getBoundingClientRect();
+      if (r.top < 110) el.classList.add('tip-below');
+    } catch (e) {}
+  }
 }
 document.addEventListener('click', function (e) {
   // Taps that landed inside a tooltip host are handled by _courtSetTip.
@@ -43715,7 +43744,10 @@ document.addEventListener('click', function (e) {
     n = n.parentNode;
   }
   var open = document.querySelectorAll(_TIP_SEL);
-  for (var i = 0; i < open.length; i++) open[i].classList.remove('tip-open');
+  for (var i = 0; i < open.length; i++) {
+    open[i].classList.remove('tip-open');
+    open[i].classList.remove('tip-below');   // FXTIP
+  }
 }, true);
 
 function renderCourt() {
@@ -70653,7 +70685,7 @@ function _extFhubRowsFor(at, idx, sport) {
       // id, so no name matching is needed here. FXENGINE
       var sm = _fxStadiumStatMap(at.espnId);
       if (sm) {
-        var res = _fxScoreStatMap(sport, row.scoring, sm.statMap, sm.pos);
+        var res = _fxScoreStatMap(sport, row.scoring, sm.statMap, sm.pos, sm.ctx);   // FXGOALIE
         if (res) { fp = Math.round(res.fp * 100) / 100; calc = true; calcTitle = _fxScoreTitle(res); }
       }
     }
@@ -104810,6 +104842,16 @@ var _FX_ESPN_ALIAS = {
     TIME_ON_ICE: 'TOI', SHIFTS: 'SHFT', POWER_PLAY_TIME_ON_ICE: 'PPTOI',
     // goalies
     GOALS_AGAINST: 'GA', SHOTS_AGAINST: 'SA', SAVES: 'SV', SAVE_PERCENTAGE: 'SV%',
+    // Derived goalie decisions. These point at synthetic keys that
+    // _fxNhlDerived writes into the stat map from the game's final state —
+    // ESPN's goalie box carries SA/GA/SV/TOI and nothing about who got the
+    // decision. When the game isn't final, or the decision can't be safely
+    // attributed, the key is simply absent and the category reports as
+    // unscored exactly as it did before. FXGOALIE
+    GOALIE_WINS: '_W', WINS: '_W', W: '_W',
+    GOALIE_LOSSES: '_L', LOSSES: '_L', L: '_L',
+    OVERTIME_LOSSES: '_OTL', OTL: '_OTL', OT_LOSSES: '_OTL',
+    SHUTOUTS: '_SO', SHUTOUT: '_SO', SHO: '_SO',
     // short forms, in case a league exports them
     G: 'G', A: 'A', PTS: 'P', PIM: 'PIM', SOG: 'S', HIT: 'HT', BLK: 'BS', GA: 'GA', SV: 'SV'
   },
@@ -104862,6 +104904,36 @@ var _FX_ESPN_DERIVED = {
 // are worth 1 there, not the skater 2. Basketball has one group.
 function _fxIsGoaliePos(pos) { return /^G$/i.test(String(pos || '').trim()); }
 
+// ── Goalie decisions from game state ── FXGOALIE ──
+// ESPN's goalie box line is SA / GA / SV / SV% / TOI. The decision — win,
+// loss, OT loss, shutout — is nowhere in it, which is why a goalie's FP came
+// up short by exactly the win bonus and GOALIE_WINS showed as "not scored".
+//
+// The decision is derivable from the final score plus which goalie was in
+// net, and that second part is the constraint that matters. The NHL awards
+// the win to the goalie of record — whoever was in net when his team took
+// the lead for good — and nothing in the box identifies him. So this derives
+// a decision ONLY when the team used exactly ONE goalie. With a single goalie
+// the goalie of record is unambiguous; with two, guessing from time on ice
+// would be wrong often enough to be worse than reporting nothing, so both
+// keys stay absent and the category continues to read as unscored.
+//
+// ctx: { final, ot, won, goalieCount } for the goalie's OWN team.
+function _fxNhlDerived(statMap, pos, ctx) {
+  var out = {};
+  if (!ctx || !ctx.final || !statMap) return out;
+  if (!_fxIsGoaliePos(pos)) return out;
+  if (ctx.goalieCount !== 1) return out;   // can't attribute the decision
+  if (ctx.won) { out._W = 1; out._L = 0; out._OTL = 0; }
+  else if (ctx.ot) { out._W = 0; out._L = 0; out._OTL = 1; }
+  else { out._W = 0; out._L = 1; out._OTL = 0; }
+  // Shutout is the sole goalie finishing on zero goals against. A win is NOT
+  // required: a 0-0 game decided in a shootout credits both goalies with one.
+  var ga = parseFloat(String(statMap.GA == null ? '' : statMap.GA));
+  if (!isNaN(ga)) out._SO = (ga === 0) ? 1 : 0;
+  return out;
+}
+
 function _fxGroupFor(scoring, sport, pos) {
   if (!scoring || !scoring.groups || !scoring.groups.length) return null;
   if (scoring.groups.length === 1) return scoring.groups[0];
@@ -104892,9 +104964,22 @@ function _fxStatValue(statMap, target) {
 
 // -> { fp, scored:[{code,pts,val,contrib}], unscored:[code] } or null when
 // the league has no scoring or the box carries nothing scorable.
-function _fxScoreStatMap(sport, scoring, statMap, pos) {
+function _fxScoreStatMap(sport, scoring, statMap, pos, ctx) {
   var grp = _fxGroupFor(scoring, sport, pos);
   if (!grp || !statMap) return null;
+  // Derived values ride alongside the box labels in a COPY, so the cached
+  // stat map stays exactly what ESPN sent. FXGOALIE
+  if (String(sport).toUpperCase() === 'NHL' && ctx) {
+    var _d = _fxNhlDerived(statMap, pos, ctx);
+    var _has = false, _dk;
+    for (_dk in _d) { if (_d.hasOwnProperty(_dk)) { _has = true; break; } }
+    if (_has) {
+      var _copy = {};
+      for (_dk in statMap) { if (statMap.hasOwnProperty(_dk)) _copy[_dk] = statMap[_dk]; }
+      for (_dk in _d) { if (_d.hasOwnProperty(_dk)) _copy[_dk] = _d[_dk]; }
+      statMap = _copy;
+    }
+  }
   var alias = _FX_ESPN_ALIAS[String(sport).toUpperCase()] || {};
   var fp = 0, scored = [], unscored = [], any = false;
   for (var i = 0; i < grp.cats.length; i++) {
@@ -104921,6 +105006,68 @@ function _fxScoreStatMap(sport, scoring, statMap, pos) {
   return { fp: Math.round(fp * 100) / 100, scored: scored, unscored: unscored };
 }
 
+// Goalie-decision context for ONE team out of an ESPN summary. FXGOALIE
+// Returns { final, ot, won, goalieCount } or null when the pieces aren't
+// there — the deriver treats null as "don't derive", never as a zero.
+function _fxNhlCtxFor(summary, teamId, stateHint, detailHint) {
+  try {
+    if (!summary || teamId == null) return null;
+    var comp = null;
+    try { comp = summary.header.competitions[0]; } catch (e0) {}
+    var status = (comp && comp.status) || (summary.header && summary.header.status) || null;
+    var state = stateHint || ((status && status.type && status.type.state) || '');
+    if (state !== 'post') return null;      // only a finished game has a decision
+    var detail = String(detailHint ||
+      (status && status.type && (status.type.shortDetail || status.type.detail)) || '');
+    var period = parseInt((status && status.period), 10);
+    // "Final/OT", "Final/SO", or a period past regulation. An OT/SO loss is a
+    // different category from a regulation loss in most Fantrax systems.
+    var ot = /\/(OT|SO)\b/i.test(detail) || /\bOT\b|\bSO\b/i.test(detail) ||
+             (!isNaN(period) && period > 3);
+    var comps = (comp && comp.competitors) || [];
+    var won = null, myScore = null, oppScore = null;
+    for (var i = 0; i < comps.length; i++) {
+      var cid = String((comps[i].team && comps[i].team.id) || comps[i].id || '');
+      var sc = parseFloat(comps[i].score);
+      if (cid === String(teamId)) {
+        myScore = isNaN(sc) ? null : sc;
+        if (comps[i].winner === true) won = true;
+        else if (comps[i].winner === false) won = false;
+      } else if (oppScore == null) {
+        oppScore = isNaN(sc) ? null : sc;
+      }
+    }
+    // ESPN sets a winner flag on finals; scores are the fallback.
+    if (won == null && myScore != null && oppScore != null) won = (myScore > oppScore);
+    if (won == null) return null;
+    // How many goalies this team dressed AND played. The deriver refuses to
+    // attribute a decision unless this is exactly one.
+    var goalieCount = 0;
+    var teams = ((summary.boxscore || {}).players) || [];
+    for (var t = 0; t < teams.length; t++) {
+      var tid = String((teams[t].team && teams[t].team.id) || '');
+      if (tid !== String(teamId)) continue;
+      var groups = teams[t].statistics || [];
+      for (var g = 0; g < groups.length; g++) {
+        var gname = String(groups[g].name || groups[g].text || '').toLowerCase();
+        if (!/goal/.test(gname)) continue;
+        var aths = groups[g].athletes || [];
+        for (var a = 0; a < aths.length; a++) {
+          // A dressed backup who never took the ice has no line to speak of.
+          var vals = aths[a].stats || [];
+          var any = false;
+          for (var v = 0; v < vals.length; v++) {
+            var sv = String(vals[v] == null ? '' : vals[v]).trim();
+            if (sv !== '' && sv !== '--' && sv !== '0:00') { any = true; break; }
+          }
+          if (any) goalieCount++;
+        }
+      }
+    }
+    return { final: true, ot: !!ot, won: !!won, goalieCount: goalieCount };
+  } catch (e) { return null; }
+}
+
 // Stat map for an ESPN athlete id from whichever stadium box is open.
 function _fxStadiumStatMap(espnId) {
   var id = String(espnId || '');
@@ -104942,7 +105089,11 @@ function _fxStadiumStatMap(espnId) {
           var m = {};
           var vals = aths[a].stats || [];
           for (var i = 0; i < labels.length && i < vals.length; i++) m[String(labels[i])] = vals[i];
-          return { statMap: m, pos: (who.position && who.position.abbreviation) || '' };
+          // Which team he's on decides the decision, so it's resolved here
+          // where the box already tells us. FXGOALIE
+          var myTid = (teams[t].team && teams[t].team.id) || null;
+          return { statMap: m, pos: (who.position && who.position.abbreviation) || '',
+                   ctx: _fxNhlCtxFor(boxes[b].d, myTid, '', '') };
         }
       }
     }
@@ -145398,7 +145549,7 @@ function _fxLineupFill(row, bodyEl, headEl) {
         // FXENGINE — calculated FP in the lineup modal too
         (function () {
           if (!_lv || !_lv.statMap || !row || !row.scoring || typeof _fxScoreStatMap !== 'function') return '';
-          var res = _fxScoreStatMap(SPORT, row.scoring, _lv.statMap, _lv.pos || players[p].pos);
+          var res = _fxScoreStatMap(SPORT, row.scoring, _lv.statMap, _lv.pos || players[p].pos, _lv.ctx);   // FXGOALIE
           if (!res) return '';
           // FXPREC — two decimals: this is our arithmetic, and 4.15 vs 4.2 is
           // the difference between confirming the engine and hiding a gap.
@@ -147223,7 +147374,14 @@ function _ftxParseBox(j, SPORT, g) {
               for (var _v = 0; _v < labels.length && _v < vals.length; _v++) _sm[String(labels[_v] || '')] = vals[_v];
               out[keys[kk]] = { line: bits.join('\u0001'), live: (g.state === 'in'),
                                 detail: g.detail || '', statMap: _sm,
-                                pos: (who.position && who.position.abbreviation) || '' };
+                                pos: (who.position && who.position.abbreviation) || '',
+                                // Goalie decision context for THIS athlete's
+                                // team, resolved while we still have the
+                                // summary in hand. FXGOALIE
+                                ctx: (SPORT === 'NHL' && typeof _fxNhlCtxFor === 'function')
+                                  ? _fxNhlCtxFor(j, (teams[t].team && teams[t].team.id) || null,
+                                                 g.state, g.detail)
+                                  : null };
             }
           }
         }
@@ -147539,7 +147697,7 @@ function _ftxRosterRowsHtml(row, myTeam) {
               // this league's own settings. FXENGINE
               (function () {
                 if (!_lv || !_lv.statMap || !row.scoring || typeof _fxScoreStatMap !== 'function') return '';
-                var res = _fxScoreStatMap(SPORT, row.scoring, _lv.statMap, _lv.pos || e.res.pos);
+                var res = _fxScoreStatMap(SPORT, row.scoring, _lv.statMap, _lv.pos || e.res.pos, _lv.ctx);   // FXGOALIE
                 if (!res) return '';
                 // FXPREC — two decimals, same reason as the lineup modal.
                 // FXTIP - data-tip + tap toggle, not title=.
