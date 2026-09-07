@@ -6528,8 +6528,12 @@
   .fx-catline {
     font-family: var(--sk-font-mono, monospace); font-size: 9px;
     color: rgba(255,255,255,0.55); letter-spacing: 0.01em;
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-    display: block;
+    display: block; line-height: 1.45;
+    /* A cats league can count a dozen things. One nowrap line meant every
+       category after the second fell off the end, so this wraps to two and
+       only then ellipsises. FXCATS */
+    white-space: normal; overflow: hidden;
+    display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
   }
   .crs-fhub-fp {
     font-family: 'Barlow Condensed', sans-serif; font-weight: 700; font-size: 11px;
@@ -105297,6 +105301,29 @@ function _fxNhlCtxFor(summary, teamId, stateHint, detailHint, athleteId) {
 // Returns a string like "1 G · 1 BS · 12:41 TOI", or '' when the box carries
 // none of the league's categories. Zeros are omitted so the line reads as a
 // contribution rather than a scorecard — matching the Yahoo cats stat line.
+// Display label for a category. Fantrax names its categories with long codes
+// ("INDIVIDUAL_FACEOFFS_WON"), which is unreadable in a one-line stat line and
+// pushed everything after the second category off the end. The ESPN box label
+// the category already maps to is the natural short form — and it's the same
+// abbreviation shown as a column header in the box score above, so the two
+// read consistently. Derived keys get an explicit label since their target is
+// a synthetic underscore key. FXCATS
+var _FX_CAT_LABEL = {
+  '_W': 'W', '_L': 'L', '_OTL': 'OTL', '_SO': 'SHO',
+  '_PPG': 'PPG', '_PPA': 'PPA', '_PPP': 'PPP',
+  '_SHG': 'SHG', '_SHA': 'SHA', '_SHP': 'SHP',
+  '3PT:made': '3PM', '3PT:att': '3PA', 'FG:made': 'FGM', 'FG:att': 'FGA',
+  'FT:made': 'FTM', 'FT:att': 'FTA'
+};
+function _fxCatLabel(target, code) {
+  if (_FX_CAT_LABEL[target]) return _FX_CAT_LABEL[target];
+  var t = String(target || '');
+  if (t && t.charAt(0) !== '_') return t.split(':')[0];
+  // No usable target — fall back to the code, trimmed of the provider's
+  // prefix noise rather than shown raw.
+  return String(code || '').replace(/_/g, ' ');
+}
+
 function _fxCatStatLine(sport, scoring, statMap, pos, ctx) {
   if (!scoring || !statMap) return '';
   var grp = _fxGroupFor(scoring, sport, pos);
@@ -105311,23 +105338,33 @@ function _fxCatStatLine(sport, scoring, statMap, pos, ctx) {
     statMap = _copy;
   }
   var alias = _FX_ESPN_ALIAS[String(sport).toUpperCase()] || {};
-  var bits = [];
+  var bits = [], missed = [];
   for (var i = 0; i < grp.cats.length; i++) {
     var c = grp.cats[i];
     var code = _fxCodeNorm(c.abbr || c.name);
     var target = alias[code];
-    if (!target) continue;                       // no ESPN equivalent
+    if (!target) { missed.push(code); continue; }   // no ESPN equivalent
     var raw = _fxStatValue(statMap, target);
-    if (raw == null) continue;                   // box has no such column
+    if (raw == null) { missed.push(code); continue; }  // box has no such column
+    var label = _fxCatLabel(target, code);
     // Clock-style values (TOI) keep their string form; counts drop at zero.
     var disp = statMap[String(target).split(':')[0]];
     if (typeof disp === 'string' && disp.indexOf(':') !== -1) {
       if (disp === '0:00') continue;
-      bits.push(disp + ' ' + (c.abbr || code));
+      bits.push(disp + ' ' + label);
       continue;
     }
     if (!raw) continue;                          // a zero is not a contribution
-    bits.push(raw + ' ' + (c.abbr || code));
+    bits.push(raw + ' ' + label);
+  }
+  // Categories this league counts that the box couldn't answer. Named rather
+  // than dropped, so a mapping gap is visible on screen instead of looking
+  // like the player simply did nothing. Same principle as the FP tooltip's
+  // "can't map" list. FXCATS
+  if (missed.length) {
+    _fxCatStatLine._lastMissed = missed;
+    bits.push('unmapped: ' + missed.slice(0, 4).join(', ') +
+      (missed.length > 4 ? ' +' + (missed.length - 4) : ''));
   }
   return bits.join(' \u00b7 ');
 }
@@ -105392,7 +105429,13 @@ function skProbeFantraxScoring() {
     say('\u2500\u2500 ' + (row.name || row.key) + ' \u2500\u2500');
     say('sport: ' + sport + '   format: ' + (fmt || '?'));
     if (!row.scoring || !row.scoring.groups) { say('  (scoring not loaded yet \u2014 open the league once, then re-run)'); say(''); return; }
-    if (fmt !== 'headpoint' && fmt !== 'point') { say('  categories league \u2014 skipped (points leagues only)'); say(''); return; }
+    // Categories leagues are now parsed too (FXCATS), and they need this
+    // report MORE than points leagues do: a cats league has no FP to check
+    // against Fantrax, so a missing mapping shows up only as a category that
+    // silently never appears in the stat line. Weighting is by count rather
+    // than by points, since a category carries no point value.
+    var _isCats = (fmt !== 'headpoint' && fmt !== 'point');
+    if (_isCats) say('  CATEGORIES league \u2014 no FP; coverage below is for the stat line.');
     anyPts = true;
     var alias = _FX_ESPN_ALIAS[sport] || {};
     var derived = _FX_ESPN_DERIVED[sport] || {};
@@ -105402,9 +105445,11 @@ function skProbeFantraxScoring() {
       g.cats.forEach(function (c) {
         var rawCode = String(c.abbr || c.name || '');
         var code = _fxCodeNorm(rawCode);   // FXCODES
-        var w = Math.abs(Number(c.pts) || 0);
+        // Points leagues weight by how much a category is worth; a cats
+        // league has no weights, so each category counts once.
+        var w = _isCats ? 1 : Math.abs(Number(c.pts) || 0);
         total += w;
-        var tag = (g.name ? g.name + ' \u00b7 ' : '') + code + ' (' + (c.pts != null ? c.pts : '?') + ')';
+        var tag = (g.name ? g.name + ' \u00b7 ' : '') + code + (_isCats ? '' : ' (' + (c.pts != null ? c.pts : '?') + ')');
         if (alias[code]) { mapped += w; mList.push(tag + ' \u2192 ' + alias[code]); }
         else if (derived[code]) {
           if (/^play-by-play/.test(derived[code])) { pbp += w; pList.push(tag + ' \u2014 ' + derived[code]); }
@@ -105413,7 +105458,7 @@ function skProbeFantraxScoring() {
       });
     });
     function pct(n) { return total ? Math.round(n / total * 100) + '%' : '\u2014'; }
-    say('  coverage by weight: box ' + pct(mapped) + ' \u00b7 game-state ' + pct(deriv) +
+    say('  coverage by ' + (_isCats ? 'category' : 'weight') + ': box ' + pct(mapped) + ' \u00b7 game-state ' + pct(deriv) +
         ' \u00b7 play-by-play ' + pct(pbp) + ' \u00b7 unknown ' + pct(missing));
     say('  READ STRAIGHT OFF THE BOX (' + mList.length + ')');
     mList.forEach(function (l) { say('    ' + l); });
@@ -105425,8 +105470,9 @@ function skProbeFantraxScoring() {
     xList.forEach(function (l) { say('    ' + l); });
     say('');
   });
-  if (!anyPts) say('(no points leagues with scoring loaded)');
-  say('Weight = |points per unit|, summed. It says which categories matter, not how often they occur.');
+  if (!anyPts) say('(no Fantrax leagues with scoring loaded \u2014 open one once, then re-run)');
+  say('Points leagues: weight = |points per unit|, summed \u2014 it says which categories matter,');
+  say('not how often they occur. Categories leagues: every category counts once.');
   _skGpProbeShow(lines.join('\n'));
 }
 
