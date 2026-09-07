@@ -106255,20 +106255,69 @@ function _fxCatLabel(target, code) {
   return String(code || '').replace(/_/g, ' ');
 }
 
+// Rate categories for ONE line. The day totals and the roto board compute
+// these from summed components across a roster; a single player's stat line
+// needs the same arithmetic over just his own numbers, and had nothing doing
+// it — so FG% and FT% resolved to the synthetic _FGP/_FTP keys, found no such
+// column, and reported as "unmapped" on every NBA card. FXRATE1
+function _fxRatesForLine(SPORT, statMap) {
+  var out = {};
+  var rates = _FX_RATE_CATS[SPORT] || {};
+  var parts = _FX_RATE_PARTS[SPORT] || { plain: [], clock: [], split: {} };
+  if (!statMap) return out;
+  var comps = {}, any = false;
+  (parts.clock || []).forEach(function (nm) {
+    var cm = _fxClockMinutes(statMap[nm]);
+    if (cm != null) { comps[nm] = cm; any = true; }
+  });
+  (parts.plain || []).forEach(function (nm) {
+    var v = parseFloat(String(statMap[nm] == null ? '' : statMap[nm]));
+    if (!isNaN(v)) { comps[nm] = v; any = true; }
+  });
+  for (var sp in (parts.split || {})) {
+    if (!parts.split.hasOwnProperty(sp)) continue;
+    var mv = _fxStatValue(statMap, sp + ':made'), av = _fxStatValue(statMap, sp + ':att');
+    if (mv != null) { comps[parts.split[sp][0]] = mv; any = true; }
+    if (av != null) { comps[parts.split[sp][1]] = av; any = true; }
+  }
+  if (!any) return out;
+  for (var t in rates) {
+    if (!rates.hasOwnProperty(t) || !rates[t]) continue;
+    var rv = rates[t].fn(comps);
+    // Null denominator means the rate genuinely doesn't exist for this line
+    // (0 attempts), which is different from the column being missing. Leaving
+    // it out lets the caller report it honestly either way.
+    if (rv != null) out[t] = Math.round(rv * 1000) / 1000;
+  }
+  return out;
+}
+
 function _fxCatStatLine(sport, scoring, statMap, pos, ctx) {
   if (!scoring || !statMap) return '';
   var grp = _fxGroupFor(scoring, sport, pos);
   if (!grp || !grp.cats || !grp.cats.length) return '';
-  // Same derived values the scorer gets, so a cats league that counts wins or
-  // power-play goals shows them too. FXPBP / FXGOALIE
-  if (String(sport).toUpperCase() === 'NHL' && ctx && typeof _fxNhlDerived === 'function') {
-    var _d = _fxNhlDerived(statMap, pos, ctx);
-    var _copy = {}, _k;
+  var SPORTU = String(sport).toUpperCase();
+  // Derived values, merged into a copy so the cached box line is untouched:
+  // NHL game-state and play-by-play figures, plus this line's own rate
+  // categories for every sport. FXPBP / FXGOALIE / FXRATE1
+  var _d = {}, _k;
+  if (SPORTU === 'NHL' && ctx && typeof _fxNhlDerived === 'function') {
+    var _dn = _fxNhlDerived(statMap, pos, ctx);
+    for (_k in _dn) { if (_dn.hasOwnProperty(_k)) _d[_k] = _dn[_k]; }
+  }
+  if (typeof _fxRatesForLine === 'function') {
+    var _dr = _fxRatesForLine(SPORTU, statMap);
+    for (_k in _dr) { if (_dr.hasOwnProperty(_k)) _d[_k] = _dr[_k]; }
+  }
+  var _hasD = false;
+  for (_k in _d) { if (_d.hasOwnProperty(_k)) { _hasD = true; break; } }
+  if (_hasD) {
+    var _copy = {};
     for (_k in statMap) { if (statMap.hasOwnProperty(_k)) _copy[_k] = statMap[_k]; }
     for (_k in _d) { if (_d.hasOwnProperty(_k)) _copy[_k] = _d[_k]; }
     statMap = _copy;
   }
-  var alias = _FX_ESPN_ALIAS[String(sport).toUpperCase()] || {};
+  var alias = _FX_ESPN_ALIAS[SPORTU] || {};
   var bits = [], missed = [];
   for (var i = 0; i < grp.cats.length; i++) {
     var c = grp.cats[i];
@@ -106276,8 +106325,23 @@ function _fxCatStatLine(sport, scoring, statMap, pos, ctx) {
     var target = alias[code];
     if (!target) { missed.push(code); continue; }   // no ESPN equivalent
     var raw = _fxStatValue(statMap, target);
-    if (raw == null) { missed.push(code); continue; }  // box has no such column
+    if (raw == null) {
+      // A rate with no denominator isn't a mapping failure — the player just
+      // hasn't attempted one. Skipped like a zero rather than reported as
+      // unmapped, which would send us hunting for an alias that's fine.
+      // FXRATE1
+      if ((_FX_RATE_CATS[SPORTU] || {})[target]) continue;
+      missed.push(code); continue;  // box has no such column
+    }
     var label = _fxCatLabel(target, code);
+    // Rates print at their own precision rather than as a bare number.
+    var _rc = (_FX_RATE_CATS[SPORTU] || {})[target];
+    if (_rc) {
+      var _rt = Number(raw).toFixed(_rc.dp);
+      if (_rc.strip0) _rt = _rt.replace(/^0/, '');
+      bits.push('<b class="fx-catv">' + slEsc(_rt) + '</b> ' + slEsc(label));
+      continue;
+    }
     // Clock-style values (TOI) keep their string form; counts drop at zero.
     var disp = statMap[String(target).split(':')[0]];
     if (typeof disp === 'string' && disp.indexOf(':') !== -1) {
