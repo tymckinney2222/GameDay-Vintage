@@ -119279,7 +119279,11 @@ function _skSearchWarmRosters() {
   // Nothing synced yet at all — load the league list first; its own
   // completion path fires the enrichers.
   if (!rows.length) {
-    if (typeof extLoadLeagues === 'function') { try { extLoadLeagues(); } catch (e0) {} }
+    // extLoadAll, not extLoadLeagues — the latter doesn't exist in this build,
+    // and the typeof guard meant the call silently did nothing. Same shape of
+    // mistake as the _nhlEspnAbbr guard: a name that reads plausibly, guarded
+    // into a no-op, so the failure is invisible. XPSEARCH
+    if (typeof extLoadAll === 'function') { try { extLoadAll(); } catch (e0) {} }
   } else if (missing()) {
     try { if (typeof extEnrichFantrax === 'function') extEnrichFantrax(); } catch (e1) {}
     try { if (typeof slEnrichLeagues === 'function') slEnrichLeagues(); } catch (e2) {}
@@ -119288,24 +119292,26 @@ function _skSearchWarmRosters() {
     return;   // everything already loaded
   }
 
-  var tries = 0, before = missing();
+  // Repaint on a TIMER, not only when the missing-count changes. Watching the
+  // count assumed extLeagues holds the same row objects the enrichers write
+  // to — it doesn't always, since a reload replaces the array — so rosters
+  // could land and the poll would never notice. Re-running the query is a
+  // local filter over a few hundred rows, cheap enough to just do. XPSEARCH
+  var tries = 0;
   var iv = setInterval(function () {
     tries++;
     var ov = document.getElementById('skSearchOverlay');
-    // Overlay closed, or rosters stopped arriving — stop either way.
-    if (!ov || !ov.classList.contains('open') || tries > 15) { clearInterval(iv); return; }
+    if (!ov || !ov.classList.contains('open') || tries > 16) { clearInterval(iv); return; }
     rows = (typeof extLeagues !== 'undefined' && extLeagues) ? extLeagues : [];
-    var now = missing();
-    if (now === before) return;
-    before = now;
-    // Repaint whatever the user is looking at with the newly-landed rosters.
     if (typeof _skSearchRenderSports === 'function') _skSearchRenderSports();
     var input = document.getElementById('skSearchInput');
     var q = input ? String(input.value || '').trim() : '';
     if (q.length >= 2) _skSearchRunQuery(q);
     else if (typeof _skSearchRenderHint === 'function') _skSearchRenderHint();
-    if (!now) clearInterval(iv);
-  }, 400);
+    // Everything that can arrive has. ESPN rosters are a lazy 1.5MB detail
+    // fetch and may never land here, so this is a best case, not a guarantee.
+    if (!missing()) clearInterval(iv);
+  }, 500);
 }
 
 function _skSearchRunQuery(query) {
@@ -137952,10 +137958,26 @@ function espFetchLeague(game, id, season, q) {
   });
 }
 
-function espTeamName(t) {
+function espTeamName(t, leagueId) {
   if (!t) return '';
   var n = t.name || ((t.location || '') + ' ' + (t.nickname || '')).trim();
-  return n || ('Team ' + t.id);
+  if (n) return n;
+  // The roster view's team object often carries only an id — no name,
+  // location or nickname — so this fell through to "Team 2" even though the
+  // light mTeam payload cached the real name at sync. Look there before
+  // giving up. ESPTEAMNAME
+  if (leagueId != null) {
+    try {
+      var meta = (typeof _espMeta === 'object' && _espMeta) ? _espMeta[leagueId] : null;
+      var list = (meta && meta.teams) || [];
+      for (var i = 0; i < list.length; i++) {
+        if (String(list[i].id) === String(t.id) && list[i].name) return list[i].name;
+      }
+    } catch (e) {}
+  }
+  // Abbreviation beats a bare id when that's all ESPN sent.
+  if (t.abbrev) return String(t.abbrev);
+  return 'Team ' + t.id;
 }
 
 // Cache the light payload's identity bits so the manage overlay can
@@ -138933,7 +138955,7 @@ function espRosters(j, game, scoredIds, sport) {
       if (r) return r;
       return (a.slotId || 0) - (b.slotId || 0);
     });
-    byTeam[String(t.id)] = { teamName: espTeamName(t), items: items };
+    byTeam[String(t.id)] = { teamName: espTeamName(t, (j && j.id) || null), items: items };   // ESPTEAMNAME
   }
   return {
     period: (j.scoringPeriodId != null) ? j.scoringPeriodId : null,
