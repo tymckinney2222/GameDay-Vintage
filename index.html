@@ -106193,9 +106193,42 @@ function _fxRotoRankOne(teams, target, lower) {
   return { pts: pts, rank: rank, order: rows };
 }
 
+// ── Season line units ── FXSEASONUNITS ──
+// ESPN reports an NBA season line as PER-GAME AVERAGES (the PPG/RPG/APG
+// convention), while MLB, NHL, NFL and CFB report cumulative TOTALS. Summing
+// averages across a roster produces a number with no meaning in roto — the
+// standings are cumulative — and it can never agree with Fantrax because the
+// units are different, not because the arithmetic is wrong.
+//
+// GP is in the same line, so an average converts back to a total exactly.
+// Percentages are left alone: they are not per-game quantities, and the
+// season line carries no makes/attempts to rebuild them from, which is why
+// FG% and FT% legitimately read as unavailable rather than as zero.
+var _FX_SEASON_PER_GAME = { NBA: true, GLEAGUE: true, NBASL: true, NCAAMB: true };
+
+function _fxSeasonToTotals(SPORT, statMap) {
+  if (!statMap || !_FX_SEASON_PER_GAME[String(SPORT).toUpperCase()]) return statMap;
+  var gp = parseFloat(String(statMap.GP == null ? '' : statMap.GP));
+  // No GP means no way to convert, and a guess here would be worse than an
+  // honest absence — hand the line back untouched.
+  if (isNaN(gp) || gp <= 0) return statMap;
+  var out = {}, k;
+  for (k in statMap) {
+    if (!statMap.hasOwnProperty(k)) continue;
+    var v = statMap[k];
+    if (k === 'GP' || String(k).indexOf('%') !== -1) { out[k] = v; continue; }
+    var n = parseFloat(String(v == null ? '' : v));
+    out[k] = isNaN(n) ? v : (n * gp);
+  }
+  return out;
+}
+
 // Build the whole board. One _skFetchEspnSeasonStats call per team (cached by
 // that function per sport+teamKey), so re-opening the tab is free. FXROTO2
+var _fxRotoPrior = false;   // FXROTOSEASON — stats came from a played season
+
 function _fxRotoBuild(row, onProgress) {
+  _fxRotoPrior = false;
   var SPORT = String(row.sport || '').toUpperCase();
   var sportKey = String(row.sport || '').toLowerCase();
   var cats = _fxRotoCats(row);
@@ -106219,6 +106252,29 @@ function _fxRotoBuild(row, onProgress) {
   }
   if (!teams.length) return Promise.resolve({ error: 'no-rosters' });
 
+  // ── Name preflight ── FXROTONAMES ──
+  // Fantrax roster items carry only an ID; the NAME comes from a dictionary
+  // loaded lazily. Without it every player is dropped as unresolved, every
+  // team's roster reads empty, and the board renders all-zero and all-tied —
+  // which then gets CACHED, so the zeros stick for the session. Exactly the
+  // bug the player search had. Load it first, then build.
+  var _needNames = false;
+  for (var _t0 = 0; _t0 < teams.length && !_needNames; _t0++) {
+    if (!teams[_t0].players.length) _needNames = true;
+  }
+  if (_needNames && typeof _extEnsureFtxNames === 'function' && !_fxRotoBuild._retry) {
+    return new Promise(function (resolve) {
+      _extEnsureFtxNames(function () {
+        _fxRotoBuild._retry = true;
+        _fxRotoBuild(row, onProgress).then(function (r) {
+          _fxRotoBuild._retry = false;
+          resolve(r);
+        })['catch'](function () { _fxRotoBuild._retry = false; resolve({ error: 'no-rosters' }); });
+      });
+    });
+  }
+  _fxRotoBuild._retry = false;
+
   var doneN = 0;
   return Promise.all(teams.map(function (tm) {
     // teamKey is the season-stat cache key, so each Fantrax team caches
@@ -106229,7 +106285,21 @@ function _fxRotoBuild(row, onProgress) {
         var maps = [];
         for (var p = 0; p < tm.players.length; p++) {
           var fl = by[tm.players[p].playerKey];
-          if (fl) { maps.push(fl); tm.resolved++; }
+          // Per-game averages become season totals here, per player, using
+          // that player's own GP. Doing it before aggregation matters: a
+          // roster mixes 82-game regulars with 20-game part-timers, and
+          // scaling the summed average by any single GP would be wrong for
+          // everyone. FXSEASONUNITS
+          if (fl) {
+            maps.push(_fxSeasonToTotals(SPORT, fl));
+            tm.resolved++;
+            // Any real production at all means these are played games, not an
+            // empty new season. FXROTOSEASON
+            try {
+              var _g = parseFloat(String(fl.GP == null ? '' : fl.GP));
+              if (!isNaN(_g) && _g > 0) _fxRotoPrior = true;
+            } catch (eG2) {}
+          }
         }
         tm.totals = _fxRotoTeamTotals(SPORT, cats, maps);
       })
@@ -106265,8 +106335,13 @@ function _fxRotoBuild(row, onProgress) {
       var ap = (row.standings && row.standings.points);
       if (ap != null && !isNaN(parseFloat(ap))) actual = parseFloat(ap);
     } catch (eA) {}
+    // Which season the numbers describe. ESPN serves the most recent season
+    // with data, so before opening night that's LAST season — the board looks
+    // like a live standing when it's really a preseason strength ranking off
+    // last year's production. Detected from GP: a played season has games.
+    // FXROTOSEASON
     return { cats: cats, teams: teams, pts: pts, rank: rank, order: order,
-             actual: actual, sport: SPORT };
+             actual: actual, sport: SPORT, priorSeason: !!_fxRotoPrior };
   });
 }
 
@@ -106317,6 +106392,16 @@ function _fxRotoHtml(d) {
       'every category, so each takes an equal share of the rank points. ' +
       'The check against Fantrax\u2019s total starts meaning something once games ' +
       'have been played.</div>';
+  } else if (d.priorSeason && d.actual != null && Math.abs(d.actual) < 0.05) {
+    // Production exists but Fantrax reports nothing: these are LAST season's
+    // numbers, and the board is a preseason strength ranking rather than a
+    // standing. Calling that a "+56.1 discrepancy" compares two different
+    // quantities and reads as a bug in the arithmetic. FXROTOSEASON
+    head = '<div class="fxr-check">' +
+      '<b>Preseason strength ranking</b> \u2014 built from last season\u2019s ' +
+      'totals for the players on each roster now. Fantrax has no standing yet, ' +
+      'so there is nothing to check against; these ranks show whose roster ' +
+      'produced most last year, not where anyone stands.</div>';
   } else if (d.actual != null) {
     var diff = Math.round((est - d.actual) * 10) / 10;
     var ok = Math.abs(diff) < 0.05;
@@ -106418,6 +106503,11 @@ function _fxRotoHtml(d) {
     '<div class="fxr-gridhead">LEAGUE GRID \u00b7 shaded by rank in each category</div>' +
     grid +
     '<div class="fxr-note">' +
+      (d.priorSeason
+        ? 'NBA season lines are per-game averages, converted back to totals with each ' +
+          'player\u2019s games played. Percentages carry no makes/attempts in a season ' +
+          'line, so FG% and FT% read as unavailable rather than zero. '
+        : '') +
       'Category totals are rebuilt from every team\u2019s current roster and ESPN season ' +
       'stats \u2014 Fantrax publishes no per-category standings. Players count for whoever ' +
       'holds them NOW, so trades and waiver claims misattribute production, and bench days ' +
@@ -106439,7 +106529,16 @@ function fxLoadRoto(leagueKey, paneId) {
     if (p2) p2.innerHTML = '<div class="slb-empty">Building the board\u2026 ' +
       done + ' of ' + total + ' teams</div>';
   }).then(function (d) {
-    if (!d.error) row._rotoBoard = d;
+    // Never cache a board nobody resolved into — a zeroed board would be
+    // served for the rest of the session even after the dictionary lands.
+    // FXROTONAMES
+    var anyResolved = false;
+    try {
+      for (var i2 = 0; i2 < (d.teams || []).length; i2++) {
+        if (d.teams[i2].resolved > 0) { anyResolved = true; break; }
+      }
+    } catch (eR) {}
+    if (!d.error && anyResolved) row._rotoBoard = d;
     var p3 = document.getElementById(paneId || 'skFxRotoPane');
     if (p3) p3.innerHTML = _fxRotoHtml(d);
   })['catch'](function () {
