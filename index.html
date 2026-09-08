@@ -105619,6 +105619,24 @@ function _fxGroupFor(scoring, sport, pos) {
 // so a split target that finds no combined cell falls back to the direct one.
 // Without this every made/attempted category reads zero on season stats,
 // which is exactly what the roto board consumes. FXSPLITFB
+// ── Season-line fallbacks for derived keys ── SEASONDERIVED ──
+// Confirmed by probe. ESPN's NHL season line carries the special-teams and
+// goalie columns OUTRIGHT — its 14 labels are:
+//   GP G A PTS +/- PIM S PPG PPA SHG SHA GWG TOI/G PROD
+// The alias table points POWER_PLAY_GOALS at the synthetic _PPG key, which
+// only exists once play-by-play has been walked. On a SEASON line there are no
+// plays, so those categories read as unavailable even though ESPN published
+// them right there. Falling back to the plain label fixes power play and
+// short handed for every NHL roto and categories league.
+//
+// _PPP and _SHP have no single column; they're the sum of their two parts,
+// which the season line does carry.
+var _FX_DERIVED_FALLBACK = {
+  '_PPG': 'PPG', '_PPA': 'PPA', '_SHG': 'SHG', '_SHA': 'SHA',
+  '_GWG': 'GWG', '_GAA': 'GAA', '_W': 'W', '_L': 'L', '_SO': 'SO'
+};
+var _FX_DERIVED_SUM = { '_PPP': ['PPG', 'PPA'], '_SHP': ['SHG', 'SHA'] };
+
 var _FX_SPLIT_FALLBACK = {
   'FG:made': 'FGM', 'FG:att': 'FGA',
   'FT:made': 'FTM', 'FT:att': 'FTA',
@@ -105646,7 +105664,27 @@ function _fxStatValue(statMap, target) {
     }
     return null;
   }
-  if (raw == null || raw === '') return null;
+  if (raw == null || raw === '') {
+    // A synthetic key with no derived value in this map — try the plain
+    // season label ESPN actually publishes. SEASONDERIVED
+    var db = _FX_DERIVED_FALLBACK[String(target)];
+    if (db && statMap[db] != null && statMap[db] !== '') {
+      var dv = parseFloat(String(statMap[db]).replace('+', ''));
+      if (!isNaN(dv)) return dv;
+    }
+    var ds = _FX_DERIVED_SUM[String(target)];
+    if (ds) {
+      var sum = 0, got = false;
+      for (var si = 0; si < ds.length; si++) {
+        var sv = statMap[ds[si]];
+        if (sv == null || sv === '') continue;
+        var sn = parseFloat(String(sv).replace('+', ''));
+        if (!isNaN(sn)) { sum += sn; got = true; }
+      }
+      if (got) return sum;
+    }
+    return null;
+  }
   var n = parseFloat(String(raw).replace('+', ''));
   return isNaN(n) ? null : n;
 }
@@ -106517,9 +106555,10 @@ function _fxRotoHtml(d) {
     '<div class="fxr-note">' +
       (d.priorSeason
         ? 'NBA season lines are per-game averages, converted back to totals with each ' +
-          'player\u2019s games played. A category ESPN\u2019s season line doesn\u2019t carry ' +
-          'reads as an em-dash rather than zero \u2014 it publishes shooting percentages ' +
-          'but no makes or attempts, so FG%, FT% and 3PM have no season source. '
+          'player\u2019s games played. ESPN\u2019s NBA season line is 12 columns \u2014 ' +
+          'GP MIN FG% 3P% FT% REB AST BLK STL PF TO PTS \u2014 so FG%, FT% and 3PM have ' +
+          'no season source and read as an em-dash rather than a false zero. The box ' +
+          'score does carry them, so those categories are live during games. '
         : '') +
       'Category totals are rebuilt from every team\u2019s current roster and ESPN season ' +
       'stats \u2014 Fantrax publishes no per-category standings. Players count for whoever ' +
@@ -106960,6 +106999,84 @@ function skProbeSeasonLabels() {
         if (flat) { for (var kk in flat) { if (flat.hasOwnProperty(kk)) fk.push(kk + '=' + flat[kk]); } }
         say('  PARSED map: ' + (fk.join('  ') || '(empty)'));
         say('');
+        // ── The /stats payload ── SEASONLABELS2 ──
+        // A DIFFERENT endpoint from /overview, and the one the Career tab
+        // renders: it carries per-season TOTALS with made-attempted pairs
+        // (FG 464-915, 3PT 58-183, FT 166-216) that the overview simply
+        // doesn't have. If the roto board is to mean anything once the season
+        // starts, this is the source it needs — so dump its real category
+        // and label structure rather than inferring it from the rendered
+        // table.
+        var surl = 'https://site.web.api.espn.com/apis/common/v3/sports/' +
+          cfg.sport + '/' + cfg.slug + '/athletes/' + id + '/stats';
+        return fetch(surl).then(function (r2) { return r2.ok ? r2.json() : null; })
+          .then(function (sj) {
+            say('  \u2500\u2500 /stats payload \u2500\u2500');
+            if (!sj) { say('    no payload'); say(''); return; }
+            say('    top-level keys: ' + Object.keys(sj).join(' '));
+            // seasonTypes is where ESPN usually splits "Regular Season
+            // Averages" from "Regular Season Totals" — the distinction that
+            // decides whether the roto board gets real totals. Dumped before
+            // _skCareerCategories flattens them together. SEASONLABELS2
+            if (sj.seasonTypes && sj.seasonTypes.length) {
+              var stn = [];
+              for (var _s2 = 0; _s2 < sj.seasonTypes.length && _s2 < 8; _s2++) {
+                var _st2 = sj.seasonTypes[_s2] || {};
+                var _cn2 = (_st2.categories || []).map(function (c9) {
+                  return (c9.name || c9.displayName || '?') +
+                    '(' + ((c9.labels || []).length) + 'lbl,' +
+                    ((c9.statistics || []).length) + 'row)';
+                });
+                stn.push('      seasonType[' + _s2 + '] ' +
+                  (_st2.displayName || _st2.name || '?') + ' -> ' + _cn2.join(' '));
+              }
+              say('    seasonTypes:');
+              for (var _s3 = 0; _s3 < stn.length; _s3++) say(stn[_s3]);
+              // Full labels+first row for every category in the FIRST
+              // seasonType, which is where the totals live if they exist.
+              var _c0 = (sj.seasonTypes[0] && sj.seasonTypes[0].categories) || [];
+              for (var _ci = 0; _ci < _c0.length && _ci < 6; _ci++) {
+                var _cc = _c0[_ci] || {};
+                say('      * ' + (_cc.displayName || _cc.name || '?') +
+                    ' labels: ' + ((_cc.labels || []).join(' ') || '(none)'));
+                var _r0 = (_cc.statistics || [])[0];
+                if (_r0) {
+                  say('        row0 ' +
+                    ((_r0.season && (_r0.season.displayName || _r0.season.year)) || _r0.displayName || '?') +
+                    ': ' + ((_r0.stats || []).join(' ')));
+                }
+              }
+            }
+            var cats2 = (typeof _skCareerCategories === 'function')
+              ? _skCareerCategories(sj) : ((sj.categories) || []);
+            if (!cats2 || !cats2.length) {
+              say('    no categories found');
+              say('    raw: ' + JSON.stringify(sj).slice(0, 500));
+              say('');
+              return;
+            }
+            say('    categories (' + cats2.length + '):');
+            for (var c2 = 0; c2 < cats2.length && c2 < 6; c2++) {
+              var cat = cats2[c2] || {};
+              say('      [' + c2 + '] name=' + (cat.name || '?') +
+                  '  display=' + (cat.displayName || '?'));
+              var lb = cat.labels || cat.names || [];
+              say('          labels(' + lb.length + '): ' + lb.join(' '));
+              if (cat.names && cat.names !== lb) {
+                say('          names: ' + cat.names.join(' '));
+              }
+              // Season rows — the one that says "Totals" is what we want.
+              var st = cat.statistics || cat.splits || [];
+              for (var r3 = 0; r3 < st.length && r3 < 3; r3++) {
+                var row3 = st[r3] || {};
+                var vals = row3.stats || row3.values || [];
+                say('          row[' + r3 + '] ' +
+                    (row3.season && (row3.season.displayName || row3.season.year) ||
+                     row3.displayName || '?') + ': ' + vals.join(' '));
+              }
+            }
+            say('');
+          })['catch'](function () { say('    /stats fetch failed'); say(''); });
       });
     })['catch'](function (e) {
       say(sp + ': failed \u2014 ' + (e && e.message ? e.message : 'unknown'));
