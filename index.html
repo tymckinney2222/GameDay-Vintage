@@ -28368,6 +28368,11 @@
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V10"/><path d="M12 20V4"/><path d="M20 20v-6"/></svg>
       <span>Games-played cap (this league)</span>
     </button>
+    <!-- SEASONLABELS — what does ESPN's season line actually contain? -->
+    <button class="sk-account-item" onclick="skProbeSeasonLabels(); skCloseAccountMenu();">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18M7 15l4-4 3 3 5-6"/></svg>
+      <span>Probe ESPN season stat labels</span>
+    </button>
     <!-- XPSEARCH — why isn't a provider reaching the player search? -->
     <button class="sk-account-item" onclick="skProbeSearchIndex(); skCloseAccountMenu();">
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
@@ -106117,7 +106122,7 @@ function _fxRotoCats(row) {
 function _fxRotoTeamTotals(SPORT, cats, statMaps) {
   var rates = _FX_RATE_CATS[SPORT] || {};
   var parts = _FX_RATE_PARTS[SPORT] || { plain: [], clock: [], split: {} };
-  var sums = {}, comps = {}, i, j;
+  var sums = {}, comps = {}, seen = {}, i, j;
   function addComp(n, v) { comps[n] = (comps[n] || 0) + v; }
   for (i = 0; i < statMaps.length; i++) {
     var sm = statMaps[i];
@@ -106142,13 +106147,20 @@ function _fxRotoTeamTotals(SPORT, cats, statMaps) {
       var raw = _fxStatValue(sm, t);
       if (raw == null) continue;
       sums[t] = (sums[t] || 0) + raw;
+      seen[t] = true;   // FXROTONODATA
     }
   }
   var out = {};
   for (j = 0; j < cats.length; j++) {
     var tg = cats[j].target;
     if (rates[tg]) { out[tg] = rates[tg].fn(comps); continue; }
-    out[tg] = (sums[tg] == null) ? 0 : Math.round(sums[tg] * 1000) / 1000;
+    // NOBODY had this stat, so it is unavailable — not zero. ESPN's NBA
+    // season line carries 3P% but no 3PM, so three-pointers read as a flat 0
+    // for all ten teams, which says these players made none. They made
+    // hundreds. Null renders as an em-dash and ranks as a league-wide tie,
+    // the same treatment FG% and FT% already get. FXROTONODATA
+    if (!seen[tg]) { out[tg] = null; continue; }
+    out[tg] = Math.round(sums[tg] * 1000) / 1000;
   }
   return out;
 }
@@ -106505,8 +106517,9 @@ function _fxRotoHtml(d) {
     '<div class="fxr-note">' +
       (d.priorSeason
         ? 'NBA season lines are per-game averages, converted back to totals with each ' +
-          'player\u2019s games played. Percentages carry no makes/attempts in a season ' +
-          'line, so FG% and FT% read as unavailable rather than zero. '
+          'player\u2019s games played. A category ESPN\u2019s season line doesn\u2019t carry ' +
+          'reads as an em-dash rather than zero \u2014 it publishes shooting percentages ' +
+          'but no makes or attempts, so FG%, FT% and 3PM have no season source. '
         : '') +
       'Category totals are rebuilt from every team\u2019s current roster and ESPN season ' +
       'stats \u2014 Fantrax publishes no per-category standings. Players count for whoever ' +
@@ -106881,6 +106894,85 @@ function _fxScoreTitle(res) {
 //   named      how many resolved to a real player name
 //
 // Whichever column first reads zero is the stage that's broken.
+// ── Season-stats label probe ── SEASONLABELS ──
+// I claimed ESPN's NBA season line carries no 3PM. My evidence was that the
+// press-box report only READS PTS/REB/AST/GP/MIN/percentages — which is what
+// that function chose to use, not what the payload contains. Wrong kind of
+// evidence, and the box score plainly does carry 3PT and FG as made-attempted
+// pairs.
+//
+// This dumps the RAW labels array and the parsed flat map for one real
+// rostered player per sport, so the question is settled from the payload:
+//   - if a three-point label is there under a name _FX_SPLIT_FALLBACK doesn't
+//     know, it's a one-line alias fix and the category comes back
+//   - same for FG/FT makes and attempts, so the rate categories could then
+//     compute properly instead of reading unavailable
+// NHL and MLB are included because the same silent miss could be hiding
+// categories in those roto leagues too.
+function skProbeSeasonLabels() {
+  var lines = [];
+  function say(t) { lines.push(t); }
+
+  // One player per sport, taken from a league you actually roster.
+  var all = (typeof _skSearchAllRosters === 'function') ? _skSearchAllRosters() : [];
+  var pick = {}, order = [];
+  for (var i = 0; i < all.length; i++) {
+    var sp = String(all[i].sport || '').toLowerCase();
+    if (!sp || pick[sp]) continue;
+    pick[sp] = all[i];
+    order.push(sp);
+  }
+  if (!order.length) { _skGpProbeShow('No rostered players found — open the player search once first.'); return; }
+
+  var pending = order.length;
+  order.forEach(function (sp) {
+    var pl = pick[sp];
+    var cfg = (typeof _ESPN_SPORT_CFG === 'object' && _ESPN_SPORT_CFG) ? _ESPN_SPORT_CFG[sp] : null;
+    if (!cfg) { say(sp + ': no ESPN sport config'); if (!--pending) _skGpProbeShow(lines.join('\n')); return; }
+    _resolveEspnAthleteId(sp, pl.name, pl.teamAbbr).then(function (id) {
+      if (!id) { say(sp + ': could not resolve ' + pl.name); return null; }
+      var url = 'https://site.web.api.espn.com/apis/common/v3/sports/' +
+        cfg.sport + '/' + cfg.slug + '/athletes/' + id + '/overview';
+      return fetch(url).then(function (r) { return r.ok ? r.json() : null; }).then(function (j) {
+        say('\u2500\u2500 ' + sp.toUpperCase() + ' \u00b7 ' + pl.name + ' (id ' + id + ') \u2500\u2500');
+        if (!j) { say('  no payload'); return; }
+        var raw = (j.statistics) || (j.athlete && j.athlete.statistics) || null;
+        var labels = (raw && (raw.labels || raw.names)) || [];
+        say('  RAW labels (' + labels.length + '): ' + labels.join(' '));
+        var names = (raw && raw.names) || [];
+        if (names.length && names !== labels) say('  RAW names  (' + names.length + '): ' + names.join(' '));
+        var displayNames = (raw && raw.displayNames) || [];
+        if (displayNames.length) say('  displayNames: ' + displayNames.join(' '));
+        // Which season splits exist, so we know which one is being read.
+        var splits = (raw && raw.splits) || [];
+        var sNames = [];
+        for (var q = 0; q < splits.length && q < 6; q++) {
+          sNames.push((splits[q].displayName || '?') + '[' + ((splits[q].stats || []).length) + ']');
+        }
+        say('  splits: ' + (sNames.join('  ') || '(none)'));
+        if (splits[0] && splits[0].stats) {
+          say('  split0 stats: ' + splits[0].stats.join(' '));
+        }
+        // What our parser actually produced.
+        var flat = (typeof _parseEspnSeasonStats === 'function')
+          ? _parseEspnSeasonStats(j, sp, pl.name, '') : null;
+        var fk = [];
+        if (flat) { for (var kk in flat) { if (flat.hasOwnProperty(kk)) fk.push(kk + '=' + flat[kk]); } }
+        say('  PARSED map: ' + (fk.join('  ') || '(empty)'));
+        say('');
+      });
+    })['catch'](function (e) {
+      say(sp + ': failed \u2014 ' + (e && e.message ? e.message : 'unknown'));
+    }).then(function () {
+      if (!--pending) {
+        say('Looking for: any three-point label, and FG/FT makes+attempts.');
+        say('If present, the alias table just needs the right key names.');
+        _skGpProbeShow(lines.join('\n'));
+      }
+    });
+  });
+}
+
 function skProbeSearchIndex() {
   var lines = [];
   function say(t) { lines.push(t); }
