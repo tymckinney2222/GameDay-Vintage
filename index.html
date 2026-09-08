@@ -105436,6 +105436,8 @@ var _FX_ESPN_ALIAS = {
   NHL: {
     GOALS: 'G', ASSISTS: 'A', POINTS: 'P', PLUS_MINUS: '+/-', PENALTY_MINUTES: 'PIM',
     SHOTS_ON_GOAL: 'S', SHOTS: 'S', HITS: 'HT', BLOCKS: 'BS', BLOCKED_SHOTS: 'BS',
+    // /stats labels shots SOG where /overview and the box use S. SEASONTOTALS
+    SOG: 'S',
     TAKEAWAYS: 'TK', GIVEAWAYS: 'GV', FACEOFFS_WON: 'FW', FACEOFFS_LOST: 'FL',
     TIME_ON_ICE: 'TOI', SHIFTS: 'SHFT', POWER_PLAY_TIME_ON_ICE: 'PPTOI',
     // goalies
@@ -105635,6 +105637,9 @@ var _FX_DERIVED_FALLBACK = {
   '_PPG': 'PPG', '_PPA': 'PPA', '_SHG': 'SHG', '_SHA': 'SHA',
   '_GWG': 'GWG', '_GAA': 'GAA', '_W': 'W', '_L': 'L', '_SO': 'SO'
 };
+// The season line labels shots SOG; the box says S. Either can be the source
+// depending on which payload a caller has, so both resolve. SEASONTOTALS
+var _FX_LABEL_ALT = { 'S': ['SOG'], 'SOG': ['S'] };
 var _FX_DERIVED_SUM = { '_PPP': ['PPG', 'PPA'], '_SHP': ['SHG', 'SHA'] };
 
 var _FX_SPLIT_FALLBACK = {
@@ -105671,6 +105676,16 @@ function _fxStatValue(statMap, target) {
     if (db && statMap[db] != null && statMap[db] !== '') {
       var dv = parseFloat(String(statMap[db]).replace('+', ''));
       if (!isNaN(dv)) return dv;
+    }
+    // Same stat, different label between payloads. SEASONTOTALS
+    var alt = _FX_LABEL_ALT[String(target)];
+    if (alt) {
+      for (var ai = 0; ai < alt.length; ai++) {
+        var av2 = statMap[alt[ai]];
+        if (av2 == null || av2 === '') continue;
+        var an = parseFloat(String(av2).replace('+', ''));
+        if (!isNaN(an)) return an;
+      }
     }
     var ds = _FX_DERIVED_SUM[String(target)];
     if (ds) {
@@ -106329,7 +106344,8 @@ function _fxRotoBuild(row, onProgress) {
   return Promise.all(teams.map(function (tm) {
     // teamKey is the season-stat cache key, so each Fantrax team caches
     // separately and a repeat open costs nothing.
-    return _skFetchEspnSeasonStats(sportKey, row.key + '|' + tm.teamId, tm.players)
+    // TOTALS, not the overview's averages. SEASONTOTALS
+    return _skFetchEspnSeasonStats(sportKey, row.key + '|' + tm.teamId, tm.players, true)
       .then(function (entry) {
         var by = (entry && entry.byPlayerKey) || {};
         var maps = [];
@@ -106554,11 +106570,9 @@ function _fxRotoHtml(d) {
     grid +
     '<div class="fxr-note">' +
       (d.priorSeason
-        ? 'NBA season lines are per-game averages, converted back to totals with each ' +
-          'player\u2019s games played. ESPN\u2019s NBA season line is 12 columns \u2014 ' +
-          'GP MIN FG% 3P% FT% REB AST BLK STL PF TO PTS \u2014 so FG%, FT% and 3PM have ' +
-          'no season source and read as an em-dash rather than a false zero. The box ' +
-          'score does carry them, so those categories are live during games. '
+        ? 'Season totals come from ESPN\u2019s per-season totals table \u2014 real ' +
+          'cumulative numbers, including three-pointers and the makes and attempts ' +
+          'behind FG% and FT%. '
         : '') +
       'Category totals are rebuilt from every team\u2019s current roster and ESPN season ' +
       'stats \u2014 Fantrax publishes no per-category standings. Players count for whoever ' +
@@ -125377,9 +125391,69 @@ function _skHydrateNflTargetShare(players, byPlayer) {
   });
 }
 
-async function _skFetchEspnSeasonStats(sportKey, teamKey, players) {
+// ── Season TOTALS from /stats ── SEASONTOTALS ──
+// Confirmed by probe. /overview and /stats are different payloads:
+//
+//   NBA /overview  12 cols, every one an average (avgPoints, avgRebounds…),
+//                  percentages only — no makes, no attempts, no 3PM.
+//   NBA /stats     categories[1] name="totals" display="Regular Season Totals"
+//                  labels: FG FG% 3PT 3P% FT FT% OR DR REB AST BLK STL PF TO PTS
+//                  row:    429-1031 41.6 114-363 31.4 142-168 84.5 58 296 354
+//                          356 43 78 200 234 1114
+//
+// Those made-attempted pairs are exactly the form _fxStatValue already reads,
+// so three-pointers, FG% and FT% all become available — and the counting
+// stats arrive as real season totals rather than averages needing conversion.
+//
+// NHL /stats returns ONE category named after the player's position
+// ("center"), already totals, and adds SOG/SPCT that /overview lacks.
+//
+// Rows are per season in ascending order, so the last one is current.
+function _parseEspnSeasonTotals(sj, sportKey) {
+  try {
+    var cats = (typeof _skCareerCategories === 'function') ? _skCareerCategories(sj) : null;
+    if (!cats || !cats.length) return null;
+    // Prefer an explicitly-named totals category; otherwise the sole category
+    // (NHL's position-named block) is already totals. An "averages" category
+    // is never acceptable here — that's the thing we came to replace.
+    var cat = null, i;
+    for (i = 0; i < cats.length; i++) {
+      var nm = String((cats[i] && cats[i].name) || '').toLowerCase();
+      if (nm === 'totals') { cat = cats[i]; break; }
+    }
+    if (!cat) {
+      for (i = 0; i < cats.length; i++) {
+        var nm2 = String((cats[i] && cats[i].name) || '').toLowerCase();
+        if (nm2 === 'averages' || nm2 === 'miscellaneous') continue;
+        cat = cats[i];
+        break;
+      }
+    }
+    if (!cat) return null;
+    var labels = cat.labels || cat.names || [];
+    var rows = cat.statistics || [];
+    if (!labels.length || !rows.length) return null;
+    // Last row = most recent season. Before opening night that's last season,
+    // which the board already labels as a preseason ranking.
+    var row = rows[rows.length - 1] || {};
+    var vals = row.stats || row.values || [];
+    if (!vals.length) return null;
+    var out = {};
+    for (i = 0; i < labels.length && i < vals.length; i++) {
+      out[String(labels[i])] = vals[i];
+    }
+    // Season label, so a caller can tell which year it got.
+    out._SEASON = (row.season && (row.season.displayName || row.season.year)) ||
+                  row.displayName || '';
+    return out;
+  } catch (e) { return null; }
+}
+
+async function _skFetchEspnSeasonStats(sportKey, teamKey, players, useTotals) {
   if (!teamKey || !_ESPN_SPORT_CFG[sportKey]) return null;
-  var ck = sportKey + '|' + teamKey;
+  // Totals live in their own cache slot — the two payloads are different
+  // shapes and must never share an entry. SEASONTOTALS
+  var ck = sportKey + '|' + teamKey + (useTotals ? '|tot' : '');
   var cached = _espnSeasonCache[ck];
   if (cached && (Date.now() - cached.ts) < ESPN_SEASON_TTL) return cached;
   if (_espnSeasonInflight[ck]) return _espnSeasonInflight[ck];
@@ -125408,7 +125482,7 @@ async function _skFetchEspnSeasonStats(sportKey, teamKey, players) {
       // field from the RIGHT category. /overview flattens everything into one
       // row and collides YDS/TD/INT/AVG/LNG across categories (the mixed-up-
       // stats bug). NBA/NHL keep /overview + the flat parser unchanged.
-      var _espnUseStats = (sportKey === 'nfl' || sportKey === 'cfb');
+      var _espnUseStats = (sportKey === 'nfl' || sportKey === 'cfb') || !!useTotals;
       var _espnPathSeg = _espnUseStats ? 'stats' : 'overview';
       // Stage 2: fetch each athlete's stats/overview — also capped at 3 concurrent.
       var statResults = await _espnMapLimited(withId, 3, function(r) {
@@ -125424,7 +125498,9 @@ async function _skFetchEspnSeasonStats(sportKey, teamKey, players) {
         // NFL: build a per-category season map { passing:{...}, rushing:{...},
         // receiving:{...}, defensive:{...}, kicking:{...} } from /stats so the
         // formatter reads each field from its own category (no label collisions).
-        var flat = _espnUseStats ? _parseEspnNflCategories(sj) : _parseEspnSeasonStats(sj);
+        var flat = useTotals
+          ? _parseEspnSeasonTotals(sj, sportKey)
+          : (_espnUseStats ? _parseEspnNflCategories(sj) : _parseEspnSeasonStats(sj));
         if (flat && Object.keys(flat).length) {
           byPlayerKey[r.playerKey] = flat;
           nParsed++;
