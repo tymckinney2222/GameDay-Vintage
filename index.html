@@ -117715,6 +117715,9 @@ function skOpenSearch() {
   ov.classList.add('open');
   // Always open in the fast local roster mode.
   skSetSearchMode('rosters');
+  // XPSEARCH — pull in any external rosters that haven't loaded yet, so the
+  // search doesn't quietly report a player as missing on load order alone.
+  if (typeof _skSearchWarmRosters === 'function') _skSearchWarmRosters();
   if (typeof _skSearchRenderSports === 'function') _skSearchRenderSports();   // XPSEARCH
   // Render initial hint state — guidance, not noise
   _skSearchRenderHint();
@@ -117761,6 +117764,15 @@ function _skSearchRenderHint() {
   // Counts now span every platform, not just Yahoo. XPSEARCH
   var _all = (typeof _skSearchAllRosters === 'function') ? _skSearchAllRosters() : [];
   var totalPlayers = _all.length;
+  // Leagues whose rosters haven't landed yet, so the count doesn't silently
+  // understate what's searchable. XPSEARCH
+  var _pend = 0;
+  try {
+    var _er = (typeof extLeagues !== 'undefined' && extLeagues) ? extLeagues : [];
+    for (var _q = 0; _q < _er.length; _q++) {
+      if (_er[_q] && !(_er[_q].rosters && _er[_q].rosters.byTeam)) _pend++;
+    }
+  } catch (eP) {}
   var _lgSeen = {}, _provSeen = {};
   for (var _i = 0; _i < _all.length; _i++) {
     _lgSeen[_all[_i].leagueKey] = 1;
@@ -117775,6 +117787,8 @@ function _skSearchRenderHint() {
     ' on <strong>' + totalLeagues + '</strong> league' + (totalLeagues === 1 ? '' : 's') +
     ' across <strong>' + provN + '</strong> platform' + (provN === 1 ? '' : 's') + '.<br>' +
     'Type a name to find every team you roster them on.' +
+    (_pend ? ('<br><span style="opacity:0.6">Loading ' + _pend + ' more league' +
+      (_pend === 1 ? '' : 's') + '\u2026</span>') : '') +
     '</div>';
 }
 
@@ -119121,7 +119135,11 @@ function _skSearchAllRosters() {
         name: r.name, teamAbbr: r.teamAbbr || '', displayPos: r.displayPos || '',
         sport: String(r.sport || '').toLowerCase(), provider: 'yahoo',
         leagueKey: r.leagueKey, leagueName: r.leagueName || '(unnamed league)',
-        teamName: '', slot: r.selectedPos || '', scoringType: r.scoringType || ''
+        // Yahoo's own team name, from the same helper the rest of Skipper
+        // uses. The league name alone doesn't say which of your teams it is
+        // when you have several in one sport. XPSEARCH
+        teamName: (typeof _skMyTeamName === 'function') ? _skMyTeamName(r.leagueKey) : '',
+        slot: r.selectedPos || '', scoringType: r.scoringType || ''
       });
     }
   } catch (eY) {}
@@ -119237,6 +119255,57 @@ function skSetSearchSport(sp) {
   // filter is a refinement, not a restart.
   if (q.length >= 2) _skSearchRunQuery(q);
   else _skSearchRenderHint();
+}
+
+// ── Warm missing rosters ── XPSEARCH ──
+// Sleeper and Fantrax rosters arrive from the league enrichers, which only
+// run once the external league list has loaded — so opening the search
+// straight after launch found no rosters and reported those players missing.
+// Visiting a Roster tab happened to trigger the same fetch, which is why it
+// "worked" afterwards. That's a load-order accident, not a design.
+//
+// This kicks the enrichers when anything is missing and re-renders as the
+// data lands. Poll rather than promises because the enrichers are
+// fire-and-forget; it gives up after a few seconds rather than spinning.
+function _skSearchWarmRosters() {
+  var rows = (typeof extLeagues !== 'undefined' && extLeagues) ? extLeagues : [];
+  function missing() {
+    var n = 0;
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i] && !(rows[i].rosters && rows[i].rosters.byTeam)) n++;
+    }
+    return n;
+  }
+  // Nothing synced yet at all — load the league list first; its own
+  // completion path fires the enrichers.
+  if (!rows.length) {
+    if (typeof extLoadLeagues === 'function') { try { extLoadLeagues(); } catch (e0) {} }
+  } else if (missing()) {
+    try { if (typeof extEnrichFantrax === 'function') extEnrichFantrax(); } catch (e1) {}
+    try { if (typeof slEnrichLeagues === 'function') slEnrichLeagues(); } catch (e2) {}
+    try { if (typeof espEnrichLeagues === 'function') espEnrichLeagues(); } catch (e3) {}
+  } else {
+    return;   // everything already loaded
+  }
+
+  var tries = 0, before = missing();
+  var iv = setInterval(function () {
+    tries++;
+    var ov = document.getElementById('skSearchOverlay');
+    // Overlay closed, or rosters stopped arriving — stop either way.
+    if (!ov || !ov.classList.contains('open') || tries > 15) { clearInterval(iv); return; }
+    rows = (typeof extLeagues !== 'undefined' && extLeagues) ? extLeagues : [];
+    var now = missing();
+    if (now === before) return;
+    before = now;
+    // Repaint whatever the user is looking at with the newly-landed rosters.
+    if (typeof _skSearchRenderSports === 'function') _skSearchRenderSports();
+    var input = document.getElementById('skSearchInput');
+    var q = input ? String(input.value || '').trim() : '';
+    if (q.length >= 2) _skSearchRunQuery(q);
+    else if (typeof _skSearchRenderHint === 'function') _skSearchRenderHint();
+    if (!now) clearInterval(iv);
+  }, 400);
 }
 
 function _skSearchRunQuery(query) {
