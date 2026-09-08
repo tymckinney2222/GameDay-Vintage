@@ -16364,6 +16364,17 @@
     color: var(--sk-red);
     border: 1px solid rgba(225,80,80,0.3);
   }
+  /* Platform chip on each result row — knowing WHERE to go is the point of
+     the search, so it sits beside the slot rather than in a tooltip. XPSEARCH */
+  .sk-search-league-row .xp-prov {
+    flex-shrink: 0; font-family: var(--sk-font-mono, monospace); font-size: 8px;
+    font-weight: 700; letter-spacing: 0.06em; padding: 1px 4px; border-radius: 4px;
+    border: 1px solid; margin-right: 6px;
+  }
+  .sk-search-league-row .xp-team {
+    display: block; font-style: normal; font-size: 9px;
+    color: rgba(255,255,255,0.35); margin-top: 1px;
+  }
   .sk-search-league-row .arrow {
     color: var(--sk-text-4);
     font-size: 14px;
@@ -117727,13 +117738,23 @@ function _skSearchRenderHint() {
       '</div>';
     return;
   }
-  var totalPlayers = (fyFullRosters || []).length;
-  var totalLeagues = (fyLeagues || []).length;
+  // Counts now span every platform, not just Yahoo. XPSEARCH
+  var _all = (typeof _skSearchAllRosters === 'function') ? _skSearchAllRosters() : [];
+  var totalPlayers = _all.length;
+  var _lgSeen = {}, _provSeen = {};
+  for (var _i = 0; _i < _all.length; _i++) {
+    _lgSeen[_all[_i].leagueKey] = 1;
+    _provSeen[_all[_i].provider] = 1;
+  }
+  var totalLeagues = 0, _p, provN = 0;
+  for (_p in _lgSeen) { if (_lgSeen.hasOwnProperty(_p)) totalLeagues++; }
+  for (_p in _provSeen) { if (_provSeen.hasOwnProperty(_p)) provN++; }
   body.innerHTML = '<div class="sk-search-hint">' +
     '<span class="ic">\ud83d\udd0d</span>' +
-    'Search across <strong>' + totalPlayers + '</strong> player' + (totalPlayers === 1 ? '' : 's') +
-    ' on <strong>' + totalLeagues + '</strong> league' + (totalLeagues === 1 ? '' : 's') + '.<br>' +
-    'Type a name to find which of your teams roster them.' +
+    'Search across <strong>' + totalPlayers + '</strong> roster spot' + (totalPlayers === 1 ? '' : 's') +
+    ' on <strong>' + totalLeagues + '</strong> league' + (totalLeagues === 1 ? '' : 's') +
+    ' across <strong>' + provN + '</strong> platform' + (provN === 1 ? '' : 's') + '.<br>' +
+    'Type a name to find every team you roster them on.' +
     '</div>';
 }
 
@@ -119050,10 +119071,101 @@ function _skFaRenderResults(groups, query, leagueCount) {
   body.innerHTML = html;
 }
 
+// ══════════════════════════════════════════════════════════════════
+// CROSS-PLATFORM ROSTER SEARCH ── XPSEARCH ──
+// ──────────────────────────────────────────────────────────────────
+// The search already answered "which of my teams roster this player" — for
+// Yahoo only, off fyFullRosters. With leagues on four platforms that answer
+// was quietly incomplete: a player you hold in three Fantrax leagues showed
+// up as "not found", which is worse than no answer at all.
+//
+// This unifies MY rosters across every provider into one list in the shape
+// the search already consumes. Everything here is already in memory — Yahoo's
+// fyFullRosters, and each synced league's own team inside rosters.byTeam — so
+// a search costs nothing and works offline.
+//
+// Deliberately scoped to what I OWN. Whether a player is available elsewhere
+// is only provable for Fantrax and Sleeper (they publish every team's roster);
+// Yahoo and un-opened ESPN leagues would have to guess, and a lookup tool you
+// can't trust is worse than one with a narrower promise.
+function _skSearchAllRosters() {
+  var out = [];
+
+  // Yahoo — already flat, already carries league and slot.
+  try {
+    var fy = (typeof fyFullRosters !== 'undefined' && fyFullRosters) ? fyFullRosters : [];
+    for (var i = 0; i < fy.length; i++) {
+      var r = fy[i];
+      if (!r || !r.name) continue;
+      out.push({
+        name: r.name, teamAbbr: r.teamAbbr || '', displayPos: r.displayPos || '',
+        sport: String(r.sport || '').toLowerCase(), provider: 'yahoo',
+        leagueKey: r.leagueKey, leagueName: r.leagueName || '(unnamed league)',
+        teamName: '', slot: r.selectedPos || '', scoringType: r.scoringType || ''
+      });
+    }
+  } catch (eY) {}
+
+  // Sleeper / Fantrax / ESPN — walk MY team inside each synced league.
+  try {
+    var rows = (typeof extLeagues !== 'undefined' && extLeagues) ? extLeagues : [];
+    for (var L = 0; L < rows.length; L++) {
+      var row = rows[L];
+      if (!row || !row.rosters || !row.rosters.byTeam) continue;
+      var SPORT = String(row.sport || '').toUpperCase();
+      var myIds = row.myTeamIds ||
+        ((typeof _fxMyTeamIds === 'function' && row.provider === 'fantrax')
+          ? _fxMyTeamIds(row.raw || {}) : null) || {};
+      var teamKey = null, k;
+      for (k in row.rosters.byTeam) {
+        if (row.rosters.byTeam.hasOwnProperty(k) && myIds[k]) { teamKey = k; break; }
+      }
+      if (!teamKey) continue;   // can't tell which team is mine — say nothing
+      var team = row.rosters.byTeam[teamKey] || {};
+      var items = team.items || [];
+      for (var it = 0; it < items.length; it++) {
+        var res = (typeof _extRosterItemName === 'function')
+          ? _extRosterItemName(items[it] || {}, SPORT) : null;
+        if (!res || !res.name || res.name === '?' || res.unresolved) continue;
+        // Slot label: the lineup slot where a provider sends one, otherwise
+        // the lineup STATUS, so a Fantrax reserve still reads as benched.
+        var slot = items[it].slot || items[it].position || '';
+        if ((typeof _fxItemIsActive === 'function') && _fxItemIsActive(items[it]) === false) {
+          slot = (typeof _fxItemStatusLabel === 'function')
+            ? _fxItemStatusLabel(items[it]).toUpperCase() : 'BN';
+        }
+        out.push({
+          name: res.name, teamAbbr: res.team || '', displayPos: res.pos || '',
+          sport: String(row.sport || '').toLowerCase(), provider: row.provider || 'ext',
+          leagueKey: row.key, leagueName: row.name || '(unnamed league)',
+          teamName: team.teamName || '', slot: slot, scoringType: ''
+        });
+      }
+    }
+  } catch (eX) {}
+
+  return out;
+}
+
+// One tap from a result to that league, whichever platform it's on. Yahoo
+// keys open Skipper's detail; everything else routes to the external league
+// view. XPSEARCH
+function _skSearchOpenAny(leagueKey, provider) {
+  if (!leagueKey) return;
+  if (provider && provider !== 'yahoo' && typeof extOpenLeague === 'function') {
+    extOpenLeague(leagueKey);
+    return;
+  }
+  if (typeof skOpenDetail === 'function') skOpenDetail(leagueKey);
+}
+
+var _XP_PROV_LABEL = { yahoo: 'Y', sleeper: 'SLP', fantrax: 'FTX', espn: 'ESPN' };
+var _XP_PROV_COLOR = { yahoo: '#a78bfa', sleeper: '#fbbf24', fantrax: '#34d399', espn: '#ef4444' };
+
 function _skSearchRunQuery(query) {
   var body = document.getElementById('skSearchBody');
   if (!body) return;
-  var rosters = fyFullRosters || [];
+  var rosters = _skSearchAllRosters();   // XPSEARCH — every platform, not just Yahoo
   if (!rosters.length) {
     body.innerHTML = '<div class="sk-search-empty">No roster data loaded yet</div>';
     return;
@@ -119089,7 +119201,9 @@ function _skSearchRunQuery(query) {
     byPlayer[key].leagues.push({
       leagueKey: p.leagueKey,
       leagueName: p.leagueName || '(unnamed league)',
-      slot: p.selectedPos || '',
+      teamName: p.teamName || '',
+      provider: p.provider || 'yahoo',   // XPSEARCH
+      slot: p.slot || '',
       scoringType: p.scoringType || '',
     });
   });
@@ -119145,9 +119259,17 @@ function _skSearchRunQuery(query) {
       // Escape leagueKey for the inline onclick — leagueKeys are
       // safe (alphanumeric + dots + dashes) but defensive anyway.
       var lkSafe = String(l.leagueKey || '').replace(/'/g, "\\'");
-      html += '<button class="sk-search-league-row" onclick="skSearchGoToLeague(\'' + lkSafe + '\')">' +
+      var pv = l.provider || 'yahoo';
+      var pvSafe = String(pv).replace(/'/g, "\\'");
+      // Which platform, on every row — the whole point of the search is
+      // knowing WHERE to go make the change. XPSEARCH
+      html += '<button class="sk-search-league-row" onclick="skSearchGoToLeague(\'' + lkSafe + '\',\'' + pvSafe + '\')">' +
         '<span class="slot-pill ' + pillClass + '">' + skEscape(pillLabel) + '</span>' +
-        '<span class="league-name">' + skEscape(l.leagueName) + '</span>' +
+        '<span class="xp-prov" style="color:' + (_XP_PROV_COLOR[pv] || '#94a3b8') + ';' +
+          'border-color:' + (_XP_PROV_COLOR[pv] || '#94a3b8') + '55">' +
+          skEscape(_XP_PROV_LABEL[pv] || pv.toUpperCase()) + '</span>' +
+        '<span class="league-name">' + skEscape(l.leagueName) +
+          (l.teamName ? '<em class="xp-team">' + skEscape(l.teamName) + '</em>' : '') + '</span>' +
         '<span class="arrow">\u203a</span>' +
       '</button>';
     });
@@ -119164,14 +119286,18 @@ function _skSearchRunQuery(query) {
 
 // Tap handler for a league chip — close the search and open that
 // league's detail view at the Matchup tab.
-function skSearchGoToLeague(leagueKey) {
+function skSearchGoToLeague(leagueKey, provider) {
   if (!leagueKey) return;
   // Close search overlay (pops nav stack)
   skCloseSearch();
   // Slight delay so the close animation doesn't visually collide
   // with the detail view opening
   setTimeout(function() {
-    if (typeof skOpenDetail === 'function') skOpenDetail(leagueKey);
+    // Provider decides the destination — a Fantrax key means nothing to
+    // skOpenDetail. Missing provider stays on the Yahoo path, which is what
+    // every existing caller means. XPSEARCH
+    if (typeof _skSearchOpenAny === 'function') _skSearchOpenAny(leagueKey, provider);
+    else if (typeof skOpenDetail === 'function') skOpenDetail(leagueKey);
   }, 60);
 }
 
