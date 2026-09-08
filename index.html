@@ -16366,6 +16366,21 @@
   }
   /* Platform chip on each result row — knowing WHERE to go is the point of
      the search, so it sits beside the slot rather than in a tooltip. XPSEARCH */
+  /* Sport filter chips — XPSEARCH */
+  .sk-search-sports {
+    display: flex; gap: 6px; padding: 0 14px 10px; flex-wrap: wrap;
+  }
+  .sk-search-sport {
+    flex: 0 0 auto; padding: 4px 10px; border-radius: 999px;
+    border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.04);
+    color: rgba(255,255,255,0.5); font-family: var(--sk-font-mono, monospace);
+    font-size: 9.5px; font-weight: 700; letter-spacing: 0.08em; cursor: pointer;
+  }
+  .sk-search-sport.active {
+    background: rgba(245,197,24,0.14); border-color: rgba(245,197,24,0.5);
+    color: var(--sk-gold, #f5c518);
+  }
+
   .sk-search-league-row .xp-prov {
     flex-shrink: 0; font-family: var(--sk-font-mono, monospace); font-size: 8px;
     font-weight: 700; letter-spacing: 0.06em; padding: 1px 4px; border-radius: 4px;
@@ -28635,6 +28650,10 @@
       <button class="sk-search-mode active" id="skSearchModeRosters" onclick="skSetSearchMode('rosters')">My Rosters</button>
       <button class="sk-search-mode" id="skSearchModeFa" onclick="skSetSearchMode('fa')">Free Agents</button>
     </div>
+    <!-- Sport filter — XPSEARCH. Chips rather than a <select> so the current
+         choice is visible without a tap, and so it sits on one row on a
+         phone. Populated from the sports actually rostered. -->
+    <div class="sk-search-sports" id="skSearchSports"></div>
     <!-- FA action row — only visible in Free Agent mode. The fan-out runs on
          tap/enter (not per keystroke) since it's N Yahoo calls. -->
     <div class="sk-search-fa-actions" id="skSearchFaActions" style="display:none">
@@ -117696,6 +117715,7 @@ function skOpenSearch() {
   ov.classList.add('open');
   // Always open in the fast local roster mode.
   skSetSearchMode('rosters');
+  if (typeof _skSearchRenderSports === 'function') _skSearchRenderSports();   // XPSEARCH
   // Render initial hint state — guidance, not noise
   _skSearchRenderHint();
   // Register with the nav stack so swipe-back closes the overlay
@@ -119113,9 +119133,13 @@ function _skSearchAllRosters() {
       var row = rows[L];
       if (!row || !row.rosters || !row.rosters.byTeam) continue;
       var SPORT = String(row.sport || '').toUpperCase();
-      var myIds = row.myTeamIds ||
-        ((typeof _fxMyTeamIds === 'function' && row.provider === 'fantrax')
-          ? _fxMyTeamIds(row.raw || {}) : null) || {};
+      // _extMyIds, not row.myTeamIds. A Fantrax row carries no myTeamIds —
+      // ownership lives in the raw payload — so reading the field directly
+      // finds no team of mine and skips the league silently. That's the same
+      // trap FTXMYIDS documents on the hub index, and I walked straight into
+      // it: Sleeper and ESPN set myTeamIds so they worked, Fantrax didn't and
+      // vanished. XPSEARCH
+      var myIds = (typeof _extMyIds === 'function') ? _extMyIds(row) : (row.myTeamIds || {});
       var teamKey = null, k;
       for (k in row.rosters.byTeam) {
         if (row.rosters.byTeam.hasOwnProperty(k) && myIds[k]) { teamKey = k; break; }
@@ -119124,18 +119148,28 @@ function _skSearchAllRosters() {
       var team = row.rosters.byTeam[teamKey] || {};
       var items = team.items || [];
       for (var it = 0; it < items.length; it++) {
+        var itm = items[it] || {};
         var res = (typeof _extRosterItemName === 'function')
-          ? _extRosterItemName(items[it] || {}, SPORT) : null;
-        if (!res || !res.name || res.name === '?' || res.unresolved) continue;
+          ? _extRosterItemName(itm, SPORT) : null;
+        var nm = (res && res.name) || '';
+        if (!nm || nm === '?' || (res && res.unresolved)) continue;
+        // Fantrax stores names surname-first ("MacKinnon, Nathan"); every
+        // other source is "Nathan MacKinnon". Flip it so one search matches
+        // across platforms instead of only the ones that agree on order.
+        // XPSEARCH
+        if (typeof _ftxDisplayName === 'function') {
+          var flipped = _ftxDisplayName(nm);
+          if (flipped) nm = flipped;
+        }
         // Slot label: the lineup slot where a provider sends one, otherwise
         // the lineup STATUS, so a Fantrax reserve still reads as benched.
-        var slot = items[it].slot || items[it].position || '';
-        if ((typeof _fxItemIsActive === 'function') && _fxItemIsActive(items[it]) === false) {
+        var slot = itm.slot || itm.position || '';
+        if ((typeof _fxItemIsActive === 'function') && _fxItemIsActive(itm) === false) {
           slot = (typeof _fxItemStatusLabel === 'function')
-            ? _fxItemStatusLabel(items[it]).toUpperCase() : 'BN';
+            ? _fxItemStatusLabel(itm).toUpperCase() : 'BN';
         }
         out.push({
-          name: res.name, teamAbbr: res.team || '', displayPos: res.pos || '',
+          name: nm, teamAbbr: res.team || '', displayPos: res.pos || '',
           sport: String(row.sport || '').toLowerCase(), provider: row.provider || 'ext',
           leagueKey: row.key, leagueName: row.name || '(unnamed league)',
           teamName: team.teamName || '', slot: slot, scoringType: ''
@@ -119162,6 +119196,49 @@ function _skSearchOpenAny(leagueKey, provider) {
 var _XP_PROV_LABEL = { yahoo: 'Y', sleeper: 'SLP', fantrax: 'FTX', espn: 'ESPN' };
 var _XP_PROV_COLOR = { yahoo: '#a78bfa', sleeper: '#fbbf24', fantrax: '#34d399', espn: '#ef4444' };
 
+// ── Sport filter ── XPSEARCH ──
+// Only the sports you actually roster get a chip, so a hockey-only manager
+// never sees an NBA button. ALL stays first and is the default: a name is
+// usually unambiguous, and the filter is there for the times it isn't.
+var _skSearchSport = 'all';
+var _SK_SPORT_LABEL = { mlb: 'MLB', nfl: 'NFL', nba: 'NBA', nhl: 'NHL', cfb: 'CFB' };
+
+function _skSearchRenderSports() {
+  var host = document.getElementById('skSearchSports');
+  if (!host) return;
+  var all = (typeof _skSearchAllRosters === 'function') ? _skSearchAllRosters() : [];
+  var seen = {}, order = [];
+  for (var i = 0; i < all.length; i++) {
+    var sp = String(all[i].sport || '').toLowerCase();
+    if (!sp || seen[sp]) continue;
+    seen[sp] = 1; order.push(sp);
+  }
+  // One sport is no choice at all — the row would be a label pretending to
+  // be a control, so it's hidden entirely.
+  if (order.length < 2) { host.innerHTML = ''; host.style.display = 'none'; return; }
+  order.sort();
+  host.style.display = '';
+  var html = '<button class="sk-search-sport' + (_skSearchSport === 'all' ? ' active' : '') +
+    '" onclick="skSetSearchSport(\'all\')">ALL</button>';
+  for (i = 0; i < order.length; i++) {
+    html += '<button class="sk-search-sport' + (_skSearchSport === order[i] ? ' active' : '') +
+      '" onclick="skSetSearchSport(\'' + order[i] + '\')">' +
+      (_SK_SPORT_LABEL[order[i]] || order[i].toUpperCase()) + '</button>';
+  }
+  host.innerHTML = html;
+}
+
+function skSetSearchSport(sp) {
+  _skSearchSport = sp || 'all';
+  _skSearchRenderSports();
+  var input = document.getElementById('skSearchInput');
+  var q = input ? String(input.value || '').trim() : '';
+  // Re-run against the same query rather than clearing it — changing the
+  // filter is a refinement, not a restart.
+  if (q.length >= 2) _skSearchRunQuery(q);
+  else _skSearchRenderHint();
+}
+
 function _skSearchRunQuery(query) {
   var body = document.getElementById('skSearchBody');
   if (!body) return;
@@ -119177,6 +119254,9 @@ function _skSearchRunQuery(query) {
   var qNorm = (typeof _skNormalizeName === 'function') ? _skNormalizeName(query) : qLower;
   var matches = rosters.filter(function(p) {
     if (!p.name) return false;
+    // XPSEARCH — sport filter
+    if (_skSearchSport !== 'all' &&
+        String(p.sport || '').toLowerCase() !== _skSearchSport) return false;
     var nLower = p.name.toLowerCase();
     if (nLower.indexOf(qLower) !== -1) return true;
     var nNorm = (typeof _skNormalizeName === 'function') ? _skNormalizeName(p.name) : nLower;
@@ -119188,7 +119268,16 @@ function _skSearchRunQuery(query) {
   // collapses to one card with a list of league chips.
   var byPlayer = {};
   matches.forEach(function(p) {
-    var key = (p.name || '').toLowerCase() + '||' + (p.teamAbbr || '').toUpperCase();
+    // Key on NORMALIZED NAME + SPORT, not name + pro team. Two reasons:
+    // providers disagree on punctuation ("K'Andre" vs "KAndre"), and not all
+    // of them send a pro team at all — ESPN sends none, so keying on it split
+    // one Tyler Herro into an ESPN card and a Yahoo card, which is exactly
+    // the fragmentation this search exists to remove. Sport keeps a
+    // basketball and a hockey player of the same name apart. XPSEARCH
+    var nKey = (typeof _pmNameKey === 'function')
+      ? _pmNameKey(p.name || '')
+      : (p.name || '').toLowerCase();
+    var key = nKey + '||' + (p.sport || '').toLowerCase();
     if (!byPlayer[key]) {
       byPlayer[key] = {
         name: p.name,
@@ -119198,6 +119287,11 @@ function _skSearchRunQuery(query) {
         leagues: [],
       };
     }
+    // First provider to report a pro team or position fills it — ESPN sends
+    // neither, so without this the merged card showed a bare em-dash even
+    // when Yahoo knew the answer. XPSEARCH
+    if (!byPlayer[key].teamAbbr && p.teamAbbr) byPlayer[key].teamAbbr = p.teamAbbr;
+    if (!byPlayer[key].displayPos && p.displayPos) byPlayer[key].displayPos = p.displayPos;
     byPlayer[key].leagues.push({
       leagueKey: p.leagueKey,
       leagueName: p.leagueName || '(unnamed league)',
