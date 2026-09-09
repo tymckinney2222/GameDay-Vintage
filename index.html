@@ -8217,6 +8217,18 @@
   .crs-act-liveab { border-color: rgba(239,68,68,0.55); color: #ff6a6a; }
   /* ── My Players pill + modal ── MYPLAYERS ── */
   .crs-act-mine { border-color: rgba(245,197,24,0.55); color: var(--sk-gold, #f5c518); }
+  /* ── Hub lineup filter ── FHUBFILT ── */
+  .fhub-filt { display: flex; gap: 6px; margin: 0 0 10px; }
+  .fhub-filt-chip {
+    flex: 1; padding: 5px 4px; border-radius: 7px;
+    border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.04);
+    color: rgba(255,255,255,0.45); font-family: var(--sk-font-mono, monospace);
+    font-size: 9px; font-weight: 700; letter-spacing: 0.1em; cursor: pointer;
+  }
+  .fhub-filt-chip.on {
+    background: rgba(245,197,24,0.14); border-color: rgba(245,197,24,0.5);
+    color: var(--sk-gold, #f5c518);
+  }
   .myp-chips { display: flex; gap: 6px; flex-wrap: wrap; margin: 0 0 10px; }
   .myp-chip {
     display: inline-flex; align-items: center; gap: 5px; padding: 4px 10px;
@@ -64178,6 +64190,12 @@ function _sbMyPlayersData() {
     for (var h = 0; h < hits.length; h++) {
       if (sportTok && hits[h].sport &&
           String(hits[h].sport).toUpperCase() !== String(sportTok).toUpperCase()) continue;
+      // Active spots only. A player sitting on your bench or IR isn't
+      // scoring for you, so listing that team here answers the wrong
+      // question — this pill exists to say which of your lineups a game
+      // actually affects. An unknown status (provider didn't say) is kept
+      // rather than dropped: silence isn't evidence of a bench slot. XPACTIVE
+      if (hits[h].active === false) continue;
       rows.push(hits[h]);
     }
     if (!rows.length) continue;
@@ -64309,7 +64327,7 @@ function openMyPlayersModal() {
     var nT = 0;
     for (var i = 0; i < data.length; i++) nT += data[i].rows.length;
     sub.textContent = data.length + (data.length === 1 ? ' player' : ' players') +
-      ' \u00b7 ' + nT + (nT === 1 ? ' roster spot' : ' roster spots');
+      ' \u00b7 ' + nT + (nT === 1 ? ' active spot' : ' active spots');
   }
   host.classList.add('open');
   _myPlayersRender();
@@ -71155,6 +71173,7 @@ function openEspFantasyHub() {
       var rowsHtml = '';
       for (var ei = 0; ei < g.entries.length; ei++) {
         var en = g.entries[ei], fr = en.row, lu = en.lineup || fr.lineup || {};
+        if (!_fhubRowPasses(fr)) continue;   // FHUBFILT
         var fpTag = '';
         if (!fr.isCats && fr.fp != null) {
           var fpStr = (fr.fp > 0 ? '+' : '') + fr.fp.toFixed(1);
@@ -71187,6 +71206,7 @@ function openEspFantasyHub() {
 
       // fxh-uni scopes the typography for THIS hub only — the Sleeper/Fantrax
       // hub carries its own stat line and reads well as it is. FXHUBUNI
+      if (!rowsHtml) continue;   // FHUBFILT
       html += '<div class="crs-fhub-card fxh-uni" style="--fhub-accent:' + ACC + '">' +
         '<div class="crs-fhub-card-top">' +
           (g.teamLogo ? '<img class="crs-fhub-card-logo" src="' + g.teamLogo + '" alt="" onerror="this.style.display=\'none\'">' : '') +
@@ -71203,7 +71223,10 @@ function openEspFantasyHub() {
     // share one sport and one period word. ESPFFLWIN
     var _hg = (players[0] && players[0].rows && players[0].rows[0])
       ? players[0].rows[0].game : '';
-    body.innerHTML = html +
+    body.innerHTML = _fhubFilterChips('openEspFantasyHub') +
+      (html || '<div class="crs-fhub-empty">No ' +
+        (_fhubLineupFilter === 'BENCH' ? 'benched' : 'active') +
+        ' players from this game on your ESPN rosters.</div>') +
       '<div style="color:rgba(255,255,255,0.25);font-size:9.5px;text-align:center;padding:8px 0 2px;">' +
       'ESPN Fantasy \u00b7 ' +
       ((typeof espPeriodWord === 'function') ? espPeriodWord(_hg) : 'today') +
@@ -71695,6 +71718,40 @@ var _extFhubRetried = false;   // FTXFHUBLOAD
 // differently: Fantrax and Sleeper set a starter field, ESPN and Yahoo nest
 // it under lineup. The grouper asks this rather than each hub's own field.
 // FXHUBGRP
+// ── Hub lineup filter ── FHUBFILT ──
+// ALL / ACTIVE / BENCH, shared by all three hubs. The BENCH view is the
+// interesting one: it answers "what am I leaving on the bench" — a player
+// scoring real points for nobody. Rows whose status the provider never
+// reported show in ALL and ACTIVE but never in BENCH, since we can't claim a
+// player is benched on silence.
+var _fhubLineupFilter = 'ALL';
+
+function setFhubLineupFilter(which, reopen) {
+  _fhubLineupFilter = which || 'ALL';
+  if (reopen && typeof window[reopen] === 'function') window[reopen]();
+}
+
+function _fhubFilterChips(reopenFn) {
+  var opts = [['ALL', 'ALL'], ['ACTIVE', 'ACTIVE'], ['BENCH', 'BENCH']];
+  var h = '<div class="fhub-filt">';
+  for (var i = 0; i < opts.length; i++) {
+    h += '<button class="fhub-filt-chip' + (_fhubLineupFilter === opts[i][0] ? ' on' : '') +
+      '" onclick="setFhubLineupFilter(\'' + opts[i][0] + '\',\'' + reopenFn + '\')">' +
+      opts[i][1] + '</button>';
+  }
+  return h + '</div>';
+}
+
+// Does this row survive the current filter? Used per ROW, so a card can show
+// only the half you asked for while its header total still reflects the
+// active lineup — the total is a scoring fact, not a display preference.
+function _fhubRowPasses(fr) {
+  if (_fhubLineupFilter === 'ALL') return true;
+  var b = _fhubRowBenched(fr);
+  if (_fhubLineupFilter === 'BENCH') return b === true;
+  return b !== true;   // ACTIVE — unknown counts as active
+}
+
 function _fhubRowBenched(fr) {
   if (!fr) return undefined;
   if (fr.starter === true) return false;
@@ -71988,6 +72045,7 @@ function openExtFantasyHub() {
       for (var ei = 0; ei < g.entries.length; ei++) {
         var en = g.entries[ei];
         var fr = en.row;
+        if (!_fhubRowPasses(fr)) continue;   // FHUBFILT
         var right;
         if (fr.fp != null) {
           // Calculated rows print to two decimals so they can be checked
@@ -72029,6 +72087,10 @@ function openExtFantasyHub() {
         '</div>';
       }
 
+      // A card with nothing left after filtering is dropped rather than shown
+      // empty — in BENCH view most teams have no benched player in this game,
+      // and a page of empty cards buries the ones that do. FHUBFILT
+      if (!rowsHtml) continue;
       html += '<div class="crs-fhub-card" style="--fhub-accent:' + col + '">' +
         '<div class="crs-fhub-card-top">' +
           (g.teamLogo ? '<img class="crs-fhub-card-logo" src="' + g.teamLogo + '" alt="" onerror="this.style.display=\'none\'">' : '') +
@@ -72043,7 +72105,10 @@ function openExtFantasyHub() {
         catStrip + rowsHtml +
       '</div>';
     }
-    body.innerHTML = html +
+    body.innerHTML = _fhubFilterChips('openExtFantasyHub') +
+      (html || '<div class="crs-fhub-empty">No ' +
+        (_fhubLineupFilter === 'BENCH' ? 'benched' : 'active') +
+        ' players from this game on your rosters.</div>') +
       '<div style="color:rgba(255,255,255,0.25);font-size:9.5px;text-align:center;padding:8px 0 2px;">' +
       'Sleeper points are the league\u2019s own per-player totals \u00b7 ' +
       'Fantrax exposes no per-player FP</div>';
@@ -72154,6 +72219,7 @@ function openCrsFantasyHub() {
       var rowsHtml = '';
       g.entries.forEach(function(en) {
         var fr = en.row;
+        if (!_fhubRowPasses(fr)) return;   // FHUBFILT
         // Lineup / availability, per player per league. This was a card badge
         // when the card was a player; grouped, it belongs on the row — the
         // same player can be starting in one league and benched in the next.
@@ -72189,6 +72255,7 @@ function openCrsFantasyHub() {
         '</div>';
       });
 
+      if (!rowsHtml) return;   // FHUBFILT
       html += '<div class="crs-fhub-card fxh-uni" style="--fhub-accent:#a78bfa">' +   // FXHUBUNI
         '<div class="crs-fhub-card-top">' +
           (g.teamLogo ? '<img class="crs-fhub-card-logo" src="' + g.teamLogo + '" alt="" onerror="this.style.display=\'none\'">' : '') +
@@ -72205,7 +72272,11 @@ function openCrsFantasyHub() {
     // Every row here comes from fyFullRosters / teamFpCache / fyLeagues —
     // Yahoo data end to end, kept that way deliberately. One renderer
     // serves all four stadium modes (Fenway, Gym, Rink, Field).
-    body.innerHTML = html + _fyStampHtml(null);
+    body.innerHTML = _fhubFilterChips('openCrsFantasyHub') +
+      (html || '<div class="crs-fhub-empty">No ' +
+        (_fhubLineupFilter === 'BENCH' ? 'benched' : 'active') +
+        ' players from this game on your Yahoo rosters.</div>') +
+      _fyStampHtml(null);
   }
   modal.classList.add('open');
 }
@@ -119995,6 +120066,33 @@ function _skFaRenderResults(groups, query, leagueCount) {
 // is only provable for Fantrax and Sleeper (they publish every team's roster);
 // Yahoo and un-opened ESPN leagues would have to guess, and a lookup tool you
 // can't trust is worse than one with a narrower promise.
+// ── Is this roster spot ACTIVE? ── XPACTIVE ──
+// Tri-state: true / false / undefined when the provider didn't say.
+//
+// Every provider answers this differently, and each has a field that already
+// knows: ESPN sets a starter flag from _espIsBenchSlot, Sleeper sets one on
+// its start slots, Fantrax sends a status (ACTIVE/RESERVE/INJURED_RESERVE),
+// and Yahoo names the slot itself (BN/IR/IL/NA). So the flag is preferred and
+// the slot name is the fallback — reading the slot name FIRST would misjudge
+// a provider whose active slots are named things this list can't anticipate.
+var _XP_BENCH_SLOTS = {
+  BN: 1, BE: 1, BEN: 1, BENCH: 1, IR: 1, IL: 1, DL: 1, NA: 1,
+  RES: 1, RESERVE: 1, INJURED_RESERVE: 1, TAXI: 1, MINORS: 1, MIN: 1, SUS: 1
+};
+function _xpSpotIsActive(it, slot) {
+  if (it) {
+    if (typeof _fxItemIsActive === 'function') {
+      var st = _fxItemIsActive(it);          // Fantrax status, Sleeper starter
+      if (st === true || st === false) return st;
+    }
+    if (it.starter === true) return true;    // ESPN / Sleeper
+    if (it.starter === false) return false;
+  }
+  var sl = String(slot || '').trim().toUpperCase();
+  if (!sl) return undefined;
+  return !_XP_BENCH_SLOTS[sl];
+}
+
 function _skSearchAllRosters() {
   var out = [];
 
@@ -120016,7 +120114,9 @@ function _skSearchAllRosters() {
         // consumer that tried to draw one got an empty placeholder box.
         // Yahoo rosters carry it per row. XPLOGO
         teamLogo: (/^https?:\/\//i.test(String(r.myTeamLogo || '')) ? r.myTeamLogo : ''),
-        slot: r.selectedPos || '', scoringType: r.scoringType || ''
+        slot: r.selectedPos || '', scoringType: r.scoringType || '',
+        active: _xpSpotIsActive(null, r.selectedPos)   // XPACTIVE
+
       });
     }
   } catch (eY) {}
@@ -120097,7 +120197,8 @@ function _skSearchAllRosters() {
           name: nm, teamAbbr: res.team || '', displayPos: res.pos || '',
           sport: String(row.sport || '').toLowerCase(), provider: row.provider || 'ext',
           leagueKey: row.key, leagueName: row.name || '(unnamed league)',
-          teamName: team.teamName || '', teamLogo: lgLogo, slot: slot, scoringType: ''
+          teamName: team.teamName || '', teamLogo: lgLogo, slot: slot, scoringType: '',
+          active: _xpSpotIsActive(itm, itm.slot || itm.position || '')   // XPACTIVE
         });
       }
     }
