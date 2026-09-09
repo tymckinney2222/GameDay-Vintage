@@ -40296,8 +40296,14 @@ function writePtsSnapshot(leagueKey, date) {
   // after week N's last game tags N (the completed week), which is
   // exactly what a Sunday-morning CFB snap should mean.
   if (league && _skIsNflLeague(league)) {
-    var _wfd = _skWeekForDate(leagueKey, snapDate);
-    if (_wfd && _wfd.phase !== 'pre') week = _wfd.week;
+    // PTSWEEK — the week this cumulative total COMPLETES, which is not the
+    // same as the week the date falls in. See _skPtsWeekForDate.
+    var _pw = _skPtsWeekForDate(leagueKey, snapDate);
+    if (_pw != null) week = _pw;
+    else {
+      var _wfd = _skWeekForDate(leagueKey, snapDate);
+      if (_wfd && _wfd.phase !== 'pre') week = _wfd.week;
+    }
   }
 
   var pfByTeam = {};
@@ -84176,6 +84182,51 @@ function _skLoadGameWeeks() {
 // (between week N's end and N+1's start → N just completed; the
 // Sunday-morning CFB case), 'pre' (before week 1), 'post' (after the
 // last week), or null when game_weeks aren't loaded.
+// Which NFL week a season-points snapshot COMPLETES ── PTSWEEK ──
+//
+// A points snapshot is a cumulative season total, so the week it belongs to
+// is the week whose games are all in it — not the week the calendar says it
+// falls in. Yahoo's game_weeks run Tuesday→Monday with no gap between them,
+// so the Tuesday morning snap the app tells you to take lands on the FIRST
+// DAY OF THE NEXT WEEK. The old rule read that as week N+1, which meant:
+//
+//   • the Tuesday snap that captures week N's finals was filed under N+1
+//   • week N kept whatever earlier, emptier snap had landed inside it
+//   • that earlier snap was rarely a Tuesday, so the grid's green Tuesday
+//     tick never appeared
+//
+// Tuesday and Wednesday of a new week have no games played yet (kickoff is
+// Thursday, or Wednesday for a Wednesday opener — and a morning snap still
+// precedes it), so a snapshot taken then still holds exactly the previous
+// week's totals and is filed there. From Thursday on, the new week has
+// started scoring and the snapshot is that week's, partial or complete.
+//
+// Returns 0 before any week has completed, which the weekly grid skips —
+// better than filing a zeroed pre-season snapshot as week 1 and having it
+// win the week on date order.
+function _skPtsWeekForDate(leagueKey, dateStr) {
+  var gk = String(leagueKey || '').split('.')[0];
+  var weeks = _skGameWeeksMem[gk];
+  if (!weeks || !weeks.length) return null;   // no schedule — caller falls back
+  if (dateStr < weeks[0].start) return 0;     // pre-season
+  for (var i = 0; i < weeks.length; i++) {
+    var w = weeks[i];
+    if (dateStr >= w.start && dateStr <= w.end) {
+      // Days elapsed since this week began. 0 = Tuesday, 1 = Wednesday.
+      var d0 = new Date(w.start + 'T12:00:00');
+      var d1 = new Date(dateStr + 'T12:00:00');
+      var daysIn = Math.round((d1 - d0) / 86400000);
+      if (daysIn <= 1) return w.week - 1;     // nothing played yet this week
+      return w.week;
+    }
+    // Between weeks (rare — Yahoo usually butts them together).
+    if (i + 1 < weeks.length && dateStr > w.end && dateStr < weeks[i + 1].start) {
+      return w.week;
+    }
+  }
+  return weeks[weeks.length - 1].week;        // after the last week
+}
+
 function _skWeekForDate(leagueKey, dateStr) {
   var gk = String(leagueKey || '').split('.')[0];
   var weeks = _skGameWeeksMem[gk];
@@ -108981,18 +109032,36 @@ function _skBuildNflWeeklyDeltaTable(leagueKey, snaps, valid, me, weeksLeft, lea
   html += '<th class="tot">TOT</th><th class="need">NEED</th></tr>';
 
   // INSURANCE ROW: which snapshot date fed each week, so you can verify the
-  // Tuesday-morning timing is landing. Shows M/D of the snap used per week and
-  // stars it if it was actually taken on a Tuesday (getDay()===2). Blank weeks
-  // show a dot. Helps confirm during the season that the week bucketing is
-  // capturing the right day.
+  // capture timing is landing. Shows M/D of the snap used per week, green when
+  // the capture was CLEAN. Blank weeks show a dot.
+  //
+  // "Clean" is a question about the data, not the calendar: was this snapshot
+  // taken after every one of that week's games finished, and before the next
+  // week's games started? _skPtsWeekForDate files a snap under the week it
+  // completes, so any snap landing in the first two days of the FOLLOWING
+  // week (Tuesday or Wednesday — nothing is played then) satisfies both
+  // halves and is a clean capture.
+  //
+  // The old test was literally getDay()===2. That marked a correct Wednesday
+  // capture amber, which mattered because a daily snapper's Wednesday snap
+  // beats their Tuesday one on date and wins the bucket — so the indicator
+  // warned about data that was exactly right. PTSCLEAN
   html += '<tr class="skw-snapdates"><th class="team" style="font-size:8px;color:#64748b;font-weight:400">snapped</th>';
   for (var dw = 1; dw <= TOTAL_WEEKS; dw++) {
     var snapForWk = byWeek[dw];
     if (snapForWk && snapForWk.date) {
       var _sd = new Date(snapForWk.date + 'T12:00:00');
-      var _isTue = _sd.getDay() === 2;
       var _md = (_sd.getMonth() + 1) + '/' + _sd.getDate();
-      html += '<th style="font-size:8px;font-weight:400;color:' + (_isTue ? '#22c55e' : '#f59e0b') + '">' + _md + (_isTue ? '\u2713' : '') + '</th>';
+      // A clean capture files under an EARLIER week than the one its date
+      // sits in — that gap is precisely "taken before this week played".
+      var _clean = false;
+      var _dayWk = (typeof _skWeekForDate === 'function')
+        ? _skWeekForDate(leagueKey, snapForWk.date) : null;
+      if (_dayWk && _dayWk.week > dw) _clean = true;
+      // No game_weeks loaded (or a non-football league reaching here) —
+      // fall back to the original Tuesday test rather than claiming clean.
+      else if (!_dayWk) _clean = (_sd.getDay() === 2);
+      html += '<th style="font-size:8px;font-weight:400;color:' + (_clean ? '#22c55e' : '#f59e0b') + '">' + _md + (_clean ? '\u2713' : '') + '</th>';
     } else {
       html += '<th style="font-size:8px;color:#334155;font-weight:400">\u00b7</th>';
     }
@@ -109044,8 +109113,10 @@ function _skBuildNflWeeklyDeltaTable(leagueKey, snaps, valid, me, weeksLeft, lea
   html += '<div class="sk-catch-daily-note">Each cell is your points that week minus theirs \u2014 '
         + 'green you gained, red you lost. TOT is your season margin vs that team. '
         + 'NEED is the weekly margin to catch them (gap \u00f7 weeks left). '
-        + 'The "snapped" row shows which date fed each week \u2014 green \u2713 means it was a Tuesday '
-        + '(the clean capture day); amber means another day. Snap every Tuesday morning after the week completes.</div>';
+        + 'The "snapped" row shows which date fed each week \u2014 green \u2713 means a clean capture: '
+        + 'taken after every one of that week\u2019s games and before the next week started (Tuesday or '
+        + 'Wednesday morning). Amber means the snap landed mid-week, so that column may be partial. '
+        + 'Snapping daily is fine \u2014 the clean one wins its week.</div>';
   html += '</details>';
 
   if (!anyData) {
