@@ -8234,10 +8234,20 @@
     margin-left: auto; flex-shrink: 0; font-family: var(--sk-font-mono, monospace);
     font-size: 9px; letter-spacing: 0.06em; color: rgba(255,255,255,0.4);
   }
+  /* Game line under the player name — their actual box stats. MYPGAME */
+  .myp-gline {
+    font-family: var(--sk-font-mono, monospace); font-size: 10px;
+    color: var(--sk-gold, #f5c518); letter-spacing: 0.02em;
+    margin: -2px 0 7px; padding-bottom: 7px;
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+  }
   .myp-row {
     display: flex; align-items: center; gap: 8px; padding: 5px 0;
     border-top: 1px solid rgba(255,255,255,0.05);
   }
+  /* The game line already draws a rule, so the first ownership row under it
+     doesn't need a second one stacked on top. MYPGAME */
+  .myp-gline + .myp-row { border-top: 0; }
   .myp-tlogo { width: 18px; height: 18px; border-radius: 4px; object-fit: cover; flex-shrink: 0; }
   .myp-tph {
     background: rgba(255,255,255,0.07); display: inline-flex;
@@ -64115,11 +64125,14 @@ function _sbPbpFab(data, game, prefix) {
 // it's a roster membership list, which is why one combined view is the right
 // shape where the scoring hubs stay separate.
 function _sbMyPlayersInlinePill() {
+  // Always rendered, including pre-game. Hiding it on an empty count meant
+  // the pill appeared and disappeared depending on kickoff state, and before
+  // a game is the moment you most want to check who you have in it. The count
+  // is shown only once there is one. MYPLAYERS
   var n = 0;
   try { n = _sbMyPlayersData().length; } catch (e) {}
-  if (!n) return '';
   return '<button class="fwbx-actpill crs-act-mine" onclick="openMyPlayersModal()">' +
-    '<span>My Players \u00b7 ' + n + '</span>\ud83d\udc64</button>';
+    '<span>My Players' + (n ? (' \u00b7 ' + n) : '') + '</span>\ud83d\udc64</button>';
 }
 
 // Athletes in the open game that appear on any of my rosters, with every
@@ -64160,7 +64173,8 @@ function _sbMyPlayersData() {
     if (!rows.length) continue;
     seen[nk] = 1;
     out.push({ name: at.name, pos: at.pos || '', teamAbbr: at.teamAbbr || '',
-               teamLogo: at.teamLogo || '', accent: at.accent || '', rows: rows });
+               teamLogo: at.teamLogo || '', accent: at.accent || '',
+               espnId: at.espnId || null, rows: rows });
   }
   // Most-exposed player first — the one a piece of news matters most for.
   out.sort(function (a, b) {
@@ -64170,11 +64184,95 @@ function _sbMyPlayersData() {
   return out;
 }
 
+// ── Game line for one player ── MYPGAME ──
+// Their actual game stats, not fantasy points. Two sources, because MLB is a
+// different pipeline from everything else:
+//
+//   MLB — the MLB Stats API box that Fenway already holds, keyed by full
+//         name. Same numbers the player card's "GAME:" line shows, built the
+//         same way, so the two can never disagree.
+//   NHL / NBA / NFL / CFB — the ESPN box already fetched for the open
+//         stadium. No extra request: _fxStadiumStatMap reads the boxscore
+//         that's in memory.
+//
+// The non-MLB line is built from the box's OWN column order rather than a
+// per-sport whitelist, so a skater, a goalie, a quarterback and a receiver
+// each read correctly without four hand-maintained lists — and a column ESPN
+// adds later shows up on its own.
+function _sbMlbGameLine(name) {
+  try {
+    var live = window.fenwayLiveData;
+    var bx = live && live.boxscore;
+    if (!bx || !bx.teams) return '';
+    var rec = null;
+    ['away', 'home'].forEach(function (sd) {
+      var players = (bx.teams[sd] && bx.teams[sd].players) || {};
+      Object.keys(players).forEach(function (pid) {
+        var pp = players[pid];
+        if (!rec && pp && pp.person && pp.person.fullName === name) rec = pp;
+      });
+    });
+    if (!rec || !rec.stats) return '';
+    var bat = rec.stats.batting || {};
+    var pit = rec.stats.pitching || {};
+    // A pitcher who also batted is rare enough that the pitching line wins
+    // when he actually pitched.
+    if (pit.inningsPitched != null && String(pit.inningsPitched) !== '0.0') {
+      var pp2 = [pit.inningsPitched + ' IP'];
+      if ((pit.hits || 0) > 0) pp2.push(pit.hits + ' H');
+      if ((pit.earnedRuns || 0) > 0) pp2.push(pit.earnedRuns + ' ER');
+      if ((pit.baseOnBalls || 0) > 0) pp2.push(pit.baseOnBalls + ' BB');
+      if ((pit.strikeOuts || 0) > 0) pp2.push(pit.strikeOuts + ' K');
+      return pp2.join(', ');
+    }
+    if (bat.atBats == null && !bat.baseOnBalls) return '';
+    var g = [(bat.hits || 0) + '-' + (bat.atBats || 0)];
+    if ((bat.homeRuns || 0) > 0) g.push(bat.homeRuns + ' HR');
+    if ((bat.doubles || 0) > 0) g.push(bat.doubles + ' 2B');
+    if ((bat.triples || 0) > 0) g.push(bat.triples + ' 3B');
+    if ((bat.rbi || 0) > 0) g.push(bat.rbi + ' RBI');
+    if ((bat.runs || 0) > 0) g.push(bat.runs + ' R');
+    if ((bat.baseOnBalls || 0) > 0) g.push(bat.baseOnBalls + ' BB');
+    if ((bat.strikeOuts || 0) > 0) g.push(bat.strikeOuts + ' K');
+    if ((bat.stolenBases || 0) > 0) g.push(bat.stolenBases + ' SB');
+    return g.join(', ');
+  } catch (e) { return ''; }
+}
+
+// Compact line from an ESPN box stat map. Zeros and placeholders are dropped
+// so a player who did one thing shows that one thing rather than a row of
+// noughts; clock columns are kept even though they never read as zero.
+function _sbBoxGameLine(statMap) {
+  if (!statMap) return '';
+  var bits = [], k;
+  for (k in statMap) {
+    if (!statMap.hasOwnProperty(k)) continue;
+    if (k.charAt(0) === '_') continue;          // synthetic/derived keys
+    var v = statMap[k];
+    if (v == null) continue;
+    var sv = String(v).trim();
+    if (sv === '' || sv === '0' || sv === '-' || sv === '--' || sv === '0:00' ||
+        sv === '0-0' || sv === '.000') continue;
+    bits.push(sv + ' ' + k);
+    if (bits.length >= 6) break;
+  }
+  return bits.join(' \u00b7 ');
+}
+
+function _sbMyPlayerGameLine(at) {
+  try {
+    var sport = (typeof _extStadiumSport === 'function') ? _extStadiumSport() : '';
+    if (String(sport).toUpperCase() === 'MLB') return _sbMlbGameLine(at.name);
+    if (!at.espnId || typeof _fxStadiumStatMap !== 'function') return '';
+    var sm = _fxStadiumStatMap(at.espnId);
+    return sm ? _sbBoxGameLine(sm.statMap) : '';
+  } catch (e) { return ''; }
+}
+
 var _myPlayersFilter = 'ALL';   // pro-team filter inside the modal
 
 function openMyPlayersModal() {
   var data = _sbMyPlayersData();
-  if (!data.length) return;
   _myPlayersFilter = 'ALL';
   var host = document.getElementById('mypModal');
   var body = document.getElementById('mypBody');
@@ -64259,10 +64357,22 @@ function _myPlayersRender() {
         (pl.pos ? '<span class="crs-fhub-card-pos">' + slEsc(pl.pos) + '</span>' : '') +
         '<span class="myp-count">' + pl.rows.length +
           (pl.rows.length === 1 ? ' team' : ' teams') + '</span>' +
-      '</div>' + rows +
+      '</div>' +
+      // Their game, not their fantasy value. Sits under the name so the
+      // header answers "what has he done" before the ownership list answers
+      // "where do I have him". MYPGAME
+      (function () {
+        var gl = _sbMyPlayerGameLine(pl);
+        return gl ? '<div class="myp-gline">' + slEsc(gl) + '</div>' : '';
+      })() + rows +
     '</div>';
   }
-  if (!html) html = '<div class="crs-fhub-empty">No players from that team on your rosters.</div>';
+  if (!html) {
+    html = '<div class="crs-fhub-empty">' +
+      (data.length
+        ? 'No players from that team on your rosters.'
+        : 'None of your players are in this game.') + '</div>';
+  }
   body.innerHTML = chips + html;
 }
 
