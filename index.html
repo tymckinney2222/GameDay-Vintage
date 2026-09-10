@@ -107526,7 +107526,10 @@ function skProbeEspnStats() {
     say('  scoringPeriodId: ' + (row.scoringPeriodId != null ? row.scoringPeriodId : '?') +
         '   seasonId: ' + (row.seasonId != null ? row.seasonId : '?'));
     var ids = (typeof espScoredIds === 'function') ? espScoredIds(row) : [];
-    say('  espScoredIds (' + ids.length + '): ' + ids.slice(0, 24).join(' '));
+    // FULL list. Truncating this hid the answer last time: the question is
+    // whether the ids a player actually has intersect the ids the league
+    // scores, and a slice can't answer it.
+    say('  espScoredIds (' + ids.length + '): ' + ids.join(' '));
     var gcode = (typeof _espGameCode === 'function') ? _espGameCode(row) : '?';
     say('  game code: ' + gcode);
     var wins = (typeof espWindows === 'function') ? espWindows(gcode) : [];
@@ -107543,22 +107546,55 @@ function skProbeEspnStats() {
     for (k in row.rosters.byTeam) { if (myIds[k]) { teamKey = k; break; } }
     if (!teamKey) { say('  (my team not identified)'); say(''); return; }
     var items = (row.rosters.byTeam[teamKey] || {}).items || [];
-    var pick = null;
-    for (var i = 0; i < items.length; i++) {
+    // A player who has ACTUALLY PLAYED. Falling back to items[0] picked
+    // Caleb Williams, whose game hadn't kicked off — so windows.today was
+    // legitimately NULL and the probe reported a non-problem. Prefer today
+    // stats, then any today total, and say so plainly if neither exists.
+    var pick = null, why = '';
+    for (var i = 0; i < items.length && !pick; i++) {
       var w2 = items[i].windows && items[i].windows.today;
-      if (w2 && w2.total != null && Number(w2.total) !== 0) { pick = items[i]; break; }
+      if (w2 && w2.stats && Object.keys(w2.stats).length) { pick = items[i]; why = 'has today stats'; }
     }
-    if (!pick) pick = items[0];
-    if (!pick) { say('  (no roster items)'); say(''); return; }
-    shown++;
+    for (i = 0; i < items.length && !pick; i++) {
+      var w3 = items[i].windows && items[i].windows.today;
+      if (w3 && w3.total != null && Number(w3.total) !== 0) { pick = items[i]; why = 'has today FP, no stats'; }
+    }
+    if (!pick) {
+      say('  No player on this roster has played yet \u2014 nothing to diagnose here.');
+      say('');
+      shown--;
+      return;
+    }
     say('');
-    say('  player: ' + (pick.name || pick.playerId) + '   slot ' + (pick.slot || '?'));
+    say('  player: ' + (pick.name || pick.playerId) + '   slot ' + (pick.slot || '?') +
+        '   [' + why + ']');
     var tw = pick.windows && pick.windows.today;
     say('  windows.today: ' + (tw ? ('total=' + tw.total +
         '  stats keys=' + (tw.stats ? Object.keys(tw.stats).length : 'NULL') +
         '  fp keys=' + (tw.fp ? Object.keys(tw.fp).length : 'NULL')) : 'NULL'));
-    if (tw && tw.stats) say('  today.stats: ' + JSON.stringify(tw.stats).slice(0, 300));
-    if (tw && tw.fp) say('  today.fp:    ' + JSON.stringify(tw.fp).slice(0, 300));
+    if (tw && tw.stats) say('  today.stats: ' + JSON.stringify(tw.stats));
+    if (tw && tw.fp) say('  today.fp:    ' + JSON.stringify(tw.fp));
+    // THE question: do the ids he has intersect the ids the league scores,
+    // and does espStatName have a label for them? A stat with no label is
+    // skipped silently by _espFhubStatHtml, which looks identical to having
+    // no stat at all.
+    if (tw && tw.stats) {
+      var have = Object.keys(tw.stats);
+      var inBoth = [], notScored = [], noLabel = [];
+      for (var h = 0; h < have.length; h++) {
+        var idh = have[h];
+        var scored = false;
+        for (var q = 0; q < ids.length; q++) { if (String(ids[q]) === String(idh)) { scored = true; break; } }
+        var nm2 = (typeof espStatName === 'function') ? espStatName(gcode, idh) : null;
+        if (!scored) notScored.push(idh);
+        else if (!nm2) noLabel.push(idh);
+        else inBoth.push(idh + '=' + nm2);
+      }
+      say('');
+      say('  WOULD RENDER (' + inBoth.length + '): ' + (inBoth.join(' \u00b7 ') || 'NOTHING'));
+      say('  has stat, league does not score it: ' + (notScored.join(' ') || 'none'));
+      say('  scored but espStatName has no label:  ' + (noLabel.join(' ') || 'none'));
+    }
     // The raw entries, which is the thing we actually need to see.
     var pl = pick._raw || pick.player || null;
     var st = (pl && pl.stats) || pick.rawStats || null;
@@ -111007,6 +111043,17 @@ function _skBuildNflGameLogHTML(myPl, myWeeks, opPl, opWeeks, startWk, endWk, st
   for (var w = startWk; w <= endWk; w++) {
     var mv = (myWeeks && myWeeks[w] != null) ? myWeeks[w] : null;
     var ov = (opWeeks && opWeeks[w] != null) ? opWeeks[w] : null;
+    // Seed the CURRENT week from the live matchup value. Yahoo's weekly
+    // stats endpoint doesn't publish a week until it's settled, so an
+    // in-progress week came back empty and the row read as an em-dash —
+    // while the card directly above it showed the player's live 1.8. Two
+    // numbers for the same thing, one of them blank. The live figure is
+    // already on the pair, so it fills the gap rather than being refetched.
+    // NFLGLLIVE
+    if (w === curWk) {
+      if (mv == null && myPl && myPl.fp != null) mv = Number(myPl.fp);
+      if (ov == null && opPl && opPl.fp != null) ov = Number(opPl.fp);
+    }
     if (mv != null) { myTot += mv; myHas = true; }
     if (ov != null) { opTot += ov; opHas = true; }
     var myWin = (mv != null && ov != null && mv > ov);
