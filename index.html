@@ -8217,6 +8217,12 @@
   .crs-act-liveab { border-color: rgba(239,68,68,0.55); color: #ff6a6a; }
   /* ── My Players pill + modal ── MYPLAYERS ── */
   .crs-act-mine { border-color: rgba(245,197,24,0.55); color: var(--sk-gold, #f5c518); }
+  /* FP refresh, in every stadium. Spins while a refresh is in flight — the
+     same .spinning class the MLB header button uses. STADREFRESH */
+  .crs-act-fp { border-color: rgba(96,165,250,0.55); color: #93c5fd; }
+  .fwbx-actpill.spinning { opacity: 0.55; pointer-events: none; }
+  .fwbx-actpill.spinning span { animation: crsFpPulse 0.9s ease-in-out infinite; }
+  @keyframes crsFpPulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
   /* ── Hub lineup filter ── FHUBFILT ── */
   .fhub-filt { display: flex; gap: 6px; margin: 0 0 10px; }
   .fhub-filt-chip {
@@ -40018,8 +40024,11 @@ async function _skStadiumRefresh() {
   if (_skStadiumRefreshing) return;
   _skStadiumRefreshing = true;
   // Spin the button if present.
-  var btn = document.getElementById('fwYahooRefresh');
-  if (btn) btn.classList.add('spinning');
+  // Every stadium's button shares the class, so all of them spin. Ids stay
+  // unique per stadium so nothing else that queries by id is disturbed.
+  // STADREFRESH
+  var btns = document.querySelectorAll('.fw-yahoo-refresh');
+  for (var _b = 0; _b < btns.length; _b++) btns[_b].classList.add('spinning');
   try {
     // 1) Re-pull all rosters (refreshes fyFullRosters + fyRosterCache + logos).
     if (typeof fyAutoLoadAllRosters === 'function') {
@@ -40060,10 +40069,45 @@ async function _skStadiumRefresh() {
         }));
       }
     }
-    // 3) Refresh the live game feed for the open stadium game, which re-renders
-    //    the scoreboard + fantasy tab with the new data.
+    // 2c) Sleeper and Fantrax. The button reached Yahoo and ESPN only, so a
+    //     Sleeper card or a calculated Fantrax figure kept whatever it had
+    //     until something else happened to refresh it. The enrichers re-pull
+    //     rosters and settings; the Fantrax live cache is cleared outright
+    //     because it holds today's box lines behind a 60-second TTL, and an
+    //     explicit tap should not wait that out. STADREFRESH
+    try { if (typeof extEnrichFantrax === 'function') extEnrichFantrax(); } catch (eF) {}
+    try { if (typeof slEnrichLeagues === 'function') slEnrichLeagues(); } catch (eS) {}
+    try {
+      if (typeof _ftxLiveCache !== 'undefined' && _ftxLiveCache) {
+        for (var _sp in _ftxLiveCache) {
+          if (_ftxLiveCache.hasOwnProperty(_sp)) delete _ftxLiveCache[_sp];
+        }
+      }
+    } catch (eC) {}
+    // A roto board built from season stats is now stale too — drop the cache
+    // so the next open rebuilds rather than serving yesterday's ranks.
+    try {
+      var _rr = (typeof extLeagues !== 'undefined' && extLeagues) ? extLeagues : [];
+      for (var _ri = 0; _ri < _rr.length; _ri++) {
+        if (_rr[_ri] && _rr[_ri]._rotoBoard) delete _rr[_ri]._rotoBoard;
+      }
+    } catch (eR) {}
+
+    // 3) Refresh the live game feed for WHICHEVER stadium is open, which
+    //    re-renders its scoreboard and fantasy surfaces with the new data.
+    //    This was hardcoded to Fenway, so the button did nothing for the game
+    //    on screen in field, rink or gym mode. STADREFRESH
     if (typeof fenwayGame !== 'undefined' && fenwayGame && typeof fetchFenwayData === 'function') {
       await fetchFenwayData(fenwayGame);
+    }
+    if (typeof fieldGame !== 'undefined' && fieldGame && typeof fetchFieldData === 'function') {
+      await fetchFieldData(fieldGame);
+    }
+    if (typeof rinkGame !== 'undefined' && rinkGame && typeof fetchRinkData === 'function') {
+      await fetchRinkData(rinkGame);
+    }
+    if (typeof gymGame !== 'undefined' && gymGame && typeof fetchGymData === 'function') {
+      await fetchGymData(gymGame);
     }
     // 4) Refresh the score cards underneath too (count markers / scores).
     if (typeof renderCards === 'function') { try { renderCards(); } catch (e) {} }
@@ -40071,7 +40115,7 @@ async function _skStadiumRefresh() {
     try { console.warn('[stadium-refresh] failed', e); } catch (e2) {}
   } finally {
     _skStadiumRefreshing = false;
-    if (btn) btn.classList.remove('spinning');
+    for (var _b2 = 0; _b2 < btns.length; _b2++) btns[_b2].classList.remove('spinning');
   }
 }
 
@@ -57270,6 +57314,7 @@ function renderFieldBoxScore(data, game) {
   html += _sbGameStatsInlinePill(data, 'field');
   html += _sbPbpInlinePill();
   html += _sbMyPlayersInlinePill();   // MYPLAYERS
+  html += _sbFpRefreshInlinePill('field');   // STADREFRESH
   html += '</div>';
 
   sides.forEach(function(side, sideIdx) {
@@ -59088,6 +59133,7 @@ function renderRinkBoxScore(data, game) {
   html += _sbGameStatsInlinePill(data, 'rink');
   html += _sbPbpInlinePill();
   html += _sbMyPlayersInlinePill();   // MYPLAYERS
+  html += _sbFpRefreshInlinePill('rink');   // STADREFRESH
   html += '</div>';
 
   sides.forEach(function(side, sideIdx) {
@@ -62797,6 +62843,7 @@ function renderGymBoxScore(data, game, isV) {
   html += _sbGameStatsInlinePill(data, 'gym');
   html += _sbPbpInlinePill();
   html += _sbMyPlayersInlinePill();   // MYPLAYERS
+  html += _sbFpRefreshInlinePill('gym');   // STADREFRESH
   html += '</div>';
 
   // Box score columns — lead with the stats fans scan first (MIN, PTS, REB,
@@ -64169,6 +64216,16 @@ function _sbPbpFab(data, game, prefix) {
 // Deliberately stat-free. Nothing here is a fantasy score or a projection —
 // it's a roster membership list, which is why one combined view is the right
 // shape where the scoring hubs stay separate.
+// Refresh fantasy data from every provider, from inside any stadium.
+// MLB had this on its own header row; field, rink and gym had no way to pull
+// fresh fantasy points without leaving for Skipper and coming back.
+// STADREFRESH
+function _sbFpRefreshInlinePill(ns) {
+  return '<button class="fwbx-actpill crs-act-fp fw-yahoo-refresh" id="fwFpRefresh-' + ns +
+    '" onclick="_skStadiumRefresh()" title="Refresh fantasy points and stats">' +
+    '<span>FP</span>\uD83D\uDD04</button>';
+}
+
 function _sbMyPlayersInlinePill() {
   // Always rendered, including pre-game. Hiding it on an empty count meant
   // the pill appeared and disappeared depending on kickoff state, and before
