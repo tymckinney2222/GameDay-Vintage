@@ -28496,6 +28496,11 @@
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V10"/><path d="M12 20V4"/><path d="M20 20v-6"/></svg>
       <span>Games-played cap (this league)</span>
     </button>
+    <!-- ESPSTATPROBE — why is there FP but no stat line? -->
+    <button class="sk-account-item" onclick="skProbeEspnStats(); skCloseAccountMenu();">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19h16M7 16V9M12 16V5M17 16v-4"/></svg>
+      <span>Probe ESPN live stat entries</span>
+    </button>
     <!-- SEASONLABELS — what does ESPN's season line actually contain? -->
     <button class="sk-account-item" onclick="skProbeSeasonLabels(); skCloseAccountMenu();">
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18M7 15l4-4 3 3 5-6"/></svg>
@@ -107490,6 +107495,96 @@ function _fxScoreTitle(res) {
 //     compute properly instead of reading unavailable
 // NHL and MLB are included because the same silent miss could be hiding
 // categories in those roto leagues too.
+// ── ESPN live stat-entry probe ── ESPSTATPROBE ──
+// The fantasy points land (appliedTotal is right there) but no stat LINE
+// renders — the roster tab, the lineup modal and the hub all read
+// windows.today.stats, and something upstream is leaving it empty.
+//
+// Rather than guess which of the four candidate causes it is, this dumps the
+// raw stats array for a rostered NFL player: every entry's statSourceId,
+// statSplitTypeId, seasonId, scoringPeriodId, whether it carries raw stats,
+// whether it carries appliedStats, and a sample of each. Set against what
+// espWindows asks for, the mismatch is visible rather than inferred.
+//
+//   • entry exists with appliedStats but NO stats  -> ESPN isn't sending raw
+//     numbers live, and the line has to be built from appliedStats instead
+//   • entry has stats but under a different split  -> espWindows is asking
+//     for the wrong split and the fix is one id
+//   • stats present and matching                   -> the break is in
+//     espScoredIds or espStatName, not the fetch
+function skProbeEspnStats() {
+  var lines = [];
+  function say(t) { lines.push(t); }
+  var rows = (typeof extLeagues !== 'undefined' && extLeagues) ? extLeagues : [];
+  var shown = 0;
+  rows.forEach(function (row) {
+    if (shown >= 2) return;
+    if (!row || row.provider !== 'espn') return;
+    if (!(row.rosters && row.rosters.byTeam)) return;
+    var raw = row.rawRosterJson || row._rawRoster || null;
+    say('\u2500\u2500 ' + (row.name || row.key) + '  (' + String(row.sport || '?').toUpperCase() + ') \u2500\u2500');
+    say('  scoringPeriodId: ' + (row.scoringPeriodId != null ? row.scoringPeriodId : '?') +
+        '   seasonId: ' + (row.seasonId != null ? row.seasonId : '?'));
+    var ids = (typeof espScoredIds === 'function') ? espScoredIds(row) : [];
+    say('  espScoredIds (' + ids.length + '): ' + ids.slice(0, 24).join(' '));
+    var gcode = (typeof _espGameCode === 'function') ? _espGameCode(row) : '?';
+    say('  game code: ' + gcode);
+    var wins = (typeof espWindows === 'function') ? espWindows(gcode) : [];
+    say('  espWindows asks for:');
+    for (var wi = 0; wi < wins.length; wi++) {
+      var w = wins[wi];
+      say('    ' + String(w.key).padEnd(10) + 'src=' + w.src + ' split=' + w.split +
+          (w.splitAlt ? (' alt=' + w.splitAlt.join(',')) : '') +
+          (w.useCur ? ' useCurrentPeriod' : '') + (w.prevSeason ? ' prevSeason' : ''));
+    }
+    // A player from MY team who has points today.
+    var myIds = (typeof _extMyIds === 'function') ? (_extMyIds(row) || {}) : {};
+    var teamKey = null, k;
+    for (k in row.rosters.byTeam) { if (myIds[k]) { teamKey = k; break; } }
+    if (!teamKey) { say('  (my team not identified)'); say(''); return; }
+    var items = (row.rosters.byTeam[teamKey] || {}).items || [];
+    var pick = null;
+    for (var i = 0; i < items.length; i++) {
+      var w2 = items[i].windows && items[i].windows.today;
+      if (w2 && w2.total != null && Number(w2.total) !== 0) { pick = items[i]; break; }
+    }
+    if (!pick) pick = items[0];
+    if (!pick) { say('  (no roster items)'); say(''); return; }
+    shown++;
+    say('');
+    say('  player: ' + (pick.name || pick.playerId) + '   slot ' + (pick.slot || '?'));
+    var tw = pick.windows && pick.windows.today;
+    say('  windows.today: ' + (tw ? ('total=' + tw.total +
+        '  stats keys=' + (tw.stats ? Object.keys(tw.stats).length : 'NULL') +
+        '  fp keys=' + (tw.fp ? Object.keys(tw.fp).length : 'NULL')) : 'NULL'));
+    if (tw && tw.stats) say('  today.stats: ' + JSON.stringify(tw.stats).slice(0, 300));
+    if (tw && tw.fp) say('  today.fp:    ' + JSON.stringify(tw.fp).slice(0, 300));
+    // The raw entries, which is the thing we actually need to see.
+    var pl = pick._raw || pick.player || null;
+    var st = (pl && pl.stats) || pick.rawStats || null;
+    if (!st) {
+      say('');
+      say('  RAW stats array not retained on the roster item.');
+      say('  (That alone may be the bug — espBuildWindows runs at parse time');
+      say('   and the source array is dropped afterwards.)');
+    } else {
+      say('');
+      say('  raw stats entries (' + st.length + '):');
+      for (var e2 = 0; e2 < st.length && e2 < 12; e2++) {
+        var en = st[e2] || {};
+        say('    src=' + en.statSourceId + ' split=' + en.statSplitTypeId +
+            ' season=' + en.seasonId + ' period=' + en.scoringPeriodId +
+            ' stats=' + (en.stats ? Object.keys(en.stats).length : 'none') +
+            ' applied=' + (en.appliedStats ? Object.keys(en.appliedStats).length : 'none') +
+            ' total=' + en.appliedTotal);
+      }
+    }
+    say('');
+  });
+  if (!shown) say('No ESPN leagues with rosters loaded — open one, then re-run.');
+  _skGpProbeShow(lines.join('\n'));
+}
+
 function skProbeSeasonLabels() {
   var lines = [];
   function say(t) { lines.push(t); }
