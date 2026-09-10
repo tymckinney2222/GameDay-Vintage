@@ -92001,7 +92001,21 @@ function skRenderSeasonLeaderboard(league) {
       _anyCapped = true;
     }
   });
-  rows.sort(function(a, b) { return a.rank - b.rank; });
+  // Guillotine leagues carry no meaningful season rank — Yahoo ranks them
+  // week to week and the season-level rank comes back identical (or absent)
+  // for everyone, so sorting on it left the table in payload order, which
+  // reads as random. Total points is the actual ordering in a survival
+  // league: it decides who gets chopped. GUILSORT
+  var _isGuil = (typeof _skIsGuillotine === 'function')
+    ? !!_skIsGuillotine(league) : !!(league && league.is_guillotine);
+  rows.sort(function(a, b) {
+    if (_isGuil) {
+      var apf = (a.fp != null) ? a.fp : ((a.points_for != null) ? a.points_for : -1);
+      var bpf = (b.fp != null) ? b.fp : ((b.points_for != null) ? b.points_for : -1);
+      if (apf !== bpf) return bpf - apf;
+    }
+    return a.rank - b.rank;
+  });
 
   // Find max FP for bar normalization. Skip nulls (still loading) and
   // negatives (rare, but possible — e.g., all-K relievers). Floor at 1
@@ -116247,9 +116261,20 @@ function _skBuildMiniFpBars(weeklyFp) {
   var dates = weeklyFp.dates.slice().sort(function(a, b) {
     return a.date < b.date ? -1 : 1;
   });
-  // Pad/normalize to 7 day slots Mon-Sun
-  var dayNames = ['MON','TUE','WED','THU','FRI','SAT','SUN'];
+  // Label every column FROM ITS OWN DATE, never from its position.
+  //
+  // This used to index a fixed MON..SUN array by slot, which silently assumed
+  // the week starts on Monday. Yahoo's football week runs TUESDAY to MONDAY,
+  // so every football bar was labelled a day early: Tuesday's production
+  // appeared under MON, Wednesday's under TUE, and the chart looked like
+  // points were being scored before the games. WKTRENDDAY
   var todayStr = _todayDateString();
+  function _dowOf(ds) {
+    try {
+      var d0 = new Date(String(ds) + 'T12:00:00');
+      return ['SUN','MON','TUE','WED','THU','FRI','SAT'][d0.getDay()] || '';
+    } catch (e) { return ''; }
+  }
   
   var maxVal = 0;
   dates.forEach(function(d) {
@@ -116264,19 +116289,17 @@ function _skBuildMiniFpBars(weeklyFp) {
   }
   
   var bars = '';
-  for (var i = 0; i < 7; i++) {
+  // Iterate the dates we actually have rather than padding to seven. A padded
+  // slot had no date, so it could only be labelled by position — which is the
+  // very assumption that was wrong. A short week simply draws fewer columns.
+  // WKTRENDDAY
+  for (var i = 0; i < dates.length; i++) {
     var d = dates[i];
-    if (!d) {
-      bars += '<div class="sk-trend-fp-col">' +
-        '<div class="sk-trend-fp-pair"></div>' +
-        '<div class="sk-trend-bar-day">' + dayNames[i] + '</div>' +
-      '</div>';
-      continue;
-    }
+    if (!d) continue;
     var isToday = (d.date === todayStr);
     var isFuture = (d.future || d.date > todayStr);
     var dayCls = 'sk-trend-bar-day' + (isToday ? ' today' : '') + (isFuture ? ' future' : '');
-    var dayLabel = (d.dayLabel || dayNames[i]).toUpperCase();
+    var dayLabel = String(d.dayLabel || _dowOf(d.date) || '').toUpperCase();
     
     var myH = (d.myFp != null && d.myFp > 0) ? (d.myFp / maxVal) * 100 : 0;
     var oppH = (d.oppFp != null && d.oppFp > 0) ? (d.oppFp / maxVal) * 100 : 0;
