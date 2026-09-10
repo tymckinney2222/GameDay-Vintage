@@ -40501,26 +40501,102 @@ function _weekDaysForDate(anchorDate) {
   return out;
 }
 
+// ── FOOTBALL WEEK TRENDS ── WKTRENDFB ──
+// Yahoo has no per-DAY football stats. /players/stats;type=week is the finest
+// grain that exists, so asking for Monday, Tuesday and Wednesday of the same
+// week all return the SAME week-to-date total. The trend chart was drawing that
+// one number once per elapsed day, and every consumer that sums the days
+// (trend-card headline, detail-chart delta) was therefore multiplying the score
+// by however many days had passed — a 4.2-point team read 10.1 on Wednesday.
+//
+// Fix: for football, exactly ONE day carries the total — the day it is current
+// AS OF (today during a live week, the closing day of a finished one). Every
+// other day in the window is left null, which the bar builders render as an
+// empty column and the summers add as zero. Daily sports are untouched: their
+// days really are independent.
+function _skIsFootballTeamKey(teamKey) {
+  var lgKey = String(teamKey || '').split('.t.')[0];
+  var lg = null;
+  try {
+    lg = (typeof fyLeagues !== 'undefined' && fyLeagues)
+      ? fyLeagues.filter(function (l) { return l.league_key === lgKey; })[0] : null;
+  } catch (e) {}
+  return !!lg && (typeof _skIsNflLeague === 'function') && _skIsNflLeague(lg);
+}
+
+// The dates of the football GAME WEEK containing anchorDate. Yahoo's football
+// week runs TUESDAY→MONDAY, so the Mon-Sun calendar window daily sports use
+// both invents a leading Monday belonging to the PREVIOUS week (the phantom
+// Monday bar) and drops the Monday-night game that closes this one. Returns
+// null when game_weeks haven't loaded, so the caller falls back to Mon-Sun.
+function _skFootballWeekDays(teamKey, anchorDate) {
+  var gk = String(teamKey || '').split('.')[0];
+  var weeks = (typeof _skGameWeeksMem !== 'undefined') ? _skGameWeeksMem[gk] : null;
+  if (!weeks || !weeks.length) return null;
+  var win = null;
+  for (var i = 0; i < weeks.length; i++) {
+    if (anchorDate >= weeks[i].start && anchorDate <= weeks[i].end) { win = weeks[i]; break; }
+  }
+  if (!win) return null;
+  var out = [];
+  var d = new Date(win.start + 'T12:00:00');
+  var endD = new Date(win.end + 'T12:00:00');
+  var guard = 0;
+  while (d <= endD && guard < 14) {
+    out.push(d.getFullYear() + '-' +
+      String(d.getMonth() + 1).padStart(2, '0') + '-' +
+      String(d.getDate()).padStart(2, '0'));
+    d.setDate(d.getDate() + 1);
+    guard++;
+  }
+  return out.length ? out : null;
+}
+
 // Fetch a full week's worth of (my, opp) FP totals. Returns an array
-// of { date, dayLabel, myFp, oppFp } — one entry per day Mon-Sun.
+// of { date, dayLabel, myFp, oppFp } — one entry per day in the week
+// window (Mon-Sun for daily sports, Tue-Mon for football).
 // Past days come instantly from localStorage; today is in-memory;
 // future days return { myFp: null, oppFp: null } and are not fetched.
 async function fetchWeeklyFp(myTeamKey, oppTeamKey, anchorDate, opts) {
-  var dates = _weekDaysForDate(anchorDate || _todayDateString());
+  var anchor = anchorDate || _todayDateString();
   var today = _todayDateString();
-  var dayNames = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  var isFb = _skIsFootballTeamKey(myTeamKey);
+  var dates = (isFb ? _skFootballWeekDays(myTeamKey, anchor) : null) || _weekDaysForDate(anchor);
+
+  // Label each column FROM ITS OWN DATE, never from its slot index. The old
+  // positional Mon..Sun array is wrong the moment the window starts on a
+  // Tuesday, and it was already wrong for football. WKTRENDDAY
+  var dowNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  function _labelFor(ds) {
+    try { return dowNames[new Date(String(ds) + 'T12:00:00').getDay()] || ''; }
+    catch (e) { return ''; }
+  }
+
+  // Football: which single day carries the week-to-date total. WKTRENDFB
+  var asOf = null;
+  if (isFb && dates.length) {
+    if (today < dates[0]) asOf = null;                          // week hasn't started
+    else if (today > dates[dates.length - 1]) asOf = dates[dates.length - 1]; // finished week
+    else asOf = today;                                          // live week
+  }
 
   // Kick off all fetches in parallel — most are localStorage hits.
   // Skip future days entirely (would 404 / return empty).
-  var promises = dates.map(function(dt, idx) {
+  var promises = dates.map(function(dt) {
+    var label = _labelFor(dt);
     if (dt > today) {
-      return Promise.resolve({ date: dt, dayLabel: dayNames[idx], myFp: null, oppFp: null, future: true });
+      return Promise.resolve({ date: dt, dayLabel: label, myFp: null, oppFp: null, future: true, weekScoped: isFb });
+    }
+    if (isFb && dt !== asOf) {
+      // No per-day football grain exists — draw an empty column rather than
+      // repeating (and later summing) the same week total. WKTRENDFB
+      return Promise.resolve({ date: dt, dayLabel: label, myFp: null, oppFp: null, future: false, weekScoped: true, na: true });
     }
     return Promise.all([
       myTeamKey ? getTeamFpDayTotal(myTeamKey, dt) : Promise.resolve(null),
       oppTeamKey ? getTeamFpDayTotal(oppTeamKey, dt) : Promise.resolve(null),
     ]).then(function(pair) {
-      var entry = { date: dt, dayLabel: dayNames[idx], myFp: pair[0], oppFp: pair[1], future: false };
+      var entry = { date: dt, dayLabel: label, myFp: pair[0], oppFp: pair[1], future: false, weekScoped: isFb };
       // Notify progress listener so the chart can re-render as days arrive
       if (opts && opts.onDayDone) {
         try { opts.onDayDone(entry); } catch (e) {}
@@ -81300,6 +81376,40 @@ function _skEnrichGuillotine(league) {
   });
 }
 
+// ── GUILLOTINE ORDERING ── GUILSORT ──
+// One comparator for every guillotine view (survival card rank, Survival board,
+// Standings table) so they can never disagree with each other.
+//
+// The board is a race between ACTUAL scores — the lowest real total gets chopped
+// on Tuesday, and nobody has ever been eliminated by a projection. Yahoo's
+// rank_week, though, orders the field by PROJECTED points, so preferring it (as
+// all three views did) sorted a live week entirely by projection: a team sitting
+// on 12.0 real points appeared below four teams on 0.0 simply because their
+// projections were higher.
+//
+// Actual weekly points descending. Projection is the tiebreak only — among the
+// teams still on 0.0 it puts the lowest projection nearest the cut line, which
+// is the honest read on who's actually in danger. Season total breaks the rest.
+function _skGuilAliveCmp(a, b) {
+  function num(v) {
+    if (v == null || v === '' || isNaN(v)) return null;
+    var n = parseFloat(v);
+    return isNaN(n) ? null : n;
+  }
+  var as = num(a && a.points_week), bs = num(b && b.points_week);
+  if (as == null) as = -1;
+  if (bs == null) bs = -1;
+  if (as !== bs) return bs - as;
+  var ap = num(a && a.projected_points_week), bp = num(b && b.projected_points_week);
+  if (ap == null) ap = -1;
+  if (bp == null) bp = -1;
+  if (ap !== bp) return bp - ap;
+  var af = num(a && a.points_for), bf = num(b && b.points_for);
+  if (af == null) af = -1;
+  if (bf == null) bf = -1;
+  return bf - af;
+}
+
 // Compute survival state for a guillotine league card.
 // Returns { alive, myWeekScore, cushion, myRank, week } or null.
 //
@@ -81380,16 +81490,14 @@ function _skGuillotineSurvivalState(l, data) {
     cushion = null;
   }
 
-  // My rank among survivors — prefer Yahoo's rank_week; else derive by points_week.
+  // My rank among survivors, by ACTUAL weekly points. GUILSORT — Yahoo's
+  // rank_week orders the field by projection, so trusting it made the card
+  // disagree with the Survival board it links to.
   var myRank = null;
-  if (me && me.rank_week != null && !isNaN(me.rank_week)) {
-    myRank = me.rank_week;
-  } else if (myWeek != null) {
-    var scored = alive.filter(function(t){ return t.points_week != null && !isNaN(t.points_week); })
-                      .map(function(t){ return { k: t.team_key, s: parseFloat(t.points_week) }; });
-    scored.sort(function(a, b){ return b.s - a.s; });
+  if (myWeek != null) {
+    var scored = alive.slice().sort(_skGuilAliveCmp);
     for (var r = 0; r < scored.length; r++) {
-      if (scored[r].k === myTeamKey) { myRank = r + 1; break; }
+      if (scored[r].team_key === myTeamKey) { myRank = r + 1; break; }
     }
   }
 
@@ -104848,13 +104956,9 @@ function skBuildGuillotineSurvival(league, data) {
   var alive = rows.filter(function(r){ return r.is_chopped !== true; });
   var choppedCount = rows.length - alive.length;
 
-  // Rank survivors by this week's points (rank_week if present, else points_week).
-  alive.sort(function(a, b) {
-    if (a.rank_week != null && b.rank_week != null && a.rank_week !== b.rank_week) return a.rank_week - b.rank_week;
-    var as = a.points_week != null ? a.points_week : -1;
-    var bs = b.points_week != null ? b.points_week : -1;
-    return bs - as;
-  });
+  // Rank survivors by this week's ACTUAL points, projection as tiebreak only.
+  // GUILSORT — shared with the survival card and the standings table.
+  alive.sort(_skGuilAliveCmp);
   var lowest = null;
   alive.forEach(function(t){ if (t.points_week != null && (lowest == null || t.points_week < lowest)) lowest = t.points_week; });
 
@@ -105030,9 +105134,10 @@ function skBuildGuillotineStandings(league, leagueData, myKey) {
     return '<div class="sk-standings"><div class="sk-empty-state" style="padding:24px 16px">Standings loading…</div></div>';
   }
 
-  // Sort: survivors first (by weekly rank if we have it, else by total points
-  // descending), then chopped teams at the bottom ordered by the week they were
-  // eliminated (latest survivors last).
+  // Sort: survivors first (by this week's ACTUAL points — GUILSORT, the same
+  // comparator the Survival board and the survival card use), then chopped
+  // teams at the bottom ordered by the week they were eliminated (latest
+  // survivors last).
   rows.sort(function(a, b) {
     var aC = a.is_chopped === true, bC = b.is_chopped === true;
     if (aC !== bC) return aC ? 1 : -1; // alive before chopped
@@ -105040,13 +105145,7 @@ function skBuildGuillotineStandings(league, leagueData, myKey) {
       // both chopped: later chopped_week ranks higher (survived longer)
       return (b.chopped_week || 0) - (a.chopped_week || 0);
     }
-    // both alive: prefer Yahoo weekly rank; fall back to total points desc
-    var ar = (a.rank_week != null) ? a.rank_week : null;
-    var br = (b.rank_week != null) ? b.rank_week : null;
-    if (ar != null && br != null && ar !== br) return ar - br;
-    var apf = a.points_for != null ? a.points_for : -1;
-    var bpf = b.points_for != null ? b.points_for : -1;
-    return bpf - apf;
+    return _skGuilAliveCmp(a, b);
   });
 
   var aliveCount = rows.filter(function(r) { return r.is_chopped !== true; }).length;
