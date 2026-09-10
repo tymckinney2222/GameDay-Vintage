@@ -6652,6 +6652,22 @@
     margin-left: 7px; letter-spacing: 0.02em; vertical-align: 1px;
   }
 
+  /* ── ROTOHUB ── Roto pressure emphasis on a hub stat line. Categories one
+     place from flipping stay full strength and get a hairline underline;
+     locked ones recede. The cat-XX colour still paints the number, so this
+     only touches weight and opacity — never the hue. Dim is deliberately
+     legible (0.4), not hidden: the stat still happened. */
+  .crs-fhub-cats .stat-num.rp-live { font-weight: 800; }
+  .crs-fhub-cats .stat-abbr.rp-live { opacity: 0.9; }
+  .crs-fhub-cats .stat-num.rp-contested,
+  .crs-fhub-cats .stat-abbr.rp-contested { border-bottom: 1px solid rgba(245,213,71,0.55); }
+  .crs-fhub-cats .stat-num.rp-climbable,
+  .crs-fhub-cats .stat-abbr.rp-climbable { border-bottom: 1px solid rgba(74,222,128,0.55); }
+  .crs-fhub-cats .stat-num.rp-exposed,
+  .crs-fhub-cats .stat-abbr.rp-exposed { border-bottom: 1px solid rgba(248,113,113,0.55); }
+  .crs-fhub-cats .stat-num.rp-dim,
+  .crs-fhub-cats .stat-abbr.rp-dim { opacity: 0.4; font-weight: 400; }
+
   .crs-fhub-card-total {
     font-family: 'Barlow Condensed', sans-serif; font-weight: 800; font-size: 15px;
     flex-shrink: 0; letter-spacing: 0.02em;
@@ -13740,6 +13756,11 @@
     --sk-border:       rgba(255,255,255,0.06);
     --sk-border-strong:rgba(255,255,255,0.12);
     --sk-text:         #f5f5f0;
+    /* Alias for the brightest text. ~20 rules across this file already say
+       var(--sk-text-1) — it was never declared, so those declarations were
+       invalid at computed-value time and silently inherited the parent's
+       colour instead. */
+    --sk-text-1:       #f5f5f0;
     --sk-text-2:       rgba(245,245,240,0.65);
     --sk-text-3:       rgba(245,245,240,0.42);
     --sk-text-4:       rgba(245,245,240,0.28);
@@ -46306,6 +46327,34 @@ function _skMyTeamName(leagueKey) {
   } catch (e) { return ''; }
 }
 
+// ── ROTOHUB ── Pressure states for one roto league, memoised. The hub calls
+// _buildSkipperFpRows once per player, and each call would otherwise re-rank
+// every team in every category. Short TTL rather than an invalidation hook so
+// a standings refresh shows through on its own without another thing to
+// remember to call.
+var _skRotoStateMemo = {};
+function _skRotoStatesForLeague(leagueKey) {
+  if (!leagueKey) return null;
+  var now = Date.now();
+  var hit = _skRotoStateMemo[leagueKey];
+  if (hit && (now - hit.ts) < 60000) return hit.map;
+  var lg = null;
+  try {
+    lg = (typeof fyLeagues !== 'undefined' && fyLeagues)
+      ? fyLeagues.filter(function(l) { return l.league_key === leagueKey; })[0] : null;
+  } catch (e) {}
+  var map = null;
+  if (lg && lg.scoring_type === 'roto') {
+    var data = (typeof skLeagueData !== 'undefined') ? skLeagueData[leagueKey] : null;
+    try {
+      var res = _skRotoCatStates(lg, data);
+      map = (res && res.byStat) || null;
+    } catch (e2) {}
+  }
+  _skRotoStateMemo[leagueKey] = { ts: now, map: map };
+  return map;
+}
+
 function _buildSkipperFpRows(playerName, includeEmpty, sportFilter) {
   if (typeof fyFullRosters === 'undefined' || !fyFullRosters || !fyFullRosters.length) return [];
   if (typeof _skNormalizeName !== 'function' || typeof _todayDateString !== 'function') return [];
@@ -46357,7 +46406,13 @@ function _buildSkipperFpRows(playerName, includeEmpty, sportFilter) {
     // untouched, same guard as the wire-card FP work.
     var isPoints = st === 'headpoint' || st === 'point' ||
       (st === 'head' && typeof _skCmpLeagueIsPointsFp === 'function' && _skCmpLeagueIsPointsFp(r.leagueKey));
-    var isCats   = !isPoints && (st === 'head' || st === 'headone');
+    // ── ROTOHUB ── Roto is a category format: identical Yahoo payload,
+    // identical stat line, and the only difference — how categories score
+    // league-wide — is something the hub has no opinion about. It matched
+    // NEITHER branch before, so it fell through to the unknown-scoring
+    // fallback: the league listed with an empty stat line in hub mode, and
+    // the player dropped entirely from stadium cards.
+    var isCats   = !isPoints && (st === 'head' || st === 'headone' || st === 'roto');
     // Player-level Yahoo lineup status (same across leagues; carried on every
     // row so the hub can read it from any of the player's league rows).
     var lineup = {
@@ -46392,8 +46447,13 @@ function _buildSkipperFpRows(playerName, includeEmpty, sportFilter) {
       var stats = entry.stats || {};
       var hasStats = false;
       Object.keys(stats).forEach(function(sid) { if (stats[sid] > 0) hasStats = true; });
+      // ── ROTOHUB ── In roto, the same stat line is worth different things
+      // on different teams, so mark each category with its pressure state.
+      // Cats (H2H) leagues pass nothing and render exactly as before.
+      var _rpStates = (st === 'roto' && typeof _skRotoStatesForLeague === 'function')
+        ? _skRotoStatesForLeague(r.leagueKey) : null;
       var catHtml = (hasStats && typeof _skBuildCatStatLine === 'function')
-        ? _skBuildCatStatLine(stats, statsMeta, 6)
+        ? _skBuildCatStatLine(stats, statsMeta, 6, _rpStates)
         : '';
       // Drop empty cats rows on stadium cards, but keep them in hub mode so a
       // rostered player still appears (with no stat line yet).
@@ -93271,7 +93331,7 @@ function _skFpStatLine(stats, selectedPos, leagueKey, statsMeta) {
     '</span>';
 }
 
-function _skBuildCatStatLine(statsMap, statsMeta, cap) {
+function _skBuildCatStatLine(statsMap, statsMeta, cap, states) {
   if (!statsMap || !statsMeta) return '';
   var entries = [];
   Object.keys(statsMap).forEach(function(sid) {
@@ -93280,7 +93340,7 @@ function _skBuildCatStatLine(statsMap, statsMeta, cap) {
     var meta = statsMeta[sid];
     if (!_skIsCountingCatStat(meta)) return;
     var abbr = (meta.abbr || meta.displayName || meta.name || sid).toUpperCase();
-    entries.push({ abbr: abbr, val: v, sortOrder: parseInt(sid, 10) });
+    entries.push({ sid: String(sid), abbr: abbr, val: v, sortOrder: parseInt(sid, 10) });
   });
   // Sort by raw value descending — biggest stat output first.
   entries.sort(function(a, b) { return b.val - a.val; });
@@ -93291,8 +93351,24 @@ function _skBuildCatStatLine(statsMap, statsMeta, cap) {
     // class only carries the abbr; CSS supplies the color. Unknown
     // abbreviations fall through to the default gold.
     var catCls = _skCatStatColorClass(e.abbr);
-    return '<span class="stat-num' + (catCls ? ' ' + catCls : '') + '">' +
-      _skFmtCountingVal(e.val) + '</span>' + skEscape(e.abbr);
+    // ── ROTOHUB ── In a roto league the same stat line means different
+    // things on different teams: a rebound is worth chasing where REB is
+    // one place from flipping and worth nothing where it's locked. When the
+    // caller passes the league's pressure states, mark each stat so the row
+    // reads as "did tonight land where it counts" rather than a flat list.
+    var stCls = '';
+    if (states && states[e.sid]) {
+      var s = states[e.sid];
+      if (s === 'CONTESTED' || s === 'CLIMBABLE' || s === 'EXPOSED') stCls = ' rp-live rp-' + s.toLowerCase();
+      else stCls = ' rp-dim';
+    }
+    // Without states the output is byte-identical to before — ten other
+    // callers share this builder and none of them should shift.
+    var abbrHtml = stCls
+      ? ('<span class="stat-abbr' + stCls + '">' + skEscape(e.abbr) + '</span>')
+      : skEscape(e.abbr);
+    return '<span class="stat-num' + (catCls ? ' ' + catCls : '') + stCls + '">' +
+      _skFmtCountingVal(e.val) + '</span>' + abbrHtml;
   }).join('<span class="sep">·</span>');
 }
 
@@ -108900,8 +108976,15 @@ function skBuildRotoCategoryTable(league, leagueData, allTeams) {
 // Reads catPoints / catStats off the standings payload. No extra request.
 var _SK_RP_NEAR = 0.06;   // within 6% of the category's league-wide spread
 
-function _skBuildRotoPressureHTML(league, data) {
-  if (!league || league.scoring_type !== 'roto') return '';
+// ── ROTOPRESS ── The classification itself, split out from the rendering so
+// the Fantasy Hub can read the same states the Analysis board shows. Two
+// copies of this logic would drift, and a category reading CLIMBABLE on one
+// screen and LOCKED on the other is worse than not showing it at all.
+//
+// Returns { groups, byStat, gain, risk, scored } or null when the standings
+// payload isn't hydrated yet. byStat maps stat id -> state for cheap lookup.
+function _skRotoCatStates(league, data) {
+  if (!league || league.scoring_type !== 'roto') return null;
   var allTeams = (data && data.allTeams) || {};
   var myKey = (data && data.team && data.team.team_key) || '';
   var teams = [];
@@ -108910,17 +108993,11 @@ function _skBuildRotoPressureHTML(league, data) {
     var t = allTeams[k];
     if (t && t.catPoints) teams.push({ key: k, name: t.name || k, pts: t.catPoints, raw: t.catStats || {} });
   }
-  function shell(msg) {
-    return '<div class="sk-rp">' +
-      '<div class="sk-rp-head"><div class="sk-rp-title">CATEGORY PRESSURE</div>' +
-      '<div class="sk-rp-sub">where your rank points can actually move</div></div>' +
-      '<div class="sk-rp-empty">' + skEscape(msg) + '</div></div>';
-  }
-  if (teams.length < 2 || !myKey) return shell('Waiting on league standings.');
+  if (teams.length < 2 || !myKey) return null;
 
   var meT = null;
   for (var mi = 0; mi < teams.length; mi++) if (teams[mi].key === myKey) meT = teams[mi];
-  if (!meT) return shell('Waiting on league standings.');
+  if (!meT) return null;
 
   var meta = (typeof leagueSettingsCache !== 'undefined' && leagueSettingsCache[league.league_key])
     ? leagueSettingsCache[league.league_key] : null;
@@ -108935,13 +109012,9 @@ function _skBuildRotoPressureHTML(league, data) {
     if (a >= 1) return v.toFixed(1);
     return String(Math.round(v * 1000) / 1000);
   }
-  function ordinal(n) {
-    var s = ['th', 'st', 'nd', 'rd'], v = n % 100;
-    return n + (s[(v - 20) % 10] || s[v] || s[0]);
-  }
-  function f1(n) { return (Math.round(n * 10) / 10).toFixed(1); }
 
   var groups = { CONTESTED: [], CLIMBABLE: [], EXPOSED: [], LOCKED: [] };
+  var byStat = {};
   var gainTotal = 0, riskTotal = 0, scored = 0;
 
   for (var oi = 0; oi < order.length; oi++) {
@@ -109006,8 +109079,10 @@ function _skBuildRotoPressureHTML(league, data) {
               : upNear ? 'CLIMBABLE'
               : downNear ? 'EXPOSED'
               : 'LOCKED';
+    byStat[id] = state;
 
     groups[state].push({
+      id: id,
       label: m2.abbr || m2.displayName || ('#' + id),
       rank: myIdx + 1,
       pts: myPts,
@@ -109019,7 +109094,29 @@ function _skBuildRotoPressureHTML(league, data) {
       sortC: Math.min(upC == null ? 9 : upC, downC == null ? 9 : downC)
     });
   }
-  if (!scored) return shell('No category values yet \u2014 this fills in once the season\u2019s scoring.');
+  return { groups: groups, byStat: byStat, gain: gainTotal, risk: riskTotal, scored: scored };
+}
+
+function _skBuildRotoPressureHTML(league, data) {
+  if (!league || league.scoring_type !== 'roto') return '';
+  function shell(msg) {
+    return '<div class="sk-rp">' +
+      '<div class="sk-rp-head"><div class="sk-rp-title">CATEGORY PRESSURE</div>' +
+      '<div class="sk-rp-sub">where your rank points can actually move</div></div>' +
+      '<div class="sk-rp-empty">' + skEscape(msg) + '</div></div>';
+  }
+  var res = _skRotoCatStates(league, data);
+  if (!res) return shell('Waiting on league standings.');
+  if (!res.scored) return shell('No category values yet \u2014 this fills in once the season\u2019s scoring.');
+
+  function ordinal(n) {
+    var s = ['th', 'st', 'nd', 'rd'], v = n % 100;
+    return n + (s[(v - 20) % 10] || s[v] || s[0]);
+  }
+  function f1(n) { return (Math.round(n * 10) / 10).toFixed(1); }
+
+  var groups = res.groups;
+  var gainTotal = res.gain, riskTotal = res.risk;
 
   var ORDER = ['CONTESTED', 'CLIMBABLE', 'EXPOSED', 'LOCKED'];
   var BLURB = {
