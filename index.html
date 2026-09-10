@@ -71828,7 +71828,12 @@ function _extFhubRowsFor(at, idx, sport) {
       fp: fp,
       calc: calc, calcTitle: calcTitle,
       catLine: catLine,   // FXCATS
-      noFp: row.provider === 'fantrax' && !calc,
+      // ESPROTO — a roto league has no per-player fantasy points at all, so
+      // the hub's fallback "0.0 FP" was inventing a number that doesn't exist
+      // in that format. noFp renders nothing instead.
+      noFp: (row.provider === 'fantrax' && !calc) ||
+            (row.provider === 'espn' && typeof extFormatKey === 'function' &&
+             extFormatKey(row) === 'roto' && fp == null),
       slot: it.slot || it.position || '',
       // TRI-STATE, deliberately: true / false / undefined. Collapsing it with
       // an === true test threw away the difference between "provider says he's
@@ -108983,7 +108988,11 @@ var _SK_RP_NEAR = 0.06;   // within 6% of the category's league-wide spread
 //
 // Returns { groups, byStat, gain, risk, scored } or null when the standings
 // payload isn't hydrated yet. byStat maps stat id -> state for cheap lookup.
-function _skRotoCatStates(league, data) {
+//
+// metaOverride lets a non-Yahoo provider supply { stats, statOrder } directly
+// — ESPN has no leagueSettingsCache entry, and its adapter builds the same
+// shape. ESPROTO
+function _skRotoCatStates(league, data, metaOverride) {
   if (!league || league.scoring_type !== 'roto') return null;
   var allTeams = (data && data.allTeams) || {};
   var myKey = (data && data.team && data.team.team_key) || '';
@@ -108999,8 +109008,9 @@ function _skRotoCatStates(league, data) {
   for (var mi = 0; mi < teams.length; mi++) if (teams[mi].key === myKey) meT = teams[mi];
   if (!meT) return null;
 
-  var meta = (typeof leagueSettingsCache !== 'undefined' && leagueSettingsCache[league.league_key])
-    ? leagueSettingsCache[league.league_key] : null;
+  var meta = metaOverride ||
+    ((typeof leagueSettingsCache !== 'undefined' && leagueSettingsCache[league.league_key])
+      ? leagueSettingsCache[league.league_key] : null);
   var statsMeta = (meta && meta.stats) || {};
   var order = (meta && meta.statOrder) || [];
   if (!order.length) { for (var sid in meT.pts) if (meT.pts.hasOwnProperty(sid)) order.push(sid); }
@@ -109097,7 +109107,7 @@ function _skRotoCatStates(league, data) {
   return { groups: groups, byStat: byStat, gain: gainTotal, risk: riskTotal, scored: scored };
 }
 
-function _skBuildRotoPressureHTML(league, data) {
+function _skBuildRotoPressureHTML(league, data, metaOverride) {
   if (!league || league.scoring_type !== 'roto') return '';
   function shell(msg) {
     return '<div class="sk-rp">' +
@@ -109105,7 +109115,7 @@ function _skBuildRotoPressureHTML(league, data) {
       '<div class="sk-rp-sub">where your rank points can actually move</div></div>' +
       '<div class="sk-rp-empty">' + skEscape(msg) + '</div></div>';
   }
-  var res = _skRotoCatStates(league, data);
+  var res = _skRotoCatStates(league, data, metaOverride);
   if (!res) return shell('Waiting on league standings.');
   if (!res.scored) return shell('No category values yet \u2014 this fills in once the season\u2019s scoring.');
 
@@ -144588,6 +144598,207 @@ function _espDailyH2HHtml(row, game) {
   return h;
 }
 
+// ── ESPN ROTO ADAPTER ── ESPROTO ──
+// Yahoo publishes per-category rank points (catPoints) straight off its
+// standings. ESPN publishes raw season totals and ONE overall roto number,
+// nothing in between — so the per-category points have to be derived here.
+//
+// That derivation isn't a workaround, it's the definition of roto scoring:
+// rank every team within a category, best gets N points down to 1, and tied
+// teams split the positions they jointly occupy (which is where roto's half
+// points come from). Output is shaped exactly like Yahoo's allTeams entries
+// — { name, catPoints, catStats } — so _skRotoCatStates consumes it unchanged.
+//
+// TWO THINGS THIS GETS WRONG IF UNCHECKED, hence the reconciliation below:
+//   1. Direction. scoringItems[].isReverseItem marks a lower-wins category
+//      (turnovers). Nothing else in this file reads it. Miss it and that one
+//      category ranks backwards while every number on screen still looks
+//      entirely plausible — the worst kind of failure.
+//   2. Category set. If ESPN scores a stat we skip (or we score one it
+//      ignores), every team's total lands off by the same shape.
+// Both surface as a per-team mismatch against ESPN's own published total, so
+// the caller gates on the reconciled flag rather than trusting this blind.
+function _espRotoAdapt(row) {
+  if (!row || row.provider !== 'espn') return null;
+  if (typeof extFormatKey !== 'function' || extFormatKey(row) !== 'roto') return null;
+  var raw = row.raw || {};
+  var teamsRaw = raw.teams || [];
+  if (teamsRaw.length < 2) return null;
+  var game = (typeof _espSsGame === 'function') ? _espSsGame(row) : 'fba';
+  var items = (((raw.settings || {}).scoringSettings) || {}).scoringItems || [];
+  if (!items.length) return null;
+
+  function num(v) { var n = parseFloat(v); return isNaN(n) ? null : n; }
+
+  // Scored categories, in the league's own order. A stat nobody carries a
+  // value for is dropped — it can't be ranked and would only add noise.
+  var cats = [], seen = {}, i, j;
+  for (i = 0; i < items.length; i++) {
+    var it = items[i];
+    var sid = it && it.statId;
+    if (sid == null) continue;
+    var key = String(sid);
+    if (seen[key]) continue;
+    var any = false;
+    for (j = 0; j < teamsRaw.length; j++) {
+      var vb0 = teamsRaw[j] && teamsRaw[j].valuesByStat;
+      if (vb0 && num(vb0[key]) != null) { any = true; break; }
+    }
+    if (!any) continue;
+    seen[key] = 1;
+    cats.push({
+      id: key,
+      label: ((typeof espStatLabel === 'function') ? espStatLabel(game, key) : '') || ('#' + key),
+      reverse: (it.isReverseItem === true)
+    });
+  }
+  if (!cats.length) return null;
+
+  var out = {};
+  for (i = 0; i < teamsRaw.length; i++) {
+    var t0 = teamsRaw[i];
+    out[String(t0.id)] = {
+      name: t0.abbrev || t0.name || t0.location || String(t0.id),
+      catPoints: {}, catStats: {}
+    };
+  }
+
+  var allTied = true;
+  for (i = 0; i < cats.length; i++) {
+    var c = cats[i];
+    var list = [];
+    for (j = 0; j < teamsRaw.length; j++) {
+      var vb = teamsRaw[j] && teamsRaw[j].valuesByStat;
+      var v = vb ? num(vb[c.id]) : null;
+      if (v == null) continue;
+      list.push({ key: String(teamsRaw[j].id), v: v });
+      out[String(teamsRaw[j].id)].catStats[c.id] = v;
+    }
+    if (list.length < 2) continue;
+    // Best first. A reverse category (TO) is best at its LOWEST value.
+    list.sort(function(a, b) { return c.reverse ? (a.v - b.v) : (b.v - a.v); });
+    if (list[0].v !== list[list.length - 1].v) allTied = false;
+    var n = list.length;
+    var p = 0;
+    while (p < n) {
+      // Everyone on the same raw value occupies the same rank and splits the
+      // points for the positions they cover — 1.5 apiece for two teams tied
+      // across places 1 and 2 of a 2-team span, etc.
+      var q = p;
+      while (q + 1 < n && list[q + 1].v === list[p].v) q++;
+      var sum = 0;
+      for (var z = p; z <= q; z++) sum += (n - z);
+      var share = sum / (q - p + 1);
+      for (z = p; z <= q; z++) out[list[z].key].catPoints[c.id] = share;
+      p = q + 1;
+    }
+  }
+
+  // ── Reconciliation ── the whole reason this is a separate step.
+  var detail = [], worst = 0, checked = 0;
+  for (i = 0; i < teamsRaw.length; i++) {
+    var tt = teamsRaw[i];
+    var kk = String(tt.id);
+    var derived = 0, hasAny = false;
+    for (j = 0; j < cats.length; j++) {
+      var pv = out[kk].catPoints[cats[j].id];
+      if (pv != null) { derived += pv; hasAny = true; }
+    }
+    if (!hasAny) continue;
+    var published = (typeof espPickPoints === 'function')
+      ? espPickPoints((tt.record || {}).overall, tt) : null;
+    var pub = num(published);
+    var delta = (pub == null) ? null : (derived - pub);
+    if (delta != null) {
+      checked++;
+      if (Math.abs(delta) > Math.abs(worst)) worst = delta;
+    }
+    detail.push({ teamId: kk, name: out[kk].name, derived: derived, published: pub, delta: delta });
+  }
+  // No published totals at all (preseason) is "unverified", not "wrong".
+  var reconciled = (checked > 0) && (Math.abs(worst) <= 0.05);
+
+  // Synthetic stat metadata in the shape _skRotoCatStates expects, so the
+  // shared classifier needs no ESPN-specific branch. sortOrder mirrors
+  // Yahoo's convention: 0 means lower wins.
+  var statsMeta = {}, statOrder = [];
+  for (i = 0; i < cats.length; i++) {
+    statOrder.push(cats[i].id);
+    statsMeta[cats[i].id] = { abbr: cats[i].label, sortOrder: cats[i].reverse ? 0 : 1 };
+  }
+
+  var myIds = {};
+  try { myIds = ((typeof _extMyIds === 'function') ? _extMyIds(row) : (row.myTeamIds || {})) || {}; }
+  catch (e) { myIds = row.myTeamIds || {}; }
+  var myKey = '';
+  for (var mk in myIds) { if (myIds.hasOwnProperty(mk) && myIds[mk] && out[String(mk)]) { myKey = String(mk); break; } }
+
+  return {
+    allTeams: out,
+    myKey: myKey,
+    cats: cats,
+    meta: { stats: statsMeta, statOrder: statOrder },
+    reconciled: reconciled,
+    checked: checked,
+    worst: worst,
+    allTied: allTied,
+    detail: detail
+  };
+}
+
+// On-screen reconciliation readout. This exists because the derivation above
+// can be confidently wrong, and a mismatch is invisible in the numbers
+// themselves — the only tell is that the per-category points stop adding up
+// to ESPN's own total. Renders under the SEASON table on a roto league.
+function _espRotoReconcileHtml(row) {
+  var a = null;
+  try { a = _espRotoAdapt(row); } catch (e) { a = null; }
+  if (!a) return '';
+  var box = 'margin-top:10px;padding:8px 10px;border-radius:8px;' +
+    'border:1px solid rgba(255,255,255,0.08);background:rgba(255,255,255,0.02);' +
+    'font-size:9.5px;line-height:1.5;color:rgba(255,255,255,0.5);';
+  var mono = "font-family:'JetBrains Mono',ui-monospace,'SF Mono',Menlo,monospace;";
+  var head = '<div style="' + mono + 'font-size:8.5px;letter-spacing:0.09em;' +
+    'color:rgba(255,255,255,0.35);margin-bottom:4px;">ROTO POINTS \u00b7 DERIVED VS ESPN</div>';
+
+  if (a.allTied) {
+    return '<div style="' + box + '">' + head +
+      'Every team is level in every category, so there are no ranks to derive yet. ' +
+      'This fills in once the season starts scoring.</div>';
+  }
+  if (!a.checked) {
+    return '<div style="' + box + '">' + head +
+      'Derived ' + a.cats.length + ' categories, but ESPN publishes no roto total to check them against yet.</div>';
+  }
+  var rows = '';
+  var bad = 0, i;
+  for (i = 0; i < a.detail.length; i++) {
+    var d = a.detail[i];
+    if (d.delta == null) continue;
+    var off = Math.abs(d.delta) > 0.05;
+    if (off) bad++;
+    rows += '<div style="' + mono + 'display:flex;gap:8px;justify-content:space-between;' +
+      'color:' + (off ? '#f87171' : 'rgba(255,255,255,0.45)') + ';">' +
+      '<span>' + slEsc(d.name) + '</span>' +
+      '<span>' + (Math.round(d.derived * 10) / 10).toFixed(1) + ' vs ' +
+        (Math.round(d.published * 10) / 10).toFixed(1) +
+        (off ? (' \u00b7 off ' + (d.delta > 0 ? '+' : '') + (Math.round(d.delta * 10) / 10).toFixed(1)) : ' \u2713') +
+      '</span></div>';
+  }
+  var verdict = a.reconciled
+    ? ('<div style="color:#4ade80;' + mono + 'margin-bottom:4px;">RECONCILES \u00b7 ' +
+        a.checked + ' teams \u00b7 ' + a.cats.length + ' categories</div>')
+    : ('<div style="color:#f87171;' + mono + 'margin-bottom:4px;">MISMATCH \u00b7 ' +
+        bad + ' of ' + a.checked + ' teams \u00b7 worst ' +
+        (a.worst > 0 ? '+' : '') + (Math.round(a.worst * 10) / 10).toFixed(1) + '</div>');
+  var note = a.reconciled
+    ? 'Per-category ranks add up to ESPN\u2019s own roto totals, so the derived points can be trusted.'
+    : 'Per-category ranks don\u2019t add up to ESPN\u2019s totals. Most likely a category that scores ' +
+      'in reverse, or a scored category missing from this list. The pressure board stays off until this clears.';
+  return '<div style="' + box + '">' + head + verdict + rows +
+    '<div style="margin-top:5px;">' + note + '</div></div>';
+}
+
 // teamId -> { statId: value } for whichever view is active.
 function _espSsValues(row, mode, game) {
   var out = {}, teams = ((row.raw || {}).teams) || [], i;
@@ -144780,6 +144991,11 @@ function _espSeasonStatsHtml(row, mode) {
       : 'Season totals from ESPN\u2019s own per-team values') +
     ' \u00b7 in this league\u2019s scoring order \u00b7 tap a column to sort, TEAM to reset ' +
     '\u00b7 swipe sideways for the rest.</div>';
+  // ESPROTO — season totals are the input to the roto derivation, so the
+  // check that the derivation is right belongs directly under them.
+  if (mode !== 'daily' && typeof _espRotoReconcileHtml === 'function') {
+    try { h += _espRotoReconcileHtml(row); } catch (e) {}
+  }
   if (mode === 'daily' && typeof _espDailyH2HHtml === 'function') {
     h += _espDailyH2HHtml(row, game);
   }
@@ -147175,6 +147391,60 @@ function espHasPaceTab(row) {
   return false;
 }
 
+// ── ESPN ROTO PRESSURE PANE ── ESPROTO ──
+// Same predicate the tab and the router share, so a selected tab can never
+// land on a pane that declined to render.
+function espHasRotoPressure(row) {
+  if (!row || row.provider !== 'espn') return false;
+  if (typeof extFormatKey !== 'function' || extFormatKey(row) !== 'roto') return false;
+  var teams = ((row.raw || {}).teams) || [];
+  return teams.length > 1;
+}
+
+// Category Pressure for an ESPN roto league. Everything below the adapter is
+// the same code the Yahoo board runs — the adapter's job is to hand over
+// Yahoo-shaped teams and stat metadata.
+//
+// Gated on reconciliation, deliberately. ESPN's per-category rank points are
+// DERIVED here, not published, and a derivation that's off by a reversed
+// category produces numbers that look completely reasonable. A blank pane
+// costs nothing; a confidently wrong pressure board costs a roster move.
+function _espRotoPressurePaneHtml(row) {
+  var h = '<div data-espstand>';
+  h += _espStandToggleHtml(row, 'press');
+  var a = null;
+  try { a = _espRotoAdapt(row); } catch (e) { a = null; }
+
+  function shell(msg) {
+    return h + '<div class="sk-rp">' +
+      '<div class="sk-rp-head"><div class="sk-rp-title">CATEGORY PRESSURE</div>' +
+      '<div class="sk-rp-sub">where your rank points can actually move</div></div>' +
+      '<div class="sk-rp-empty">' + skEscape(msg) + '</div></div></div>';
+  }
+
+  if (!a) return shell('Waiting on league standings.');
+  if (a.allTied) {
+    return shell('Every team is level in every category \u2014 this fills in once the season starts scoring.');
+  }
+  if (!a.myKey) return shell('Couldn\u2019t tell which team is yours in this league.');
+  if (!a.checked) {
+    return shell('ESPN hasn\u2019t published a roto total yet, so the derived category points can\u2019t be verified. ' +
+      'The board stays off until they check out.');
+  }
+  if (!a.reconciled) {
+    return shell('The derived category points don\u2019t add up to ESPN\u2019s own roto totals ' +
+      '(worst team off by ' + (Math.round(a.worst * 10) / 10).toFixed(1) + '), so the board is held back. ' +
+      'The SEASON tab shows the per-team breakdown.');
+  }
+
+  var fakeLeague = { league_key: String(row.key || 'espn'), scoring_type: 'roto' };
+  var fakeData = { allTeams: a.allTeams, team: { team_key: a.myKey } };
+  var board = '';
+  try { board = _skBuildRotoPressureHTML(fakeLeague, fakeData, a.meta) || ''; } catch (e) { board = ''; }
+  if (!board) return shell('No category values yet.');
+  return h + board + '</div>';
+}
+
 function _espStandToggleHtml(row, active) {
   if (!espHasSeasonStats(row)) return '';
   var key = String(row.key || '').replace(/'/g, '');
@@ -147192,6 +147462,9 @@ function _espStandToggleHtml(row, active) {
     // points — calling it POINTS described the wrong thing entirely.
     tab('pts', (typeof espIsCats === 'function' && espIsCats(row)) ? 'RECORD' : 'POINTS') +
     tab('season', 'SEASON') + tab('daily', 'DAILY') +
+    // ESPROTO — roto only. Shares espHasRotoPressure with the pane router.
+    ((typeof espHasRotoPressure === 'function' && espHasRotoPressure(row))
+      ? tab('press', 'PRESSURE') : '') +
     // ESPSCHED — same predicate the router uses, so the two can't disagree.
     ((typeof espHasSchedule === 'function' && espHasSchedule(row))
       ? tab('sched', 'SCHEDULE') : '') +
@@ -147374,6 +147647,9 @@ function _espStandingsPaneHtml(row) {
   }
   if (_sv === 'proj' && espHasProjection(row)) {   // ESPPROJ
     return _espProjStandingsHtml(row);
+  }
+  if (_sv === 'press' && typeof espHasRotoPressure === 'function' && espHasRotoPressure(row)) {
+    return _espRotoPressurePaneHtml(row);   // ESPROTO
   }
   if ((_sv === 'season' || _sv === 'daily') && espHasSeasonStats(row)) {
     return _espSeasonStatsHtml(row, _sv);
