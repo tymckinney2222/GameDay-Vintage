@@ -141339,13 +141339,23 @@ function _espRosterRowsHtml(row, myTeam) {
     // can't serve both. Unmapped ids are omitted, never guessed at.
     var statLine = '';
     if (wd && wd.stats) {
+      // ESPROTO — same id space, so the league's category states index
+      // straight into this player's stats. Null in every non-roto league,
+      // and in a roto league whose derivation hasn't reconciled.
+      var _rpSt = (typeof _espRotoStatesFor === 'function') ? _espRotoStatesFor(row) : null;
       var bits = [];
       for (var sk in wd.stats) {
         if (!wd.stats.hasOwnProperty(sk)) continue;
         var lbl = espStatName(game, sk);
         if (!lbl) continue;
-        bits.push('<span style="color:rgba(255,255,255,0.3);">' + lbl + '</span> ' +
-                  espStatFmt(sk, wd.stats[sk], game));
+        var _sty = _rpSt ? _espRotoStatStyle(_rpSt[String(sk)]) : null;
+        if (_sty) {
+          bits.push('<span style="color:' + _sty.lbl + ';">' + lbl + '</span> ' +
+                    '<span style="' + _sty.val + '">' + espStatFmt(sk, wd.stats[sk], game) + '</span>');
+        } else {
+          bits.push('<span style="color:rgba(255,255,255,0.3);">' + lbl + '</span> ' +
+                    espStatFmt(sk, wd.stats[sk], game));
+        }
       }
       if (bits.length) {
         statLine = '<div style="font-size:10px;line-height:1.5;color:rgba(255,255,255,0.62);' +
@@ -141434,6 +141444,16 @@ function _espRosterRowsHtml(row, myTeam) {
           ((row.rosters && row.rosters.splits)
             ? '<br><span onclick="espToggleSplits()" style="cursor:pointer;' +
               'text-decoration:underline;color:rgba(255,255,255,0.42);">ESPN stat feed</span>'
+            : '') +
+          // ESPROTO — the underlines are meaningless without this, and it
+          // only appears when there's actually emphasis on screen.
+          (((typeof _espRotoStatesFor === 'function') && _espRotoStatesFor(row))
+            ? '<br><span style="color:rgba(255,255,255,0.42);">Underlined stats are ' +
+              'one place from moving in this league \u00b7 ' +
+              '<span style="border-bottom:1px solid rgba(245,213,71,0.55);">contested</span> \u00b7 ' +
+              '<span style="border-bottom:1px solid rgba(74,222,128,0.55);">climbable</span> \u00b7 ' +
+              '<span style="border-bottom:1px solid rgba(248,113,113,0.55);">exposed</span> \u00b7 ' +
+              'dimmed ones are locked</span>'
             : '') +
           '</div>' +
           ((row.rosters && row.rosters.splits)
@@ -147443,6 +147463,53 @@ function _espRotoPressurePaneHtml(row) {
   try { board = _skBuildRotoPressureHTML(fakeLeague, fakeData, a.meta) || ''; } catch (e) { board = ''; }
   if (!board) return shell('No category values yet.');
   return h + board + '</div>';
+}
+
+// ── ESPROTO ── Pressure states for an ESPN roto league, keyed by stat id.
+//
+// No id translation happens here, and that's the point: a player's window
+// stats (wd.stats), the league's per-team season totals (valuesByStat) and
+// scoringItems[].statId all live in ONE ESPN id space. espStatName resolves
+// the same key in all three. So the classifier's output drops straight onto
+// a roster stat line with nothing in between to get wrong.
+//
+// Gated on reconciliation like the pane is — if the derived rank points don't
+// add up to ESPN's own totals, no emphasis is shown at all rather than
+// emphasis that might be pointing at the wrong categories.
+var _espRotoStateMemo = {};
+function _espRotoStatesFor(row) {
+  var key = String((row && row.key) || '');
+  if (!key) return null;
+  var now = Date.now();
+  var hit = _espRotoStateMemo[key];
+  if (hit && (now - hit.ts) < 60000) return hit.map;
+  var map = null;
+  try {
+    var a = _espRotoAdapt(row);
+    if (a && a.reconciled && a.myKey && !a.allTied) {
+      var res = _skRotoCatStates(
+        { league_key: key, scoring_type: 'roto' },
+        { allTeams: a.allTeams, team: { team_key: a.myKey } },
+        a.meta);
+      map = (res && res.byStat) || null;
+    }
+  } catch (e) {}
+  _espRotoStateMemo[key] = { ts: now, map: map };
+  return map;
+}
+
+// Inline styling for one stat on a roster line, given its pressure state.
+// Returns null when there's no state, so callers keep their original markup
+// byte-for-byte rather than routing through a no-op wrapper.
+function _espRotoStatStyle(state) {
+  if (!state) return null;
+  if (state === 'LOCKED') {
+    return { lbl: 'rgba(255,255,255,0.16)', val: 'opacity:0.4;' };
+  }
+  var uc = (state === 'CONTESTED') ? 'rgba(245,213,71,0.55)'
+         : (state === 'CLIMBABLE') ? 'rgba(74,222,128,0.55)'
+         : 'rgba(248,113,113,0.55)';
+  return { lbl: 'rgba(255,255,255,0.42)', val: 'font-weight:700;border-bottom:1px solid ' + uc + ';' };
 }
 
 function _espStandToggleHtml(row, active) {
