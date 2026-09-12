@@ -86916,63 +86916,124 @@ function _skWireIsNflLeague(league) {
 // abbreviation: 'pre' not kicked off, 'in' playing now, 'post' final. Read
 // off the same allGames feed the rest of the app uses, so nothing extra is
 // fetched. Returns null when that feed hasn't loaded.
-function _skWireNflGameStates() {
-  var out = null;
-  try {
-    if (typeof allGames === 'undefined' || !allGames) return null;
-    var list = allGames['NFL'];
-    if (!list || !list.length) return null;
-    // Tue→Mon, so Monday night belongs to the week that opened the Thursday
-    // before it rather than to the week starting that morning.
-    var today = _todayDateString();
-    var d0 = new Date(today + 'T12:00:00');
-    var dow = d0.getDay();                       // 0 Sun .. 6 Sat
-    var backToTue = (dow >= 2) ? (dow - 2) : (dow + 5);
-    var start = new Date(d0.getTime());
-    start.setDate(start.getDate() - backToTue);
-    var end = new Date(start.getTime());
-    end.setDate(end.getDate() + 6);
-    function ds(x) {
-      return x.getFullYear() + '-' +
-        String(x.getMonth() + 1).padStart(2, '0') + '-' +
-        String(x.getDate()).padStart(2, '0');
-    }
-    var lo = ds(start), hi = ds(end);
-    out = { byTeam: {}, lastFinal: '', nextKick: null, anyLive: false, anyPre: false };
-    var n = 0, i, si;
-    for (i = 0; i < list.length; i++) {
-      var g = list[i];
-      if (!g || !g.date) continue;
-      var gd = new Date(g.date);
-      if (isNaN(gd.getTime())) continue;
-      var gds = ds(gd);
-      if (gds < lo || gds > hi) continue;
-      var state = (g.state === 'post' || g.state === 'in' || g.state === 'pre') ? g.state : null;
-      if (!state) continue;
-      if (state === 'post' && gds > out.lastFinal) out.lastFinal = gds;
-      if (state === 'in') out.anyLive = true;
-      if (state === 'pre') {
-        out.anyPre = true;
-        if (out.nextKick == null || gd.getTime() < out.nextKick) out.nextKick = gd.getTime();
+// ── WIRENFL ── The football week window containing today, Tue→Mon, so
+// Monday night belongs to the week that opened the Thursday before it rather
+// than to the week starting that morning. Returns { lo, hi } as YYYY-MM-DD.
+function _skWireNflWeekWindow() {
+  var today = _todayDateString();
+  var d0 = new Date(today + 'T12:00:00');
+  var dow = d0.getDay();                       // 0 Sun .. 6 Sat
+  var backToTue = (dow >= 2) ? (dow - 2) : (dow + 5);
+  var start = new Date(d0.getTime());
+  start.setDate(start.getDate() - backToTue);
+  var end = new Date(start.getTime());
+  end.setDate(end.getDate() + 6);
+  function ds(x) {
+    return x.getFullYear() + '-' +
+      String(x.getMonth() + 1).padStart(2, '0') + '-' +
+      String(x.getDate()).padStart(2, '0');
+  }
+  return { lo: ds(start), hi: ds(end) };
+}
+
+// The week's club game states, fetched and cached.
+//
+// This CANNOT come from allGames. That feed is scoped to the single date the
+// main scoreboard is showing (fetchLeague requests one dates= day), so on a
+// Wednesday it holds no football at all, and even on a Sunday it would be
+// missing Thursday's finals and Monday night. A week-shaped question needs a
+// week-shaped request: ESPN's scoreboard takes a dates=START-END range, so
+// one call covers Tue→Mon.
+//
+// Cached for 5 minutes, or 60 seconds while anything is live, since that's
+// the only time a state actually changes underneath us.
+var _skWireNflSched = { lo: '', hi: '', ts: 0, data: null, inflight: false };
+
+function _skWireNflSchedule() {
+  var win = _skWireNflWeekWindow();
+  var now = Date.now();
+  var c = _skWireNflSched;
+  var fresh = c.data && c.lo === win.lo && c.hi === win.hi &&
+    (now - c.ts) < ((c.data.anyLive ? 60 : 300) * 1000);
+  if (fresh) return c.data;
+  if (c.inflight) return (c.lo === win.lo) ? c.data : null;
+
+  c.inflight = true;
+  var qs = win.lo.replace(/-/g, '') + '-' + win.hi.replace(/-/g, '');
+  fetch('https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard' +
+        '?dates=' + qs + '&limit=300')
+    .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+    .then(function(j) {
+      var games = (typeof parseGames === 'function') ? parseGames(j.events, 'NFL') : [];
+      _skWireNflSched.data = _skWireNflBuildStates(games, win);
+      _skWireNflSched.lo = win.lo;
+      _skWireNflSched.hi = win.hi;
+      _skWireNflSched.ts = Date.now();
+    })
+    .catch(function() {
+      // Leave data null so the card says the schedule is unavailable rather
+      // than reporting a count built on nothing.
+      _skWireNflSched.ts = Date.now();
+      _skWireNflSched.lo = win.lo;
+      _skWireNflSched.hi = win.hi;
+    })
+    .then(function() {
+      _skWireNflSched.inflight = false;
+      if (typeof skRenderWireCards === 'function' &&
+          typeof skState !== 'undefined' && skState.mode === 'wire') {
+        try { skRenderWireCards(); } catch (e) {}
       }
-      var sides = [g.home, g.away];
-      for (si = 0; si < 2; si++) {
-        var ab = sides[si] && sides[si].abbr;
-        if (!ab) continue;
-        ab = String(ab).toUpperCase();
-        out.byTeam[ab] = state;
-        // Fantasy and site abbreviations are both ESPN's but come from
-        // different APIs and don't always agree, so both spellings go in.
-        if (typeof _skNormalizeTeamAbbr === 'function') {
-          var nb = String(_skNormalizeTeamAbbr(ab) || '').toUpperCase();
-          if (nb && nb !== ab) out.byTeam[nb] = state;
-        }
-        n++;
+    });
+  return c.data;
+}
+
+// Fold a normalized game list into per-club states for the week.
+function _skWireNflBuildStates(list, win) {
+  var out = { byTeam: {}, lastFinal: '', nextKick: null, anyLive: false, anyPre: false, games: 0 };
+  if (!list || !list.length) return out;
+  function ds(x) {
+    return x.getFullYear() + '-' +
+      String(x.getMonth() + 1).padStart(2, '0') + '-' +
+      String(x.getDate()).padStart(2, '0');
+  }
+  for (var i = 0; i < list.length; i++) {
+    var g = list[i];
+    if (!g || !g.date) continue;
+    var gd = new Date(g.date);
+    if (isNaN(gd.getTime())) continue;
+    var gds = ds(gd);
+    if (win && (gds < win.lo || gds > win.hi)) continue;
+    var state = (g.state === 'post' || g.state === 'in' || g.state === 'pre') ? g.state : null;
+    if (!state) continue;
+    out.games++;
+    if (state === 'post' && gds > out.lastFinal) out.lastFinal = gds;
+    if (state === 'in') out.anyLive = true;
+    if (state === 'pre') {
+      out.anyPre = true;
+      if (out.nextKick == null || gd.getTime() < out.nextKick) out.nextKick = gd.getTime();
+    }
+    var sides = [g.home, g.away];
+    for (var si = 0; si < 2; si++) {
+      var ab = sides[si] && sides[si].abbr;
+      if (!ab) continue;
+      ab = String(ab).toUpperCase();
+      out.byTeam[ab] = state;
+      // Fantasy and site abbreviations are both ESPN's but come from
+      // different APIs and don't always agree, so both spellings go in.
+      if (typeof _skNormalizeTeamAbbr === 'function') {
+        var nb = String(_skNormalizeTeamAbbr(ab) || '').toUpperCase();
+        if (nb && nb !== ab) out.byTeam[nb] = state;
       }
     }
-    if (!n) return null;
-  } catch (e) { return null; }
+  }
   return out;
+}
+
+function _skWireNflGameStates() {
+  var s = null;
+  try { s = _skWireNflSchedule(); } catch (e) { s = null; }
+  if (!s || !s.games) return null;
+  return s;
 }
 
 // How many of one side's starters are final, live, and still to come.
@@ -87176,6 +87237,9 @@ async function skScanWireLeague(league) {
             nextKick: _gs ? _gs.nextKick : null,
             lastFinal: _gs ? _gs.lastFinal : '',
             known: !!_gs,
+            // In flight vs failed: the card says different things, because
+            // "loading" resolves itself and "unavailable" doesn't.
+            loading: !_gs && !!(typeof _skWireNflSched !== 'undefined' && _skWireNflSched.inflight),
             // Settled only when BOTH sides have finished and nothing is
             // unresolved. Until then a lead is a lead, not a win — calling
             // a Sunday-afternoon margin a W is the whole reason this exists.
@@ -87694,7 +87758,7 @@ function _skBuildWireLeagueRowHTML(league, entry) {
   var teamName = (team && team.name) || league.name || '?';
   var logoUrl = (team && team.logoUrl) || '';
   var leagueName = league.name || '';
-  var st = league.scoring_type || '';
+  var st = _skWireScoringType(league);   // WIREFMT — not the raw scoring_type
   var fmtPill = st === 'headpoint' ? 'H2H\u00b7PTS'
               : st === 'head'      ? 'H2H\u00b7CATS'
               : st === 'headone'   ? 'H2H\u00b71-CAT'
@@ -87770,7 +87834,8 @@ function _skBuildWireLeagueRowHTML(league, entry) {
     // read as certainty.
     var remainTxt = '';
     if (!nf.known) {
-      remainTxt = 'Week ' + (nf.week || '?') + ' \u00b7 schedule not loaded';
+      remainTxt = 'Week ' + (nf.week || '?') + ' \u00b7 ' +
+        (nf.loading ? 'loading schedule\u2026' : 'schedule unavailable');
     } else if (nf.settled) {
       remainTxt = 'Week ' + (nf.week || '?') + ' final \u00b7 all starters played';
     } else {
