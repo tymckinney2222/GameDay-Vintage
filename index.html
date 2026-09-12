@@ -145229,8 +145229,8 @@ function _espSeasonWindow(sport, season) {
   var yr = Number(season) || (new Date()).getFullYear();
   var sp = String(sport || '').toLowerCase();
   var s, e;
-  if (sp === 'nba') { s = (yr - 1) + '-10-21'; e = yr + '-04-13'; }
-  else if (sp === 'nhl') { s = (yr - 1) + '-10-07'; e = yr + '-04-17'; }
+  if (sp === 'nba') { s = (yr - 1) + '-10-20'; e = yr + '-04-13'; }
+  else if (sp === 'nhl') { s = (yr - 1) + '-09-29'; e = yr + '-04-17'; }
   // Football, which had been falling through to the baseball window — a
   // September-to-January season being told it runs March to September. It
   // never mattered while this only fed pace figures for the sports above,
@@ -145342,7 +145342,35 @@ function espCatchRows(row) {
 // hitting-heavy league. It is a directional read, not a forecast — which is
 // why the unadjusted number stays on screen next to it.
 function espCapWatch(row) {
-  var cap = (typeof espStatLimit === 'function') ? espStatLimit(row, 33) : null;
+  // Which stat this league caps, and the team-wide allowance for it.
+  //
+  // Baseball first, and deliberately: stat 33 (games started) is read exactly
+  // as before, so MLB leagues take the identical path they always did. Only
+  // when there's no 33 limit does this fall through to espGameCaps, which
+  // finds the capped stat generically — whichever statId the most limit nodes
+  // name — and sums the allowance across slots. That's how NBA and NHL
+  // express the same constraint: not one pitcher-slot limit but a per-slot
+  // games budget (82 a slot, 246 across a three-deep UTIL line), which sums
+  // to the team's real allowance. ESPCAPGEN
+  var statId = '33', cap = null, unit = 'starts', label = 'GAMES STARTED';
+  var mlbCap = (typeof espStatLimit === 'function') ? espStatLimit(row, 33) : null;
+  if (mlbCap != null) {
+    cap = mlbCap;
+  } else {
+    var caps = (typeof espGameCaps === 'function') ? espGameCaps(row) : null;
+    if (caps && caps.statId != null && caps.total > 0) {
+      cap = caps.total;
+      statId = String(caps.statId);
+      unit = 'games';
+      var nm = (typeof espStatName === 'function') ? espStatName(caps.game, statId) : '';
+      nm = String(nm || '').toUpperCase();
+      // The heading wants words, not the box-score abbreviation. Anything
+      // unrecognised keeps ESPN's own label rather than being guessed at.
+      label = (nm === 'GP' || nm === 'G') ? 'GAMES PLAYED'
+            : (nm === 'GS') ? 'GAMES STARTED'
+            : (nm ? nm : 'GAMES PLAYED');
+    }
+  }
   if (cap == null) return null;
   var clock = espSeasonClock(row);
   if (!clock || clock.weeksElapsed <= 0) return null;
@@ -145358,7 +145386,7 @@ function espCapWatch(row) {
     var r = ls.list[i];
     var t = byId[String(r.teamId)];
     var vb = t && t.valuesByStat;
-    var used = (vb && vb['33'] != null) ? Number(vb['33']) : null;
+    var used = (vb && vb[statId] != null) ? Number(vb[statId]) : null;
     if (used == null || isNaN(used)) continue;
     var perWk = used / clock.weeksElapsed;
     var left = cap - used;
@@ -145388,7 +145416,7 @@ function espCapWatch(row) {
   }
   if (!out.length) return null;
   out.sort(function (a, b) { return (a.left || 0) - (b.left || 0); });
-  return { cap: cap, clock: clock, rows: out };
+  return { cap: cap, statId: statId, unit: unit, label: label, clock: clock, rows: out };
 }
 
 // Freeze-adjusted catch numbers, keyed by team id, or null when there is no
@@ -145909,10 +145937,10 @@ function _espPacePanelHtml(row) {
   var cw = (typeof espCapWatch === 'function') ? espCapWatch(row) : null;
   if (cw) {
     h += '<div style="font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
-      'margin:14px 0 2px;">CAP WATCH \u00b7 GAMES STARTED</div>' +
+      'margin:14px 0 2px;">CAP WATCH \u00b7 ' + slEsc(cw.label || 'GAMES STARTED') + '</div>' +
       '<div style="font-size:9.5px;color:rgba(255,255,255,0.3);margin:0 0 8px;">' +
-      'cap ' + cw.cap + ' \u00b7 starts per week you can still afford, against ' +
-      'what you\u2019re using</div>';
+      'cap ' + cw.cap + ' \u00b7 ' + slEsc(cw.unit || 'starts') + ' per week you can still ' +
+      'afford, against what you\u2019re using</div>';
     for (i = 0; i < cw.rows.length; i++) {
       var g = cw.rows[i];
       var pctUsed = cw.cap > 0 ? Math.round((g.used / cw.cap) * 100) : 0;
@@ -145935,7 +145963,7 @@ function _espPacePanelHtml(row) {
           // glance without arithmetic. ESPSTARTBUDGET
           '<span style="display:block;color:' +
             (g.freezes ? '#f87171' : 'rgba(255,255,255,0.62)') + ';">' +
-            (g.budget == null ? (g.wksToCap == null ? 'no starts' : 'clears')
+            (g.budget == null ? (g.wksToCap == null ? ('no ' + (cw.unit || 'starts')) : 'clears')
               : (g.budget + '/wk left')) + '</span>' +
           (g.budget != null
             ? '<span style="display:block;font-size:8.5px;color:' +
@@ -145955,8 +145983,9 @@ function _espPacePanelHtml(row) {
       ' remaining \u2014 spend at that rate and you finish level. Red is ' +
       'burning faster than that; amber is running more than two a week under ' +
       'it, which is scoring left unused. Freeze-adjusted catch math above ' +
-      'treats a capped team as scoring nothing further, but they still hit, ' +
-      'so it overstates the effect.</div>';
+      'treats a capped team as scoring nothing further. That overstates it: ' +
+      'in baseball a team out of starts still hits, and in basketball or ' +
+      'hockey a cap binds slot by slot rather than all at once.</div>';
   }
 
   // ── DAILY DETAIL: my score, then my MARGIN against every team ──
