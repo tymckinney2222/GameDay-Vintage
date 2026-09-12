@@ -147132,6 +147132,136 @@ function espPlayoffPicture(row, mode) {
   };
 }
 
+// ── ESPBRACKET3 ── Fold ESPN's published playoff schedule into ROUNDS.
+//
+// espRealBracket already returns every real playoff matchup — period, tier,
+// both team ids and the winner — but only its .length was ever used, for the
+// "5 playoff matchups below are actual" note. What got DRAWN underneath was
+// still espProjectedPairings, which only ever produces the first round. So a
+// 4-team bracket announced five actual matchups and then showed two projected
+// ones. The data was there the whole time; nothing rendered it.
+//
+// Two things have to happen before it can be drawn:
+//
+//   1. DE-DUPLICATION. ESPN emits one schedule row per matchupPeriodId, so a
+//      two-week round is the SAME matchup twice. Counting rows counts weeks,
+//      not games, which is most of why the number looked wrong. Rows are
+//      collapsed on (round, tier, pairing) and the period span is kept.
+//   2. SEPARATION. playoffTierType distinguishes the championship bracket
+//      from consolation ladders. Mixing them into one list inflates the
+//      bracket with games that can't win anything.
+function _espRealBracketRounds(row) {
+  var real = (typeof espRealBracket === 'function') ? espRealBracket(row) : null;
+  var ps = (typeof espPlayoffSettings === 'function') ? espPlayoffSettings(row) : null;
+  if (!real || !real.length || !ps) return null;
+
+  var rl = Math.max(1, Number(ps.roundLen) || 1);
+  var byKey = {}, order = [], i;
+  for (i = 0; i < real.length; i++) {
+    var m = real[i];
+    if (m.period == null || isNaN(m.period)) continue;
+    var rnd = Math.floor((m.period - ps.startPeriod) / rl) + 1;
+    if (rnd < 1) rnd = 1;
+    var key = rnd + '|' + m.tier + '|' + (m.homeId || '-') + '|' + (m.awayId || '-');
+    if (!byKey[key]) {
+      byKey[key] = {
+        round: rnd, tier: m.tier, homeId: m.homeId, awayId: m.awayId,
+        winner: (m.winner && m.winner !== 'UNDECIDED') ? m.winner : '',
+        periods: [m.period]
+      };
+      order.push(key);
+    } else {
+      var e = byKey[key];
+      if (e.periods.indexOf(m.period) < 0) e.periods.push(m.period);
+      // A round decided in its final week: keep the verdict, not the blank
+      // first-week row.
+      if (m.winner && m.winner !== 'UNDECIDED') e.winner = m.winner;
+    }
+  }
+  if (!order.length) return null;
+
+  // Team lookup for names, records and seeds.
+  var info = {};
+  var all = (row && row.standingsAll) || [];
+  for (i = 0; i < all.length; i++) {
+    info[String(all[i].teamId)] = {
+      name: all[i].teamName || String(all[i].teamId),
+      record: all[i].record || '', seed: i + 1
+    };
+  }
+  var myIds = (row && row.myTeamIds) || {};
+
+  var champ = [], cons = [];
+  for (i = 0; i < order.length; i++) {
+    var g = byKey[order[i]];
+    g.periods.sort(function(a, b) { return a - b; });
+    function side(id, isHome) {
+      var nfo = id ? info[String(id)] : null;
+      return {
+        teamId: id,
+        name: nfo ? nfo.name : (id ? ('Team ' + id) : 'TBD'),
+        record: nfo ? nfo.record : '',
+        seed: nfo ? nfo.seed : null,
+        mine: !!(id && myIds[id]),
+        won: !!(g.winner && ((isHome && g.winner === 'HOME') || (!isHome && g.winner === 'AWAY')))
+      };
+    }
+    g.home = side(g.homeId, true);
+    g.away = side(g.awayId, false);
+    g.decided = !!g.winner;
+    // A tier is championship-side only when ESPN says WINNERS. Everything
+    // else is a consolation or placement ladder.
+    if (String(g.tier).toUpperCase().indexOf('WINNERS') >= 0) champ.push(g);
+    else cons.push(g);
+  }
+  function byRound(list) {
+    var rounds = {}, ord = [], k;
+    for (k = 0; k < list.length; k++) {
+      var r = list[k].round;
+      if (!rounds[r]) { rounds[r] = []; ord.push(r); }
+      rounds[r].push(list[k]);
+    }
+    ord.sort(function(a, b) { return a - b; });
+    return ord.map(function(r) { return { round: r, games: rounds[r] }; });
+  }
+  return {
+    champRounds: byRound(champ),
+    consRounds: byRound(cons),
+    games: champ.length + cons.length,
+    champGames: champ.length,
+    rounds: ps.rounds
+  };
+}
+
+// One published matchup, both sides, winner marked.
+function _espRealGameHtml(g, ps, accent, mono) {
+  function sideHtml(s, other) {
+    var dim = (g.decided && !s.won);
+    return '<div style="display:flex;align-items:center;gap:8px;' +
+      (other ? 'margin-top:3px;' : '') + (dim ? 'opacity:0.45;' : '') + '">' +
+      '<span style="' + mono + 'color:rgba(255,255,255,0.3);flex:0 0 18px;">' +
+        (s.seed != null ? s.seed : '\u2013') + '</span>' +
+      '<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;' +
+        'white-space:nowrap;color:' +
+        (s.mine ? accent + ';font-weight:700' : 'rgba(255,255,255,0.8)') + ';">' +
+        slEsc(s.name) + '</span>' +
+      (s.won ? '<span style="font-size:9px;color:#4ade80;letter-spacing:0.06em;">WON</span>' : '') +
+      '<span style="' + mono + 'font-size:10px;color:rgba(255,255,255,0.35);">' +
+        slEsc(s.record || '') + '</span>' +
+    '</div>';
+  }
+  var pLabel = (g.periods.length > 1)
+    ? ('periods ' + g.periods[0] + '\u2013' + g.periods[g.periods.length - 1])
+    : ('period ' + g.periods[0]);
+  return '<div style="padding:6px;border-radius:7px;margin:0 0 3px;' +
+    'background:rgba(255,255,255,0.03);font-size:11.5px;">' +
+    sideHtml(g.home, false) + sideHtml(g.away, true) +
+    '<div style="' + mono + 'font-size:8.5px;color:rgba(255,255,255,0.22);' +
+      'margin-top:3px;">' + pLabel +
+      (g.decided ? '' : ' \u00b7 undecided') + '</div>' +
+  '</div>';
+}
+
 function espHasBracket(row) {
   if (typeof espIsSeasonPts === 'function' && espIsSeasonPts(row)) return false;
   return !!espPlayoffSettings(row);
@@ -147285,12 +147415,47 @@ function _espBracketHtml(row) {
   // ESPCUTLINE — follows whichever mode is active.
   h += _espCutlineHtml(pic, accent);
 
+  // ESPBRACKET3 — when ESPN has published the bracket, draw ALL of it.
+  var _rb = (real && typeof _espRealBracketRounds === 'function')
+    ? _espRealBracketRounds(row) : null;
+
   if (real) {
     h += '<div style="font-size:9.5px;color:#4ade80;margin:0 0 8px;">' +
-      'ESPN has published the real bracket \u2014 ' + real.length +
-      ' playoff matchup' + (real.length === 1 ? '' : 's') + ' below are actual, ' +
-      'not projected.</div>';
+      'ESPN has published the real bracket \u2014 ' +
+      (_rb ? _rb.games : real.length) +
+      ' playoff matchup' + ((_rb ? _rb.games : real.length) === 1 ? '' : 's') +
+      ' below are actual, not projected.' +
+      // The old count was schedule ROWS, and a multi-week round emits one row
+      // per week — so it over-reported. Say so when they differ.
+      ((_rb && real.length !== _rb.games)
+        ? ' <span style="color:rgba(255,255,255,0.35);">(' + real.length +
+          ' schedule rows across ' + ps.roundLen + '-week rounds)</span>'
+        : '') +
+      '</div>';
   }
+
+  if (_rb && (_rb.champRounds.length || _rb.consRounds.length)) {
+    var rr, ri, gi;
+    for (ri = 0; ri < _rb.champRounds.length; ri++) {
+      rr = _rb.champRounds[ri];
+      var isFinal = (rr.round >= _rb.rounds);
+      h += '<div style="font-size:9px;letter-spacing:0.1em;' +
+        'color:rgba(255,255,255,0.3);margin:' + (ri ? '12px' : '0') + ' 0 4px;">' +
+        (isFinal ? 'FINAL' : ('ROUND ' + rr.round)) + '</div>';
+      for (gi = 0; gi < rr.games.length; gi++) {
+        h += _espRealGameHtml(rr.games[gi], ps, accent, mono);
+      }
+    }
+    for (ri = 0; ri < _rb.consRounds.length; ri++) {
+      rr = _rb.consRounds[ri];
+      h += '<div style="font-size:9px;letter-spacing:0.1em;' +
+        'color:rgba(255,255,255,0.22);margin:12px 0 4px;">' +
+        'CONSOLATION \u00b7 ROUND ' + rr.round + '</div>';
+      for (gi = 0; gi < rr.games.length; gi++) {
+        h += _espRealGameHtml(rr.games[gi], ps, accent, mono);
+      }
+    }
+  } else {
 
   // ── projected first round ──
   h += '<div style="font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
@@ -147337,6 +147502,7 @@ function _espBracketHtml(row) {
       '</div>' +
     '</div>';
   }
+  }   // ESPBRACKET3 — end projected-pairings fallback
 
   // ── the race for the cutoff ──
   h += '<div style="font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
