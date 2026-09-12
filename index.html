@@ -17723,6 +17723,20 @@
     font-size: 10px; color: var(--sk-text-3); margin-top: 2px;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
+  /* ── WIRENFL ── How much of the football week is still to play, and what
+     comes next. The remaining count is the line that makes a margin mean
+     something, so it reads brighter than the MVP note; the kickoff is a
+     footnote. */
+  .sk-wr-row-remain {
+    font-family: var(--sk-font-mono); font-size: 10px; color: var(--sk-text-2);
+    margin-top: 2px; letter-spacing: 0.01em;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .sk-wr-row-next {
+    font-family: var(--sk-font-mono); font-size: 9.5px; color: var(--sk-text-4);
+    margin-top: 1px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
   .sk-wr-row-right {
     flex-shrink: 0; display: flex; flex-direction: column;
     align-items: flex-end; gap: 6px;
@@ -86861,10 +86875,147 @@ function skWireScanComplete() {
   return true;
 }
 
+// ── WIREFMT ── The wire's EFFECTIVE scoring type for a league.
+//
+// Yahoo reports scoring_type "head" for two completely different formats:
+// true category leagues (NBA/NHL/MLB) and head-to-head POINTS football.
+// There is no cats format in NFL or college football at all. Taking "head"
+// at face value labelled every football league H2H\u00b7CATS and sent it down
+// the category branch, which then counted category wins from categories that
+// don't exist — hence 0-0 cats on the card and nothing in the detail sheet.
+//
+// Reuses _skCmpLeagueIsPointsFp, the same reclassifier the hub and the
+// comparison views already use, so the three can't disagree about a league.
+function _skWireScoringType(league) {
+  var st = (league && league.scoring_type) || '';
+  if (st === 'head' && league && typeof _skCmpLeagueIsPointsFp === 'function' &&
+      _skCmpLeagueIsPointsFp(league.league_key)) {
+    return 'headpoint';
+  }
+  return st;
+}
+
+function _skWireIsNflLeague(league) {
+  var sp = String((league && league.sport) || '').toLowerCase();
+  return sp === 'nfl' || sp === 'cfb';
+}
+
+// ── WIRENFL ── Football's week, not yesterday.
+//
+// The wire's frame is "what happened yesterday", and football doesn't work
+// that way: games land Thursday, Sunday and Monday, so on four days in seven
+// there IS no yesterday to report. Even with the format bug fixed the card
+// would honestly read 0.0 and still tell you nothing.
+//
+// What matters on a football morning is the WEEK, and specifically how much
+// of it is still to come. A 14-point lead with two starters left against an
+// opponent holding five is a completely different situation from the same
+// lead with nobody left, and the score alone cannot tell those apart.
+//
+// Club game states for the football week containing today, keyed by team
+// abbreviation: 'pre' not kicked off, 'in' playing now, 'post' final. Read
+// off the same allGames feed the rest of the app uses, so nothing extra is
+// fetched. Returns null when that feed hasn't loaded.
+function _skWireNflGameStates() {
+  var out = null;
+  try {
+    if (typeof allGames === 'undefined' || !allGames) return null;
+    var list = allGames['NFL'];
+    if (!list || !list.length) return null;
+    // Tue→Mon, so Monday night belongs to the week that opened the Thursday
+    // before it rather than to the week starting that morning.
+    var today = _todayDateString();
+    var d0 = new Date(today + 'T12:00:00');
+    var dow = d0.getDay();                       // 0 Sun .. 6 Sat
+    var backToTue = (dow >= 2) ? (dow - 2) : (dow + 5);
+    var start = new Date(d0.getTime());
+    start.setDate(start.getDate() - backToTue);
+    var end = new Date(start.getTime());
+    end.setDate(end.getDate() + 6);
+    function ds(x) {
+      return x.getFullYear() + '-' +
+        String(x.getMonth() + 1).padStart(2, '0') + '-' +
+        String(x.getDate()).padStart(2, '0');
+    }
+    var lo = ds(start), hi = ds(end);
+    out = { byTeam: {}, lastFinal: '', nextKick: null, anyLive: false, anyPre: false };
+    var n = 0, i, si;
+    for (i = 0; i < list.length; i++) {
+      var g = list[i];
+      if (!g || !g.date) continue;
+      var gd = new Date(g.date);
+      if (isNaN(gd.getTime())) continue;
+      var gds = ds(gd);
+      if (gds < lo || gds > hi) continue;
+      var state = (g.state === 'post' || g.state === 'in' || g.state === 'pre') ? g.state : null;
+      if (!state) continue;
+      if (state === 'post' && gds > out.lastFinal) out.lastFinal = gds;
+      if (state === 'in') out.anyLive = true;
+      if (state === 'pre') {
+        out.anyPre = true;
+        if (out.nextKick == null || gd.getTime() < out.nextKick) out.nextKick = gd.getTime();
+      }
+      var sides = [g.home, g.away];
+      for (si = 0; si < 2; si++) {
+        var ab = sides[si] && sides[si].abbr;
+        if (!ab) continue;
+        ab = String(ab).toUpperCase();
+        out.byTeam[ab] = state;
+        // Fantasy and site abbreviations are both ESPN's but come from
+        // different APIs and don't always agree, so both spellings go in.
+        if (typeof _skNormalizeTeamAbbr === 'function') {
+          var nb = String(_skNormalizeTeamAbbr(ab) || '').toUpperCase();
+          if (nb && nb !== ab) out.byTeam[nb] = state;
+        }
+        n++;
+      }
+    }
+    if (!n) return null;
+  } catch (e) { return null; }
+  return out;
+}
+
+// How many of one side's starters are final, live, and still to come.
+//
+// A club the feed can't resolve counts as UNKNOWN, never as played. The
+// absent-versus-negative trap: telling you nobody is left because the
+// schedule didn't load is worse than admitting the count is incomplete.
+function _skWireNflSideState(starters, gs) {
+  var o = { total: 0, done: 0, live: 0, left: 0, unknown: 0, fp: 0 };
+  if (!starters) return o;
+  for (var i = 0; i < starters.length; i++) {
+    var p = starters[i];
+    if (!p) continue;
+    o.total++;
+    o.fp += (typeof p.fp === 'number' ? p.fp : 0);
+    var ab = String(p.teamAbbr || '').toUpperCase();
+    var st = (gs && ab) ? gs.byTeam[ab] : null;
+    if (st === 'post') o.done++;
+    else if (st === 'in') o.live++;
+    else if (st === 'pre') o.left++;
+    else o.unknown++;
+  }
+  o.fp = Math.round(o.fp * 10) / 10;
+  return o;
+}
+
+// Short local time for the next kickoff, e.g. "Thu 8:15p".
+function _skWireKickLabel(ms) {
+  if (ms == null) return '';
+  try {
+    var d = new Date(ms);
+    var DOW = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    var h = d.getHours(), m = d.getMinutes();
+    var ap = (h >= 12) ? 'p' : 'a';
+    var h12 = (h % 12) || 12;
+    return DOW[d.getDay()] + ' ' + h12 + (m ? (':' + String(m).padStart(2, '0')) : '') + ap;
+  } catch (e) { return ''; }
+}
+
 async function skScanWireLeague(league) {
   var key = league.league_key;
   var dateStr = skYesterdayDateString();
-  var scoringType = league.scoring_type || '';
+  var scoringType = _skWireScoringType(league);   // WIREFMT
 
   // Pull team identity from the live data cache (populated by
   // skHydrateAll). For points leagues we need myTeamKey to fetch FP;
@@ -86920,6 +87071,16 @@ async function skScanWireLeague(league) {
   }
 
   try {
+    // ── WIRENFL ── Football runs on the week, so the fetch date is TODAY,
+    // not yesterday. Yahoo's football stats endpoint is week-scoped anyway
+    // (type=week is its finest grain), so asking for yesterday returns the
+    // same week-to-date total with a misleading label attached — and on a
+    // Tuesday it asks about a week that has no games in it yet.
+    var _isFb = _skWireIsNflLeague(league);
+    if (_isFb) dateStr = _todayDateString();
+    entry.dateStr = dateStr;
+    entry.isFootball = _isFb;
+
     if (scoringType === 'headpoint' || scoringType === 'point') {
       // POINTS / SEASON POINTS — reuse the existing FP cache.
       var myFpMap = await fetchTeamFpForDate(myTeamKey, dateStr);
@@ -87000,6 +87161,28 @@ async function skScanWireLeague(league) {
           // FP, but cheap insurance).
           if (Math.abs(entry.myFp - entry.oppFp) < 0.001) entry.result = 'T';
           else entry.result = (entry.myFp > entry.oppFp) ? 'W' : 'L';
+        }
+
+        // ── WIRENFL ── How much of the week is actually in the books.
+        if (_isFb) {
+          var _gs = _skWireNflGameStates();
+          var _mine = _skWireNflSideState(myStarters, _gs);
+          var _theirs = _skWireNflSideState(oppStartersArr, _gs);
+          entry.nfl = {
+            week: (matchup && matchup.week) || null,
+            mine: _mine, theirs: _theirs,
+            anyLive: !!(_gs && _gs.anyLive),
+            anyPre: !!(_gs && _gs.anyPre),
+            nextKick: _gs ? _gs.nextKick : null,
+            lastFinal: _gs ? _gs.lastFinal : '',
+            known: !!_gs,
+            // Settled only when BOTH sides have finished and nothing is
+            // unresolved. Until then a lead is a lead, not a win — calling
+            // a Sunday-afternoon margin a W is the whole reason this exists.
+            settled: !!(_gs && _mine.left === 0 && _mine.live === 0 && _mine.unknown === 0 &&
+                        _theirs.left === 0 && _theirs.live === 0 && _theirs.unknown === 0)
+          };
+          if (!entry.nfl.settled) entry.result = null;
         }
       }
       // Season pts (`point`): no daily H2H — result stays null.
@@ -87554,9 +87737,70 @@ function _skBuildWireLeagueRowHTML(league, entry) {
   else if (entry.result === 'L') { pillCls = 'loss'; pillTxt = 'L'; }
   else if (entry.result === 'T') { pillCls = 'tie'; pillTxt = 'T'; }
   else if (st === 'point') { pillCls = 'no'; pillTxt = 'SOLO'; }
+  // ── WIRENFL ── An unfinished football week has no result to report, so
+  // the pill says where the week IS rather than showing a neutral dash:
+  // LIVE while clubs are on the field, LEAD/TRAIL once a day is done but
+  // players remain, and the week number before anything kicks off.
+  else if (entry.nfl) {
+    var _n = entry.nfl;
+    if (_n.anyLive) { pillCls = 'tie'; pillTxt = 'LIVE'; }
+    else if (entry.myFp != null && entry.oppFp != null &&
+             (_n.mine.done > 0 || _n.theirs.done > 0)) {
+      var _lead = entry.myFp - entry.oppFp;
+      pillCls = _lead > 0 ? 'win' : (_lead < 0 ? 'loss' : 'tie');
+      pillTxt = _lead > 0 ? 'LEAD' : (_lead < 0 ? 'TRAIL' : 'EVEN');
+    } else if (_n.week) { pillCls = 'no'; pillTxt = 'WK ' + _n.week; }
+  }
 
   var noteHtml = '';
-  if (st === 'headpoint' && entry.myFp != null && entry.oppFp != null) {
+  // ── WIRENFL ── Football's body, before the generic points branch can
+  // claim it. Three lines at most: where the score stands, how much of the
+  // week is still to play on each side, and what's next.
+  if (entry.nfl && entry.myFp != null && entry.oppFp != null) {
+    var nf = entry.nfl;
+    var nDiff = entry.myFp - entry.oppFp;
+    var nDiffStr = (nDiff >= 0 ? '+' : '') + nDiff.toFixed(1);
+    noteHtml = '<div class="sk-wr-row-score">' +
+      entry.myFp.toFixed(1) + ' <span class="sk-wr-row-vs">vs</span> ' + entry.oppFp.toFixed(1) +
+      ' <span class="sk-wr-row-diff ' + (nDiff >= 0 ? 'pos' : 'neg') + '">' + nDiffStr + '</span>' +
+    '</div>';
+
+    // The line that makes a margin mean something. Only stated when the
+    // schedule actually resolved — a count built on a missing feed would
+    // read as certainty.
+    var remainTxt = '';
+    if (!nf.known) {
+      remainTxt = 'Week ' + (nf.week || '?') + ' \u00b7 schedule not loaded';
+    } else if (nf.settled) {
+      remainTxt = 'Week ' + (nf.week || '?') + ' final \u00b7 all starters played';
+    } else {
+      var myLeft = nf.mine.left + nf.mine.live;
+      var opLeft = nf.theirs.left + nf.theirs.live;
+      remainTxt = myLeft + ' of yours left \u00b7 ' + opLeft + ' of theirs';
+      if (nf.mine.live || nf.theirs.live) {
+        remainTxt += ' \u00b7 ' + (nf.mine.live + nf.theirs.live) + ' on the field';
+      }
+      var unk = nf.mine.unknown + nf.theirs.unknown;
+      if (unk) remainTxt += ' \u00b7 ' + unk + ' unresolved';
+    }
+    noteHtml += '<div class="sk-wr-row-remain">' + skEscape(remainTxt) + '</div>';
+
+    // Forward-looking on a dead day. Tuesday through Saturday there is
+    // nothing behind you worth reporting, so point at the next kickoff.
+    if (nf.known && !nf.anyLive && nf.anyPre && nf.nextKick != null) {
+      var kl = _skWireKickLabel(nf.nextKick);
+      if (kl) noteHtml += '<div class="sk-wr-row-next">Next kick ' + skEscape(kl) + '</div>';
+    }
+  } else if (entry.nfl) {
+    // Week hasn't produced a score yet (or the opponent isn't resolved).
+    var nf2 = entry.nfl;
+    var pre = 'Week ' + (nf2.week || '?') + ' \u00b7 no scoring yet';
+    if (nf2.nextKick != null) {
+      var kl2 = _skWireKickLabel(nf2.nextKick);
+      if (kl2) pre += ' \u00b7 first kick ' + kl2;
+    }
+    noteHtml = '<div class="sk-wr-row-remain">' + skEscape(pre) + '</div>';
+  } else if (st === 'headpoint' && entry.myFp != null && entry.oppFp != null) {
     var diff = entry.myFp - entry.oppFp;
     var diffStr = (diff >= 0 ? '+' : '') + diff.toFixed(1);
     noteHtml = '<div class="sk-wr-row-score">' +
@@ -87586,7 +87830,13 @@ function _skBuildWireLeagueRowHTML(league, entry) {
   }
 
   var rowCls = 'sk-wr-row' + (entry.result === 'W' ? ' win' : entry.result === 'L' ? ' loss' : '');
-  return '<div class="' + rowCls + '" onclick="skOpenWireDetail(\'' + skEscape(league.league_key) + '\')" role="button" tabindex="0">' +
+  // ── WIRENFL ── The daily snapshot sheet has nothing to show a football
+  // league — there is no per-day breakdown behind it. Send the tap to the
+  // week lineup, which is the detail that actually exists.
+  var _tapFn = entry.isFootball
+    ? ('skOpenNflLineup(\'' + skEscape(league.league_key) + '\')')
+    : ('skOpenWireDetail(\'' + skEscape(league.league_key) + '\')');
+  return '<div class="' + rowCls + '" onclick="' + _tapFn + '" role="button" tabindex="0">' +
     '<div class="sk-wr-row-logo-wrap">' +
       (logoUrl ? '<img class="sk-wr-row-logo" src="' + skEscape(logoUrl) + '" alt="" onerror="this.style.display=\'none\'">' : '<div class="sk-wr-row-logo-ph"></div>') +
     '</div>' +
