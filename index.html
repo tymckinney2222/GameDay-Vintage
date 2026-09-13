@@ -18448,8 +18448,17 @@
     background: rgba(255,255,255,0.02);
   }
   .sk-probe-row.hit  { border-left-color: var(--sk-green); }
+  .sk-probe-row.weak { border-left-color: var(--sk-gold); }
   .sk-probe-row.miss { border-left-color: rgba(255,255,255,0.14); }
   .sk-probe-row.err  { border-left-color: var(--sk-red); }
+  .sk-probe-row.weak .sk-probe-verdict { color: var(--sk-gold); }
+  .sk-probe-hit .sc {
+    display: inline-block; min-width: 44px; text-align: center;
+    border-radius: 4px; padding: 0 3px; font-size: 8px; letter-spacing: 0.05em;
+    background: rgba(255,255,255,0.06); color: var(--sk-text-4);
+  }
+  .sk-probe-hit .sc.season { background: rgba(74,222,128,0.16); color: var(--sk-green); }
+  .sk-probe-hit .sc.week   { background: rgba(245,213,71,0.14); color: var(--sk-gold); }
   .sk-probe-lbl {
     font-size: 11.5px; font-weight: 700; color: var(--sk-text);
   }
@@ -115404,10 +115413,29 @@ function skRenderLabPanel() {
 var _skProbeState = { leagueKey: '', running: false, rows: [], done: false };
 
 // Walk any JSON and collect every key whose name mentions "proj", with the
-// dotted path to it and a short sample of the value.
+// dotted path to it, a short sample, and — the part that matters here — the
+// COVERAGE SCOPE of what was found.
+//
+// A weekly projection is not the thing we're asking about. A season simulator
+// needs a full-season number per player; a week-2 projection would have to be
+// re-fetched seventeen times and still wouldn't describe the season. Yahoo
+// stamps its stat nodes with coverage_type, so a hit is read as season-scoped
+// only when it says so. Anything that can't be established is reported as
+// unknown rather than counted as a win.
 function _skProbeScan(obj, maxHits) {
   var hits = [];
   var cap = maxHits || 12;
+  function scopeOf(v, path) {
+    var txt = '';
+    if (v && typeof v === 'object') {
+      try { txt = JSON.stringify(v); } catch (e) { txt = ''; }
+    }
+    if (/"coverage_type"\s*:\s*"season"/.test(txt)) return 'season';
+    if (/"coverage_type"\s*:\s*"(week|date)"/.test(txt)) return 'week';
+    if (/season/i.test(path) && !/week/i.test(path)) return 'season';
+    if (/week/i.test(path)) return 'week';
+    return 'unknown';
+  }
   function walk(node, path, depth) {
     if (hits.length >= cap || depth > 12 || node == null) return;
     if (typeof node !== 'object') return;
@@ -115419,9 +115447,10 @@ function _skProbeScan(obj, maxHits) {
         var sample;
         if (v == null) sample = 'null';
         else if (typeof v === 'object') {
-          try { sample = JSON.stringify(v).slice(0, 90); } catch (e) { sample = '[object]'; }
+          try { sample = JSON.stringify(v).slice(0, 110); } catch (e) { sample = '[object]'; }
         } else sample = String(v).slice(0, 60);
-        hits.push({ path: (path ? path + '.' : '') + k, sample: sample });
+        var full = (path ? path + '.' : '') + k;
+        hits.push({ path: full, sample: sample, scope: scopeOf(v, full) });
       }
       if (v && typeof v === 'object') walk(v, (path ? path + '.' : '') + k, depth + 1);
     }
@@ -115430,42 +115459,97 @@ function _skProbeScan(obj, maxHits) {
   return hits;
 }
 
-// The candidate paths. Ordered cheapest-and-most-likely first, and every one
-// is count-limited so a miss costs almost nothing.
-function _skProbePaths(lg, myTeamKey) {
+function _skProbeSeasonHits(hits) {
+  var n = 0;
+  for (var i = 0; i < (hits || []).length; i++) if (hits[i].scope === 'season') n++;
+  return n;
+}
+
+// Season-points and roto only. Those are the formats a season simulator is
+// worth building for — a H2H league is decided week by week, so a full-season
+// player number answers a question nobody asked there.
+function _skProbeLeagues() {
+  var all = (typeof fyLeagues !== 'undefined' && fyLeagues) ? fyLeagues : [];
+  var out = [];
+  for (var i = 0; i < all.length; i++) {
+    var st = String(all[i].scoring_type || '');
+    if (st === 'point' || st === 'roto') out.push(all[i]);
+  }
+  return out;
+}
+
+// Any weekly H2H league, used ONLY as the scanner control.
+//
+// The control's job is to prove the detector and the fetch/parse path work —
+// not to say anything about the league under test. team_projected_points is
+// weekly and lives on H2H leagues, so the control has to come from one even
+// though every subject request below is season-scoped. Running the control
+// against a season-points league would fail for the same reason the subject
+// might, and then prove nothing.
+function _skProbeControlLeague() {
+  var all = (typeof fyLeagues !== 'undefined' && fyLeagues) ? fyLeagues : [];
+  for (var i = 0; i < all.length; i++) {
+    var st = String(all[i].scoring_type || '');
+    if (st === 'head' || st === 'headone' || st === 'headpoint') return all[i];
+  }
+  return null;
+}
+
+// The candidate paths — all season-scoped. Every one is count-limited so a
+// miss costs almost nothing.
+function _skProbePaths(lg, myTeamKey, ctlLg, ctlTeamKey) {
   var k = lg.league_key;
-  var wk = lg.current_week || 1;
-  var list = [
-    { label: 'CONTROL \u00b7 team weekly stats',
-      path: '/team/' + (myTeamKey || (k + '.t.1')) + '/stats;type=week;week=' + wk,
-      control: true },
+  var season = String(lg.season || '');
+  var list = [];
+
+  if (ctlLg && ctlTeamKey) {
+    list.push({
+      label: 'CONTROL \u00b7 ' + (ctlLg.name || 'H2H league') + ' team week stats',
+      path: '/team/' + ctlTeamKey + '/stats;type=week;week=' + (ctlLg.current_week || 1),
+      control: true, ctlScope: 'week'
+    });
+  }
+
+  list.push(
     { label: 'league players \u00b7 season stats',
       path: '/league/' + k + '/players;start=0;count=3/stats;type=season' },
-    { label: 'league players \u00b7 week stats',
-      path: '/league/' + k + '/players;start=0;count=3/stats;type=week;week=' + wk },
-    { label: 'league players \u00b7 out=stats',
+    { label: 'league players \u00b7 season stats, explicit season',
+      path: '/league/' + k + '/players;start=0;count=3/stats;type=season' +
+            (season ? (';season=' + season) : '') },
+    { label: 'league players \u00b7 out=stats (league default coverage)',
       path: '/league/' + k + '/players;start=0;count=3;out=stats' },
-    { label: 'league players \u00b7 out=stats,ownership',
-      path: '/league/' + k + '/players;start=0;count=3;out=stats,ownership' },
-    { label: 'my roster \u00b7 players stats (week)',
-      path: '/team/' + (myTeamKey || (k + '.t.1')) + '/roster;week=' + wk + '/players/stats' }
-  ];
+    { label: 'league players \u00b7 out=stats,ownership,percent_owned',
+      path: '/league/' + k + '/players;start=0;count=3;out=stats,ownership,percent_owned' },
+    { label: 'my roster \u00b7 players season stats',
+      path: '/team/' + (myTeamKey || (k + '.t.1')) + '/roster/players/stats;type=season' },
+    { label: 'my team \u00b7 season stats',
+      path: '/team/' + (myTeamKey || (k + '.t.1')) + '/stats;type=season' }
+  );
   return list;
 }
 
 function skLabRenderProbe(el) {
-  var leagues = (typeof fyLeagues !== 'undefined' && fyLeagues) ? fyLeagues : [];
+  var leagues = _skProbeLeagues();
   if (!leagues.length) {
-    el.innerHTML = '<div class="sk-lab-blurb">No Yahoo leagues synced, so there\u2019s nothing to ask.</div>';
+    el.innerHTML = '<div class="sk-lab-blurb">No season-points or roto leagues synced. ' +
+      'Those are the only formats this asks about \u2014 a full-season player projection ' +
+      'doesn\u2019t decide anything in a week-by-week H2H league.</div>';
     return;
   }
-  if (!_skProbeState.leagueKey) _skProbeState.leagueKey = leagues[0].league_key;
+  var known = {};
+  for (var q = 0; q < leagues.length; q++) known[leagues[q].league_key] = 1;
+  if (!_skProbeState.leagueKey || !known[_skProbeState.leagueKey]) {
+    _skProbeState.leagueKey = leagues[0].league_key;
+  }
 
   var pills = leagues.map(function(l) {
     return '<button class="sk-probe-pill' +
       (l.league_key === _skProbeState.leagueKey ? ' on' : '') +
       '" onclick="skProbePick(\'' + skEscape(l.league_key) + '\')">' +
-      skEscape(l.name || l.league_key) + '</button>';
+      skEscape(l.name || l.league_key) +
+      ' <span style="opacity:0.6;">' +
+      (String(l.scoring_type) === 'roto' ? 'roto' : 'season pts') + '</span>' +
+      '</button>';
   }).join('');
 
   var body = '';
@@ -115473,19 +115557,25 @@ function skLabRenderProbe(el) {
     body = '<div class="sk-probe-note">Running \u2014 ' + _skProbeState.rows.length +
       ' of ' + _skProbeState.total + ' requests done\u2026</div>';
   } else if (!_skProbeState.done) {
-    body = '<div class="sk-probe-note">Asks Yahoo for player stats six ways and ' +
-      'scans every response for a field mentioning \u201cproj\u201d. Each request is ' +
-      'capped at three players, so a miss is cheap. The first row is a control ' +
-      'that is known to carry projections \u2014 if it comes back empty, the ' +
+    body = '<div class="sk-probe-note">Asks Yahoo for player stats six season-scoped ' +
+      'ways and scans every response for a field mentioning \u201cproj\u201d. Only ' +
+      'FULL-SEASON coverage counts \u2014 a weekly projection is reported separately, ' +
+      'because it would have to be re-fetched every week and still wouldn\u2019t ' +
+      'describe a season. The control row comes from a H2H league, which is where ' +
+      'the one projection field we know exists lives; if it comes back empty the ' +
       'scanner is broken and the rest of the run means nothing.</div>';
   }
 
   for (var i = 0; i < _skProbeState.rows.length; i++) {
     var r = _skProbeState.rows[i];
-    var cls = r.err ? 'err' : (r.hits.length ? 'hit' : 'miss');
-    var verdict = r.err ? ('FAILED \u00b7 ' + r.err)
-                : (r.hits.length ? (r.hits.length + ' projection field' +
-                    (r.hits.length === 1 ? '' : 's')) : 'nothing matching \u201cproj\u201d');
+    var seasonN = _skProbeSeasonHits(r.hits);
+    var cls = r.err ? 'err' : (seasonN ? 'hit' : (r.hits.length ? 'weak' : 'miss'));
+    var verdict;
+    if (r.err) verdict = 'FAILED \u00b7 ' + r.err;
+    else if (seasonN) verdict = seasonN + ' SEASON projection field' + (seasonN === 1 ? '' : 's');
+    else if (r.hits.length) verdict = r.hits.length + ' projection field' +
+      (r.hits.length === 1 ? '' : 's') + ', none season-scoped';
+    else verdict = 'nothing matching \u201cproj\u201d';
     body += '<div class="sk-probe-row ' + cls + '">' +
       '<div class="sk-probe-lbl">' + skEscape(r.label) +
         (r.control ? ' <span class="sk-probe-ctl">CONTROL</span>' : '') + '</div>' +
@@ -115493,36 +115583,51 @@ function skLabRenderProbe(el) {
       '<div class="sk-probe-verdict">' + skEscape(verdict) +
         (r.bytes ? (' \u00b7 ' + r.bytes + ' bytes') : '') + '</div>';
     for (var h = 0; h < r.hits.length; h++) {
-      body += '<div class="sk-probe-hit"><span class="k">' + skEscape(r.hits[h].path) +
+      body += '<div class="sk-probe-hit"><span class="sc ' + r.hits[h].scope + '">' +
+        r.hits[h].scope + '</span> <span class="k">' + skEscape(r.hits[h].path) +
         '</span> <span class="v">' + skEscape(r.hits[h].sample) + '</span></div>';
     }
     body += '</div>';
   }
 
   if (_skProbeState.done && !_skProbeState.running) {
-    var ctl = null, anyPlayer = false;
+    var ctl = null, anySeason = false, anyWeekOnly = false;
     for (var c = 0; c < _skProbeState.rows.length; c++) {
       var rr = _skProbeState.rows[c];
-      if (rr.control) ctl = rr;
-      else if (rr.hits.length) anyPlayer = true;
+      if (rr.control) { ctl = rr; continue; }
+      if (_skProbeSeasonHits(rr.hits)) anySeason = true;
+      else if (rr.hits.length) anyWeekOnly = true;
     }
     var summary;
-    if (ctl && !ctl.hits.length && !ctl.err) {
+    if (!ctl) {
+      summary = 'No H2H league is synced, so the scanner ran without a control. ' +
+        'A clean sweep below could mean Yahoo has nothing, or that the detector ' +
+        'is broken \u2014 this run can\u2019t tell those apart.';
+    } else if (ctl.err) {
+      summary = 'The control request failed, so this run is inconclusive \u2014 ' +
+        'nothing below can be trusted until it comes back clean.';
+    } else if (!ctl.hits.length) {
       summary = 'The control found nothing, so treat this whole run as inconclusive \u2014 ' +
         'the scanner or the path is wrong, not necessarily Yahoo.';
-    } else if (anyPlayer) {
-      summary = 'Player-level projections ARE reachable. The field paths above say where; ' +
-        'a simulator can fetch its inputs instead of modelling them.';
+    } else if (anySeason) {
+      summary = 'Full-season player projections ARE reachable. The season-tagged paths ' +
+        'above say where; a simulator can fetch its hardest input rather than model it.';
+    } else if (anyWeekOnly) {
+      summary = 'Control passed. Projections exist on players, but every one is ' +
+        'week-scoped \u2014 nothing full-season. A simulator would have to sum or ' +
+        'extrapolate weekly numbers, which is its own modelling problem.';
     } else {
-      summary = 'Control passed, no player request returned anything projection-shaped. ' +
-        'On this evidence the public API exposes projections at TEAM level only, ' +
-        'and a simulator has to build its own player numbers.';
+      summary = 'Control passed, and no player request returned anything ' +
+        'projection-shaped. On this evidence the public API carries projections at ' +
+        'TEAM level and weekly only, so a season simulator has to build its own ' +
+        'player numbers.';
     }
     body += '<div class="sk-probe-summary">' + skEscape(summary) + '</div>';
   }
 
   el.innerHTML =
-    '<div class="sk-lab-blurb">Does Yahoo\u2019s API hand out <strong>player projections</strong>?</div>' +
+    '<div class="sk-lab-blurb">Does Yahoo\u2019s API hand out <strong>full-season ' +
+      'player projections</strong>?</div>' +
     '<div class="sk-probe-pills">' + pills + '</div>' +
     '<button class="sk-probe-run" onclick="skProbeRun()"' +
       (_skProbeState.running ? ' disabled' : '') + '>' +
@@ -115539,27 +115644,33 @@ function skProbePick(key) {
   if (el) skLabRenderProbe(el);
 }
 
+function _skProbeTeamKeyFor(leagueKey) {
+  try {
+    if (typeof fyFullRosters !== 'undefined' && fyFullRosters) {
+      for (var r = 0; r < fyFullRosters.length; r++) {
+        if (fyFullRosters[r].leagueKey === leagueKey && fyFullRosters[r].myTeamKey) {
+          return fyFullRosters[r].myTeamKey;
+        }
+      }
+    }
+  } catch (e) {}
+  return '';
+}
+
 async function skProbeRun() {
   if (_skProbeState.running) return;
-  var leagues = (typeof fyLeagues !== 'undefined' && fyLeagues) ? fyLeagues : [];
+  var leagues = _skProbeLeagues();
   var lg = null;
   for (var i = 0; i < leagues.length; i++) {
     if (leagues[i].league_key === _skProbeState.leagueKey) lg = leagues[i];
   }
   if (!lg) return;
 
-  var myTeamKey = '';
-  try {
-    if (typeof fyFullRosters !== 'undefined' && fyFullRosters) {
-      for (var r = 0; r < fyFullRosters.length; r++) {
-        if (fyFullRosters[r].leagueKey === lg.league_key && fyFullRosters[r].myTeamKey) {
-          myTeamKey = fyFullRosters[r].myTeamKey; break;
-        }
-      }
-    }
-  } catch (e) {}
+  var myTeamKey = _skProbeTeamKeyFor(lg.league_key);
+  var ctlLg = _skProbeControlLeague();
+  var ctlTeamKey = ctlLg ? _skProbeTeamKeyFor(ctlLg.league_key) : '';
 
-  var paths = _skProbePaths(lg, myTeamKey);
+  var paths = _skProbePaths(lg, myTeamKey, ctlLg, ctlTeamKey);
   _skProbeState.running = true;
   _skProbeState.done = false;
   _skProbeState.rows = [];
