@@ -18452,6 +18452,16 @@
   .sk-probe-row.miss { border-left-color: rgba(255,255,255,0.14); }
   .sk-probe-row.err  { border-left-color: var(--sk-red); }
   .sk-probe-row.weak .sk-probe-verdict { color: var(--sk-gold); }
+  .sk-probe-body {
+    font-family: var(--sk-font-mono); font-size: 9px; line-height: 1.45;
+    color: var(--sk-text-3); background: rgba(255,255,255,0.04);
+    border-radius: 5px; padding: 5px 6px; margin-top: 4px;
+    word-break: break-word; white-space: pre-wrap;
+  }
+  .sk-probe-cov {
+    font-family: var(--sk-font-mono); font-size: 9px; color: var(--sk-gold);
+    margin-top: 4px; word-break: break-all;
+  }
   .sk-probe-hit .sc {
     display: inline-block; min-width: 44px; text-align: center;
     border-radius: 4px; padding: 0 3px; font-size: 8px; letter-spacing: 0.05em;
@@ -115430,7 +115440,7 @@ function _skProbeScan(obj, maxHits) {
     if (v && typeof v === 'object') {
       try { txt = JSON.stringify(v); } catch (e) { txt = ''; }
     }
-    if (/"coverage_type"\s*:\s*"season"/.test(txt)) return 'season';
+    if (/"coverage_type"\s*:\s*"[^"]*season[^"]*"/.test(txt)) return 'season';
     if (/"coverage_type"\s*:\s*"(week|date)"/.test(txt)) return 'week';
     if (/season/i.test(path) && !/week/i.test(path)) return 'season';
     if (/week/i.test(path)) return 'week';
@@ -115443,7 +115453,11 @@ function _skProbeScan(obj, maxHits) {
     for (var i = 0; i < keys.length && hits.length < cap; i++) {
       var k = keys[i];
       var v = node[k];
-      if (/proj/i.test(k)) {
+      // "proj" was too narrow. Yahoo's own app calls this view "Remaining
+      // Games (proj)", so the field it comes from may well be named for the
+      // remainder rather than the projection. ESPN calls the same idea
+      // "outlook". Cast wider; a false positive costs one dim line.
+      if (/proj|remain|outlook|forecast/i.test(k)) {
         var sample;
         if (v == null) sample = 'null';
         else if (typeof v === 'object') {
@@ -115457,6 +115471,31 @@ function _skProbeScan(obj, maxHits) {
   }
   walk(obj, '', 0);
   return hits;
+}
+
+// Every distinct coverage_type value in a response.
+//
+// This is the other half of the detector, and on reflection the more likely
+// one to find something. A projected stat line may well arrive in an ordinary
+// player_stats node that is simply STAMPED differently — coverage_type
+// "projected_season" or similar — in which case a key-name scan sails right
+// past it. Enumerating the values Yahoo actually returns says what vocabulary
+// exists, which is the thing worth knowing.
+function _skProbeCoverages(obj) {
+  var seen = {}, out = [];
+  function walk(node, depth) {
+    if (depth > 12 || node == null || typeof node !== 'object') return;
+    var keys = Object.keys(node);
+    for (var i = 0; i < keys.length; i++) {
+      var k = keys[i], v = node[k];
+      if (k === 'coverage_type' && typeof v === 'string' && !seen[v]) {
+        seen[v] = 1; out.push(v);
+      }
+      if (v && typeof v === 'object') walk(v, depth + 1);
+    }
+  }
+  walk(obj, 0);
+  return out;
 }
 
 function _skProbeSeasonHits(hits) {
@@ -115500,31 +115539,59 @@ function _skProbeControlLeague() {
 function _skProbePaths(lg, myTeamKey, ctlLg, ctlTeamKey) {
   var k = lg.league_key;
   var season = String(lg.season || '');
+  var tk = myTeamKey || (k + '.t.1');
   var list = [];
 
-  if (ctlLg && ctlTeamKey) {
+  if (ctlLg) {
     list.push({
       label: 'CONTROL \u00b7 ' + (ctlLg.name || 'H2H league') + ' team week stats',
-      path: '/team/' + ctlTeamKey + '/stats;type=week;week=' + (ctlLg.current_week || 1),
-      control: true, ctlScope: 'week'
+      path: '/team/' + (ctlTeamKey || (ctlLg.league_key + '.t.1')) +
+            '/stats;type=week;week=' + (ctlLg.current_week || 1),
+      control: true
     });
   }
 
   list.push(
     { label: 'league players \u00b7 season stats',
       path: '/league/' + k + '/players;start=0;count=3/stats;type=season' },
-    { label: 'league players \u00b7 season stats, explicit season',
-      path: '/league/' + k + '/players;start=0;count=3/stats;type=season' +
-            (season ? (';season=' + season) : '') },
-    { label: 'league players \u00b7 out=stats (league default coverage)',
-      path: '/league/' + k + '/players;start=0;count=3;out=stats' },
     { label: 'league players \u00b7 out=stats,ownership,percent_owned',
       path: '/league/' + k + '/players;start=0;count=3;out=stats,ownership,percent_owned' },
     { label: 'my roster \u00b7 players season stats',
-      path: '/team/' + (myTeamKey || (k + '.t.1')) + '/roster/players/stats;type=season' },
-    { label: 'my team \u00b7 season stats',
-      path: '/team/' + (myTeamKey || (k + '.t.1')) + '/stats;type=season' }
+      path: '/team/' + tk + '/roster/players/stats;type=season' }
   );
+
+  // ── Coverage-type guesses ── YPROBE2 ──
+  //
+  // The first run came back clean on every documented path, which only rules
+  // out the documented paths. Yahoo's app plainly HAS these numbers — the
+  // roto team page offers a "Remaining Games (proj)" view — so the question
+  // becomes what token that view asks for.
+  //
+  // These are guesses, and most will 400. That is the point: Yahoo's error
+  // body for a bad type token often names the values it WILL accept, which is
+  // worth more than another clean 200. The raw body is printed verbatim.
+  var guesses = ['projected_season', 'projected', 'remaining', 'rest_of_season',
+                 'season_remaining', 'projected_week'];
+  for (var gi = 0; gi < guesses.length; gi++) {
+    list.push({
+      label: 'guess \u00b7 type=' + guesses[gi],
+      path: '/league/' + k + '/players;start=0;count=2/stats;type=' + guesses[gi],
+      guess: true
+    });
+  }
+  list.push({
+    label: 'guess \u00b7 out=projected_stats',
+    path: '/league/' + k + '/players;start=0;count=2;out=projected_stats',
+    guess: true
+  });
+  if (season) {
+    list.push({
+      label: 'guess \u00b7 season stats, next season',
+      path: '/league/' + k + '/players;start=0;count=2/stats;type=season;season=' +
+            (parseInt(season, 10) + 1),
+      guess: true
+    });
+  }
   return list;
 }
 
@@ -115578,10 +115645,21 @@ function skLabRenderProbe(el) {
     else verdict = 'nothing matching \u201cproj\u201d';
     body += '<div class="sk-probe-row ' + cls + '">' +
       '<div class="sk-probe-lbl">' + skEscape(r.label) +
-        (r.control ? ' <span class="sk-probe-ctl">CONTROL</span>' : '') + '</div>' +
+        (r.control ? ' <span class="sk-probe-ctl">CONTROL</span>' : '') +
+        (r.guess ? ' <span class="sk-probe-ctl">GUESS</span>' : '') + '</div>' +
       '<div class="sk-probe-path">' + skEscape(r.path) + '</div>' +
       '<div class="sk-probe-verdict">' + skEscape(verdict) +
+        (r.status ? (' \u00b7 HTTP ' + r.status) : '') +
         (r.bytes ? (' \u00b7 ' + r.bytes + ' bytes') : '') + '</div>';
+    // YPROBE2 — Yahoo's own words, unedited. A rejected guess that names the
+    // valid tokens is a better result than a clean 200.
+    if (r.body) {
+      body += '<div class="sk-probe-body">' + skEscape(r.body) + '</div>';
+    }
+    if (r.coverages && r.coverages.length) {
+      body += '<div class="sk-probe-cov">coverage types seen: ' +
+        skEscape(r.coverages.join(', ')) + '</div>';
+    }
     for (var h = 0; h < r.hits.length; h++) {
       body += '<div class="sk-probe-hit"><span class="sc ' + r.hits[h].scope + '">' +
         r.hits[h].scope + '</span> <span class="k">' + skEscape(r.hits[h].path) +
@@ -115600,9 +115678,13 @@ function skLabRenderProbe(el) {
     }
     var summary;
     if (!ctl) {
-      summary = 'No H2H league is synced, so the scanner ran without a control. ' +
-        'A clean sweep below could mean Yahoo has nothing, or that the detector ' +
-        'is broken \u2014 this run can\u2019t tell those apart.';
+      // YPROBE2 — the old wording blamed a missing H2H league, but the control
+      // was actually being skipped whenever its team key hadn't loaded, which
+      // is a different problem with a different fix. It now falls back to
+      // team .t.1 and only disappears when there is genuinely no H2H league.
+      summary = 'No head-to-head league is synced, so the scanner ran without a ' +
+        'control. A clean sweep below could mean Yahoo has nothing, or that the ' +
+        'detector is broken \u2014 this run can\u2019t tell those apart.';
     } else if (ctl.err) {
       summary = 'The control request failed, so this run is inconclusive \u2014 ' +
         'nothing below can be trusted until it comes back clean.';
@@ -115680,14 +115762,22 @@ async function skProbeRun() {
 
   for (var p = 0; p < paths.length; p++) {
     var spec = paths[p];
-    var row = { label: spec.label, path: spec.path, control: !!spec.control, hits: [], err: '', bytes: 0 };
+    var row = { label: spec.label, path: spec.path, control: !!spec.control,
+                guess: !!spec.guess, hits: [], err: '', body: '', status: 0,
+                bytes: 0, coverages: [] };
     try {
       var data = await fyApi(spec.path);
       if (!data || data.error) {
         row.err = String((data && data.error) || 'no data');
+        // YPROBE2 — Yahoo's error body is the most informative thing a failed
+        // guess produces; a bad type token is often answered with the list of
+        // types it would have accepted. Keep it verbatim.
+        row.body = String((data && (data._body || '')) || '').slice(0, 300);
+        row.status = (data && data._status) || 0;
       } else {
         try { row.bytes = JSON.stringify(data).length; } catch (e2) {}
         row.hits = _skProbeScan(data, 12);
+        row.coverages = _skProbeCoverages(data);
       }
     } catch (e3) {
       row.err = String(e3 && e3.message || e3);
