@@ -18416,6 +18416,71 @@
   }
 
   /* Section intro + footnote — used at top/bottom of each panel */
+  /* ── YPROBE ── Lab probe panel ── */
+  .sk-probe-pills {
+    display: flex; flex-wrap: wrap; gap: 5px; margin: 8px 0 10px;
+  }
+  .sk-probe-pill {
+    font-family: var(--sk-font-mono); font-size: 9.5px;
+    background: rgba(255,255,255,0.04); color: var(--sk-text-3);
+    border: 1px solid var(--sk-border); border-radius: 20px;
+    padding: 4px 9px; cursor: pointer;
+    max-width: 150px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .sk-probe-pill.on {
+    background: var(--sk-gold); color: #14110a; border-color: var(--sk-gold);
+    font-weight: 700;
+  }
+  .sk-probe-run {
+    font-family: var(--sk-font-mono); font-size: 11px; font-weight: 800;
+    letter-spacing: 0.06em; width: 100%; padding: 9px;
+    background: rgba(245,213,71,0.12); color: var(--sk-gold);
+    border: 1px solid rgba(245,213,71,0.4); border-radius: 9px;
+    cursor: pointer; margin-bottom: 10px;
+  }
+  .sk-probe-run[disabled] { opacity: 0.5; }
+  .sk-probe-note {
+    font-size: 10.5px; line-height: 1.5; color: var(--sk-text-4); margin-bottom: 10px;
+  }
+  .sk-probe-row {
+    border: 1px solid var(--sk-border); border-left-width: 3px;
+    border-radius: 8px; padding: 7px 9px; margin-bottom: 6px;
+    background: rgba(255,255,255,0.02);
+  }
+  .sk-probe-row.hit  { border-left-color: var(--sk-green); }
+  .sk-probe-row.miss { border-left-color: rgba(255,255,255,0.14); }
+  .sk-probe-row.err  { border-left-color: var(--sk-red); }
+  .sk-probe-lbl {
+    font-size: 11.5px; font-weight: 700; color: var(--sk-text);
+  }
+  .sk-probe-ctl {
+    font-family: var(--sk-font-mono); font-size: 8px; letter-spacing: 0.08em;
+    background: rgba(255,255,255,0.07); border-radius: 4px; padding: 1px 4px;
+    color: var(--sk-text-3);
+  }
+  .sk-probe-path {
+    font-family: var(--sk-font-mono); font-size: 8.5px; color: var(--sk-text-4);
+    margin-top: 2px; word-break: break-all;
+  }
+  .sk-probe-verdict {
+    font-family: var(--sk-font-mono); font-size: 10px; color: var(--sk-text-2);
+    margin-top: 3px;
+  }
+  .sk-probe-row.hit .sk-probe-verdict { color: var(--sk-green); }
+  .sk-probe-row.err .sk-probe-verdict { color: var(--sk-red); }
+  .sk-probe-hit {
+    font-family: var(--sk-font-mono); font-size: 9px; margin-top: 3px;
+    padding-left: 6px; border-left: 1px solid rgba(255,255,255,0.08);
+    word-break: break-all;
+  }
+  .sk-probe-hit .k { color: var(--sk-gold); }
+  .sk-probe-hit .v { color: var(--sk-text-3); }
+  .sk-probe-summary {
+    font-size: 11px; line-height: 1.55; color: var(--sk-text-2);
+    background: rgba(255,255,255,0.03); border: 1px solid var(--sk-border);
+    border-radius: 9px; padding: 9px 10px; margin-top: 10px;
+  }
+
   .sk-lab-blurb {
     font-family: var(--sk-font-ui);
     font-size: 12.5px; line-height: 1.5;
@@ -115300,6 +115365,7 @@ function skBuildLabShellHTML() {
     tab('burns',      'Burns') +
     tab('cats',       'Cats') +
     tab('twostart',   '2 Start') +
+    tab('probe',      'Probe') +
     '</div>' +
     '<div id="skLabPanel"></div>';
 }
@@ -115313,7 +115379,220 @@ function skRenderLabPanel() {
   else if (t === 'burns') el.innerHTML = skLabRenderBurns();
   else if (t === 'cats')  skLabRenderCats(el); // async — manages its own innerHTML
   else if (t === 'twostart') skLabRenderTwoStart(el); // async — manages its own innerHTML
+  else if (t === 'probe') skLabRenderProbe(el);       // YPROBE — async
   el.scrollTop = 0;
+}
+
+// ─── PROBE ───────────────────────────────────────────────────────  YPROBE
+// Does Yahoo's API hand out PLAYER projections?
+//
+// Yahoo plainly has projections in its product — consensus blends plus the
+// Fantasy Plus tiers — but that says nothing about the public API, and the
+// answer decides whether a season simulator fetches its hardest input or has
+// to build it. Guessing either way is expensive, so ask.
+//
+// Two design choices worth stating:
+//
+//   1. The detector is a DEEP KEY SCAN for /proj/i, not a check for a node
+//      name I predicted. If I knew the field name there'd be nothing to
+//      probe. A scan finds it wherever Yahoo actually put it, and reports the
+//      path to it so we can read it directly afterwards.
+//   2. There is a CONTROL request — team weekly stats, which we already know
+//      carries projected_points (it's the PROJ column in the Guillotine
+//      board). If the control comes back clean, the scanner is broken and
+//      every other "not found" in the run is meaningless.
+var _skProbeState = { leagueKey: '', running: false, rows: [], done: false };
+
+// Walk any JSON and collect every key whose name mentions "proj", with the
+// dotted path to it and a short sample of the value.
+function _skProbeScan(obj, maxHits) {
+  var hits = [];
+  var cap = maxHits || 12;
+  function walk(node, path, depth) {
+    if (hits.length >= cap || depth > 12 || node == null) return;
+    if (typeof node !== 'object') return;
+    var keys = Object.keys(node);
+    for (var i = 0; i < keys.length && hits.length < cap; i++) {
+      var k = keys[i];
+      var v = node[k];
+      if (/proj/i.test(k)) {
+        var sample;
+        if (v == null) sample = 'null';
+        else if (typeof v === 'object') {
+          try { sample = JSON.stringify(v).slice(0, 90); } catch (e) { sample = '[object]'; }
+        } else sample = String(v).slice(0, 60);
+        hits.push({ path: (path ? path + '.' : '') + k, sample: sample });
+      }
+      if (v && typeof v === 'object') walk(v, (path ? path + '.' : '') + k, depth + 1);
+    }
+  }
+  walk(obj, '', 0);
+  return hits;
+}
+
+// The candidate paths. Ordered cheapest-and-most-likely first, and every one
+// is count-limited so a miss costs almost nothing.
+function _skProbePaths(lg, myTeamKey) {
+  var k = lg.league_key;
+  var wk = lg.current_week || 1;
+  var list = [
+    { label: 'CONTROL \u00b7 team weekly stats',
+      path: '/team/' + (myTeamKey || (k + '.t.1')) + '/stats;type=week;week=' + wk,
+      control: true },
+    { label: 'league players \u00b7 season stats',
+      path: '/league/' + k + '/players;start=0;count=3/stats;type=season' },
+    { label: 'league players \u00b7 week stats',
+      path: '/league/' + k + '/players;start=0;count=3/stats;type=week;week=' + wk },
+    { label: 'league players \u00b7 out=stats',
+      path: '/league/' + k + '/players;start=0;count=3;out=stats' },
+    { label: 'league players \u00b7 out=stats,ownership',
+      path: '/league/' + k + '/players;start=0;count=3;out=stats,ownership' },
+    { label: 'my roster \u00b7 players stats (week)',
+      path: '/team/' + (myTeamKey || (k + '.t.1')) + '/roster;week=' + wk + '/players/stats' }
+  ];
+  return list;
+}
+
+function skLabRenderProbe(el) {
+  var leagues = (typeof fyLeagues !== 'undefined' && fyLeagues) ? fyLeagues : [];
+  if (!leagues.length) {
+    el.innerHTML = '<div class="sk-lab-blurb">No Yahoo leagues synced, so there\u2019s nothing to ask.</div>';
+    return;
+  }
+  if (!_skProbeState.leagueKey) _skProbeState.leagueKey = leagues[0].league_key;
+
+  var pills = leagues.map(function(l) {
+    return '<button class="sk-probe-pill' +
+      (l.league_key === _skProbeState.leagueKey ? ' on' : '') +
+      '" onclick="skProbePick(\'' + skEscape(l.league_key) + '\')">' +
+      skEscape(l.name || l.league_key) + '</button>';
+  }).join('');
+
+  var body = '';
+  if (_skProbeState.running) {
+    body = '<div class="sk-probe-note">Running \u2014 ' + _skProbeState.rows.length +
+      ' of ' + _skProbeState.total + ' requests done\u2026</div>';
+  } else if (!_skProbeState.done) {
+    body = '<div class="sk-probe-note">Asks Yahoo for player stats six ways and ' +
+      'scans every response for a field mentioning \u201cproj\u201d. Each request is ' +
+      'capped at three players, so a miss is cheap. The first row is a control ' +
+      'that is known to carry projections \u2014 if it comes back empty, the ' +
+      'scanner is broken and the rest of the run means nothing.</div>';
+  }
+
+  for (var i = 0; i < _skProbeState.rows.length; i++) {
+    var r = _skProbeState.rows[i];
+    var cls = r.err ? 'err' : (r.hits.length ? 'hit' : 'miss');
+    var verdict = r.err ? ('FAILED \u00b7 ' + r.err)
+                : (r.hits.length ? (r.hits.length + ' projection field' +
+                    (r.hits.length === 1 ? '' : 's')) : 'nothing matching \u201cproj\u201d');
+    body += '<div class="sk-probe-row ' + cls + '">' +
+      '<div class="sk-probe-lbl">' + skEscape(r.label) +
+        (r.control ? ' <span class="sk-probe-ctl">CONTROL</span>' : '') + '</div>' +
+      '<div class="sk-probe-path">' + skEscape(r.path) + '</div>' +
+      '<div class="sk-probe-verdict">' + skEscape(verdict) +
+        (r.bytes ? (' \u00b7 ' + r.bytes + ' bytes') : '') + '</div>';
+    for (var h = 0; h < r.hits.length; h++) {
+      body += '<div class="sk-probe-hit"><span class="k">' + skEscape(r.hits[h].path) +
+        '</span> <span class="v">' + skEscape(r.hits[h].sample) + '</span></div>';
+    }
+    body += '</div>';
+  }
+
+  if (_skProbeState.done && !_skProbeState.running) {
+    var ctl = null, anyPlayer = false;
+    for (var c = 0; c < _skProbeState.rows.length; c++) {
+      var rr = _skProbeState.rows[c];
+      if (rr.control) ctl = rr;
+      else if (rr.hits.length) anyPlayer = true;
+    }
+    var summary;
+    if (ctl && !ctl.hits.length && !ctl.err) {
+      summary = 'The control found nothing, so treat this whole run as inconclusive \u2014 ' +
+        'the scanner or the path is wrong, not necessarily Yahoo.';
+    } else if (anyPlayer) {
+      summary = 'Player-level projections ARE reachable. The field paths above say where; ' +
+        'a simulator can fetch its inputs instead of modelling them.';
+    } else {
+      summary = 'Control passed, no player request returned anything projection-shaped. ' +
+        'On this evidence the public API exposes projections at TEAM level only, ' +
+        'and a simulator has to build its own player numbers.';
+    }
+    body += '<div class="sk-probe-summary">' + skEscape(summary) + '</div>';
+  }
+
+  el.innerHTML =
+    '<div class="sk-lab-blurb">Does Yahoo\u2019s API hand out <strong>player projections</strong>?</div>' +
+    '<div class="sk-probe-pills">' + pills + '</div>' +
+    '<button class="sk-probe-run" onclick="skProbeRun()"' +
+      (_skProbeState.running ? ' disabled' : '') + '>' +
+      (_skProbeState.running ? 'Running\u2026' : 'Run probe') + '</button>' +
+    body;
+}
+
+function skProbePick(key) {
+  if (_skProbeState.running) return;
+  _skProbeState.leagueKey = key;
+  _skProbeState.rows = [];
+  _skProbeState.done = false;
+  var el = document.getElementById('skLabPanel');
+  if (el) skLabRenderProbe(el);
+}
+
+async function skProbeRun() {
+  if (_skProbeState.running) return;
+  var leagues = (typeof fyLeagues !== 'undefined' && fyLeagues) ? fyLeagues : [];
+  var lg = null;
+  for (var i = 0; i < leagues.length; i++) {
+    if (leagues[i].league_key === _skProbeState.leagueKey) lg = leagues[i];
+  }
+  if (!lg) return;
+
+  var myTeamKey = '';
+  try {
+    if (typeof fyFullRosters !== 'undefined' && fyFullRosters) {
+      for (var r = 0; r < fyFullRosters.length; r++) {
+        if (fyFullRosters[r].leagueKey === lg.league_key && fyFullRosters[r].myTeamKey) {
+          myTeamKey = fyFullRosters[r].myTeamKey; break;
+        }
+      }
+    }
+  } catch (e) {}
+
+  var paths = _skProbePaths(lg, myTeamKey);
+  _skProbeState.running = true;
+  _skProbeState.done = false;
+  _skProbeState.rows = [];
+  _skProbeState.total = paths.length;
+  var panel = document.getElementById('skLabPanel');
+  if (panel) skLabRenderProbe(panel);
+
+  for (var p = 0; p < paths.length; p++) {
+    var spec = paths[p];
+    var row = { label: spec.label, path: spec.path, control: !!spec.control, hits: [], err: '', bytes: 0 };
+    try {
+      var data = await fyApi(spec.path);
+      if (!data || data.error) {
+        row.err = String((data && data.error) || 'no data');
+      } else {
+        try { row.bytes = JSON.stringify(data).length; } catch (e2) {}
+        row.hits = _skProbeScan(data, 12);
+      }
+    } catch (e3) {
+      row.err = String(e3 && e3.message || e3);
+    }
+    _skProbeState.rows.push(row);
+    panel = document.getElementById('skLabPanel');
+    if (panel) skLabRenderProbe(panel);
+    // Paced, same as the roster lanes — six quick calls shouldn't look like
+    // a burst to the Worker.
+    await new Promise(function(res) { setTimeout(res, 250); });
+  }
+
+  _skProbeState.running = false;
+  _skProbeState.done = true;
+  panel = document.getElementById('skLabPanel');
+  if (panel) skLabRenderProbe(panel);
 }
 
 // ─── ROSTERED ────────────────────────────────────────────────────
