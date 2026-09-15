@@ -112421,8 +112421,27 @@ function _skOpenNflH2hModal(idx) {
 // { playerKey: { week:number → fp:number } }. Yahoo returns player_points as
 // either a single object (one week) or a numeric-keyed array (many weeks); we
 // normalize both via _yahooArr.
-function _skParseNflWeeklyPoints(data) {
+// ── NFLGLWEEKS3 ── Why this kept coming back empty.
+//
+// The diagnostic settled it: Yahoo returns the week, two players parse, and
+// player_points is present — yet no value landed. Two reasons, both in here:
+//
+//   1. The player node is not always an ARRAY. Yahoo hands these back as an
+//      object with numeric string keys about as often as a real array, and
+//      the old scan walked j < p.length. On an object, p.length is
+//      undefined, the loop never runs, and the player still registers because
+//      its key was read from p[0] separately. Two players parsed, zero weeks —
+//      exactly what the panel showed.
+//   2. A week-scoped player_points node doesn't reliably carry a week. It is
+//      redundant there — the request named the week — so requiring it threw
+//      away perfectly good totals.
+//
+// Fixed at the root: normalise through _yahooArr, and accept a total on its
+// own, attributing it to the week that was asked for.
+function _skParseNflWeeklyPoints(data, fallbackWeek) {
   var out = {};
+  var fbWk = parseInt(fallbackWeek, 10);
+  if (isNaN(fbWk)) fbWk = 0;
   try {
     var league = data && data.fantasy_content && data.fantasy_content.league;
     if (!league) return out;
@@ -112436,7 +112455,10 @@ function _skParseNflWeeklyPoints(data) {
     for (var i = 0; i < count; i++) {
       var p = playersObj[i] && playersObj[i].player;
       if (!p) continue;
-      var meta = Array.isArray(p[0]) ? p[0] : [];
+      var parts = _yahooArr(p);          // array OR numeric-keyed object
+      if (!parts.length && Array.isArray(p)) parts = p;
+      var meta = _yahooArr(parts[0]);
+      if (!meta.length && Array.isArray(parts[0])) meta = parts[0];
       var key = '';
       for (var m = 0; m < meta.length; m++) {
         var x = meta[m];
@@ -112444,27 +112466,29 @@ function _skParseNflWeeklyPoints(data) {
       }
       if (!key) continue;
       var weeks = {};
-      // The stats bags live in p[1..]; the one we want carries player_points.
-      for (var j = 1; j < p.length; j++) {
-        var bag = p[j];
+      for (var j = 1; j < parts.length; j++) {
+        var bag = parts[j];
         if (!bag || typeof bag !== 'object') continue;
         if (bag.player_points == null) continue;
         var pp = bag.player_points;
-        // Single-week: { week, total }. Multi-week: { 0:{week,total}, 1:{…}, count }.
-        if (pp.total != null && pp.week != null) {
+        // Single-week: { week, total } — or just { total } when the request
+        // already named the week. Multi-week: { 0:{…}, 1:{…}, count }.
+        if (pp.total != null) {
           var wk1 = parseInt(pp.week, 10);
+          if (isNaN(wk1)) wk1 = fbWk;
           var tot1 = parseFloat(pp.total);
-          if (!isNaN(wk1) && !isNaN(tot1)) weeks[wk1] = tot1;
-        } else {
-          var arr = _yahooArr(pp);
-          arr.forEach(function(entry) {
-            if (!entry) return;
-            var node = entry.player_points ? entry.player_points : entry;
-            var wk = parseInt(node.week, 10);
-            var tot = parseFloat(node.total);
-            if (!isNaN(wk) && !isNaN(tot)) weeks[wk] = tot;
-          });
+          if (wk1 > 0 && !isNaN(tot1)) weeks[wk1] = tot1;
         }
+        var arr = _yahooArr(pp);
+        arr.forEach(function(entry) {
+          if (!entry) return;
+          var node = entry.player_points ? entry.player_points : entry;
+          if (node.total == null) return;
+          var wk = parseInt(node.week, 10);
+          if (isNaN(wk)) wk = fbWk;
+          var tot = parseFloat(node.total);
+          if (wk > 0 && !isNaN(tot)) weeks[wk] = tot;
+        });
       }
       out[key] = weeks;
     }
@@ -112566,7 +112590,7 @@ function _skFetchNflWeekLog(leagueKey, keys, startWk, endWk, currentWk) {
         try { d.bytes = JSON.stringify(data).length; } catch (e0) {}
         try { d.sawPoints = /"player_points"/.test(JSON.stringify(data)); } catch (e1) {}
       }
-      var parsed = (data && !data.error) ? _skParseNflWeeklyPoints(data) : {};
+      var parsed = (data && !data.error) ? _skParseNflWeeklyPoints(data, wk) : {};
       d.players = Object.keys(parsed).length;
       for (var q = 0; q < keys.length; q++) {
         var pk = keys[q];
