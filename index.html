@@ -24204,6 +24204,19 @@
     text-align: center; margin: 14px 0 8px;
   }
   .sk-gl-loading { display: flex; justify-content: center; padding: 20px 0; }
+  /* NFLGLWEEKS2 — shown only when no week resolved. */
+  .sk-gl-diag {
+    margin-top: 10px; padding: 8px 9px; border-radius: 8px;
+    border: 1px solid rgba(248,113,113,0.25); background: rgba(248,113,113,0.05);
+  }
+  .sk-gl-diag-head {
+    font-family: var(--sk-font-mono); font-size: 8.5px; letter-spacing: 0.09em;
+    color: var(--sk-red); margin-bottom: 4px;
+  }
+  .sk-gl-diag-row {
+    font-family: var(--sk-font-mono); font-size: 8.5px; line-height: 1.5;
+    color: var(--sk-text-3); word-break: break-all;
+  }
   .sk-gl-empty {
     text-align: center; font-size: 11px; color: var(--sk-text-3);
     font-style: italic; padding: 14px 0;
@@ -112471,8 +112484,12 @@ function _skParseNflWeeklyPoints(data) {
 // more requests, so the cache does the heavy lifting: a COMPLETED week's Fan
 // Pts never change, so it's written to localStorage per player and never
 // fetched again. Only the current week is refetched, and only on a short TTL.
-var _skNflWkMem = {};        // "lg|player|wk" -> number | null
-var _SK_NFL_WK_LS = 'sk_nflwk_';
+var _skNflWkMem = {};        // "lg|player|wk" -> { v, ts }
+// v2: the previous version persisted NULLS, which was a mistake — a week that
+// failed to fetch got written to disk as "no data" and was never asked for
+// again, so any later fix would have been masked by the cache. The prefix
+// change abandons anything written under the old scheme. NFLGLWEEKS2
+var _SK_NFL_WK_LS = 'sk_nflwk2_';
 
 function _skNflWkCacheGet(lg, pk, wk, isCurrent) {
   var k = lg + '|' + pk + '|' + wk;
@@ -112481,22 +112498,24 @@ function _skNflWkCacheGet(lg, pk, wk, isCurrent) {
   if (isCurrent) return undefined;
   try {
     var raw = localStorage.getItem(_SK_NFL_WK_LS + k);
-    if (raw != null) {
-      var v = (raw === '') ? null : parseFloat(raw);
-      var e = { v: (raw === '' || isNaN(v)) ? null : v, ts: Date.now() };
-      _skNflWkMem[k] = e;
-      return e;
+    if (raw != null && raw !== '') {
+      var v = parseFloat(raw);
+      if (!isNaN(v)) {
+        var e = { v: v, ts: Date.now() };
+        _skNflWkMem[k] = e;
+        return e;
+      }
     }
   } catch (e2) {}
   return undefined;
 }
 function _skNflWkCacheSet(lg, pk, wk, val, isCurrent) {
   var k = lg + '|' + pk + '|' + wk;
+  // A miss is held for the session so one open doesn't re-ask seventeen
+  // times, but it is never written to disk. Only a real number is durable.
   _skNflWkMem[k] = { v: val, ts: Date.now() };
-  // A week still being played will change; only settled weeks are durable.
-  if (isCurrent) return;
-  try { localStorage.setItem(_SK_NFL_WK_LS + k, (val == null) ? '' : String(val)); }
-  catch (e) {}
+  if (isCurrent || val == null) return;
+  try { localStorage.setItem(_SK_NFL_WK_LS + k, String(val)); } catch (e) {}
 }
 
 // Fetch weekly Fan Pts for the given player_keys across [startWk..endWk].
@@ -112521,9 +112540,17 @@ function _skFetchNflWeekLog(leagueKey, keys, startWk, endWk, currentWk) {
     }
     if (missing) need.push(w);
   }
-  if (!need.length) return Promise.resolve({ byPlayer: byPlayer });
+  if (!need.length) return Promise.resolve({ byPlayer: byPlayer, diag: [] });
 
-  // Three at a time — the same lane width the roster fetches use.
+  // ── NFLGLWEEKS2 ── What came back, recorded.
+  //
+  // Two attempts at this have now failed silently — first the repeated
+  // ;week=N form, then the per-week form — and both times the only evidence
+  // was an em-dash. That isn't enough to reason from. Each request keeps its
+  // URL, status, size and whether any player_points node appeared, and the
+  // panel prints it when nothing resolves. Cheap, and it turns the next fix
+  // into a reading rather than a third guess.
+  var diag = [];
   var idx = 0;
   function worker() {
     if (idx >= need.length) return Promise.resolve();
@@ -112531,23 +112558,36 @@ function _skFetchNflWeekLog(leagueKey, keys, startWk, endWk, currentWk) {
     var isCur = (wk === cur);
     var url = '/league/' + leagueKey + '/players;player_keys=' + keys.join(',') +
       '/stats;type=week;week=' + wk;
+    var d = { wk: wk, url: url, err: '', bytes: 0, players: 0, sawPoints: false };
     return fyApi(url).then(function(data) {
+      if (!data || data.error) {
+        d.err = String((data && data.error) || 'no data');
+      } else {
+        try { d.bytes = JSON.stringify(data).length; } catch (e0) {}
+        try { d.sawPoints = /"player_points"/.test(JSON.stringify(data)); } catch (e1) {}
+      }
       var parsed = (data && !data.error) ? _skParseNflWeeklyPoints(data) : {};
+      d.players = Object.keys(parsed).length;
       for (var q = 0; q < keys.length; q++) {
         var pk = keys[q];
         var wks = parsed[pk] || {};
         var val = (wks[wk] != null) ? wks[wk] : null;
-        // A null is cached too, and deliberately: a bye or an unplayed week
-        // is a real answer, and re-asking for it on every open would spend
-        // seventeen requests to relearn the same nothing.
         _skNflWkCacheSet(leagueKey, pk, wk, val, isCur);
         if (val != null) byPlayer[pk][wk] = val;
       }
-    }).catch(function() {}).then(worker);
+    }).catch(function(e) {
+      d.err = String((e && e.message) || e || 'threw');
+    }).then(function() {
+      diag.push(d);
+      return worker();
+    });
   }
   var lanes = [];
   for (i = 0; i < Math.min(3, need.length); i++) lanes.push(worker());
-  return Promise.all(lanes).then(function() { return { byPlayer: byPlayer }; });
+  return Promise.all(lanes).then(function() {
+    diag.sort(function(a, b) { return a.wk - b.wk; });
+    return { byPlayer: byPlayer, diag: diag };
+  });
 }
 
 // Render the side-by-side weekly Fan Pts table into the compare modal.
@@ -112582,13 +112622,48 @@ function _skRenderNflGameLog(pair, st) {
     var byP = (entry && entry.byPlayer) || {};
     var myWeeks = (myKey && byP[myKey]) || {};
     var opWeeks = (opKey && byP[opKey]) || {};
-    wrap.innerHTML = _skBuildNflGameLogHTML(myPl, myWeeks, opPl, opWeeks, startWk, endWk, st);
+    wrap.innerHTML = _skBuildNflGameLogHTML(myPl, myWeeks, opPl, opWeeks, startWk, endWk, st) +
+      _skNflGameLogDiagHTML(entry, myWeeks, opWeeks, keys);   // NFLGLWEEKS2
   }).catch(function() {
     var live = document.getElementById('skNflCompareBody');
     if (!live || !live.contains(wrap)) return;
     wrap.innerHTML = '<div class="sk-gl-head">WEEKLY FAN PTS</div>' +
       '<div class="sk-gl-empty">Couldn\u2019t load game log.</div>';
   });
+}
+
+// ── NFLGLWEEKS2 ── Printed only when the grid resolved nothing.
+//
+// A silent em-dash is what made the last two attempts unfixable from a
+// screenshot. When no week came back with a value, say what was asked and
+// what arrived — the request, the status, the payload size, and whether the
+// response contained a player_points node at all. That last flag separates
+// "Yahoo returned nothing" from "Yahoo returned it and the parser missed it",
+// which are different bugs with different fixes.
+function _skNflGameLogDiagHTML(entry, myWeeks, opWeeks, keys) {
+  var diag = (entry && entry.diag) || [];
+  if (!diag.length) return '';
+  var any = false, w;
+  for (w in myWeeks) { if (myWeeks.hasOwnProperty(w)) any = true; }
+  for (w in opWeeks) { if (opWeeks.hasOwnProperty(w)) any = true; }
+  if (any) return '';   // it worked — no need to explain anything
+
+  var rows = '';
+  for (var i = 0; i < diag.length && i < 6; i++) {
+    var d = diag[i];
+    rows += '<div class="sk-gl-diag-row">wk ' + d.wk + ' \u00b7 ' +
+      (d.err ? ('FAILED: ' + skEscape(d.err))
+             : (d.bytes + ' bytes \u00b7 ' + d.players + ' player' +
+                (d.players === 1 ? '' : 's') + ' parsed \u00b7 player_points ' +
+                (d.sawPoints ? 'present' : 'absent'))) +
+      '</div>';
+  }
+  return '<div class="sk-gl-diag">' +
+    '<div class="sk-gl-diag-head">NO WEEKLY DATA CAME BACK</div>' +
+    '<div class="sk-gl-diag-row">keys: ' + skEscape((keys || []).join(', ') || '(none)') + '</div>' +
+    '<div class="sk-gl-diag-row">' + skEscape(diag[0] ? diag[0].url : '') + '</div>' +
+    rows +
+  '</div>';
 }
 
 // Build the two-column (mine | week | opp) weekly table HTML. Byes and future/
