@@ -134450,6 +134450,22 @@ function mrWeekResult(row) {
 // addressed, just not by pretending one number is another. MGRREC5
 function mrYahooSeason() {
   var out = {}, pending = 0, needCats = [];
+  // ── MGRLEAGUES ── Per-league rows alongside the sport totals.
+  //
+  // This only ever returned aggregates, so the sport sections could show a
+  // platform line and nothing beneath it — a Yahoo baseball row of 108-42-3
+  // with no way to see which league contributed what. The external providers
+  // already kept a detail list per league; Yahoo didn't, which is why it
+  // was the one platform that couldn't be broken out. Totals are unchanged;
+  // this is an addition.
+  var rows = {};                       // sport -> [{name, w, l, t, key}]
+  function addRow(sport, lg, w, l, t, pendingRow) {
+    if (!rows[sport]) rows[sport] = [];
+    rows[sport].push({
+      name: (lg.name || lg.league_key || ''), key: lg.league_key,
+      w: w, l: l, t: t, pending: !!pendingRow
+    });
+  }
   var leagues = [];
   try {
     if (typeof _ppLeagues === 'function') {
@@ -134479,9 +134495,10 @@ function mrYahooSeason() {
       var ld = (typeof skLeagueData === 'object' && skLeagueData)
         ? (skLeagueData[lg.league_key] || {}) : {};
       var rec = _mrParseRec(ld.team && ld.team.record);
-      if (!rec) { pending++; continue; }
+      if (!rec) { pending++; addRow(sport, lg, null, null, null, true); continue; }
       out[sport].w += rec.w; out[sport].l += rec.l; out[sport].t += rec.t;
       out[sport].n++;
+      addRow(sport, lg, rec.w, rec.l, rec.t, false);
       continue;
     }
 
@@ -134492,12 +134509,14 @@ function mrYahooSeason() {
     if (tally && !tally.missing) {
       out[sport].w += tally.wins; out[sport].l += tally.losses; out[sport].t += tally.ties;
       out[sport].n++;
+      addRow(sport, lg, tally.wins, tally.losses, tally.ties, false);
     } else {
       pending++;
       needCats.push(lg);
+      addRow(sport, lg, null, null, null, true);
     }
   }
-  return { bySport: out, pending: pending, needCats: needCats };
+  return { bySport: out, rows: rows, pending: pending, needCats: needCats };
 }
 
 // Fetch only the cats leagues that still lack a weekly tally. Bounded at
@@ -134522,6 +134541,18 @@ function mrHydrateCats(list) {
     }
   }
   pump();
+}
+
+// Win% for a "W-L-T" string, ties counting a half. MGRLEAGUES
+// Returns '' rather than .000 when there's nothing played — an empty cell
+// reads as "no games yet", a zero reads as "lost them all".
+function _mrRowPct(rec) {
+  var m = /^(\d+)-(\d+)(?:-(\d+))?$/.exec(String(rec || '').trim());
+  if (!m) return '';
+  var w = parseInt(m[1], 10), l = parseInt(m[2], 10), t = parseInt(m[3] || '0', 10);
+  var g = w + l + t;
+  if (!g) return '';
+  return ((w + t / 2) / g).toFixed(3).replace(/^0/, '');
 }
 
 function _mrBlank() {
@@ -134573,6 +134604,21 @@ function mrCollect() {
         var yr = ys.bySport[sk2];
         if (yr) {
           b.sw += yr.w; b.sl += yr.l; b.st += yr.t; b.recLeagues += yr.n;
+        }
+        // MGRLEAGUES — same per-league shape the external providers push, so
+        // the renderer needs one code path rather than a Yahoo special case.
+        var yrows = (ys.rows && ys.rows[sk2]) || [];
+        if (yrows.length) {
+          if (!b.detail) b.detail = [];
+          for (var _yr = 0; _yr < yrows.length; _yr++) {
+            var _y = yrows[_yr];
+            b.detail.push({
+              name: _y.name, key: _y.key, fmt: '', auto: true,
+              rec: _y.pending ? '\u2014' : (_y.w + '-' + _y.l + '-' + _y.t),
+              src: _y.pending ? 'loading' : 'yahoo',
+              n: 0, weeks: null, raw: '', week: '\u2014'
+            });
+          }
         }
       }
       // Season-points and roto placings — the piece the Yahoo branch never
@@ -135261,6 +135307,36 @@ function mrRenderBody() {
           'font-size:12.5px;color:' + (st.weekLeagues ? '#4ade80' : 'rgba(255,255,255,0.25)') + ';">' +
           (st.weekLeagues ? _mrRec(st, true) : '\u2014') + '</span>' +
       '</div>';
+
+      // ── MGRLEAGUES ── Every league on that platform, named, underneath it.
+      //
+      // The platform line answers "how am I doing on Yahoo baseball", which
+      // averages a league you're winning with one you're losing and shows
+      // neither. Same change the Season points table got: keep the rollup,
+      // add the leagues that produced it.
+      var det = st.detail || [];
+      for (var d2 = 0; d2 < det.length; d2++) {
+        var dl = det[d2];
+        var recTxt = dl.rec || '\u2014';
+        var isPre = !!dl.pre || recTxt === '\u2014';
+        h += '<div style="display:flex;align-items:center;padding:3px 0 3px 10px;' +
+          'border-bottom:1px solid rgba(255,255,255,0.04);">' +
+          '<span style="flex:1;min-width:0;font-size:11px;color:rgba(255,255,255,0.72);' +
+            'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' +
+            slEsc(dl.name || 'Unnamed league') + '</span>' +
+          '<span style="flex:0 0 44px;text-align:right;font-family:var(--sk-font-mono,monospace);' +
+            'font-size:10px;color:rgba(255,255,255,0.35);">' +
+            slEsc(_mrRowPct(recTxt)) + '</span>' +
+          '<span style="flex:0 0 78px;text-align:right;font-family:var(--sk-font-mono,monospace);' +
+            'font-size:11px;color:' +
+            (isPre ? 'rgba(255,255,255,0.3)' : 'rgba(255,255,255,0.85)') + ';">' +
+            slEsc(recTxt) + '</span>' +
+          '<span style="flex:0 0 62px;text-align:right;font-family:var(--sk-font-mono,monospace);' +
+            'font-size:11px;color:' +
+            (dl.week && dl.week !== '\u2014' ? '#4ade80' : 'rgba(255,255,255,0.25)') + ';">' +
+            slEsc(dl.week || '\u2014') + '</span>' +
+        '</div>';
+      }
     }
 
     h += '<div style="display:flex;align-items:center;padding:8px 0 0;">' +
