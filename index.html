@@ -112403,8 +112403,6 @@ function _skOpenNflH2hModal(idx) {
 // call and render a side-by-side Week / FP table into the compare modal.
 // Projected points are NOT exposed per-player by Yahoo's API, so this shows
 // actual Fan Pts only.
-var _skNflWeekLogCache = {};   // "leagueKey|startWk-endWk|k1,k2" → { byPlayer }
-var _skNflWeekLogInflight = {};
 
 // Parse a multi-week /players;.../stats;type=week;week=A;week=B… response into
 // { playerKey: { week:number → fp:number } }. Yahoo returns player_points as
@@ -112461,33 +112459,95 @@ function _skParseNflWeeklyPoints(data) {
   return out;
 }
 
-// Fetch weekly Fan Pts for the given player_keys across [startWk..endWk] in a
-// single batched Yahoo call. Cached per league+range+keys. Returns
-// { byPlayer: { key: { week:fp } } }.
-function _skFetchNflWeekLog(leagueKey, keys, startWk, endWk) {
+// ── NFLGLWEEKS ── Weekly Fan Pts, one request per week.
+//
+// This used to ask for every week in a single call by repeating ;week=N, on
+// the assumption Yahoo honours repeated params. It evidently doesn't for this
+// resource — the response comes back scoped to one week, so week 1 was simply
+// absent and the grid drew an em-dash beside a live week 2. The season-long
+// comparison the modal exists for never appeared.
+//
+// One call per week instead, with both players batched into each. That costs
+// more requests, so the cache does the heavy lifting: a COMPLETED week's Fan
+// Pts never change, so it's written to localStorage per player and never
+// fetched again. Only the current week is refetched, and only on a short TTL.
+var _skNflWkMem = {};        // "lg|player|wk" -> number | null
+var _SK_NFL_WK_LS = 'sk_nflwk_';
+
+function _skNflWkCacheGet(lg, pk, wk, isCurrent) {
+  var k = lg + '|' + pk + '|' + wk;
+  var m = _skNflWkMem[k];
+  if (m !== undefined && (!isCurrent || (Date.now() - m.ts) < 60000)) return m;
+  if (isCurrent) return undefined;
+  try {
+    var raw = localStorage.getItem(_SK_NFL_WK_LS + k);
+    if (raw != null) {
+      var v = (raw === '') ? null : parseFloat(raw);
+      var e = { v: (raw === '' || isNaN(v)) ? null : v, ts: Date.now() };
+      _skNflWkMem[k] = e;
+      return e;
+    }
+  } catch (e2) {}
+  return undefined;
+}
+function _skNflWkCacheSet(lg, pk, wk, val, isCurrent) {
+  var k = lg + '|' + pk + '|' + wk;
+  _skNflWkMem[k] = { v: val, ts: Date.now() };
+  // A week still being played will change; only settled weeks are durable.
+  if (isCurrent) return;
+  try { localStorage.setItem(_SK_NFL_WK_LS + k, (val == null) ? '' : String(val)); }
+  catch (e) {}
+}
+
+// Fetch weekly Fan Pts for the given player_keys across [startWk..endWk].
+// Returns { byPlayer: { key: { week:fp } } }.
+function _skFetchNflWeekLog(leagueKey, keys, startWk, endWk, currentWk) {
   keys = (keys || []).filter(function(k) { return !!k; });
   if (!leagueKey || !keys.length) return Promise.resolve({ byPlayer: {} });
-  var ck = leagueKey + '|' + startWk + '-' + endWk + '|' + keys.slice().sort().join(',');
-  if (_skNflWeekLogCache[ck]) return Promise.resolve(_skNflWeekLogCache[ck]);
-  if (_skNflWeekLogInflight[ck]) return _skNflWeekLogInflight[ck];
-  // Build the repeated ;week=N segment. Yahoo honors multiple week params.
-  var weekSeg = '';
-  for (var w = startWk; w <= endWk; w++) weekSeg += ';week=' + w;
-  var url = '/league/' + leagueKey + '/players;player_keys=' + keys.join(',') +
-    '/stats;type=week' + weekSeg;
-  var pr = fyApi(url).then(function(data) {
-    var byPlayer = (data && !data.error) ? _skParseNflWeeklyPoints(data) : {};
-    var entry = { byPlayer: byPlayer };
-    _skNflWeekLogCache[ck] = entry;
-    return entry;
-  }).catch(function() {
-    return { byPlayer: {} };
-  }).then(function(entry) {
-    delete _skNflWeekLogInflight[ck];
-    return entry;
-  });
-  _skNflWeekLogInflight[ck] = pr;
-  return pr;
+  var cur = parseInt(currentWk, 10) || 0;
+  var byPlayer = {};
+  var i;
+  for (i = 0; i < keys.length; i++) byPlayer[keys[i]] = {};
+
+  // What still needs asking for, after the cache has had its say.
+  var need = [];
+  for (var w = startWk; w <= endWk; w++) {
+    var isCur = (w === cur);
+    var missing = false;
+    for (i = 0; i < keys.length; i++) {
+      var hit = _skNflWkCacheGet(leagueKey, keys[i], w, isCur);
+      if (hit === undefined) { missing = true; }
+      else if (hit.v != null) byPlayer[keys[i]][w] = hit.v;
+    }
+    if (missing) need.push(w);
+  }
+  if (!need.length) return Promise.resolve({ byPlayer: byPlayer });
+
+  // Three at a time — the same lane width the roster fetches use.
+  var idx = 0;
+  function worker() {
+    if (idx >= need.length) return Promise.resolve();
+    var wk = need[idx++];
+    var isCur = (wk === cur);
+    var url = '/league/' + leagueKey + '/players;player_keys=' + keys.join(',') +
+      '/stats;type=week;week=' + wk;
+    return fyApi(url).then(function(data) {
+      var parsed = (data && !data.error) ? _skParseNflWeeklyPoints(data) : {};
+      for (var q = 0; q < keys.length; q++) {
+        var pk = keys[q];
+        var wks = parsed[pk] || {};
+        var val = (wks[wk] != null) ? wks[wk] : null;
+        // A null is cached too, and deliberately: a bye or an unplayed week
+        // is a real answer, and re-asking for it on every open would spend
+        // seventeen requests to relearn the same nothing.
+        _skNflWkCacheSet(leagueKey, pk, wk, val, isCur);
+        if (val != null) byPlayer[pk][wk] = val;
+      }
+    }).catch(function() {}).then(worker);
+  }
+  var lanes = [];
+  for (i = 0; i < Math.min(3, need.length); i++) lanes.push(worker());
+  return Promise.all(lanes).then(function() { return { byPlayer: byPlayer }; });
 }
 
 // Render the side-by-side weekly Fan Pts table into the compare modal.
@@ -112515,7 +112575,7 @@ function _skRenderNflGameLog(pair, st) {
     return;
   }
 
-  _skFetchNflWeekLog(lk, keys, startWk, endWk).then(function(entry) {
+  _skFetchNflWeekLog(lk, keys, startWk, endWk, st.currentWeek).then(function(entry) {
     // Bail if the modal was closed / a different pair opened.
     var live = document.getElementById('skNflCompareBody');
     if (!live || !live.contains(wrap)) return;
