@@ -81842,7 +81842,7 @@ async function skHydrateLeague(league) {
     var matchup = skParseScoreboardForMyMatchup(scoreboardRes, team && team.team_key);
     // Per-team running tallies for THIS week's matchup. Used by the
     // standings "If week ended now" toggle to project final records.
-    var weekRecords = skParseScoreboardForAllWeekRecords(scoreboardRes, matchup && matchup.scoringType, league.current_week);
+    var weekRecords = skParseScoreboardForAllWeekRecords(scoreboardRes, matchup && matchup.scoringType, league.current_week, league.sport);
     
     // Extract standings array and divisions from the full standings response
     var standings = [];
@@ -82389,12 +82389,14 @@ function skParseScoreboardForMyMatchup(data, myTeamKey) {
 // silently skipped so a single malformed matchup doesn't poison the
 // whole map.
 // ─────────────────────────────────────────────────────────────────
-function skParseScoreboardForAllWeekRecords(data, scoringType, currentWeek) {
+function skParseScoreboardForAllWeekRecords(data, scoringType, currentWeek, sport) {
   var out = {};
   if (!data || data.error || !data.fantasy_content) return out;
   if (scoringType !== 'head' && scoringType !== 'headone' && scoringType !== 'headpoint') {
     return out;
   }
+  // NFLNOTIE — football only, per the 0-0 rule below.
+  var _sbIsFootball = /^(nfl|cfb)$/i.test(String(sport || ''));
   try {
     var sb = data.fantasy_content.league[1].scoreboard;
     var matchups = sb && sb['0'] && sb['0'].matchups;
@@ -82558,6 +82560,20 @@ function skParseScoreboardForAllWeekRecords(data, scoringType, currentWeek) {
         var ptsB = (sideB[1] && sideB[1].team_points) ? parseFloat(sideB[1].team_points.total) : 0;
         if (isNaN(ptsA)) ptsA = 0;
         if (isNaN(ptsB)) ptsB = 0;
+        // ── NFLNOTIE ── In football, 0-0 means nobody has played, not a draw.
+        //
+        // Yahoo's week runs Thursday to Monday, so for most of it every
+        // matchup in the league sits at 0.0-0.0 and was being booked as a
+        // tie on both sides — a Yahoo football week read 0-0-4 across four
+        // leagues that hadn't kicked off. Daily sports don't have this
+        // problem to the same degree (their periods turn over nightly), and
+        // a genuine 0-0 finish in football would mean two entire lineups
+        // scored nothing, which is not a result worth protecting.
+        //
+        // Recorded as nothing at all rather than as a tie: the matchup has
+        // no outcome yet, and inventing one in either direction is worse
+        // than leaving the week blank until it has.
+        if (_sbIsFootball && ptsA === 0 && ptsB === 0) continue;
         if (ptsA > ptsB) { recA.wins++; recB.losses++; }
         else if (ptsB > ptsA) { recB.wins++; recA.losses++; }
         else { recA.ties++; recB.ties++; }
@@ -135745,10 +135761,15 @@ function _mdBuildRollup() {
       var myWeek = weekRecords && weekRecords[team.team_key];
       if (myWeek) {
         if (isPtsH2H || st === 'headone') {
-          s.weekW += (myWeek.wins || 0);
-          s.weekL += (myWeek.losses || 0);
-          s.weekT += (myWeek.ties || 0);
-          s.weekLeagueCount++;
+          var _pw = (myWeek.wins || 0), _pl = (myWeek.losses || 0), _pt = (myWeek.ties || 0);
+          // NFLNOTIE — a football matchup still at 0-0 now records nothing,
+          // so the entry exists but is empty. Counting it as a live league
+          // would say four leagues are playing and showing 0-0-0, when the
+          // truth is they haven't started.
+          if (_pw || _pl || _pt) {
+            s.weekW += _pw; s.weekL += _pl; s.weekT += _pt;
+            s.weekLeagueCount++;
+          }
         } else if (st === 'head') {
           var w = myWeek.wins || 0;
           var l = myWeek.losses || 0;
