@@ -8303,6 +8303,17 @@
     white-space: nowrap; -webkit-tap-highlight-color: transparent;
     transition: transform 0.1s, background 0.15s;
   }
+  /* HOOPMOMENT — the run/crunch pill, coloured by which state it's in. */
+  .fwbx-actpill.crs-act-hoop.run {
+    border-color: rgba(74,222,128,0.5); color: #4ade80;
+  }
+  .fwbx-actpill.crs-act-hoop.recap {
+    border-color: rgba(255,255,255,0.28); color: rgba(255,255,255,0.75);
+  }
+  .fwbx-actpill.crs-act-hoop.crunch {
+    border-color: rgba(248,113,113,0.6); color: #f87171;
+    animation: crsFpPulse 1.6s ease-in-out infinite;
+  }
   .fwbx-actpill:active { transform: scale(0.95); }
   .fwbx-actpill span { line-height: 1; }
   .crs-act-perf { border-color: rgba(245,213,71,0.5); color: #f5d547; }
@@ -63450,6 +63461,331 @@ function renderGym() {
   scoreboardClick();
 }
 
+// ── HOOPMOMENT ── Basketball's answer to the Live AB button.
+//
+// Live AB works because baseball is DISCRETE: a pitch has a pause around it,
+// so a panel can sit on that moment. Basketball has no equivalent atom — a
+// possession is too fast and, on its own, says almost nothing. What it does
+// have is two moments worth interrupting for, and they never overlap:
+//
+//   RUN    — one team scoring in a burst. The unit the sport is narrated in.
+//   CRUNCH — the NBA's own clutch definition: final five minutes, margin ≤5.
+//
+// So this is ONE pill that changes identity with the game state, and shows
+// nothing when neither applies — the same discipline as Live AB, which never
+// appears outside a live at-bat.
+//
+// Everything is derived from data.plays, already fetched for win probability
+// and the game-flow chart. No new endpoint.
+
+// Clock text ("7:41", "0:48.3") to seconds. Returns null when unparseable,
+// which the callers treat as "unknown" rather than zero.
+function _hoopClockSec(p) {
+  var t = (p && p.clock && p.clock.displayValue) || '';
+  var m = /^(\d+):(\d+(?:\.\d+)?)$/.exec(String(t).trim());
+  if (!m) return null;
+  return parseInt(m[1], 10) * 60 + parseFloat(m[2]);
+}
+
+// The current scoring run, if there is one.
+//
+// A naive "consecutive unanswered points" rule misses what people actually
+// call a run: 12-4 over three minutes is a run, and a single answering free
+// throw shouldn't end it. So instead this walks backwards while the ratio
+// stays lopsided, and reports the real tally both ways.
+function _hoopCurrentRun(data) {
+  var plays = (data && data.plays) || [];
+  if (plays.length < 4) return null;
+  var scoring = [];
+  var pa = 0, ph = 0;
+  for (var i = 0; i < plays.length; i++) {
+    var p = plays[i];
+    if (p.awayScore == null || p.homeScore == null) continue;
+    var da = p.awayScore - pa, dh = p.homeScore - ph;
+    pa = p.awayScore; ph = p.homeScore;
+    if (da <= 0 && dh <= 0) continue;
+    scoring.push({ da: da, dh: dh, p: p });
+  }
+  if (scoring.length < 3) return null;
+
+  var last = scoring[scoring.length - 1];
+  var side = (last.da > 0) ? 'away' : 'home';
+  var mine = 0, theirs = 0, startIdx = scoring.length;
+  for (var j = scoring.length - 1; j >= 0; j--) {
+    var s = scoring[j];
+    var m2 = (side === 'away') ? s.da : s.dh;
+    var t2 = (side === 'away') ? s.dh : s.da;
+    // Stop once the other side has kept enough pace that this is no longer
+    // one team's burst. Two thresholds: they can't have matched us, and
+    // they can't have scored more than a third of the total.
+    if (theirs + t2 > 0 && (theirs + t2) * 3 > (mine + m2)) break;
+    mine += m2; theirs += t2; startIdx = j;
+  }
+  if (mine < 7) return null;              // not yet a run worth naming
+
+  var first = scoring[startIdx];
+  var startP = first.p, endP = last.p;
+  var perA = (startP.period && startP.period.number) || 0;
+  var perB = (endP.period && endP.period.number) || 0;
+  var cA = _hoopClockSec(startP), cB = _hoopClockSec(endP);
+  var elapsed = null;
+  if (cA != null && cB != null) {
+    // Quarters are 12 minutes in the NBA, 10 in most others; using the
+    // observed clock start avoids hardcoding either.
+    var perLen = (perA >= 5 || perB >= 5) ? 300 : 720;
+    elapsed = (perB - perA) * perLen + (cA - cB);
+    if (elapsed < 0) elapsed = null;
+  }
+  return {
+    side: side, mine: mine, theirs: theirs,
+    period: perB, clock: (endP.clock && endP.clock.displayValue) || '',
+    elapsed: elapsed
+  };
+}
+
+// Is the game in clutch time? NBA's own definition.
+function _hoopCrunch(data, game) {
+  var plays = (data && data.plays) || [];
+  if (!plays.length) return null;
+  var last = null;
+  for (var i = plays.length - 1; i >= 0; i--) {
+    if (plays[i].awayScore != null && plays[i].homeScore != null) { last = plays[i]; break; }
+  }
+  if (!last) return null;
+  var per = (last.period && last.period.number) || 0;
+  if (per < 4) return null;                       // 4th quarter or OT only
+  var sec = _hoopClockSec(last);
+  if (sec == null || sec > 300) return null;      // final five minutes
+  var margin = Math.abs((last.homeScore || 0) - (last.awayScore || 0));
+  if (margin > 5) return null;                    // within five
+  return {
+    period: per, clock: (last.clock && last.clock.displayValue) || '',
+    margin: margin,
+    leader: (last.homeScore > last.awayScore) ? 'home'
+          : (last.awayScore > last.homeScore) ? 'away' : ''
+  };
+}
+
+// ── HOOPRECAP ── The post-game branch.
+//
+// The live pill is gated to state 'in', so a final showed nothing — even
+// though the two things it reports are still sitting in data.plays. The fix
+// is not to leave the live pill running, which would claim something is happening
+// now. A finished game gets its own question: what was the swing that decided
+// it, and how did the last five minutes actually go.
+
+// The single biggest run of the game, by either team.
+//
+// Brute-forced from every possible start rather than tracked in one pass:
+// the "when does a run end" rule is a ratio, not a reset, so a greedy scan
+// can close a run one basket early and miss the longer one containing it.
+// There are only a couple of hundred scoring plays, so the cost is nothing.
+function _hoopBiggestRun(data) {
+  var plays = (data && data.plays) || [];
+  var ev = [], pa = 0, ph = 0, i;
+  for (i = 0; i < plays.length; i++) {
+    var p = plays[i];
+    if (p.awayScore == null || p.homeScore == null) continue;
+    var da = p.awayScore - pa, dh = p.homeScore - ph;
+    pa = p.awayScore; ph = p.homeScore;
+    if (da <= 0 && dh <= 0) continue;
+    ev.push({ da: da, dh: dh, p: p });
+  }
+  if (ev.length < 3) return null;
+
+  var best = null;
+  for (i = 0; i < ev.length; i++) {
+    var side = (ev[i].da > 0) ? 'away' : 'home';
+    var mine = 0, theirs = 0;
+    for (var j = i; j < ev.length; j++) {
+      var m = (side === 'away') ? ev[j].da : ev[j].dh;
+      var t = (side === 'away') ? ev[j].dh : ev[j].da;
+      if (theirs + t > 0 && (theirs + t) * 3 > (mine + m)) break;
+      mine += m; theirs += t;
+      if (mine >= 8 && (!best || mine - theirs > best.mine - best.theirs)) {
+        best = { side: side, mine: mine, theirs: theirs, from: ev[i].p, to: ev[j].p };
+      }
+    }
+  }
+  if (!best) return null;
+  var perA = (best.from.period && best.from.period.number) || 0;
+  var perB = (best.to.period && best.to.period.number) || 0;
+  var cA = _hoopClockSec(best.from), cB = _hoopClockSec(best.to);
+  var elapsed = null;
+  if (cA != null && cB != null) {
+    var perLen = (perA >= 5 || perB >= 5) ? 300 : 720;
+    elapsed = (perB - perA) * perLen + (cA - cB);
+    if (elapsed < 0) elapsed = null;
+  }
+  best.period = perB;
+  best.clock = (best.to.clock && best.to.clock.displayValue) || '';
+  best.startPeriod = perA;
+  best.startClock = (best.from.clock && best.from.clock.displayValue) || '';
+  best.elapsed = elapsed;
+  return best;
+}
+
+// How the last five minutes went. Null when the game was never close enough
+// for that stretch to mean anything — a 20-point fourth quarter has no crunch
+// time, and inventing one would be the same overstatement the live gate avoids.
+function _hoopCrunchRecap(data) {
+  var plays = (data && data.plays) || [];
+  var mark = null, last = null;
+  for (var i = 0; i < plays.length; i++) {
+    var p = plays[i];
+    if (p.awayScore == null || p.homeScore == null) continue;
+    var per = (p.period && p.period.number) || 0;
+    if (per < 4) continue;
+    var sec = _hoopClockSec(p);
+    if (per === 4 && (sec == null || sec > 300)) { mark = p; continue; }
+    if (!last) last = p;
+    last = p;
+  }
+  if (!mark || !last) return null;
+  var mA = mark.awayScore || 0, mH = mark.homeScore || 0;
+  var fA = last.awayScore || 0, fH = last.homeScore || 0;
+  if (Math.abs(mH - mA) > 10) return null;   // never actually close
+  var stretchA = fA - mA, stretchH = fH - mH;
+  return {
+    markAway: mA, markHome: mH, finalAway: fA, finalHome: fH,
+    stretchAway: stretchA, stretchHome: stretchH,
+    marginAtMark: Math.abs(mH - mA), marginFinal: Math.abs(fH - fA),
+    wentOT: ((last.period && last.period.number) || 4) > 4
+  };
+}
+
+function _hoopRecapPill(data, game) {
+  if (!game || (game.state || '').toLowerCase() !== 'post') return '';
+  var run = null, recap = null;
+  try { run = _hoopBiggestRun(data); } catch (e) {}
+  try { recap = _hoopCrunchRecap(data); } catch (e2) {}
+  if (!run && !recap) return '';
+  window._hoopMoment = { kind: 'recap', run: run, recap: recap };
+  var label;
+  if (run) {
+    var who = (run.side === 'home') ? (game.home.abbr || 'HOME') : (game.away.abbr || 'AWAY');
+    label = 'Decisive run \u00b7 ' + slEsc(who) + ' ' + run.mine + '-' + run.theirs;
+  } else {
+    label = 'How it finished';
+  }
+  return '<button class="fwbx-actpill crs-act-hoop recap" onclick="openHoopMoment()">' +
+    '<span>' + label + '</span>\ud83d\udcd0</button>';
+}
+
+function _hoopRecapHtml(data, game, mo) {
+  var mono = "font-family:var(--sk-font-mono,monospace);";
+  var awayC = (typeof vibrant === 'function') ? vibrant(game.away.color) : '#6cf';
+  var homeC = (typeof vibrant === 'function') ? vibrant(game.home.color) : '#f66';
+  var aAb = game.away.abbr || 'AWAY', hAb = game.home.abbr || 'HOME';
+  var h = '<div style="padding:14px 14px 20px;">';
+  var r = mo.run;
+
+  if (r) {
+    var who = (r.side === 'home') ? hAb : aAb;
+    var col = (r.side === 'home') ? homeC : awayC;
+    h += '<div style="' + mono + 'font-size:10px;letter-spacing:0.12em;color:rgba(255,255,255,0.4);">' +
+        'THE SWING</div>' +
+      '<div style="font-size:26px;font-weight:800;color:' + col + ';margin:2px 0 2px;">' +
+        slEsc(who) + ' ' + r.mine + '\u2013' + r.theirs + '</div>' +
+      '<div style="' + mono + 'font-size:11px;color:rgba(255,255,255,0.45);">' +
+        _hoopPerLabel(r.startPeriod) + ' ' + slEsc(r.startClock) + ' \u2192 ' +
+        _hoopPerLabel(r.period) + ' ' + slEsc(r.clock) +
+        (r.elapsed != null ? (' \u00b7 ' + _hoopMMSS(r.elapsed)) : '') + '</div>';
+  }
+
+  var rc = mo.recap;
+  if (rc) {
+    var sA = rc.stretchAway, sH = rc.stretchHome;
+    var winA = sA > sH, even = (sA === sH);
+    h += '<div style="' + mono + 'font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
+        'margin:16px 0 6px;">LAST FIVE MINUTES</div>' +
+      '<div style="display:flex;align-items:baseline;gap:10px;">' +
+        '<span style="' + mono + 'font-size:20px;font-weight:800;color:' +
+          (even ? 'rgba(255,255,255,0.7)' : (winA ? awayC : 'rgba(255,255,255,0.4)')) + ';">' +
+          slEsc(aAb) + ' ' + sA + '</span>' +
+        '<span style="' + mono + 'font-size:12px;color:rgba(255,255,255,0.25);">\u2013</span>' +
+        '<span style="' + mono + 'font-size:20px;font-weight:800;color:' +
+          (even ? 'rgba(255,255,255,0.7)' : (!winA ? homeC : 'rgba(255,255,255,0.4)')) + ';">' +
+          sH + ' ' + slEsc(hAb) + '</span>' +
+      '</div>' +
+      '<div style="' + mono + 'font-size:11px;color:rgba(255,255,255,0.45);margin-top:4px;">' +
+        'Within ' + rc.marginAtMark + ' at the five-minute mark \u00b7 ' +
+        (rc.marginFinal === 0 ? 'level at the buzzer'
+                              : ('decided by ' + rc.marginFinal)) +
+        (rc.wentOT ? ' \u00b7 went to overtime' : '') + '</div>';
+  } else {
+    h += '<div style="' + mono + 'font-size:11px;color:rgba(255,255,255,0.35);margin-top:16px;">' +
+      'Never within ten in the final five \u2014 no crunch time to report.</div>';
+  }
+
+  if (r) h += _hoopRunPlaysAtHtml(data, game, r, mono, awayC, homeC);
+  return h + '</div>';
+}
+
+function _hoopPerLabel(per) {
+  if (!per) return '';
+  return (per > 4) ? ('OT' + (per - 4)) : ('Q' + per);
+}
+
+// The scoring plays inside a specific run window.
+function _hoopRunPlaysAtHtml(data, game, run, mono, awayC, homeC) {
+  var plays = (data && data.plays) || [];
+  var out = [], pa = 0, ph = 0, inWin = false;
+  for (var i = 0; i < plays.length; i++) {
+    var p = plays[i];
+    if (p.awayScore == null || p.homeScore == null) continue;
+    var da = p.awayScore - pa, dh = p.homeScore - ph;
+    pa = p.awayScore; ph = p.homeScore;
+    if (da <= 0 && dh <= 0) continue;
+    if (p === run.from) inWin = true;
+    if (inWin) out.push({ side: da > 0 ? 'away' : 'home', pts: da > 0 ? da : dh, p: p });
+    if (p === run.to) break;
+  }
+  if (!out.length) return '';
+  var h = '<div style="' + mono + 'font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
+    'margin:16px 0 4px;">HOW IT HAPPENED</div>';
+  for (var k = 0; k < out.length; k++) {
+    var t = out[k];
+    var inRun = (t.side === run.side);
+    h += '<div style="display:flex;gap:8px;align-items:baseline;padding:4px 0;' +
+      'border-bottom:1px solid rgba(255,255,255,0.05);opacity:' + (inRun ? '1' : '0.45') + ';">' +
+      '<span style="' + mono + 'font-size:9px;color:rgba(255,255,255,0.35);flex:0 0 34px;">' +
+        slEsc((t.p.clock && t.p.clock.displayValue) || '') + '</span>' +
+      '<span style="' + mono + 'font-size:11px;font-weight:800;flex:0 0 20px;color:' +
+        (t.side === 'home' ? homeC : awayC) + ';">+' + t.pts + '</span>' +
+      '<span style="flex:1;min-width:0;font-size:11.5px;color:rgba(255,255,255,0.75);">' +
+        slEsc(t.p.text || '') + '</span>' +
+    '</div>';
+  }
+  return h;
+}
+
+// The pill. Crunch outranks a run — if both are true, the last two minutes of
+// a one-possession game is the thing you want on screen.
+function _hoopMomentPill(data, game) {
+  if (!game) return '';
+  var _st = (game.state || '').toLowerCase();
+  // HOOPRECAP — a finished game gets the retrospective branch instead.
+  if (_st === 'post') return _hoopRecapPill(data, game);
+  if (_st !== 'in') return '';
+  var crunch = null, run = null;
+  try { crunch = _hoopCrunch(data, game); } catch (e) {}
+  try { run = _hoopCurrentRun(data); } catch (e) {}
+  window._hoopMoment = null;
+  if (crunch) {
+    window._hoopMoment = { kind: 'crunch', crunch: crunch, run: run };
+    return '<button class="fwbx-actpill crs-act-hoop crunch" onclick="openHoopMoment()">' +
+      '<span>Crunch \u00b7 ' + crunch.clock + '</span>\u23f1\ufe0f</button>';
+  }
+  if (run) {
+    var who = (run.side === 'home') ? (game.home.abbr || 'HOME') : (game.away.abbr || 'AWAY');
+    window._hoopMoment = { kind: 'run', crunch: null, run: run };
+    return '<button class="fwbx-actpill crs-act-hoop run" onclick="openHoopMoment()">' +
+      '<span>' + slEsc(who) + ' ' + run.mine + '-' + run.theirs + ' run</span>\ud83d\udd25</button>';
+  }
+  return '';
+}
+
 function renderGymBoxScore(data, game, isV) {
   var html = '';
   var boxPlayers = data.boxscore?.players || [];
@@ -63491,6 +63827,7 @@ function renderGymBoxScore(data, game, isV) {
       'onclick="_fwBoxFilter(this)" style="--fwpill:' + (s.color || '#888') + '">' +
       pLogo + '<span>' + s.label + '</span></button>';
   });
+  html += _hoopMomentPill(data, game);   // HOOPMOMENT — first: it's the live one
   html += _sbPerfInlinePill(data, 'gym');
   html += _sbGameStatsInlinePill(data, 'gym');
   html += _sbPbpInlinePill();
@@ -64819,6 +65156,191 @@ function closePlayByPlay() {
 // The stadium renderers stash the game's PBP data in window._sbPbpData
 // and render a clipboard FAB; this opens the overlay and fills it with
 // the same renderScoreboardPBP output that used to be inline.
+// ── HOOPMOMENT ── The panel behind the pill. Reuses the existing
+// scoreboard overlay shell rather than adding another modal.
+function openHoopMoment() {
+  var mo = window._hoopMoment;
+  var ctx = window._sbPbpData;
+  if (!mo || !ctx || !ctx.data || !ctx.game) return;
+  var ov = document.getElementById('sbPbpOverlay');
+  if (!ov) return;
+  ov.classList.add('open');
+  var g = ctx.game;
+  var sub = (g.away && g.away.abbr || '') + ' ' + (g.away && g.away.score != null ? g.away.score : 0) +
+            ' \u2014 ' + (g.home && g.home.score != null ? g.home.score : 0) + ' ' + (g.home && g.home.abbr || '');
+  var tEl = document.getElementById('sbPbpSubtitle');
+  if (tEl) tEl.textContent = sub;
+  var body = document.getElementById('sbPbpBody');
+  if (body) body.innerHTML = _hoopMomentHtml(ctx.data, g, mo);
+}
+
+function _hoopMomentHtml(data, game, mo) {
+  if (mo && mo.kind === 'recap') return _hoopRecapHtml(data, game, mo);   // HOOPRECAP
+  var mono = "font-family:var(--sk-font-mono,monospace);";
+  var awayC = (typeof vibrant === 'function') ? vibrant(game.away.color) : '#6cf';
+  var homeC = (typeof vibrant === 'function') ? vibrant(game.home.color) : '#f66';
+  var h = '<div style="padding:14px 14px 20px;">';
+
+  if (mo.kind === 'crunch') {
+    var c = mo.crunch;
+    var ldC = (c.leader === 'home') ? homeC : (c.leader === 'away') ? awayC : 'rgba(255,255,255,0.7)';
+    var ldAb = (c.leader === 'home') ? (game.home.abbr || 'HOME')
+             : (c.leader === 'away') ? (game.away.abbr || 'AWAY') : '';
+    h += '<div style="' + mono + 'font-size:10px;letter-spacing:0.12em;color:#f87171;">CRUNCH TIME</div>' +
+      '<div style="font-size:26px;font-weight:800;color:#fff;margin:2px 0 2px;">' +
+        (c.margin === 0 ? 'Tied' : (slEsc(ldAb) + ' by ' + c.margin)) + '</div>' +
+      '<div style="' + mono + 'font-size:11px;color:rgba(255,255,255,0.45);">' +
+        (c.period > 4 ? ('OT' + (c.period - 4)) : ('Q' + c.period)) + ' \u00b7 ' + slEsc(c.clock) +
+        ' \u00b7 within five in the final five</div>';
+    if (mo.run) {
+      var rw = (mo.run.side === 'home') ? (game.home.abbr || 'HOME') : (game.away.abbr || 'AWAY');
+      h += '<div style="' + mono + 'font-size:11px;color:#4ade80;margin-top:6px;">' +
+        'and ' + slEsc(rw) + ' is on a ' + mo.run.mine + '-' + mo.run.theirs + ' run</div>';
+    }
+    h += _hoopFoulTroubleHtml(data, game, mono, awayC, homeC);
+    h += _hoopHotHandHtml(data, game, mono);
+  } else {
+    var r = mo.run;
+    var who = (r.side === 'home') ? (game.home.abbr || 'HOME') : (game.away.abbr || 'AWAY');
+    var col = (r.side === 'home') ? homeC : awayC;
+    h += '<div style="' + mono + 'font-size:10px;letter-spacing:0.12em;color:#4ade80;">ON A RUN</div>' +
+      '<div style="font-size:26px;font-weight:800;color:' + col + ';margin:2px 0 2px;">' +
+        slEsc(who) + ' ' + r.mine + '\u2013' + r.theirs + '</div>' +
+      '<div style="' + mono + 'font-size:11px;color:rgba(255,255,255,0.45);">' +
+        (r.period > 4 ? ('OT' + (r.period - 4)) : ('Q' + r.period)) + ' \u00b7 ' + slEsc(r.clock) +
+        (r.elapsed != null ? (' \u00b7 over ' + _hoopMMSS(r.elapsed)) : '') + '</div>';
+    h += _hoopRunPlaysHtml(data, game, r, mono, awayC, homeC);
+  }
+  return h + '</div>';
+}
+
+function _hoopMMSS(sec) {
+  var s = Math.max(0, Math.round(sec));
+  return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+}
+
+// The scoring plays that made up the run, newest first.
+function _hoopRunPlaysHtml(data, game, run, mono, awayC, homeC) {
+  var plays = (data && data.plays) || [];
+  var out = [], pa = 0, ph = 0;
+  for (var i = 0; i < plays.length; i++) {
+    var p = plays[i];
+    if (p.awayScore == null || p.homeScore == null) continue;
+    var da = p.awayScore - pa, dh = p.homeScore - ph;
+    pa = p.awayScore; ph = p.homeScore;
+    if (da <= 0 && dh <= 0) continue;
+    out.push({ side: da > 0 ? 'away' : 'home', pts: da > 0 ? da : dh, p: p });
+  }
+  var take = out.slice(-10).reverse();
+  if (!take.length) return '';
+  var h = '<div style="' + mono + 'font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
+    'margin:14px 0 4px;">HOW IT HAPPENED</div>';
+  for (var k = 0; k < take.length; k++) {
+    var t = take[k];
+    var inRun = (t.side === run.side);
+    h += '<div style="display:flex;gap:8px;align-items:baseline;padding:4px 0;' +
+      'border-bottom:1px solid rgba(255,255,255,0.05);opacity:' + (inRun ? '1' : '0.45') + ';">' +
+      '<span style="' + mono + 'font-size:9px;color:rgba(255,255,255,0.35);flex:0 0 34px;">' +
+        slEsc((t.p.clock && t.p.clock.displayValue) || '') + '</span>' +
+      '<span style="' + mono + 'font-size:11px;font-weight:800;flex:0 0 20px;color:' +
+        (t.side === 'home' ? homeC : awayC) + ';">+' + t.pts + '</span>' +
+      '<span style="flex:1;min-width:0;font-size:11.5px;color:rgba(255,255,255,0.75);">' +
+        slEsc(t.p.text || '') + '</span>' +
+    '</div>';
+  }
+  return h;
+}
+
+// Who's a foul away from trouble. Straight off the box score.
+function _hoopFoulTroubleHtml(data, game, mono, awayC, homeC) {
+  var teams = (data && data.boxscore && data.boxscore.players) || [];
+  var rows = [];
+  for (var t = 0; t < teams.length; t++) {
+    var tm = teams[t];
+    var stats = (tm.statistics && tm.statistics[0]) || {};
+    var keys = stats.names || [];
+    var pfIdx = -1, minIdx = -1;
+    for (var k = 0; k < keys.length; k++) {
+      if (String(keys[k]).toUpperCase() === 'PF') pfIdx = k;
+      if (String(keys[k]).toUpperCase() === 'MIN') minIdx = k;
+    }
+    if (pfIdx < 0) continue;
+    var ath = stats.athletes || [];
+    for (var a = 0; a < ath.length; a++) {
+      var st = ath[a].stats || [];
+      var pf = parseInt(st[pfIdx], 10);
+      if (isNaN(pf) || pf < 4) continue;
+      rows.push({
+        name: (ath[a].athlete && (ath[a].athlete.shortName || ath[a].athlete.displayName)) || '?',
+        pf: pf, min: (minIdx >= 0 ? st[minIdx] : ''),
+        abbr: (tm.team && tm.team.abbreviation) || '',
+        home: !!(game.home && tm.team && tm.team.abbreviation === game.home.abbr)
+      });
+    }
+  }
+  if (!rows.length) return '';
+  rows.sort(function(x, y) { return y.pf - x.pf; });
+  var h = '<div style="' + mono + 'font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
+    'margin:14px 0 4px;">FOUL TROUBLE</div>';
+  for (var i = 0; i < rows.length; i++) {
+    var r = rows[i];
+    h += '<div style="display:flex;gap:8px;align-items:baseline;padding:3px 0;">' +
+      '<span style="' + mono + 'font-size:9px;flex:0 0 34px;color:' + (r.home ? homeC : awayC) + ';">' +
+        slEsc(r.abbr) + '</span>' +
+      '<span style="flex:1;min-width:0;font-size:11.5px;color:rgba(255,255,255,0.8);">' +
+        slEsc(r.name) + '</span>' +
+      '<span style="' + mono + 'font-size:11px;font-weight:800;color:' +
+        (r.pf >= 5 ? '#f87171' : '#fbbf24') + ';">' + r.pf + ' PF</span>' +
+    '</div>';
+  }
+  return h;
+}
+
+// Who's making shots right now — last six field-goal attempts per player.
+function _hoopHotHandHtml(data, game, mono) {
+  var plays = (data && data.plays) || [];
+  var byName = {};
+  for (var i = 0; i < plays.length; i++) {
+    var p = plays[i];
+    if (!p.shootingPlay) continue;
+    var txt = String(p.text || '');
+    var m = /^(.+?)\s+(makes|misses)\s/.exec(txt);
+    if (!m) continue;
+    var nm = m[1].trim();
+    if (!byName[nm]) byName[nm] = [];
+    byName[nm].push(m[2] === 'makes');
+  }
+  var rows = [];
+  for (var n in byName) {
+    if (!byName.hasOwnProperty(n)) continue;
+    var seq = byName[n].slice(-6);
+    if (seq.length < 3) continue;
+    var made = 0;
+    for (var s = 0; s < seq.length; s++) if (seq[s]) made++;
+    rows.push({ name: n, made: made, of: seq.length, seq: seq });
+  }
+  if (!rows.length) return '';
+  rows.sort(function(a, b) { return (b.made / b.of) - (a.made / a.of); });
+  rows = rows.slice(0, 5);
+  var h = '<div style="' + mono + 'font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
+    'margin:14px 0 4px;">LAST SIX SHOTS</div>';
+  for (var r = 0; r < rows.length; r++) {
+    var row = rows[r], dots = '';
+    for (var d = 0; d < row.seq.length; d++) {
+      dots += '<span style="display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:3px;' +
+        'background:' + (row.seq[d] ? '#4ade80' : 'rgba(255,255,255,0.18)') + ';"></span>';
+    }
+    h += '<div style="display:flex;gap:8px;align-items:center;padding:3px 0;">' +
+      '<span style="flex:1;min-width:0;font-size:11.5px;color:rgba(255,255,255,0.8);">' +
+        slEsc(row.name) + '</span>' +
+      '<span style="flex:0 0 auto;">' + dots + '</span>' +
+      '<span style="' + mono + 'font-size:10px;color:rgba(255,255,255,0.45);flex:0 0 32px;text-align:right;">' +
+        row.made + '/' + row.of + '</span>' +
+    '</div>';
+  }
+  return h;
+}
+
 function openSbPlayByPlay() {
   var ctx = window._sbPbpData;
   if (!ctx || !ctx.data || !ctx.game) return;
