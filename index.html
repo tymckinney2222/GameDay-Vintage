@@ -14361,23 +14361,6 @@
     align-content: start;
     align-items: start;
   }
-  /* FMSKIP — synced leagues that produced no card, and why. */
-  .fm-skip {
-    margin: 12px 10px 4px; padding: 9px 11px; border-radius: 9px;
-    border: 1px solid rgba(248,113,113,0.22); background: rgba(248,113,113,0.05);
-  }
-  .fm-skip-head {
-    font-family: var(--sk-font-mono, monospace); font-size: 9px;
-    letter-spacing: 0.09em; color: #f87171; margin-bottom: 5px;
-  }
-  .fm-skip-row {
-    font-size: 10px; line-height: 1.5; color: rgba(255,255,255,0.55);
-    padding: 3px 0; word-break: break-word;
-  }
-  .fm-skip-p {
-    font-family: var(--sk-font-mono, monospace); font-size: 8px;
-    letter-spacing: 0.06em; color: rgba(255,255,255,0.35);
-  }
   .fm-empty {
     grid-column: 1 / -1;
     text-align: center;
@@ -127242,11 +127225,8 @@ function _fmTeamColor(seed, isVintage) {
 // same scorecard chrome, sort-by-closeness and open-on-tap all apply with
 // no second renderer. Cats leagues use awayWins/homeWins, points use scores,
 // matching the split the ticker already makes.
-var _fmExtSkips = [];
-
 function _fmExtPairs() {
   var out = [];
-  _fmExtSkips = [];
   var rows = (typeof extSyncedLeagues === 'function') ? extSyncedLeagues() : [];
   for (var i = 0; i < rows.length; i++) {
     var row = rows[i];
@@ -127256,8 +127236,7 @@ function _fmExtPairs() {
     // silence, and the two ways that happens need different fixes: the
     // provider returned nothing we could parse, or we parsed games but
     // couldn't find the user's team in any of them. Record which.
-    if (!ls) { _fmExtSkips.push({ name: row.name || row.key, why: 'no matchup data returned', p: row.provider }); continue; }
-    if (!ls.games || !ls.games.length) { _fmExtSkips.push({ name: row.name || row.key, why: 'matchup data parsed to 0 games', p: row.provider }); continue; }
+    if (!ls || !ls.games || !ls.games.length) continue;
     // FTXMYIDS2 — _extMyIds, never row.myTeamIds directly. This was the third
     // call site to make that mistake. The row now carries the field too, but
     // the resolver stays as the belt-and-braces path.
@@ -127268,22 +127247,21 @@ function _fmExtPairs() {
       if (gg.awayId != null && myIds[String(gg.awayId)]) { g = gg; meAway = true; break; }
       if (gg.homeId != null && myIds[String(gg.homeId)]) { g = gg; meAway = false; break; }
     }
-    if (!g) {
-      var _ids = [];
-      for (var mk in myIds) { if (myIds.hasOwnProperty(mk)) _ids.push(mk); }
-      var _seen = [];
-      for (var sg = 0; sg < ls.games.length && sg < 3; sg++) {
-        _seen.push((ls.games[sg].awayId || '?') + '/' + (ls.games[sg].homeId || '?'));
-      }
-      _fmExtSkips.push({
-        name: row.name || row.key, p: row.provider,
-        why: ls.games.length + ' games, but my team id isn\u2019t in them \u00b7 mine: ' +
-             (_ids.join(',') || '(none)') + ' \u00b7 theirs: ' + _seen.join(' ')
-      });
-      continue;   // bye week, or ids we can't match
-    }
+    if (!g) continue;   // bye week, or a league whose ids we can't match
 
-    var isCats = (g.awayWins != null && g.homeWins != null);
+    // ── FMFMT ── Ask the LEAGUE what it is, don't infer it from the score.
+    //
+    // This read cats-vs-points off whether a W-L tally had parsed out of the
+    // matchup payload. For Fantrax that tally comes from field names the
+    // extractor is still guessing at, so a categories league whose fields
+    // didn't match was labelled POINTS — describing the parser's luck rather
+    // than the league. extFormatKey already resolves this properly for every
+    // provider, including the Fantrax roto-vs-cats distinction.
+    var _fmt = (typeof extFormatKey === 'function') ? extFormatKey(row) : '';
+    var isCats;
+    if (_fmt === 'head' || _fmt === 'headone') isCats = true;
+    else if (_fmt === 'headpoint' || _fmt === 'point') isCats = false;
+    else isCats = (g.awayWins != null && g.homeWins != null);
     var myName = (row.standings && row.standings.name) || (meAway ? g.away : g.home) || row.name || 'Me';
     var oppName = (meAway ? g.home : g.away) || 'Opponent';
     var myLogo = ((typeof extGetMyLogo === 'function') ? (extGetMyLogo(row.key) || '') : '') ||
@@ -127320,22 +127298,6 @@ function _fmExtPairs() {
     });
   }
   return out;
-}
-
-// FMSKIP — say which synced leagues didn't make the board, and why.
-// Only rendered when something was actually dropped.
-function _fmSkipNoteHtml() {
-  if (!_fmExtSkips || !_fmExtSkips.length) return '';
-  var h = '<div class="fm-skip"><div class="fm-skip-head">' +
-    _fmExtSkips.length + ' synced league' + (_fmExtSkips.length === 1 ? '' : 's') +
-    ' not shown</div>';
-  for (var i = 0; i < _fmExtSkips.length; i++) {
-    var s = _fmExtSkips[i];
-    h += '<div class="fm-skip-row"><b>' + slEsc(s.name) + '</b>' +
-      (s.p ? (' <span class="fm-skip-p">' + slEsc(String(s.p).toUpperCase()) + '</span>') : '') +
-      '<br>' + slEsc(s.why) + '</div>';
-  }
-  return h + '</div>';
 }
 
 // ── Sport filter for the board ── FMSORT ──
@@ -127662,7 +127624,7 @@ function _fmRender() {
     return;
   }
 
-  body.innerHTML = cards.join('') + _fmSkipNoteHtml() + _fyStampHtml(null);
+  body.innerHTML = cards.join('') + _fyStampHtml(null);
 }
 
 function _fmOpenLeague(leagueKey) {
