@@ -127258,7 +127258,10 @@ function _fmExtPairs() {
     // couldn't find the user's team in any of them. Record which.
     if (!ls) { _fmExtSkips.push({ name: row.name || row.key, why: 'no matchup data returned', p: row.provider }); continue; }
     if (!ls.games || !ls.games.length) { _fmExtSkips.push({ name: row.name || row.key, why: 'matchup data parsed to 0 games', p: row.provider }); continue; }
-    var myIds = row.myTeamIds || {};
+    // FTXMYIDS2 — _extMyIds, never row.myTeamIds directly. This was the third
+    // call site to make that mistake. The row now carries the field too, but
+    // the resolver stays as the belt-and-braces path.
+    var myIds = (typeof _extMyIds === 'function') ? (_extMyIds(row) || {}) : (row.myTeamIds || {});
     var g = null, meAway = false;
     for (var gi = 0; gi < ls.games.length; gi++) {
       var gg = ls.games[gi];
@@ -150878,7 +150881,10 @@ function extLoadAll(force) {
           var lg = leagues[j] || {};
           var id = lg.leagueId || lg.id;
           if (!id) continue;
-          rows.push({
+          var _fxIds = (typeof _fxMyTeamIds === 'function') ? (_fxMyTeamIds(lg) || {}) : {};
+          var _fxHasIds = false;
+          for (var _fk in _fxIds) { if (_fxIds.hasOwnProperty(_fk)) { _fxHasIds = true; break; } }
+          var _fxRow = {
             key: 'ftx:' + id,
             provider: 'fantrax',
             sport: String(lg.sport || '').toLowerCase(),
@@ -150887,7 +150893,25 @@ function extLoadAll(force) {
             teams: null,
             status: lg.draftStatus || '',
             raw: lg
-          });
+          };
+          // ── FTXMYIDS2 ── Resolve ownership ONCE, here.
+          //
+          // Fantrax was the only provider that never set myTeamIds —
+          // ownership stayed buried in raw — so every consumer reading
+          // row.myTeamIds directly found nothing and silently dropped the
+          // league. That has now been fixed three separate times downstream
+          // (the fantasy hub, the collector, the matchups board), each time by
+          // routing one call site through _extMyIds. Patching call sites can't
+          // finish: the next reader writes the obvious thing and brings it
+          // back. Setting it on the row makes row.myTeamIds right for
+          // everyone, and _extMyIds keeps working since it checks this first.
+          //
+          // Assigned only when it actually resolved. An EMPTY object is
+          // truthy, so writing {} would make _extMyIds return it instead of
+          // falling through to its raw parse — breaking the very call sites
+          // that currently work.
+          if (_fxHasIds) _fxRow.myTeamIds = _fxIds;
+          rows.push(_fxRow);
         }
       }).catch(function() { /* provider hiccup — skip quietly */ });
     jobs.push(fxJob);
@@ -154625,7 +154649,14 @@ function _ftxColorFor(abbr, SPORT) {
 // stats fetch came back.
 function _extMyIds(row) {
   if (!row) return {};
-  if (row.myTeamIds) return row.myTeamIds;
+  // An EMPTY myTeamIds is not an answer. The old check tested row.myTeamIds alone,
+  // and {} is truthy — so a provider that set the field but resolved nothing
+  // would short-circuit the raw-payload fallback and report no teams. FTXMYIDS2
+  if (row.myTeamIds) {
+    for (var k in row.myTeamIds) {
+      if (row.myTeamIds.hasOwnProperty(k)) return row.myTeamIds;
+    }
+  }
   try {
     if (typeof _fxMyTeamIds === 'function') return _fxMyTeamIds(row.raw || {}) || {};
   } catch (e) {}
