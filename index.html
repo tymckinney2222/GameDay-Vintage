@@ -87988,48 +87988,65 @@ function _skWireNflSchedule() {
   // -- WIRENFLFAIL -- Don't re-fire a request that just failed.
   //
   // The freshness check above requires c.data, so a FAILED fetch never
-  // counted as fresh: it left data null, and the next render started the
-  // whole thing over. Every render set inflight, so every render rendered
-  // "loading schedule...", forever, while quietly hammering the endpoint.
-  // The card looked stuck when it was actually looping.
-  //
-  // A failure now sticks for two minutes and records why, so the state is
-  // visible instead of disguised as work in progress.
+  // counted as fresh: it left data null, and the next render started over.
+  // Every render set inflight, so every render rendered "loading schedule",
+  // forever, while hammering the endpoint.
   if (c.err && c.lo === win.lo && c.hi === win.hi && (now - c.failTs) < 120000) {
     return null;
   }
 
+  // -- WIRENFLDAY -- One request per day, not a date RANGE.
+  //
+  // The range form (?dates=START-END) returned HTTP 400. ESPN's scoreboard
+  // takes a single ?dates=YYYYMMDD, which is the shape fetchLeague has always
+  // used and the only one this app has ever proven works. Seven small calls
+  // beat one clever call that the endpoint rejects, and the cache means the
+  // week is fetched once per five minutes regardless.
   c.inflight = true;
   c.err = '';
-  var qs = win.lo.replace(/-/g, '') + '-' + win.hi.replace(/-/g, '');
-  fetch('https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard' +
-        '?dates=' + qs + '&limit=300')
-    .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
-    .then(function(j) {
-      var games = (typeof parseGames === 'function') ? parseGames(j.events, 'NFL') : [];
-      _skWireNflSched.data = _skWireNflBuildStates(games, win);
-      _skWireNflSched.lo = win.lo;
-      _skWireNflSched.hi = win.hi;
-      _skWireNflSched.ts = Date.now();
-      _skWireNflSched.err = '';
-    })
-    .catch(function(e) {
-      // Leave data null so the card says the schedule is unavailable rather
-      // than reporting a count built on nothing -- but record WHY and WHEN,
-      // so the retry is paced and the card can say what went wrong.
-      _skWireNflSched.err = String((e && e.message) || e || 'failed');
+  var days = [];
+  var d = new Date(win.lo + 'T12:00:00');
+  for (var k = 0; k < 7; k++) {
+    days.push(d.getFullYear() +
+      String(d.getMonth() + 1).padStart(2, '0') +
+      String(d.getDate()).padStart(2, '0'));
+    d.setDate(d.getDate() + 1);
+  }
+  var all = [], errs = [], idx = 0;
+  function lane() {
+    if (idx >= days.length) return Promise.resolve();
+    var ds = days[idx++];
+    return fetch('https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard' +
+                 '?dates=' + ds + '&limit=300')
+      .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then(function(j) {
+        var g = (typeof parseGames === 'function') ? parseGames(j.events, 'NFL') : [];
+        for (var i = 0; i < g.length; i++) all.push(g[i]);
+      })
+      .catch(function(e) { errs.push(String((e && e.message) || e)); })
+      .then(lane);
+  }
+  var lanes = [];
+  for (var L = 0; L < 3; L++) lanes.push(lane());
+  Promise.all(lanes).then(function() {
+    // Partial success still beats nothing: a single bad day shouldn't void
+    // the week. Only a clean sweep of failures counts as a failure.
+    if (errs.length >= days.length) {
+      _skWireNflSched.err = errs[0] || 'failed';
       _skWireNflSched.failTs = Date.now();
-      _skWireNflSched.ts = Date.now();
-      _skWireNflSched.lo = win.lo;
-      _skWireNflSched.hi = win.hi;
-    })
-    .then(function() {
-      _skWireNflSched.inflight = false;
-      if (typeof skRenderWireCards === 'function' &&
-          typeof skState !== 'undefined' && skState.mode === 'wire') {
-        try { skRenderWireCards(); } catch (e2) {}
-      }
-    });
+    } else {
+      _skWireNflSched.data = _skWireNflBuildStates(all, win);
+      _skWireNflSched.err = '';
+    }
+    _skWireNflSched.lo = win.lo;
+    _skWireNflSched.hi = win.hi;
+    _skWireNflSched.ts = Date.now();
+    _skWireNflSched.inflight = false;
+    if (typeof skRenderWireCards === 'function' &&
+        typeof skState !== 'undefined' && skState.mode === 'wire') {
+      try { skRenderWireCards(); } catch (e2) {}
+    }
+  });
   return c.data;
 }
 
