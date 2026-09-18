@@ -116525,6 +116525,7 @@ function skBuildLabShellHTML() {
     tab('cats',       'Cats') +
     tab('twostart',   '2 Start') +
     tab('probe',      'Probe') +
+    tab('caps',       'Caps') +
     '</div>' +
     '<div id="skLabPanel"></div>';
 }
@@ -116539,7 +116540,104 @@ function skRenderLabPanel() {
   else if (t === 'cats')  skLabRenderCats(el); // async — manages its own innerHTML
   else if (t === 'twostart') skLabRenderTwoStart(el); // async — manages its own innerHTML
   else if (t === 'probe') skLabRenderProbe(el);       // YPROBE — async
+  else if (t === 'caps') skLabRenderCaps(el);         // YCAPS — async
   el.scrollTop = 0;
+}
+
+// ─── CAPS ────────────────────────────────────────────────────────  YCAPS
+// What Yahoo actually publishes about roster limits, per league.
+//
+// The recurring question is whether Yahoo sends per-POSITION games-played
+// maximums. It does not, and it doesn't need to: it sends at most ONE
+// per-slot number (settings.max_games_played) and the slot counts
+// (settings.roster_positions). Every per-position figure in Yahoo's own UI is
+// the product of those two — a 3-slot OF at 162 per slot shows 486.
+//
+// Innings are the exception and the reason the screen looks inconsistent:
+// max_innings_pitched is a real, separate league rule, because innings can't
+// be derived from how many pitcher slots you roster.
+//
+// What varies by sport is whether max_games_played is present at all — an NBA
+// league published it, a hockey league published nothing. This panel reads it
+// straight from the settings cache so the answer for any given league is a
+// reading rather than a recollection.
+function skLabRenderCaps(el) {
+  var leagues = (typeof fyLeagues !== 'undefined' && fyLeagues) ? fyLeagues : [];
+  if (!leagues.length) {
+    el.innerHTML = '<div class="sk-lab-blurb">No Yahoo leagues synced.</div>';
+    return;
+  }
+  el.innerHTML = '<div class="sk-lab-blurb">What Yahoo publishes about roster limits. ' +
+    '<strong>PER-SLOT</strong> is settings.max_games_played; the per-position maximums in ' +
+    'Yahoo\u2019s own UI are that number times the slot count, never sent separately. ' +
+    '<strong>IP</strong> is max_innings_pitched, a separate rule that can\u2019t be derived ' +
+    'from slots.</div><div id="skCapsList"><div class="sk-probe-note">Reading settings\u2026</div></div>';
+
+  var rows = [], idx = 0;
+  function next() {
+    if (idx >= leagues.length) { paint(true); return; }
+    var lg = leagues[idx++];
+    Promise.resolve()
+      .then(function() { return ensureLeagueSettings(lg.league_key); })
+      .then(function(st) {
+        st = st || (leagueSettingsCache ? leagueSettingsCache[lg.league_key] : null) || {};
+        var slots = [];
+        var rp = st.rosterPositions || [];
+        for (var i = 0; i < rp.length; i++) {
+          var pos = String(rp[i].position || '');
+          if (!pos || pos === 'BN' || pos === 'IL' || pos === 'IR' || pos === 'NA') continue;
+          slots.push(pos + '\u00d7' + (rp[i].count || 0));
+        }
+        rows.push({
+          name: lg.name || lg.league_key,
+          sport: String(lg.sport || '').toUpperCase(),
+          perSlot: (st.maxGamesPlayed != null && st.maxGamesPlayed > 0) ? st.maxGamesPlayed : null,
+          slots: slots
+        });
+      })
+      .catch(function() {
+        rows.push({ name: lg.name || lg.league_key, sport: String(lg.sport || '').toUpperCase(),
+                    perSlot: null, slots: [], err: true });
+      })
+      .then(function() { paint(false); next(); });
+  }
+  function paint(done) {
+    var host = document.getElementById('skCapsList');
+    if (!host) return;
+    var h = '';
+    for (var i = 0; i < rows.length; i++) {
+      var r = rows[i];
+      var cls = r.perSlot != null ? 'hit' : 'miss';
+      h += '<div class="sk-probe-row ' + cls + '">' +
+        '<div class="sk-probe-lbl">' + skEscape(r.name) +
+          ' <span class="sk-probe-ctl">' + skEscape(r.sport) + '</span></div>' +
+        '<div class="sk-probe-verdict">PER-SLOT ' +
+          (r.perSlot != null ? r.perSlot : 'not published') + '</div>' +
+        (r.slots.length
+          ? ('<div class="sk-probe-path">' + skEscape(r.slots.join('  ')) + '</div>')
+          : '<div class="sk-probe-path">(no roster_positions)</div>') +
+        (r.perSlot != null && r.slots.length
+          ? ('<div class="sk-probe-hit"><span class="k">derived maxima</span> <span class="v">' +
+             skEscape(_skCapsDerived(r)) + '</span></div>')
+          : '') +
+      '</div>';
+    }
+    if (!done) h += '<div class="sk-probe-note">Reading settings\u2026</div>';
+    host.innerHTML = h;
+  }
+  next();
+}
+
+// Per-position maxima, the same multiplication Yahoo's UI does.
+function _skCapsDerived(r) {
+  var out = [];
+  for (var i = 0; i < r.slots.length && i < 12; i++) {
+    var parts = String(r.slots[i]).split('\u00d7');
+    var n = parseInt(parts[1], 10) || 0;
+    if (!n) continue;
+    out.push(parts[0] + ' ' + (n * r.perSlot));
+  }
+  return out.join('  ');
 }
 
 // ─── PROBE ───────────────────────────────────────────────────────  YPROBE
