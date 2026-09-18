@@ -87875,6 +87875,9 @@ function _skWireNflLive(entry) {
     mine: mine, theirs: theirs,
     known: !!gs,
     loading: !gs && !!(typeof _skWireNflSched !== 'undefined' && _skWireNflSched.inflight),
+    // WIRENFLFAIL - the reason, when there is one, so a broken fetch reads
+    // as broken rather than as perpetually in progress.
+    err: (typeof _skWireNflSched !== 'undefined') ? (_skWireNflSched.err || '') : '',
     anyLive: !!(gs && gs.anyLive),
     anyPre: !!(gs && gs.anyPre),
     nextKick: gs ? gs.nextKick : null,
@@ -87971,7 +87974,7 @@ function _skWireNflWeekWindow() {
 //
 // Cached for 5 minutes, or 60 seconds while anything is live, since that's
 // the only time a state actually changes underneath us.
-var _skWireNflSched = { lo: '', hi: '', ts: 0, data: null, inflight: false };
+var _skWireNflSched = { lo: '', hi: '', ts: 0, data: null, inflight: false, err: '', failTs: 0 };
 
 function _skWireNflSchedule() {
   var win = _skWireNflWeekWindow();
@@ -87982,7 +87985,22 @@ function _skWireNflSchedule() {
   if (fresh) return c.data;
   if (c.inflight) return (c.lo === win.lo) ? c.data : null;
 
+  // -- WIRENFLFAIL -- Don't re-fire a request that just failed.
+  //
+  // The freshness check above requires c.data, so a FAILED fetch never
+  // counted as fresh: it left data null, and the next render started the
+  // whole thing over. Every render set inflight, so every render rendered
+  // "loading schedule...", forever, while quietly hammering the endpoint.
+  // The card looked stuck when it was actually looping.
+  //
+  // A failure now sticks for two minutes and records why, so the state is
+  // visible instead of disguised as work in progress.
+  if (c.err && c.lo === win.lo && c.hi === win.hi && (now - c.failTs) < 120000) {
+    return null;
+  }
+
   c.inflight = true;
+  c.err = '';
   var qs = win.lo.replace(/-/g, '') + '-' + win.hi.replace(/-/g, '');
   fetch('https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard' +
         '?dates=' + qs + '&limit=300')
@@ -87993,10 +88011,14 @@ function _skWireNflSchedule() {
       _skWireNflSched.lo = win.lo;
       _skWireNflSched.hi = win.hi;
       _skWireNflSched.ts = Date.now();
+      _skWireNflSched.err = '';
     })
-    .catch(function() {
+    .catch(function(e) {
       // Leave data null so the card says the schedule is unavailable rather
-      // than reporting a count built on nothing.
+      // than reporting a count built on nothing -- but record WHY and WHEN,
+      // so the retry is paced and the card can say what went wrong.
+      _skWireNflSched.err = String((e && e.message) || e || 'failed');
+      _skWireNflSched.failTs = Date.now();
       _skWireNflSched.ts = Date.now();
       _skWireNflSched.lo = win.lo;
       _skWireNflSched.hi = win.hi;
@@ -88005,7 +88027,7 @@ function _skWireNflSchedule() {
       _skWireNflSched.inflight = false;
       if (typeof skRenderWireCards === 'function' &&
           typeof skState !== 'undefined' && skState.mode === 'wire') {
-        try { skRenderWireCards(); } catch (e) {}
+        try { skRenderWireCards(); } catch (e2) {}
       }
     });
   return c.data;
@@ -88900,7 +88922,8 @@ function _skBuildWireLeagueRowHTML(league, entry) {
     var remainTxt = '';
     if (!nf.known) {
       remainTxt = 'Week ' + (nf.week || '?') + ' \u00b7 ' +
-        (nf.loading ? 'loading schedule\u2026' : 'schedule unavailable');
+        (nf.loading ? 'loading schedule\u2026'
+                    : ('schedule unavailable' + (nf.err ? (' \u00b7 ' + nf.err) : '')));
     } else if (nf.settled) {
       remainTxt = 'Week ' + (nf.week || '?') + ' final';
       var byeF = nf.mine.bye + nf.theirs.bye;
