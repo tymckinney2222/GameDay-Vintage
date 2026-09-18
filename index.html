@@ -97909,9 +97909,6 @@ function skBuildDetailHTML(league) {
           '<div id="skCapWatchContent">' +
           '<div class="sk-gpb-empty">Loading\u2026</div>' +
           '</div>' +
-          // GPCAPMLB — baseball shows both boards in this tab: innings above,
-          // hitter games below. Empty for every other sport.
-          '<div id="skCapWatchGp"></div>' +
         '</div>'
       : '') +   // GPTAB
     // Adds pane — league-wide weekly-adds board ("who's out of bullets").
@@ -98061,21 +98058,8 @@ var _skGpRebuilding = false;   // GPTABFIX
 function _skKickGpBoard(league) {
   if (!league || typeof _skIsGpCapLeague !== 'function' || !_skIsGpCapLeague(league)) return;
   setTimeout(function () {
-    // ── GPCAPMLB2 ── Baseball draws into its OWN container.
-    //
-    // This wrote the games board into skCapWatchContent, which for every
-    // other sport IS the whole pane. Once MLB started satisfying
-    // _skIsGpCapLeague, that same line began overwriting the innings board
-    // it was supposed to sit beneath — the tab lost the thing it exists for.
-    // Hitters get skCapWatchGp; innings keep skCapWatchContent.
-    var _mlb = (typeof _skIsSeasonPtsMlb === 'function') && _skIsSeasonPtsMlb(league);
-    var host = document.getElementById(_mlb ? 'skCapWatchGp' : 'skCapWatchContent');
+    var host = document.getElementById('skCapWatchContent');
     if (!host) return;   // pane not in the DOM (league without the tab)
-    // On baseball the innings board has to be drawn too — the render path
-    // reaches this kicker instead of the tab-switch branch.
-    if (_mlb && typeof _skHydrateCapWatch === 'function') {
-      try { _skHydrateCapWatch(league, league.league_key); } catch (e0) {}
-    }
     try {
       _skRenderGpBoard(league, host);
     } catch (e) {
@@ -98169,21 +98153,11 @@ function skSetDetailTab(tab) {
       }
       return;
     }
-    // GPCAPMLB2 — an MLB league WITHOUT a published per-slot number never
-    // reaches the rebuild guard above, so it still needs the innings board
-    // drawn here. One that does have the number goes through _skKickGpBoard,
-    // which draws both.
     if (leagueCw && typeof _skIsGpCapLeague === 'function' && _skIsGpCapLeague(leagueCw)) {
       // Hockey: no fetch at all — the board reads caches. GPBOARD
       // Do NOT swallow this. A silent catch here is exactly why the pane
       // rendered blank with no clue as to why. GPBOARD2
-      // GPCAPMLB2 — same split as the kicker: baseball's hitter board lives
-      // in its own container so the innings board above it survives.
-      var _cwMlb = (typeof _skIsSeasonPtsMlb === 'function') && _skIsSeasonPtsMlb(leagueCw);
-      var _gpHost = document.getElementById(_cwMlb ? 'skCapWatchGp' : 'skCapWatchContent');
-      if (_cwMlb && typeof _skHydrateCapWatch === 'function') {
-        try { _skHydrateCapWatch(leagueCw, lkCw); } catch (e4) {}
-      }
+      var _gpHost = document.getElementById('skCapWatchContent');
       try {
         _skRenderGpBoard(leagueCw, _gpHost);
       } catch (e) {
@@ -107696,20 +107670,9 @@ function _skGpMaxByPos(leagueKey) {
   // as "Util" in settings but uppercases in a lineup — matching them raw made
   // Util read as zero games used forever. Label kept alongside for display.
   // GPCAP
-  // GPCAPMLB — in baseball a pitcher slot has no games-played maximum; its
-  // limit is innings, and Cap Watch already reports that. Deriving one here
-  // would invent a number no league enforces and double-count the roster.
-  var _mlb = false;
-  try {
-    var _lg = (typeof fyLeagues !== 'undefined' && fyLeagues)
-      ? fyLeagues.filter(function(l) { return l.league_key === leagueKey; })[0] : null;
-    _mlb = !!_lg && String(_lg.sport || '').toLowerCase() === 'mlb';
-  } catch (e) {}
   var out = {};
   for (var i = 0; i < rp.length; i++) {
-    if (!(rp[i].count > 0)) continue;
-    if (_mlb && String(rp[i].type || '').toUpperCase() === 'P') continue;
-    out[String(rp[i].position).toUpperCase()] = rp[i].count * per;
+    if (rp[i].count > 0) out[String(rp[i].position).toUpperCase()] = rp[i].count * per;
   }
   return out;
 }
@@ -107759,9 +107722,28 @@ function _skGpCountDate(fpMap) {
     if (!fpMap.hasOwnProperty(pk)) continue;
     var e = fpMap[pk];
     if (!e || !_isActiveSlot(e.selectedPos)) continue;
+    // ── GPPLAYED ── "Has a stats object" was the wrong test.
+    //
+    // _parseTeamFpResponse stores every stat whose value parses as a number,
+    // and Yahoo returns a full line of ZEROS for a rostered player whose club
+    // didn't play. So an idle slot looked identical to one that played, and a
+    // team with one appearance at a position read as two.
+    //
+    // A real appearance leaves a mark: an 0-for-4 still has AB=4, a pinch
+    // runner has R=1, a skater who dressed has TOI. So the test is any
+    // NONZERO stat, or fantasy points on the board.
+    //
+    // Better, not exact. Someone who appeared and produced a pure zero line
+    // still reads as not played, so this is a LOWER BOUND — which is why the
+    // board calls itself an estimate.
     var played = false;
-    if (e.stats && typeof e.stats === 'object') {
-      for (var sk in e.stats) { if (e.stats.hasOwnProperty(sk)) { played = true; break; } }
+    if (typeof e.fp === 'number' && e.fp !== 0) played = true;
+    if (!played && e.stats && typeof e.stats === 'object') {
+      for (var sk in e.stats) {
+        if (!e.stats.hasOwnProperty(sk)) continue;
+        var sv = e.stats[sk];
+        if (typeof sv === 'number' && sv !== 0) { played = true; break; }
+      }
     }
     if (!played) continue;
     var pos = String(e.selectedPos || '').toUpperCase();
@@ -107971,10 +107953,17 @@ function _skIsGpCapLeague(league) {
   // usage. GPCAPNBA
   if (!league) return false;
   var sp = String(league.sport || '').toLowerCase();
-  // MLB joins them for HITTERS only. Its pitchers are capped by innings and
-  // already have the IP board; _skGpMaxByPos drops pitcher slots so the two
-  // boards never claim the same roster spots. GPCAPMLB
-  if (sp !== 'nhl' && sp !== 'nba' && sp !== 'mlb') return false;
+  // ── GPCAPMLBOUT ── Hockey and basketball only, deliberately.
+  //
+  // Baseball was added and then removed. The usage count is derived from
+  // cached lineups and can only ever be a LOWER BOUND: a player who appears
+  // and produces a pure zero line is indistinguishable from one who never
+  // left the bench, and Yahoo publishes no GP-per-position counter to check
+  // against. In hockey and basketball that estimate is the only signal there
+  // is, so it earns its place. In baseball it would sit directly beneath the
+  // innings board — a number Yahoo publishes exactly — and invite a
+  // comparison it cannot survive. Cap Watch stays the IP board there.
+  if (sp !== 'nhl' && sp !== 'nba') return false;
   return _skGetGpPerSlot(league.league_key) != null;
 }
 
