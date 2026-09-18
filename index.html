@@ -39694,6 +39694,22 @@ async function fetchTeamFpForDate(teamKey, date) {
       // Also guard against empty maps (failed parse): writing {} to
       // localStorage would cache a bad result permanently.
       var _hasData = Object.keys(byKey).length > 0;
+      // ── GPTALLY ── Keep a 40-byte position tally regardless.
+      //
+      // The full roster map does NOT survive: the Vs-the-League grid deletes
+      // other teams' persisted rosters right after reading them, and
+      // _fpCacheTrim caps the whole store at 140 entries and evicts oldest
+      // first. In a 12-team league that's about eleven days, shared across
+      // every league. So "coverage grows on its own" was false — the games
+      // board could only ever see a day or two no matter how often the app
+      // was opened.
+      //
+      // A per-position count for one team on one day is a few dozen bytes
+      // against 7 KB for the roster it came from, so it can be kept for the
+      // whole season in its own namespace, untouched by either eviction.
+      if (_hasData && typeof _skGpWriteTally === 'function') {
+        try { _skGpWriteTally(teamKey, date, byKey, isImmutable); } catch (e3) {}
+      }
       if (isImmutable && _hasData) {
         // STORAGE — quota-aware: makes room and retries rather than failing
         // silently and leaving this date permanently uncached.
@@ -107770,15 +107786,80 @@ function _skGpDateRange(league) {
   return out;
 }
 
-// Usage for one team across the season so far, from cache only.
-function _skGpUsageForTeam(league, teamKey) {
+// ── GPTALLY ── The durable per-date position count.
+//
+// Written at the fetch choke point so every caller feeds it, and stored in
+// its own namespace so neither the Vs-the-League roster drop nor the 140-entry
+// FP trim can take it. Only settled days are persisted: today's lineup is
+// still accruing, so writing it would freeze a partial count.
+var GP_LS_PREFIX = 'gptal_v1_';
+
+function _skGpWriteTally(teamKey, date, fpMap, isImmutable) {
+  if (!isImmutable) return;                 // today/yesterday still moving
+  var day = _skGpCountDate(fpMap);
+  var keys = Object.keys(day);
+  if (!keys.length) return;                 // nobody played — nothing to keep
+  try {
+    localStorage.setItem(GP_LS_PREFIX + _fpKey(teamKey, date), JSON.stringify(day));
+  } catch (e) { /* quota: the board just reports lower coverage */ }
+}
+
+function _skGpReadTally(teamKey, date) {
+  try {
+    var raw = localStorage.getItem(GP_LS_PREFIX + _fpKey(teamKey, date));
+    if (raw) return JSON.parse(raw);
+  } catch (e) {}
+  // Fall back to a full roster map if one happens to still be around.
+  var m = _skGpReadCachedMap(teamKey, date);
+  return m ? _skGpCountDate(m) : null;
+}
+
+// Is a date counted for this team? Presence only — no JSON parse, because
+// this runs teams x dates just to work out the common window. GPCOMMON
+function _skGpHasCachedMap(teamKey, date) {
+  try { if (localStorage.getItem(GP_LS_PREFIX + _fpKey(teamKey, date)) != null) return true; }
+  catch (e) {}
+  var memKey = _fpKey(teamKey, date);
+  if (teamFpCache[memKey]) return true;
+  try { return localStorage.getItem(FP_LS_PREFIX + memKey) != null; }
+  catch (e2) { return false; }
+}
+
+// ── GPCOMMON ── Every row counts the SAME days.
+//
+// This used to count whatever each team happened to have cached, then print
+// one coverage figure — the minimum across teams. So a row built from three
+// cached days sat beside a row built from one, under a note saying "1 day",
+// and the columns weren't comparable with each other or with the note. On a
+// board whose entire purpose is comparing teams against a shared ceiling,
+// that's the wrong kind of wrong: every number was individually defensible
+// and the table as a whole wasn't.
+//
+// Now the window is the INTERSECTION — the dates cached for every team — so a
+// row is directly comparable to the row above it, and the reported count is
+// the number actually used rather than a summary of something else.
+function _skGpCommonDates(league, teamKeys) {
   var dates = _skGpDateRange(league);
+  var out = [];
+  for (var i = 0; i < dates.length; i++) {
+    var ok = true;
+    for (var t = 0; t < teamKeys.length; t++) {
+      if (!_skGpHasCachedMap(teamKeys[t], dates[i])) { ok = false; break; }
+    }
+    if (ok) out.push(dates[i]);
+  }
+  return { common: out, elapsed: dates.length };
+}
+
+// Usage for one team, over a supplied date list (or the whole season so far).
+function _skGpUsageForTeam(league, teamKey, dateList) {
+  var dates = dateList || _skGpDateRange(league);
   var byPos = {}, counted = 0;
   for (var i = 0; i < dates.length; i++) {
-    var m = _skGpReadCachedMap(teamKey, dates[i]);
-    if (!m) continue;
+    // GPTALLY — the tally first; a surviving roster map is the fallback.
+    var day = _skGpReadTally(teamKey, dates[i]);
+    if (!day) continue;
     counted++;
-    var day = _skGpCountDate(m);
     for (var pos in day) {
       if (day.hasOwnProperty(pos)) byPos[pos] = (byPos[pos] || 0) + day[pos];
     }
@@ -107938,11 +108019,11 @@ function _skRenderGpBoard(league, host) {
   var positions = Object.keys(maxByPos);
   var myKey = data && data.team && data.team.team_key;
 
-  var rows = [], minCoverage = null, maxElapsed = 0;
+  // GPCOMMON — one shared window so the rows can be compared.
+  var _win = _skGpCommonDates(league, teamKeys);
+  var rows = [], minCoverage = _win.common.length, maxElapsed = _win.elapsed;
   teamKeys.forEach(function (tk) {
-    var u = _skGpUsageForTeam(league, tk);
-    maxElapsed = Math.max(maxElapsed, u.daysElapsed);
-    if (minCoverage == null || u.daysCounted < minCoverage) minCoverage = u.daysCounted;
+    var u = _skGpUsageForTeam(league, tk, _win.common);
     // Worst position = the one closest to its ceiling; that's the one that
     // freezes first and the only one worth sorting on.
     var worst = null;
@@ -107988,7 +108069,8 @@ function _skRenderGpBoard(league, host) {
 
   host.innerHTML =
     '<div class="sk-gpb-cov ' + covCls + '">Counted from ' + minCoverage + ' of ' +
-      maxElapsed + ' elapsed days (' + cov + '%). ' +
+      maxElapsed + ' elapsed days (' + cov + '%) \u2014 the days cached for ' +
+      'EVERY team, so the rows compare like for like. ' +
       'Usage is derived from cached daily lineups, not published by Yahoo \u2014 ' +
       'treat it as an estimate and spot-check against Team \u2192 Max Games Played.</div>' +
     '<div class="sk-gpb">' + head + body + '</div>' +
