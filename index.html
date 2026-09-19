@@ -18373,6 +18373,37 @@
   .sk-wire-cat-head .col-marker { text-align: center; }
 
   /* ─── Points: ranked player row ──────────────────────────── */
+  /* SKSCOUT / SKRECAP — sheets built on The Wire's chrome */
+  .sk-scout-trigger { background: rgba(234,179,8,0.08); border-color: rgba(234,179,8,0.35); }
+  .sk-rc-tiles { display: flex; gap: 6px; margin: 4px 4px 8px; }
+  .sk-rc-tiles > div {
+    flex: 1; min-width: 0; text-align: center; padding: 8px 4px; border-radius: 10px;
+    background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06);
+  }
+  .sk-rc-tiles b { display: block; font-family: var(--sk-font-mono); font-size: 18px; color: var(--sk-text); }
+  .sk-rc-tiles span {
+    font-family: var(--sk-font-mono); font-size: 8.5px; letter-spacing: 0.12em;
+    text-transform: uppercase; color: var(--sk-text-4);
+  }
+  .sk-rc-note { font-size: 12px; line-height: 1.55; color: var(--sk-text-3); margin: 8px 6px 2px; }
+  .sk-sc-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 4px; }
+  .sk-sc-chip {
+    font-family: var(--sk-font-mono); font-size: 10.5px; padding: 4px 8px; border-radius: 8px;
+    border: 1px solid rgba(255,255,255,0.1); color: var(--sk-text-3);
+  }
+  .sk-sc-chip b { margin: 0 2px; }
+  .sk-sc-chip.w { border-color: rgba(74,222,128,0.4); } .sk-sc-chip.w b { color: #4ade80; }
+  .sk-sc-chip.l { border-color: rgba(248,113,113,0.4); } .sk-sc-chip.l b { color: #f87171; }
+  .sk-sc-chip.t b { color: #fbbf24; }
+  .sk-sc-verdict {
+    display: inline-block; margin: 0 6px; padding: 4px 12px; border-radius: 999px;
+    font-family: var(--sk-font-mono); font-size: 11px; font-weight: 800; letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  .sk-sc-verdict.good { color: #4ade80; background: rgba(74,222,128,0.1); }
+  .sk-sc-verdict.mid  { color: #fbbf24; background: rgba(251,191,36,0.1); }
+  .sk-sc-verdict.bad  { color: #f87171; background: rgba(248,113,113,0.1); }
+  .sk-sc-good { color: #4ade80; } .sk-sc-bad { color: #f87171; }
   /* WIREPL — player lines on The Wire sheet */
   .sk-wpl-tabs { display: flex; gap: 6px; margin: 0 4px 10px; }
   .sk-wpl-tab {
@@ -39982,6 +40013,7 @@ function _parseTeamFpResponse(data) {
                                   // detect pitchers on a roster we don't own
                                   // (the opponent), which has no displayPos field.
         var positionType = '';    // 'P' for pitchers, 'B' for batters
+        var elig = [];            // SKBANK — eligible slot names
         for (var m = 0; m < meta.length; m++) {
           var x = meta[m];
           if (!x || typeof x !== 'object') continue;
@@ -39994,6 +40026,15 @@ function _parseTeamFpResponse(data) {
           }
           if (x.display_position != null && x.display_position !== '') displayPosition = String(x.display_position);
           if (x.position_type != null && x.position_type !== '') positionType = String(x.position_type);
+          // SKBANK — every slot this player may fill (C, 1B, Util, P, …),
+          // in Yahoo's own slot names. Drives the optimal-lineup math.
+          if (x.eligible_positions) {
+            var _ep = _yahooArr(x.eligible_positions);
+            for (var _e = 0; _e < _ep.length; _e++) {
+              var _pos = _ep[_e] && (_ep[_e].position || (_ep[_e].eligible_position && _ep[_e].eligible_position.position));
+              if (_pos) elig.push(String(_pos));
+            }
+          }
           // Injury/availability designation (separate from today's lineup).
           if (x.status != null && x.status !== '') pStatus = String(x.status);
           if (x.status_full != null && x.status_full !== '') pStatusFull = String(x.status_full);
@@ -40063,7 +40104,7 @@ function _parseTeamFpResponse(data) {
           }
         }
         out[key] = { fp: fp, selectedPos: selectedPos, name: name, teamAbbr: teamAbbr, stats: stats,
-          displayPosition: displayPosition, positionType: positionType,
+          displayPosition: displayPosition, positionType: positionType, elig: elig,
           status: pStatus, statusFull: pStatusFull, isStarting: isStarting, battingOrder: battingOrder };
       } catch (e) { /* skip player on parse error */ }
     }
@@ -88709,6 +88750,7 @@ async function skScanWireLeague(league) {
     }
 
     skWireCache[key] = entry;
+    try { _skBankDay(league, entry); } catch (eb) {}   // SKBANK
     return entry;
   } catch (e) {
     entry.error = e.message || 'Scan failed';
@@ -89676,9 +89718,872 @@ function _skWirePLPaint() {
   host.innerHTML = h;
 }
 
+// ══════════════════════════════════════════════════════════════════
+// SKBANK — the daily bank: a small per-league record of every day,
+// kept on the device, that lineup efficiency and the season recap are
+// built from. Heavy free-agent churn is fine: each day records who was
+// actually in the lineup THAT day, so a player picked up in May and cut
+// in June still counts for the days he played for you.
+//
+// Fed by The Wire scan, which already reads yesterday for every league.
+// Points leagues: zero extra requests (the Wire fetched the same roster
+// day). Categories leagues: one small request per league per day (the
+// Wire reads their totals from a different endpoint). If the app wasn't
+// opened for a day or two, the next scan fills up to two missed days —
+// only for a league whose bank has already started, so nothing reaches
+// back before today.
+//
+// Written only once yesterday is final (after 5am local): a scan just
+// after midnight can still be mid-game on the west coast, and a day is
+// banked once and never rewritten.
+//
+// Storage: sk_bank_v1_<leagueKey> =
+//   { v, sport, st,
+//     days: { 'YYYY-MM-DD': [actualFp, optimalFp, benchFp, idleStarters,
+//                            { statId: benchTotal }] },
+//     pl:   { playerKey: [name, club, daysActive, daysBench, fpActive,
+//                         { statId: activeTotal }, firstDay, lastDay,
+//                         positionType] } }
+// Per-player season aggregates rather than raw days, so a full season is
+// a few KB per league. League keys carry the season's game id, so a new
+// season is a new key.
+// ══════════════════════════════════════════════════════════════════
+var SK_BANK_PREFIX = 'sk_bank_v1_';
+var _skBankMem = {};
+var _skBankBusy = {};
+
+function _skBankEligible(league) {
+  if (!league || !league.league_key) return false;
+  var sp = String(league.sport || '').toLowerCase();
+  if (sp === 'nfl' || sp === 'cfb') return false;   // weekly lineups; not banked yet
+  var st = String(league.scoring_type || '');
+  return st === 'head' || st === 'headone' || st === 'headpoint' || st === 'point';
+}
+function _skBankGet(key) {
+  if (_skBankMem[key]) return _skBankMem[key];
+  var o = null;
+  try { o = JSON.parse(localStorage.getItem(SK_BANK_PREFIX + key) || 'null'); } catch (e) {}
+  if (!o || typeof o !== 'object' || !o.days || !o.pl) o = { v: 1, sport: '', st: '', days: {}, pl: {} };
+  _skBankMem[key] = o;
+  return o;
+}
+function _skBankPut(key) {
+  try { localStorage.setItem(SK_BANK_PREFIX + key, JSON.stringify(_skBankGet(key))); } catch (e) {}
+}
+function _skBankIsPts(st) { return st === 'headpoint' || st === 'point'; }
+
+// Stats that ADD UP over a season and where more is better: the ones a
+// bench can "leave behind". Rate stats (AVG, ERA…) and lower-is-better
+// stats (L, pitcher BB…) are excluded.
+function _skBankCounting(meta) {
+  if (!meta || !meta.enabled || meta.isOnlyDisplayStat) return false;
+  if (meta.sortOrder === 0) return false;
+  var ab = String(meta.abbr || meta.displayName || '');
+  return !/AVG|OBP|SLG|OPS|%|ERA|WHIP|\/9|GAA|K\/BB|A\/T/i.test(ab);
+}
+
+// Active lineup slots from the league's roster settings, expanded by
+// count: [{pos:'OF'}, {pos:'OF'}, {pos:'OF'}, {pos:'Util'}, …].
+function _skBankSlots(leagueKey) {
+  var set = (typeof leagueSettingsCache === 'object' && leagueSettingsCache) ? leagueSettingsCache[leagueKey] : null;
+  var rp = (set && set.rosterPositions) || [];
+  var out = [], i, c;
+  for (i = 0; i < rp.length; i++) {
+    var pos = String(rp[i].position || '');
+    var up = pos.toUpperCase();
+    if (!pos || up === 'BN' || up === 'NA' || up === 'IR' || up === 'DL' || up.indexOf('IL') === 0) continue;
+    var n = parseInt(rp[i].count, 10) || 1;
+    for (c = 0; c < n; c++) out.push(pos);
+  }
+  return out;
+}
+
+// Can this player fill this slot? Yahoo's eligible_positions answers it
+// exactly when present; older cached days fall back to the eligibility
+// string plus the two universal flex slots.
+function _skBankCanFill(p, slot) {
+  var S = String(slot).toUpperCase(), i;
+  if (p.elig && p.elig.length) {
+    for (i = 0; i < p.elig.length; i++) if (String(p.elig[i]).toUpperCase() === S) return true;
+    return false;
+  }
+  var toks = String(p.displayPosition || '').toUpperCase().split(/[,\/]/);
+  for (i = 0; i < toks.length; i++) if (toks[i].replace(/\s+/g, '') === S) return true;
+  if (S === 'UTIL') return p.positionType !== 'P' && p.positionType !== 'G';
+  if (S === 'P') return p.positionType === 'P';
+  return false;
+}
+
+// Best possible lineup points for the day, from everyone who was on the
+// active lineup or the bench (IL/NA slots can't be started). Because a
+// player's value doesn't depend on WHICH slot he fills, the best lineup
+// is found greedily: take players highest-points-first, keeping each one
+// if the lineup can still be rearranged to fit him (an augmenting-path
+// check). That's exact for this kind of problem, not an approximation.
+// Doesn't know about game caps (max starts, games-played limits).
+function _skBankOptimal(players, slots) {
+  if (!slots.length) return null;
+  var owner = [], i, total = 0;
+  for (i = 0; i < slots.length; i++) owner.push(-1);
+  var cand = players.filter(function (p) { return p.fp != null && p.fp > 0; })
+                    .sort(function (a, b) { return b.fp - a.fp; });
+  function place(pi, seen) {
+    for (var si = 0; si < slots.length; si++) {
+      if (seen[si] || !_skBankCanFill(cand[pi], slots[si])) continue;
+      seen[si] = 1;
+      if (owner[si] === -1 || place(owner[si], seen)) { owner[si] = pi; return true; }
+    }
+    return false;
+  }
+  for (i = 0; i < cand.length; i++) {
+    if (place(i, {})) total += cand[i].fp;
+  }
+  return Math.round(total * 10) / 10;
+}
+
+function _skBankLocalDay(offset) {
+  var d = new Date();
+  d.setDate(d.getDate() + offset);
+  var m = d.getMonth() + 1, dd = d.getDate();
+  return d.getFullYear() + '-' + (m < 10 ? '0' : '') + m + '-' + (dd < 10 ? '0' : '') + dd;
+}
+
+// Fold one day's roster map into the bank.
+function _skBankFold(league, st, date, map) {
+  var key = league.league_key;
+  var bank = _skBankGet(key);
+  if (bank.days[date]) return false;
+  var set = (typeof leagueSettingsCache === 'object' && leagueSettingsCache) ? leagueSettingsCache[key] : null;
+  var meta = (set && set.stats) || {};
+  var sport = String(league.sport || 'mlb').toLowerCase();
+  var isPts = _skBankIsPts(st);
+  var act = 0, bench = 0, idle = 0, benchStats = {}, pool = [], k, sid;
+  var sawAny = false;
+  for (k in map) {
+    if (!map.hasOwnProperty(k)) continue;
+    var p = map[k];
+    if (!p) continue;
+    var slot = String(p.selectedPos || '').toUpperCase();
+    var active = _isActiveSlot(p.selectedPos);
+    var onBench = (slot === 'BN');
+    if (!active && !onBench) continue;              // IL / NA: couldn't play
+    sawAny = true;
+    var fp = (typeof p.fp === 'number' && !isNaN(p.fp)) ? p.fp : null;
+    var statKeys = Object.keys(p.stats || {});
+    var played = statKeys.length > 0 || (fp != null && fp !== 0);
+    pool.push(p);
+    var rec = bank.pl[k];
+    if (!rec) rec = bank.pl[k] = [p.name || '', p.teamAbbr || '', 0, 0, 0, {}, date, date, p.positionType || ''];
+    if (p.name) rec[0] = p.name;
+    if (p.teamAbbr) rec[1] = p.teamAbbr;
+    if (date < rec[6]) rec[6] = date;
+    if (date > rec[7]) rec[7] = date;
+    if (active) {
+      rec[2]++;
+      if (fp != null) { act += fp; rec[4] = Math.round((rec[4] + fp) * 10) / 10; }
+      for (sid in p.stats) {
+        if (!p.stats.hasOwnProperty(sid) || !_skBankCounting(meta[sid])) continue;
+        rec[5][sid] = Math.round(((rec[5][sid] || 0) + p.stats[sid]) * 10) / 10;
+      }
+      // Idle starter: in the lineup, didn't play. Pitchers' and goalies'
+      // off days are normal, so only everyday players count.
+      var everyday = (sport === 'mlb') ? p.positionType !== 'P'
+                   : (sport === 'nhl') ? p.positionType !== 'G' : true;
+      if (!played && everyday) idle++;
+    } else {
+      rec[3]++;
+      if (fp != null) bench += fp;
+      for (sid in p.stats) {
+        if (!p.stats.hasOwnProperty(sid) || !_skBankCounting(meta[sid])) continue;
+        benchStats[sid] = Math.round(((benchStats[sid] || 0) + p.stats[sid]) * 10) / 10;
+      }
+    }
+  }
+  if (!sawAny) return false;
+  var opt = isPts ? _skBankOptimal(pool, _skBankSlots(key)) : null;
+  if (opt != null && opt < act) opt = Math.round(act * 10) / 10;   // never below what was scored
+  bank.sport = sport; bank.st = st;
+  bank.days[date] = [isPts ? Math.round(act * 10) / 10 : null, opt,
+                     isPts ? Math.round(bench * 10) / 10 : null, idle, benchStats];
+  return true;
+}
+
+function _skBankDay(league, entry) {
+  if (!_skBankEligible(league) || !entry || entry.error || entry.isFootball) return;
+  if (!entry.myTeamKey || !entry.dateStr) return;
+  if (new Date().getHours() < 5) return;            // yesterday may still be live
+  var key = league.league_key;
+  if (_skBankBusy[key]) return;
+  var st = entry.scoringType || league.scoring_type;
+  var bank = _skBankGet(key);
+  var want = [entry.dateStr];
+  var started = false;
+  for (var d in bank.days) { if (bank.days.hasOwnProperty(d)) { started = true; break; } }
+  if (started) {                                    // fill up to two missed days
+    for (var off = -3; off <= -2; off++) {
+      var dd = _skBankLocalDay(off);
+      if (!bank.days[dd]) want.unshift(dd);
+    }
+  }
+  want = want.filter(function (x) { return !bank.days[x]; });
+  if (!want.length) return;
+  _skBankBusy[key] = 1;
+  var i = 0, wrote = false;
+  function next() {
+    if (i >= want.length) {
+      delete _skBankBusy[key];
+      if (wrote) _skBankPut(key);
+      return;
+    }
+    var date = want[i++];
+    fetchTeamFpForDate(entry.myTeamKey, date).then(function (map) {
+      if (map && _skBankFold(league, st, date, map)) wrote = true;
+      next();
+    }, function () { next(); });
+  }
+  next();
+}
+
+// Summary of a league's bank: totals across banked days.
+function _skBankSummary(key) {
+  var bank = _skBankGet(key);
+  var o = { days: 0, first: null, last: null, act: 0, opt: 0, optDays: 0, bench: 0, idle: 0,
+            benchStats: {}, bestDay: null, st: bank.st, sport: bank.sport };
+  for (var d in bank.days) {
+    if (!bank.days.hasOwnProperty(d)) continue;
+    var r = bank.days[d];
+    o.days++;
+    if (!o.first || d < o.first) o.first = d;
+    if (!o.last || d > o.last) o.last = d;
+    if (r[0] != null) {
+      o.act += r[0];
+      if (!o.bestDay || r[0] > o.bestDay.fp) o.bestDay = { date: d, fp: r[0] };
+    }
+    if (r[1] != null && r[0] != null) { o.opt += r[1]; o.optDays++; }
+    if (r[2] != null) o.bench += r[2];
+    o.idle += r[3] || 0;
+    var bs = r[4] || {};
+    for (var sid in bs) if (bs.hasOwnProperty(sid)) o.benchStats[sid] = (o.benchStats[sid] || 0) + bs[sid];
+  }
+  return o;
+}
+
+function _skBankShortDate(d) {
+  var MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  var p = String(d || '').split('-');
+  return p.length === 3 ? (MON[parseInt(p[1], 10) - 1] + ' ' + parseInt(p[2], 10)) : '';
+}
+
+// ── Lineup efficiency — Manager Record section ── SKBANK ──
+// Points leagues: points scored against the best lineup the same roster
+// allowed that day. Categories leagues have no single number to optimise,
+// so they show what the bench produced (counting stats) instead. Both
+// show idle starter-days: an everyday player in the lineup on a day he
+// didn't play — the closest thing to a direct measure of lineup setting.
+function _mrEfficiencyHtml() {
+  var yl = (typeof _skYahooArchLeagues === 'function') ? _skYahooArchLeagues() : [];
+  var rows = [], T = { act: 0, opt: 0, idle: 0, days: 0, first: null }, i;
+  for (i = 0; i < yl.length; i++) {
+    var lg = yl[i];
+    if (!_skBankEligible(lg)) continue;
+    var s = _skBankSummary(lg.league_key);
+    if (!s.days) continue;
+    rows.push({ lg: lg, s: s });
+    if (s.optDays) { T.act += s.act; T.opt += s.opt; }
+    T.idle += s.idle; T.days += s.days;
+    if (!T.first || s.first < T.first) T.first = s.first;
+  }
+  var mono = 'font-family:var(--sk-font-mono,monospace);';
+  var h = '<div style="background:var(--sk-bg-card,rgba(255,255,255,0.03));' +
+    'border:1px solid rgba(255,255,255,0.07);border-radius:12px;padding:14px;margin:0 0 10px;">' +
+    '<div style="display:flex;align-items:baseline;margin:0 0 10px;">' +
+      '<span style="font-family:var(--sk-font-display,serif);font-size:18px;color:#fff;">Lineup efficiency</span>' +
+      '<span style="flex:1;"></span>' +
+      '<span style="font-size:9.5px;letter-spacing:0.12em;color:rgba(255,255,255,0.4);">' +
+        (T.first ? 'SINCE ' + _skBankShortDate(T.first).toUpperCase() : 'STARTING') + '</span>' +
+    '</div>';
+  if (!rows.length) {
+    return h + '<div style="font-size:11.5px;line-height:1.6;color:rgba(255,255,255,0.42);">' +
+      'Tracking starts with your next day of games. Each morning Skipper banks the day before \u2014 ' +
+      'who started, who sat, and what they scored \u2014 and this fills in from there.</div></div>';
+  }
+  var eff = T.opt > 0 ? T.act / T.opt : null;
+  function tile(lbl, val, sub, col) {
+    return '<div style="flex:1;min-width:0;text-align:center;padding:8px 2px;border-radius:9px;' +
+      'background:rgba(255,255,255,0.025);border:1px solid rgba(255,255,255,0.05);">' +
+      '<div style="font-size:8px;letter-spacing:0.12em;color:rgba(255,255,255,0.35);">' + lbl + '</div>' +
+      '<div style="' + mono + 'font-size:15px;font-weight:800;color:' + (col || '#fff') + ';margin-top:2px;">' + val + '</div>' +
+      '<div style="' + mono + 'font-size:9px;color:rgba(255,255,255,0.35);">' + sub + '</div></div>';
+  }
+  h += '<div style="display:flex;gap:6px;margin:0 0 12px;">' +
+    tile('EFFICIENCY', eff == null ? '\u2014' : Math.round(eff * 1000) / 10 + '%', 'points leagues',
+         eff == null ? '#fff' : eff >= 0.9 ? '#4ade80' : eff >= 0.8 ? '#fbbf24' : '#f87171') +
+    tile('LEFT ON BENCH', T.opt > 0 ? (T.opt - T.act).toFixed(1) : '\u2014', 'fantasy points') +
+    tile('IDLE STARTS', String(T.idle), 'everyday players', T.idle ? '#fbbf24' : '#4ade80') +
+  '</div>';
+  h += '<div style="display:flex;font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
+    'padding:0 0 4px;border-bottom:1px solid rgba(255,255,255,0.08);">' +
+    '<span style="flex:1;">LEAGUE</span>' +
+    '<span style="flex:0 0 36px;text-align:right;">DAYS</span>' +
+    '<span style="flex:0 0 54px;text-align:right;">EFF</span>' +
+    '<span style="flex:0 0 52px;text-align:right;">LEFT</span>' +
+    '<span style="flex:0 0 36px;text-align:right;">IDLE</span></div>';
+  rows.sort(function (a, b) {
+    var ea = a.s.opt > 0 ? a.s.act / a.s.opt : 2, eb = b.s.opt > 0 ? b.s.act / b.s.opt : 2;
+    return ea - eb;
+  });
+  for (i = 0; i < rows.length; i++) {
+    var r = rows[i], S = r.s, key = r.lg.league_key;
+    var e2 = S.opt > 0 ? S.act / S.opt : null;
+    var ecol = e2 == null ? 'rgba(255,255,255,0.3)' : e2 >= 0.9 ? '#4ade80' : e2 >= 0.8 ? '#fbbf24' : '#f87171';
+    var sub = '';
+    if (!_skBankIsPts(S.st)) {
+      var set = (typeof leagueSettingsCache === 'object' && leagueSettingsCache) ? leagueSettingsCache[key] : null;
+      var meta = (set && set.stats) || {}, bits = [];
+      var ids = Object.keys(S.benchStats).filter(function (x) { return S.benchStats[x] > 0; })
+        .sort(function (a2, b2) { return parseInt(a2, 10) - parseInt(b2, 10); });
+      for (var b = 0; b < ids.length && bits.length < 5; b++) {
+        var m = meta[ids[b]];
+        bits.push((S.benchStats[ids[b]] % 1 === 0 ? S.benchStats[ids[b]] : S.benchStats[ids[b]].toFixed(1)) +
+          ' ' + ((m && (m.abbr || m.displayName)) || ids[b]));
+      }
+      sub = bits.length ? 'Bench produced: ' + bits.join(' \u00b7 ') : 'Bench produced nothing in your cats';
+    }
+    h += '<div style="padding:5px 0;border-bottom:1px solid rgba(255,255,255,0.04);">' +
+      '<div style="display:flex;align-items:center;">' +
+        '<span style="flex:1;min-width:0;font-size:11px;color:rgba(255,255,255,0.75);' +
+          'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' +
+          slEsc(_mrNm({ name: r.lg.name, team: _mrYTeam(key) })) + '</span>' +
+        '<span style="flex:0 0 36px;text-align:right;' + mono + 'font-size:11px;color:rgba(255,255,255,0.5);">' + S.days + '</span>' +
+        '<span style="flex:0 0 54px;text-align:right;' + mono + 'font-size:11.5px;color:' + ecol + ';">' +
+          (e2 == null ? '\u2014' : (Math.round(e2 * 1000) / 10) + '%') + '</span>' +
+        '<span style="flex:0 0 52px;text-align:right;' + mono + 'font-size:11px;color:rgba(255,255,255,0.7);">' +
+          (S.opt > 0 ? (S.opt - S.act).toFixed(1) : '\u2014') + '</span>' +
+        '<span style="flex:0 0 36px;text-align:right;' + mono + 'font-size:11px;color:' +
+          (S.idle ? '#fbbf24' : 'rgba(255,255,255,0.4)') + ';">' + S.idle + '</span>' +
+      '</div>' +
+      (sub ? '<div style="font-size:9.5px;color:rgba(255,255,255,0.38);padding-top:2px;">' + slEsc(sub) + '</div>' : '') +
+    '</div>';
+  }
+  h += '<div style="font-size:9px;line-height:1.5;color:rgba(255,255,255,0.28);margin-top:9px;">' +
+    'EFF is points scored \u00f7 the best lineup the same roster allowed that day, using each ' +
+    'player\u2019s real position eligibility (game caps like max starts aren\u2019t modelled, so ' +
+    'a capped week can read a little low). LEFT is the points that best lineup would have added. ' +
+    'Categories leagues have no single number to optimise, so they show what the bench produced ' +
+    'instead. IDLE counts days an everyday player sat in your lineup without playing \u2014 pitchers ' +
+    'and goalies excluded. Tracked from ' + _skBankShortDate(T.first) + '; each morning banks the day before.</div>';
+  return h + '</div>';
+}
+
+// ── Shared sheet: reuse The Wire's bottom sheet chrome ──
+function _skSheetOpen(eyebrow, title, subHtml, bodyHtml) {
+  var r = document.getElementById('skWireSheetResult');
+  if (r) { r.className = 'sk-wire-sheet-result no'; r.textContent = ''; r.style.display = 'none'; }
+  var t = document.getElementById('skWireSheetTitle');
+  if (t) t.textContent = title || '';
+  var e = document.getElementById('skWireSheetEyebrow');
+  if (e) e.innerHTML = eyebrow || '';
+  var s = document.getElementById('skWireSheetSub');
+  if (s) s.innerHTML = subHtml || '';
+  var b = document.getElementById('skWireSheetBody');
+  if (b) { b.innerHTML = bodyHtml || ''; b.scrollTop = 0; }
+  var bd = document.getElementById('skWireSheetBackdrop'), sh = document.getElementById('skWireSheet');
+  if (bd) bd.classList.add('open');
+  if (sh) sh.classList.add('open');
+}
+function _skSheetBody(html) {
+  var b = document.getElementById('skWireSheetBody');
+  if (b) b.innerHTML = html;
+}
+function _skSheetSection(icon, label, meta) {
+  return '<div class="sk-wire-sheet-section"><span class="ic">' + icon + '</span>' + skEscape(label) +
+    (meta ? '<span class="meta">' + skEscape(meta) + '</span>' : '') + '</div>';
+}
+
+// ── Season so far / season recap ── SKRECAP ──
+var _skDraftCache = {};   // leagueKey -> { playerKey: 1 } for MY draft picks
+
+function _skMyDraftPicks(league) {
+  var key = league.league_key;
+  if (_skDraftCache[key]) return Promise.resolve(_skDraftCache[key]);
+  var ld = (typeof skLeagueData === 'object' && skLeagueData) ? skLeagueData[key] : null;
+  var myKey = ld && ld.team && ld.team.team_key;
+  return fyApi('/league/' + key + '/draftresults').then(function (res) {
+    var out = {};
+    try {
+      var parts = _yahooArr(res.fantasy_content.league);
+      for (var i = 0; i < parts.length; i++) {
+        var dr = parts[i] && parts[i].draft_results;
+        if (!dr) continue;
+        for (var j = 0; j < (parseInt(dr.count, 10) || 0); j++) {
+          var r = dr[String(j)] && dr[String(j)].draft_result;
+          if (r && r.player_key && (!myKey || r.team_key === myKey)) out[r.player_key] = 1;
+        }
+      }
+    } catch (e) {}
+    _skDraftCache[key] = out;
+    return out;
+  }, function () { return null; });
+}
+
+function skOpenRecap(leagueKey) {
+  var league = (fyLeagues || []).find(function (l) { return l.league_key === leagueKey; });
+  if (!league) return;
+  var done = !!league.is_finished;
+  _skSheetOpen((done ? 'Season recap' : 'Season so far') + ' <span class="sep">\u00b7</span> ' +
+                 skEscape(String(league.sport || '').toUpperCase()),
+               _mrYTeam(leagueKey) || league.name || 'Your team',
+               skEscape(league.name || ''),
+               '<div class="sk-wire-sheet-empty">Reading your season\u2026</div>');
+  _skMyDraftPicks(league).then(function (drafted) {
+    _skSheetBody(_skRecapHtml(league, drafted));
+  });
+}
+
+function _skRecapHtml(league, drafted) {
+  var key = league.league_key;
+  var bank = _skBankGet(key), S = _skBankSummary(key);
+  if (!S.days) {
+    return '<div class="sk-wire-sheet-empty">Nothing banked for this league yet. Each morning Skipper ' +
+      'saves the day before \u2014 your first day will show up after the next day of games.</div>';
+  }
+  var set = (typeof leagueSettingsCache === 'object' && leagueSettingsCache) ? leagueSettingsCache[key] : null;
+  var meta = (set && set.stats) || {};
+  var isPts = _skBankIsPts(S.st);
+  var players = [], k;
+  // Share of the team's production over the tracked span: points, or for
+  // cats the player's slice of each counting stat, averaged across cats.
+  var teamTot = {};
+  for (k in bank.pl) {
+    if (!bank.pl.hasOwnProperty(k)) continue;
+    var r = bank.pl[k];
+    if (!r[2]) continue;                               // never in the lineup
+    for (var sid in r[5]) if (r[5].hasOwnProperty(sid)) teamTot[sid] = (teamTot[sid] || 0) + r[5][sid];
+  }
+  var catIds = Object.keys(teamTot).filter(function (x) { return teamTot[x] > 0; });
+  for (k in bank.pl) {
+    if (!bank.pl.hasOwnProperty(k)) continue;
+    var q = bank.pl[k];
+    if (!q[2]) continue;
+    var share;
+    if (isPts) share = S.act > 0 ? q[4] / S.act : 0;
+    else {
+      var sum = 0;
+      for (var c = 0; c < catIds.length; c++) sum += (q[5][catIds[c]] || 0) / teamTot[catIds[c]];
+      share = catIds.length ? sum / catIds.length : 0;
+    }
+    players.push({ key: k, name: q[0], club: q[1], days: q[2], fp: q[4], stats: q[5], first: q[6], last: q[7],
+                   share: share, drafted: !!(drafted && drafted[k]) });
+  }
+  players.sort(function (a, b) { return b.share - a.share; });
+  var used = players.length, pickups = 0, pickShare = 0, draftedN = 0;
+  for (var i = 0; i < players.length; i++) {
+    if (players[i].drafted) draftedN++;
+    else { pickups++; pickShare += players[i].share; }
+  }
+
+  var h = '';
+  h += '<div class="sk-rc-tiles">' +
+    '<div><b>' + S.days + '</b><span>days tracked</span></div>' +
+    '<div><b>' + used + '</b><span>players used</span></div>' +
+    (drafted ? '<div><b>' + Math.round(pickShare * 100) + '%</b><span>from pickups</span></div>' : '') +
+  '</div>';
+  h += '<div class="sk-rc-note">' + skEscape(_skBankShortDate(S.first) + ' \u2013 ' + _skBankShortDate(S.last)) +
+    (drafted ? ' \u00b7 ' + draftedN + ' drafted, ' + pickups + ' picked up' : '') + '</div>';
+
+  h += _skSheetSection('\ud83c\udfc6', 'Top contributors', isPts ? 'FP in your lineup' : 'share of your cats');
+  for (i = 0; i < players.length && i < 8; i++) {
+    var p = players[i];
+    var line;
+    if (isPts) line = p.fp.toFixed(1) + ' FP';
+    else {
+      var parts = [];
+      Object.keys(p.stats).sort(function (a2, b2) { return parseInt(a2, 10) - parseInt(b2, 10); })
+        .forEach(function (x) {
+          if (!p.stats[x] || !meta[x]) return;
+          parts.push((p.stats[x] % 1 === 0 ? p.stats[x] : p.stats[x].toFixed(1)) + ' ' + (meta[x].abbr || meta[x].displayName || x));
+        });
+      line = parts.slice(0, 6).join(' \u00b7 ');
+    }
+    h += '<div class="sk-wpl-row">' +
+      '<div class="sk-wpl-top">' +
+        '<span class="sk-wpl-name">' + skEscape(p.name || '\u2014') + '</span>' +
+        '<span class="sk-wpl-meta">' + skEscape(String(p.club || '').toUpperCase()) +
+          (drafted ? (p.drafted ? ' \u00b7 DRAFTED' : ' \u00b7 PICKUP') : '') + '</span>' +
+        '<span class="sk-wpl-fp">' + Math.round(p.share * 100) + '<span class="u">%</span></span>' +
+      '</div>' +
+      '<div class="sk-wpl-line">' + skEscape(line) + '<span class="sep"> \u00b7 </span>' + p.days +
+        ' day' + (p.days === 1 ? '' : 's') + ' in lineup</div>' +
+    '</div>';
+  }
+
+  if (drafted) {
+    var bestPick = null;
+    for (i = 0; i < players.length; i++) if (!players[i].drafted) { bestPick = players[i]; break; }
+    if (bestPick) {
+      h += _skSheetSection('\u2b50', 'Best pickup', '');
+      h += '<div class="sk-rc-note" style="margin-top:0">' + skEscape(bestPick.name) + ' \u2014 ' +
+        Math.round(bestPick.share * 100) + '% of your ' + (isPts ? 'points' : 'category production') +
+        ' in ' + bestPick.days + ' day' + (bestPick.days === 1 ? '' : 's') + ' with you (' +
+        skEscape(_skBankShortDate(bestPick.first)) + ' \u2013 ' + skEscape(_skBankShortDate(bestPick.last)) + ').</div>';
+    }
+  }
+
+  h += _skSheetSection('\ud83d\udccb', 'Lineup', '');
+  var lines = [];
+  if (S.optDays && S.opt > 0) {
+    lines.push(Math.round(S.act / S.opt * 1000) / 10 + '% efficiency \u2014 ' + (S.opt - S.act).toFixed(1) +
+      ' points left on the bench');
+  }
+  lines.push(S.idle + ' idle start' + (S.idle === 1 ? '' : 's') + ' (everyday players in the lineup who didn\u2019t play)');
+  if (S.bestDay) lines.push('Best day: ' + S.bestDay.fp.toFixed(1) + ' FP on ' + _skBankShortDate(S.bestDay.date));
+  h += '<div class="sk-rc-note" style="margin-top:0">' + lines.map(skEscape).join('<br>') + '</div>';
+  if (!drafted) {
+    h += '<div class="sk-rc-note">Draft results couldn\u2019t be read, so drafted vs. pickup is hidden.</div>';
+  }
+  return h;
+}
+
+// ── Scouting report ── SKSCOUT ──
+// Your current opponent: their form, how engaged they are, who's hot, and
+// where they're strong or weak. Four small Yahoo requests on open, cached
+// for the session (10 minutes).
+//
+// "Engagement" can't be read directly — Yahoo doesn't publish when a
+// lineup was last set. Two proxies it does publish:
+//   • moves: season adds/drops, ranked against the league;
+//   • lineup holes right now: active slots holding an injured/out player
+//     or left empty — a manager who's checked out leaves these sitting.
+var _skScoutCache = {};
+
+function _skScoutEligible(league) {
+  if (!league || !league.league_key) return false;
+  var st = String(league.scoring_type || '');
+  if (st !== 'head' && st !== 'headone' && st !== 'headpoint') return false;
+  if (typeof _mrIsGuillotineLeague === 'function' && _mrIsGuillotineLeague(league)) return false;
+  return true;
+}
+
+function _skScoutTeams(res) {
+  var out = {};
+  try {
+    var tObj = res.fantasy_content.league[1].teams;
+    for (var i = 0; i < (parseInt(tObj.count, 10) || 0); i++) {
+      var t = tObj[String(i)] && tObj[String(i)].team;
+      if (!t) continue;
+      var row = { key: '', name: '', moves: null, felo: '', stats: {}, pts: null };
+      var metaArr = _yahooArr(t[0]);
+      for (var m = 0; m < metaArr.length; m++) {
+        var o = metaArr[m];
+        if (!o || typeof o !== 'object') continue;
+        if (o.team_key != null) row.key = o.team_key;
+        if (o.name != null) row.name = o.name;
+        if (o.number_of_moves != null) row.moves = parseInt(o.number_of_moves, 10) || 0;
+        if (o.managers) {
+          var mg = _yahooArr(o.managers);
+          for (var g = 0; g < mg.length; g++) {
+            var mo = mg[g] && (mg[g].manager || mg[g]);
+            if (mo && mo.felo_tier) { row.felo = String(mo.felo_tier); break; }
+          }
+        }
+      }
+      for (var b = 1; b < t.length; b++) {
+        var bag = t[b];
+        if (!bag || typeof bag !== 'object') continue;
+        if (bag.team_stats && bag.team_stats.stats) {
+          var ss = _yahooArr(bag.team_stats.stats);
+          for (var s2 = 0; s2 < ss.length; s2++) {
+            var st = ss[s2] && ss[s2].stat;
+            if (st && st.stat_id != null) {
+              var v = parseFloat(st.value);
+              if (!isNaN(v)) row.stats[String(st.stat_id)] = v;
+            }
+          }
+        }
+        if (bag.team_points && bag.team_points.total != null) {
+          var tp = parseFloat(bag.team_points.total);
+          if (!isNaN(tp)) row.pts = tp;
+        }
+      }
+      if (row.key) out[row.key] = row;
+    }
+  } catch (e) {}
+  return out;
+}
+
+function skOpenScouting(leagueKey) {
+  var league = (fyLeagues || []).find(function (l) { return l.league_key === leagueKey; });
+  if (!league) return;
+  var ld = (typeof skLeagueData === 'object' && skLeagueData) ? skLeagueData[leagueKey] : null;
+  var mu = (ld && ld.matchup) || {};
+  var oppKey = mu.oppTeamKey, myKey = mu.myTeamKey || (ld && ld.team && ld.team.team_key);
+  _skSheetOpen('Scouting report <span class="sep">\u00b7</span> ' + skEscape(league.name || ''),
+               mu.oppName || 'Opponent', '', '<div class="sk-wire-sheet-empty">Scouting\u2026</div>');
+  if (!oppKey || !myKey) {
+    _skSheetBody('<div class="sk-wire-sheet-empty">No opponent this week \u2014 a bye, or the ' +
+      'matchup hasn\u2019t loaded yet.</div>');
+    return;
+  }
+  var c = _skScoutCache[leagueKey];
+  if (c && c.opp === oppKey && (Date.now() - c.ts) < 10 * 60 * 1000) {
+    _skSheetBody(_skScoutHtml(league, c));
+    return;
+  }
+  var sport = String(league.sport || 'mlb').toLowerCase();
+  var fb = (sport === 'nfl' || sport === 'cfb');
+  var cw = parseInt(league.current_week, 10) || 1;
+  var first = Math.max(parseInt(league.start_week, 10) || 1, cw - 5);
+  var weeks = [];
+  for (var w = first; w < cw; w++) weeks.push(w);
+  var statsType = fb ? (';type=week;week=' + Math.max(1, cw - 1)) : ';type=lastweek';
+  var st = (typeof _skWireScoringType === 'function') ? _skWireScoringType(league) : league.scoring_type;
+
+  var pTeams = fyApi('/league/' + leagueKey + '/teams/stats;type=season')
+    .then(_skScoutTeams, function () { return {}; });
+  var pForm = weeks.length
+    ? fyApi('/team/' + oppKey + '/matchups;weeks=' + weeks.join(',')).then(function (res) {
+        if (!res || res.error) return [];
+        var ms = _skParseMatchupsWithScores(res);
+        var agg = _skAggregateHistory(ms, oppKey, st);
+        return ((agg && agg.byWeek) || []).filter(function (e) { return e && !e.isLive; });
+      }, function () { return []; })
+    : Promise.resolve([]);
+  var pHot = fyApi('/team/' + oppKey + '/roster/players/stats' + statsType)
+    .then(function (r) { return (r && !r.error) ? _parseTeamFpResponse(r) : {}; }, function () { return {}; });
+  var pMine = fyApi('/team/' + myKey + '/roster/players/stats' + statsType)
+    .then(function (r) { return (r && !r.error) ? _parseTeamFpResponse(r) : {}; }, function () { return {}; });
+  var pToday = fetchTeamFpForDate(oppKey, _todayDateString())['catch'](function () { return null; });
+
+  Promise.all([pTeams, pForm, pHot, pMine, pToday]).then(function (r) {
+    var data = { ts: Date.now(), opp: oppKey, me: myKey, st: st, sport: sport, fb: fb,
+                 teams: r[0] || {}, form: r[1] || [], hot: r[2] || {}, mine: r[3] || {}, today: r[4] };
+    _skScoutCache[leagueKey] = data;
+    var t = document.getElementById('skWireSheetTitle');
+    if (t && data.teams[oppKey] && data.teams[oppKey].name) t.textContent = data.teams[oppKey].name;
+    _skSheetBody(_skScoutHtml(league, data));
+  });
+}
+
+function _skScoutHtml(league, d) {
+  var key = league.league_key;
+  var set = (typeof leagueSettingsCache === 'object' && leagueSettingsCache) ? leagueSettingsCache[key] : null;
+  var meta = (set && set.stats) || {};
+  var isPts = (d.st === 'headpoint') || d.fb;
+  var ld = (typeof skLeagueData === 'object' && skLeagueData) ? skLeagueData[key] : null;
+  var all = (ld && ld.allTeams) || {};
+  var oppT = all[d.opp] || {}, opp = d.teams[d.opp] || {};
+  var nTeams = Object.keys(d.teams).length || Object.keys(all).length;
+  var h = '';
+
+  // Sub line: record, place, Felo.
+  var sub = [];
+  if (oppT.record) sub.push(String(oppT.record));
+  if (oppT.rank) sub.push((typeof skOrdinal === 'function' ? skOrdinal(parseInt(oppT.rank, 10)) : oppT.rank) +
+    (nTeams ? ' of ' + nTeams : ''));
+  if (opp.felo) sub.push('Felo ' + opp.felo.charAt(0).toUpperCase() + opp.felo.slice(1));
+  var subEl = document.getElementById('skWireSheetSub');
+  if (subEl) subEl.innerHTML = skEscape(sub.join(' \u00b7 '));
+
+  // ── Form ──
+  h += _skSheetSection('\ud83d\udcc8', 'Recent form', d.form.length ? 'last ' + d.form.length + ' weeks' : '');
+  if (d.form.length) {
+    var chips = '', streak = 0, sres = null;
+    for (var i = d.form.length - 1; i >= 0; i--) {
+      var rs = d.form[i].result;
+      if (sres === null) sres = rs;
+      if (rs === sres) streak++; else break;
+    }
+    var pfSum = 0, pfN = 0;
+    for (i = 0; i < d.form.length; i++) {
+      var e = d.form[i];
+      var sc = isPts && e.myPts != null ? (' ' + Number(e.myPts).toFixed(0) + '\u2013' + Number(e.oppPts).toFixed(0))
+             : (!isPts && e.myCatsWon != null ? (' ' + e.myCatsWon + '\u2013' + e.oppCatsWon) : '');
+      if (isPts && e.myPts != null) { pfSum += Number(e.myPts); pfN++; }
+      chips += '<span class="sk-sc-chip ' + (e.result === 'W' ? 'w' : e.result === 'L' ? 'l' : 't') + '">' +
+        'Wk ' + e.week + ' <b>' + (e.result || '\u2013') + '</b>' + skEscape(sc) + '</span>';
+    }
+    h += '<div class="sk-sc-chips">' + chips + '</div>';
+    var fl = [];
+    if (sres && streak >= 2) fl.push((sres === 'W' ? 'Won ' : sres === 'L' ? 'Lost ' : 'Tied ') + streak + ' straight');
+    if (pfN) fl.push('averaging ' + (pfSum / pfN).toFixed(1) + ' a week');
+    if (fl.length) h += '<div class="sk-rc-note" style="margin-top:6px">' + skEscape(fl.join(' \u00b7 ')) + '</div>';
+  } else {
+    h += '<div class="sk-rc-note" style="margin-top:0">No completed weeks yet.</div>';
+  }
+
+  // ── Engagement ──
+  h += _skSheetSection('\ud83d\udd75\ufe0f', 'How engaged are they', '');
+  var movesList = [];
+  for (var tk in d.teams) if (d.teams.hasOwnProperty(tk) && d.teams[tk].moves != null) movesList.push(d.teams[tk].moves);
+  var moveLine = '', movesRank = null, movesAvg = null;
+  if (opp.moves != null && movesList.length) {
+    movesList.sort(function (a, b) { return b - a; });
+    movesRank = movesList.indexOf(opp.moves) + 1;
+    var sm = 0;
+    for (i = 0; i < movesList.length; i++) sm += movesList[i];
+    movesAvg = sm / movesList.length;
+    moveLine = opp.moves + ' add/drop' + (opp.moves === 1 ? '' : 's') + ' this season \u2014 ' +
+      (typeof skOrdinal === 'function' ? skOrdinal(movesRank) : movesRank) + ' most of ' + movesList.length +
+      ' (league average ' + movesAvg.toFixed(0) + ')';
+  }
+  var holes = [], empty = 0;
+  if (d.today) {
+    var slots = _skBankSlots(key), activeN = 0;
+    for (var pk in d.today) {
+      if (!d.today.hasOwnProperty(pk)) continue;
+      var tp = d.today[pk];
+      if (!tp || !_isActiveSlot(tp.selectedPos)) continue;
+      activeN++;
+      var stt = String(tp.status || '').toUpperCase();
+      if (/^(IL|IR|O|NA|SUSP|PUP|NFI|OUT|INJ)/.test(stt)) holes.push(tp.name + ' (' + tp.status + ')');
+    }
+    if (slots.length && activeN < slots.length) empty = slots.length - activeN;
+  }
+  var holeLine = d.today
+    ? ((holes.length || empty)
+        ? 'Right now: ' + (holes.length ? holes.length + ' injured/out player' + (holes.length === 1 ? '' : 's') +
+            ' in their lineup (' + holes.join(', ') + ')' : '') +
+          (holes.length && empty ? ' and ' : '') +
+          (empty ? empty + ' empty slot' + (empty === 1 ? '' : 's') : '')
+        : 'Right now: a clean lineup \u2014 no injured players starting, no empty slots.')
+    : '';
+  var verdict = 'Engaged', vcls = 'good';
+  var lowMoves = (movesAvg != null && opp.moves != null && opp.moves < movesAvg / 3);
+  if ((holes.length + empty) >= 2 || (lowMoves && (holes.length + empty) >= 1)) { verdict = 'Checked out?'; vcls = 'bad'; }
+  else if ((holes.length + empty) === 1 || lowMoves) { verdict = 'Slipping'; vcls = 'mid'; }
+  h += '<div class="sk-sc-verdict ' + vcls + '">' + verdict + '</div>';
+  h += '<div class="sk-rc-note" style="margin-top:6px">' +
+    [moveLine, holeLine].filter(function (x) { return !!x; }).map(skEscape).join('<br>') + '</div>';
+
+  // ── Hottest players ──
+  var hotList = [], catTot = {};
+  for (pk in d.hot) {
+    if (!d.hot.hasOwnProperty(pk)) continue;
+    var hp = d.hot[pk];
+    if (!hp) continue;
+    for (var sid in hp.stats) {
+      if (hp.stats.hasOwnProperty(sid) && _skBankCounting(meta[sid]) && hp.stats[sid] > 0) {
+        catTot[sid] = Math.max(catTot[sid] || 0, hp.stats[sid]);
+      }
+    }
+  }
+  for (pk in d.hot) {
+    if (!d.hot.hasOwnProperty(pk)) continue;
+    var hp2 = d.hot[pk];
+    if (!hp2) continue;
+    var score = 0;
+    if (isPts) score = (typeof hp2.fp === 'number') ? hp2.fp : 0;
+    else for (var sid2 in catTot) if (catTot.hasOwnProperty(sid2)) score += (hp2.stats[sid2] || 0) / catTot[sid2];
+    if (score > 0) hotList.push({ p: hp2, score: score });
+  }
+  hotList.sort(function (a, b) { return b.score - a.score; });
+  h += _skSheetSection('\ud83d\udd25', 'Hottest players', d.fb ? 'last week' : 'last 7 days');
+  if (!hotList.length) h += '<div class="sk-rc-note" style="margin-top:0">No stats to read yet.</div>';
+  for (i = 0; i < hotList.length && i < 5; i++) {
+    var hpl = hotList[i].p;
+    var ln = (typeof _skWirePLLine === 'function') ? _skWirePLLine(hpl, meta) : { parts: [] };
+    var lineTxt = ln.parts.map(function (x) {
+      return '<span class="v">' + skEscape(x.txt) + '</span> ' + skEscape(x.ab);
+    }).join('<span class="sep"> \u00b7 </span>');
+    h += '<div class="sk-wpl-row"><div class="sk-wpl-top">' +
+      '<span class="sk-wpl-name">' + skEscape(hpl.name || '\u2014') + '</span>' +
+      '<span class="sk-wpl-meta">' + skEscape([(hpl.teamAbbr || '').toUpperCase(), hpl.displayPosition || '']
+        .filter(function (x) { return !!x; }).join(' \u00b7 ')) + '</span>' +
+      (isPts && typeof hpl.fp === 'number' ? '<span class="sk-wpl-fp">' + hpl.fp.toFixed(1) + '<span class="u">FP</span></span>' : '') +
+      '</div>' + (lineTxt ? '<div class="sk-wpl-line">' + lineTxt + '</div>' : '') + '</div>';
+  }
+
+  // ── Strengths & weaknesses ──
+  h += _skSheetSection('\u2694\ufe0f', 'Where they\u2019re strong', isPts ? '' : 'season, by category');
+  if (!isPts) {
+    var ranks = [], youBetter = [], themBetter = [];
+    var me = d.teams[d.me] || {};
+    for (var sid3 in meta) {
+      if (!meta.hasOwnProperty(sid3)) continue;
+      var mt = meta[sid3];
+      if (!mt || !mt.enabled || mt.isOnlyDisplayStat) continue;
+      if (opp.stats == null || opp.stats[sid3] == null) continue;
+      var low = (mt.sortOrder === 0);
+      var vals = [];
+      for (tk in d.teams) if (d.teams.hasOwnProperty(tk) && d.teams[tk].stats[sid3] != null) vals.push(d.teams[tk].stats[sid3]);
+      vals.sort(function (a, b) { return low ? a - b : b - a; });
+      var rk = vals.indexOf(opp.stats[sid3]) + 1;
+      var ab = mt.abbr || mt.displayName || sid3;
+      ranks.push({ ab: ab, rk: rk, n: vals.length });
+      if (me.stats && me.stats[sid3] != null) {
+        var ov = opp.stats[sid3], mv = me.stats[sid3];
+        if (ov !== mv) { if ((low ? ov < mv : ov > mv)) themBetter.push(ab); else youBetter.push(ab); }
+      }
+    }
+    ranks.sort(function (a, b) { return a.rk - b.rk; });
+    // Strong = top third of the league in that category; weak = bottom
+    // third. Keeps a category from showing up on both lists in a small
+    // league, and leaves a middling category off both.
+    var strong = ranks.filter(function (x) { return x.rk <= Math.ceil(x.n / 3); }).slice(0, 3);
+    var weak = ranks.filter(function (x) { return x.rk > x.n - Math.ceil(x.n / 3); }).reverse().slice(0, 3);
+    var rkTxt = function (x) { return x.ab + ' (' + (typeof skOrdinal === 'function' ? skOrdinal(x.rk) : x.rk) + ')'; };
+    if (ranks.length) {
+      h += '<div class="sk-rc-note" style="margin-top:0"><b class="sk-sc-good">Strong:</b> ' +
+        skEscape(strong.length ? strong.map(rkTxt).join(', ') : 'nothing in the top third') +
+        '<br><b class="sk-sc-bad">Weak:</b> ' +
+        skEscape(weak.length ? weak.map(rkTxt).join(', ') : 'nothing in the bottom third') + '</div>';
+      if (youBetter.length + themBetter.length) {
+        h += '<div class="sk-rc-note">On the season you\u2019re ahead in ' + youBetter.length + ' of ' +
+          (youBetter.length + themBetter.length) + ' categories' +
+          (themBetter.length ? ' \u2014 they lead ' + skEscape(themBetter.join(', ')) : '') + '.</div>';
+      }
+    } else {
+      h += '<div class="sk-rc-note" style="margin-top:0">Season category totals aren\u2019t available yet.</div>';
+    }
+  } else {
+    var pfs = [];
+    for (tk in d.teams) if (d.teams.hasOwnProperty(tk) && d.teams[tk].pts != null) pfs.push(d.teams[tk].pts);
+    pfs.sort(function (a, b) { return b - a; });
+    var pl = [];
+    if (opp.pts != null && pfs.length) {
+      pl.push(opp.pts.toFixed(1) + ' points this season \u2014 ' +
+        (typeof skOrdinal === 'function' ? skOrdinal(pfs.indexOf(opp.pts) + 1) : (pfs.indexOf(opp.pts) + 1)) +
+        ' of ' + pfs.length);
+    }
+    // Position groups, their last week vs yours.
+    var grp = function (map) {
+      var g = {};
+      for (var q in map) {
+        if (!map.hasOwnProperty(q)) continue;
+        var pp = map[q];
+        if (!pp || typeof pp.fp !== 'number' || !_isActiveSlot(pp.selectedPos)) continue;
+        var gname;
+        if (d.fb) gname = String(pp.displayPosition || pp.selectedPos || '?').split(',')[0];
+        else if (d.sport === 'mlb') gname = pp.positionType === 'P' ? 'Pitchers' : 'Hitters';
+        else if (d.sport === 'nhl') gname = pp.positionType === 'G' ? 'Goalies' : 'Skaters';
+        else gname = 'Players';
+        g[gname] = (g[gname] || 0) + pp.fp;
+      }
+      return g;
+    };
+    var go = grp(d.hot), gm = grp(d.mine), names = {};
+    for (var n1 in go) if (go.hasOwnProperty(n1)) names[n1] = 1;
+    for (var n2 in gm) if (gm.hasOwnProperty(n2)) names[n2] = 1;
+    var edges = Object.keys(names).map(function (nm) {
+      var dd = (gm[nm] || 0) - (go[nm] || 0);
+      return nm + ': ' + (dd >= 0 ? 'you +' : 'them +') + Math.abs(dd).toFixed(1);
+    });
+    if (edges.length) pl.push('Last ' + (d.fb ? 'week' : '7 days') + ' by group \u2014 ' + edges.join(' \u00b7 '));
+    h += '<div class="sk-rc-note" style="margin-top:0">' + (pl.length ? pl.map(skEscape).join('<br>') :
+      'Season points aren\u2019t available yet.') + '</div>';
+  }
+  h += '<div class="sk-rc-note" style="opacity:0.7">Engagement is read from what Yahoo publishes: ' +
+    'season add/drops, and whether their lineup has injured players or empty slots right now. ' +
+    'Yahoo doesn\u2019t say when a lineup was last set.</div>';
+  return h;
+}
+
 function skCloseWireSheet() {
   var bd = document.getElementById('skWireSheetBackdrop');
   var sh = document.getElementById('skWireSheet');
+  // SKSCOUT — the scouting/recap sheets hide the result badge; restore it.
+  var rb = document.getElementById('skWireSheetResult');
+  if (rb) rb.style.display = '';
   if (bd) bd.classList.remove('open');
   if (sh) sh.classList.remove('open');
 }
@@ -98170,6 +99075,18 @@ function skBuildDetailHTML(league) {
             '<button class="sk-duel-trigger sk-duel-trigger-skate" onclick="openSkatersDuel(\'' + league.league_key + '\', (typeof skDetailDate!==\'undefined\'&&skDetailDate)||null)">' +
             '\ud83c\udfd2 Today\u2019s Skaters \u2014 My Lineup vs Theirs' +
             '</button></div>'
+        : '') +
+      // SKSCOUT / SKRECAP — scouting report on this week's opponent, and the
+      // season-so-far view built from the daily bank.
+      ((_skScoutEligible(league) || _skBankEligible(league))
+        ? '<div class="sk-duel-trigger-wrap">' +
+            (_skScoutEligible(league)
+              ? '<button class="sk-duel-trigger sk-scout-trigger" onclick="skOpenScouting(\'' + league.league_key + '\')">' +
+                '\ud83d\udd0e Scouting Report \u2014 This Week\u2019s Opponent</button>' : '') +
+            (_skBankEligible(league)
+              ? '<button class="sk-duel-trigger sk-scout-trigger" onclick="skOpenRecap(\'' + league.league_key + '\')">' +
+                '\ud83d\udcdc Season So Far \u2014 Your Roster</button>' : '') +
+          '</div>'
         : '') +
       nflH2hHTML +
       seasonScoringHTML +
@@ -139260,6 +140177,7 @@ function mrRenderBody() {
   h += _mrKnockoutSectionHtml(data);   // MGRKO
   h += _mrCloseGamesHtml('pts');       // MGRCLOSE (replaced MGRNEM)
   h += _mrCloseGamesHtml('cats');      // MGRCLOSE — categories, kept apart
+  h += _mrEfficiencyHtml();            // SKBANK — lineup efficiency
 
   // Per-league trace. Small, and it makes a surprising total explainable
   // instead of something to argue with. MGRREC2
