@@ -137007,7 +137007,8 @@ function mrYahooSeason() {
     rows[sport].push({
       name: (lg.name || lg.league_key || ''), key: lg.league_key,
       team: _mrYTeam(lg.league_key), fmt: String(lg.scoring_type || ''),   // MGRNAMES
-      w: w, l: l, t: t, pending: !!pendingRow
+      w: w, l: l, t: t, pending: !!pendingRow,
+      week: _mrYahooWeekResult(lg)   // MGRYWEEK
     });
   }
   var leagues = [];
@@ -137063,6 +137064,40 @@ function mrYahooSeason() {
     }
   }
   return { bySport: out, rows: rows, pending: pending, needCats: needCats };
+}
+
+// ── MGRYWEEK ── This week's result for a Yahoo H2H league, as it stands.
+// Every Yahoo row showed a dash in WEEK, and the platform line read 0-0-4:
+// the rollup's week tally came from the standings projection map, which
+// counts an unstarted football matchup (0.0 vs 0.0) as a tie and drops
+// playoff weeks on purpose (they don't move regular-season standings). The
+// matchup the league card already shows is the better source. Returns
+// 'W' / 'L' / 'T' while the week is live, null when nothing's been scored,
+// the matchup is stale, or there's no matchup (bye, eliminated). Never
+// feeds the season record — that stays finished weeks only (MGRRECLIVE).
+function _mrYahooWeekResult(lg) {
+  if (!lg || !lg.league_key) return null;
+  var ld = (typeof skLeagueData === 'object' && skLeagueData) ? skLeagueData[lg.league_key] : null;
+  var m = ld && ld.matchup;
+  if (!m || !m.hasMatchup) return null;
+  var cw = parseInt(lg.current_week, 10), mw = parseInt(m.week, 10);
+  if (cw && mw && mw < cw) return null;                  // last week's, not this week's
+  if (m.weekEnd) {
+    var d = new Date();
+    var mo = d.getMonth() + 1, dy = d.getDate();
+    var today = d.getFullYear() + '-' + (mo < 10 ? '0' : '') + mo + '-' + (dy < 10 ? '0' : '') + dy;
+    if (String(m.weekEnd) < today) return null;          // over — it's in the record now
+  }
+  var st = String(lg.scoring_type || ''), sp = String(lg.sport || '').toLowerCase();
+  var pts = (st === 'headpoint') || (st === 'head' && (sp === 'nfl' || sp === 'cfb'));
+  if (pts) {
+    var my = Number(m.myScore) || 0, op = Number(m.oppScore) || 0;
+    if (!my && !op) return null;                         // nobody has scored yet
+    return (my > op) ? 'W' : (my < op) ? 'L' : 'T';
+  }
+  var w = m.wins || 0, l = m.losses || 0;
+  if (!w && !l) return null;                             // no category taken yet
+  return (w > l) ? 'W' : (l > w) ? 'L' : 'T';
 }
 
 // ── MGRRECLIVE ── Completed-week tally for a Yahoo H2H league.
@@ -137175,8 +137210,10 @@ function mrCollect() {
         var sk2 = sp.toLowerCase();
         var b = bucket(sk2, 'yahoo');
         b.leagues += r.leagueCount || 0;
-        b.weekLeagues += r.weekLeagueCount || 0;
-        b.ww += r.weekW || 0; b.wl += r.weekL || 0; b.wt += r.weekT || 0;
+        // MGRYWEEK — the week column is now built from the same per-league
+        // results the rows show (below), not the rollup's week tally, which
+        // read football's unstarted 0-0 matchups as ties (the 0-0-4) and
+        // skipped playoff weeks entirely.
         var yr = ys.bySport[sk2];
         if (yr) {
           b.sw += yr.w; b.sl += yr.l; b.st += yr.t; b.recLeagues += yr.n;
@@ -137193,8 +137230,14 @@ function mrCollect() {
               team: _y.team || '',   // MGRNAMES
               rec: _y.pending ? '\u2014' : (_y.w + '-' + _y.l + '-' + _y.t),
               src: _y.pending ? 'loading' : 'yahoo',
-              n: 0, weeks: null, raw: '', week: '\u2014'
+              n: 0, weeks: null, raw: '', week: _y.week || '\u2014'
             });
+            // MGRYWEEK — live result feeds THIS WEEK only; the season record
+            // above stays finished weeks.
+            if (_y.week) {
+              b.weekLeagues++;
+              if (_y.week === 'W') b.ww++; else if (_y.week === 'L') b.wl++; else b.wt++;
+            }
           }
         }
       }
