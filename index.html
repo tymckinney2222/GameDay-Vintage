@@ -18373,6 +18373,33 @@
   .sk-wire-cat-head .col-marker { text-align: center; }
 
   /* ─── Points: ranked player row ──────────────────────────── */
+  /* ROOTFOR — Root-for board cards */
+  .sk-rf-card {
+    margin: 0 4px 8px; padding: 10px 12px; border-radius: 12px; cursor: pointer;
+    background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.07);
+  }
+  .sk-rf-card.fin { opacity: 0.55; }
+  .sk-rf-top { display: flex; align-items: center; gap: 8px; }
+  .sk-rf-game { flex: 1; min-width: 0; font-family: var(--sk-font-ui); font-size: 15px; font-weight: 700; color: var(--sk-text); }
+  .sk-rf-tag { font-family: var(--sk-font-mono); font-size: 9.5px; font-weight: 700; letter-spacing: 0.06em;
+    text-transform: uppercase; padding: 2px 7px; border-radius: 6px; }
+  .sk-rf-tag.hot { color: #fbbf24; background: rgba(251,191,36,0.12); }
+  .sk-rf-tag.against { color: #f87171; background: rgba(248,113,113,0.12); }
+  .sk-rf-stake { font-family: var(--sk-font-mono); font-size: 16px; font-weight: 800; color: var(--sk-text-3); }
+  .sk-rf-stake.up { color: #4ade80; } .sk-rf-stake.dn { color: #f87171; }
+  .sk-rf-when { font-family: var(--sk-font-mono); font-size: 10.5px; color: var(--sk-text-4); margin: 2px 0 8px; }
+  .sk-rf-bar { height: 6px; border-radius: 3px; background: rgba(248,113,113,0.75); overflow: hidden; margin-bottom: 8px; }
+  .sk-rf-bar > div { height: 100%; background: #4ade80; }
+  .sk-rf-line { font-size: 12px; line-height: 1.6; color: var(--sk-text-2, rgba(255,255,255,0.8)); }
+  .sk-rf-line .f, .sk-rf-detail .f { color: #4ade80; font-weight: 700; margin-right: 4px; }
+  .sk-rf-line .a, .sk-rf-detail .a { color: #f87171; font-weight: 700; margin-right: 4px; }
+  .sk-rf-vs { color: #f87171; font-size: 11px; }
+  .sk-rf-more, .sk-rf-none { color: var(--sk-text-4); }
+  .sk-rf-detail { margin-top: 8px; padding-top: 8px; border-top: 1px solid rgba(255,255,255,0.06);
+    font-size: 11.5px; line-height: 1.5; color: var(--sk-text-3); }
+  .sk-rf-detail > div { padding: 3px 0; }
+  .sk-rf-detail b { color: var(--sk-text); }
+  .sk-rf-detail .c { font-family: var(--sk-font-mono); font-size: 10px; color: var(--sk-text-4); }
   /* SKSCOUT / SKRECAP — sheets built on The Wire's chrome */
   .sk-scout-trigger { background: rgba(234,179,8,0.08); border-color: rgba(234,179,8,0.35); }
   .sk-rc-tiles { display: flex; gap: 6px; margin: 4px 4px 8px; }
@@ -90615,6 +90642,344 @@ function _mrEffDaysHtml(key, st, league) {
   return h + moreBtn(weeks.length - shownW.length) + '</div>';
 }
 
+// ══════════════════════════════════════════════════════════════════
+// ROOTFOR — the Root-for board: tonight's games ranked by how much they
+// matter to you across every Yahoo league.
+//
+// For each game on today's slate (the scoreboard already in memory), who
+// is in YOUR active lineups and who is in your OPPONENTS' active lineups,
+// counted across leagues. A player on your side in four leagues and
+// against you in two shows as "×4 · vs ×2" — both kept, not netted away.
+//
+// Weighted (default): each league's players count by how live that
+// matchup is. A tight week counts fully; a blowout counts for little;
+// a season-points league (no opponent) counts half, since only your side
+// exists there. Plain: every lineup spot counts 1 — easy to tie out.
+//
+//   points leagues:  weight = 1 / (1 + 8 × gap), gap = |margin| ÷ avg score
+//                    (projected totals when Yahoo has them)
+//   categories:      weight = 1 / (1 + 3 × gap), gap = |cats won − lost| ÷ cats
+//   floor 0.15 so a lopsided week still registers.
+//
+// Who counts: players in an active slot whose team plays today. A hitter
+// Yahoo has confirmed OUT of today's lineup is dropped. Baseball pitchers
+// count only when they're today's probable starter — a bullpen arm may
+// never appear, and counting every reliever would drown the board.
+//
+// Requests: your lineup and your opponent's for each league with a game
+// today — the same daily roster call the Today views and Player lines use,
+// so much of it is already cached. Football reads the week's lineup.
+// Held for five minutes.
+// ══════════════════════════════════════════════════════════════════
+var _rfState = { ts: 0, data: null, loading: false, weighted: true, open: {}, sport: '', done: 0, total: 0 };
+
+function _rfSportKey(sp) {
+  var s = String(sp || '').toLowerCase();
+  return s === 'mlb' ? 'MLB' : s === 'nfl' ? 'NFL' : s === 'nba' ? 'NBA' : s === 'nhl' ? 'NHL' : '';
+}
+function _rfTeamKeys(sport, abbr) {
+  var u = String(abbr || '').toUpperCase(), out = {};
+  if (!u) return out;
+  out[u] = 1;
+  try {
+    if (typeof _skNormalizeTeamAbbr === 'function') out[String(_skNormalizeTeamAbbr(u) || '').toUpperCase()] = 1;
+    if (sport === 'MLB' && typeof _normMlbAbbr === 'function') {
+      var ks = Object.keys(out);
+      for (var ki = 0; ki < ks.length; ki++) out[_normMlbAbbr(ks[ki])] = 1;
+    }
+    if (sport === 'NFL' && typeof _skEspnNflAbbr === 'function') out[String(_skEspnNflAbbr(u) || '').toUpperCase()] = 1;
+  } catch (e) {}
+  delete out[''];
+  return out;
+}
+function _rfToday() {
+  var d = new Date(), m = d.getMonth() + 1, dd = d.getDate();
+  return d.getFullYear() + '-' + (m < 10 ? '0' : '') + m + '-' + (dd < 10 ? '0' : '') + dd;
+}
+
+// Today's games per sport, indexed by every spelling of each club.
+function _rfSlate() {
+  var out = {}, now = new Date(), y = now.getFullYear(), mo = now.getMonth(), d = now.getDate();
+  if (typeof allGames === 'undefined' || !allGames) return out;
+  ['MLB', 'NFL', 'NBA', 'NHL'].forEach(function (sp) {
+    var list = allGames[sp];
+    if (!list || !list.length) return;
+    var games = [], idx = {};
+    for (var i = 0; i < list.length; i++) {
+      var g = list[i];
+      if (!g || !g.home || !g.away) continue;
+      if (g.date) {
+        var gd = new Date(g.date);
+        if (gd.getFullYear() !== y || gd.getMonth() !== mo || gd.getDate() !== d) continue;
+      }
+      var gi = games.length;
+      games.push(g);
+      var ka = _rfTeamKeys(sp, g.away.abbr), kh = _rfTeamKeys(sp, g.home.abbr), k;
+      for (k in ka) if (ka.hasOwnProperty(k)) idx[k] = { gi: gi, side: 'away' };
+      for (k in kh) if (kh.hasOwnProperty(k)) idx[k] = { gi: gi, side: 'home' };
+    }
+    if (games.length) out[sp] = { games: games, idx: idx };
+  });
+  return out;
+}
+
+// How live is this league's matchup? 0.15–1.
+function _rfWeight(league) {
+  var st = (typeof _skWireScoringType === 'function') ? _skWireScoringType(league) : league.scoring_type;
+  if (st === 'point') return 0.5;
+  var ld = (typeof skLeagueData === 'object' && skLeagueData) ? skLeagueData[league.league_key] : null;
+  var m = ld && ld.matchup;
+  if (!m || !m.hasMatchup) return 0.5;
+  var sp = String(league.sport || '').toLowerCase();
+  var pts = (st === 'headpoint') || (st === 'head' && (sp === 'nfl' || sp === 'cfb'));
+  var w;
+  if (pts) {
+    var a = (m.myProj != null && m.oppProj != null) ? Number(m.myProj) : Number(m.myScore) || 0;
+    var b = (m.myProj != null && m.oppProj != null) ? Number(m.oppProj) : Number(m.oppScore) || 0;
+    var avg = (a + b) / 2;
+    var gap = avg > 0 ? Math.abs(a - b) / avg : 0;
+    w = 1 / (1 + 8 * gap);
+  } else {
+    var W = m.wins || 0, L = m.losses || 0, T = m.ties || 0, n = W + L + T;
+    var g2 = n ? Math.abs(W - L) / n : 0;
+    w = 1 / (1 + 3 * g2);
+  }
+  return Math.max(0.15, Math.min(1, w));
+}
+
+function _rfSurname(n) {
+  var p = String(n || '').replace(/\s+(Jr\.?|Sr\.?|II|III|IV)$/i, '').trim().split(/\s+/);
+  return (p[p.length - 1] || '').toLowerCase();
+}
+
+function _rfLoad(force) {
+  if (_rfState.loading) return;
+  if (!force && _rfState.data && (Date.now() - _rfState.ts) < 5 * 60 * 1000) { _rfPaint(); return; }
+  var slate = _rfSlate();
+  var leagues = (typeof _skYahooArchLeagues === 'function') ? _skYahooArchLeagues() : [];
+  var jobs = [], today = _rfToday();
+  for (var i = 0; i < leagues.length; i++) {
+    var lg = leagues[i];
+    var sp = _rfSportKey(lg.sport);
+    if (!sp || !slate[sp]) continue;
+    var st = String(lg.scoring_type || '');
+    if (st !== 'head' && st !== 'headone' && st !== 'headpoint' && st !== 'point') continue;
+    var ld = (typeof skLeagueData === 'object' && skLeagueData) ? skLeagueData[lg.league_key] : null;
+    var mu = (ld && ld.matchup) || {};
+    var myKey = mu.myTeamKey || (ld && ld.team && ld.team.team_key);
+    if (!myKey) continue;
+    var oppKey = (st === 'point') ? null : (mu.oppTeamKey || null);
+    jobs.push({ lg: lg, sp: sp, my: myKey, opp: oppKey, w: _rfWeight(lg) });
+  }
+  _rfState.loading = true;
+  _rfState.done = 0;
+  _rfState.total = jobs.length;
+  _rfPaint();
+  function roster(teamKey, job) {
+    if (!teamKey) return Promise.resolve(null);
+    var p;
+    if (job.sp === 'NFL' && typeof fetchTeamFpForWeek === 'function') {
+      var cw = parseInt(job.lg.current_week, 10);
+      p = fetchTeamFpForWeek(teamKey, cw, cw);
+    } else {
+      p = fetchTeamFpForDate(teamKey, today);
+    }
+    return p.then(function (m) { return m || null; }, function () { return null; });
+  }
+  var results = [];
+  var ps = jobs.map(function (job) {
+    return Promise.all([roster(job.my, job), roster(job.opp, job)]).then(function (r) {
+      results.push({ job: job, mine: r[0], theirs: r[1] });
+      _rfState.done++;
+      if (_rfState.done % 3 === 0) _rfPaint();
+    });
+  });
+  Promise.all(ps).then(function () {
+    _rfState.data = { slate: slate, results: results };
+    _rfState.ts = Date.now();
+    _rfState.loading = false;
+    _rfPaint();
+  });
+}
+
+// Fold every league's two lineups into per-game tallies.
+function _rfBuild() {
+  var d = _rfState.data;
+  if (!d) return null;
+  var byGame = {}, totals = { mine: 0, theirs: 0 };
+  function add(sp, map, side, job) {
+    if (!map) return;
+    var S = d.slate[sp];
+    for (var k in map) {
+      if (!map.hasOwnProperty(k)) continue;
+      var p = map[k];
+      if (!p || !_isActiveSlot(p.selectedPos)) continue;
+      if (p.isStarting === false) continue;                      // confirmed out of today's lineup
+      var keys = _rfTeamKeys(sp, p.teamAbbr), hit = null;
+      for (var tk in keys) if (keys.hasOwnProperty(tk) && S.idx[tk]) { hit = S.idx[tk]; break; }
+      if (!hit) continue;
+      var g = S.games[hit.gi];
+      if (sp === 'MLB' && p.positionType === 'P') {
+        var prob = hit.side === 'home' ? g.homeProbable : g.awayProbable;
+        if (!prob || !prob.name || _rfSurname(prob.name) !== _rfSurname(p.name)) continue;
+      }
+      var gid = sp + ':' + (g.id || hit.gi);
+      var G = byGame[gid];
+      if (!G) G = byGame[gid] = { sp: sp, g: g, players: {}, forN: 0, agN: 0, forW: 0, agW: 0 };
+      var pid = (p.name || '?') + '|' + String(p.teamAbbr || '').toUpperCase();
+      var P = G.players[pid];
+      if (!P) P = G.players[pid] = { name: p.name || '?', club: String(p.teamAbbr || '').toUpperCase(),
+                                     forN: 0, agN: 0, forW: 0, agW: 0, forL: [], agL: [] };
+      var lname = (typeof _mrNm === 'function')
+        ? _mrNm({ name: job.lg.name, team: (typeof _mrYTeam === 'function') ? _mrYTeam(job.lg.league_key) : '' })
+        : job.lg.name;
+      if (side === 'for') { P.forN++; P.forW += job.w; P.forL.push(lname); G.forN++; G.forW += job.w; totals.mine++; }
+      else { P.agN++; P.agW += job.w; P.agL.push(lname); G.agN++; G.agW += job.w; totals.theirs++; }
+    }
+  }
+  for (var i = 0; i < d.results.length; i++) {
+    var r = d.results[i];
+    add(r.job.sp, r.mine, 'for', r.job);
+    add(r.job.sp, r.theirs, 'against', r.job);
+  }
+  var list = [];
+  for (var gk in byGame) {
+    if (!byGame.hasOwnProperty(gk)) continue;
+    var G2 = byGame[gk];
+    G2.id = gk;
+    G2.stake = _rfState.weighted ? (G2.forW - G2.agW) : (G2.forN - G2.agN);
+    list.push(G2);
+  }
+  return { list: list, totals: totals };
+}
+
+function skOpenRootFor() {
+  _skSheetOpen('Root-for board <span class="sep">\u00b7</span> ' +
+               skEscape(new Date().toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' })),
+               'Tonight\u2019s sweats', '', '<div class="sk-wire-sheet-empty">Reading tonight\u2019s lineups\u2026</div>');
+  _rfLoad(false);
+}
+function rfSetWeighted(on) { _rfState.weighted = !!on; _rfPaint(); }
+function rfSetSport(sp) { _rfState.sport = sp || ''; _rfPaint(); }
+function rfToggleGame(id) { _rfState.open[id] = !_rfState.open[id]; _rfPaint(); }
+
+function _rfPaint() {
+  var body = document.getElementById('skWireSheetBody');
+  var title = document.getElementById('skWireSheetTitle');
+  if (!body || !title || title.textContent !== 'Tonight\u2019s sweats') return;   // sheet shows something else
+  if (_rfState.loading) {
+    body.innerHTML = '<div class="sk-wire-sheet-empty">Reading tonight\u2019s lineups\u2026 ' +
+      (_rfState.total ? _rfState.done + ' of ' + _rfState.total + ' leagues' : '') + '</div>';
+    return;
+  }
+  var B = _rfBuild();
+  if (!B) { body.innerHTML = '<div class="sk-wire-sheet-empty">No lineups loaded yet.</div>'; return; }
+  var sports = {}, i;
+  for (i = 0; i < B.list.length; i++) sports[B.list[i].sp] = 1;
+  var sportList = ['MLB', 'NFL', 'NBA', 'NHL'].filter(function (x) { return sports[x]; });
+  if (_rfState.sport && !sports[_rfState.sport]) _rfState.sport = '';
+  var list = B.list.filter(function (G) { return !_rfState.sport || G.sp === _rfState.sport; });
+  // Games still to be decided first; finals sink to the bottom.
+  list.sort(function (a, b) {
+    var fa = a.g.state === 'post' ? 1 : 0, fb = b.g.state === 'post' ? 1 : 0;
+    if (fa !== fb) return fa - fb;
+    return Math.abs(b.stake) - Math.abs(a.stake);
+  });
+
+  function pill(on, lbl, click) {
+    return '<button class="sk-wpl-tab' + (on ? ' on' : '') + '" style="flex:0 0 auto;padding:6px 12px;" onclick="' + click + '">' +
+      lbl + '</button>';
+  }
+  var h = '<div class="sk-wpl-tabs" style="flex-wrap:wrap;">' +
+    pill(_rfState.weighted, 'Weighted', 'rfSetWeighted(true)') +
+    pill(!_rfState.weighted, 'Plain counts', 'rfSetWeighted(false)');
+  if (sportList.length > 1) {
+    h += pill(!_rfState.sport, 'All', 'rfSetSport(\'\')');
+    for (i = 0; i < sportList.length; i++) h += pill(_rfState.sport === sportList[i], sportList[i], 'rfSetSport(\'' + sportList[i] + '\')');
+  }
+  h += '</div>';
+  h += '<div class="sk-rc-tiles">' +
+    '<div><b style="color:#4ade80">' + B.totals.mine + '</b><span>your lineup spots</span></div>' +
+    '<div><b style="color:#f87171">' + B.totals.theirs + '</b><span>against you</span></div>' +
+    '<div><b>' + list.length + '</b><span>games</span></div></div>';
+
+  if (!list.length) {
+    return (body.innerHTML = h + '<div class="sk-wire-sheet-empty">None of your players are on today\u2019s slate.</div>');
+  }
+  var maxAbs = 0;
+  for (i = 0; i < list.length; i++) maxAbs = Math.max(maxAbs, Math.abs(list[i].stake));
+  for (i = 0; i < list.length; i++) {
+    var G = list[i], g = G.g;
+    var fin = g.state === 'post', live = g.state === 'in';
+    var tot = _rfState.weighted ? (G.forW + G.agW) : (G.forN + G.agN);
+    var forShare = tot > 0 ? (_rfState.weighted ? G.forW : G.forN) / tot : 0.5;
+    var st = Math.round(G.stake * 10) / 10;
+    var stTxt = (st > 0 ? '+' : st < 0 ? '\u2212' : '') + (_rfState.weighted ? Math.abs(st).toFixed(1) : Math.abs(st));
+    var tag = '';
+    if (!fin && i === 0 && G.stake > 0) tag = '<span class="sk-rf-tag hot">Biggest sweat</span>';
+    else if (!fin && G.stake < 0) tag = '<span class="sk-rf-tag against">Root against</span>';
+    var when = fin ? 'Final ' + g.away.score + '\u2013' + g.home.score
+             : live ? 'Live \u00b7 ' + (g.statusDetail || '') + ' \u00b7 ' + g.away.score + '\u2013' + g.home.score
+             : (g.statusDetail || '');
+    var probs = (G.sp === 'MLB' && g.awayProbable && g.homeProbable)
+      ? ' \u00b7 ' + _rfSurname(g.awayProbable.name).replace(/^./, function (c) { return c.toUpperCase(); }) + ' vs ' +
+        _rfSurname(g.homeProbable.name).replace(/^./, function (c) { return c.toUpperCase(); }) : '';
+
+    // Players: yours (with any "vs" count folded in), then theirs-only.
+    var ps = [];
+    for (var pk in G.players) if (G.players.hasOwnProperty(pk)) ps.push(G.players[pk]);
+    var mineP = ps.filter(function (p) { return p.forN > 0; })
+      .sort(function (a, b) { return (b.forW - b.agW) - (a.forW - a.agW) || b.forN - a.forN; });
+    var theirsP = ps.filter(function (p) { return p.forN === 0 && p.agN > 0; })
+      .sort(function (a, b) { return b.agW - a.agW || b.agN - a.agN; });
+    var open = !!_rfState.open[G.id];
+    var nm = function (p, side) {
+      var s = skEscape(_rfSurname(p.name) ? p.name.split(/\s+/).slice(-1)[0] : p.name);
+      if (side === 'for') {
+        if (p.forN > 1) s += ' \u00d7' + p.forN;
+        if (p.agN) s += ' <span class="sk-rf-vs">vs \u00d7' + p.agN + '</span>';
+      } else if (p.agN > 1) s += ' \u00d7' + p.agN;
+      return s;
+    };
+    var line = function (arr, side) {
+      if (!arr.length) return '<span class="sk-rf-none">nobody</span>';
+      var shown = open ? arr : arr.slice(0, 3);
+      var t = shown.map(function (p) { return nm(p, side); }).join(' \u00b7 ');
+      if (!open && arr.length > 3) t += ' <span class="sk-rf-more">+' + (arr.length - 3) + ' more</span>';
+      return t;
+    };
+    h += '<div class="sk-rf-card' + (fin ? ' fin' : '') + '" onclick="rfToggleGame(\'' + G.id + '\')">' +
+      '<div class="sk-rf-top">' +
+        '<span class="sk-rf-game">' + skEscape(g.away.abbr + ' @ ' + g.home.abbr) + '</span>' + tag +
+        '<span class="sk-rf-stake ' + (G.stake > 0 ? 'up' : G.stake < 0 ? 'dn' : '') + '">' + stTxt + '</span>' +
+      '</div>' +
+      '<div class="sk-rf-when">' + skEscape(G.sp + ' \u00b7 ' + when + probs) + '</div>' +
+      '<div class="sk-rf-bar"><div style="width:' + Math.round(forShare * 100) + '%"></div></div>' +
+      '<div class="sk-rf-line"><span class="f">For you</span> ' + line(mineP, 'for') + '</div>' +
+      '<div class="sk-rf-line"><span class="a">Against</span> ' + line(theirsP, 'against') + '</div>';
+    if (open) {
+      h += '<div class="sk-rf-detail">';
+      ps.sort(function (a, b) { return (b.forW + b.agW) - (a.forW + a.agW); });
+      for (var q = 0; q < ps.length; q++) {
+        var P = ps[q];
+        h += '<div><b>' + skEscape(P.name) + '</b> <span class="c">' + skEscape(P.club) + '</span>' +
+          (P.forL.length ? '<br><span class="f">For</span> ' + skEscape(P.forL.join(', ')) : '') +
+          (P.agL.length ? '<br><span class="a">Against</span> ' + skEscape(P.agL.join(', ')) : '') + '</div>';
+      }
+      h += '</div>';
+    }
+    h += '</div>';
+  }
+  h += '<div class="sk-rc-note" style="opacity:0.75">' +
+    (_rfState.weighted
+      ? 'Weighted: each league counts by how close its matchup is \u2014 a tight week counts fully, a blowout ' +
+        'barely at all, and a season-points league counts half. The number is your weighted players minus theirs.'
+      : 'Plain counts: every lineup spot counts 1. The number is your players in the game minus your opponents\u2019.') +
+    ' Active lineups only; baseball pitchers count when they\u2019re the probable starter. ' +
+    'Tap a game to see every player and the leagues he counts in.</div>';
+  body.innerHTML = h;
+}
+
 // ── Shared sheet: reuse The Wire's bottom sheet chrome ──
 function _skSheetOpen(eyebrow, title, subHtml, bodyHtml) {
   var r = document.getElementById('skWireSheetResult');
@@ -122429,6 +122794,24 @@ function _skMountTodayHittersCard(hitters, todayStr) {
       (snapLeagueCount ? '<span class="sk-hp-teaser-count">' + snapLeagueCount + ' leagues</span>' : '') +
       '<span class="sk-hp-teaser-arrow">\u203a</span>';
     trendsTeaser.style.display = _platYahoo ? '' : 'none';   // PLATATT
+
+    // ROOTFOR — Root-for board teaser, after Week Trends. Yahoo-only.
+    var rfTeaser = document.getElementById('skRootForTeaser');
+    if (!rfTeaser) {
+      rfTeaser = document.createElement('button');
+      rfTeaser.id = 'skRootForTeaser';
+      rfTeaser.className = 'sk-hp-teaser';
+      rfTeaser.type = 'button';
+      rfTeaser.onclick = function() { skOpenRootFor(); };
+      if (trendsTeaser.nextSibling) listEl.parentNode.insertBefore(rfTeaser, trendsTeaser.nextSibling);
+      else listEl.parentNode.insertBefore(rfTeaser, listEl);
+    }
+    rfTeaser.innerHTML =
+      '<span class="sk-hp-teaser-icon">\ud83d\udce3</span>' +
+      '<span class="sk-hp-teaser-label">ROOT-FOR BOARD</span>' +
+      '<span class="sk-hp-teaser-count">tonight</span>' +
+      '<span class="sk-hp-teaser-arrow">\u203a</span>';
+    rfTeaser.style.display = _platYahoo ? '' : 'none';
   }
 
   // Floating button
