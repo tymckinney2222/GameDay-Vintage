@@ -89837,6 +89837,13 @@ function _skBankCanFill(p, slot) {
 // values don't depend on which slot they fill, so this is exact.
 // Doesn't know about game caps (max starts, innings limits).
 function _skBankOptimal(players, slots) {
+  var d = _skBankOptimalDetail(players, slots);
+  return d ? d.total : null;
+}
+// SKBANK3 — same search, also reporting WHO moved: bench players the best
+// lineup brings in (and the slot each takes) and starters it takes out.
+// Their difference is exactly the day's LEFT.
+function _skBankOptimalDetail(players, slots) {
   if (!slots.length) return null;
   var owner = [], i, total = 0;
   for (i = 0; i < slots.length; i++) owner.push(-1);
@@ -89858,29 +89865,97 @@ function _skBankOptimal(players, slots) {
   for (i = 0; i < cand.length; i++) {
     if (place(i, {})) total += cand[i].fp;
   }
-  return Math.round(total * 10) / 10;
+  var placed = {}, ins = [], outs = [];
+  for (i = 0; i < slots.length; i++) {
+    if (owner[i] === -1) continue;
+    placed[owner[i]] = 1;
+    var cp = cand[owner[i]];
+    if (!_isActiveSlot(cp.p.selectedPos)) ins.push([cp.p.name || '?', Math.round(cp.fp * 10) / 10, slots[i]]);
+  }
+  for (i = 0; i < cand.length; i++) {
+    if (!placed[i] && _isActiveSlot(cand[i].p.selectedPos)) {
+      outs.push([cand[i].p.name || '?', Math.round(cand[i].fp * 10) / 10, String(cand[i].p.selectedPos || '')]);
+    }
+  }
+  return { total: Math.round(total * 10) / 10, ins: ins, outs: outs };
+}
+
+// SKBANK3 — one day's row, with the detail behind it:
+//   [actual, best, benchFp, idle, benchStats,
+//    { i: [[name, fp, slot]] bench players the best lineup starts,
+//      o: [[name, fp, slot]] starters it sits,
+//      d: [names] idle everyday starters,
+//      b: [[name, 'line']] bench production, categories leagues }]
+function _skBankDayRow(league, st, map) {
+  var key = league.league_key;
+  var set = (typeof leagueSettingsCache === 'object' && leagueSettingsCache) ? leagueSettingsCache[key] : null;
+  var meta = (set && set.stats) || {};
+  var sport = String(league.sport || 'mlb').toLowerCase();
+  var isPts = _skBankIsPts(st);
+  var act = 0, bench = 0, idle = 0, benchStats = {}, pool = [], idleNames = [], benchLines = [];
+  var sawAny = false, k, sid;
+  for (k in map) {
+    if (!map.hasOwnProperty(k)) continue;
+    var p = map[k];
+    if (!p) continue;
+    var slot = String(p.selectedPos || '').toUpperCase();
+    var active = _isActiveSlot(p.selectedPos);
+    if (!active && slot !== 'BN') continue;
+    sawAny = true;
+    pool.push(p);
+    var fp = (typeof p.fp === 'number' && !isNaN(p.fp)) ? p.fp : null;
+    var played = Object.keys(p.stats || {}).length > 0 || (fp != null && fp !== 0);
+    if (active) {
+      if (fp != null) act += fp;
+      var everyday = (sport === 'mlb') ? p.positionType !== 'P'
+                   : (sport === 'nhl') ? p.positionType !== 'G' : true;
+      if (!played && everyday) { idle++; idleNames.push(p.name || '?'); }
+    } else {
+      if (fp != null) bench += fp;
+      var bits = [];
+      var ids = Object.keys(p.stats || {}).sort(function (a, b) { return parseInt(a, 10) - parseInt(b, 10); });
+      for (var j = 0; j < ids.length; j++) {
+        sid = ids[j];
+        if (!_skBankCounting(meta[sid]) || !(p.stats[sid] > 0)) continue;
+        benchStats[sid] = Math.round(((benchStats[sid] || 0) + p.stats[sid]) * 10) / 10;
+        bits.push((p.stats[sid] % 1 === 0 ? p.stats[sid] : p.stats[sid].toFixed(1)) + ' ' +
+                  (meta[sid].abbr || meta[sid].displayName || sid));
+      }
+      if (!isPts && bits.length) benchLines.push([p.name || '?', bits.join(' \u00b7 ')]);
+    }
+  }
+  if (!sawAny) return null;
+  var det = { i: [], o: [], d: idleNames, b: benchLines };
+  var opt = null;
+  if (isPts) {
+    var od = _skBankOptimalDetail(pool, _skBankSlots(key));
+    if (od) {
+      opt = Math.max(od.total, Math.round(act * 10) / 10);
+      if (od.total > act + 0.05) { det.i = od.ins; det.o = od.outs; }
+    }
+  }
+  return [isPts ? Math.round(act * 10) / 10 : null, opt,
+          isPts ? Math.round(bench * 10) / 10 : null, idle, benchStats, det];
 }
 
 // SKBANK2 — days banked under the first rule get their best-lineup number
 // recomputed once. Those dates are 2+ days old, so their rosters come from
 // the on-device cache: no Yahoo requests in the normal case.
+// SKBANK3 — days saved before the daily detail existed are rebuilt once
+// with it (and with the current best-lineup rule). Their rosters are 2+
+// days old, so they come from the on-device cache: normally no requests.
+// Player season totals aren't touched — only each day's row.
 function _skBankRecalc(league, st, myTeamKey) {
   var key = league.league_key, bank = _skBankGet(key);
-  if ((bank.v || 1) >= 2) return Promise.resolve(false);
-  if (!_skBankIsPts(st)) { bank.v = 2; _skBankPut(key); return Promise.resolve(true); }
-  var dates = Object.keys(bank.days), i = 0, slots = _skBankSlots(key);
-  if (!slots.length) return Promise.resolve(false);            // settings not loaded; try next time
+  if ((bank.v || 1) >= 3) return Promise.resolve(false);
+  if (_skBankIsPts(st) && !_skBankSlots(key).length) return Promise.resolve(false);   // settings not loaded yet
+  var dates = Object.keys(bank.days), i = 0;
   function next() {
-    if (i >= dates.length) { bank.v = 2; _skBankPut(key); return Promise.resolve(true); }
+    if (i >= dates.length) { bank.v = 3; _skBankPut(key); return Promise.resolve(true); }
     var d = dates[i++];
     return fetchTeamFpForDate(myTeamKey, d).then(function (map) {
-      var r = bank.days[d];
-      if (map && r && r[0] != null) {
-        var pool = [];
-        for (var k in map) if (map.hasOwnProperty(k) && map[k]) pool.push(map[k]);
-        var opt = _skBankOptimal(pool, slots);
-        if (opt != null) r[1] = Math.max(opt, r[0]);
-      }
+      var row = map ? _skBankDayRow(league, st, map) : null;
+      if (row) bank.days[d] = row;
       return next();
     }, function () { return next(); });
   }
@@ -89946,16 +90021,15 @@ function _skBankFold(league, st, date, map) {
     }
   }
   if (!sawAny) return false;
-  var opt = isPts ? _skBankOptimal(pool, _skBankSlots(key)) : null;   // SKBANK2 rule
-  if (opt != null && opt < act) opt = Math.round(act * 10) / 10;   // never below what was scored
+  var row = _skBankDayRow(league, st, map);           // SKBANK3 — row + its detail
+  if (!row) return false;
   bank.sport = sport; bank.st = st;
-  if (!bank.v || bank.v < 2) {                        // a fresh bank starts on the new rule
+  if (!bank.v || bank.v < 3) {                        // a fresh bank starts on the current rule
     var any = false;
     for (var dk in bank.days) { if (bank.days.hasOwnProperty(dk)) { any = true; break; } }
-    if (!any) bank.v = 2;
+    if (!any) bank.v = 3;
   }
-  bank.days[date] = [isPts ? Math.round(act * 10) / 10 : null, opt,
-                     isPts ? Math.round(bench * 10) / 10 : null, idle, benchStats];
+  bank.days[date] = row;
   return true;
 }
 
@@ -89967,7 +90041,7 @@ function _skBankDay(league, entry) {
   if (_skBankBusy[key]) return;
   var st = entry.scoringType || league.scoring_type;
   var bank = _skBankGet(key);
-  if ((bank.v || 1) < 2 && Object.keys(bank.days).length) {   // SKBANK2 — fix old days first
+  if ((bank.v || 1) < 3 && Object.keys(bank.days).length) {   // SKBANK3 — upgrade old days first
     _skBankBusy[key] = 1;
     _skBankRecalc(league, st, entry.myTeamKey).then(function () {
       delete _skBankBusy[key];
@@ -90118,8 +90192,12 @@ function _mrEfficiencyHtml() {
       }
       sub = bits.length ? 'Bench produced: ' + bits.join(' \u00b7 ') : 'Bench produced nothing in your cats';
     }
+    var isOpen = !!_mrEffOpen[key];
     h += '<div style="padding:5px 0;border-bottom:1px solid rgba(255,255,255,0.04);">' +
-      '<div style="display:flex;align-items:center;">' +
+      '<div style="display:flex;align-items:center;cursor:pointer;" onclick="mrEffToggle(\'' +
+        String(key).replace(/[\\']/g, '') + '\')">' +
+        '<span style="flex:0 0 12px;font-size:9px;color:rgba(255,255,255,0.35);">' +
+          (isOpen ? '\u25be' : '\u25b8') + '</span>' +
         '<span style="flex:1;min-width:0;font-size:11px;color:rgba(255,255,255,0.75);' +
           'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' +
           slEsc(_mrNm({ name: r.lg.name, team: _mrYTeam(key) })) +
@@ -90134,7 +90212,8 @@ function _mrEfficiencyHtml() {
         '<span style="flex:0 0 36px;text-align:right;' + mono + 'font-size:11px;color:' +
           (S.idle ? '#fbbf24' : 'rgba(255,255,255,0.4)') + ';">' + S.idle + '</span>' +
       '</div>' +
-      (sub ? '<div style="font-size:9.5px;color:rgba(255,255,255,0.38);padding-top:2px;">' + slEsc(sub) + '</div>' : '') +
+      (sub ? '<div style="font-size:9.5px;color:rgba(255,255,255,0.38);padding:2px 0 0 12px;">' + slEsc(sub) + '</div>' : '') +
+      (isOpen ? _mrEffDaysHtml(key, S.st) : '') +
     '</div>';
   }
   h += '<div style="font-size:9px;line-height:1.5;color:rgba(255,255,255,0.28);margin-top:9px;">' +
@@ -90147,6 +90226,80 @@ function _mrEfficiencyHtml() {
     'Categories leagues have no single number to optimise, so they show what the bench produced ' +
     'instead. IDLE counts days an everyday player sat in your lineup without playing \u2014 pitchers ' +
     'and goalies excluded. Tracked from ' + _skBankShortDate(T.first) + '; each morning banks the day before.</div>';
+  return h + '</div>';
+}
+
+// ── SKBANK3 ── Tie it out by day ──
+// Tap a league in Lineup efficiency to open its days, newest first: what
+// you scored against the best lineup, the exact swaps that make up the
+// difference, and who sat idle. Categories leagues list who produced what
+// on the bench instead.
+var _mrEffOpen = {};
+function mrEffToggle(key) {
+  _mrEffOpen[key] = !_mrEffOpen[key];
+  if (typeof mrRenderBody === 'function') mrRenderBody();
+}
+function _mrEffDaysHtml(key, st) {
+  var bank = _skBankGet(key), isPts = _skBankIsPts(st);
+  var dates = Object.keys(bank.days).sort().reverse();
+  var mono = 'font-family:var(--sk-font-mono,monospace);';
+  var h = '<div style="margin:6px 0 4px 12px;padding:6px 0 2px 10px;border-left:2px solid rgba(234,179,8,0.35);">';
+  for (var i = 0; i < dates.length; i++) {
+    var r = bank.days[dates[i]], det = r[5] || null;
+    var left = (r[0] != null && r[1] != null) ? Math.round((r[1] - r[0]) * 10) / 10 : null;
+    h += '<div style="padding:4px 0 6px;">' +
+      '<div style="display:flex;align-items:baseline;gap:8px;">' +
+        '<span style="flex:1;' + mono + 'font-size:10.5px;font-weight:700;color:rgba(255,255,255,0.75);">' +
+          slEsc(_skBankShortDate(dates[i])) + '</span>' +
+        (isPts && r[0] != null
+          ? '<span style="' + mono + 'font-size:10.5px;color:rgba(255,255,255,0.55);">' +
+              r[0].toFixed(1) + ' of ' + (r[1] != null ? r[1].toFixed(1) : '\u2014') + '</span>' +
+            '<span style="flex:0 0 48px;text-align:right;' + mono + 'font-size:10.5px;font-weight:700;color:' +
+              (left ? '#fbbf24' : '#4ade80') + ';">' + (left ? '+' + left.toFixed(1) : '0.0') + '</span>'
+          : '') +
+      '</div>';
+    var lines = [];
+    if (!det) {
+      lines.push('<span style="color:rgba(255,255,255,0.3);">detail not saved for this day</span>');
+    } else {
+      var j;
+      for (j = 0; j < det.i.length; j++) {
+        lines.push('<span style="color:#4ade80;">\u2191</span> ' + slEsc(det.i[j][0]) + ' ' +
+          det.i[j][1].toFixed(1) + ' <span style="color:rgba(255,255,255,0.35);">from bench \u2192 ' +
+          slEsc(det.i[j][2]) + '</span>');
+      }
+      for (j = 0; j < det.o.length; j++) {
+        lines.push('<span style="color:#f87171;">\u2193</span> ' + slEsc(det.o[j][0]) + ' ' +
+          det.o[j][1].toFixed(1) + ' <span style="color:rgba(255,255,255,0.35);">out of ' +
+          slEsc(det.o[j][2]) + '</span>');
+      }
+      // The best lineup can slide a starter over (a 1B to Util) to make room,
+      // so the slot a bench player lands in needn't be the one vacated.
+      if (det.i.length && det.o.length) {
+        var inS = det.i.map(function (x) { return String(x[2]); }).sort().join(',');
+        var outS = det.o.map(function (x) { return String(x[2]); }).sort().join(',');
+        if (inS !== outS) {
+          lines.push('<span style="color:rgba(255,255,255,0.35);">Starters shift positions to make room ' +
+            '\u2014 the total is the same either way.</span>');
+        }
+      }
+      if (isPts && !det.i.length && !det.o.length) {
+        lines.push('<span style="color:rgba(255,255,255,0.35);">Best lineup \u2014 nothing on the bench would have helped.</span>');
+      }
+      for (j = 0; j < (det.b || []).length; j++) {
+        lines.push('<span style="color:rgba(255,255,255,0.35);">Bench:</span> ' + slEsc(det.b[j][0]) +
+          ' \u2014 ' + slEsc(det.b[j][1]));
+      }
+      if (!isPts && !(det.b || []).length) {
+        lines.push('<span style="color:rgba(255,255,255,0.35);">Bench produced nothing in your cats.</span>');
+      }
+      if (det.d && det.d.length) {
+        lines.push('<span style="color:#fbbf24;">Idle:</span> ' + slEsc(det.d.join(', ')));
+      }
+    }
+    h += '<div style="font-size:10.5px;line-height:1.55;color:rgba(255,255,255,0.7);padding-top:2px;">' +
+      lines.join('<br>') + '</div></div>';
+  }
   return h + '</div>';
 }
 
