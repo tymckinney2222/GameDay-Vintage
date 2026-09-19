@@ -137927,22 +137927,35 @@ function _mrKnockoutSectionHtml(data) {
 }
 
 // ── CLOSE GAMES ── MGRCLOSE ──
-// (Replaced the nemesis board, which found no repeat opponents.)
+// Two sections, never mixed: a points margin and a category margin can't be
+// averaged together.
 //
-// H2H POINTS leagues only. A close game is one decided by no more than a
-// share of the matchup's own scoring — the margin against the AVERAGE of the
-// two scores. A fixed point margin can't work across sports: 8 points is a
-// nail-biter in a 115-point NFL week and nothing at all in a 300-point MLB
-// week. The share is selectable (5 / 7 / 10%), 7% by default — about 8 points
-// on an NFL-sized week. Completed weeks only; ties always count as close.
+// POINTS: close when the margin is within a share of the matchup's AVERAGE
+// score (5 / 7 / 10%, default 7%). A fixed point margin can't work across
+// sports — 8 points is a nail-biter in a 115-point NFL week and nothing in a
+// 300-point MLB week. Ties always count as close.
 //
-// Sources: Yahoo's per-week aggregate (the History tab's, which carries
-// myPts/oppPts), fetched here for any points league not already cached; and
-// ESPN's schedule, already loaded for the season records. Sleeper and
-// Fantrax don't have per-week scores fetched, so they aren't in yet.
+// CATEGORIES: close when the week is decided by ONE category or fewer —
+// 6-5, 5-4-1, or level on category wins. The categories equivalent of one
+// play deciding the week. Scored on category WINS, so 5-4-1 is a
+// one-category margin.
+//
+// Sources: Yahoo's per-week matchups (the History tab's aggregate), and
+// ESPN's schedule, already loaded for the season records. Completed weeks
+// only. Sleeper and Fantrax don't have per-week results fetched yet.
+//
+// ── MGRCLOSE2 ── Getting Yahoo weeks reliably.
+// One Yahoo points league (Boys of Summer) failed every time: its
+// /team/<key>/matchups call never produced a history, and the retry just
+// asked the same endpoint again. This path now fetches the matchups itself
+// so the failure REASON is kept and shown, and when that endpoint won't
+// answer it rebuilds the season week by week from the league scoreboard —
+// the endpoint the Scoreboard tab uses, which that league does answer.
 var MR_CLOSE_KEY = 'sk_mr_close_pct_v1';
-var _mrCgFailed = {};     // leagueKey -> 1 when a fetch settled with nothing
+var _mrCgFailed = {};     // leagueKey -> reason string once both paths failed
 var _mrCgInflight = {};   // leagueKey -> 1 while fetching
+var _mrCgFallback = {};   // leagueKey -> { byWeek, via } rebuilt from scoreboards
+var _mrCgNote = {};       // leagueKey -> why the fallback was needed
 function _mrClosePct() {
   var v = 7;
   try { v = parseInt(localStorage.getItem(MR_CLOSE_KEY), 10) || 7; } catch (e) {}
@@ -137953,32 +137966,124 @@ function mrSetClosePct(v) {
   if (typeof mrRenderBody === 'function') mrRenderBody();
 }
 
-function _mrCgYahooPts() {
+// Yahoo H2H leagues of one kind: 'pts' (headpoint) or 'cats' (head/headone).
+function _mrCgYahoo(kind) {
   var yl = (typeof _skYahooArchLeagues === 'function') ? _skYahooArchLeagues() : [], out = [], i;
   for (i = 0; i < yl.length; i++) {
     var lg = yl[i];
-    if (!lg || !lg.league_key || String(lg.scoring_type || '') !== 'headpoint') continue;
+    if (!lg || !lg.league_key) continue;
+    var st = String(lg.scoring_type || '');
+    var isPts = (st === 'headpoint'), isCats = (st === 'head' || st === 'headone');
+    if (kind === 'pts' ? !isPts : !isCats) continue;
     if (typeof _mrIsGuillotineLeague === 'function' && _mrIsGuillotineLeague(lg)) continue;
     out.push(lg);
   }
   return out;
 }
+function _mrCgWeeks(key) {
+  var hc = (typeof _skHistoryCache === 'object' && _skHistoryCache) ? _skHistoryCache[key] : null;
+  if (hc && hc.data && hc.data.byWeek && hc.data.byWeek.length) return hc.data.byWeek;
+  var fb = _mrCgFallback[key];
+  return (fb && fb.byWeek) ? fb.byWeek : null;
+}
 
-// Fetch the missing Yahoo weekly histories, two at a time. A fetch that
-// settles without producing a history is marked FAILED rather than left
-// "loading" forever — the nemesis board's stuck state came from exactly
-// that: an API refusal looked identical to a request still in flight.
+// Rebuild a league's completed weeks from /league/<key>/scoreboard;week=N,
+// three weeks at a time (fyApi's own pacer still governs the rate).
+function _mrCgFromScoreboards(lg, myKey) {
+  var first = parseInt(lg.start_week, 10) || 1;
+  var cur = parseInt(lg.current_week, 10) || 0;
+  var last = lg.is_finished ? (parseInt(lg.end_week, 10) || cur) : cur;
+  var weeks = [], w;
+  for (w = first; w <= last; w++) weeks.push(w);
+  if (!weeks.length || typeof fyApi !== 'function' || typeof _skParseScoreboardMatchups !== 'function') {
+    return Promise.resolve(null);
+  }
+  var out = [], errs = 0;
+  function one(wk) {
+    return fyApi('/league/' + lg.league_key + '/scoreboard;week=' + wk + ';out=matchups')
+      .then(function (res) {
+        if (!res || res.error) { errs++; return; }
+        var ms = _skParseScoreboardMatchups(res), i, t;
+        for (i = 0; i < ms.length; i++) {
+          var m = ms[i];
+          if (!m || !m.complete || !m.teams || m.teams.length < 2) continue;
+          var me = null, op = null;
+          for (t = 0; t < m.teams.length; t++) {
+            if (m.teams[t].teamKey === myKey) me = m.teams[t]; else op = m.teams[t];
+          }
+          if (!me || !op) continue;
+          var r = m.isTied ? 'T' : (m.winnerKey === myKey) ? 'W' : m.winnerKey ? 'L' : null;
+          out.push({ week: wk, oppTeamKey: op.teamKey, oppName: op.name,
+                     myPts: me.pts, oppPts: op.pts,
+                     myCatsWon: me.catsWon || 0, oppCatsWon: op.catsWon || 0, catsTied: me.catsTied || 0,
+                     result: r, isLive: false });
+          break;
+        }
+      }, function () { errs++; });
+  }
+  var idx = 0;
+  function next() {
+    if (idx >= weeks.length) return Promise.resolve();
+    var batch = weeks.slice(idx, idx + 3);
+    idx += 3;
+    var ps = [];
+    for (var b = 0; b < batch.length; b++) ps.push(one(batch[b]));
+    return Promise.all(ps).then(next);
+  }
+  return next().then(function () {
+    out.sort(function (a, b2) { return a.week - b2.week; });
+    return out.length ? { byWeek: out, via: 'scoreboard', errs: errs } : null;
+  });
+}
+
+function _mrCgLoadOne(lg) {
+  var key = lg.league_key;
+  var ld = (typeof skLeagueData === 'object' && skLeagueData) ? skLeagueData[key] : null;
+  var myKey = ld && ld.team && ld.team.team_key;
+  if (!myKey) return Promise.resolve('standings not loaded yet');
+  var why = '';
+  var first = (typeof _skFetchSeasonMatchups === 'function')
+    ? _skFetchSeasonMatchups(myKey) : Promise.resolve(null);
+  return first.then(function (matchups) {
+    if (!matchups) { why = 'matchups not available'; return null; }
+    if (matchups._apiError) { why = 'matchups call refused (' + String(matchups._apiError) + ')'; return null; }
+    var agg = null;
+    try { agg = _skAggregateHistory(matchups, myKey, lg.scoring_type); }
+    catch (e) { why = 'matchups unreadable (' + (e && e.message ? e.message : 'parse error') + ')'; return null; }
+    if (!agg || !agg.byWeek || !agg.byWeek.length) {
+      why = 'matchups came back empty' +
+        (matchups._rawCount != null ? ' (' + matchups._rawCount + ' raw)' : '');
+      return null;
+    }
+    if (typeof _skHistoryCache === 'object' && _skHistoryCache) {
+      _skHistoryCache[key] = { ts: Date.now(), data: agg };
+    }
+    return agg;
+  }, function (e2) {
+    why = 'matchups call failed (' + (e2 && e2.message ? e2.message : 'network') + ')';
+    return null;
+  }).then(function (agg) {
+    if (agg) return '';
+    return _mrCgFromScoreboards(lg, myKey).then(function (fb) {
+      if (fb) { _mrCgFallback[key] = fb; _mrCgNote[key] = why; return ''; }
+      return why + '; weekly scoreboards also empty';
+    }, function () { return why + '; weekly scoreboards failed'; });
+  });
+}
+
+// Fetch whatever's missing, two leagues at a time. Categories leagues that
+// the season-record hydrator is still working on are left to it.
 function mrCgHydrate(force) {
-  if (typeof _mdFetchAndTally !== 'function') return;
-  var list = _mrCgYahooPts(), queue = [], i;
+  var list = _mrCgYahoo('pts').concat(_mrCgYahoo('cats')), queue = [], i;
   for (i = 0; i < list.length; i++) {
-    var k = list[i].league_key;
-    var hc = (typeof _skHistoryCache === 'object' && _skHistoryCache) ? _skHistoryCache[k] : null;
-    if (hc && hc.data && hc.data.byWeek) continue;
-    if (_mrCgInflight[k]) continue;
+    var lg = list[i], k = lg.league_key;
+    if (_mrCgWeeks(k) || _mrCgInflight[k]) continue;
     if (_mrCgFailed[k] && !force) continue;
+    if (!force && typeof _mdMatchupInflight === 'object' && _mdMatchupInflight && _mdMatchupInflight[k]) continue;
+    if (!force && String(lg.scoring_type) !== 'headpoint' &&
+        typeof _mdMatchupTally === 'object' && _mdMatchupTally && !_mdMatchupTally[k]) continue;
     delete _mrCgFailed[k];
-    queue.push(list[i]);
+    queue.push(lg);
   }
   var running = 0;
   function repaint() {
@@ -137987,22 +138092,21 @@ function mrCgHydrate(force) {
   }
   function pump() {
     while (running < 2 && queue.length) {
-      (function (lg) {
-        var key = lg.league_key;
+      (function (lg2) {
+        var key = lg2.league_key;
         running++;
         _mrCgInflight[key] = 1;
-        var p;
-        try { p = _mdFetchAndTally(lg); } catch (e0) { p = null; }
-        function done() {
+        function done(reason) {
           running--;
           delete _mrCgInflight[key];
-          var hc2 = (typeof _skHistoryCache === 'object' && _skHistoryCache) ? _skHistoryCache[key] : null;
-          if (!(hc2 && hc2.data && hc2.data.byWeek)) _mrCgFailed[key] = 1;
+          if (!_mrCgWeeks(key)) _mrCgFailed[key] = reason || 'no weekly results';
           repaint();
           pump();
         }
-        if (p && typeof p.then === 'function') p.then(done, done);
-        else done();
+        var p;
+        try { p = _mrCgLoadOne(lg2); } catch (e0) { p = null; }
+        if (p && typeof p.then === 'function') p.then(done, function () { done('load error'); });
+        else done('load error');
       })(queue.shift());
     }
   }
@@ -138010,44 +138114,63 @@ function mrCgHydrate(force) {
   if (force) repaint();
 }
 
-function _mrCgCollect() {
+// kind 'pts' | 'cats'. Each game: { week, res, close, margin, share, my, opp, oppName }.
+function _mrCgCollect(kind) {
   var pct = _mrClosePct() / 100;
-  var leagues = [], pending = 0, failed = 0, i, k;
+  var leagues = [], pending = 0, failed = [], rebuilt = [], i, k;
   function mkLeague(key, name, team, plat) {
     return { key: key, name: name, team: team, plat: plat, games: [],
              w: 0, l: 0, t: 0, cw: 0, cl: 0, ct: 0 };
   }
-  function addGame(L, week, my, opp, oppName) {
+  function tally(L, g) {
+    if (g.res === 'W') L.w++; else if (g.res === 'L') L.l++; else L.t++;
+    if (g.close) { if (g.res === 'W') L.cw++; else if (g.res === 'L') L.cl++; else L.ct++; }
+    L.games.push(g);
+  }
+  function addPts(L, week, my, opp, oppName) {
     my = Number(my); opp = Number(opp);
-    if (isNaN(my) || isNaN(opp)) return;
-    if (my === 0 && opp === 0) return;             // an unplayed week
+    if (isNaN(my) || isNaN(opp) || (my === 0 && opp === 0)) return;
     var res = (my > opp) ? 'W' : (my < opp) ? 'L' : 'T';
-    var margin = Math.abs(my - opp);
-    var avg = (my + opp) / 2;
-    var close = (res === 'T') || (avg > 0 && margin / avg <= pct);
-    if (res === 'W') L.w++; else if (res === 'L') L.l++; else L.t++;
-    if (close) { if (res === 'W') L.cw++; else if (res === 'L') L.cl++; else L.ct++; }
-    L.games.push({ week: week, my: my, opp: opp, oppName: oppName || '', res: res,
-                   margin: margin, share: avg > 0 ? margin / avg : 0, close: close });
+    var margin = Math.abs(my - opp), avg = (my + opp) / 2;
+    tally(L, { week: week, my: my, opp: opp, oppName: oppName || '', res: res, margin: margin,
+               close: (res === 'T') || (avg > 0 && margin / avg <= pct) });
+  }
+  function addCats(L, week, mw, ow, tied, oppName, resHint) {
+    mw = Number(mw) || 0; ow = Number(ow) || 0; tied = Number(tied) || 0;
+    if (!mw && !ow && !tied) return;                   // nothing decided
+    var res = (mw > ow) ? 'W' : (mw < ow) ? 'L' : 'T';
+    // Yahoo's matchup-level result wins where it disagrees (tiebreakers).
+    if (resHint === 'W' || resHint === 'L' || resHint === 'T') res = resHint;
+    tally(L, { week: week, my: mw, opp: ow, tied: tied, oppName: oppName || '', res: res,
+               margin: Math.abs(mw - ow), close: Math.abs(mw - ow) <= 1 });
   }
 
-  // Yahoo points leagues.
-  var yl = _mrCgYahooPts();
+  var yl = _mrCgYahoo(kind);
   for (i = 0; i < yl.length; i++) {
     var lg = yl[i], key = lg.league_key;
-    var hc = (typeof _skHistoryCache === 'object' && _skHistoryCache) ? _skHistoryCache[key] : null;
-    var bw = hc && hc.data && hc.data.byWeek;
-    if (!bw) { if (_mrCgFailed[key]) failed++; else pending++; continue; }
+    var bw = _mrCgWeeks(key);
+    if (!bw) {
+      if (_mrCgFailed[key]) failed.push({ name: _mrNm({ name: lg.name, team: _mrYTeam(key) }), why: _mrCgFailed[key] });
+      else pending++;
+      continue;
+    }
+    if (_mrCgFallback[key] && !(_skHistoryCache[key] && _skHistoryCache[key].data)) {
+      rebuilt.push({ name: _mrNm({ name: lg.name, team: _mrYTeam(key) }), why: _mrCgNote[key] || '' });
+    }
     var L = mkLeague(key, lg.name || key, _mrYTeam(key), 'yahoo');
     for (k = 0; k < bw.length; k++) {
       var e = bw[k];
-      if (!e || e.isLive || e.myPts == null || e.oppPts == null) continue;
-      addGame(L, e.week, e.myPts, e.oppPts, e.oppName);
+      if (!e || e.isLive) continue;
+      if (kind === 'pts') {
+        if (e.myPts == null || e.oppPts == null) continue;
+        addPts(L, e.week, e.myPts, e.oppPts, e.oppName);
+      } else {
+        addCats(L, e.week, e.myCatsWon, e.oppCatsWon, e.catsTied, e.oppName, e.result);
+      }
     }
     if (L.games.length) leagues.push(L);
   }
 
-  // ESPN points leagues.
   var rows = [];
   try { rows = (typeof extSyncedLeagues === 'function') ? extSyncedLeagues() : []; } catch (e1) {}
   for (i = 0; i < rows.length; i++) {
@@ -138055,7 +138178,7 @@ function _mrCgCollect() {
     if (!row || row.provider !== 'espn') continue;
     if (typeof skMrCounts === 'function' && !skMrCounts(row)) continue;
     var fmt = (typeof extFormatKey === 'function') ? extFormatKey(row) : '';
-    if (fmt !== 'headpoint') continue;
+    if (kind === 'pts' ? fmt !== 'headpoint' : (fmt !== 'head' && fmt !== 'headone')) continue;
     var j = row._espScoreJson;
     if (!j || !j.schedule) continue;
     var myIds = row.myTeamIds || {}, byId = {};
@@ -138071,18 +138194,28 @@ function _mrCgCollect() {
       var meHome = !!(h.teamId != null && myIds[String(h.teamId)]);
       if (!meAway && !meHome) continue;
       var me = meAway ? a : h, op = meAway ? h : a;
-      if (op.teamId == null) continue;             // bye
-      var ot = byId[String(op.teamId)] || {};
-      addGame(E, m.matchupPeriodId, me.totalPoints, op.totalPoints,
-              (typeof espTeamName === 'function') ? espTeamName(ot) : '');
+      if (op.teamId == null) continue;               // bye
+      var on = (typeof espTeamName === 'function') ? espTeamName(byId[String(op.teamId)] || {}) : '';
+      if (kind === 'pts') {
+        addPts(E, m.matchupPeriodId, me.totalPoints, op.totalPoints, on);
+      } else {
+        var mc = me.cumulativeScore || {}, oc = op.cumulativeScore || {};
+        var win = String(m.winner || '').toUpperCase(), hint = null;
+        if (win && win !== 'UNDECIDED') {
+          hint = (win === 'TIE') ? 'T' : ((win === 'AWAY' && meAway) || (win === 'HOME' && meHome)) ? 'W' : 'L';
+        }
+        addCats(E, m.matchupPeriodId, mc.wins, oc.wins, mc.ties, on, hint);
+      }
     }
     if (E.games.length) leagues.push(E);
   }
-  return { leagues: leagues, pending: pending, failed: failed, pct: _mrClosePct() };
+  return { leagues: leagues, pending: pending, failed: failed, rebuilt: rebuilt,
+           pct: _mrClosePct(), kind: kind };
 }
 
-function _mrCloseGamesHtml() {
-  var d = _mrCgCollect(), i, j;
+function _mrCloseGamesHtml(kind) {
+  var d = _mrCgCollect(kind), i, j;
+  var isPts = (kind === 'pts');
   var mono = 'font-family:var(--sk-font-mono,monospace);';
   var T = { w: 0, l: 0, t: 0, cw: 0, cl: 0, ct: 0, n: 0 };
   var bestW = null, worstL = null;
@@ -138090,61 +138223,80 @@ function _mrCloseGamesHtml() {
     var L = d.leagues[i];
     T.w += L.w; T.l += L.l; T.t += L.t; T.cw += L.cw; T.cl += L.cl; T.ct += L.ct;
     T.n += L.games.length;
+    if (!isPts) continue;
     for (j = 0; j < L.games.length; j++) {
       var g = L.games[j];
       if (g.res === 'W' && (!bestW || g.margin < bestW.g.margin)) bestW = { g: g, L: L };
       if (g.res === 'L' && (!worstL || g.margin < worstL.g.margin)) worstL = { g: g, L: L };
     }
   }
+  if (!d.leagues.length && !d.pending && !d.failed.length) return '';
   var cN = T.cw + T.cl + T.ct;
-  function rec(w, l, t) { return w + '-' + l + '-' + t; }
-  function pct(w, l, t) {
+  var rec = function (w, l, t) { return w + '-' + l + '-' + t; };
+  var pctTxt = function (w, l, t) {
     var n = w + l + t;
     return n ? ((w + t / 2) / n).toFixed(3).replace(/^0/, '') : '\u2014';
-  }
-  function pill(v) {
+  };
+  var pill = function (v) {
     var on = (d.pct === v);
     return '<button onclick="mrSetClosePct(' + v + ')" style="padding:3px 9px;border-radius:999px;' +
       'font-size:9.5px;font-weight:700;cursor:pointer;' +
       'border:1px solid ' + (on ? 'rgba(234,179,8,0.55)' : 'rgba(255,255,255,0.14)') + ';' +
       'background:' + (on ? 'rgba(234,179,8,0.12)' : 'none') + ';' +
       'color:' + (on ? 'var(--sk-gold,#eab308)' : 'rgba(255,255,255,0.5)') + ';">' + v + '%</button>';
-  }
+  };
+  var tile = function (lbl, val, sub, col) {
+    return '<div style="flex:1;min-width:0;text-align:center;padding:8px 2px;border-radius:9px;' +
+      'background:rgba(255,255,255,0.025);border:1px solid rgba(255,255,255,0.05);">' +
+      '<div style="font-size:8px;letter-spacing:0.12em;color:rgba(255,255,255,0.35);">' + lbl + '</div>' +
+      '<div style="' + mono + 'font-size:15px;font-weight:800;color:' + (col || '#fff') + ';margin-top:2px;">' + val + '</div>' +
+      '<div style="' + mono + 'font-size:9px;color:rgba(255,255,255,0.35);">' + sub + '</div></div>';
+  };
+  var edge = function (lbl, o, col) {
+    if (!o) return '';
+    return '<div style="display:flex;align-items:baseline;gap:8px;padding:6px 0 0;">' +
+      '<span style="flex:0 0 74px;font-size:8.5px;font-weight:800;letter-spacing:0.1em;color:' + col + ';">' + lbl + '</span>' +
+      '<span style="flex:1;min-width:0;font-size:10.5px;color:rgba(255,255,255,0.6);' +
+        'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' +
+        slEsc(_mrNm(o.L)) + ' \u00b7 wk ' + slEsc(String(o.g.week)) +
+        (o.g.oppName ? ' vs ' + slEsc(o.g.oppName) : '') + '</span>' +
+      '<span style="' + mono + 'font-size:10.5px;color:rgba(255,255,255,0.8);">' +
+        o.g.my.toFixed(1) + '\u2013' + o.g.opp.toFixed(1) + '</span>' +
+    '</div>';
+  };
 
   var h = '<div style="background:var(--sk-bg-card,rgba(255,255,255,0.03));' +
     'border:1px solid rgba(255,255,255,0.07);border-radius:12px;padding:14px;margin:0 0 10px;">' +
     '<div style="display:flex;align-items:baseline;margin:0 0 8px;">' +
-      '<span style="font-family:var(--sk-font-display,serif);font-size:18px;color:#fff;">Close games</span>' +
+      '<span style="font-family:var(--sk-font-display,serif);font-size:18px;color:#fff;">' +
+        (isPts ? 'Close games' : 'Close games \u00b7 categories') + '</span>' +
       '<span style="flex:1;"></span>' +
-      '<span style="font-size:9.5px;letter-spacing:0.12em;color:rgba(255,255,255,0.4);">H2H POINTS</span>' +
-    '</div>' +
-    '<div style="display:flex;align-items:center;gap:5px;margin:0 0 10px;">' +
+      '<span style="font-size:9.5px;letter-spacing:0.12em;color:rgba(255,255,255,0.4);">' +
+        (isPts ? 'H2H POINTS' : 'H2H CATS') + '</span>' +
+    '</div>';
+  if (isPts) {
+    h += '<div style="display:flex;align-items:center;gap:5px;margin:0 0 10px;">' +
       '<span style="font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.35);margin-right:3px;">WITHIN</span>' +
       pill(5) + pill(7) + pill(10) +
       '<span style="font-size:9px;color:rgba(255,255,255,0.3);margin-left:4px;">of the matchup\u2019s avg score</span>' +
     '</div>';
+  } else {
+    h += '<div style="font-size:9.5px;color:rgba(255,255,255,0.35);margin:0 0 10px;">' +
+      'Close = decided by one category or fewer (6-5, 5-4-1, or level)</div>';
+  }
 
   if (!d.leagues.length) {
     h += '<div style="font-size:11.5px;line-height:1.6;color:rgba(255,255,255,0.42);">' +
-      (d.pending ? ('Loading weekly scores for ' + d.pending + ' league' + (d.pending === 1 ? '' : 's') + '\u2026')
-                 : 'No completed H2H points weeks to read yet.') + '</div>';
+      (d.pending ? ('Loading weekly results for ' + d.pending + ' league' + (d.pending === 1 ? '' : 's') + '\u2026')
+                 : 'No completed weeks to read yet.') + '</div>';
   } else {
-    // Headline: close record vs. everything else. Function expressions, not
-    // declarations: these sit inside a block, which ES5 doesn't define.
-    var tile = function (lbl, val, sub, col) {
-      return '<div style="flex:1;min-width:0;text-align:center;padding:8px 2px;border-radius:9px;' +
-        'background:rgba(255,255,255,0.025);border:1px solid rgba(255,255,255,0.05);">' +
-        '<div style="font-size:8px;letter-spacing:0.12em;color:rgba(255,255,255,0.35);">' + lbl + '</div>' +
-        '<div style="' + mono + 'font-size:15px;font-weight:800;color:' + (col || '#fff') + ';margin-top:2px;">' + val + '</div>' +
-        '<div style="' + mono + 'font-size:9px;color:rgba(255,255,255,0.35);">' + sub + '</div></div>';
-    };
     var cp = cN ? (T.cw + T.ct / 2) / cN : null;
     h += '<div style="display:flex;gap:6px;margin:0 0 12px;">' +
-      tile('CLOSE', rec(T.cw, T.cl, T.ct), pct(T.cw, T.cl, T.ct) + ' win%',
+      tile('CLOSE', rec(T.cw, T.cl, T.ct), pctTxt(T.cw, T.cl, T.ct) + ' win%',
            cp == null ? '#fff' : cp > 0.5 ? '#4ade80' : cp < 0.5 ? '#f87171' : '#fff') +
       tile('THE REST', rec(T.w - T.cw, T.l - T.cl, T.t - T.ct),
-           pct(T.w - T.cw, T.l - T.cl, T.t - T.ct) + ' win%') +
-      tile('SHARE', (T.n ? Math.round(cN / T.n * 100) : 0) + '%', cN + ' of ' + T.n + ' games') +
+           pctTxt(T.w - T.cw, T.l - T.cl, T.t - T.ct) + ' win%') +
+      tile('SHARE', (T.n ? Math.round(cN / T.n * 100) : 0) + '%', cN + ' of ' + T.n + ' weeks') +
     '</div>';
 
     h += '<div style="display:flex;font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
@@ -138171,43 +138323,38 @@ function _mrCloseGamesHtml() {
           (xn ? '#fff' : 'rgba(255,255,255,0.3)') + ';">' + (xn ? rec(X.cw, X.cl, X.ct) : '\u2014') + '</span>' +
         '<span style="flex:0 0 44px;text-align:right;' + mono + 'font-size:11px;color:' +
           (xp == null ? 'rgba(255,255,255,0.3)' : xp > 0.5 ? '#4ade80' : xp < 0.5 ? '#f87171' : 'rgba(255,255,255,0.6)') + ';">' +
-          (xn ? pct(X.cw, X.cl, X.ct) : '') + '</span>' +
+          (xn ? pctTxt(X.cw, X.cl, X.ct) : '') + '</span>' +
         '<span style="flex:0 0 66px;text-align:right;' + mono + 'font-size:11px;color:rgba(255,255,255,0.5);">' +
           rec(X.w, X.l, X.t) + '</span>' +
       '</div>';
     }
-
-    var edge = function (lbl, o, col) {
-      if (!o) return '';
-      return '<div style="display:flex;align-items:baseline;gap:8px;padding:6px 0 0;">' +
-        '<span style="flex:0 0 74px;font-size:8.5px;font-weight:800;letter-spacing:0.1em;color:' + col + ';">' + lbl + '</span>' +
-        '<span style="flex:1;min-width:0;font-size:10.5px;color:rgba(255,255,255,0.6);' +
-          'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' +
-          slEsc(_mrNm(o.L)) + ' \u00b7 wk ' + slEsc(String(o.g.week)) +
-          (o.g.oppName ? ' vs ' + slEsc(o.g.oppName) : '') + '</span>' +
-        '<span style="' + mono + 'font-size:10.5px;color:rgba(255,255,255,0.8);">' +
-          o.g.my.toFixed(1) + '\u2013' + o.g.opp.toFixed(1) + '</span>' +
-      '</div>';
-    };
-    h += edge('CLOSEST WIN', bestW, '#4ade80') + edge('CLOSEST LOSS', worstL, '#f87171');
+    if (isPts) h += edge('CLOSEST WIN', bestW, '#4ade80') + edge('CLOSEST LOSS', worstL, '#f87171');
   }
 
   h += '<div style="font-size:9px;line-height:1.5;color:rgba(255,255,255,0.28);margin-top:9px;">' +
-    'Close means the margin was within ' + d.pct + '% of the two teams\u2019 average score that week ' +
-    '\u2014 roughly ' + Math.round(115 * d.pct / 100) + ' points on an NFL-sized week, scaling with ' +
-    'the league\u2019s scoring. Ties count as close. Completed weeks only. A close-game record ' +
-    'well away from .500 is mostly luck, and it tends not to last. Yahoo and ESPN; Sleeper and ' +
-    'Fantrax aren\u2019t in yet.';
-  if (d.pending) h += ' Loading ' + d.pending + ' more league' + (d.pending === 1 ? '' : 's') + '\u2026';
+    (isPts
+      ? ('Close means the margin was within ' + d.pct + '% of the two teams\u2019 average score that week ' +
+         '\u2014 roughly ' + Math.round(115 * d.pct / 100) + ' points on an NFL-sized week, scaling with ' +
+         'the league\u2019s scoring. Ties count as close. ')
+      : ('Scored on category wins, so 5-4-1 is a one-category margin. Counted apart from points ' +
+         'leagues because the two margins can\u2019t be averaged. ')) +
+    'Completed weeks only. A close-game record well away from .500 is mostly luck, and it tends ' +
+    'not to last. Yahoo and ESPN; Sleeper and Fantrax aren\u2019t in yet.' +
+    (d.pending ? (' Loading ' + d.pending + ' more league' + (d.pending === 1 ? '' : 's') + '\u2026') : '');
+  for (i = 0; i < d.rebuilt.length; i++) {
+    h += '<br>' + slEsc(d.rebuilt[i].name) + ' was rebuilt from weekly scoreboards' +
+      (d.rebuilt[i].why ? ' \u2014 its ' + slEsc(d.rebuilt[i].why) : '') + '.';
+  }
   h += '</div>';
-  if (d.failed) {
-    h += '<div style="display:flex;align-items:center;gap:8px;margin-top:8px;">' +
-      '<span style="flex:1;font-size:10px;color:#f59e0b;">' + d.failed + ' Yahoo league' +
-        (d.failed === 1 ? '' : 's') + ' couldn\u2019t load weekly scores.</span>' +
-      '<button onclick="mrCgHydrate(true)" style="padding:4px 11px;border-radius:999px;' +
+  if (d.failed.length) {
+    h += '<div style="margin-top:8px;">';
+    for (i = 0; i < d.failed.length; i++) {
+      h += '<div style="font-size:10px;line-height:1.45;color:#f59e0b;">' + slEsc(d.failed[i].name) +
+        ' couldn\u2019t load: ' + slEsc(d.failed[i].why) + '</div>';
+    }
+    h += '<button onclick="mrCgHydrate(true)" style="margin-top:6px;padding:4px 11px;border-radius:999px;' +
         'border:1px solid rgba(255,255,255,0.16);background:none;color:rgba(255,255,255,0.6);' +
-        'font-size:9.5px;font-weight:700;letter-spacing:0.06em;">RETRY</button>' +
-    '</div>';
+        'font-size:9.5px;font-weight:700;letter-spacing:0.06em;">RETRY</button></div>';
   }
   return h + '</div>';
 }
@@ -138623,7 +138770,8 @@ function mrRenderBody() {
         'league in points and finish fourth. Counted apart from season points ' +
         'for that reason. PCTL scales a finish to league size.');
   h += _mrKnockoutSectionHtml(data);   // MGRKO
-  h += _mrCloseGamesHtml();            // MGRCLOSE (replaced MGRNEM)
+  h += _mrCloseGamesHtml('pts');       // MGRCLOSE (replaced MGRNEM)
+  h += _mrCloseGamesHtml('cats');      // MGRCLOSE — categories, kept apart
 
   // Per-league trace. Small, and it makes a surprising total explainable
   // instead of something to argue with. MGRREC2
