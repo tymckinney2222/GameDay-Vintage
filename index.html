@@ -1243,6 +1243,46 @@
   .sk-gpb-cov.low { color: #f87171; }
   .sk-gpb-cov.mid { color: #fbbf24; }
   .sk-gpb-cov.ok  { color: rgba(255,255,255,0.45); }
+  /* ── ESPKO ── Knockout survival board. */
+  .sk-ko-head {
+    font-family: var(--sk-font-mono, monospace); font-size: 9px;
+    letter-spacing: 0.1em; color: rgba(255,255,255,0.35); margin: 10px 0 5px;
+  }
+  .sk-ko-head.gone { color: rgba(248,113,113,0.6); margin-top: 18px; }
+  .sk-ko-row {
+    display: grid; grid-template-columns: 26px 1fr 58px 44px;
+    gap: 6px; align-items: baseline; padding: 6px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.05); font-size: 12.5px;
+  }
+  .sk-ko-row.mine { background: rgba(245,213,71,0.06); }
+  .sk-ko-row.block { background: rgba(248,113,113,0.07); }
+  .sk-ko-row.gone { opacity: 0.45; }
+  .sk-ko-rank {
+    font-family: var(--sk-font-mono, monospace); font-size: 10px;
+    color: rgba(255,255,255,0.35);
+  }
+  .sk-ko-name {
+    min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    color: rgba(255,255,255,0.85);
+  }
+  .sk-ko-row.mine .sk-ko-name { color: var(--sk-gold, #f5d547); font-weight: 700; }
+  .sk-ko-wk {
+    font-family: var(--sk-font-mono, monospace); font-weight: 800;
+    text-align: right; color: #fff;
+  }
+  .sk-ko-row.block .sk-ko-wk { color: #f87171; }
+  .sk-ko-cum {
+    font-family: var(--sk-font-mono, monospace); font-size: 10px;
+    text-align: right; color: rgba(255,255,255,0.3);
+  }
+  .sk-ko-cut {
+    font-family: var(--sk-font-mono, monospace); font-size: 8.5px;
+    letter-spacing: 0.12em; color: #f87171; margin: 6px 0 2px;
+    border-top: 1px dashed rgba(248,113,113,0.45); padding-top: 5px;
+  }
+  .sk-ko-note {
+    font-size: 10px; line-height: 1.5; color: rgba(255,255,255,0.3); margin-top: 12px;
+  }
   .sk-gpb-note, .sk-gpb-empty {
     padding: 10px 12px; font-size: 10px; line-height: 1.5;
     color: rgba(255,255,255,0.35);
@@ -150878,6 +150918,175 @@ function espHasPaceTab(row) {
   return false;
 }
 
+// ── ESPN KNOCKOUT ── ESPKO ──
+//
+// ESPN has no league-level knockout flag, but it models the format inside the
+// schedule: each matchup period carries a teams[] array where every entry has
+// totalPoints for that week, cumulativeScore, and — the one that settles it —
+// eliminationMatchupPeriod, the week that team was chopped (0 while alive).
+//
+// That is strictly better than the team-level eliminated boolean the Lab
+// probe found first: a boolean says who is gone, this says WHEN, which is
+// what a graveyard is grouped by.
+//
+// A guillotine chops the lowest WEEKLY score, never the season total. The
+// Yahoo board had that bug and it was fixed in GUILSORT; this one reads the
+// weekly figure from the start.
+var _espKoCache = {};      // leagueKey -> { ts, data }
+var _espKoInflight = {};
+
+function _espKoParse(json) {
+  var sch = (json && json.schedule) || [];
+  if (!sch.length) return null;
+  var byTeam = {}, periods = {}, maxPeriod = 0, sawElimField = false, i, t;
+  for (i = 0; i < sch.length; i++) {
+    var e = sch[i];
+    var pid = parseInt(e && e.matchupPeriodId, 10);
+    if (isNaN(pid)) continue;
+    var arr = (e && e.teams) || [];
+    if (!arr.length) continue;
+    periods[pid] = 1;
+    if (pid > maxPeriod) maxPeriod = pid;
+    for (t = 0; t < arr.length; t++) {
+      var row = arr[t];
+      var id = String(row.teamId);
+      if (!byTeam[id]) byTeam[id] = { id: id, weeks: {}, elim: 0, cum: null };
+      var pts = (typeof row.totalPoints === 'number') ? row.totalPoints : null;
+      if (pts != null) byTeam[id].weeks[pid] = pts;
+      if (typeof row.cumulativeScore === 'number') byTeam[id].cum = row.cumulativeScore;
+      if (row.eliminationMatchupPeriod !== undefined) {
+        sawElimField = true;
+        var em = parseInt(row.eliminationMatchupPeriod, 10);
+        if (!isNaN(em) && em > 0) byTeam[id].elim = em;
+      }
+    }
+  }
+  var keys = Object.keys(byTeam);
+  if (!keys.length) return null;
+  return { byTeam: byTeam, maxPeriod: maxPeriod, hasElimField: sawElimField,
+           periods: Object.keys(periods).length };
+}
+
+// Is this an ESPN knockout league? Requires the elimination field AND at
+// least one team actually chopped — the field alone appears on ordinary
+// season-points leagues where it stays 0 forever, and a board that declares
+// a guillotine before anyone has been cut would be inventing a format.
+function espIsKnockout(row) {
+  var d = _espKoCache[row && row.key];
+  d = d && d.data;
+  if (!d || !d.hasElimField) return false;
+  for (var k in d.byTeam) {
+    if (d.byTeam.hasOwnProperty(k) && d.byTeam[k].elim > 0) return true;
+  }
+  return false;
+}
+
+// Fetch + cache the schedule. Five minutes: a chop happens once a week.
+function _espKoLoad(row, done) {
+  var key = row && row.key;
+  if (!key) { if (done) done(null); return; }
+  var c = _espKoCache[key];
+  if (c && (Date.now() - c.ts) < 300000) { if (done) done(c.data); return; }
+  if (_espKoInflight[key]) { if (done) done(c && c.data); return; }
+  var sv = (typeof espFindSaved === 'function') ? espFindSaved(String(key).slice(4)) : null;
+  if (!sv || typeof ESP_BASE === 'undefined') { if (done) done(null); return; }
+  var game = (typeof _espVbsGame === 'function') ? _espVbsGame(row)
+           : (typeof _espSsGame === 'function') ? _espSsGame(row) : 'ffl';
+  _espKoInflight[key] = 1;
+  fetch(ESP_BASE + game + '/seasons/' + (row.season || '') + '/segments/0/leagues/' +
+        sv.id + '?view=mMatchupScore')
+    .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+    .then(function (j) {
+      _espKoCache[key] = { ts: Date.now(), data: _espKoParse(j) };
+    })
+    .catch(function () { _espKoCache[key] = { ts: Date.now(), data: null }; })
+    .then(function () {
+      delete _espKoInflight[key];
+      if (done) done(_espKoCache[key] && _espKoCache[key].data);
+    });
+}
+
+function _espKoPaneHtml(row) {
+  var h = '<div data-espstand>';
+  h += _espStandToggleHtml(row, 'ko');
+  var c = _espKoCache[row.key];
+  var d = c && c.data;
+  if (!d) {
+    return h + '<div class="sk-gpb-empty">Loading the knockout schedule\u2026</div></div>';
+  }
+  var names = {};
+  try {
+    var teams = ((row.raw || {}).teams) || [];
+    for (var i = 0; i < teams.length; i++) {
+      names[String(teams[i].id)] = (typeof espTeamName === 'function')
+        ? espTeamName(teams[i], null) : (teams[i].abbrev || String(teams[i].id));
+    }
+  } catch (e) {}
+
+  // The live week is the newest period anybody has points for.
+  var live = 0, k, w;
+  for (k in d.byTeam) {
+    if (!d.byTeam.hasOwnProperty(k)) continue;
+    for (w in d.byTeam[k].weeks) {
+      if (d.byTeam[k].weeks.hasOwnProperty(w) && +w > live) live = +w;
+    }
+  }
+
+  var alive = [], gone = [];
+  for (k in d.byTeam) {
+    if (!d.byTeam.hasOwnProperty(k)) continue;
+    var t = d.byTeam[k];
+    var entry = {
+      id: k, name: names[k] || ('Team ' + k),
+      wk: (t.weeks[live] != null) ? t.weeks[live] : null,
+      cum: t.cum, elim: t.elim
+    };
+    if (t.elim > 0) gone.push(entry); else alive.push(entry);
+  }
+  // ESPKO — ranked on the WEEK, lowest at the cut line. Season total is only
+  // a tiebreak; nobody has ever been chopped for a season total.
+  alive.sort(function (a, b) {
+    var aw = (a.wk == null) ? -1 : a.wk, bw = (b.wk == null) ? -1 : b.wk;
+    if (aw !== bw) return bw - aw;
+    var ac = (a.cum == null) ? -1 : a.cum, bc = (b.cum == null) ? -1 : b.cum;
+    return bc - ac;
+  });
+  gone.sort(function (a, b) { return b.elim - a.elim; });
+
+  var mine = {};
+  try { mine = (typeof _extMyIds === 'function') ? (_extMyIds(row) || {}) : (row.myTeamIds || {}); }
+  catch (e2) { mine = row.myTeamIds || {}; }
+
+  h += '<div class="sk-ko-head">WEEK ' + live + ' \u00b7 ' + alive.length +
+    ' alive \u00b7 lowest weekly score is chopped</div>';
+  for (var a = 0; a < alive.length; a++) {
+    var r = alive[a];
+    var last = (a === alive.length - 1);
+    h += (last ? '<div class="sk-ko-cut">CUT LINE</div>' : '') +
+      '<div class="sk-ko-row' + (mine[r.id] ? ' mine' : '') + (last ? ' block' : '') + '">' +
+        '<span class="sk-ko-rank">' + (a + 1) + '</span>' +
+        '<span class="sk-ko-name">' + slEsc(r.name) + '</span>' +
+        '<span class="sk-ko-wk">' + ((r.wk == null) ? '\u2014' : r.wk.toFixed(1)) + '</span>' +
+        '<span class="sk-ko-cum">' + ((r.cum == null) ? '' : Math.round(r.cum)) + '</span>' +
+      '</div>';
+  }
+  if (gone.length) {
+    h += '<div class="sk-ko-head gone">GRAVEYARD</div>';
+    for (var g = 0; g < gone.length; g++) {
+      h += '<div class="sk-ko-row gone">' +
+        '<span class="sk-ko-rank">W' + gone[g].elim + '</span>' +
+        '<span class="sk-ko-name">' + slEsc(gone[g].name) + '</span>' +
+        '<span class="sk-ko-wk"></span>' +
+        '<span class="sk-ko-cum">' + ((gone[g].cum == null) ? '' : Math.round(gone[g].cum)) + '</span>' +
+      '</div>';
+    }
+  }
+  h += '<div class="sk-ko-note">Weekly score decides the chop \u2014 the season ' +
+    'total on the right is context only. Elimination weeks come from ESPN\u2019s own ' +
+    'eliminationMatchupPeriod, not inferred.</div>';
+  return h + '</div>';
+}
+
 // ── ESPN ROTO PRESSURE PANE ── ESPROTO ──
 // Same predicate the tab and the router share, so a selected tab can never
 // land on a pane that declined to render.
@@ -150979,7 +151188,22 @@ function _espRotoStatStyle(state) {
   return { lbl: 'rgba(255,255,255,0.42)', val: 'font-weight:700;border-bottom:1px solid ' + uc + ';' };
 }
 
+// ESPKO — warm the knockout schedule so the SURVIVAL tab can appear at all.
+// espIsKnockout reads the cache only; without this it would always be false
+// on first paint and the tab would never show.
+function _espKoWarm(row) {
+  if (!row || row.provider !== 'espn') return;
+  var sp = String(row.sport || '').toLowerCase();
+  if (sp !== 'nfl' && sp !== 'cfb') return;
+  if (_espKoCache[row.key]) return;
+  _espKoLoad(row, function () {
+    // Re-open the detail so the tab strip is rebuilt with SURVIVAL on it.
+    if (typeof extOpenLeague === 'function') { try { extOpenLeague(row.key); } catch (e) {} }
+  });
+}
+
 function _espStandToggleHtml(row, active) {
+  _espKoWarm(row);
   if (!espHasSeasonStats(row)) return '';
   var key = String(row.key || '').replace(/'/g, '');
   function tab(id, label) {
@@ -150999,6 +151223,9 @@ function _espStandToggleHtml(row, active) {
     // ESPROTO — roto only. Shares espHasRotoPressure with the pane router.
     ((typeof espHasRotoPressure === 'function' && espHasRotoPressure(row))
       ? tab('press', 'PRESSURE') : '') +
+    ((typeof espIsKnockout === 'function' && espIsKnockout(row))
+      ? tab('ko', 'SURVIVAL') : '') +   // ESPKO
+
     // ESPSCHED — same predicate the router uses, so the two can't disagree.
     ((typeof espHasSchedule === 'function' && espHasSchedule(row))
       ? tab('sched', 'SCHEDULE') : '') +
@@ -151181,6 +151408,9 @@ function _espStandingsPaneHtml(row) {
   }
   if (_sv === 'proj' && espHasProjection(row)) {   // ESPPROJ
     return _espProjStandingsHtml(row);
+  }
+  if (_sv === 'ko' && typeof espIsKnockout === 'function' && espIsKnockout(row)) {
+    return _espKoPaneHtml(row);   // ESPKO
   }
   if (_sv === 'press' && typeof espHasRotoPressure === 'function' && espHasRotoPressure(row)) {
     return _espRotoPressurePaneHtml(row);   // ESPROTO
