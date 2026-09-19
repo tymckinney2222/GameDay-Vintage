@@ -136186,9 +136186,10 @@ function skArchiveYahooLeague(lg, force) {
 
   var record = '';
   if (fmt === 'head') {
-    var tally = (typeof _mdMatchupTally === 'object' && _mdMatchupTally)
-      ? _mdMatchupTally[lg.league_key] : null;
-    if (!tally || tally.missing) { window._skArchReason = 'matchup record loading'; return null; }
+    var tally = (typeof _mdMatchupTally === 'object' && _mdMatchupTally &&
+                 _mdMatchupTally[lg.league_key] && !_mdMatchupTally[lg.league_key].missing)
+      ? _mrYahooDoneTally(lg.league_key) : null;   // MGRRECLIVE
+    if (!tally) { window._skArchReason = 'matchup record loading'; return null; }
     record = tally.wins + '-' + tally.losses + '-' + tally.ties;
   } else if (fmt === 'headpoint') {
     var pr = (typeof _mrParseRec === 'function') ? _mrParseRec(tm.record) : null;
@@ -137047,9 +137048,11 @@ function mrYahooSeason() {
 
     // Categories: standings would give a per-category total, so use the
     // weekly history instead.
-    var tally = (typeof _mdMatchupTally === 'object' && _mdMatchupTally)
-      ? _mdMatchupTally[lg.league_key] : null;
-    if (tally && !tally.missing) {
+    // MGRRECLIVE — finished weeks only; the tally also counted this week.
+    var tally = (typeof _mdMatchupTally === 'object' && _mdMatchupTally &&
+                 _mdMatchupTally[lg.league_key] && !_mdMatchupTally[lg.league_key].missing)
+      ? _mrYahooDoneTally(lg.league_key) : null;
+    if (tally) {
       out[sport].w += tally.wins; out[sport].l += tally.losses; out[sport].t += tally.ties;
       out[sport].n++;
       addRow(sport, lg, tally.wins, tally.losses, tally.ties, false);
@@ -137060,6 +137063,30 @@ function mrYahooSeason() {
     }
   }
   return { bySport: out, rows: rows, pending: pending, needCats: needCats };
+}
+
+// ── MGRRECLIVE ── Completed-week tally for a Yahoo H2H league.
+// _mdMatchupTally is built from the History aggregate, which includes the
+// week in progress (so the History tab can show it live). Counted into a
+// SEASON record, that banked a week that isn't over: the three categories
+// leagues winning this week each read one win higher than their close-games
+// breakdown, which only counts finished weeks. ESPN had the same bug and
+// was fixed in MGRREC3. Reads the aggregate directly and skips live weeks;
+// falls back to the tally only when the aggregate is gone.
+function _mrYahooDoneTally(key) {
+  var hc = (typeof _skHistoryCache === 'object' && _skHistoryCache) ? _skHistoryCache[key] : null;
+  var bw = hc && hc.data && hc.data.byWeek;
+  if (bw) {
+    var w = 0, l = 0, t = 0, i;
+    for (i = 0; i < bw.length; i++) {
+      var e = bw[i];
+      if (!e || e.isLive) continue;
+      if (e.result === 'W') w++; else if (e.result === 'L') l++; else if (e.result === 'T') t++;
+    }
+    return { wins: w, losses: l, ties: t };
+  }
+  var tl = (typeof _mdMatchupTally === 'object' && _mdMatchupTally) ? _mdMatchupTally[key] : null;
+  return (tl && !tl.missing && !tl.error) ? tl : null;
 }
 
 // Fetch only the cats leagues that still lack a weekly tally. Bounded at
@@ -137972,7 +137999,14 @@ function _mrCgYahoo(kind) {
     var lg = yl[i];
     if (!lg || !lg.league_key) continue;
     var st = String(lg.scoring_type || '');
-    var isPts = (st === 'headpoint'), isCats = (st === 'head' || st === 'headone');
+    // MGRCLOSE4 — Yahoo labels a football H2H POINTS league 'head', the same
+    // code it uses for categories; 'headpoint' only shows up in other
+    // sports. So the four Yahoo football leagues were sorted as categories,
+    // had no category wins to score, and dropped out of both sections.
+    var sp = String(lg.sport || '').toLowerCase();
+    var fbPts = (st === 'head' && (sp === 'nfl' || sp === 'cfb'));
+    var isPts = (st === 'headpoint') || fbPts;
+    var isCats = !fbPts && (st === 'head' || st === 'headone');
     if (kind === 'pts' ? !isPts : !isCats) continue;
     if (typeof _mrIsGuillotineLeague === 'function' && _mrIsGuillotineLeague(lg)) continue;
     out.push(lg);
@@ -138264,9 +138298,15 @@ function _mrCgCollect(kind) {
     if (_mrCgFailed[key]) failed.push({ name: _mrNm({ name: lg.name, team: _mrYTeam(key) }), why: _mrCgFailed[key] });
     if (_mrCgNote[key]) rebuilt.push({ name: _mrNm({ name: lg.name, team: _mrYTeam(key) }), why: _mrCgNote[key] });
     var L = mkLeague(key, lg.name || key, _mrYTeam(key), 'yahoo');
+    // MGRCLOSE4 — a week Yahoo has marked final can still be missing from
+    // the standings record for a few hours (Sunday night into Monday), so it
+    // counted here and not there. Same cutoff as the record: finished weeks
+    // up to the one before Yahoo's current week.
+    var nd = _mrCgNeeded(lg), cutoff = nd.length ? nd[nd.length - 1] : 0;
     for (k = 0; k < bw.length; k++) {
       var e = bw[k];
       if (!e || e.isLive) continue;
+      if (e.week > cutoff) continue;
       if (kind === 'pts') {
         if (e.myPts == null || e.oppPts == null) continue;
         addPts(L, e.week, e.myPts, e.oppPts, e.oppName);
