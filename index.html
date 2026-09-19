@@ -18431,6 +18431,12 @@
   .sk-sc-verdict.mid  { color: #fbbf24; background: rgba(251,191,36,0.1); }
   .sk-sc-verdict.bad  { color: #f87171; background: rgba(248,113,113,0.1); }
   .sk-sc-good { color: #4ade80; } .sk-sc-bad { color: #f87171; }
+  /* SKSCOUT3 — team labels over each form row */
+  .sk-sc-formlbl {
+    font-family: var(--sk-font-mono); font-size: 9.5px; font-weight: 700; letter-spacing: 0.12em;
+    text-transform: uppercase; color: var(--sk-text-3); margin: 10px 6px 6px;
+  }
+  .sk-sc-formlbl.you { color: var(--sk-gold); margin-top: 14px; }
   /* WIREPL — player lines on The Wire sheet */
   .sk-wpl-tabs { display: flex; gap: 6px; margin: 0 4px 10px; }
   .sk-wpl-tab {
@@ -91307,6 +91313,24 @@ function skOpenScouting(leagueKey) {
         return ((agg && agg.byWeek) || []).filter(function (e) { return e && !e.isLive; });
       }, function () { return []; })
     : Promise.resolve([]);
+  // SKSCOUT3 — your own recent form, shown under theirs. Uses the weekly
+  // results Close games already keeps on the device when they cover these
+  // weeks; otherwise one small request for the same weeks.
+  var pMyForm;
+  var stored = (typeof _mrCgWeeks === 'function') ? _mrCgWeeks(leagueKey) : null;
+  var storedHit = [];
+  if (stored && weeks.length) {
+    for (var sw2 = 0; sw2 < stored.length; sw2++) if (weeks.indexOf(stored[sw2].week) >= 0) storedHit.push(stored[sw2]);
+  }
+  if (weeks.length && storedHit.length === weeks.length) pMyForm = Promise.resolve(storedHit);
+  else pMyForm = weeks.length
+    ? fyApi('/team/' + myKey + '/matchups;weeks=' + weeks.join(',')).then(function (res) {
+        if (!res || res.error) return storedHit;
+        var ms = _skParseMatchupsWithScores(res);
+        var agg = _skAggregateHistory(ms, myKey, st);
+        return ((agg && agg.byWeek) || []).filter(function (e) { return e && !e.isLive; });
+      }, function () { return storedHit; })
+    : Promise.resolve([]);
   var pHot = fyApi('/team/' + oppKey + '/roster/players/stats' + statsType)
     .then(function (r) { return (r && !r.error) ? _parseTeamFpResponse(r) : {}; }, function () { return {}; });
   var pMine = fyApi('/team/' + myKey + '/roster/players/stats' + statsType)
@@ -91318,9 +91342,10 @@ function skOpenScouting(leagueKey) {
   var pTx = fyApi('/league/' + leagueKey + '/transactions;types=add,drop,trade;count=100')
     .then(function (res) { return _skScoutTx(res, oppKey); }, function () { return null; });
 
-  Promise.all([pTeams, pForm, pHot, pMine, pToday, pTx]).then(function (r) {
+  Promise.all([pTeams, pForm, pHot, pMine, pToday, pTx, pMyForm]).then(function (r) {
     var data = { ts: Date.now(), opp: oppKey, me: myKey, st: st, sport: sport, fb: fb,
-                 teams: r[0] || {}, form: r[1] || [], hot: r[2] || {}, mine: r[3] || {}, today: r[4], tx: r[5] };
+                 teams: r[0] || {}, form: r[1] || [], hot: r[2] || {}, mine: r[3] || {}, today: r[4], tx: r[5],
+                 myForm: r[6] || [] };
     _skScoutCache[leagueKey] = data;
     var t = document.getElementById('skWireSheetTitle');
     if (t && data.teams[oppKey] && data.teams[oppKey].name) t.textContent = data.teams[oppKey].name;
@@ -91348,32 +91373,40 @@ function _skScoutHtml(league, d) {
   var subEl = document.getElementById('skWireSheetSub');
   if (subEl) subEl.innerHTML = skEscape(sub.join(' \u00b7 '));
 
-  // ── Form ──
-  h += _skSheetSection('\ud83d\udcc8', 'Recent form', d.form.length ? 'last ' + d.form.length + ' weeks' : '');
-  if (d.form.length) {
-    var chips = '', streak = 0, sres = null;
-    for (var i = d.form.length - 1; i >= 0; i--) {
-      var rs = d.form[i].result;
+  // ── Form ── theirs, then yours (SKSCOUT3) ──
+  var i;   // shared loop counter for the sections below
+  var formBlock = function (list, label, you) {
+    var out = '<div class="sk-sc-formlbl' + (you ? ' you' : '') + '">' + skEscape(label) + '</div>';
+    if (!list || !list.length) return out + '<div class="sk-rc-note" style="margin-top:0">No completed weeks yet.</div>';
+    list = list.slice().sort(function (a, b) { return a.week - b.week; });
+    var chips = '', streak = 0, sres = null, k;
+    for (k = list.length - 1; k >= 0; k--) {
+      var rs = list[k].result;
       if (sres === null) sres = rs;
       if (rs === sres) streak++; else break;
     }
     var pfSum = 0, pfN = 0;
-    for (i = 0; i < d.form.length; i++) {
-      var e = d.form[i];
+    for (k = 0; k < list.length; k++) {
+      var e = list[k];
       var sc = isPts && e.myPts != null ? (' ' + Number(e.myPts).toFixed(0) + '\u2013' + Number(e.oppPts).toFixed(0))
              : (!isPts && e.myCatsWon != null ? (' ' + e.myCatsWon + '\u2013' + e.oppCatsWon) : '');
       if (isPts && e.myPts != null) { pfSum += Number(e.myPts); pfN++; }
       chips += '<span class="sk-sc-chip ' + (e.result === 'W' ? 'w' : e.result === 'L' ? 'l' : 't') + '">' +
         'Wk ' + e.week + ' <b>' + (e.result || '\u2013') + '</b>' + skEscape(sc) + '</span>';
     }
-    h += '<div class="sk-sc-chips">' + chips + '</div>';
+    out += '<div class="sk-sc-chips">' + chips + '</div>';
     var fl = [];
     if (sres && streak >= 2) fl.push((sres === 'W' ? 'Won ' : sres === 'L' ? 'Lost ' : 'Tied ') + streak + ' straight');
     if (pfN) fl.push('averaging ' + (pfSum / pfN).toFixed(1) + ' a week');
-    if (fl.length) h += '<div class="sk-rc-note" style="margin-top:6px">' + skEscape(fl.join(' \u00b7 ')) + '</div>';
-  } else {
-    h += '<div class="sk-rc-note" style="margin-top:0">No completed weeks yet.</div>';
-  }
+    if (fl.length) out += '<div class="sk-rc-note" style="margin-top:6px">' + skEscape(fl.join(' \u00b7 ')) + '</div>';
+    return out;
+  };
+  var nWk = Math.max(d.form.length, (d.myForm || []).length);
+  h += _skSheetSection('\ud83d\udcc8', 'Recent form', nWk ? 'last ' + nWk + ' weeks' : '');
+  var oppLbl = (opp && opp.name) || (d.teams[d.opp] && d.teams[d.opp].name) || 'Them';
+  var myLbl = ((typeof _mrYTeam === 'function' && _mrYTeam(key)) || (d.teams[d.me] && d.teams[d.me].name) || 'Your team');
+  h += formBlock(d.form, oppLbl, false);
+  h += formBlock(d.myForm || [], 'You \u00b7 ' + myLbl, true);
 
   // ── Engagement ── SKSCOUT2 ──
   // The first version leaned on "empty slots right now", which misfires in
