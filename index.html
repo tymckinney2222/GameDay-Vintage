@@ -116794,9 +116794,119 @@ function skLabRenderKnockout(el) {
         list.length + '</span> <span class="v">' + skEscape(flagged[q].name) +
         (flagged[q].pf != null ? ('  ' + flagged[q].pf) : '') + '</span></div>';
     }
+    // ESPKOWK — offer the weekly-score probe where a chop looks real.
+    if (cls === 'hit') {
+      h += '<button class="sk-probe-run" style="margin-top:8px" ' +
+        'onclick="skKoProbeWeekly(\'' + skEscape(row.key) + '\')">' +
+        'Probe weekly scores</button>';
+    }
     h += '</div>';
   }
-  el.innerHTML = h;
+  el.innerHTML = h + '<div id="skKoProbeOut"></div>';
+}
+
+// ── ESPKOWK ── Can ESPN give per-team WEEKLY scores in a season-points league?
+//
+// A guillotine chops the lowest WEEKLY score, but the standings column is a
+// season TOTAL — the exact bug the Yahoo board had before GUILSORT. So before
+// building a survival board the question is whether ESPN will scope a team's
+// points to one period.
+//
+// Three candidate shapes, asked in order of how much they'd give us:
+//   mTeam + scoringPeriodId  — does the team payload narrow to that period?
+//   mScoreboard + period     — does a league with no matchups still score one?
+//   mMatchupScore            — is there a schedule at all to read from?
+//
+// The mTeam test compares TWO different periods: if a team's points come back
+// identical for both, the parameter was ignored and the response is a season
+// total wearing a period label. That's the failure worth catching, because it
+// looks like success.
+function skKoProbeWeekly(leagueKey) {
+  var host = document.getElementById('skKoProbeOut');
+  if (host) host.innerHTML = '<div class="sk-probe-note">Asking\u2026</div>';
+  var rows = [];
+  try {
+    var all = (typeof extSyncedLeagues === 'function') ? extSyncedLeagues() : [];
+    for (var i = 0; i < all.length; i++) {
+      if (all[i] && all[i].key === leagueKey) rows.push(all[i]);
+    }
+  } catch (e) {}
+  var row = rows[0];
+  if (!row) { if (host) host.innerHTML = '<div class="sk-probe-note">League not found.</div>'; return; }
+  var sv = (typeof espFindSaved === 'function') ? espFindSaved(String(row.key).slice(4)) : null;
+  if (!sv) { if (host) host.innerHTML = '<div class="sk-probe-note">No saved league record.</div>'; return; }
+  var game = (typeof _espVbsGame === 'function') ? _espVbsGame(row) : 'ffl';
+  var base = ESP_BASE + game + '/seasons/' + (row.season || '') + '/segments/0/leagues/' + sv.id;
+  var cur = ((row.raw || {}).scoringPeriodId) || 3;
+  var prev = Math.max(1, cur - 1);
+
+  function pfMap(j) {
+    var out = {};
+    var ts = (j && j.teams) || [];
+    for (var t = 0; t < ts.length; t++) {
+      var pf = null;
+      try { if (typeof espPickPoints === 'function') pf = espPickPoints((ts[t].record || {}).overall, ts[t]); }
+      catch (e2) {}
+      out[String(ts[t].id)] = (pf == null || isNaN(pf)) ? null : Number(pf);
+    }
+    return out;
+  }
+  function get(q) {
+    return fetch(base + q, { cache: 'no-store' })
+      .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .catch(function (e) { return { __err: String((e && e.message) || e) }; });
+  }
+
+  Promise.all([
+    get('?view=mTeam&scoringPeriodId=' + cur),
+    get('?view=mTeam&scoringPeriodId=' + prev),
+    get('?view=mScoreboard&scoringPeriodId=' + cur),
+    get('?view=mMatchupScore')
+  ]).then(function (res) {
+    var a = res[0], b = res[1], sb = res[2], ms = res[3];
+    var h = '';
+
+    if (a.__err || b.__err) {
+      h += _skKoRow('err', 'mTeam + scoringPeriodId', 'FAILED: ' + (a.__err || b.__err), '');
+    } else {
+      var ma = pfMap(a), mb = pfMap(b), diff = 0, seen = 0, sample = [];
+      for (var k in ma) {
+        if (!ma.hasOwnProperty(k) || mb[k] === undefined) continue;
+        seen++;
+        if (ma[k] !== mb[k]) diff++;
+        if (sample.length < 3) sample.push(k + ': wk' + cur + '=' + ma[k] + '  wk' + prev + '=' + mb[k]);
+      }
+      if (!seen) h += _skKoRow('miss', 'mTeam + scoringPeriodId', 'no team points in either response', '');
+      else if (diff === 0) h += _skKoRow('miss', 'mTeam + scoringPeriodId',
+        'identical across weeks ' + cur + ' and ' + prev + ' (' + seen + ' teams) \u2014 ' +
+        'the parameter is ignored; this is a season total', sample.join('   '));
+      else h += _skKoRow('hit', 'mTeam + scoringPeriodId',
+        diff + ' of ' + seen + ' teams differ between weeks \u2014 the response IS period-scoped',
+        sample.join('   '));
+    }
+
+    if (sb.__err) h += _skKoRow('err', 'mScoreboard + period', 'FAILED: ' + sb.__err, '');
+    else {
+      var sch = (sb.schedule || []).length;
+      h += _skKoRow(sch ? 'hit' : 'miss', 'mScoreboard + period',
+        sch + ' schedule entries', '');
+    }
+    if (ms.__err) h += _skKoRow('err', 'mMatchupScore', 'FAILED: ' + ms.__err, '');
+    else {
+      var sch2 = (ms.schedule || []).length;
+      h += _skKoRow(sch2 ? 'hit' : 'miss', 'mMatchupScore',
+        sch2 + ' schedule entries' + (sch2 ? '' : ' \u2014 no matchups, as expected for season points'), '');
+    }
+    if (host) host.innerHTML = h;
+  });
+}
+
+function _skKoRow(cls, label, verdict, detail) {
+  return '<div class="sk-probe-row ' + cls + '">' +
+    '<div class="sk-probe-lbl">' + skEscape(label) + '</div>' +
+    '<div class="sk-probe-verdict">' + skEscape(verdict) + '</div>' +
+    (detail ? ('<div class="sk-probe-hit"><span class="v">' + skEscape(detail) + '</span></div>') : '') +
+  '</div>';
 }
 
 // ─── CAPS ────────────────────────────────────────────────────────  YCAPS
