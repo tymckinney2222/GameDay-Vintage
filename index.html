@@ -151001,12 +151001,23 @@ function espIsKnockout(row) {
 // Fetch + cache the schedule. Five minutes: a chop happens once a week.
 function _espKoLoad(row, done) {
   var key = row && row.key;
-  if (!key) { if (done) done(null); return; }
+  if (!key) return;
+  // ── ESPKO6 ── Never call back synchronously.
+  //
+  // The cached and in-flight paths both invoked done() straight away. The
+  // warm callback repaints, a repaint re-renders the cards, and each card
+  // calls the warm again — so an in-flight league recursed until the tab
+  // locked up. Those paths now return silently: the data is either already
+  // there for the next paint, or the real completion will fire once.
   var c = _espKoCache[key];
-  if (c && (Date.now() - c.ts) < 300000) { if (done) done(c.data); return; }
-  if (_espKoInflight[key]) { if (done) done(c && c.data); return; }
+  if (c && (Date.now() - c.ts) < 300000) return;
+  if (_espKoInflight[key]) return;
   var sv = (typeof espFindSaved === 'function') ? espFindSaved(String(key).slice(4)) : null;
-  if (!sv || typeof ESP_BASE === 'undefined') { if (done) done(null); return; }
+  if (!sv || typeof ESP_BASE === 'undefined') {
+    // Cache the miss so the warm guard stops asking every render.
+    _espKoCache[key] = { ts: Date.now(), data: null };
+    return;
+  }
   var game = (typeof _espVbsGame === 'function') ? _espVbsGame(row)
            : (typeof _espSsGame === 'function') ? _espSsGame(row) : 'ffl';
   _espKoInflight[key] = 1;
@@ -151222,11 +151233,17 @@ function _espRotoStatStyle(state) {
 // ESPKO — warm the knockout schedule so the SURVIVAL tab can appear at all.
 // espIsKnockout reads the cache only; without this it would always be false
 // on first paint and the tab would never show.
+var _espKoWarmed = {};   // ESPKO6 — latched before the fetch, not after
+
 function _espKoWarm(row) {
   if (!row || row.provider !== 'espn') return;
   var sp = String(row.sport || '').toLowerCase();
   if (sp !== 'nfl' && sp !== 'cfb') return;
   if (_espKoCache[row.key]) return;
+  // The cache only fills when the response lands, so between the first call
+  // and that moment every render asked again. This latch closes the window.
+  if (_espKoWarmed[row.key]) return;
+  _espKoWarmed[row.key] = 1;
   _espKoLoad(row, function () {
     // ── ESPKO5 ── Repaint whatever is actually on screen.
     //
@@ -151237,11 +151254,15 @@ function _espKoWarm(row) {
     // DOM, so its presence says which surface is live.
     var inDetail = false;
     try { inDetail = !!document.querySelector('[data-espstand]'); } catch (e0) {}
-    if (inDetail && typeof extOpenLeague === 'function') {
-      try { extOpenLeague(row.key); } catch (e) {}
-    } else if (typeof _extRepaintToday === 'function') {
-      try { _extRepaintToday(); } catch (e2) {}
-    }
+    // Deferred a tick so the repaint can never run inside the render that
+    // triggered this warm. ESPKO6
+    setTimeout(function () {
+      if (inDetail && typeof extOpenLeague === 'function') {
+        try { extOpenLeague(row.key); } catch (e) {}
+      } else if (typeof _extRepaintToday === 'function') {
+        try { _extRepaintToday(); } catch (e2) {}
+      }
+    }, 0);
   });
 }
 
