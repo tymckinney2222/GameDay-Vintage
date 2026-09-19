@@ -137926,76 +137926,143 @@ function _mrKnockoutSectionHtml(data) {
   return h;
 }
 
-// ── NEMESIS BOARD ── MGRNEM ──
-// Managers I face in more than one league, with the combined record against
-// each. Matched by ACCOUNT, not display name: Yahoo's manager guid (from the
-// standings every league already caches) and ESPN's owner id (primaryOwner
-// in mTeam). Two platforms can't be joined — nothing ties a Yahoo guid to an
-// ESPN id, and matching on names would pair strangers called "Mike" — so the
-// same person on both counts twice. Completed weeks only: a live week is a
-// score, not a result. Sleeper and Fantrax aren't in yet (no per-week
-// opponent history is fetched for them).
-function _mrNemCollect() {
-  var opps = {}, pending = [], leaguesSeen = 0, i, k;
-  function add(id, name, plat, lgKey, lgName, myTeam, oppTeam, res) {
-    if (!id || (res !== 'W' && res !== 'L' && res !== 'T')) return;
-    var o = opps[id];
-    if (!o) o = opps[id] = { id: id, name: name || 'Unknown manager', plat: plat,
-                             w: 0, l: 0, t: 0, leagues: {}, nLeagues: 0 };
-    if (!o.leagues[lgKey]) {
-      o.leagues[lgKey] = { name: lgName || lgKey, team: myTeam || '', opp: oppTeam || '',
-                           w: 0, l: 0, t: 0 };
-      o.nLeagues++;
-    }
-    var L = o.leagues[lgKey];
-    if (res === 'W') { o.w++; L.w++; } else if (res === 'L') { o.l++; L.l++; } else { o.t++; L.t++; }
-  }
+// ── CLOSE GAMES ── MGRCLOSE ──
+// (Replaced the nemesis board, which found no repeat opponents.)
+//
+// H2H POINTS leagues only. A close game is one decided by no more than a
+// share of the matchup's own scoring — the margin against the AVERAGE of the
+// two scores. A fixed point margin can't work across sports: 8 points is a
+// nail-biter in a 115-point NFL week and nothing at all in a 300-point MLB
+// week. The share is selectable (5 / 7 / 10%), 7% by default — about 8 points
+// on an NFL-sized week. Completed weeks only; ties always count as close.
+//
+// Sources: Yahoo's per-week aggregate (the History tab's, which carries
+// myPts/oppPts), fetched here for any points league not already cached; and
+// ESPN's schedule, already loaded for the season records. Sleeper and
+// Fantrax don't have per-week scores fetched, so they aren't in yet.
+var MR_CLOSE_KEY = 'sk_mr_close_pct_v1';
+var _mrCgFailed = {};     // leagueKey -> 1 when a fetch settled with nothing
+var _mrCgInflight = {};   // leagueKey -> 1 while fetching
+function _mrClosePct() {
+  var v = 7;
+  try { v = parseInt(localStorage.getItem(MR_CLOSE_KEY), 10) || 7; } catch (e) {}
+  return (v === 5 || v === 7 || v === 10) ? v : 7;
+}
+function mrSetClosePct(v) {
+  try { localStorage.setItem(MR_CLOSE_KEY, String(v)); } catch (e) {}
+  if (typeof mrRenderBody === 'function') mrRenderBody();
+}
 
-  // Yahoo — the History tab's per-week aggregate, which carries oppTeamKey.
-  var yl = (typeof _skYahooArchLeagues === 'function') ? _skYahooArchLeagues() : [];
+function _mrCgYahooPts() {
+  var yl = (typeof _skYahooArchLeagues === 'function') ? _skYahooArchLeagues() : [], out = [], i;
   for (i = 0; i < yl.length; i++) {
     var lg = yl[i];
-    if (!lg || !lg.league_key) continue;
-    var st = String(lg.scoring_type || '');
-    if (st !== 'head' && st !== 'headone' && st !== 'headpoint') continue;
+    if (!lg || !lg.league_key || String(lg.scoring_type || '') !== 'headpoint') continue;
     if (typeof _mrIsGuillotineLeague === 'function' && _mrIsGuillotineLeague(lg)) continue;
-    var ld = (typeof skLeagueData === 'object' && skLeagueData) ? skLeagueData[lg.league_key] : null;
-    if (!ld || !ld.team || !ld.team.team_key) continue;
-    var hc = (typeof _skHistoryCache === 'object' && _skHistoryCache) ? _skHistoryCache[lg.league_key] : null;
-    var bw = hc && hc.data && hc.data.byWeek;
-    if (!bw) { pending.push(lg); continue; }
-    leaguesSeen++;
-    var all = ld.allTeams || {};
-    var myGuid = ld.team.managerGuid || ((all[ld.team.team_key] || {}).managerGuid) || '';
-    for (k = 0; k < bw.length; k++) {
-      var e = bw[k];
-      if (!e || e.isLive) continue;
-      var ot = all[e.oppTeamKey] || null;
-      var guid = ot && ot.managerGuid;
-      if (!guid || guid === myGuid) continue;
-      add('y:' + guid, (ot.managerNickname || ''), 'yahoo', lg.league_key, lg.name,
-          ld.team.name || '', e.oppName || ot.name || '', e.result);
+    out.push(lg);
+  }
+  return out;
+}
+
+// Fetch the missing Yahoo weekly histories, two at a time. A fetch that
+// settles without producing a history is marked FAILED rather than left
+// "loading" forever — the nemesis board's stuck state came from exactly
+// that: an API refusal looked identical to a request still in flight.
+function mrCgHydrate(force) {
+  if (typeof _mdFetchAndTally !== 'function') return;
+  var list = _mrCgYahooPts(), queue = [], i;
+  for (i = 0; i < list.length; i++) {
+    var k = list[i].league_key;
+    var hc = (typeof _skHistoryCache === 'object' && _skHistoryCache) ? _skHistoryCache[k] : null;
+    if (hc && hc.data && hc.data.byWeek) continue;
+    if (_mrCgInflight[k]) continue;
+    if (_mrCgFailed[k] && !force) continue;
+    delete _mrCgFailed[k];
+    queue.push(list[i]);
+  }
+  var running = 0;
+  function repaint() {
+    var ov = document.getElementById('mrOverlay');
+    if (ov && ov.classList.contains('open')) { try { mrRenderBody(); } catch (e) {} }
+  }
+  function pump() {
+    while (running < 2 && queue.length) {
+      (function (lg) {
+        var key = lg.league_key;
+        running++;
+        _mrCgInflight[key] = 1;
+        var p;
+        try { p = _mdFetchAndTally(lg); } catch (e0) { p = null; }
+        function done() {
+          running--;
+          delete _mrCgInflight[key];
+          var hc2 = (typeof _skHistoryCache === 'object' && _skHistoryCache) ? _skHistoryCache[key] : null;
+          if (!(hc2 && hc2.data && hc2.data.byWeek)) _mrCgFailed[key] = 1;
+          repaint();
+          pump();
+        }
+        if (p && typeof p.then === 'function') p.then(done, done);
+        else done();
+      })(queue.shift());
     }
   }
+  pump();
+  if (force) repaint();
+}
 
-  // ESPN — the schedule already fetched for the season records.
+function _mrCgCollect() {
+  var pct = _mrClosePct() / 100;
+  var leagues = [], pending = 0, failed = 0, i, k;
+  function mkLeague(key, name, team, plat) {
+    return { key: key, name: name, team: team, plat: plat, games: [],
+             w: 0, l: 0, t: 0, cw: 0, cl: 0, ct: 0 };
+  }
+  function addGame(L, week, my, opp, oppName) {
+    my = Number(my); opp = Number(opp);
+    if (isNaN(my) || isNaN(opp)) return;
+    if (my === 0 && opp === 0) return;             // an unplayed week
+    var res = (my > opp) ? 'W' : (my < opp) ? 'L' : 'T';
+    var margin = Math.abs(my - opp);
+    var avg = (my + opp) / 2;
+    var close = (res === 'T') || (avg > 0 && margin / avg <= pct);
+    if (res === 'W') L.w++; else if (res === 'L') L.l++; else L.t++;
+    if (close) { if (res === 'W') L.cw++; else if (res === 'L') L.cl++; else L.ct++; }
+    L.games.push({ week: week, my: my, opp: opp, oppName: oppName || '', res: res,
+                   margin: margin, share: avg > 0 ? margin / avg : 0, close: close });
+  }
+
+  // Yahoo points leagues.
+  var yl = _mrCgYahooPts();
+  for (i = 0; i < yl.length; i++) {
+    var lg = yl[i], key = lg.league_key;
+    var hc = (typeof _skHistoryCache === 'object' && _skHistoryCache) ? _skHistoryCache[key] : null;
+    var bw = hc && hc.data && hc.data.byWeek;
+    if (!bw) { if (_mrCgFailed[key]) failed++; else pending++; continue; }
+    var L = mkLeague(key, lg.name || key, _mrYTeam(key), 'yahoo');
+    for (k = 0; k < bw.length; k++) {
+      var e = bw[k];
+      if (!e || e.isLive || e.myPts == null || e.oppPts == null) continue;
+      addGame(L, e.week, e.myPts, e.oppPts, e.oppName);
+    }
+    if (L.games.length) leagues.push(L);
+  }
+
+  // ESPN points leagues.
   var rows = [];
-  try { rows = (typeof extSyncedLeagues === 'function') ? extSyncedLeagues() : []; } catch (e0) {}
+  try { rows = (typeof extSyncedLeagues === 'function') ? extSyncedLeagues() : []; } catch (e1) {}
   for (i = 0; i < rows.length; i++) {
     var row = rows[i];
     if (!row || row.provider !== 'espn') continue;
     if (typeof skMrCounts === 'function' && !skMrCounts(row)) continue;
-    var j = row._espScoreJson, raw = row.raw || {};
-    if (!j || !j.schedule || !raw.teams) continue;
-    leaguesSeen++;
-    var myIds = row.myTeamIds || {};
+    var fmt = (typeof extFormatKey === 'function') ? extFormatKey(row) : '';
+    if (fmt !== 'headpoint') continue;
+    var j = row._espScoreJson;
+    if (!j || !j.schedule) continue;
+    var myIds = row.myTeamIds || {}, byId = {};
+    var teams = (row.raw && row.raw.teams) || [];
+    for (k = 0; k < teams.length; k++) byId[String(teams[k].id)] = teams[k];
     var cur = Number((j.status && j.status.currentMatchupPeriod) || 1);
-    var byId = {}, myOwner = null;
-    for (k = 0; k < raw.teams.length; k++) {
-      var tt = raw.teams[k];
-      byId[String(tt.id)] = tt;
-      if (myIds[String(tt.id)]) myOwner = tt.primaryOwner || (tt.owners && tt.owners[0]) || null;
-    }
+    var E = mkLeague(row.key, row.name || row.key, _mrExtTeam(row), 'espn');
     for (k = 0; k < j.schedule.length; k++) {
       var m = j.schedule[k] || {};
       if (Number(m.matchupPeriodId) >= cur) continue;
@@ -138003,137 +138070,145 @@ function _mrNemCollect() {
       var meAway = !!(a.teamId != null && myIds[String(a.teamId)]);
       var meHome = !!(h.teamId != null && myIds[String(h.teamId)]);
       if (!meAway && !meHome) continue;
-      var oppSide = meAway ? h : a;
-      if (oppSide.teamId == null) continue;            // bye
-      var res = null;
-      var win = String(m.winner || '').toUpperCase();
-      if (win && win !== 'UNDECIDED') {
-        res = (win === 'TIE') ? 'T'
-            : ((win === 'AWAY' && meAway) || (win === 'HOME' && meHome)) ? 'W' : 'L';
-      } else {
-        var mc = (meAway ? a.cumulativeScore : h.cumulativeScore) || null;
-        var oc = (meAway ? h.cumulativeScore : a.cumulativeScore) || null;
-        if (mc && oc && ((mc.wins || 0) + (mc.losses || 0) + (mc.ties || 0)) > 0) {
-          res = ((mc.wins || 0) > (oc.wins || 0)) ? 'W' : ((mc.wins || 0) < (oc.wins || 0)) ? 'L' : 'T';
-        } else {
-          var ms = meAway ? a.totalPoints : h.totalPoints, os = meAway ? h.totalPoints : a.totalPoints;
-          if (ms != null && os != null && (Number(ms) || Number(os))) {
-            res = (Number(ms) > Number(os)) ? 'W' : (Number(ms) < Number(os)) ? 'L' : 'T';
-          }
-        }
-      }
-      if (!res) continue;
-      var oteam = byId[String(oppSide.teamId)] || {};
-      var owner = oteam.primaryOwner || (oteam.owners && oteam.owners[0]) || null;
-      if (!owner || owner === myOwner) continue;
-      var oname = (typeof espOwnerName === 'function') ? espOwnerName(row, oppSide.teamId) : '';
-      var otn = (typeof espTeamName === 'function') ? espTeamName(oteam) : '';
-      add('e:' + owner, oname, 'espn', row.key, row.name, _mrExtTeam(row), otn, res);
+      var me = meAway ? a : h, op = meAway ? h : a;
+      if (op.teamId == null) continue;             // bye
+      var ot = byId[String(op.teamId)] || {};
+      addGame(E, m.matchupPeriodId, me.totalPoints, op.totalPoints,
+              (typeof espTeamName === 'function') ? espTeamName(ot) : '');
+    }
+    if (E.games.length) leagues.push(E);
+  }
+  return { leagues: leagues, pending: pending, failed: failed, pct: _mrClosePct() };
+}
+
+function _mrCloseGamesHtml() {
+  var d = _mrCgCollect(), i, j;
+  var mono = 'font-family:var(--sk-font-mono,monospace);';
+  var T = { w: 0, l: 0, t: 0, cw: 0, cl: 0, ct: 0, n: 0 };
+  var bestW = null, worstL = null;
+  for (i = 0; i < d.leagues.length; i++) {
+    var L = d.leagues[i];
+    T.w += L.w; T.l += L.l; T.t += L.t; T.cw += L.cw; T.cl += L.cl; T.ct += L.ct;
+    T.n += L.games.length;
+    for (j = 0; j < L.games.length; j++) {
+      var g = L.games[j];
+      if (g.res === 'W' && (!bestW || g.margin < bestW.g.margin)) bestW = { g: g, L: L };
+      if (g.res === 'L' && (!worstL || g.margin < worstL.g.margin)) worstL = { g: g, L: L };
     }
   }
-
-  var list = [], total = 0;
-  for (k in opps) {
-    if (!opps.hasOwnProperty(k)) continue;
-    total++;
-    if (opps[k].nLeagues >= 2) list.push(opps[k]);
+  var cN = T.cw + T.cl + T.ct;
+  function rec(w, l, t) { return w + '-' + l + '-' + t; }
+  function pct(w, l, t) {
+    var n = w + l + t;
+    return n ? ((w + t / 2) / n).toFixed(3).replace(/^0/, '') : '\u2014';
   }
-  return { list: list, pending: pending, opponents: total, leagues: leaguesSeen };
-}
-
-function _mrNemPct(o) {
-  var n = o.w + o.l + o.t;
-  return n ? (o.w + o.t / 2) / n : null;
-}
-
-function _mrNemesisHtml() {
-  var nd = _mrNemCollect();
-  var list = nd.list, i;
-  var mono = 'font-family:var(--sk-font-mono,monospace);';
-  // Most-played first: the rivalries with the most history lead.
-  list.sort(function (a, b) {
-    var ga = a.w + a.l + a.t, gb = b.w + b.l + b.t;
-    if (gb !== ga) return gb - ga;
-    return (_mrNemPct(a) || 0) - (_mrNemPct(b) || 0);
-  });
-  // The tags need enough games to mean something.
-  var nem = null, own = null;
-  for (i = 0; i < list.length; i++) {
-    var g = list[i].w + list[i].l + list[i].t;
-    if (g < 3) continue;
-    var p = _mrNemPct(list[i]);
-    if (p < 0.5 && (!nem || p < _mrNemPct(nem))) nem = list[i];
-    if (p > 0.5 && (!own || p > _mrNemPct(own))) own = list[i];
+  function pill(v) {
+    var on = (d.pct === v);
+    return '<button onclick="mrSetClosePct(' + v + ')" style="padding:3px 9px;border-radius:999px;' +
+      'font-size:9.5px;font-weight:700;cursor:pointer;' +
+      'border:1px solid ' + (on ? 'rgba(234,179,8,0.55)' : 'rgba(255,255,255,0.14)') + ';' +
+      'background:' + (on ? 'rgba(234,179,8,0.12)' : 'none') + ';' +
+      'color:' + (on ? 'var(--sk-gold,#eab308)' : 'rgba(255,255,255,0.5)') + ';">' + v + '%</button>';
   }
 
   var h = '<div style="background:var(--sk-bg-card,rgba(255,255,255,0.03));' +
     'border:1px solid rgba(255,255,255,0.07);border-radius:12px;padding:14px;margin:0 0 10px;">' +
-    '<div style="display:flex;align-items:baseline;margin:0 0 10px;">' +
-      '<span style="font-family:var(--sk-font-display,serif);font-size:18px;color:#fff;">Nemesis board</span>' +
+    '<div style="display:flex;align-items:baseline;margin:0 0 8px;">' +
+      '<span style="font-family:var(--sk-font-display,serif);font-size:18px;color:#fff;">Close games</span>' +
       '<span style="flex:1;"></span>' +
-      '<span style="font-size:9.5px;letter-spacing:0.12em;color:rgba(255,255,255,0.4);">' +
-        list.length + ' RIVAL' + (list.length === 1 ? '' : 'S') + '</span>' +
+      '<span style="font-size:9.5px;letter-spacing:0.12em;color:rgba(255,255,255,0.4);">H2H POINTS</span>' +
+    '</div>' +
+    '<div style="display:flex;align-items:center;gap:5px;margin:0 0 10px;">' +
+      '<span style="font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.35);margin-right:3px;">WITHIN</span>' +
+      pill(5) + pill(7) + pill(10) +
+      '<span style="font-size:9px;color:rgba(255,255,255,0.3);margin-left:4px;">of the matchup\u2019s avg score</span>' +
     '</div>';
 
-  if (!list.length) {
+  if (!d.leagues.length) {
     h += '<div style="font-size:11.5px;line-height:1.6;color:rgba(255,255,255,0.42);">' +
-      (nd.opponents
-        ? ('Nobody shows up in more than one of your leagues yet \u2014 ' + nd.opponents +
-           ' opponent' + (nd.opponents === 1 ? '' : 's') + ' across ' + nd.leagues +
-           ' league' + (nd.leagues === 1 ? '' : 's') + ', all one-offs.')
-        : 'No completed matchups to read yet.') +
-      (nd.pending.length ? (' Loading matchups for ' + nd.pending.length + ' more league' +
-        (nd.pending.length === 1 ? '' : 's') + '\u2026') : '') +
-      '</div></div>';
-    return h;
+      (d.pending ? ('Loading weekly scores for ' + d.pending + ' league' + (d.pending === 1 ? '' : 's') + '\u2026')
+                 : 'No completed H2H points weeks to read yet.') + '</div>';
+  } else {
+    // Headline: close record vs. everything else. Function expressions, not
+    // declarations: these sit inside a block, which ES5 doesn't define.
+    var tile = function (lbl, val, sub, col) {
+      return '<div style="flex:1;min-width:0;text-align:center;padding:8px 2px;border-radius:9px;' +
+        'background:rgba(255,255,255,0.025);border:1px solid rgba(255,255,255,0.05);">' +
+        '<div style="font-size:8px;letter-spacing:0.12em;color:rgba(255,255,255,0.35);">' + lbl + '</div>' +
+        '<div style="' + mono + 'font-size:15px;font-weight:800;color:' + (col || '#fff') + ';margin-top:2px;">' + val + '</div>' +
+        '<div style="' + mono + 'font-size:9px;color:rgba(255,255,255,0.35);">' + sub + '</div></div>';
+    };
+    var cp = cN ? (T.cw + T.ct / 2) / cN : null;
+    h += '<div style="display:flex;gap:6px;margin:0 0 12px;">' +
+      tile('CLOSE', rec(T.cw, T.cl, T.ct), pct(T.cw, T.cl, T.ct) + ' win%',
+           cp == null ? '#fff' : cp > 0.5 ? '#4ade80' : cp < 0.5 ? '#f87171' : '#fff') +
+      tile('THE REST', rec(T.w - T.cw, T.l - T.cl, T.t - T.ct),
+           pct(T.w - T.cw, T.l - T.cl, T.t - T.ct) + ' win%') +
+      tile('SHARE', (T.n ? Math.round(cN / T.n * 100) : 0) + '%', cN + ' of ' + T.n + ' games') +
+    '</div>';
+
+    h += '<div style="display:flex;font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
+      'padding:0 0 4px;border-bottom:1px solid rgba(255,255,255,0.08);">' +
+      '<span style="flex:1;">LEAGUE</span>' +
+      '<span style="flex:0 0 58px;text-align:right;">CLOSE</span>' +
+      '<span style="flex:0 0 44px;text-align:right;">PCT</span>' +
+      '<span style="flex:0 0 66px;text-align:right;">OVERALL</span></div>';
+    d.leagues.sort(function (a2, b2) {
+      return (b2.cw + b2.cl + b2.ct) - (a2.cw + a2.cl + a2.ct);
+    });
+    for (i = 0; i < d.leagues.length; i++) {
+      var X = d.leagues[i];
+      var meta = null;
+      for (var m2 = 0; m2 < MR_PLATFORMS.length; m2++) if (MR_PLATFORMS[m2].key === X.plat) meta = MR_PLATFORMS[m2];
+      var xn = X.cw + X.cl + X.ct;
+      var xp = xn ? (X.cw + X.ct / 2) / xn : null;
+      h += '<div style="display:flex;align-items:center;padding:5px 0;border-bottom:1px solid rgba(255,255,255,0.04);">' +
+        '<span style="flex:1;min-width:0;font-size:11px;color:rgba(255,255,255,0.75);' +
+          'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + slEsc(_mrNm(X)) + '</span>' +
+        '<span style="flex:0 0 auto;font-size:9px;font-weight:700;letter-spacing:0.05em;margin:0 6px;color:' +
+          (meta ? meta.accent : 'rgba(255,255,255,0.5)') + ';">' + slEsc(meta ? meta.label : X.plat) + '</span>' +
+        '<span style="flex:0 0 58px;text-align:right;' + mono + 'font-size:11.5px;color:' +
+          (xn ? '#fff' : 'rgba(255,255,255,0.3)') + ';">' + (xn ? rec(X.cw, X.cl, X.ct) : '\u2014') + '</span>' +
+        '<span style="flex:0 0 44px;text-align:right;' + mono + 'font-size:11px;color:' +
+          (xp == null ? 'rgba(255,255,255,0.3)' : xp > 0.5 ? '#4ade80' : xp < 0.5 ? '#f87171' : 'rgba(255,255,255,0.6)') + ';">' +
+          (xn ? pct(X.cw, X.cl, X.ct) : '') + '</span>' +
+        '<span style="flex:0 0 66px;text-align:right;' + mono + 'font-size:11px;color:rgba(255,255,255,0.5);">' +
+          rec(X.w, X.l, X.t) + '</span>' +
+      '</div>';
+    }
+
+    var edge = function (lbl, o, col) {
+      if (!o) return '';
+      return '<div style="display:flex;align-items:baseline;gap:8px;padding:6px 0 0;">' +
+        '<span style="flex:0 0 74px;font-size:8.5px;font-weight:800;letter-spacing:0.1em;color:' + col + ';">' + lbl + '</span>' +
+        '<span style="flex:1;min-width:0;font-size:10.5px;color:rgba(255,255,255,0.6);' +
+          'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' +
+          slEsc(_mrNm(o.L)) + ' \u00b7 wk ' + slEsc(String(o.g.week)) +
+          (o.g.oppName ? ' vs ' + slEsc(o.g.oppName) : '') + '</span>' +
+        '<span style="' + mono + 'font-size:10.5px;color:rgba(255,255,255,0.8);">' +
+          o.g.my.toFixed(1) + '\u2013' + o.g.opp.toFixed(1) + '</span>' +
+      '</div>';
+    };
+    h += edge('CLOSEST WIN', bestW, '#4ade80') + edge('CLOSEST LOSS', worstL, '#f87171');
   }
 
-  h += '<div style="display:flex;font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
-    'padding:0 0 4px;border-bottom:1px solid rgba(255,255,255,0.08);">' +
-    '<span style="flex:1;">MANAGER</span>' +
-    '<span style="flex:0 0 34px;text-align:right;">LGS</span>' +
-    '<span style="flex:0 0 66px;text-align:right;">RECORD</span>' +
-    '<span style="flex:0 0 44px;text-align:right;">PCT</span></div>';
-
-  for (i = 0; i < list.length; i++) {
-    var o = list[i];
-    var meta = null;
-    for (var m2 = 0; m2 < MR_PLATFORMS.length; m2++) if (MR_PLATFORMS[m2].key === o.plat) meta = MR_PLATFORMS[m2];
-    var pc = _mrNemPct(o);
-    var tag = (o === nem) ? ['NEMESIS', '#f87171'] : (o === own) ? ['OWNED', '#4ade80'] : null;
-    var bits = [];
-    for (var lk in o.leagues) {
-      if (!o.leagues.hasOwnProperty(lk)) continue;
-      var L = o.leagues[lk];
-      bits.push(_mrNm(L) + ' ' + L.w + '-' + L.l + (L.t ? '-' + L.t : ''));
-    }
-    h += '<div style="padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.04);">' +
-      '<div style="display:flex;align-items:center;">' +
-        '<span style="flex:1;min-width:0;font-size:12px;color:rgba(255,255,255,0.88);' +
-          'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + slEsc(o.name) +
-          (tag ? '<span style="font-size:8.5px;font-weight:800;letter-spacing:0.08em;margin-left:7px;' +
-            'color:' + tag[1] + ';">' + tag[0] + '</span>' : '') + '</span>' +
-        '<span style="flex:0 0 auto;font-size:9px;font-weight:700;letter-spacing:0.05em;margin:0 6px;color:' +
-          (meta ? meta.accent : 'rgba(255,255,255,0.5)') + ';">' + slEsc(meta ? meta.label : o.plat) + '</span>' +
-        '<span style="flex:0 0 34px;text-align:right;' + mono + 'font-size:11px;color:rgba(255,255,255,0.55);">' +
-          o.nLeagues + '</span>' +
-        '<span style="flex:0 0 66px;text-align:right;' + mono + 'font-size:12px;color:#fff;">' +
-          o.w + '-' + o.l + '-' + o.t + '</span>' +
-        '<span style="flex:0 0 44px;text-align:right;' + mono + 'font-size:11px;color:' +
-          (pc == null ? 'rgba(255,255,255,0.3)' : pc > 0.5 ? '#4ade80' : pc < 0.5 ? '#f87171' : 'rgba(255,255,255,0.6)') + ';">' +
-          (pc == null ? '' : pc.toFixed(3).replace(/^0/, '')) + '</span>' +
-      '</div>' +
-      '<div style="font-size:9.5px;color:rgba(255,255,255,0.38);padding-top:2px;line-height:1.45;">' +
-        slEsc(bits.join(' \u00b7 ')) + '</div>' +
+  h += '<div style="font-size:9px;line-height:1.5;color:rgba(255,255,255,0.28);margin-top:9px;">' +
+    'Close means the margin was within ' + d.pct + '% of the two teams\u2019 average score that week ' +
+    '\u2014 roughly ' + Math.round(115 * d.pct / 100) + ' points on an NFL-sized week, scaling with ' +
+    'the league\u2019s scoring. Ties count as close. Completed weeks only. A close-game record ' +
+    'well away from .500 is mostly luck, and it tends not to last. Yahoo and ESPN; Sleeper and ' +
+    'Fantrax aren\u2019t in yet.';
+  if (d.pending) h += ' Loading ' + d.pending + ' more league' + (d.pending === 1 ? '' : 's') + '\u2026';
+  h += '</div>';
+  if (d.failed) {
+    h += '<div style="display:flex;align-items:center;gap:8px;margin-top:8px;">' +
+      '<span style="flex:1;font-size:10px;color:#f59e0b;">' + d.failed + ' Yahoo league' +
+        (d.failed === 1 ? '' : 's') + ' couldn\u2019t load weekly scores.</span>' +
+      '<button onclick="mrCgHydrate(true)" style="padding:4px 11px;border-radius:999px;' +
+        'border:1px solid rgba(255,255,255,0.16);background:none;color:rgba(255,255,255,0.6);' +
+        'font-size:9.5px;font-weight:700;letter-spacing:0.06em;">RETRY</button>' +
     '</div>';
   }
-  h += '<div style="font-size:9px;line-height:1.5;color:rgba(255,255,255,0.28);margin-top:8px;">' +
-    'Managers you\u2019ve played in two or more leagues, completed weeks only. Matched by ' +
-    'account, so the same person on Yahoo and ESPN shows up twice \u2014 there\u2019s nothing ' +
-    'that links the two. NEMESIS and OWNED need three games. Sleeper and Fantrax aren\u2019t ' +
-    'included yet.' +
-    (nd.pending.length ? (' Loading ' + nd.pending.length + ' more league' +
-      (nd.pending.length === 1 ? '' : 's') + '\u2026') : '') + '</div>';
   return h + '</div>';
 }
 
@@ -138548,7 +138623,7 @@ function mrRenderBody() {
         'league in points and finish fourth. Counted apart from season points ' +
         'for that reason. PCTL scales a finish to league size.');
   h += _mrKnockoutSectionHtml(data);   // MGRKO
-  h += _mrNemesisHtml();               // MGRNEM
+  h += _mrCloseGamesHtml();            // MGRCLOSE (replaced MGRNEM)
 
   // Per-league trace. Small, and it makes a surprising total explainable
   // instead of something to argue with. MGRREC2
@@ -138593,11 +138668,10 @@ function openManagerRecord() {
   try {
     var need = mrYahooSeason().needCats;
     if (need && need.length) mrHydrateCats(need);
-    // MGRNEM — the nemesis board needs every Yahoo H2H league's matchups,
-    // points leagues included (their record comes from standings, so they
-    // were never fetched). Session-cached; only what's missing is queued.
-    var nemNeed = _mrNemCollect().pending;
-    if (nemNeed && nemNeed.length) mrHydrateCats(nemNeed);
+    // MGRCLOSE — close games need Yahoo points leagues' weekly scores,
+    // which their standings-based record never fetched. Session-cached;
+    // failures are marked so the section offers RETRY instead of spinning.
+    mrCgHydrate(false);
     if (typeof _mrPollTallies === 'function') _mrPollTallies(0);
   } catch (e2) {}
 }
