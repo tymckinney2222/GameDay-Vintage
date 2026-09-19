@@ -137954,8 +137954,7 @@ function _mrKnockoutSectionHtml(data) {
 var MR_CLOSE_KEY = 'sk_mr_close_pct_v1';
 var _mrCgFailed = {};     // leagueKey -> reason string once both paths failed
 var _mrCgInflight = {};   // leagueKey -> 1 while fetching
-var _mrCgFallback = {};   // leagueKey -> { byWeek, via } rebuilt from scoreboards
-var _mrCgNote = {};       // leagueKey -> why the fallback was needed
+var _mrCgNote = {};       // leagueKey -> why some weeks came from scoreboards
 function _mrClosePct() {
   var v = 7;
   try { v = parseInt(localStorage.getItem(MR_CLOSE_KEY), 10) || 7; } catch (e) {}
@@ -137980,60 +137979,141 @@ function _mrCgYahoo(kind) {
   }
   return out;
 }
-function _mrCgWeeks(key) {
-  var hc = (typeof _skHistoryCache === 'object' && _skHistoryCache) ? _skHistoryCache[key] : null;
-  if (hc && hc.data && hc.data.byWeek && hc.data.byWeek.length) return hc.data.byWeek;
-  var fb = _mrCgFallback[key];
-  return (fb && fb.byWeek) ? fb.byWeek : null;
+// ── MGRCLOSE3 ── Weekly results are kept, and only new weeks are asked for.
+//
+// The full-season /team/<key>/matchups call is big (every week, every stat)
+// and some points leagues' answers didn't land inside fyApi's 15-second
+// timeout — so one league or another fell through to a 20-call scoreboard
+// rebuild on every open, depending on the day. But a completed week never
+// changes. So each league's completed weeks are stored on the device, and
+// a visit only asks Yahoo for weeks it doesn't have yet, in small chunks
+// (matchups;weeks=a,b,c — six weeks a call). After the first full load, a
+// normal visit asks for nothing, and next Monday it asks for one week.
+// A chunk that still fails is filled from that week's league scoreboard,
+// so the per-week fallback now covers only the weeks that actually failed.
+//
+// Store: sk_mr_cgw_v1_<leagueKey> = { w: { "<week>": [myPts, oppPts,
+//   myCats, oppCats, catsTied, result, oppName] | 0 } }. 0 = no matchup for
+// me that week (bye, knocked out of the playoffs), recorded so it isn't
+// asked again. League keys carry the season's game id, so next year's
+// league is a new key and old years can't mix in. ~1.5 KB per league.
+var SK_CGW_PREFIX = 'sk_mr_cgw_v1_';
+var _mrCgMem = {};
+function _mrCgStore(key) {
+  if (_mrCgMem[key]) return _mrCgMem[key];
+  var o = null;
+  try { o = JSON.parse(localStorage.getItem(SK_CGW_PREFIX + key) || 'null'); } catch (e) {}
+  if (!o || typeof o.w !== 'object' || !o.w) o = { w: {} };
+  _mrCgMem[key] = o;
+  return o;
 }
-
-// Rebuild a league's completed weeks from /league/<key>/scoreboard;week=N,
-// three weeks at a time (fyApi's own pacer still governs the rate).
-function _mrCgFromScoreboards(lg, myKey) {
+function _mrCgSave(key) {
+  try { localStorage.setItem(SK_CGW_PREFIX + key, JSON.stringify(_mrCgStore(key))); } catch (e) {}
+}
+function _mrCgNum(v) {
+  if (v == null || v === '' || isNaN(v)) return null;
+  return Math.round(parseFloat(v) * 100) / 100;
+}
+function _mrCgPut(key, e) {
+  if (!e || e.week == null) return;
+  _mrCgStore(key).w[String(e.week)] = [
+    _mrCgNum(e.myPts), _mrCgNum(e.oppPts),
+    e.myCatsWon || 0, e.oppCatsWon || 0, e.catsTied || 0,
+    e.result || '', e.oppName || ''
+  ];
+}
+// Weeks that are over: start through last week, or through the final week
+// once Yahoo marks the league finished.
+function _mrCgNeeded(lg) {
   var first = parseInt(lg.start_week, 10) || 1;
   var cur = parseInt(lg.current_week, 10) || 0;
-  var last = lg.is_finished ? (parseInt(lg.end_week, 10) || cur) : cur;
-  var weeks = [], w;
-  for (w = first; w <= last; w++) weeks.push(w);
-  if (!weeks.length || typeof fyApi !== 'function' || typeof _skParseScoreboardMatchups !== 'function') {
-    return Promise.resolve(null);
+  var last = lg.is_finished ? (parseInt(lg.end_week, 10) || cur) : (cur - 1);
+  var out = [], w;
+  for (w = first; w <= last; w++) out.push(w);
+  return out;
+}
+// Anything the History tab or the season-record hydrator already fetched
+// this session is banked for free.
+function _mrCgSyncSession(lg) {
+  var key = lg.league_key;
+  var hc = (typeof _skHistoryCache === 'object' && _skHistoryCache) ? _skHistoryCache[key] : null;
+  var bw = hc && hc.data && hc.data.byWeek;
+  if (!bw || !bw.length) return;
+  var st = _mrCgStore(key), changed = false, i;
+  for (i = 0; i < bw.length; i++) {
+    var e = bw[i];
+    if (!e || e.isLive || e.week == null) continue;
+    if (st.w.hasOwnProperty(String(e.week)) && st.w[String(e.week)] !== 0) continue;
+    _mrCgPut(key, e);
+    changed = true;
   }
-  var out = [], errs = 0;
+  if (changed) _mrCgSave(key);
+}
+function _mrCgMissing(lg) {
+  _mrCgSyncSession(lg);
+  var need = _mrCgNeeded(lg), st = _mrCgStore(lg.league_key), out = [], i;
+  for (i = 0; i < need.length; i++) {
+    if (!st.w.hasOwnProperty(String(need[i]))) out.push(need[i]);
+  }
+  return out;
+}
+// Stored weeks back in the byWeek shape the collector reads, or null.
+function _mrCgWeeks(key) {
+  var st = _mrCgStore(key), out = [], k;
+  for (k in st.w) {
+    if (!st.w.hasOwnProperty(k)) continue;
+    var a = st.w[k];
+    if (!a || !a.length) continue;
+    out.push({ week: parseInt(k, 10), myPts: a[0], oppPts: a[1],
+               myCatsWon: a[2], oppCatsWon: a[3], catsTied: a[4],
+               result: a[5] || null, oppName: a[6] || '', isLive: false });
+  }
+  if (!out.length) return null;
+  out.sort(function (x, y) { return x.week - y.week; });
+  return out;
+}
+
+// Per-week fallback for weeks the matchups chunks couldn't deliver.
+function _mrCgFromScoreboards(lg, myKey, weeks) {
+  var key = lg.league_key, filled = 0;
+  if (!weeks.length || typeof fyApi !== 'function' || typeof _skParseScoreboardMatchups !== 'function') {
+    return Promise.resolve(0);
+  }
   function one(wk) {
-    return fyApi('/league/' + lg.league_key + '/scoreboard;week=' + wk + ';out=matchups')
+    return fyApi('/league/' + key + '/scoreboard;week=' + wk + ';out=matchups')
       .then(function (res) {
-        if (!res || res.error) { errs++; return; }
-        var ms = _skParseScoreboardMatchups(res), i, t;
+        if (!res || res.error) return;
+        var ms = _skParseScoreboardMatchups(res), i, t, seen = false;
         for (i = 0; i < ms.length; i++) {
           var m = ms[i];
-          if (!m || !m.complete || !m.teams || m.teams.length < 2) continue;
+          if (!m || !m.teams || m.teams.length < 2) continue;
           var me = null, op = null;
           for (t = 0; t < m.teams.length; t++) {
             if (m.teams[t].teamKey === myKey) me = m.teams[t]; else op = m.teams[t];
           }
           if (!me || !op) continue;
-          var r = m.isTied ? 'T' : (m.winnerKey === myKey) ? 'W' : m.winnerKey ? 'L' : null;
-          out.push({ week: wk, oppTeamKey: op.teamKey, oppName: op.name,
-                     myPts: me.pts, oppPts: op.pts,
-                     myCatsWon: me.catsWon || 0, oppCatsWon: op.catsWon || 0, catsTied: me.catsTied || 0,
-                     result: r, isLive: false });
+          seen = true;
+          if (!m.complete) break;                   // not final yet — ask again later
+          var r = m.isTied ? 'T' : (m.winnerKey === myKey) ? 'W' : m.winnerKey ? 'L' : '';
+          if (!r && me.pts != null && op.pts != null) r = (me.pts > op.pts) ? 'W' : (me.pts < op.pts) ? 'L' : 'T';
+          _mrCgPut(key, { week: wk, myPts: me.pts, oppPts: op.pts,
+                          myCatsWon: me.catsWon || 0, oppCatsWon: op.catsWon || 0,
+                          catsTied: me.catsTied || 0, result: r, oppName: op.name });
+          filled++;
           break;
         }
-      }, function () { errs++; });
+        if (!seen && ms.length) { _mrCgStore(key).w[String(wk)] = 0; filled++; }
+      }, function () {});
   }
   var idx = 0;
   function next() {
     if (idx >= weeks.length) return Promise.resolve();
-    var batch = weeks.slice(idx, idx + 3);
+    var batch = weeks.slice(idx, idx + 3), ps = [], b;
     idx += 3;
-    var ps = [];
-    for (var b = 0; b < batch.length; b++) ps.push(one(batch[b]));
+    for (b = 0; b < batch.length; b++) ps.push(one(batch[b]));
     return Promise.all(ps).then(next);
   }
-  return next().then(function () {
-    out.sort(function (a, b2) { return a.week - b2.week; });
-    return out.length ? { byWeek: out, via: 'scoreboard', errs: errs } : null;
-  });
+  return next().then(function () { _mrCgSave(key); return filled; });
 }
 
 function _mrCgLoadOne(lg) {
@@ -138041,33 +138121,57 @@ function _mrCgLoadOne(lg) {
   var ld = (typeof skLeagueData === 'object' && skLeagueData) ? skLeagueData[key] : null;
   var myKey = ld && ld.team && ld.team.team_key;
   if (!myKey) return Promise.resolve('standings not loaded yet');
-  var why = '';
-  var first = (typeof _skFetchSeasonMatchups === 'function')
-    ? _skFetchSeasonMatchups(myKey) : Promise.resolve(null);
-  return first.then(function (matchups) {
-    if (!matchups) { why = 'matchups not available'; return null; }
-    if (matchups._apiError) { why = 'matchups call refused (' + String(matchups._apiError) + ')'; return null; }
-    var agg = null;
-    try { agg = _skAggregateHistory(matchups, myKey, lg.scoring_type); }
-    catch (e) { why = 'matchups unreadable (' + (e && e.message ? e.message : 'parse error') + ')'; return null; }
-    if (!agg || !agg.byWeek || !agg.byWeek.length) {
-      why = 'matchups came back empty' +
-        (matchups._rawCount != null ? ' (' + matchups._rawCount + ' raw)' : '');
-      return null;
-    }
-    if (typeof _skHistoryCache === 'object' && _skHistoryCache) {
-      _skHistoryCache[key] = { ts: Date.now(), data: agg };
-    }
-    return agg;
-  }, function (e2) {
-    why = 'matchups call failed (' + (e2 && e2.message ? e2.message : 'network') + ')';
-    return null;
-  }).then(function (agg) {
-    if (agg) return '';
-    return _mrCgFromScoreboards(lg, myKey).then(function (fb) {
-      if (fb) { _mrCgFallback[key] = fb; _mrCgNote[key] = why; return ''; }
-      return why + '; weekly scoreboards also empty';
-    }, function () { return why + '; weekly scoreboards failed'; });
+  var miss = _mrCgMissing(lg);
+  if (!miss.length) return Promise.resolve('');
+  if (typeof fyApi !== 'function' || typeof _skParseMatchupsWithScores !== 'function' ||
+      typeof _skAggregateHistory !== 'function') {
+    return Promise.resolve('matchup tools unavailable');
+  }
+  var chunks = [], i, failedWeeks = [], why = '';
+  for (i = 0; i < miss.length; i += 6) chunks.push(miss.slice(i, i + 6));
+
+  function chunk(ws) {
+    return fyApi('/team/' + myKey + '/matchups;weeks=' + ws.join(','))
+      .then(function (res) {
+        if (!res || res.error) {
+          why = why || String((res && res.error) || 'no response');
+          failedWeeks = failedWeeks.concat(ws);
+          return;
+        }
+        var ms = _skParseMatchupsWithScores(res), agg = null, present = {}, j;
+        for (j = 0; j < ms.length; j++) if (ms[j]) present[ms[j].week] = 1;
+        try { agg = _skAggregateHistory(ms, myKey, lg.scoring_type); } catch (e) { agg = null; }
+        var got = {};
+        var bw = (agg && agg.byWeek) || [];
+        for (j = 0; j < bw.length; j++) {
+          if (!bw[j] || bw[j].isLive) continue;
+          _mrCgPut(key, bw[j]);
+          got[bw[j].week] = 1;
+        }
+        for (j = 0; j < ws.length; j++) {
+          if (got[ws[j]]) continue;
+          // Answered, and no matchup of mine that week at all: a bye or a
+          // playoff exit. Recorded so it's never asked again. A week that
+          // came back but isn't final yet is simply left to ask next time.
+          if (!present[ws[j]] && ms._rawCount != null) _mrCgStore(key).w[String(ws[j])] = 0;
+        }
+      }, function () {
+        why = why || 'network';
+        failedWeeks = failedWeeks.concat(ws);
+      });
+  }
+  var c = 0;
+  function nextChunk() {
+    if (c >= chunks.length) return Promise.resolve();
+    return chunk(chunks[c++]).then(nextChunk);
+  }
+  return nextChunk().then(function () {
+    _mrCgSave(key);
+    if (!failedWeeks.length) return '';
+    return _mrCgFromScoreboards(lg, myKey, failedWeeks).then(function (n) {
+      if (n) _mrCgNote[key] = why;
+      return _mrCgMissing(lg).length ? ('matchups call: ' + why + '; some weeks still missing') : '';
+    });
   });
 }
 
@@ -138077,7 +138181,7 @@ function mrCgHydrate(force) {
   var list = _mrCgYahoo('pts').concat(_mrCgYahoo('cats')), queue = [], i;
   for (i = 0; i < list.length; i++) {
     var lg = list[i], k = lg.league_key;
-    if (_mrCgWeeks(k) || _mrCgInflight[k]) continue;
+    if (_mrCgInflight[k] || !_mrCgMissing(lg).length) continue;   // MGRCLOSE3
     if (_mrCgFailed[k] && !force) continue;
     if (!force && typeof _mdMatchupInflight === 'object' && _mdMatchupInflight && _mdMatchupInflight[k]) continue;
     if (!force && String(lg.scoring_type) !== 'headpoint' &&
@@ -138099,7 +138203,7 @@ function mrCgHydrate(force) {
         function done(reason) {
           running--;
           delete _mrCgInflight[key];
-          if (!_mrCgWeeks(key)) _mrCgFailed[key] = reason || 'no weekly results';
+          if (reason) _mrCgFailed[key] = reason;
           repaint();
           pump();
         }
@@ -138148,15 +138252,17 @@ function _mrCgCollect(kind) {
   var yl = _mrCgYahoo(kind);
   for (i = 0; i < yl.length; i++) {
     var lg = yl[i], key = lg.league_key;
+    var stillMissing = _mrCgMissing(lg).length;   // also banks this session's history
     var bw = _mrCgWeeks(key);
     if (!bw) {
+      if (!stillMissing) continue;                 // no completed weeks yet
       if (_mrCgFailed[key]) failed.push({ name: _mrNm({ name: lg.name, team: _mrYTeam(key) }), why: _mrCgFailed[key] });
       else pending++;
       continue;
     }
-    if (_mrCgFallback[key] && !(_skHistoryCache[key] && _skHistoryCache[key].data)) {
-      rebuilt.push({ name: _mrNm({ name: lg.name, team: _mrYTeam(key) }), why: _mrCgNote[key] || '' });
-    }
+    if (_mrCgInflight[key]) pending++;
+    if (_mrCgFailed[key]) failed.push({ name: _mrNm({ name: lg.name, team: _mrYTeam(key) }), why: _mrCgFailed[key] });
+    if (_mrCgNote[key]) rebuilt.push({ name: _mrNm({ name: lg.name, team: _mrYTeam(key) }), why: _mrCgNote[key] });
     var L = mkLeague(key, lg.name || key, _mrYTeam(key), 'yahoo');
     for (k = 0; k < bw.length; k++) {
       var e = bw[k];
@@ -138341,9 +138447,12 @@ function _mrCloseGamesHtml(kind) {
     'Completed weeks only. A close-game record well away from .500 is mostly luck, and it tends ' +
     'not to last. Yahoo and ESPN; Sleeper and Fantrax aren\u2019t in yet.' +
     (d.pending ? (' Loading ' + d.pending + ' more league' + (d.pending === 1 ? '' : 's') + '\u2026') : '');
-  for (i = 0; i < d.rebuilt.length; i++) {
-    h += '<br>' + slEsc(d.rebuilt[i].name) + ' was rebuilt from weekly scoreboards' +
-      (d.rebuilt[i].why ? ' \u2014 its ' + slEsc(d.rebuilt[i].why) : '') + '.';
+  if (d.rebuilt.length) {
+    var rbn = [];
+    for (i = 0; i < d.rebuilt.length; i++) rbn.push(d.rebuilt[i].name);
+    h += '<br>Some weeks for ' + slEsc(rbn.join(', ')) + ' came from the weekly scoreboards ' +
+      '(matchups call: ' + slEsc(d.rebuilt[0].why || 'failed') + '). Kept on this device, so ' +
+      'they won\u2019t be fetched again.';
   }
   h += '</div>';
   if (d.failed.length) {
