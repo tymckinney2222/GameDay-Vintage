@@ -91218,6 +91218,58 @@ function _skScoutTeams(res) {
   return out;
 }
 
+// SKSCOUT2 — when a team last acted, from the league's transaction log.
+// A move is theirs when a player lands on or leaves their team, or they're
+// a side of a trade. The log is the league's latest 100 moves, so if they
+// don't appear in it, "their last move" is at least as old as the oldest
+// entry — reported as a lower bound, never invented.
+function _skScoutTx(res, teamKey) {
+  if (!res || res.error) return null;
+  var out = { last: null, recent14: 0, n: 0, oldest: null, bound: false };
+  function involves(t) {
+    if (!t) return false;
+    var meta = t[0] || {}, i, j;
+    if (meta.trader_team_key === teamKey || meta.tradee_team_key === teamKey) return true;
+    var pl = t[1] && t[1].players;
+    if (!pl) return false;
+    for (i = 0; i < (parseInt(pl.count, 10) || 0); i++) {
+      var p = pl[String(i)] && pl[String(i)].player;
+      if (!p) continue;
+      for (j = 1; j < p.length; j++) {
+        var td = p[j] && p[j].transaction_data;
+        if (!td) continue;
+        var arr = Array.isArray(td) ? td : [td];
+        for (var k = 0; k < arr.length; k++) {
+          if (arr[k] && (arr[k].destination_team_key === teamKey || arr[k].source_team_key === teamKey)) return true;
+        }
+      }
+    }
+    return false;
+  }
+  try {
+    var parts = _yahooArr(res.fantasy_content.league), txs = null;
+    for (var i = 0; i < parts.length; i++) if (parts[i] && parts[i].transactions) txs = parts[i].transactions;
+    if (!txs) return out;
+    var cut = Date.now() / 1000 - 14 * 86400;
+    for (var j = 0; j < (parseInt(txs.count, 10) || 0); j++) {
+      var t = txs[String(j)] && txs[String(j)].transaction;
+      if (!t) continue;
+      var tArr = Array.isArray(t) ? t : [t];
+      var meta = tArr[0] || {};
+      var ts = parseInt(meta.timestamp, 10);
+      if (!ts) continue;
+      if (!out.oldest || ts < out.oldest) out.oldest = ts;
+      if (meta.status && meta.status !== 'successful') continue;
+      if (!involves(tArr)) continue;
+      out.n++;
+      if (!out.last || ts > out.last) out.last = ts;
+      if (ts >= cut) out.recent14++;
+    }
+    if (!out.last && out.oldest) out.bound = true;
+  } catch (e) {}
+  return out;
+}
+
 function skOpenScouting(leagueKey) {
   var league = (fyLeagues || []).find(function (l) { return l.league_key === leagueKey; });
   if (!league) return;
@@ -91260,10 +91312,15 @@ function skOpenScouting(leagueKey) {
   var pMine = fyApi('/team/' + myKey + '/roster/players/stats' + statsType)
     .then(function (r) { return (r && !r.error) ? _parseTeamFpResponse(r) : {}; }, function () { return {}; });
   var pToday = fetchTeamFpForDate(oppKey, _todayDateString())['catch'](function () { return null; });
+  // SKSCOUT2 — their add/drop/trade history, for how RECENTLY they've acted.
+  // Yahoo only filters transactions by team for waivers and pending
+  // trades, so this reads the league's recent log and picks out theirs.
+  var pTx = fyApi('/league/' + leagueKey + '/transactions;types=add,drop,trade;count=100')
+    .then(function (res) { return _skScoutTx(res, oppKey); }, function () { return null; });
 
-  Promise.all([pTeams, pForm, pHot, pMine, pToday]).then(function (r) {
+  Promise.all([pTeams, pForm, pHot, pMine, pToday, pTx]).then(function (r) {
     var data = { ts: Date.now(), opp: oppKey, me: myKey, st: st, sport: sport, fb: fb,
-                 teams: r[0] || {}, form: r[1] || [], hot: r[2] || {}, mine: r[3] || {}, today: r[4] };
+                 teams: r[0] || {}, form: r[1] || [], hot: r[2] || {}, mine: r[3] || {}, today: r[4], tx: r[5] };
     _skScoutCache[leagueKey] = data;
     var t = document.getElementById('skWireSheetTitle');
     if (t && data.teams[oppKey] && data.teams[oppKey].name) t.textContent = data.teams[oppKey].name;
@@ -91318,11 +91375,24 @@ function _skScoutHtml(league, d) {
     h += '<div class="sk-rc-note" style="margin-top:0">No completed weeks yet.</div>';
   }
 
-  // ── Engagement ──
+  // ── Engagement ── SKSCOUT2 ──
+  // The first version leaned on "empty slots right now", which misfires in
+  // exactly the leagues you play: a points league with a weekly innings
+  // cap empties its pitching slots on purpose once the cap is reached, so
+  // an active manager like Hitmen (110 moves, above league average) read
+  // "Checked out?". Now:
+  //   • recency leads — when they last made a move, and how many in the
+  //     last 14 days (Yahoo's transaction log for their team);
+  //   • season moves are ranked against the league;
+  //   • lineup holes count only EVERYDAY slots (hitters / skaters /
+  //     players), matched slot by slot — pitcher and goalie slots left
+  //     empty are usually a cap or a streaming plan, not neglect;
+  //   • holes alone never make the verdict — they only tip it when the
+  //     manager is also inactive.
   h += _skSheetSection('\ud83d\udd75\ufe0f', 'How engaged are they', '');
   var movesList = [];
   for (var tk in d.teams) if (d.teams.hasOwnProperty(tk) && d.teams[tk].moves != null) movesList.push(d.teams[tk].moves);
-  var moveLine = '', movesRank = null, movesAvg = null;
+  var movesRank = null, movesAvg = null, moveLine = '';
   if (opp.moves != null && movesList.length) {
     movesList.sort(function (a, b) { return b - a; });
     movesRank = movesList.indexOf(opp.moves) + 1;
@@ -91333,34 +91403,74 @@ function _skScoutHtml(league, d) {
       (typeof skOrdinal === 'function' ? skOrdinal(movesRank) : movesRank) + ' most of ' + movesList.length +
       ' (league average ' + movesAvg.toFixed(0) + ')';
   }
-  var holes = [], empty = 0;
+  var tx = d.tx, daysSince = null, recentN = null, txLine = '';
+  if (tx && tx.last) {
+    daysSince = Math.floor((Date.now() - tx.last * 1000) / 86400000);
+    recentN = tx.recent14;
+    txLine = 'Last move ' + (daysSince <= 0 ? 'today' : daysSince === 1 ? 'yesterday' : daysSince + ' days ago') +
+      ' \u00b7 ' + recentN + ' in the last 14 days';
+  } else if (tx && tx.bound) {
+    // Not in the league's latest 100 moves: at least this long.
+    daysSince = Math.floor((Date.now() - tx.oldest * 1000) / 86400000);
+    txLine = 'No moves in the league\u2019s last 100 transactions (at least ' + daysSince + ' day' +
+      (daysSince === 1 ? '' : 's') + ')';
+  }
+  // Lineup holes, slot by slot, everyday slots only.
+  var holes = [], empty = 0, emptyPos = [];
+  var sportH = d.sport;
+  var parttime = function (pos) {
+    var u = String(pos || '').toUpperCase();
+    if (sportH === 'mlb') return u === 'P' || u === 'SP' || u === 'RP';
+    if (sportH === 'nhl') return u === 'G';
+    return false;
+  };
   if (d.today) {
-    var slots = _skBankSlots(key), activeN = 0;
+    var slots = _skBankSlots(key), need = {}, have = {};
+    for (i = 0; i < slots.length; i++) need[slots[i]] = (need[slots[i]] || 0) + 1;
     for (var pk in d.today) {
       if (!d.today.hasOwnProperty(pk)) continue;
       var tp = d.today[pk];
       if (!tp || !_isActiveSlot(tp.selectedPos)) continue;
-      activeN++;
+      have[tp.selectedPos] = (have[tp.selectedPos] || 0) + 1;
+      if (parttime(tp.selectedPos)) continue;
       var stt = String(tp.status || '').toUpperCase();
-      if (/^(IL|IR|O|NA|SUSP|PUP|NFI|OUT|INJ)/.test(stt)) holes.push(tp.name + ' (' + tp.status + ')');
+      if (/^(IL|IR|O$|OUT|NA|SUSP|PUP|NFI|INJ)/.test(stt)) holes.push(tp.name + ' (' + tp.status + ')');
     }
-    if (slots.length && activeN < slots.length) empty = slots.length - activeN;
+    for (var sp2 in need) {
+      if (!need.hasOwnProperty(sp2) || parttime(sp2)) continue;
+      var gap = need[sp2] - (have[sp2] || 0);
+      if (gap > 0) { empty += gap; emptyPos.push(sp2 + (gap > 1 ? ' \u00d7' + gap : '')); }
+    }
   }
+  var nHoles = holes.length + empty;
   var holeLine = d.today
-    ? ((holes.length || empty)
-        ? 'Right now: ' + (holes.length ? holes.length + ' injured/out player' + (holes.length === 1 ? '' : 's') +
-            ' in their lineup (' + holes.join(', ') + ')' : '') +
+    ? (nHoles
+        ? 'Lineup right now: ' + (holes.length ? holes.length + ' injured/out starter' + (holes.length === 1 ? '' : 's') +
+            ' (' + holes.join(', ') + ')' : '') +
           (holes.length && empty ? ' and ' : '') +
-          (empty ? empty + ' empty slot' + (empty === 1 ? '' : 's') : '')
-        : 'Right now: a clean lineup \u2014 no injured players starting, no empty slots.')
+          (empty ? empty + ' empty ' + (sportH === 'mlb' ? 'hitter ' : '') + 'slot' + (empty === 1 ? '' : 's') +
+            ' (' + emptyPos.join(', ') + ')' : '')
+        : 'Lineup right now: every everyday slot filled with a healthy player.')
     : '';
-  var verdict = 'Engaged', vcls = 'good';
+  // Verdict.
+  var activeMoves = (movesRank != null && movesRank <= Math.ceil(movesList.length / 2));
   var lowMoves = (movesAvg != null && opp.moves != null && opp.moves < movesAvg / 3);
-  if ((holes.length + empty) >= 2 || (lowMoves && (holes.length + empty) >= 1)) { verdict = 'Checked out?'; vcls = 'bad'; }
-  else if ((holes.length + empty) === 1 || lowMoves) { verdict = 'Slipping'; vcls = 'mid'; }
+  var verdict, vcls;
+  if (daysSince != null) {
+    if (daysSince <= 7) { verdict = 'Engaged'; vcls = 'good'; }
+    else if (daysSince <= 21) {
+      verdict = (nHoles >= 2 && !activeMoves) ? 'Checked out?' : 'Slipping';
+      vcls = (verdict === 'Slipping') ? 'mid' : 'bad';
+    } else { verdict = (nHoles >= 1 || lowMoves) ? 'Checked out?' : 'Slipping'; vcls = verdict === 'Slipping' ? 'mid' : 'bad'; }
+  } else {
+    // No transaction log — fall back to season moves, holes only as a tiebreak.
+    if (activeMoves) { verdict = 'Engaged'; vcls = 'good'; }
+    else if (lowMoves && nHoles >= 1) { verdict = 'Checked out?'; vcls = 'bad'; }
+    else { verdict = 'Slipping'; vcls = 'mid'; }
+  }
   h += '<div class="sk-sc-verdict ' + vcls + '">' + verdict + '</div>';
   h += '<div class="sk-rc-note" style="margin-top:6px">' +
-    [moveLine, holeLine].filter(function (x) { return !!x; }).map(skEscape).join('<br>') + '</div>';
+    [txLine, moveLine, holeLine].filter(function (x) { return !!x; }).map(skEscape).join('<br>') + '</div>';
 
   // ── Hottest players ──
   var hotList = [], catTot = {};
@@ -91479,9 +91589,11 @@ function _skScoutHtml(league, d) {
     h += '<div class="sk-rc-note" style="margin-top:0">' + (pl.length ? pl.map(skEscape).join('<br>') :
       'Season points aren\u2019t available yet.') + '</div>';
   }
-  h += '<div class="sk-rc-note" style="opacity:0.7">Engagement is read from what Yahoo publishes: ' +
-    'season add/drops, and whether their lineup has injured players or empty slots right now. ' +
-    'Yahoo doesn\u2019t say when a lineup was last set.</div>';
+  h += '<div class="sk-rc-note" style="opacity:0.7">Engagement is read from what Yahoo publishes: when ' +
+    'they last made an add/drop or trade, their season moves against the league, and whether any ' +
+    'everyday slot sits empty or holds an injured player right now. Empty pitcher or goalie slots are ' +
+    'ignored \u2014 caps and streaming leave those open on purpose. Yahoo doesn\u2019t say when a ' +
+    'lineup was last set.</div>';
   return h;
 }
 
