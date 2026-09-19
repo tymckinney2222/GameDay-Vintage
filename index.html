@@ -135854,6 +135854,17 @@ function espMatchupRecord(row) {
 // Yahoo is excluded for the same reason it is excluded from the records above:
 // its data comes through a different path with its own terms.
 var SK_ARCH_PREFIX = 'sk_arch_v1_';
+// SKARCH3 — a finish removed by hand leaves a marker, so the automatic
+// capture doesn't write it straight back on the next repaint (which is what
+// made the x look like it did nothing). ARCHIVE NOW clears it.
+var SK_ARCH_SKIP_PREFIX = 'sk_arch_skip_v1_';
+function _skArchSkipped(leagueKey, season) {
+  try { return !!localStorage.getItem(SK_ARCH_SKIP_PREFIX + leagueKey + '_' + season); }
+  catch (e) { return false; }
+}
+function _skArchUnskip(leagueKey, season) {
+  try { localStorage.removeItem(SK_ARCH_SKIP_PREFIX + leagueKey + '_' + season); } catch (e) {}
+}
 
 function _skArchKey(leagueKey, season) {
   return SK_ARCH_PREFIX + leagueKey + '_' + season;
@@ -135907,6 +135918,7 @@ function skArchiveLeague(row, force) {
       var existing = localStorage.getItem(key);
       if (existing) { window._skArchReason = 'already archived'; return null; }
     } catch (e) {}
+    if (_skArchSkipped(row.key, season)) { window._skArchReason = 'removed by you'; return null; }
   }
 
   var st = row.standings || {};
@@ -136011,7 +136023,17 @@ function skSeasonIsOver(row, manual) {
       var sst = String(row.status || (row.raw && row.raw.status) || '').toLowerCase();
       return sst === 'complete';
     }
-    if (row.provider === 'espn' && _skArchEspFinalRank(row, false)) return true;
+    // ── SKARCH3 ── "Any team has a final rank" was taken as the season being
+    // over, and ESPN breaks that two ways: a knockout gives every chopped
+    // team its final rank the week it's cut, and a season-points league can
+    // carry rankFinal mid-season. Both archived on 9/19 while very much live.
+    // A knockout is over when one team is left; everything else needs the
+    // calendar window to have closed, and a posted final rank only shortens
+    // the grace week after that.
+    if (row.provider === 'espn' && typeof _mrEspIsKo === 'function' && _mrEspIsKo(row)) {
+      var ko = (typeof _mrEspKoEntry === 'function') ? _mrEspKoEntry(row) : null;
+      return !!(ko && ko.alive != null && ko.alive <= 1);
+    }
 
     if (typeof _espSeasonWindow !== 'function') return false;
     var yr = _skArchWindowYear(row);
@@ -136019,7 +136041,10 @@ function skSeasonIsOver(row, manual) {
     var w = _espSeasonWindow(String(row.sport || '').toLowerCase(), yr);
     if (!w || !w.endMs) return false;
     var now = Date.now(), DAY = 86400000;
-    return now > w.endMs + (manual ? 0 : 7 * DAY) && now < w.endMs + 150 * DAY;
+    if (now <= w.endMs || now >= w.endMs + 150 * DAY) return false;
+    if (manual) return true;
+    if (row.provider === 'espn' && _skArchEspFinalRank(row, true)) return true;
+    return now > w.endMs + 7 * DAY;
   } catch (e) { return false; }
 }
 
@@ -136112,6 +136137,7 @@ function skArchiveYahooLeague(lg, force) {
   if (!force) {
     try { if (localStorage.getItem(key)) { window._skArchReason = 'already archived'; return null; } }
     catch (e) {}
+    if (_skArchSkipped(lg.league_key, season)) { window._skArchReason = 'removed by you'; return null; }
   }
 
   var st = String(lg.scoring_type || '');
@@ -136235,11 +136261,13 @@ function skArchiveNow() {
   try { rows = (typeof extSyncedLeagues === 'function') ? extSyncedLeagues() : []; } catch (e) {}
   for (i = 0; i < rows.length; i++) {
     if (!skSeasonIsOver(rows[i], true)) { live++; continue; }
+    _skArchUnskip(rows[i].key, rows[i].season);   // SKARCH3 — explicit ask
     if (skArchiveLeague(rows[i])) wrote++;
   }
   var yl = _skYahooArchLeagues();   // SKARCHY
   for (i = 0; i < yl.length; i++) {
     if (!skYahooSeasonIsOver(yl[i], true)) { live++; continue; }
+    _skArchUnskip(yl[i].league_key, yl[i].season);   // SKARCH3
     if (skArchiveYahooLeague(yl[i])) wrote++;
   }
   if (typeof skToast === 'function') {
@@ -136258,6 +136286,7 @@ function skArchRemove(leagueKey, season) {
   try { ok = window.confirm('Remove this archived finish?'); } catch (e) {}
   if (!ok) return;
   try { localStorage.removeItem(_skArchKey(leagueKey, season)); } catch (e2) {}
+  try { localStorage.setItem(SK_ARCH_SKIP_PREFIX + leagueKey + '_' + season, '1'); } catch (e3) {}
   if (typeof mrRenderBody === 'function') mrRenderBody();
 }
 
@@ -136572,7 +136601,9 @@ function mrYahooPlacings() {
         ? (skLeagueData[lg.league_key] || {}) : {};
       var ksp = String(lg.sport || 'nfl').toLowerCase();
       if (!out.kos[ksp]) out.kos[ksp] = [];
-      out.kos[ksp].push(_mrYahooKoEntry(lg, kld));
+      var kyE = _mrYahooKoEntry(lg, kld);
+      kyE.team = (kld.team && kld.team.name) || '';   // MGRNAMES
+      out.kos[ksp].push(kyE);
       continue;
     }
     if (!bucketName) continue;
@@ -136608,7 +136639,8 @@ function mrYahooPlacings() {
       rank: unranked ? null : rank, total: total,
       pct: (!unranked && total > 1) ? ((total - rank) / (total - 1)) : null,
       unranked: unranked,
-      name: (lg.name || lg.league_key || '')
+      name: (lg.name || lg.league_key || ''),
+      team: _mrYTeam(lg.league_key)   // MGRNAMES
     });
   }
   return out;
@@ -136639,7 +136671,8 @@ function mrPlacing(row) {
     // already accounted for in Season points / Roto and drop them from the
     // H2H list, instead of matching on a display name.
     key: (row.key || ''),
-    name: (row.name || row.key || '')
+    name: (row.name || row.key || ''),
+    team: _mrExtTeam(row)   // MGRNAMES
   };
 }
 
@@ -136700,6 +136733,69 @@ var MR_SPORTS = [
   { key: 'cfb', label: 'College Football' }
 ];
 var MR_ARCHIVE_KEY = 'gdhq_mgr_record_v1';
+
+// ── NAMES + FORMAT ── MGRNAMES ──
+// Every Manager Record row can be labelled by MY TEAM or by the LEAGUE; the
+// other name rides along in the per-league list so either can be matched.
+// Team is the default — across a dozen leagues it's the name you recognise.
+var MR_NAMES_KEY = 'sk_mr_names_v1';
+function _mrNamePref() {
+  try { return (localStorage.getItem(MR_NAMES_KEY) === 'league') ? 'league' : 'team'; }
+  catch (e) { return 'team'; }
+}
+function mrSetNames(v) {
+  try { localStorage.setItem(MR_NAMES_KEY, (v === 'league') ? 'league' : 'team'); } catch (e) {}
+  if (typeof mrRenderBody === 'function') mrRenderBody();
+}
+// The label for a row: my team or the league, falling back to whichever exists.
+function _mrNm(o) {
+  if (!o) return 'Unnamed league';
+  var lg = o.name || '', tm = o.team || '';
+  if (_mrNamePref() === 'team' && tm) return tm;
+  return lg || tm || 'Unnamed league';
+}
+// Whichever name _mrNm didn't show, or '' when it's the same.
+function _mrNmOther(o) {
+  if (!o) return '';
+  var shown = _mrNm(o);
+  var alt = (shown === (o.team || '')) ? (o.name || '') : (o.team || '');
+  return (alt && alt !== shown) ? alt : '';
+}
+function _mrYTeam(key) {
+  try {
+    var ld = (typeof skLeagueData === 'object' && skLeagueData) ? skLeagueData[key] : null;
+    return (ld && ld.team && ld.team.name) || '';
+  } catch (e) { return ''; }
+}
+function _mrExtTeam(row) {
+  if (!row) return '';
+  return (row.standings && row.standings.teamName) || row.myTeamName || '';
+}
+// Platform format codes in plain words.
+function _mrFmtLabel(f, row) {
+  f = String(f || '');
+  if (f === 'head') return 'H2H categories';
+  if (f === 'headone') return 'H2H most categories';
+  if (f === 'headpoint') return 'H2H points';
+  if (f === 'point') return 'Season points';
+  if (f === 'roto') return 'Roto';
+  if (f === 'knockout') return 'Knockout';
+  return f;
+}
+function _mrNamesToggleHtml() {
+  var cur = _mrNamePref();
+  function pill(v, lbl) {
+    var on = (cur === v);
+    return '<button onclick="mrSetNames(\'' + v + '\')" style="padding:4px 11px;border-radius:999px;' +
+      'font-size:9.5px;font-weight:700;letter-spacing:0.08em;cursor:pointer;' +
+      'border:1px solid ' + (on ? 'rgba(234,179,8,0.55)' : 'rgba(255,255,255,0.14)') + ';' +
+      'background:' + (on ? 'rgba(234,179,8,0.12)' : 'none') + ';' +
+      'color:' + (on ? 'var(--sk-gold,#eab308)' : 'rgba(255,255,255,0.5)') + ';">' + lbl + '</button>';
+  }
+  return '<div style="display:flex;align-items:center;gap:6px;margin:0 0 12px;">' +
+    '<span style="font-size:9px;letter-spacing:0.12em;color:rgba(255,255,255,0.35);margin-right:4px;">SHOW</span>' +
+    pill('team', 'MY TEAMS') + pill('league', 'LEAGUES') + '</div>';
+}
 
 function _mrParseRec(str) {
   var m = String(str || '').match(/^(\d+)-(\d+)(?:-(\d+))?$/);
@@ -136892,6 +136988,7 @@ function mrYahooSeason() {
     if (!rows[sport]) rows[sport] = [];
     rows[sport].push({
       name: (lg.name || lg.league_key || ''), key: lg.league_key,
+      team: _mrYTeam(lg.league_key), fmt: String(lg.scoring_type || ''),   // MGRNAMES
       w: w, l: l, t: t, pending: !!pendingRow
     });
   }
@@ -137048,7 +137145,8 @@ function mrCollect() {
           for (var _yr = 0; _yr < yrows.length; _yr++) {
             var _y = yrows[_yr];
             b.detail.push({
-              name: _y.name, key: _y.key, fmt: '', auto: true,
+              name: _y.name, key: _y.key, fmt: _y.fmt || '', auto: true,
+              team: _y.team || '',   // MGRNAMES
               rec: _y.pending ? '\u2014' : (_y.w + '-' + _y.l + '-' + _y.t),
               src: _y.pending ? 'loading' : 'yahoo',
               n: 0, weeks: null, raw: '', week: '\u2014'
@@ -137111,7 +137209,7 @@ function mrCollect() {
         var _played = (typeof skSeasonStarted === 'function') ? skSeasonStarted(row) : true;
         var _ov = (typeof skMrOverrides === 'function') ? skMrOverrides()[row.key] : null;
         if (!bk.detail) bk.detail = [];
-        bk.detail.push({ name: (row.name || row.key), key: row.key,
+        bk.detail.push({ name: (row.name || row.key), key: row.key, team: _mrExtTeam(row),
                          fmt: (typeof extFormatKey === 'function') ? extFormatKey(row) : '',
                          rec: '\u2014',
                          src: (_ov === 'off') ? 'switched off by you'
@@ -137133,11 +137231,12 @@ function mrCollect() {
         _mrEspKoWarm(row);
         if (_mrEspIsKo(row)) {
           var koE = _mrEspKoEntry(row);
+          koE.team = _mrExtTeam(row);   // MGRNAMES
           if (!bk.kos) bk.kos = [];
           bk.kos.push(koE);
           bk.koLeagues = (bk.koLeagues || 0) + 1;
           if (!bk.detail) bk.detail = [];
-          bk.detail.push({ name: (row.name || row.key), key: row.key,
+          bk.detail.push({ name: (row.name || row.key), key: row.key, team: _mrExtTeam(row),
                            auto: (typeof skSeasonStarted === 'function') ? skSeasonStarted(row) : true,
                            fmt: 'knockout', rec: '\u2014',
                            src: 'knockout \u00b7 ' + _mrKoStatusText(koE),
@@ -137159,7 +137258,7 @@ function mrCollect() {
         // Still worth listing, so it's visibly excluded rather than
         // silently missing from the trace. MGRREC2
         if (!bk.detail) bk.detail = [];
-        bk.detail.push({ name: (row.name || row.key), key: row.key,
+        bk.detail.push({ name: (row.name || row.key), key: row.key, team: _mrExtTeam(row),
                          auto: (typeof skSeasonStarted === 'function') ? skSeasonStarted(row) : true,
                          fmt: fmt, rec: '\u2014',
                          src: pl ? ((fmt === 'roto' ? 'roto \u00b7 ' : 'season-long \u00b7 ') +
@@ -137184,6 +137283,7 @@ function mrCollect() {
       if (!bk.detail) bk.detail = [];
       bk.detail.push({
         name: (row.name || row.key),
+        team: _mrExtTeam(row),   // MGRNAMES
         key: row.key,
         auto: (typeof skSeasonStarted === 'function') ? skSeasonStarted(row) : true,
         fmt: fmt || '?',
@@ -137475,14 +137575,20 @@ function _mrDetailHtml(det) {
       '<div style="flex:1;min-width:0;">' +
         '<div style="display:flex;align-items:baseline;gap:8px;">' +
           '<span style="flex:1;min-width:0;font-size:11.5px;color:rgba(255,255,255,0.8);' +
-            'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + slEsc(dt.name) + '</span>' +
+            'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + slEsc(_mrNm(dt)) + '</span>' +
           '<span style="font-family:var(--sk-font-mono,monospace);font-size:12px;color:#fff;">' +
             slEsc(dt.rec) + '</span>' +
           '<span style="font-family:var(--sk-font-mono,monospace);font-size:11px;color:#4ade80;">' +
             slEsc(dt.week) + '</span>' +
         '</div>' +
+        // MGRNAMES — format in plain words and the other name (team or
+        // league, whichever the row isn't showing), then the source trace.
+        '<div style="font-size:9.5px;color:rgba(255,255,255,0.45);' +
+          'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' +
+          slEsc([_mrFmtLabel(dt.fmt), _mrNmOther(dt)].filter(function (x) { return !!x; })
+                .join(' \u00b7 ')) + '</div>' +
         '<div style="font-size:9px;color:rgba(255,255,255,0.3);">' +
-          slEsc(dt.fmt) + (dt.pre ? ' \u00b7 ' : ' \u00b7 via ') + slEsc(dt.src) +
+          (dt.pre ? '' : 'via ') + slEsc(dt.src) +
           (dt.n ? ' \u00b7 ' + dt.n + ' wks' : '') +
           (dt.weeks != null ? ' of ' + dt.weeks : '') +
           (dt.raw ? ' \u00b7 raw ' + slEsc(dt.raw) : '') +
@@ -137535,7 +137641,7 @@ function _mrPlaceSectionHtml(data, bucket, title, note) {
         // would leak a display concern into data other code reads.
         var e3 = pl3[a3];
         bySport[k].leagues.push({
-          name: e3.name || '', rank: e3.rank, total: e3.total,
+          name: e3.name || '', team: e3.team || '', rank: e3.rank, total: e3.total,
           pct: e3.pct, unranked: e3.unranked, plat: meta3
         });
         all.push(e3);
@@ -137605,7 +137711,7 @@ function _mrPlaceSectionHtml(data, bucket, title, note) {
         'border-bottom:1px solid rgba(255,255,255,0.04);">' +
         '<span style="flex:1;min-width:0;font-size:11px;color:rgba(255,255,255,0.72);' +
           'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' +
-          slEsc(lgx.name || 'Unnamed league') + '</span>' +
+          slEsc(_mrNm(lgx)) + '</span>' +
         '<span style="flex:0 0 auto;font-size:9px;font-weight:700;letter-spacing:0.05em;' +
           'margin:0 8px;color:' +
           (lgx.plat ? lgx.plat.accent : 'rgba(255,255,255,0.5)') + ';">' +
@@ -137763,7 +137869,7 @@ function _mrKnockoutSectionHtml(data) {
         'border-bottom:1px solid rgba(255,255,255,0.04);' + (e.status === 'out' ? 'opacity:0.7;' : '') + '">' +
         '<span style="flex:1;min-width:0;font-size:11px;color:rgba(255,255,255,0.72);' +
           'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' +
-          slEsc(e.name || 'Unnamed league') + '</span>' +
+          slEsc(_mrNm(e)) + '</span>' +
         '<span style="flex:0 0 auto;font-size:9px;font-weight:700;letter-spacing:0.05em;margin:0 6px;color:' +
           (pm ? pm.accent : 'rgba(255,255,255,0.5)') + ';">' + slEsc(pm ? pm.label : '?') + '</span>' +
         '<span style="flex:0 0 84px;text-align:right;' + mono + 'font-size:10.5px;font-weight:700;' +
@@ -137858,6 +137964,7 @@ function mrRenderBody() {
       (data.pending === 1 ? '' : 's') + ')\u2026</div>';
   }
   h += '</div>';
+  h += _mrNamesToggleHtml();   // MGRNAMES
 
   // ── By platform, across every sport ── MGRREC6
   var platOrder = [], pi2;
@@ -138012,7 +138119,7 @@ function mrRenderBody() {
           'border-bottom:1px solid rgba(255,255,255,0.04);">' +
           '<span style="flex:1;min-width:0;font-size:11px;color:rgba(255,255,255,0.72);' +
             'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' +
-            slEsc(dl.name || 'Unnamed league') + '</span>' +
+            slEsc(_mrNm(dl)) + '</span>' +
           '<span style="flex:0 0 44px;text-align:right;font-family:var(--sk-font-mono,monospace);' +
             'font-size:10px;color:rgba(255,255,255,0.35);">' +
             slEsc(_mrRowPct(recTxt)) + '</span>' +
