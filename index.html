@@ -81824,6 +81824,9 @@ async function fysilentInit() {
           current_week: parseInt(lg.current_week, 10) || null,
           start_week: parseInt(lg.start_week, 10) || null,
           end_week: parseInt(lg.end_week, 10) || null,
+          // SKARCHY — Yahoo's own end-of-season signals, for the trophy case.
+          is_finished: (lg.is_finished == 1),
+          end_date: lg.end_date || null,
         });
       }
     }
@@ -135845,6 +135848,9 @@ function espMatchupRecord(row) {
 // Written once and then left alone, because a finish is a fact about a season
 // that ended and must not drift when next year's league reuses the same key.
 //
+// SKARCHY — Yahoo is now included, through its own path below (skArchiveYahoo
+// League), because its data lives in skLeagueData rather than ext rows. The
+// original note, kept for history:
 // Yahoo is excluded for the same reason it is excluded from the records above:
 // its data comes through a different path with its own terms.
 var SK_ARCH_PREFIX = 'sk_arch_v1_';
@@ -136024,10 +136030,161 @@ function skSeasonIsOver(row, manual) {
 //     whatever was recorded was a standing, not a finish.
 // Only ever removes a record for the season the league is in right now;
 // last year's finishes can't match and are never touched.
+// ── YAHOO IN THE TROPHY CASE ── SKARCHY ──
+// Yahoo leagues come from fyLeagues / skSyncedLeagues with standings cached in
+// skLeagueData, not from extSyncedLeagues, so they get their own archive path
+// that writes the same record shape.
+//
+// Season over: Yahoo says so itself — league.is_finished flips to 1 once the
+// final week is closed out. Before that flag reaches the app, the league's own
+// end_date (from the league list or the settings call) plus a few days is the
+// fallback, bounded like the other providers. Evidence of play is required
+// either way, so a drafted-but-idle league never qualifies.
+//
+// Finish: Yahoo's standings rank becomes the final placement (playoffs
+// included) once the season is over. Guillotines use the survival finish
+// instead, since Yahoo publishes no meaningful rank for them (MGRKO).
+// Record: matchup W-L-T. For categories leagues that's the weekly tally
+// (_mdMatchupTally), not the per-category standings total — if the tally
+// hasn't loaded, the archive waits for a later open rather than recording
+// 143-141-22 as a season record.
+function _skYahooArchLeagues() {
+  var leagues = [];
+  try {
+    if (typeof _ppLeagues === 'function') {
+      var syn = _ppLeagues();
+      if (Object.prototype.toString.call(syn) === '[object Array]') leagues = syn;
+    }
+  } catch (e) {}
+  if (!leagues.length && typeof fyLeagues !== 'undefined' &&
+      Object.prototype.toString.call(fyLeagues) === '[object Array]') leagues = fyLeagues;
+  return leagues;
+}
+function _skYahooLd(lg) {
+  return (typeof skLeagueData === 'object' && skLeagueData && lg)
+    ? (skLeagueData[lg.league_key] || null) : null;
+}
+function _skYahooPlayed(lg, ld) {
+  var tm = ld && ld.team;
+  if (!tm) return false;
+  var r = (typeof _mrParseRec === 'function') ? _mrParseRec(tm.record) : null;
+  if (r && (r.w + r.l + r.t) > 0) return true;
+  if (tm.points_for != null && Number(tm.points_for) > 0) return true;
+  // Guillotine / cats leagues: any spread in points-for across the league.
+  var st = (ld && ld.standings) || [], seen = {}, n = 0, i;
+  for (i = 0; i < st.length; i++) {
+    var v = st[i] && st[i].points_for;
+    if (v == null || isNaN(Number(v))) continue;
+    if (!seen[String(Number(v))]) { seen[String(Number(v))] = 1; n++; }
+  }
+  return n >= 2;
+}
+function skYahooSeasonIsOver(lg, manual) {
+  try {
+    if (!lg) return false;
+    var ld = _skYahooLd(lg);
+    if (!ld || !ld.team) return false;          // no standings to judge from
+    if (!_skYahooPlayed(lg, ld)) return false;
+    if (lg.is_finished === true || lg.is_finished == 1) return true;
+    var end = lg.end_date || null;
+    try {
+      if (!end && typeof _skLeagueDates !== 'undefined' && _skLeagueDates[lg.league_key]) {
+        end = _skLeagueDates[lg.league_key].end || null;
+      }
+    } catch (e0) {}
+    if (!end) return false;
+    var em = new Date(String(end) + 'T23:59:59').getTime();
+    if (isNaN(em)) return false;
+    var now = Date.now(), DAY = 86400000;
+    return now > em + (manual ? 0 : 3 * DAY) && now < em + 150 * DAY;
+  } catch (e) { return false; }
+}
+function skArchiveYahooLeague(lg, force) {
+  window._skArchReason = '';
+  if (!lg || !lg.league_key) { window._skArchReason = 'no league'; return null; }
+  var season = lg.season;
+  if (!season) { window._skArchReason = 'no season on the league'; return null; }
+  var ld = _skYahooLd(lg);
+  var tm = ld && ld.team;
+  if (!tm) { window._skArchReason = 'standings not loaded'; return null; }
+
+  var key = _skArchKey(lg.league_key, season);
+  if (!force) {
+    try { if (localStorage.getItem(key)) { window._skArchReason = 'already archived'; return null; } }
+    catch (e) {}
+  }
+
+  var st = String(lg.scoring_type || '');
+  var isGuil = (typeof _mrIsGuillotineLeague === 'function') && _mrIsGuillotineLeague(lg);
+  var fmt = isGuil ? 'knockout'
+          : (st === 'point') ? 'point'
+          : (st === 'roto') ? 'roto'
+          : (st === 'headpoint') ? 'headpoint' : 'head';
+
+  var size = 0, k;
+  var all = (ld && ld.allTeams) || {};
+  for (k in all) { if (all.hasOwnProperty(k)) size++; }
+  if (!size && ld.standings && ld.standings.length) size = ld.standings.length;
+  if (!size) size = parseInt(lg.num_teams, 10) || 0;
+
+  var rank = null;
+  if (isGuil) {
+    var ko = (typeof _mrYahooKoEntry === 'function') ? _mrYahooKoEntry(lg, ld) : null;
+    if (ko && ko.finish) rank = ko.finish;
+  } else {
+    rank = parseInt(tm.rank, 10);
+    if ((isNaN(rank) || rank <= 0) && tm.team_key && all[tm.team_key]) {
+      rank = parseInt(all[tm.team_key].rank, 10);
+    }
+  }
+  if (!rank || isNaN(rank) || !size || rank > size) {
+    window._skArchReason = 'no final rank'; return null;
+  }
+
+  var record = '';
+  if (fmt === 'head') {
+    var tally = (typeof _mdMatchupTally === 'object' && _mdMatchupTally)
+      ? _mdMatchupTally[lg.league_key] : null;
+    if (!tally || tally.missing) { window._skArchReason = 'matchup record loading'; return null; }
+    record = tally.wins + '-' + tally.losses + '-' + tally.ties;
+  } else if (fmt === 'headpoint') {
+    var pr = (typeof _mrParseRec === 'function') ? _mrParseRec(tm.record) : null;
+    if (pr) record = pr.w + '-' + pr.l + '-' + pr.t;
+  }
+
+  var rec = {
+    leagueKey: lg.league_key,
+    provider: 'yahoo',
+    sport: String(lg.sport || '').toLowerCase(),
+    fmt: fmt,
+    season: Number(season),
+    leagueName: lg.name || lg.league_key || '',
+    teamName: tm.name || '',
+    rank: rank,
+    size: size,
+    record: record,
+    pf: (tm.points_for != null && !isNaN(Number(tm.points_for))) ? Number(tm.points_for) : null,
+    at: new Date().toISOString()
+  };
+  try { localStorage.setItem(key, JSON.stringify(rec)); }
+  catch (e2) { window._skArchReason = 'storage full'; return null; }
+  return rec;
+}
+
+// ── SKARCH2 ── Take back finishes that were never finishes. Two tells:
+//   - nothing was played: a 0-0-0 (or blank) record with no points;
+//   - the league is still synced, its standings are loaded, it's the same
+//     season, and by the rule above that season isn't over yet — so
+//     whatever was recorded was a standing, not a finish.
+// Only ever removes a record for the season the league is in right now;
+// last year's finishes can't match and are never touched.
+// SKARCHY — Yahoo leagues get the same second test through their own rule.
 function skArchPurgePremature() {
-  var removed = 0, rows = [], byKey = {}, i;
+  var removed = 0, rows = [], byKey = {}, yByKey = {}, i;
   try { rows = (typeof extSyncedLeagues === 'function') ? extSyncedLeagues() : []; } catch (e) {}
   for (i = 0; i < rows.length; i++) if (rows[i] && rows[i].key) byKey[rows[i].key] = rows[i];
+  var yl = _skYahooArchLeagues();
+  for (i = 0; i < yl.length; i++) if (yl[i] && yl[i].league_key) yByKey[yl[i].league_key] = yl[i];
   var all = skListArchive();
   for (i = 0; i < all.length; i++) {
     var a = all[i], bad = false;
@@ -136037,6 +136194,9 @@ function skArchPurgePremature() {
     var live = byKey[a.leagueKey];
     if (!bad && live && live.standings && String(live.season) === String(a.season) &&
         !skSeasonIsOver(live, true)) bad = true;
+    var ylive = yByKey[a.leagueKey];
+    if (!bad && ylive && a.provider === 'yahoo' && _skYahooLd(ylive) &&
+        String(ylive.season) === String(a.season) && !skYahooSeasonIsOver(ylive, true)) bad = true;
     if (!bad) continue;
     try { localStorage.removeItem(_skArchKey(a.leagueKey, a.season)); removed++; } catch (e2) {}
   }
@@ -136055,6 +136215,13 @@ function skMaybeArchiveAll() {
       if (skArchiveLeague(rows[i])) n++;
     }
   } catch (e) {}
+  try {   // SKARCHY
+    var yl = _skYahooArchLeagues();
+    for (var y = 0; y < yl.length; y++) {
+      if (!skYahooSeasonIsOver(yl[y])) continue;
+      if (skArchiveYahooLeague(yl[y])) n++;
+    }
+  } catch (e3) {}
   return n;
 }
 
@@ -136070,11 +136237,27 @@ function skArchiveNow() {
     if (!skSeasonIsOver(rows[i], true)) { live++; continue; }
     if (skArchiveLeague(rows[i])) wrote++;
   }
+  var yl = _skYahooArchLeagues();   // SKARCHY
+  for (i = 0; i < yl.length; i++) {
+    if (!skYahooSeasonIsOver(yl[i], true)) { live++; continue; }
+    if (skArchiveYahooLeague(yl[i])) wrote++;
+  }
   if (typeof skToast === 'function') {
     skToast(wrote ? ('Archived ' + wrote + ' finished league' + (wrote === 1 ? '' : 's'))
                   : ('Nothing new to archive' +
                      (live ? (' \u00b7 ' + live + ' still in season') : '')));
   }
+  if (typeof mrRenderBody === 'function') mrRenderBody();
+}
+
+// SKARCHY — remove one archived finish by hand. Confirmed first, because a
+// real finish removed here is only recoverable while the platform still
+// shows that season.
+function skArchRemove(leagueKey, season) {
+  var ok = true;
+  try { ok = window.confirm('Remove this archived finish?'); } catch (e) {}
+  if (!ok) return;
+  try { localStorage.removeItem(_skArchKey(leagueKey, season)); } catch (e2) {}
   if (typeof mrRenderBody === 'function') mrRenderBody();
 }
 
@@ -137185,12 +137368,43 @@ function _skTrophyHtml() {
 
   // Everything archived that ISN'T a medal, so the case shows the whole record
   // rather than only the good years.
-  var allArch = skListArchive(), other = 0;
+  var allArch = skListArchive(), other = 0, otherList = [];
   for (var q = 0; q < allArch.length; q++) {
     if (_skTrophyYear != null && String(allArch[q].season) !== String(_skTrophyYear)) continue;
     var pr = Number(allArch[q].rank);
     if (pr >= 1 && pr <= 3 && allArch[q].size >= (SK_MEDAL_MIN[pr] || 99)) continue;
     other++;
+    otherList.push(allArch[q]);
+  }
+  // SKARCHY — the case counted these and never showed them, so "2 other
+  // seasons archived" had no way to be checked. List every one, with where it
+  // came from and when it was recorded, and a way to take a bad one out.
+  if (otherList.length) {
+    h += '<div style="font-size:9px;letter-spacing:0.12em;color:rgba(255,255,255,0.35);' +
+      'margin:10px 0 2px;">OTHER FINISHES</div>';
+    for (var ol = 0; ol < otherList.length; ol++) {
+      var oa = otherList[ol];
+      var oDate = '';
+      try { oDate = oa.at ? new Date(oa.at).toLocaleDateString() : ''; } catch (eD) {}
+      h += '<div style="display:flex;align-items:center;gap:8px;padding:5px 0;' +
+        'border-bottom:1px solid rgba(255,255,255,0.04);">' +
+        '<div style="flex:1;min-width:0;">' +
+          '<div style="font-size:11.5px;color:rgba(255,255,255,0.75);overflow:hidden;' +
+            'text-overflow:ellipsis;white-space:nowrap;">' + slEsc(oa.leagueName || oa.leagueKey) + '</div>' +
+          '<div style="' + mono + 'font-size:9px;color:rgba(255,255,255,0.32);">' +
+            slEsc(String(oa.sport || '').toUpperCase()) + ' \u00b7 ' + slEsc(oa.provider || '') +
+            (oa.teamName ? ' \u00b7 ' + slEsc(oa.teamName) : '') +
+            (oDate ? ' \u00b7 recorded ' + slEsc(oDate) : '') + '</div>' +
+        '</div>' +
+        '<span style="' + mono + 'font-size:10px;color:rgba(255,255,255,0.4);">' + oa.season + '</span>' +
+        '<span style="' + mono + 'font-size:10.5px;color:rgba(255,255,255,0.7);flex:0 0 58px;text-align:right;">' +
+          (typeof _skOrdinal === 'function' ? _skOrdinal(oa.rank) : oa.rank) + ' of ' + oa.size + '</span>' +
+        '<button onclick="skArchRemove(\'' + slEsc(String(oa.leagueKey).replace(/[\\']/g, '')) +
+          '\',' + Number(oa.season) + ')" aria-label="Remove this archived finish" ' +
+          'style="flex:0 0 22px;height:22px;border-radius:50%;border:1px solid rgba(255,255,255,0.12);' +
+          'background:none;color:rgba(255,255,255,0.4);font-size:12px;line-height:1;padding:0;">\u00d7</button>' +
+      '</div>';
+    }
   }
   h += '<div style="font-size:9px;line-height:1.5;color:rgba(255,255,255,0.28);margin-top:8px;">' +
     t.total + ' podium finish' + (t.total === 1 ? '' : 'es') +
@@ -137234,7 +137448,7 @@ function _mrDetailHtml(det) {
   var h = '<div style="background:var(--sk-bg-card,rgba(255,255,255,0.03));' +
     'border:1px solid rgba(255,255,255,0.07);border-radius:12px;padding:14px;margin:0 0 10px;">' +
     '<div style="font-size:9.5px;letter-spacing:0.14em;color:rgba(255,255,255,0.4);' +
-      'margin:0 0 8px;">PER LEAGUE \u00b7 NON-YAHOO</div>';
+      'margin:0 0 8px;">PER LEAGUE</div>';
   for (var i = 0; i < det.length; i++) {
     var dt = det[i];
     var on = !dt.pre;
@@ -140710,6 +140924,9 @@ async function loadFyLeagues() {
           current_week: parseInt(lg.current_week, 10) || null,
           start_week: parseInt(lg.start_week, 10) || null,
           end_week: parseInt(lg.end_week, 10) || null,
+          // SKARCHY — Yahoo's own end-of-season signals, for the trophy case.
+          is_finished: (lg.is_finished == 1),
+          end_date: lg.end_date || null,
         });
       }
     }
