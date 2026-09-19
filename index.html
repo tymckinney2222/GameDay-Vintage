@@ -124663,6 +124663,80 @@ function _bkPlayoffYear() {
 //   • NBA  → mid-April start (playoffs ~Apr–Jun)
 //   • WNBA → early-September start (playoffs ~Sep 14 → late Oct)
 //   • MLB  → late-September start (playoffs ~Oct)
+// ── BKDATES ── The playoff window as month keys and as days.
+//
+// The scoreboard used to be asked for a date RANGE (?dates=START-END) and
+// answered; it now returns HTTP 400, the same rejection the NFL wire schedule
+// started getting. NHL is unaffected because it uses the NHL API rather than
+// ESPN's.
+//
+// ESPN reliably accepts a single day (?dates=YYYYMMDD) — that's the form
+// fetchLeague has always used — and is widely understood to accept a whole
+// month (?dates=YYYYMM). A playoff window is six to eleven weeks, so a month
+// at a time is two or three requests versus seventy. Months are tried first
+// and days are the fallback, because the month form is the one I can't
+// verify from here and a wrong assumption shouldn't cost the feature.
+function _bkWindow(sport) {
+  var r = _bkDateRange(sport);
+  var parts = String(r).split('-');
+  return { lo: parts[0], hi: parts[1] || parts[0] };
+}
+
+function _bkMonthKeys(sport) {
+  var w = _bkWindow(sport);
+  function toDate(k) {
+    return new Date(parseInt(k.slice(0, 4), 10), parseInt(k.slice(4, 6), 10) - 1,
+                    parseInt(k.slice(6, 8), 10));
+  }
+  var d = toDate(w.lo), end = toDate(w.hi), out = [], guard = 0;
+  d.setDate(1);
+  while (d <= end && guard < 18) {
+    out.push(d.getFullYear() + String(d.getMonth() + 1).padStart(2, '0'));
+    d.setMonth(d.getMonth() + 1);
+    guard++;
+  }
+  return out;
+}
+
+function _bkDayKeys(sport) {
+  var w = _bkWindow(sport);
+  function toDate(k) {
+    return new Date(parseInt(k.slice(0, 4), 10), parseInt(k.slice(4, 6), 10) - 1,
+                    parseInt(k.slice(6, 8), 10));
+  }
+  var d = toDate(w.lo), end = toDate(w.hi), out = [], guard = 0;
+  while (d <= end && guard < 120) {
+    out.push(d.getFullYear() + String(d.getMonth() + 1).padStart(2, '0') +
+             String(d.getDate()).padStart(2, '0'));
+    d.setDate(d.getDate() + 1);
+    guard++;
+  }
+  return out;
+}
+
+// Fetch a scoreboard for each key, merge the events, and report how many
+// keys failed so the caller can decide whether to fall back.
+function _bkFetchKeys(base, keys, lanes) {
+  var events = [], fails = 0, idx = 0;
+  function worker() {
+    if (idx >= keys.length) return Promise.resolve();
+    var k = keys[idx++];
+    return fetch(base + '?dates=' + k + '&seasontype=3&limit=400')
+      .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then(function(j) {
+        var ev = (j && j.events) || [];
+        for (var i = 0; i < ev.length; i++) events.push(ev[i]);
+      })
+      .catch(function() { fails++; })
+      .then(worker);
+  }
+  var ls = [];
+  for (var i = 0; i < Math.min(lanes || 3, keys.length); i++) ls.push(worker());
+  return Promise.all(ls).then(function() {
+    return { events: events, fails: fails, total: keys.length };
+  });
+}
+
 function _bkDateRange(sport) {
   var now = new Date();
   var end = new Date(now.getTime() + 7 * 86400000);
@@ -124777,6 +124851,33 @@ var _BK_PROXY = 'https://bracket-proxy.tymckinney2222.workers.dev';
 // The diagnostic path is still active — we stash the raw response on
 // _bkLastRawResponse so we can inspect the shape and refine parsing
 // once we see what each endpoint actually returns.
+// ── BKDATES ── Months first, days as the fallback.
+//
+// Every key that answers contributes its events, so a single bad month or
+// day costs that slice and not the bracket. A clean sweep of failures is the
+// only thing treated as a failure — and only then does the error the user
+// sees carry an HTTP code.
+function _bkFetchScoreboard(slug, sport) {
+  var base = 'https://site.api.espn.com/apis/site/v2/sports/' + slug + '/scoreboard';
+  var months = _bkMonthKeys(sport);
+  return _bkFetchKeys(base, months, 3).then(function(r) {
+    if (r.events.length || r.fails < r.total) {
+      _bkLastDateRange = months.join(',') + ' (months, seasontype=3)';
+      return { events: r.events, ok: true };
+    }
+    // Every month was rejected — fall back to one request per day.
+    var days = _bkDayKeys(sport);
+    return _bkFetchKeys(base, days, 4).then(function(d) {
+      _bkLastDateRange = days.length + ' days (fallback, seasontype=3)';
+      if (d.fails >= d.total) throw new Error('HTTP 400');
+      return { events: d.events, ok: true };
+    });
+  }).then(function(res) {
+    _bkLastRawResponse = { events: res.events };
+    return [];   // parsing happens in _bkBuildSeries via the raw response
+  });
+}
+
 function _bkFetchEvents(sport) {
   var cfg = _bkSportConfig[sport];
   if (!cfg) return Promise.reject(new Error('Unknown sport ' + sport));
@@ -124796,22 +124897,19 @@ function _bkFetchEvents(sport) {
     // postseason where honored; the date window is clamped to the playoff
     // months so regular-season leakage is minimal, and the parser's guard
     // strips whatever still slips through.
-    url = 'https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?dates=' + _bkDateRange('nba') + '&seasontype=3&limit=400';
-    _bkLastDateRange = _bkDateRange('nba') + ' (seasontype=3)';
+    return _bkFetchScoreboard('basketball/nba', 'nba');
   } else if (sport === 'wnba') {
     // WNBA uses the same ESPN basketball scoreboard shape as the NBA,
     // just a different league slug. Same synthesize-from-scoreboard
     // approach and the same playoff-series guard apply. The date window
     // is sport-aware (WNBA playoffs run Sep–Oct).
-    url = 'https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/scoreboard?dates=' + _bkDateRange('wnba') + '&seasontype=3&limit=400';
-    _bkLastDateRange = _bkDateRange('wnba') + ' (seasontype=3)';
+    return _bkFetchScoreboard('basketball/wnba', 'wnba');
   } else if (sport === 'mlb') {
     // MLB uses ESPN's baseball scoreboard — same event/series JSON shape
     // as basketball, so the shared parser handles it. The structural
     // difference (Wild Card byes for the #1/#2 seeds) is resolved in the
     // round-correction pass. Postseason window is October.
-    url = 'https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard?dates=' + _bkDateRange('mlb') + '&seasontype=3&limit=400';
-    _bkLastDateRange = _bkDateRange('mlb') + ' (seasontype=3)';
+    return _bkFetchScoreboard('baseball/mlb', 'mlb');
   } else {
     return Promise.reject(new Error('No bracket endpoint configured for ' + sport));
   }
