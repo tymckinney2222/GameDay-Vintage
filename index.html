@@ -135884,6 +135884,13 @@ function skArchiveLeague(row, force) {
 
   var pl = (typeof mrPlacing === 'function') ? mrPlacing(row) : null;
   if (!pl) { window._skArchReason = 'no rank yet'; return null; }
+  // SKARCH2 — ESPN's live rank is playoffSeed: where you finished the REGULAR
+  // season. Once playoffs resolve, rankCalculatedFinal is the actual finish
+  // (the 1 seed who lost in the semis did not win the league).
+  if (row.provider === 'espn') {
+    var fin = _skArchEspFinalRank(row, true);
+    if (fin && fin <= pl.total) pl = { rank: fin, total: pl.total, pct: pl.pct };
+  }
 
   var key = _skArchKey(row.key, season);
   // Never overwrite. A finish already recorded is history; re-running the
@@ -135933,23 +135940,114 @@ function skArchiveLeague(row, force) {
 
 // Has this league's season finished? Used for the automatic capture, which
 // only ever runs when there is nothing left to play.
-function skSeasonIsOver(row) {
+//
+// ── SKARCH2 ── This used to be the calendar window alone, read with ESPN's
+// season convention. ESPN labels a basketball or hockey season by the year it
+// ENDS; Sleeper labels it by the year it STARTS. So a Sleeper NBA league
+// tagged 2026 — the 2026-27 season, still drafting — was judged against the
+// 2025-26 window, which closed in April, and was "over" in September. The
+// dashboard then archived its preseason standing (2nd of 24, 0-0-0) as a
+// finish, silver medal and all, under the name the league had that day.
+//
+// The window is still the fallback, but it no longer decides on its own:
+//   1. Evidence first — a season with nothing played has no finish.
+//   2. The platform's own word where it gives one: Sleeper's league status
+//      reaches 'complete'; ESPN posts rankCalculatedFinal once the last
+//      playoff round resolves.
+//   3. Otherwise the calendar window, with the season label normalised, a
+//      grace week (ESPN's final ranks lag the last game), and an upper bound:
+//      a window that "closed" five months ago on a league we can see live
+//      right now is a misread label, not a finished season.
+// "manual" (ARCHIVE NOW) drops the grace week — the person pressing it knows
+// the season is done — but keeps the evidence test and the upper bound, since
+// a bare-year label on a straddling sport can't otherwise be told apart.
+function _skArchEspFinalRank(row, mineOnly) {
+  var teams = (row && row.raw && row.raw.teams) || [], i, best = null;
+  var myId = (row && row.myTeamId != null) ? String(row.myTeamId) : null;
+  for (i = 0; i < teams.length; i++) {
+    var t = teams[i] || {};
+    var fr = Number(t.rankCalculatedFinal) || Number(t.rankFinal) || 0;
+    if (mineOnly) {
+      if (myId != null && String(t.id) === myId) return fr > 0 ? fr : null;
+    } else if (fr > 0) {
+      best = fr;
+    }
+  }
+  return mineOnly ? null : best;
+}
+
+// The label's END year for sports that straddle New Year, which is what
+// _espSeasonWindow expects. '2026-27' / '2026/2027' -> 2027 wherever it
+// comes from; a bare year is Sleeper's start year (+1) and taken as-is
+// elsewhere (the upper bound catches a wrong guess).
+function _skArchWindowYear(row) {
+  var raw = String((row && row.season) || '');
+  var sp = String((row && row.sport) || '').toLowerCase();
+  var straddles = (sp === 'nba' || sp === 'nhl');
+  var m = /(\d{4})\s*[-\/]\s*(\d{2,4})/.exec(raw);
+  if (m) {
+    if (!straddles) return Number(m[1]);
+    var e = m[2];
+    return Number(e.length === 2 ? (m[1].slice(0, 2) + e) : e);
+  }
+  var y = parseInt(raw, 10);
+  if (isNaN(y)) return null;
+  if (straddles && row.provider === 'sleeper') return y + 1;
+  return y;
+}
+
+function skSeasonIsOver(row, manual) {
   try {
-    if (typeof espSeasonClock !== 'function') return false;
-    var c = espSeasonClock(row);
-    // A clock exists only DURING the season; once past the end it is null,
-    // which is indistinguishable from preseason. So the window itself decides.
+    if (!row) return false;
+    if (typeof skSeasonStarted === 'function' && !skSeasonStarted(row)) return false;
+
+    if (row.provider === 'sleeper') {
+      var sst = String(row.status || (row.raw && row.raw.status) || '').toLowerCase();
+      return sst === 'complete';
+    }
+    if (row.provider === 'espn' && _skArchEspFinalRank(row, false)) return true;
+
     if (typeof _espSeasonWindow !== 'function') return false;
-    var w = _espSeasonWindow(String(row.sport || '').toLowerCase(), row.season);
+    var yr = _skArchWindowYear(row);
+    if (yr == null) return false;
+    var w = _espSeasonWindow(String(row.sport || '').toLowerCase(), yr);
     if (!w || !w.endMs) return false;
-    return Date.now() > w.endMs;
+    var now = Date.now(), DAY = 86400000;
+    return now > w.endMs + (manual ? 0 : 7 * DAY) && now < w.endMs + 150 * DAY;
   } catch (e) { return false; }
+}
+
+// ── SKARCH2 ── Take back finishes that were never finishes. Two tells:
+//   - nothing was played: a 0-0-0 (or blank) record with no points;
+//   - the league is still synced, its standings are loaded, it's the same
+//     season, and by the rule above that season isn't over yet — so
+//     whatever was recorded was a standing, not a finish.
+// Only ever removes a record for the season the league is in right now;
+// last year's finishes can't match and are never touched.
+function skArchPurgePremature() {
+  var removed = 0, rows = [], byKey = {}, i;
+  try { rows = (typeof extSyncedLeagues === 'function') ? extSyncedLeagues() : []; } catch (e) {}
+  for (i = 0; i < rows.length; i++) if (rows[i] && rows[i].key) byKey[rows[i].key] = rows[i];
+  var all = skListArchive();
+  for (i = 0; i < all.length; i++) {
+    var a = all[i], bad = false;
+    var rp = (typeof _mrParseRec === 'function') ? _mrParseRec(a.record) : null;
+    var played = rp ? ((rp.w || 0) + (rp.l || 0) + (rp.t || 0)) : 0;
+    if (!played && (a.pf == null || Number(a.pf) === 0)) bad = true;
+    var live = byKey[a.leagueKey];
+    if (!bad && live && live.standings && String(live.season) === String(a.season) &&
+        !skSeasonIsOver(live, true)) bad = true;
+    if (!bad) continue;
+    try { localStorage.removeItem(_skArchKey(a.leagueKey, a.season)); removed++; } catch (e2) {}
+  }
+  return removed;
 }
 
 // Called on sync. Silent, and only for leagues whose season has actually
 // ended — a mid-season run records nothing.
 function skMaybeArchiveAll() {
   var n = 0;
+  try { skArchPurgePremature(); } catch (e0) {}
   try {
     var rows = (typeof extSyncedLeagues === 'function') ? extSyncedLeagues() : [];
     for (var i = 0; i < rows.length; i++) {
@@ -135961,17 +136059,21 @@ function skMaybeArchiveAll() {
 }
 
 // Manual capture, for a season that ended before Skipper was watching it or
-// one the automatic check missed.
+// one the automatic check missed. SKARCH2 — finished seasons only. It used to
+// capture every league's CURRENT standing, and since a record is never
+// overwritten, one tap mid-season locked a live position in as the finish
+// and blocked the real one from ever landing.
 function skArchiveNow() {
-  var rows = [], i, wrote = 0, skipped = 0;
+  var rows = [], i, wrote = 0, live = 0;
   try { rows = (typeof extSyncedLeagues === 'function') ? extSyncedLeagues() : []; } catch (e) {}
   for (i = 0; i < rows.length; i++) {
-    if (skArchiveLeague(rows[i])) wrote++; else skipped++;
+    if (!skSeasonIsOver(rows[i], true)) { live++; continue; }
+    if (skArchiveLeague(rows[i])) wrote++;
   }
   if (typeof skToast === 'function') {
-    skToast(wrote ? ('Archived ' + wrote + ' league' + (wrote === 1 ? '' : 's') +
-                     (skipped ? (' \u00b7 ' + skipped + ' skipped') : ''))
-                  : 'Nothing new to archive');
+    skToast(wrote ? ('Archived ' + wrote + ' finished league' + (wrote === 1 ? '' : 's'))
+                  : ('Nothing new to archive' +
+                     (live ? (' \u00b7 ' + live + ' still in season') : '')));
   }
   if (typeof mrRenderBody === 'function') mrRenderBody();
 }
@@ -137106,8 +137208,8 @@ function _skArchiveBtn() {
       'color:rgba(255,255,255,0.55);font-size:9.5px;font-weight:700;' +
       'letter-spacing:0.06em;">ARCHIVE NOW</button>' +
     '<span style="font-size:9px;color:rgba(255,255,255,0.28);">' +
-      'captures every synced league\u2019s current standing for its season, ' +
-      'and never overwrites one already recorded</span>' +
+      'records the finish of any league whose season is over \u2014 never a ' +
+      'league still in season, and never over one already recorded</span>' +
   '</div>';
 }
 
