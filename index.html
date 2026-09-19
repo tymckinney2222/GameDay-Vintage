@@ -150913,6 +150913,10 @@ function _espSchedPaneHtml(row) {
 
 function espHasPaceTab(row) {
   if (typeof espIsSeasonPts !== 'function' || !espIsSeasonPts(row)) return false;
+  // ESPKO3 — a guillotine has no season-long pace worth tracking: the
+  // question is surviving Sunday, not where the season total lands. The
+  // SURVIVAL board answers it, so PACE is noise beside it.
+  if (typeof espIsKnockout === 'function' && espIsKnockout(row)) return false;
   if (typeof espSeasonClock === 'function' && espSeasonClock(row)) return true;
   if (typeof espNhlCaps === 'function' && espNhlCaps(row)) return true;
   return false;
@@ -150963,8 +150967,21 @@ function _espKoParse(json) {
   }
   var keys = Object.keys(byTeam);
   if (!keys.length) return null;
-  return { byTeam: byTeam, maxPeriod: maxPeriod, hasElimField: sawElimField,
-           periods: Object.keys(periods).length };
+  // ── ESPKO3 ── The live week comes from the LEAGUE, not the schedule.
+  //
+  // The schedule contains all 17 periods up front, and future weeks carry
+  // totalPoints: 0 rather than being absent — so "newest period with points"
+  // resolved to week 17 in September and every row read 0.0. ESPN states the
+  // real one in status.currentMatchupPeriod (not scoringPeriodId, which is a
+  // different counter).
+  var cur = 0;
+  try {
+    var st = (json && json.status) || {};
+    cur = parseInt(st.currentMatchupPeriod, 10) || 0;
+  } catch (e) {}
+  if (!cur) cur = maxPeriod;
+  return { byTeam: byTeam, maxPeriod: maxPeriod, current: cur,
+           hasElimField: sawElimField, periods: Object.keys(periods).length };
 }
 
 // Is this an ESPN knockout league? Requires the elimination field AND at
@@ -151023,12 +151040,24 @@ function _espKoPaneHtml(row) {
     }
   } catch (e) {}
 
-  // The live week is the newest period anybody has points for.
-  var live = 0, k, w;
-  for (k in d.byTeam) {
-    if (!d.byTeam.hasOwnProperty(k)) continue;
-    for (w in d.byTeam[k].weeks) {
-      if (d.byTeam[k].weeks.hasOwnProperty(w) && +w > live) live = +w;
+  // ESPKO3 — the league's current period, then a check that it has anything
+  // in it. ESPN posts a week's totalPoints as zeros until the week resolves,
+  // and a board of 0.0 says less than the last week that actually happened.
+  var k, w;
+  function anyPoints(p) {
+    for (var kk in d.byTeam) {
+      if (!d.byTeam.hasOwnProperty(kk)) continue;
+      if (d.byTeam[kk].elim > 0) continue;       // frozen teams are always 0
+      var v = d.byTeam[kk].weeks[p];
+      if (typeof v === 'number' && v !== 0) return true;
+    }
+    return false;
+  }
+  var live = d.current || d.maxPeriod;
+  var stale = false;
+  if (!anyPoints(live)) {
+    for (var back = live - 1; back >= 1; back--) {
+      if (anyPoints(back)) { live = back; stale = true; break; }
     }
   }
 
@@ -151058,7 +151087,9 @@ function _espKoPaneHtml(row) {
   catch (e2) { mine = row.myTeamIds || {}; }
 
   h += '<div class="sk-ko-head">WEEK ' + live + ' \u00b7 ' + alive.length +
-    ' alive \u00b7 lowest weekly score is chopped</div>';
+    ' alive \u00b7 lowest weekly score is chopped' +
+    (stale ? ('  \u2014 week ' + (d.current || '?') + ' hasn\u2019t posted yet') : '') +
+    '</div>';
   for (var a = 0; a < alive.length; a++) {
     var r = alive[a];
     var last = (a === alive.length - 1);
