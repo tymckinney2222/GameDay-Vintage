@@ -116673,6 +116673,7 @@ function skBuildLabShellHTML() {
     tab('twostart',   '2 Start') +
     tab('probe',      'Probe') +
     tab('caps',       'Caps') +
+    tab('knockout',   'Knockout') +
     '</div>' +
     '<div id="skLabPanel"></div>';
 }
@@ -116688,7 +116689,114 @@ function skRenderLabPanel() {
   else if (t === 'twostart') skLabRenderTwoStart(el); // async — manages its own innerHTML
   else if (t === 'probe') skLabRenderProbe(el);       // YPROBE — async
   else if (t === 'caps') skLabRenderCaps(el);         // YCAPS — async
+  else if (t === 'knockout') skLabRenderKnockout(el); // ESPKO
   el.scrollTop = 0;
+}
+
+// ─── KNOCKOUT ────────────────────────────────────────────────────  ESPKO
+// Does ESPN's per-team eliminated flag mean "chopped"?
+//
+// Yahoo publishes is_guillotine and the whole survival UI hangs off it. ESPN
+// has no knockout format at all, so the only candidate signal is the
+// eliminated boolean the row parser already reads and nothing consumes.
+//
+// The problem is that eliminated normally means "out of playoff contention",
+// which is true of half an ordinary league by December. In a knockout league
+// it should instead mark the teams that have been chopped — which means it
+// should be a SMALL number, and those teams should be the BOTTOM of the table.
+// This panel reports both so the question is settled by reading rather than
+// by assuming, before anything is built on top of it.
+function skLabRenderKnockout(el) {
+  var rows = [];
+  try {
+    var all = (typeof extSyncedLeagues === 'function') ? extSyncedLeagues() : [];
+    for (var i = 0; i < all.length; i++) {
+      if (all[i] && all[i].provider === 'espn') rows.push(all[i]);
+    }
+  } catch (e) {}
+  if (!rows.length) {
+    el.innerHTML = '<div class="sk-lab-blurb">No ESPN leagues synced.</div>';
+    return;
+  }
+
+  var h = '<div class="sk-lab-blurb">Whether ESPN\u2019s per-team ' +
+    '<strong>eliminated</strong> flag can stand in for Yahoo\u2019s ' +
+    '<strong>is_guillotine</strong>. In a knockout league it should mark a ' +
+    'FEW teams and they should be the BOTTOM of the table. If it marks many, ' +
+    'or marks teams mid-table, it means \u201cout of playoff contention\u201d ' +
+    'and can\u2019t be used.</div>';
+
+  for (var r = 0; r < rows.length; r++) {
+    var row = rows[r];
+    var teams = ((row.raw || {}).teams) || [];
+    if (!teams.length) {
+      h += '<div class="sk-probe-row miss"><div class="sk-probe-lbl">' +
+        skEscape(row.name || row.key) + '</div>' +
+        '<div class="sk-probe-verdict">no teams loaded</div></div>';
+      continue;
+    }
+    var list = [], elim = 0, t, pf;
+    for (var i2 = 0; i2 < teams.length; i2++) {
+      t = teams[i2];
+      pf = null;
+      try {
+        if (typeof espPickPoints === 'function') pf = espPickPoints((t.record || {}).overall, t);
+      } catch (e2) {}
+      var isE = !!t.eliminated;
+      if (isE) elim++;
+      list.push({
+        name: (t.abbrev || t.name || t.location || String(t.id)),
+        pf: (pf == null || isNaN(pf)) ? null : Number(pf),
+        elim: isE
+      });
+    }
+    // Rank by season total, best first, so we can see WHERE the flagged
+    // teams sit. A knockout chop takes the bottom; playoff elimination
+    // scatters through the lower half but not necessarily the very bottom.
+    list.sort(function(a, b) {
+      var ap = (a.pf == null) ? -1 : a.pf, bp = (b.pf == null) ? -1 : b.pf;
+      return bp - ap;
+    });
+    var flagged = [], bottomRun = true;
+    for (var k = 0; k < list.length; k++) {
+      if (list[k].elim) flagged.push({ rank: k + 1, name: list[k].name, pf: list[k].pf });
+    }
+    // Are the flagged teams exactly the last N rows?
+    for (var f = 0; f < flagged.length; f++) {
+      if (flagged[f].rank !== list.length - flagged.length + f + 1) { bottomRun = false; break; }
+    }
+
+    var cls, verdict;
+    if (!elim) {
+      cls = 'miss';
+      verdict = 'no team flagged \u2014 nothing eliminated, or the flag isn\u2019t set here';
+    } else if (elim >= Math.ceil(list.length / 2)) {
+      cls = 'weak';
+      verdict = elim + ' of ' + list.length + ' flagged \u2014 too many for a chop; ' +
+        'this reads as playoff contention';
+    } else if (bottomRun) {
+      cls = 'hit';
+      verdict = elim + ' of ' + list.length + ' flagged, and they ARE the bottom ' +
+        elim + ' by total \u2014 consistent with a knockout chop';
+    } else {
+      cls = 'weak';
+      verdict = elim + ' of ' + list.length + ' flagged, but not the bottom ' + elim +
+        ' \u2014 inconsistent with a chop';
+    }
+
+    h += '<div class="sk-probe-row ' + cls + '">' +
+      '<div class="sk-probe-lbl">' + skEscape(row.name || row.key) +
+        ' <span class="sk-probe-ctl">' + skEscape(String(row.sport || '').toUpperCase()) +
+        '</span></div>' +
+      '<div class="sk-probe-verdict">' + skEscape(verdict) + '</div>';
+    for (var q = 0; q < flagged.length && q < 8; q++) {
+      h += '<div class="sk-probe-hit"><span class="k">#' + flagged[q].rank + ' of ' +
+        list.length + '</span> <span class="v">' + skEscape(flagged[q].name) +
+        (flagged[q].pf != null ? ('  ' + flagged[q].pf) : '') + '</span></div>';
+    }
+    h += '</div>';
+  }
+  el.innerHTML = h;
 }
 
 // ─── CAPS ────────────────────────────────────────────────────────  YCAPS
