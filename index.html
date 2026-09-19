@@ -10949,6 +10949,12 @@
     transform: translateX(-50%); border: 5px solid transparent;
     border-top-color: #0a0c12; z-index: 5; pointer-events: none;
   }
+  /* MGRCAREER — career-chart bars at the edges anchor their tip to the bar
+     side instead of centring it, so it can't run off a phone screen. */
+  .court-mset.mr-tipL[data-tip]:hover::after,
+  .court-mset.mr-tipL[data-tip].tip-open::after { left: 0; transform: none; }
+  .court-mset.mr-tipR[data-tip]:hover::after,
+  .court-mset.mr-tipR[data-tip].tip-open::after { left: auto; right: 0; transform: none; }
   .court-mtag {
     font-size: 7px; font-weight: 800; letter-spacing: 0.5px;
     padding: 1px 3px; border-radius: 2px;
@@ -136042,8 +136048,16 @@ function skSeasonIsOver(row, manual) {
     if (!w || !w.endMs) return false;
     var now = Date.now(), DAY = 86400000;
     if (now <= w.endMs || now >= w.endMs + 150 * DAY) return false;
+    // ── SKARCH4 ── ARCHIVE NOW no longer jumps the queue on ESPN: pressed the
+    // morning after the last game, it would record the playoff SEED as the
+    // finish, and a record is never overwritten. It waits for ESPN's final
+    // rank like the automatic capture does. Only a platform that gives no
+    // final signal at all (Fantrax) falls straight back to the calendar.
+    if (row.provider === 'espn') {
+      if (_skArchEspFinalRank(row, true)) return true;
+      return now > w.endMs + 7 * DAY;
+    }
     if (manual) return true;
-    if (row.provider === 'espn' && _skArchEspFinalRank(row, true)) return true;
     return now > w.endMs + 7 * DAY;
   } catch (e) { return false; }
 }
@@ -136121,7 +136135,10 @@ function skYahooSeasonIsOver(lg, manual) {
     var em = new Date(String(end) + 'T23:59:59').getTime();
     if (isNaN(em)) return false;
     var now = Date.now(), DAY = 86400000;
-    return now > em + (manual ? 0 : 3 * DAY) && now < em + 150 * DAY;
+    // SKARCH4 — manual waits the same 3 days as automatic unless Yahoo has
+    // already said is_finished (checked above): standings before that can
+    // still be the regular-season order.
+    return now > em + 3 * DAY && now < em + 150 * DAY;
   } catch (e) { return false; }
 }
 function skArchiveYahooLeague(lg, force) {
@@ -136273,7 +136290,7 @@ function skArchiveNow() {
   if (typeof skToast === 'function') {
     skToast(wrote ? ('Archived ' + wrote + ' finished league' + (wrote === 1 ? '' : 's'))
                   : ('Nothing new to archive' +
-                     (live ? (' \u00b7 ' + live + ' still in season') : '')));
+                     (live ? (' \u00b7 ' + live + ' still in season or not final yet') : '')));
   }
   if (typeof mrRenderBody === 'function') mrRenderBody();
 }
@@ -137909,6 +137926,368 @@ function _mrKnockoutSectionHtml(data) {
   return h;
 }
 
+// ── NEMESIS BOARD ── MGRNEM ──
+// Managers I face in more than one league, with the combined record against
+// each. Matched by ACCOUNT, not display name: Yahoo's manager guid (from the
+// standings every league already caches) and ESPN's owner id (primaryOwner
+// in mTeam). Two platforms can't be joined — nothing ties a Yahoo guid to an
+// ESPN id, and matching on names would pair strangers called "Mike" — so the
+// same person on both counts twice. Completed weeks only: a live week is a
+// score, not a result. Sleeper and Fantrax aren't in yet (no per-week
+// opponent history is fetched for them).
+function _mrNemCollect() {
+  var opps = {}, pending = [], leaguesSeen = 0, i, k;
+  function add(id, name, plat, lgKey, lgName, myTeam, oppTeam, res) {
+    if (!id || (res !== 'W' && res !== 'L' && res !== 'T')) return;
+    var o = opps[id];
+    if (!o) o = opps[id] = { id: id, name: name || 'Unknown manager', plat: plat,
+                             w: 0, l: 0, t: 0, leagues: {}, nLeagues: 0 };
+    if (!o.leagues[lgKey]) {
+      o.leagues[lgKey] = { name: lgName || lgKey, team: myTeam || '', opp: oppTeam || '',
+                           w: 0, l: 0, t: 0 };
+      o.nLeagues++;
+    }
+    var L = o.leagues[lgKey];
+    if (res === 'W') { o.w++; L.w++; } else if (res === 'L') { o.l++; L.l++; } else { o.t++; L.t++; }
+  }
+
+  // Yahoo — the History tab's per-week aggregate, which carries oppTeamKey.
+  var yl = (typeof _skYahooArchLeagues === 'function') ? _skYahooArchLeagues() : [];
+  for (i = 0; i < yl.length; i++) {
+    var lg = yl[i];
+    if (!lg || !lg.league_key) continue;
+    var st = String(lg.scoring_type || '');
+    if (st !== 'head' && st !== 'headone' && st !== 'headpoint') continue;
+    if (typeof _mrIsGuillotineLeague === 'function' && _mrIsGuillotineLeague(lg)) continue;
+    var ld = (typeof skLeagueData === 'object' && skLeagueData) ? skLeagueData[lg.league_key] : null;
+    if (!ld || !ld.team || !ld.team.team_key) continue;
+    var hc = (typeof _skHistoryCache === 'object' && _skHistoryCache) ? _skHistoryCache[lg.league_key] : null;
+    var bw = hc && hc.data && hc.data.byWeek;
+    if (!bw) { pending.push(lg); continue; }
+    leaguesSeen++;
+    var all = ld.allTeams || {};
+    var myGuid = ld.team.managerGuid || ((all[ld.team.team_key] || {}).managerGuid) || '';
+    for (k = 0; k < bw.length; k++) {
+      var e = bw[k];
+      if (!e || e.isLive) continue;
+      var ot = all[e.oppTeamKey] || null;
+      var guid = ot && ot.managerGuid;
+      if (!guid || guid === myGuid) continue;
+      add('y:' + guid, (ot.managerNickname || ''), 'yahoo', lg.league_key, lg.name,
+          ld.team.name || '', e.oppName || ot.name || '', e.result);
+    }
+  }
+
+  // ESPN — the schedule already fetched for the season records.
+  var rows = [];
+  try { rows = (typeof extSyncedLeagues === 'function') ? extSyncedLeagues() : []; } catch (e0) {}
+  for (i = 0; i < rows.length; i++) {
+    var row = rows[i];
+    if (!row || row.provider !== 'espn') continue;
+    if (typeof skMrCounts === 'function' && !skMrCounts(row)) continue;
+    var j = row._espScoreJson, raw = row.raw || {};
+    if (!j || !j.schedule || !raw.teams) continue;
+    leaguesSeen++;
+    var myIds = row.myTeamIds || {};
+    var cur = Number((j.status && j.status.currentMatchupPeriod) || 1);
+    var byId = {}, myOwner = null;
+    for (k = 0; k < raw.teams.length; k++) {
+      var tt = raw.teams[k];
+      byId[String(tt.id)] = tt;
+      if (myIds[String(tt.id)]) myOwner = tt.primaryOwner || (tt.owners && tt.owners[0]) || null;
+    }
+    for (k = 0; k < j.schedule.length; k++) {
+      var m = j.schedule[k] || {};
+      if (Number(m.matchupPeriodId) >= cur) continue;
+      var a = m.away || {}, h = m.home || {};
+      var meAway = !!(a.teamId != null && myIds[String(a.teamId)]);
+      var meHome = !!(h.teamId != null && myIds[String(h.teamId)]);
+      if (!meAway && !meHome) continue;
+      var oppSide = meAway ? h : a;
+      if (oppSide.teamId == null) continue;            // bye
+      var res = null;
+      var win = String(m.winner || '').toUpperCase();
+      if (win && win !== 'UNDECIDED') {
+        res = (win === 'TIE') ? 'T'
+            : ((win === 'AWAY' && meAway) || (win === 'HOME' && meHome)) ? 'W' : 'L';
+      } else {
+        var mc = (meAway ? a.cumulativeScore : h.cumulativeScore) || null;
+        var oc = (meAway ? h.cumulativeScore : a.cumulativeScore) || null;
+        if (mc && oc && ((mc.wins || 0) + (mc.losses || 0) + (mc.ties || 0)) > 0) {
+          res = ((mc.wins || 0) > (oc.wins || 0)) ? 'W' : ((mc.wins || 0) < (oc.wins || 0)) ? 'L' : 'T';
+        } else {
+          var ms = meAway ? a.totalPoints : h.totalPoints, os = meAway ? h.totalPoints : a.totalPoints;
+          if (ms != null && os != null && (Number(ms) || Number(os))) {
+            res = (Number(ms) > Number(os)) ? 'W' : (Number(ms) < Number(os)) ? 'L' : 'T';
+          }
+        }
+      }
+      if (!res) continue;
+      var oteam = byId[String(oppSide.teamId)] || {};
+      var owner = oteam.primaryOwner || (oteam.owners && oteam.owners[0]) || null;
+      if (!owner || owner === myOwner) continue;
+      var oname = (typeof espOwnerName === 'function') ? espOwnerName(row, oppSide.teamId) : '';
+      var otn = (typeof espTeamName === 'function') ? espTeamName(oteam) : '';
+      add('e:' + owner, oname, 'espn', row.key, row.name, _mrExtTeam(row), otn, res);
+    }
+  }
+
+  var list = [], total = 0;
+  for (k in opps) {
+    if (!opps.hasOwnProperty(k)) continue;
+    total++;
+    if (opps[k].nLeagues >= 2) list.push(opps[k]);
+  }
+  return { list: list, pending: pending, opponents: total, leagues: leaguesSeen };
+}
+
+function _mrNemPct(o) {
+  var n = o.w + o.l + o.t;
+  return n ? (o.w + o.t / 2) / n : null;
+}
+
+function _mrNemesisHtml() {
+  var nd = _mrNemCollect();
+  var list = nd.list, i;
+  var mono = 'font-family:var(--sk-font-mono,monospace);';
+  // Most-played first: the rivalries with the most history lead.
+  list.sort(function (a, b) {
+    var ga = a.w + a.l + a.t, gb = b.w + b.l + b.t;
+    if (gb !== ga) return gb - ga;
+    return (_mrNemPct(a) || 0) - (_mrNemPct(b) || 0);
+  });
+  // The tags need enough games to mean something.
+  var nem = null, own = null;
+  for (i = 0; i < list.length; i++) {
+    var g = list[i].w + list[i].l + list[i].t;
+    if (g < 3) continue;
+    var p = _mrNemPct(list[i]);
+    if (p < 0.5 && (!nem || p < _mrNemPct(nem))) nem = list[i];
+    if (p > 0.5 && (!own || p > _mrNemPct(own))) own = list[i];
+  }
+
+  var h = '<div style="background:var(--sk-bg-card,rgba(255,255,255,0.03));' +
+    'border:1px solid rgba(255,255,255,0.07);border-radius:12px;padding:14px;margin:0 0 10px;">' +
+    '<div style="display:flex;align-items:baseline;margin:0 0 10px;">' +
+      '<span style="font-family:var(--sk-font-display,serif);font-size:18px;color:#fff;">Nemesis board</span>' +
+      '<span style="flex:1;"></span>' +
+      '<span style="font-size:9.5px;letter-spacing:0.12em;color:rgba(255,255,255,0.4);">' +
+        list.length + ' RIVAL' + (list.length === 1 ? '' : 'S') + '</span>' +
+    '</div>';
+
+  if (!list.length) {
+    h += '<div style="font-size:11.5px;line-height:1.6;color:rgba(255,255,255,0.42);">' +
+      (nd.opponents
+        ? ('Nobody shows up in more than one of your leagues yet \u2014 ' + nd.opponents +
+           ' opponent' + (nd.opponents === 1 ? '' : 's') + ' across ' + nd.leagues +
+           ' league' + (nd.leagues === 1 ? '' : 's') + ', all one-offs.')
+        : 'No completed matchups to read yet.') +
+      (nd.pending.length ? (' Loading matchups for ' + nd.pending.length + ' more league' +
+        (nd.pending.length === 1 ? '' : 's') + '\u2026') : '') +
+      '</div></div>';
+    return h;
+  }
+
+  h += '<div style="display:flex;font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
+    'padding:0 0 4px;border-bottom:1px solid rgba(255,255,255,0.08);">' +
+    '<span style="flex:1;">MANAGER</span>' +
+    '<span style="flex:0 0 34px;text-align:right;">LGS</span>' +
+    '<span style="flex:0 0 66px;text-align:right;">RECORD</span>' +
+    '<span style="flex:0 0 44px;text-align:right;">PCT</span></div>';
+
+  for (i = 0; i < list.length; i++) {
+    var o = list[i];
+    var meta = null;
+    for (var m2 = 0; m2 < MR_PLATFORMS.length; m2++) if (MR_PLATFORMS[m2].key === o.plat) meta = MR_PLATFORMS[m2];
+    var pc = _mrNemPct(o);
+    var tag = (o === nem) ? ['NEMESIS', '#f87171'] : (o === own) ? ['OWNED', '#4ade80'] : null;
+    var bits = [];
+    for (var lk in o.leagues) {
+      if (!o.leagues.hasOwnProperty(lk)) continue;
+      var L = o.leagues[lk];
+      bits.push(_mrNm(L) + ' ' + L.w + '-' + L.l + (L.t ? '-' + L.t : ''));
+    }
+    h += '<div style="padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.04);">' +
+      '<div style="display:flex;align-items:center;">' +
+        '<span style="flex:1;min-width:0;font-size:12px;color:rgba(255,255,255,0.88);' +
+          'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + slEsc(o.name) +
+          (tag ? '<span style="font-size:8.5px;font-weight:800;letter-spacing:0.08em;margin-left:7px;' +
+            'color:' + tag[1] + ';">' + tag[0] + '</span>' : '') + '</span>' +
+        '<span style="flex:0 0 auto;font-size:9px;font-weight:700;letter-spacing:0.05em;margin:0 6px;color:' +
+          (meta ? meta.accent : 'rgba(255,255,255,0.5)') + ';">' + slEsc(meta ? meta.label : o.plat) + '</span>' +
+        '<span style="flex:0 0 34px;text-align:right;' + mono + 'font-size:11px;color:rgba(255,255,255,0.55);">' +
+          o.nLeagues + '</span>' +
+        '<span style="flex:0 0 66px;text-align:right;' + mono + 'font-size:12px;color:#fff;">' +
+          o.w + '-' + o.l + '-' + o.t + '</span>' +
+        '<span style="flex:0 0 44px;text-align:right;' + mono + 'font-size:11px;color:' +
+          (pc == null ? 'rgba(255,255,255,0.3)' : pc > 0.5 ? '#4ade80' : pc < 0.5 ? '#f87171' : 'rgba(255,255,255,0.6)') + ';">' +
+          (pc == null ? '' : pc.toFixed(3).replace(/^0/, '')) + '</span>' +
+      '</div>' +
+      '<div style="font-size:9.5px;color:rgba(255,255,255,0.38);padding-top:2px;line-height:1.45;">' +
+        slEsc(bits.join(' \u00b7 ')) + '</div>' +
+    '</div>';
+  }
+  h += '<div style="font-size:9px;line-height:1.5;color:rgba(255,255,255,0.28);margin-top:8px;">' +
+    'Managers you\u2019ve played in two or more leagues, completed weeks only. Matched by ' +
+    'account, so the same person on Yahoo and ESPN shows up twice \u2014 there\u2019s nothing ' +
+    'that links the two. NEMESIS and OWNED need three games. Sleeper and Fantrax aren\u2019t ' +
+    'included yet.' +
+    (nd.pending.length ? (' Loading ' + nd.pending.length + ' more league' +
+      (nd.pending.length === 1 ? '' : 's') + '\u2026') : '') + '</div>';
+  return h + '</div>';
+}
+
+// ── CAREER LINE ── MGRCAREER ──
+// Year by year: the season record (Manager Record's own yearly archive,
+// rewritten every open so the current year is live) and the finishes the
+// trophy case has recorded, rolled into a lifetime line. The chart is the
+// average finish percentile per year — the one number that compares a 1st
+// of 8 with a 5th of 16. Tap a bar for the detail.
+//
+// Years are as each source labels them: the record archive by calendar year,
+// finishes by the platform's season label. For MLB and NFL those agree; an
+// NBA or NHL season is filed under the year its platform uses.
+function _mrCareerHtml(data) {
+  var arch = (typeof skListArchive === 'function') ? skListArchive() : [];
+  var recs = (typeof mrArchiveRead === 'function') ? mrArchiveRead() : {};
+  var thisYear = String(new Date().getFullYear());
+  var years = {}, order = [], y, i;
+  function yr(k) {
+    if (!years[k]) { years[k] = { y: k, rec: null, fins: [], titles: 0, pods: 0 }; order.push(k); }
+    return years[k];
+  }
+  for (y in recs) {
+    if (!recs.hasOwnProperty(y)) continue;
+    var g = recs[y] && recs[y].grand;
+    if (g && (g.sw + g.sl + g.st) > 0) yr(y).rec = g;
+  }
+  if (data && data.grand && (data.grand.sw + data.grand.sl + data.grand.st) > 0) yr(thisYear).rec = data.grand;
+  for (i = 0; i < arch.length; i++) {
+    var a = arch[i];
+    var r = Number(a.rank), sz = Number(a.size);
+    if (!r || !sz) continue;
+    var Y = yr(String(a.season));
+    Y.fins.push({ pct: (sz > 1) ? (sz - r) / (sz - 1) : null, rank: r, size: sz });
+    if (r === 1 && sz >= 2) Y.titles++;
+    var mins = (typeof SK_MEDAL_MIN === 'object') ? SK_MEDAL_MIN : { 1: 2, 2: 3, 3: 4 };
+    if (r >= 1 && r <= 3 && sz >= (mins[r] || 99)) Y.pods++;
+  }
+  if (!order.length) return '';
+  order.sort(function (a2, b2) { return Number(a2) - Number(b2); });   // oldest first
+
+  var L = { sw: 0, sl: 0, st: 0, titles: 0, pods: 0, fins: [] };
+  for (i = 0; i < order.length; i++) {
+    var e = years[order[i]];
+    if (e.rec) { L.sw += e.rec.sw; L.sl += e.rec.sl; L.st += e.rec.st; }
+    L.titles += e.titles; L.pods += e.pods;
+    for (var f = 0; f < e.fins.length; f++) L.fins.push(e.fins[f]);
+    e.avg = _mrPlacePctl(e.fins);
+  }
+  var lavg = _mrPlacePctl(L.fins);
+  var mono = 'font-family:var(--sk-font-mono,monospace);';
+  function rec3(o) { return o.sw + '-' + o.sl + '-' + o.st; }
+  function pct3(v) { return (v == null) ? '\u2014' : v.toFixed(3).replace(/^0/, ''); }
+  function wpct(o) {
+    var n = o.sw + o.sl + o.st;
+    return n ? ((o.sw + o.st / 2) / n).toFixed(3).replace(/^0/, '') : '';
+  }
+
+  var h = '<div style="background:var(--sk-bg-card,rgba(255,255,255,0.03));' +
+    'border:1px solid rgba(255,255,255,0.07);border-radius:12px;padding:14px;margin:0 0 10px;">' +
+    '<div style="display:flex;align-items:baseline;margin:0 0 10px;">' +
+      '<span style="font-family:var(--sk-font-display,serif);font-size:18px;color:#fff;">Career</span>' +
+      '<span style="flex:1;"></span>' +
+      '<span style="font-size:9.5px;letter-spacing:0.12em;color:rgba(255,255,255,0.4);">' +
+        order.length + ' SEASON' + (order.length === 1 ? '' : 'S') + '</span>' +
+    '</div>';
+
+  // Lifetime tiles.
+  function tile(lbl, val, sub, col) {
+    return '<div style="flex:1;min-width:0;text-align:center;padding:8px 2px;border-radius:9px;' +
+      'background:rgba(255,255,255,0.025);border:1px solid rgba(255,255,255,0.05);">' +
+      '<div style="font-size:8px;letter-spacing:0.12em;color:rgba(255,255,255,0.35);">' + lbl + '</div>' +
+      '<div style="' + mono + 'font-size:15px;font-weight:800;color:' + (col || '#fff') + ';margin-top:2px;">' +
+        val + '</div>' +
+      (sub ? '<div style="' + mono + 'font-size:9px;color:rgba(255,255,255,0.35);">' + sub + '</div>' : '') +
+    '</div>';
+  }
+  h += '<div style="display:flex;gap:6px;margin:0 0 12px;">' +
+    tile('RECORD', rec3(L), wpct(L) ? wpct(L) + ' win%' : '') +
+    tile('TITLES', String(L.titles), L.pods + ' podium' + (L.pods === 1 ? '' : 's'),
+         L.titles ? 'var(--sk-gold,#eab308)' : '#fff') +
+    tile('AVG FINISH', pct3(lavg), L.fins.length + ' finish' + (L.fins.length === 1 ? '' : 'es'),
+         lavg == null ? 'rgba(255,255,255,0.4)' : '#fff') +
+  '</div>';
+
+  // Chart: average finish percentile by year. Uses the shared tap-tooltip
+  // contract (.court-mset + data-tip + _courtSetTip) so it works on Android
+  // where title="" tooltips don't.
+  var PLOT = 70;
+  h += '<div style="display:flex;align-items:flex-end;gap:6px;height:' + (PLOT + 16) + 'px;' +
+    'padding:0 2px;border-bottom:1px solid rgba(255,255,255,0.1);position:relative;">' +
+    '<div style="position:absolute;left:0;right:0;bottom:' + Math.round(PLOT / 2) + 'px;' +
+      'border-top:1px dashed rgba(255,255,255,0.12);pointer-events:none;"></div>';
+  for (i = 0; i < order.length; i++) {
+    var c = years[order[i]];
+    var live = (order[i] === thisYear);
+    var tip = order[i] + (live ? ' (live)' : '') + ' \u00b7 ' +
+      (c.avg == null ? 'no finishes recorded' : (pct3(c.avg) + ' avg finish, ' + c.fins.length +
+        ' finish' + (c.fins.length === 1 ? '' : 'es'))) +
+      (c.titles ? (' \u00b7 ' + c.titles + ' title' + (c.titles === 1 ? '' : 's')) : '') +
+      (c.rec ? (' \u00b7 ' + rec3(c.rec)) : '');
+    var hgt = (c.avg == null) ? 3 : Math.max(4, Math.round(c.avg * PLOT));
+    var col = (c.avg == null) ? 'rgba(255,255,255,0.12)'
+            : c.titles ? 'var(--sk-gold,#eab308)'
+            : c.avg >= 0.5 ? '#4ade80' : '#f87171';
+    var side = (order.length < 2) ? '' : (i < order.length / 2 ? ' mr-tipL' : ' mr-tipR');
+    h += '<div class="court-mset' + side + '" data-tip="' + slEsc(tip) + '" onclick="_courtSetTip(this)" ' +
+      'style="display:flex;flex-direction:column;justify-content:flex-end;align-items:center;height:100%;">' +
+      '<div style="' + mono + 'font-size:9.5px;color:rgba(255,255,255,0.6);padding-bottom:2px;">' +
+        (c.avg == null ? '' : pct3(c.avg)) + '</div>' +
+      '<div style="width:70%;max-width:34px;height:' + hgt + 'px;border-radius:3px 3px 0 0;background:' + col + ';' +
+        (live ? 'opacity:0.65;' : '') + '"></div>' +
+    '</div>';
+  }
+  h += '</div><div style="display:flex;gap:6px;padding:4px 2px 0;">';
+  for (i = 0; i < order.length; i++) {
+    h += '<div style="flex:1;min-width:0;text-align:center;' + mono + 'font-size:9.5px;color:' +
+      (order[i] === thisYear ? 'var(--sk-gold,#eab308)' : 'rgba(255,255,255,0.45)') + ';">' +
+      slEsc(order[i]) + '</div>';
+  }
+  h += '</div>';
+
+  // Year table, newest first.
+  h += '<div style="display:flex;font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
+    'padding:12px 0 4px;border-bottom:1px solid rgba(255,255,255,0.08);">' +
+    '<span style="flex:1;">SEASON</span>' +
+    '<span style="flex:0 0 84px;text-align:right;">RECORD</span>' +
+    '<span style="flex:0 0 40px;text-align:right;">FIN</span>' +
+    '<span style="flex:0 0 46px;text-align:right;">AVG</span>' +
+    '<span style="flex:0 0 36px;text-align:right;">TTL</span></div>';
+  for (i = order.length - 1; i >= 0; i--) {
+    var d = years[order[i]];
+    var isLive = (order[i] === thisYear);
+    h += '<div style="display:flex;align-items:center;padding:5px 0;border-bottom:1px solid rgba(255,255,255,0.04);">' +
+      '<span style="flex:1;' + mono + 'font-size:12px;color:rgba(255,255,255,0.7);">' + slEsc(order[i]) +
+        (isLive ? '<span style="font-size:8.5px;letter-spacing:0.1em;color:var(--sk-gold,#eab308);margin-left:6px;">LIVE</span>' : '') +
+      '</span>' +
+      '<span style="flex:0 0 84px;text-align:right;' + mono + 'font-size:12px;color:#fff;">' +
+        (d.rec ? rec3(d.rec) : '\u2014') + '</span>' +
+      '<span style="flex:0 0 40px;text-align:right;' + mono + 'font-size:11px;color:rgba(255,255,255,0.55);">' +
+        (d.fins.length || '\u2014') + '</span>' +
+      '<span style="flex:0 0 46px;text-align:right;' + mono + 'font-size:11px;color:rgba(255,255,255,0.8);">' +
+        pct3(d.avg) + '</span>' +
+      '<span style="flex:0 0 36px;text-align:right;' + mono + 'font-size:11px;color:' +
+        (d.titles ? 'var(--sk-gold,#eab308)' : 'rgba(255,255,255,0.3)') + ';">' + (d.titles || '\u2014') + '</span>' +
+    '</div>';
+  }
+  h += '<div style="font-size:9px;line-height:1.5;color:rgba(255,255,255,0.28);margin-top:8px;">' +
+    'RECORD is every H2H matchup that season across platforms; the current year is live. ' +
+    'FIN and AVG come from the trophy case \u2014 finishes it has recorded and their average ' +
+    'percentile (1st is 1.000, last is .000). TTL is league titles. Tap a bar for the year.</div>';
+  return h + '</div>';
+}
+
 function mrRenderBody() {
   var body = document.getElementById('mrBody');
   if (!body) return;
@@ -138147,33 +138526,8 @@ function mrRenderBody() {
     '</div></div>';
   }
 
-  // ── Past seasons, from the archive ──
-  var arch = mrArchiveRead();
-  var years = [];
-  for (k in arch) { if (arch.hasOwnProperty(k)) years.push(k); }
-  years.sort().reverse();
-  var thisYear = String(new Date().getFullYear());
-  var past = [];
-  for (i = 0; i < years.length; i++) if (years[i] !== thisYear) past.push(years[i]);
-  if (past.length) {
-    h += '<div style="background:var(--sk-bg-card,rgba(255,255,255,0.03));' +
-      'border:1px solid rgba(255,255,255,0.07);border-radius:12px;padding:14px;margin:0 0 10px;">' +
-      '<div style="font-size:9.5px;letter-spacing:0.14em;color:rgba(255,255,255,0.4);' +
-        'margin:0 0 8px;">PREVIOUS SEASONS</div>';
-    for (i = 0; i < past.length; i++) {
-      var pg = (arch[past[i]] && arch[past[i]].grand) || null;
-      if (!pg) continue;
-      h += '<div style="display:flex;align-items:center;padding:5px 0;">' +
-        '<span style="flex:1;font-family:var(--sk-font-mono,monospace);font-size:12px;' +
-          'color:rgba(255,255,255,0.6);">' + slEsc(past[i]) + '</span>' +
-        '<span style="flex:0 0 96px;text-align:right;font-family:var(--sk-font-mono,monospace);' +
-          'font-size:12.5px;color:#fff;">' + _mrRec(pg, false) + '</span>' +
-        '<span style="flex:0 0 56px;text-align:right;font-family:var(--sk-font-mono,monospace);' +
-          'font-size:11px;color:rgba(255,255,255,0.4);">' + _mrPct(pg, false) + '</span>' +
-      '</div>';
-    }
-    h += '</div>';
-  }
+  // ── Past seasons ── moved into the Career line below the trophy case,
+  // which carries the same yearly records plus finishes. MGRCAREER
 
   // ── Season points, by sport and platform ── MGRPLACE ──
   // These leagues have no record, so they're absent from every table above.
@@ -138194,6 +138548,7 @@ function mrRenderBody() {
         'league in points and finish fourth. Counted apart from season points ' +
         'for that reason. PCTL scales a finish to league size.');
   h += _mrKnockoutSectionHtml(data);   // MGRKO
+  h += _mrNemesisHtml();               // MGRNEM
 
   // Per-league trace. Small, and it makes a surprising total explainable
   // instead of something to argue with. MGRREC2
@@ -138209,6 +138564,7 @@ function mrRenderBody() {
   // The trophy case sits above the per-league list: seasons finished, then
   // seasons in progress. SKARCHIVE
   if (typeof _skTrophyHtml === 'function') h += _skTrophyHtml();
+  h += _mrCareerHtml(data);            // MGRCAREER
 
   h += _mrDetailHtml(det);   // SKPRESEASON
 
@@ -138237,6 +138593,11 @@ function openManagerRecord() {
   try {
     var need = mrYahooSeason().needCats;
     if (need && need.length) mrHydrateCats(need);
+    // MGRNEM — the nemesis board needs every Yahoo H2H league's matchups,
+    // points leagues included (their record comes from standings, so they
+    // were never fetched). Session-cached; only what's missing is queued.
+    var nemNeed = _mrNemCollect().pending;
+    if (nemNeed && nemNeed.length) mrHydrateCats(nemNeed);
     if (typeof _mrPollTallies === 'function') _mrPollTallies(0);
   } catch (e2) {}
 }
