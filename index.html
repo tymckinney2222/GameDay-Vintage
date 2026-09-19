@@ -18373,6 +18373,53 @@
   .sk-wire-cat-head .col-marker { text-align: center; }
 
   /* ─── Points: ranked player row ──────────────────────────── */
+  /* WIREPL — player lines on The Wire sheet */
+  .sk-wpl-tabs { display: flex; gap: 6px; margin: 0 4px 10px; }
+  .sk-wpl-tab {
+    flex: 1; min-width: 0; padding: 7px 10px; border-radius: 999px;
+    font-family: var(--sk-font-mono); font-size: 10px; font-weight: 700;
+    letter-spacing: 0.08em; text-transform: uppercase;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    background: none; color: var(--sk-text-3);
+    border: 1px solid rgba(255,255,255,0.12);
+  }
+  .sk-wpl-tab.on { color: var(--sk-gold); border-color: var(--sk-gold); background: rgba(234,179,8,0.10); }
+  .sk-wpl-grp {
+    font-family: var(--sk-font-mono); font-size: 9px; font-weight: 700;
+    letter-spacing: 0.18em; text-transform: uppercase; color: var(--sk-text-4);
+    margin: 12px 6px 4px;
+  }
+  .sk-wpl-grp span { color: var(--sk-text-4); opacity: 0.7; margin-left: 4px; }
+  .sk-wpl-row { padding: 8px 10px; border-bottom: 1px solid rgba(255,255,255,0.04); }
+  .sk-wpl-top { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+  .sk-wpl-name {
+    font-family: var(--sk-font-ui); font-size: 13.5px; font-weight: 700; color: var(--sk-text);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
+  }
+  .sk-wpl-meta {
+    font-family: var(--sk-font-mono); font-size: 10px; color: var(--sk-text-4);
+    letter-spacing: 0.06em; flex-shrink: 0;
+  }
+  .sk-wpl-fp {
+    margin-left: auto; flex-shrink: 0;
+    font-family: var(--sk-font-mono); font-size: 13.5px; font-weight: 700; color: var(--sk-text);
+  }
+  .sk-wpl-fp .u { font-size: 9px; color: var(--sk-text-4); margin-left: 3px; font-weight: 500; }
+  .sk-wpl-line {
+    font-family: var(--sk-font-mono); font-size: 11px; color: var(--sk-text-3);
+    margin-top: 3px; line-height: 1.5;
+  }
+  .sk-wpl-line .v { color: var(--sk-text); font-weight: 700; }
+  .sk-wpl-line .sep { color: var(--sk-text-4); }
+  .sk-wpl-line .quiet { color: var(--sk-text-4); font-style: italic; }
+  .sk-wpl-dnp {
+    font-size: 11px; line-height: 1.5; color: var(--sk-text-4);
+    margin: 10px 6px 4px;
+  }
+  .sk-wpl-dnp span {
+    font-family: var(--sk-font-mono); font-size: 9px; font-weight: 700;
+    letter-spacing: 0.14em; text-transform: uppercase; margin-right: 4px;
+  }
   .sk-wire-player-row {
     display: grid;
     grid-template-columns: 24px 1fr auto;
@@ -89457,12 +89504,176 @@ function skOpenWireDetail(leagueKey) {
     } else {
       bodyHtml = '<div class="sk-wire-sheet-empty">Detail view not supported for this scoring type yet.</div>';
     }
+    // WIREPL — per-player lines for the day, mine and theirs, at the foot
+    // of the sheet. Not football (its "day" is a week-to-date total).
+    if (!entry.error && !entry.isFootball && entry.myTeamKey && entry.dateStr) {
+      bodyHtml += '<div id="skWirePL" data-key="' + skEscape(leagueKey) + '">' +
+        '<div class="sk-wire-sheet-section"><span class="ic">\ud83d\udccb</span>Player lines</div>' +
+        '<div class="sk-wire-sheet-empty">Loading player lines\u2026</div></div>';
+    }
     bodyEl.innerHTML = bodyHtml;
     bodyEl.scrollTop = 0; // reset scroll on each open
+    if (document.getElementById('skWirePL')) _skWirePLLoad(entry);
   }
 
   document.getElementById('skWireSheetBackdrop').classList.add('open');
   document.getElementById('skWireSheet').classList.add('open');
+}
+
+// ── WIREPL ── Player lines on The Wire detail sheet ──────────────
+// Every active starter's real stat line for the day, for my team and my
+// opponent's (toggle between them), with fantasy points alongside in
+// points leagues. Reuses fetchTeamFpForDate — the same per-day roster +
+// stats call the Wire scan already made for points leagues, so for those
+// it's a cache hit; cats leagues pay two calls the first time (cached for
+// the session, and in localStorage once the date is two days old).
+//
+// The line is built from the league's own scoring stats (leagueSettings),
+// in stat-id order, split by the player's position type so a pitcher
+// shows pitching cats and a hitter hitting cats. Zero counting stats are
+// left out (a line of 0s is noise); IP always shows for a pitcher who
+// threw. A starter with no stats at all didn't play and is listed
+// compactly at the end instead of getting a blank row.
+var _skWirePL = { key: null, side: 'me', entry: null, my: null, opp: null };
+
+function _skWirePLLoad(entry) {
+  _skWirePL = { key: entry.leagueKey, side: 'me', entry: entry, my: null, opp: null };
+  var want = entry.leagueKey;
+  var pMy = fetchTeamFpForDate(entry.myTeamKey, entry.dateStr)['catch'](function () { return null; });
+  var hasOpp = entry.oppTeamKey && entry.scoringType !== 'point';
+  var pOpp = hasOpp
+    ? fetchTeamFpForDate(entry.oppTeamKey, entry.dateStr)['catch'](function () { return null; })
+    : Promise.resolve(null);
+  Promise.all([pMy, pOpp]).then(function (r) {
+    if (_skWirePL.key !== want) return;          // sheet moved on to another league
+    _skWirePL.my = r[0] || {};
+    _skWirePL.opp = hasOpp ? (r[1] || {}) : null;
+    _skWirePLPaint();
+  });
+}
+
+function skWirePLSide(side) {
+  _skWirePL.side = (side === 'opp' && _skWirePL.opp) ? 'opp' : 'me';
+  _skWirePLPaint();
+}
+
+function _skWirePLFmt(v, meta) {
+  var ab = String((meta && (meta.abbr || meta.displayName)) || '').toUpperCase();
+  if (ab === 'AVG' || ab === 'OBP' || ab === 'SLG' || ab === 'OPS' || ab.indexOf('%') >= 0) {
+    return v.toFixed(3).replace(/^0/, '');
+  }
+  if (ab === 'ERA' || ab === 'WHIP' || ab.indexOf('/9') >= 0 || ab === 'K/BB' || ab === 'GAA') return v.toFixed(2);
+  if (ab === 'IP') return (v % 1 === 0) ? v.toFixed(1) : String(v);
+  if (v % 1 === 0) return String(v);
+  return v.toFixed(1);
+}
+
+// One player's line: [{ab, txt}] from the league's scoring stats.
+function _skWirePLLine(p, statsMeta) {
+  var ids = Object.keys(p.stats || {}).sort(function (a, b) { return parseInt(a, 10) - parseInt(b, 10); });
+  var parts = [], played = false, i;
+  for (i = 0; i < ids.length; i++) {
+    var sid = ids[i], meta = statsMeta[sid];
+    if (!meta || !meta.enabled || meta.isOnlyDisplayStat) continue;
+    if (meta.positionType && p.positionType && meta.positionType !== p.positionType) continue;
+    var v = p.stats[sid];
+    if (v == null || isNaN(v)) continue;
+    played = true;
+    var ab = meta.abbr || meta.displayName || meta.name || ('#' + sid);
+    var isRate = (meta.sortOrder === 0) || /AVG|OBP|SLG|OPS|%|ERA|WHIP|\/9|GAA/i.test(ab);
+    if (!isRate && v === 0 && String(ab).toUpperCase() !== 'IP') continue;
+    if (String(ab).toUpperCase() === 'IP' && v === 0) continue;
+    var isIp = String(ab).toUpperCase() === 'IP';
+    parts.push({ ab: ab, txt: _skWirePLFmt(v, meta), ord: isIp ? 0 : (isRate ? 2 : 1), sid: parseInt(sid, 10) });
+  }
+  // Read like a box score: innings first for a pitcher, then the counting
+  // stats, then the rate stats (a day's AVG/ERA is context, not the lead).
+  parts.sort(function (a, b) { return (a.ord - b.ord) || (a.sid - b.sid); });
+  return { played: played, parts: parts };
+}
+
+function _skWirePLPaint() {
+  var host = document.getElementById('skWirePL');
+  if (!host || host.getAttribute('data-key') !== _skWirePL.key) return;
+  var entry = _skWirePL.entry;
+  var settings = (typeof leagueSettingsCache === 'object' && leagueSettingsCache) ? leagueSettingsCache[entry.leagueKey] : null;
+  var statsMeta = (settings && settings.stats) || {};
+  var side = _skWirePL.side;
+  var map = (side === 'opp') ? _skWirePL.opp : _skWirePL.my;
+  var isPts = (entry.scoringType === 'headpoint' || entry.scoringType === 'point');
+
+  var sport = 'mlb';
+  try {
+    var lg = (typeof fyLeagues !== 'undefined' && fyLeagues)
+      ? fyLeagues.find(function (l) { return l.league_key === entry.leagueKey; }) : null;
+    if (lg && lg.sport) sport = String(lg.sport).toLowerCase();
+  } catch (e0) {}
+  var GROUPS = (sport === 'nhl') ? [['P', 'Skaters'], ['G', 'Goalies']]
+             : (sport === 'nba') ? [['*', 'Players']]
+             : [['B', 'Hitters'], ['P', 'Pitchers']];
+
+  var h = '<div class="sk-wire-sheet-section"><span class="ic">\ud83d\udccb</span>Player lines' +
+    '<span class="meta">' + skEscape(skYesterdayLabel()) + '</span></div>';
+  if (_skWirePL.opp) {
+    var oppLbl = entry.oppName || 'Opponent';
+    h += '<div class="sk-wpl-tabs">' +
+      '<button class="sk-wpl-tab' + (side === 'me' ? ' on' : '') + '" onclick="skWirePLSide(\'me\')">My team</button>' +
+      '<button class="sk-wpl-tab' + (side === 'opp' ? ' on' : '') + '" onclick="skWirePLSide(\'opp\')">' +
+        skEscape(oppLbl) + '</button></div>';
+  }
+
+  var rows = [], dnp = [], k;
+  for (k in (map || {})) {
+    if (!map.hasOwnProperty(k)) continue;
+    var p = map[k];
+    if (!p || !_isActiveSlot(p.selectedPos)) continue;   // bench days don't count
+    var ln = _skWirePLLine(p, statsMeta);
+    var hasFp = (typeof p.fp === 'number' && !isNaN(p.fp));
+    if (!ln.played && !(isPts && hasFp && p.fp !== 0)) { dnp.push(p); continue; }
+    rows.push({ p: p, ln: ln, fp: hasFp ? p.fp : null });
+  }
+  if (!rows.length && !dnp.length) {
+    host.innerHTML = h + '<div class="sk-wire-sheet-empty">No player data for this day.</div>';
+    return;
+  }
+
+  function rowHtml(r) {
+    var p = r.p;
+    var line = r.ln.parts.length
+      ? r.ln.parts.map(function (x) {
+          return '<span class="v">' + skEscape(x.txt) + '</span> ' + skEscape(x.ab);
+        }).join('<span class="sep"> \u00b7 </span>')
+      : '<span class="quiet">no counting stats</span>';
+    return '<div class="sk-wpl-row">' +
+      '<div class="sk-wpl-top">' +
+        '<span class="sk-wpl-name">' + skEscape(p.name || '\u2014') + '</span>' +
+        '<span class="sk-wpl-meta">' + skEscape([(p.teamAbbr || '').toUpperCase(), p.selectedPos || '']
+          .filter(function (x) { return !!x; }).join(' \u00b7 ')) + '</span>' +
+        (isPts && r.fp != null ? '<span class="sk-wpl-fp">' + r.fp.toFixed(1) + '<span class="u">FP</span></span>' : '') +
+      '</div>' +
+      '<div class="sk-wpl-line">' + line + '</div>' +
+    '</div>';
+  }
+
+  for (var g = 0; g < GROUPS.length; g++) {
+    var gk = GROUPS[g][0];
+    var list = rows.filter(function (r) {
+      if (gk === '*') return true;
+      var pt = r.p.positionType || '';
+      if (sport === 'mlb') return gk === 'P' ? pt === 'P' : pt !== 'P';
+      if (sport === 'nhl') return gk === 'G' ? pt === 'G' : pt !== 'G';
+      return true;
+    });
+    if (!list.length) continue;
+    if (isPts) list.sort(function (a, b) { return (b.fp || 0) - (a.fp || 0); });
+    h += '<div class="sk-wpl-grp">' + skEscape(GROUPS[g][1]) + ' <span>' + list.length + '</span></div>';
+    for (var r = 0; r < list.length; r++) h += rowHtml(list[r]);
+  }
+  if (dnp.length) {
+    h += '<div class="sk-wpl-dnp"><span>Didn\u2019t play</span> ' +
+      skEscape(dnp.map(function (p) { return p.name || '\u2014'; }).join(', ')) + '</div>';
+  }
+  host.innerHTML = h;
 }
 
 function skCloseWireSheet() {
