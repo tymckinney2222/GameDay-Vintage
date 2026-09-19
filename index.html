@@ -89803,6 +89803,8 @@ function _skBankSlots(leagueKey) {
 // string plus the two universal flex slots.
 function _skBankCanFill(p, slot) {
   var S = String(slot).toUpperCase(), i;
+  // A player can always go back in the slot he actually started in.
+  if (p.selectedPos && String(p.selectedPos).toUpperCase() === S) return true;
   if (p.elig && p.elig.length) {
     for (i = 0; i < p.elig.length; i++) if (String(p.elig[i]).toUpperCase() === S) return true;
     return false;
@@ -89814,24 +89816,42 @@ function _skBankCanFill(p, slot) {
   return false;
 }
 
-// Best possible lineup points for the day, from everyone who was on the
-// active lineup or the bench (IL/NA slots can't be started). Because a
-// player's value doesn't depend on WHICH slot he fills, the best lineup
-// is found greedily: take players highest-points-first, keeping each one
-// if the lineup can still be rearranged to fit him (an augmenting-path
-// check). That's exact for this kind of problem, not an approximation.
-// Doesn't know about game caps (max starts, games-played limits).
+// ── SKBANK2 ── The best lineup a day allowed, counting only real bench
+// production.
+//
+// The first version chose freely among everyone, so on a day two of your
+// starting pitchers went negative (-1.4 and -4.5) it "benched" them for
+// bench pitchers who never threw a pitch and scored 0.00 — and called the
+// 5.9 points that saved "left on the bench". True in hindsight, but it
+// isn't bench production, and nobody sits a starter because he might go
+// negative.
+//
+// Now the lineup you set is the starting point, and a bench player can
+// only take a slot if he actually scored points (> 0). Your starters keep
+// their real scores, negatives included, unless a productive bench player
+// displaces them. So LEFT reads exactly as it sounds: points your bench
+// scored that your lineup could have used.
+//
+// Found greedily — everyone highest-score-first, each kept if the lineup
+// can still be rearranged to fit him (an augmenting-path check). Players'
+// values don't depend on which slot they fill, so this is exact.
+// Doesn't know about game caps (max starts, innings limits).
 function _skBankOptimal(players, slots) {
   if (!slots.length) return null;
   var owner = [], i, total = 0;
   for (i = 0; i < slots.length; i++) owner.push(-1);
-  var cand = players.filter(function (p) { return p.fp != null && p.fp > 0; })
-                    .sort(function (a, b) { return b.fp - a.fp; });
-  function place(pi, seen) {
+  var cand = players.filter(function (p) {
+    var fp = (typeof p.fp === 'number' && !isNaN(p.fp)) ? p.fp : 0;
+    if (_isActiveSlot(p.selectedPos)) return true;           // your starters, as scored
+    return String(p.selectedPos || '').toUpperCase() === 'BN' && fp > 0;   // productive bench only
+  }).map(function (p) {
+    return { p: p, fp: (typeof p.fp === 'number' && !isNaN(p.fp)) ? p.fp : 0 };
+  }).sort(function (a, b) { return b.fp - a.fp; });
+  function place(ci, seen) {
     for (var si = 0; si < slots.length; si++) {
-      if (seen[si] || !_skBankCanFill(cand[pi], slots[si])) continue;
+      if (seen[si] || !_skBankCanFill(cand[ci].p, slots[si])) continue;
       seen[si] = 1;
-      if (owner[si] === -1 || place(owner[si], seen)) { owner[si] = pi; return true; }
+      if (owner[si] === -1 || place(owner[si], seen)) { owner[si] = ci; return true; }
     }
     return false;
   }
@@ -89839,6 +89859,32 @@ function _skBankOptimal(players, slots) {
     if (place(i, {})) total += cand[i].fp;
   }
   return Math.round(total * 10) / 10;
+}
+
+// SKBANK2 — days banked under the first rule get their best-lineup number
+// recomputed once. Those dates are 2+ days old, so their rosters come from
+// the on-device cache: no Yahoo requests in the normal case.
+function _skBankRecalc(league, st, myTeamKey) {
+  var key = league.league_key, bank = _skBankGet(key);
+  if ((bank.v || 1) >= 2) return Promise.resolve(false);
+  if (!_skBankIsPts(st)) { bank.v = 2; _skBankPut(key); return Promise.resolve(true); }
+  var dates = Object.keys(bank.days), i = 0, slots = _skBankSlots(key);
+  if (!slots.length) return Promise.resolve(false);            // settings not loaded; try next time
+  function next() {
+    if (i >= dates.length) { bank.v = 2; _skBankPut(key); return Promise.resolve(true); }
+    var d = dates[i++];
+    return fetchTeamFpForDate(myTeamKey, d).then(function (map) {
+      var r = bank.days[d];
+      if (map && r && r[0] != null) {
+        var pool = [];
+        for (var k in map) if (map.hasOwnProperty(k) && map[k]) pool.push(map[k]);
+        var opt = _skBankOptimal(pool, slots);
+        if (opt != null) r[1] = Math.max(opt, r[0]);
+      }
+      return next();
+    }, function () { return next(); });
+  }
+  return next();
 }
 
 function _skBankLocalDay(offset) {
@@ -89900,9 +89946,14 @@ function _skBankFold(league, st, date, map) {
     }
   }
   if (!sawAny) return false;
-  var opt = isPts ? _skBankOptimal(pool, _skBankSlots(key)) : null;
+  var opt = isPts ? _skBankOptimal(pool, _skBankSlots(key)) : null;   // SKBANK2 rule
   if (opt != null && opt < act) opt = Math.round(act * 10) / 10;   // never below what was scored
   bank.sport = sport; bank.st = st;
+  if (!bank.v || bank.v < 2) {                        // a fresh bank starts on the new rule
+    var any = false;
+    for (var dk in bank.days) { if (bank.days.hasOwnProperty(dk)) { any = true; break; } }
+    if (!any) bank.v = 2;
+  }
   bank.days[date] = [isPts ? Math.round(act * 10) / 10 : null, opt,
                      isPts ? Math.round(bench * 10) / 10 : null, idle, benchStats];
   return true;
@@ -89916,6 +89967,14 @@ function _skBankDay(league, entry) {
   if (_skBankBusy[key]) return;
   var st = entry.scoringType || league.scoring_type;
   var bank = _skBankGet(key);
+  if ((bank.v || 1) < 2 && Object.keys(bank.days).length) {   // SKBANK2 — fix old days first
+    _skBankBusy[key] = 1;
+    _skBankRecalc(league, st, entry.myTeamKey).then(function () {
+      delete _skBankBusy[key];
+      _skBankDay(league, entry);
+    }, function () { delete _skBankBusy[key]; });
+    return;
+  }
   var want = [entry.dateStr];
   var started = false;
   for (var d in bank.days) { if (bank.days.hasOwnProperty(d)) { started = true; break; } }
@@ -90066,9 +90125,11 @@ function _mrEfficiencyHtml() {
     '</div>';
   }
   h += '<div style="font-size:9px;line-height:1.5;color:rgba(255,255,255,0.28);margin-top:9px;">' +
-    'EFF is points scored \u00f7 the best lineup the same roster allowed that day, using each ' +
-    'player\u2019s real position eligibility (game caps like max starts aren\u2019t modelled, so ' +
-    'a capped week can read a little low). LEFT is the points that best lineup would have added. ' +
+    'EFF is points scored \u00f7 your lineup plus whatever your bench scored that could have ' +
+    'fit into it, using each player\u2019s real position eligibility. LEFT is those bench points: ' +
+    'only bench players who actually scored count, and your starters keep their real scores, ' +
+    'negatives included. Game caps (max starts, innings limits) aren\u2019t modelled, so a league ' +
+    'where you bench pitchers to save starts or innings will read low. ' +
     'Categories leagues have no single number to optimise, so they show what the bench produced ' +
     'instead. IDLE counts days an everyday player sat in your lineup without playing \u2014 pitchers ' +
     'and goalies excluded. Tracked from ' + _skBankShortDate(T.first) + '; each morning banks the day before.</div>';
