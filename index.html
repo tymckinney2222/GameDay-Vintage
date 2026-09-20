@@ -83721,6 +83721,9 @@ async function skHydrateAll() {
   // skScanWireLeague reads it. skScanWire has its own in-flight guard
   // so this is idempotent across repeat hydrations.
   if (typeof skScanWire === 'function') skScanWire();
+  // SKBUMP — bank today's ranks for every season-points / roto league, so
+  // the rank movement chart fills in daily without opening each league.
+  if (typeof _skRankHistRecordYahoo === 'function') _skRankHistRecordYahoo();
 }
 
 // Update a single card in place after its data lands. We re-build the
@@ -91009,6 +91012,339 @@ function _rfPaint() {
     ' Active lineups only; baseball pitchers count when they\u2019re the probable starter. ' +
     'Tap a game to see every player and the leagues he counts in.</div>';
   body.innerHTML = h;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// SKBUMP — rank movement ("bump") chart under the standings of every
+// season-points and roto league, Yahoo and ESPN.
+//
+// Every team is a line tracking its league rank day by day; yours is
+// gold, everyone else a faded grey, and each line ends in that team's
+// logo. Tap a logo to light up a rival alongside you.
+//
+// Where the ranks come from:
+//   • season-points leagues: the daily points snapshots already being
+//     saved (Yahoo pts_snap_v1_, ESPN esp_pts_snap_v1_). Each one holds
+//     every team's season total, so that day's ranks are just the totals
+//     sorted — and the history reaches back as far as those snapshots do
+//     (they're kept 12 weeks).
+//   • roto leagues have no such snapshot, so a small rank history is
+//     now recorded on every sync: sk_rank_hist_v1_<leagueKey> =
+//     { d: { 'YYYY-MM-DD': { teamId: rank } } }. Roto charts start from
+//     today and grow.
+//   • a points league also records into the rank history, which fills
+//     any day a points snapshot missed.
+// ══════════════════════════════════════════════════════════════════
+var SK_RANKHIST_PREFIX = 'sk_rank_hist_v1_';
+var _skBumpCtx = {};   // domId -> context for repaints
+var _skBumpSel = {};   // leagueKey -> highlighted rival id
+var _skBumpSpan = {};  // leagueKey -> '2w' | '6w' | 'all'
+
+function _skRankHistRecord(leagueKey, ranks) {
+  var ids = Object.keys(ranks || {});
+  if (ids.length < 2 || !leagueKey) return;
+  var key = SK_RANKHIST_PREFIX + leagueKey, o = null;
+  try { o = JSON.parse(localStorage.getItem(key) || 'null'); } catch (e) {}
+  if (!o || !o.d) o = { d: {} };
+  var today = (typeof _todayDateString === 'function') ? _todayDateString() : new Date().toISOString().slice(0, 10);
+  o.d[today] = ranks;                                   // latest sync of the day wins
+  var dates = Object.keys(o.d).sort();
+  while (dates.length > 200) { delete o.d[dates.shift()]; }
+  try { localStorage.setItem(key, JSON.stringify(o)); } catch (e2) {}
+}
+
+// Yahoo: record every loaded season-points / roto league. Called after a
+// Yahoo sync lands and whenever a standings table builds.
+function _skRankHistRecordYahoo() {
+  try {
+    var ls = (typeof fyLeagues !== 'undefined' && fyLeagues) ? fyLeagues : [];
+    for (var i = 0; i < ls.length; i++) {
+      var lg = ls[i], st = String(lg.scoring_type || '');
+      if (st !== 'point' && st !== 'roto') continue;
+      var ld = (typeof skLeagueData === 'object' && skLeagueData) ? skLeagueData[lg.league_key] : null;
+      var all = ld && ld.allTeams;
+      if (!all) continue;
+      var ranks = {};
+      for (var k in all) {
+        if (!all.hasOwnProperty(k)) continue;
+        var r = parseInt(all[k] && all[k].rank, 10);
+        if (r > 0) ranks[k] = r;
+      }
+      _skRankHistRecord(lg.league_key, ranks);
+    }
+  } catch (e) {}
+}
+// ESPN: one league row.
+function _skRankHistRecordEsp(row) {
+  try {
+    if (!row || !row.standingsAll) return;
+    var fk = (typeof extFormatKey === 'function') ? extFormatKey(row) : '';
+    if (fk !== 'point' && fk !== 'roto') return;
+    var ranks = {};
+    for (var i = 0; i < row.standingsAll.length; i++) {
+      var r = row.standingsAll[i];
+      var rk = parseInt(r && r.rank, 10);
+      if (r && r.teamId != null && rk > 0) ranks[String(r.teamId)] = rk;
+    }
+    _skRankHistRecord(row.key, ranks);
+  } catch (e) {}
+}
+
+// Every team's rank on every tracked day.
+function _skBumpSeries(ctx) {
+  var byDate = {}, i, k;
+  var prefix = (ctx.provider === 'espn' ? 'esp_pts_snap_v1_' : 'pts_snap_v1_') + ctx.key + '_';
+  if (ctx.points) {
+    try {
+      for (i = 0; i < localStorage.length; i++) {
+        var lk = localStorage.key(i);
+        if (!lk || lk.indexOf(prefix) !== 0) continue;
+        var snap = null;
+        try { snap = JSON.parse(localStorage.getItem(lk)); } catch (e) {}
+        if (!snap || !snap.pfByTeam || !snap.date) continue;
+        var pts = [];
+        for (k in snap.pfByTeam) {
+          if (snap.pfByTeam.hasOwnProperty(k) && ctx.teams[k] && !isNaN(Number(snap.pfByTeam[k]))) {
+            pts.push([k, Number(snap.pfByTeam[k])]);
+          }
+        }
+        if (pts.length < 2) continue;
+        pts.sort(function (a, b) { return b[1] - a[1]; });
+        var rk = {};
+        for (var j = 0; j < pts.length; j++) {
+          rk[pts[j][0]] = (j > 0 && pts[j][1] === pts[j - 1][1]) ? rk[pts[j - 1][0]] : j + 1;   // ties share
+        }
+        byDate[snap.date] = rk;
+      }
+    } catch (e1) {}
+  }
+  var hist = null;
+  try { hist = JSON.parse(localStorage.getItem(SK_RANKHIST_PREFIX + ctx.key) || 'null'); } catch (e2) {}
+  if (hist && hist.d) {
+    for (var d in hist.d) {
+      if (hist.d.hasOwnProperty(d) && !byDate[d]) byDate[d] = hist.d[d];   // snapshots win where both exist
+    }
+  }
+  var dates = Object.keys(byDate).sort();
+  var span = _skBumpSpan[ctx.key] || 'all';
+  if (span !== 'all' && dates.length) {
+    var last = dates[dates.length - 1];
+    var lastD = new Date(parseInt(last.slice(0, 4), 10), parseInt(last.slice(5, 7), 10) - 1, parseInt(last.slice(8, 10), 10));
+    lastD.setDate(lastD.getDate() - (span === '2w' ? 14 : 42));
+    var m = lastD.getMonth() + 1, dd = lastD.getDate();
+    var cut = lastD.getFullYear() + '-' + (m < 10 ? '0' : '') + m + '-' + (dd < 10 ? '0' : '') + dd;
+    dates = dates.filter(function (x) { return x >= cut; });
+  }
+  var ranks = {};
+  for (k in ctx.teams) {
+    if (!ctx.teams.hasOwnProperty(k)) continue;
+    ranks[k] = dates.map(function (dt) { var v = byDate[dt] && byDate[dt][k]; return v ? v : null; });
+  }
+  return { dates: dates, ranks: ranks, all: Object.keys(byDate).length };
+}
+
+function _skBumpDateLbl(d) {
+  var MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  return MON[parseInt(d.slice(5, 7), 10) - 1] + ' ' + parseInt(d.slice(8, 10), 10);
+}
+function _skBumpOrd(n) {
+  var s = ['th', 'st', 'nd', 'rd'], v = n % 100;
+  return n + (s[(v - 20) % 10] || s[v] || s[0]);
+}
+
+function _skBumpInner(domId) {
+  var ctx = _skBumpCtx[domId];
+  if (!ctx) return '';
+  var S = _skBumpSeries(ctx);
+  var mono = 'font-family:var(--sk-font-mono,monospace);';
+  var span = _skBumpSpan[ctx.key] || 'all';
+  var pill = function (v, lbl) {
+    var on = span === v;
+    return '<button onclick="skBumpSpan(\'' + domId + '\',\'' + v + '\')" style="padding:3px 10px;border-radius:999px;' +
+      'font-size:9.5px;font-weight:700;letter-spacing:0.08em;cursor:pointer;' +
+      'border:1px solid ' + (on ? 'rgba(234,179,8,0.55)' : 'rgba(255,255,255,0.14)') + ';' +
+      'background:' + (on ? 'rgba(234,179,8,0.12)' : 'none') + ';' +
+      'color:' + (on ? 'var(--sk-gold,#eab308)' : 'rgba(255,255,255,0.5)') + ';">' + lbl + '</button>';
+  };
+  var h = '<div style="display:flex;align-items:baseline;margin:0 0 8px;">' +
+    '<span style="font-family:var(--sk-font-display,serif);font-size:17px;color:#fff;">Rank movement</span>' +
+    '<span style="flex:1;"></span>' +
+    '<span style="display:flex;gap:4px;">' + pill('2w', '2W') + pill('6w', '6W') + pill('all', 'ALL') + '</span></div>';
+
+  if (S.dates.length < 2) {
+    return h + '<div style="font-size:11.5px;line-height:1.6;color:rgba(255,255,255,0.45);">' +
+      (S.all ? 'Only one day tracked so far' : 'Tracking starts today') +
+      ' \u2014 ranks are saved on every sync, so the lines draw from tomorrow.' +
+      (ctx.points ? '' : ' Roto has no earlier history to rebuild from.') + '</div>';
+  }
+
+  var ids = Object.keys(ctx.teams);
+  var N = 0;
+  ids.forEach(function (id) { S.ranks[id].forEach(function (r) { if (r && r > N) N = r; }); });
+  N = Math.max(N, ids.length);
+  var W = 340, L = 18, R = 34, TOP = 10, ROW = 22;
+  var H = TOP + (N - 1) * ROW + 26;
+  var n = S.dates.length;
+  var xAt = function (i) { return L + (n === 1 ? 0 : i * (W - L - R) / (n - 1)); };
+  var yAt = function (r) { return TOP + (r - 1) * ROW; };
+  var sel = _skBumpSel[ctx.key] || null;
+  var svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" width="100%" style="display:block;overflow:visible;" role="img" ' +
+    'aria-label="League rank by day for each team">';
+  // Rank gridlines + numbers.
+  for (var r = 1; r <= N; r++) {
+    svg += '<line x1="' + L + '" x2="' + (W - R) + '" y1="' + yAt(r) + '" y2="' + yAt(r) + '" stroke="rgba(255,255,255,0.05)"/>' +
+      '<text x="' + (L - 6) + '" y="' + (yAt(r) + 3.5) + '" text-anchor="end" font-size="9" fill="rgba(255,255,255,0.3)" ' +
+      'font-family="monospace">' + r + '</text>';
+  }
+  // Date labels: first, middle, last.
+  [0, Math.floor((n - 1) / 2), n - 1].filter(function (v, i2, a) { return a.indexOf(v) === i2; }).forEach(function (i3) {
+    svg += '<text x="' + xAt(i3) + '" y="' + (H - 6) + '" text-anchor="' + (i3 === 0 ? 'start' : i3 === n - 1 ? 'end' : 'middle') +
+      '" font-size="9.5" fill="rgba(255,255,255,0.4)" font-family="monospace">' + _skBumpDateLbl(S.dates[i3]) + '</text>';
+  });
+  // Lines: others first, then the highlighted rival, then you on top.
+  var order = ids.slice().sort(function (a, b) {
+    function w(x) { return x === ctx.myId ? 2 : x === sel ? 1 : 0; }
+    return w(a) - w(b);
+  });
+  var path = function (arr) {
+    var d = '', started = false;
+    for (var i4 = 0; i4 < arr.length; i4++) {
+      if (!arr[i4]) { started = false; continue; }
+      d += (started ? ' L' : ' M') + xAt(i4).toFixed(1) + ' ' + yAt(arr[i4]).toFixed(1);
+      started = true;
+    }
+    return d;
+  };
+  var ends = [];
+  order.forEach(function (id) {
+    var arr = S.ranks[id], me = id === ctx.myId, hi = id === sel;
+    var col = me ? '#eab308' : hi ? '#60a5fa' : 'rgba(255,255,255,0.22)';
+    var d2 = path(arr);
+    if (!d2) return;
+    svg += '<path d="' + d2 + '" fill="none" stroke="' + col + '" stroke-width="' + (me ? 3 : hi ? 2.5 : 1.4) + '" ' +
+      'stroke-linejoin="round" stroke-linecap="round"' + (me || hi ? '' : ' stroke-dasharray="3 3"') + '/>';
+    if (me || hi) {
+      for (var i5 = 0; i5 < arr.length; i5++) {
+        if (arr[i5]) svg += '<circle cx="' + xAt(i5).toFixed(1) + '" cy="' + yAt(arr[i5]).toFixed(1) + '" r="2.4" fill="' + col + '"/>';
+      }
+    }
+    var lastI = -1;
+    for (var i6 = arr.length - 1; i6 >= 0; i6--) if (arr[i6]) { lastI = i6; break; }
+    if (lastI >= 0) ends.push({ id: id, r: arr[lastI], me: me, hi: hi, col: col });
+  });
+  // Logos at each line's end — tap one to highlight that team.
+  ends.forEach(function (e) {
+    var t = ctx.teams[e.id] || {}, cx = W - R + 16, cy = yAt(e.r);
+    var ring = e.me ? '#eab308' : e.hi ? '#60a5fa' : 'rgba(255,255,255,0.25)';
+    svg += '<g style="cursor:pointer" onclick="skBumpPick(\'' + domId + '\',\'' + String(e.id).replace(/'/g, '') + '\')">' +
+      '<circle cx="' + cx + '" cy="' + cy + '" r="9.5" fill="#111827" stroke="' + ring + '" stroke-width="' + (e.me || e.hi ? 2 : 1) + '"/>';
+    if (t.logo) {
+      svg += '<clipPath id="' + domId + '_c_' + String(e.id).replace(/[^A-Za-z0-9]/g, '') + '"><circle cx="' + cx + '" cy="' + cy + '" r="8.5"/></clipPath>' +
+        '<image href="' + slEsc(t.logo) + '" x="' + (cx - 8.5) + '" y="' + (cy - 8.5) + '" width="17" height="17" ' +
+        'clip-path="url(#' + domId + '_c_' + String(e.id).replace(/[^A-Za-z0-9]/g, '') + ')" preserveAspectRatio="xMidYMid slice"/>';
+    } else {
+      svg += '<text x="' + cx + '" y="' + (cy + 3.5) + '" text-anchor="middle" font-size="9" font-weight="700" fill="#fff">' +
+        slEsc(String(t.name || '?').charAt(0).toUpperCase()) + '</text>';
+    }
+    svg += '<title>' + slEsc(t.name || '') + ' \u00b7 ' + _skBumpOrd(e.r) + '</title></g>';
+  });
+  svg += '</svg>';
+  h += svg;
+
+  // Story lines under the chart: you, and the rival you picked.
+  var dayNum = function (d) {
+    return Date.UTC(parseInt(d.slice(0, 4), 10), parseInt(d.slice(5, 7), 10) - 1, parseInt(d.slice(8, 10), 10)) / 86400000;
+  };
+  var story = function (id, col) {
+    var arr = S.ranks[id] || [], first = null, last = null, i7, j7;
+    for (i7 = 0; i7 < arr.length; i7++) {
+      if (!arr[i7]) continue;
+      if (first == null) first = arr[i7];
+      last = arr[i7];
+    }
+    if (first == null) return '';
+    // Best week: the biggest climb inside any 7-day window — day-to-day
+    // moves are usually one place, which undersells a real run.
+    var best = null;
+    for (i7 = 0; i7 < arr.length; i7++) {
+      if (!arr[i7]) continue;
+      for (j7 = i7 + 1; j7 < arr.length; j7++) {
+        if (dayNum(S.dates[j7]) - dayNum(S.dates[i7]) > 7) break;
+        if (!arr[j7]) continue;
+        var g = arr[i7] - arr[j7];
+        if (g > 0 && (!best || g > best.gain)) best = { gain: g, i: i7, j: j7 };
+      }
+    }
+    var mv = first - last, t = ctx.teams[id] || {};
+    var txt = (id === ctx.myId ? 'You' : (t.name || 'Team')) + ': ' + _skBumpOrd(first) + ' \u2192 ' + _skBumpOrd(last) +
+      ' since ' + _skBumpDateLbl(S.dates[0]) +
+      (mv > 0 ? ' (up ' + mv + ')' : mv < 0 ? ' (down ' + (-mv) + ')' : ' (no change)') +
+      (best ? ' \u00b7 best week ' + _skBumpDateLbl(S.dates[best.i]) + '\u2013' + _skBumpDateLbl(S.dates[best.j]) + ', ' +
+        _skBumpOrd(arr[best.i]) + ' \u2192 ' + _skBumpOrd(arr[best.j]) : '');
+    return '<div style="display:flex;gap:6px;align-items:baseline;font-size:11px;line-height:1.5;color:rgba(255,255,255,0.7);">' +
+      '<span style="flex:0 0 10px;height:3px;border-radius:2px;background:' + col + ';transform:translateY(-3px);"></span>' +
+      '<span>' + slEsc(txt) + '</span></div>';
+  };
+  h += '<div style="margin-top:6px;">' + (ctx.myId ? story(ctx.myId, '#eab308') : '') +
+    (sel && sel !== ctx.myId ? story(sel, '#60a5fa') : '') + '</div>';
+  h += '<div style="font-size:9px;line-height:1.5;color:rgba(255,255,255,0.28);margin-top:6px;">' +
+    S.dates.length + ' day' + (S.dates.length === 1 ? '' : 's') + ' tracked. ' +
+    (ctx.points ? 'Ranks come from the daily points snapshots (kept 12 weeks). '
+                : 'Roto ranks are recorded on each sync from today on. ') +
+    'Tap a logo to highlight that team; tap it again to clear.</div>';
+  return h;
+}
+
+function _skBumpCard(ctx) {
+  var domId = 'skBump_' + String(ctx.key).replace(/[^A-Za-z0-9]/g, '_');
+  _skBumpCtx[domId] = ctx;
+  var inner = '';
+  try { inner = _skBumpInner(domId); } catch (e) { inner = ''; }
+  if (!inner) return '';
+  return '<div id="' + domId + '" style="background:var(--sk-bg-card,rgba(255,255,255,0.03));' +
+    'border:1px solid rgba(255,255,255,0.07);border-radius:12px;padding:14px;margin:12px 0 10px;">' + inner + '</div>';
+}
+function _skBumpRepaint(domId) {
+  var el = document.getElementById(domId);
+  if (el) { try { el.innerHTML = _skBumpInner(domId); } catch (e) {} }
+}
+function skBumpPick(domId, id) {
+  var ctx = _skBumpCtx[domId];
+  if (!ctx) return;
+  _skBumpSel[ctx.key] = (_skBumpSel[ctx.key] === id || id === ctx.myId) ? null : id;
+  _skBumpRepaint(domId);
+}
+function skBumpSpan(domId, v) {
+  var ctx = _skBumpCtx[domId];
+  if (!ctx) return;
+  _skBumpSpan[ctx.key] = v;
+  _skBumpRepaint(domId);
+}
+
+// Builders for each platform's standings view.
+function skBumpHtmlYahoo(league, allTeams, myKey) {
+  var st = String(league.scoring_type || '');
+  if (st !== 'point' && st !== 'roto') return '';
+  _skRankHistRecordYahoo();
+  var teams = {};
+  for (var k in (allTeams || {})) {
+    if (!allTeams.hasOwnProperty(k)) continue;
+    teams[k] = { name: allTeams[k].name || '', logo: allTeams[k].logoUrl || '' };
+  }
+  return _skBumpCard({ key: league.league_key, provider: 'yahoo', points: st === 'point', teams: teams, myId: myKey || null });
+}
+function skBumpHtmlEsp(row) {
+  var fk = (typeof extFormatKey === 'function') ? extFormatKey(row) : '';
+  if ((fk !== 'point' && fk !== 'roto') || !row.standingsAll) return '';
+  _skRankHistRecordEsp(row);
+  var teams = {}, myId = null;
+  for (var i = 0; i < row.standingsAll.length; i++) {
+    var r = row.standingsAll[i];
+    if (!r || r.teamId == null) continue;
+    teams[String(r.teamId)] = { name: r.teamName || '', logo: r.avatar || '' };
+    if (row.myTeamIds && row.myTeamIds[String(r.teamId)]) myId = String(r.teamId);
+  }
+  return _skBumpCard({ key: row.key, provider: 'espn', points: fk === 'point', teams: teams, myId: myId });
 }
 
 // ── Shared sheet: reuse The Wire's bottom sheet chrome ──
@@ -109933,7 +110269,13 @@ function skBuildStandingsTable(league, leagueData, allTeams) {
     try { rotoCatHtml = skBuildRotoCategoryTable(league, leagueData, allTeams); }
     catch (e) { rotoCatHtml = ''; try { console.error('Roto category board:', e); } catch (e2) {} }
   }
-  return toggleHTML + '<div class="sk-standings">' + headHtml + bodyHtml + '</div>' + rotoCatHtml + catchHtml + paceHtml;
+  // SKBUMP — rank movement chart, right under the table.
+  var bumpHtml = '';
+  if (isSeasonPts) {
+    try { bumpHtml = skBumpHtmlYahoo(league, allTeams, myKey); }
+    catch (e) { bumpHtml = ''; try { console.error('Rank movement chart:', e); } catch (e2) {} }
+  }
+  return toggleHTML + '<div class="sk-standings">' + headHtml + bodyHtml + '</div>' + bumpHtml + rotoCatHtml + catchHtml + paceHtml;
 }
 
 // "Catch the Leaders" — season-points race math. For each team ahead of
@@ -152390,6 +152732,7 @@ function _espPurgeOldPtsSnapshots() {
 // replaced by one that knows more — so the day improves and never degrades.
 var _espSnapTried = {};
 function espMaybeSnapshot(row) {
+  try { _skRankHistRecordEsp(row); } catch (eRH) {}   // SKBUMP — daily rank history (roto too)
   if (!row || !row.key) return;
   if (typeof espIsSeasonPts !== 'function' || !espIsSeasonPts(row)) return;
   var d = _todayDateString();
@@ -155840,6 +156183,8 @@ function _espStandingsPaneHtml(row) {
       'disagree with the ranks. Worth telling me if you see this.</div>';
   }
   h += '</div>';
+  // SKBUMP — rank movement chart for ESPN season-points and roto leagues.
+  try { h += skBumpHtmlEsp(row); } catch (eB) {}
   return h;
 }
 
