@@ -18379,6 +18379,21 @@
     vertical-align: middle; margin: -4px 10px 0 0;
     border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.06);
   }
+  /* SKBUMP2 — scrub tooltip on the rank movement chart */
+  .sk-bump-tip {
+    position: absolute; top: 0; min-width: 160px; max-width: 220px; pointer-events: none; z-index: 2;
+    background: rgba(15,18,28,0.96); border: 1px solid rgba(255,255,255,0.14); border-radius: 10px;
+    padding: 7px 9px; font-size: 11px; line-height: 1.45; color: rgba(255,255,255,0.85);
+  }
+  .sk-bump-tip .d { font-family: var(--sk-font-mono); font-size: 10px; font-weight: 700; letter-spacing: 0.08em;
+    color: rgba(255,255,255,0.55); margin-bottom: 3px; text-transform: uppercase; }
+  .sk-bump-tip .r { display: flex; align-items: center; gap: 6px; }
+  .sk-bump-tip .dot { flex: 0 0 8px; height: 8px; border-radius: 50%; }
+  .sk-bump-tip .n { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sk-bump-tip .v { font-family: var(--sk-font-mono); font-size: 10.5px; white-space: nowrap; }
+  .sk-bump-tip .g { font-family: var(--sk-font-mono); font-size: 11px; font-weight: 700; margin-top: 3px;
+    color: rgba(255,255,255,0.6); }
+  .sk-bump-tip .g.up { color: #4ade80; } .sk-bump-tip .g.dn { color: #f87171; }
   /* ROOTFOR — Root-for board cards */
   .sk-rf-card {
     margin: 0 4px 8px; padding: 10px 12px; border-radius: 12px; cursor: pointer;
@@ -91040,16 +91055,18 @@ var _skBumpCtx = {};   // domId -> context for repaints
 var _skBumpSel = {};   // leagueKey -> highlighted rival id
 var _skBumpSpan = {};  // leagueKey -> '2w' | '6w' | 'all'
 
-function _skRankHistRecord(leagueKey, ranks) {
+function _skRankHistRecord(leagueKey, ranks, pts) {
   var ids = Object.keys(ranks || {});
   if (ids.length < 2 || !leagueKey) return;
   var key = SK_RANKHIST_PREFIX + leagueKey, o = null;
   try { o = JSON.parse(localStorage.getItem(key) || 'null'); } catch (e) {}
   if (!o || !o.d) o = { d: {} };
+  if (!o.p) o.p = {};                                   // SKBUMP2 — points beside ranks
   var today = (typeof _todayDateString === 'function') ? _todayDateString() : new Date().toISOString().slice(0, 10);
   o.d[today] = ranks;                                   // latest sync of the day wins
+  if (pts && Object.keys(pts).length) o.p[today] = pts;
   var dates = Object.keys(o.d).sort();
-  while (dates.length > 200) { delete o.d[dates.shift()]; }
+  while (dates.length > 200) { var old = dates.shift(); delete o.d[old]; delete o.p[old]; }
   try { localStorage.setItem(key, JSON.stringify(o)); } catch (e2) {}
 }
 
@@ -91064,13 +91081,15 @@ function _skRankHistRecordYahoo() {
       var ld = (typeof skLeagueData === 'object' && skLeagueData) ? skLeagueData[lg.league_key] : null;
       var all = ld && ld.allTeams;
       if (!all) continue;
-      var ranks = {};
+      var ranks = {}, pts = {};
       for (var k in all) {
         if (!all.hasOwnProperty(k)) continue;
         var r = parseInt(all[k] && all[k].rank, 10);
         if (r > 0) ranks[k] = r;
+        var pv = all[k] && all[k].points_for;
+        if (pv != null && !isNaN(Number(pv))) pts[k] = Number(pv);
       }
-      _skRankHistRecord(lg.league_key, ranks);
+      _skRankHistRecord(lg.league_key, ranks, pts);
     }
   } catch (e) {}
 }
@@ -91080,19 +91099,20 @@ function _skRankHistRecordEsp(row) {
     if (!row || !row.standingsAll) return;
     var fk = (typeof extFormatKey === 'function') ? extFormatKey(row) : '';
     if (fk !== 'point' && fk !== 'roto') return;
-    var ranks = {};
+    var ranks = {}, pts = {};
     for (var i = 0; i < row.standingsAll.length; i++) {
       var r = row.standingsAll[i];
       var rk = parseInt(r && r.rank, 10);
       if (r && r.teamId != null && rk > 0) ranks[String(r.teamId)] = rk;
+      if (r && r.teamId != null && r.pf != null && !isNaN(Number(r.pf))) pts[String(r.teamId)] = Number(r.pf);
     }
-    _skRankHistRecord(row.key, ranks);
+    _skRankHistRecord(row.key, ranks, pts);
   } catch (e) {}
 }
 
 // Every team's rank on every tracked day.
 function _skBumpSeries(ctx) {
-  var byDate = {}, i, k;
+  var byDate = {}, valByDate = {}, i, k;
   var prefix = (ctx.provider === 'espn' ? 'esp_pts_snap_v1_' : 'pts_snap_v1_') + ctx.key + '_';
   if (ctx.points) {
     try {
@@ -91115,6 +91135,7 @@ function _skBumpSeries(ctx) {
           rk[pts[j][0]] = (j > 0 && pts[j][1] === pts[j - 1][1]) ? rk[pts[j - 1][0]] : j + 1;   // ties share
         }
         byDate[snap.date] = rk;
+        valByDate[snap.date] = snap.pfByTeam;
       }
     } catch (e1) {}
   }
@@ -91122,7 +91143,10 @@ function _skBumpSeries(ctx) {
   try { hist = JSON.parse(localStorage.getItem(SK_RANKHIST_PREFIX + ctx.key) || 'null'); } catch (e2) {}
   if (hist && hist.d) {
     for (var d in hist.d) {
-      if (hist.d.hasOwnProperty(d) && !byDate[d]) byDate[d] = hist.d[d];   // snapshots win where both exist
+      if (hist.d.hasOwnProperty(d) && !byDate[d]) {                        // snapshots win where both exist
+        byDate[d] = hist.d[d];
+        if (hist.p && hist.p[d]) valByDate[d] = hist.p[d];
+      }
     }
   }
   var dates = Object.keys(byDate).sort();
@@ -91135,12 +91159,16 @@ function _skBumpSeries(ctx) {
     var cut = lastD.getFullYear() + '-' + (m < 10 ? '0' : '') + m + '-' + (dd < 10 ? '0' : '') + dd;
     dates = dates.filter(function (x) { return x >= cut; });
   }
-  var ranks = {};
+  var ranks = {}, vals = {};
   for (k in ctx.teams) {
     if (!ctx.teams.hasOwnProperty(k)) continue;
     ranks[k] = dates.map(function (dt) { var v = byDate[dt] && byDate[dt][k]; return v ? v : null; });
+    vals[k] = dates.map(function (dt) {
+      var v = valByDate[dt] && valByDate[dt][k];
+      return (v != null && !isNaN(Number(v))) ? Number(v) : null;
+    });
   }
-  return { dates: dates, ranks: ranks, all: Object.keys(byDate).length };
+  return { dates: dates, ranks: ranks, vals: vals, all: Object.keys(byDate).length };
 }
 
 function _skBumpDateLbl(d) {
@@ -91188,8 +91216,13 @@ function _skBumpInner(domId) {
   var xAt = function (i) { return L + (n === 1 ? 0 : i * (W - L - R) / (n - 1)); };
   var yAt = function (r) { return TOP + (r - 1) * ROW; };
   var sel = _skBumpSel[ctx.key] || null;
-  var svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" width="100%" style="display:block;overflow:visible;" role="img" ' +
-    'aria-label="League rank by day for each team">';
+  // SKBUMP2 — geometry kept for the finger scrub.
+  ctx._S = S; ctx._g = { W: W, L: L, R: R, n: n };
+  var svg = '<div style="position:relative;">' +
+    '<svg viewBox="0 0 ' + W + ' ' + H + '" width="100%" style="display:block;overflow:visible;touch-action:pan-y;" ' +
+    'role="img" aria-label="League rank by day for each team" ' +
+    'onpointerdown="skBumpScrub(event,\'' + domId + '\')" onpointermove="skBumpScrub(event,\'' + domId + '\')">' +
+    '<g id="' + domId + '_scrub"></g>';
   // Rank gridlines + numbers.
   for (var r = 1; r <= N; r++) {
     svg += '<line x1="' + L + '" x2="' + (W - R) + '" y1="' + yAt(r) + '" y2="' + yAt(r) + '" stroke="rgba(255,255,255,0.05)"/>' +
@@ -91248,7 +91281,7 @@ function _skBumpInner(domId) {
     }
     svg += '<title>' + slEsc(t.name || '') + ' \u00b7 ' + _skBumpOrd(e.r) + '</title></g>';
   });
-  svg += '</svg>';
+  svg += '</svg><div id="' + domId + '_tip" class="sk-bump-tip" style="display:none;"></div></div>';
   h += svg;
 
   // Story lines under the chart: you, and the rival you picked.
@@ -91291,6 +91324,7 @@ function _skBumpInner(domId) {
     S.dates.length + ' day' + (S.dates.length === 1 ? '' : 's') + ' tracked. ' +
     (ctx.points ? 'Ranks come from the daily points snapshots (kept 12 weeks). '
                 : 'Roto ranks are recorded on each sync from today on. ') +
+    'Slide a finger across the chart for the gap on any day. ' +
     'Tap a logo to highlight that team; tap it again to clear.</div>';
   return h;
 }
@@ -91304,6 +91338,69 @@ function _skBumpCard(ctx) {
   return '<div id="' + domId + '" style="background:var(--sk-bg-card,rgba(255,255,255,0.03));' +
     'border:1px solid rgba(255,255,255,0.07);border-radius:12px;padding:14px;margin:12px 0 10px;">' + inner + '</div>';
 }
+// ── SKBUMP2 ── Finger scrub: slide across the chart and a guide line
+// follows your finger with a tip showing that day's ranks, both teams'
+// points, and the gap. Compares you with the team you've tapped; with no
+// team tapped, with whoever sat one place above you that day (or second
+// place when you were leading). The tip stays put when you lift your
+// finger, so you can read it.
+function skBumpScrub(ev, domId) {
+  var ctx = _skBumpCtx[domId];
+  if (!ctx || !ctx._S || !ctx._g) return;
+  var svg = ev.currentTarget;
+  if (!svg || !svg.getBoundingClientRect) return;
+  var rect = svg.getBoundingClientRect();
+  if (!rect.width) return;
+  var G = ctx._g, S = ctx._S;
+  var x = (ev.clientX - rect.left) * (G.W / rect.width);
+  var span = (G.W - G.L - G.R);
+  var i = (G.n <= 1) ? 0 : Math.round((x - G.L) / (span / (G.n - 1)));
+  if (i < 0) i = 0; if (i > G.n - 1) i = G.n - 1;
+  var myId = ctx.myId, sel = _skBumpSel[ctx.key] || null;
+  var myR = myId ? S.ranks[myId][i] : null;
+  var other = sel;
+  if (!other && myR) {
+    var want = (myR === 1) ? 2 : myR - 1;
+    for (var k in S.ranks) if (S.ranks.hasOwnProperty(k) && k !== myId && S.ranks[k][i] === want) { other = k; break; }
+  }
+  var gx = G.L + (G.n <= 1 ? 0 : i * span / (G.n - 1));
+  var layer = document.getElementById(domId + '_scrub');
+  if (layer) {
+    layer.innerHTML = '<line x1="' + gx.toFixed(1) + '" x2="' + gx.toFixed(1) + '" y1="0" y2="' +
+      (svg.viewBox && svg.viewBox.baseVal ? svg.viewBox.baseVal.height - 18 : 300) +
+      '" stroke="rgba(255,255,255,0.35)" stroke-width="1" stroke-dasharray="2 2"/>';
+  }
+  var tip = document.getElementById(domId + '_tip');
+  if (!tip) return;
+  var fmt = function (v) { return (v == null) ? '\u2014' : (Math.round(v * 10) / 10).toLocaleString(); };
+  var row = function (id, col, lbl) {
+    if (!id) return '';
+    var r = S.ranks[id] ? S.ranks[id][i] : null, v = S.vals && S.vals[id] ? S.vals[id][i] : null;
+    var nm = lbl || ((ctx.teams[id] && ctx.teams[id].name) || 'Team');
+    return '<div class="r"><span class="dot" style="background:' + col + '"></span>' +
+      '<span class="n">' + slEsc(nm) + '</span><span class="v">' + (r ? _skBumpOrd(r) : '\u2014') +
+      (v != null ? ' \u00b7 ' + fmt(v) : '') + '</span></div>';
+  };
+  var html = '<div class="d">' + slEsc(_skBumpDateLbl(S.dates[i])) + '</div>' +
+    row(myId, '#eab308', 'You') + row(other, sel ? '#60a5fa' : 'rgba(255,255,255,0.5)', null);
+  var mv = myId && S.vals[myId] ? S.vals[myId][i] : null, ov = other && S.vals[other] ? S.vals[other][i] : null;
+  if (mv != null && ov != null) {
+    var gap = Math.round((mv - ov) * 10) / 10;
+    html += '<div class="g ' + (gap >= 0 ? 'up' : 'dn') + '">Gap ' + (gap > 0 ? '+' : gap < 0 ? '\u2212' : '') +
+      fmt(Math.abs(gap)) + (gap > 0 ? ' ahead' : gap < 0 ? ' behind' : ' \u2014 level') + '</div>';
+  } else if (other) {
+    html += '<div class="g">No points saved for this day</div>';
+  }
+  tip.innerHTML = html;
+  tip.style.display = 'block';
+  var px = gx * (rect.width / G.W), tw = tip.offsetWidth || 170;
+  var left = px - tw / 2;
+  if (left < 0) left = 0;
+  if (left + tw > rect.width) left = rect.width - tw;
+  tip.style.left = left + 'px';
+  if (ev.cancelable && ev.pointerType === 'mouse') ev.preventDefault();
+}
+
 function _skBumpRepaint(domId) {
   var el = document.getElementById(domId);
   if (el) { try { el.innerHTML = _skBumpInner(domId); } catch (e) {} }
