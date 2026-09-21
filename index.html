@@ -41463,6 +41463,61 @@ function _pmCleanSearchName(name) {
   // Drop a single trailing parenthetical group (role tag) and tidy spaces.
   return String(name).replace(/\s*\([^()]*\)\s*$/, '').replace(/\s+/g, ' ').trim();
 }
+// ── NAMEALIAS ── "Thomas Novak" vs "Tommy Novak".
+// Yahoo and ESPN (and the NHL) don't always agree on a first name: one
+// uses the legal name, the other the one he goes by. Exact matching then
+// finds nobody — no season line, and the player card can't open. This
+// treats two names as the same person when the SURNAME matches exactly
+// and the first names are the same name in two forms (a known nickname
+// pair, or one a clear shortening of the other). Only ever used as a
+// second pass after exact matching fails, and only against candidates
+// already narrowed to the right sport or the right team's roster.
+var _PM_NICKS = [
+  ['thomas', 'tom', 'tommy'], ['william', 'will', 'bill', 'billy', 'liam'], ['robert', 'rob', 'bob', 'bobby', 'robbie'],
+  ['michael', 'mike', 'mikey'], ['matthew', 'matt', 'matty'], ['nicholas', 'nick', 'nicky', 'nico'],
+  ['alexander', 'alex', 'sasha', 'alexandre', 'aleksander'], ['christopher', 'chris'], ['daniel', 'dan', 'danny'],
+  ['anthony', 'tony'], ['joseph', 'joe', 'joey'], ['zachary', 'zach', 'zack', 'zac'], ['jacob', 'jake'],
+  ['samuel', 'sam', 'sammy'], ['benjamin', 'ben', 'benny'], ['jonathan', 'jon', 'johnny'], ['john', 'johnny', 'jack'],
+  ['andrew', 'andy', 'drew'], ['patrick', 'pat', 'paddy'], ['cameron', 'cam'], ['mitchell', 'mitch'],
+  ['maxwell', 'max'], ['maximilian', 'max'], ['nathan', 'nate'], ['nathaniel', 'nate', 'nat'], ['timothy', 'tim', 'timmy'],
+  ['gregory', 'greg'], ['frederick', 'fred', 'freddie', 'freddy'], ['edward', 'ed', 'eddie', 'ted'],
+  ['james', 'jim', 'jimmy', 'jamie'], ['joshua', 'josh'], ['jeffrey', 'jeff'], ['kenneth', 'ken', 'kenny'],
+  ['richard', 'rick', 'ricky', 'rich', 'dick'], ['steven', 'steve', 'stevie'], ['stephen', 'steve', 'stevie'],
+  ['vincent', 'vince', 'vinnie'], ['douglas', 'doug'], ['phillip', 'phil'], ['philip', 'phil'], ['ronald', 'ron', 'ronnie'],
+  ['gerald', 'gerry', 'jerry'], ['lawrence', 'larry'], ['raymond', 'ray'], ['theodore', 'teddy', 'ted', 'theo'],
+  ['evgeny', 'evgenii', 'yevgeni', 'evgeni'], ['dmitry', 'dmitri', 'dmitrij'], ['nikolai', 'nikolaj', 'nicolai'],
+  ['jacques', 'jack'], ['elias', 'eli'], ['oliver', 'ollie'], ['isaiah', 'zay'], ['kristopher', 'kris'],
+  ['cristopher', 'cris'], ['dominic', 'dom'], ['dominik', 'dom'], ['jeremy', 'jer'], ['brandon', 'brando']
+];
+var _pmNickIdx = null;
+function _pmFirstSame(a, b) {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  if (!_pmNickIdx) {
+    _pmNickIdx = {};
+    for (var i = 0; i < _PM_NICKS.length; i++) {
+      for (var j = 0; j < _PM_NICKS[i].length; j++) {
+        var n = _PM_NICKS[i][j];
+        (_pmNickIdx[n] = _pmNickIdx[n] || []).push(i);
+      }
+    }
+  }
+  var ga = _pmNickIdx[a] || [], gb = _pmNickIdx[b] || [];
+  for (var x = 0; x < ga.length; x++) if (gb.indexOf(ga[x]) >= 0) return true;
+  // "Alex"/"Alexander", "Matt"/"Matthew": a 3+ letter start of the other.
+  var s1 = a.length < b.length ? a : b, l1 = a.length < b.length ? b : a;
+  return s1.length >= 3 && l1.indexOf(s1) === 0;
+}
+function _pmNameLoose(nameA, nameB) {
+  var ka = _pmNameKey(nameA || ''), kb = _pmNameKey(nameB || '');
+  if (!ka || !kb) return false;
+  if (ka === kb) return true;
+  var ta = ka.split(/\s+/), tb = kb.split(/\s+/);
+  if (ta.length < 2 || tb.length < 2) return false;
+  if (ta.slice(1).join(' ') !== tb.slice(1).join(' ')) return false;   // surname must match exactly
+  return _pmFirstSame(ta[0], tb[0]);
+}
+
 function _pmNameKey(name) {
   var cleaned = _pmCleanSearchName(name);
   if (typeof _skNormalizeName === 'function') return _skNormalizeName(cleaned);
@@ -132513,7 +132568,7 @@ async function _resolveEspnAthleteId(sportKey, name, teamAbbr) {
       // earns the loose "first one in the right sport" fallback, because only
       // it was specific enough for a near-miss to be trustworthy. FTXAPOS
       var res = null, data = null, _qi = 0, _usedQuery = searchName;
-      var _literalCands = null, _anyOk = false;
+      var _literalCands = null, _anyOk = false, _allCands = [];
 
       function _flatten(d) {
         var cands = [];
@@ -132586,12 +132641,28 @@ async function _resolveEspnAthleteId(sportKey, name, teamAbbr) {
         data = await res.json();
         var cands = _flatten(data);
         if (_qi === 0) _literalCands = cands;
+        _allCands = _allCands.concat(cands);   // NAMEALIAS
         if (!cands.length) continue;
         var hit = _exactIn(cands);
         if (hit) {
           var hid = idOf(hit);
           _espnIdCache[key] = hid;
           return hid;
+        }
+      }
+
+      // NAMEALIAS — nobody matched exactly under any spelling. Before the
+      // roster fallback, allow the same surname with the first name in
+      // another form (Thomas/Tommy), still restricted to the right sport.
+      // Candidates from every query tried are considered, since the
+      // surname-only query is usually the one that surfaces him.
+      if (_allCands && _allCands.length) {
+        var _loose = _allCands.filter(function (r) {
+          return inSport(r) && _pmNameLoose(name, r.displayName || r.name || '');
+        });
+        if (_loose.length === 1) {
+          var _lid = idOf(_loose[0]);
+          if (_lid) { _espnIdCache[key] = _lid; return _lid; }
         }
       }
 
@@ -132625,6 +132696,16 @@ async function _resolveEspnAthleteId(sportKey, name, teamAbbr) {
                 _espnIdCache[key] = _rid;
                 return _rid;
               }
+            }
+            // NAMEALIAS — same team, same surname, first name in another
+            // form. On one club's roster that's safe: a single match only.
+            var _lr = _people.filter(function (pp) {
+              return _pmNameLoose(name, pp.displayName || pp.fullName || '');
+            });
+            if (_lr.length === 1) {
+              var _lrid = String(_lr[0].id);
+              _espnIdCache[key] = _lrid;
+              return _lrid;
             }
           }
         } catch (eRos) {}
