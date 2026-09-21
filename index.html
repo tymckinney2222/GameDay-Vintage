@@ -18414,6 +18414,17 @@
   .sk-mp-top { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin: 4px 0 8px; font-size: 12px; }
   .sk-mp-top .bad { color: #f87171; font-weight: 700; } .sk-mp-top .ok { color: #4ade80; font-weight: 700; }
   .sk-mp-top .n { color: rgba(255,255,255,0.45); font-size: 11px; }
+  .sk-mp-top.tap { cursor: pointer; }
+  /* SKMP3 — fix list */
+  .sk-mp-fix { margin: 8px 0; padding: 10px 12px; border-radius: 12px;
+    background: rgba(248,113,113,0.05); border: 1px solid rgba(248,113,113,0.25); }
+  .sk-mp-fix .lg { display: flex; align-items: baseline; gap: 6px; font-size: 13px; font-weight: 700; color: #fff; margin-bottom: 6px; }
+  .sk-mp-fix .lg .f { font-size: 10px; font-weight: 500; color: rgba(255,255,255,0.45); }
+  .sk-mp-fix .lg .c { margin-left: auto; font-family: var(--sk-font-mono, monospace); font-size: 10px; color: #f87171; }
+  .sk-mp-fix .it { font-size: 12px; line-height: 1.55; color: rgba(255,255,255,0.85); padding: 4px 0;
+    border-top: 1px solid rgba(255,255,255,0.05); }
+  .sk-mp-fix .up { color: #4ade80; font-weight: 700; } .sk-mp-fix .dn { color: #f87171; font-weight: 700; }
+  .sk-mp-fix .tm { color: rgba(255,255,255,0.45); font-size: 11px; }
   .sk-mp-hdr, .sk-mp-row .line { display: flex; align-items: center; gap: 8px; }
   .sk-mp-hdr { font-family: var(--sk-font-mono, monospace); font-size: 9px; letter-spacing: 0.1em;
     color: rgba(255,255,255,0.35); padding: 6px 0 4px; border-bottom: 1px solid rgba(255,255,255,0.08); }
@@ -87713,6 +87724,15 @@ function skMpSetView(sport, v) {
   if (typeof _skHydrateYourWeek === 'function') _skHydrateYourWeek(sport);
 }
 function skMpSetSort(sport, v) { _skMpSort = v; _skMpPaint(sport); }
+// SKMP3 — filters (platform, format, flags only) and the fix-list view.
+var _skMpPlat = 'all', _skMpFmt = 'all', _skMpFlagsOnly = false, _skMpFix = false;
+function skMpFilter(sport, kind, v) {
+  if (kind === 'plat') _skMpPlat = v;
+  else if (kind === 'fmt') _skMpFmt = v;
+  else if (kind === 'flags') _skMpFlagsOnly = !_skMpFlagsOnly;
+  else if (kind === 'fix') _skMpFix = !_skMpFix;
+  _skMpPaint(sport);
+}
 function skMpToggle(sport, id) { _skMpOpen[id] = !_skMpOpen[id]; _skMpPaint(sport); }
 
 function _skMpViewToggle(sport) {
@@ -87745,6 +87765,7 @@ function _skMpCollect(sport) {
                        slots: (typeof _skBankSlots === 'function') ? _skBankSlots(key) : [] };
       (players || []).forEach(function (pl) {
         entries.push({ name: pl.name, team: pl.teamAbbr || '', pos: pl.pos || '', plat: 'yahoo',
+                       fmt: (typeof _skFmtKeyOf === 'function') ? _skFmtKeyOf(l) : String(l.scoring_type || ''),   // SKMP3
                        leagueKey: key, leagueLbl: lbl, slot: pl.selectedPos || '', bench: !!pl.isBench, il: !!pl.isIL });
       });
     }, function () {}));
@@ -87767,6 +87788,7 @@ function _skMpCollect(sport) {
         entries.push({ name: it.name, team: _skExtTeamAbbr(row, it),
                        pos: (it.elig && it.elig.length) ? it.elig.join(',') : (it.pos || ''),
                        plat: row.provider, leagueKey: row.key, leagueLbl: lbl,
+                       fmt: (typeof _skFmtKeyOf === 'function') ? _skFmtKeyOf(row) : '',   // SKMP3
                        slot: it.starter ? it.slot : (il ? 'IR' : 'BN'), bench: !it.starter && !il, il: il });
       });
     }, function () {}));
@@ -87805,14 +87827,18 @@ function _skMpBuild(sport, col, gThis, gNext) {
       // An open active slot he could fill?
       for (var s in need) {
         if (need.hasOwnProperty(s) && (have[s] || 0) < need[s] && _skYwCanFill(sport, pb, s)) {
-          flagged[i] = 'on the bench with an open ' + s + ' slot'; return;
+          flagged[i] = { txt: 'on the bench with an open ' + s + ' slot', slot: s, out: null }; return;
         }
       }
       // A starter he could replace who has no game today?
       for (var q = 0; q < idxs.length; q++) {
         var a = col.entries[idxs[q]];
         if (a.bench || a.il || !a.slot || playsToday(a)) continue;
-        if (_skYwCanFill(sport, pb, a.slot)) { flagged[i] = 'on the bench while ' + a.name + ' (no game) starts at ' + a.slot; return; }
+        if (_skYwCanFill(sport, pb, a.slot)) {
+          flagged[i] = { txt: 'on the bench while ' + a.name + ' (no game) starts at ' + a.slot, slot: a.slot,
+                         out: a.name, outTeam: a.team };
+          return;
+        }
       }
     });
   });
@@ -87866,27 +87892,114 @@ function _skMpPaint(sport) {
   var D = _skMpData[sport];
   if (!panel || !D) return;
   var DOW = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
-  var list = D.players.slice();
-  list.sort(function (a, b) {
+  var PL = { yahoo: ['Y', '#7b68ee'], sleeper: ['S', '#fbbf24'], espn: ['E', '#ef4444'], fantrax: ['F', '#34d399'] };
+  var FMTL = { headpoint: 'H2H Pts', head: 'Cats', headone: 'Cats', point: 'Season Pts', roto: 'Roto' };
+  var fmtGroup = function (f) { return f === 'headone' ? 'head' : f; };
+
+  // SKMP3 — which platforms/formats exist, for the pills.
+  var platsHere = {}, fmtsHere = {};
+  D.players.forEach(function (G) {
+    G.items.forEach(function (x) { platsHere[x.e.plat] = 1; if (x.e.fmt) fmtsHere[fmtGroup(x.e.fmt)] = 1; });
+  });
+  if (_skMpPlat !== 'all' && !platsHere[_skMpPlat]) _skMpPlat = 'all';
+  if (_skMpFmt !== 'all' && !fmtsHere[_skMpFmt]) _skMpFmt = 'all';
+  var pass = function (x) {
+    return (_skMpPlat === 'all' || x.e.plat === _skMpPlat) &&
+           (_skMpFmt === 'all' || fmtGroup(x.e.fmt) === _skMpFmt);
+  };
+  // Each player's rows, restricted to the leagues the filters keep.
+  var view = [];
+  D.players.forEach(function (G) {
+    var items = G.items.filter(pass);
+    if (!items.length) return;
+    var V = { name: G.name, team: G.team, week: G.week, gThis: G.gThis, gNext: G.gNext, items: items };
+    V.n = items.length;
+    V.start = items.filter(function (x) { return !x.e.bench && !x.e.il; }).length;
+    V.benchN = items.filter(function (x) { return x.e.bench; }).length;
+    V.ilN = items.filter(function (x) { return x.e.il; }).length;
+    V.flags = items.filter(function (x) { return !!x.flag; }).length;
+    V.plats = {};
+    items.forEach(function (x) { V.plats[x.e.plat] = (V.plats[x.e.plat] || 0) + 1; });
+    if (_skMpFlagsOnly && !V.flags) return;
+    view.push(V);
+  });
+  var flags = 0;
+  view.forEach(function (V) { flags += V.flags; });
+  var light = view.filter(function (p) { return p.gThis <= 1 && p.start > 0; }).length;
+
+  var pill = function (kind, v, lbl, on) {
+    return '<button class="sk-yw-pill' + (on ? ' on' : '') + '" onclick="skMpFilter(\'' + sport + '\',\'' + kind + '\',\'' + v + '\')">' + lbl + '</button>';
+  };
+  var h = _skMpViewToggle(sport);
+  h += '<div class="sk-mp-top' + (flags ? ' tap' : '') + '"' + (flags ? ' onclick="skMpFilter(\'' + sport + '\',\'fix\',\'\')"' : '') + '>' +
+    (flags ? '<span class="bad">\u26a0 ' + flags + ' lineup flag' + (flags === 1 ? '' : 's') + ' tonight ' +
+               (_skMpFix ? '\u25b4 players' : '\u203a fix list') + '</span>'
+           : '<span class="ok">\u2713 No lineup flags tonight</span>') +
+    '<span class="n">' + view.length + ' players' + (light ? ' \u00b7 ' + light + ' starting with 0\u20131 games' : '') + '</span></div>';
+  // Filter rows.
+  var pr = '<div class="sk-yw-pills">' + pill('plat', 'all', 'All', _skMpPlat === 'all');
+  ['yahoo', 'sleeper', 'espn', 'fantrax'].forEach(function (p) {
+    if (platsHere[p]) pr += pill('plat', p, '<b style="color:' + PL[p][1] + '">' + PL[p][0] + '</b> ' +
+      ({ yahoo: 'Yahoo', sleeper: 'Sleeper', espn: 'ESPN', fantrax: 'Fantrax' })[p], _skMpPlat === p);
+  });
+  h += pr + '</div>';
+  var fk = Object.keys(fmtsHere);
+  if (fk.length > 1) {
+    var fr = '<div class="sk-yw-pills">' + pill('fmt', 'all', 'All formats', _skMpFmt === 'all');
+    ['headpoint', 'head', 'point', 'roto'].forEach(function (f) { if (fmtsHere[f]) fr += pill('fmt', f, FMTL[f], _skMpFmt === f); });
+    h += fr + '</div>';
+  }
+  h += '<div class="sk-yw-pills">' + pill('flags', '', '\u26a0 Flags only', _skMpFlagsOnly) + '</div>';
+
+  if (_skMpFix && flags) {
+    // ── Fix list: flagged leagues, each with its swaps. ──
+    var byL = {}, order = [];
+    view.forEach(function (V) {
+      V.items.forEach(function (x) {
+        if (!x.flag) return;
+        var L = byL[x.e.leagueKey];
+        if (!L) { L = byL[x.e.leagueKey] = { lbl: x.e.leagueLbl, plat: x.e.plat, fmt: x.e.fmt, fixes: [] }; order.push(x.e.leagueKey); }
+        L.fixes.push({ name: V.name, team: V.team, f: x.flag });
+      });
+    });
+    order.sort(function (a2, b2) { return byL[b2].fixes.length - byL[a2].fixes.length; });
+    order.forEach(function (lk) {
+      var L = byL[lk], m = PL[L.plat] || ['?', '#aaa'];
+      h += '<div class="sk-mp-fix"><div class="lg"><b style="color:' + m[1] + '">' + m[0] + '</b> ' + skEscape(L.lbl) +
+        (FMTL[L.fmt] ? ' <span class="f">' + FMTL[L.fmt] + '</span>' : '') +
+        '<span class="c">' + L.fixes.length + ' fix' + (L.fixes.length === 1 ? '' : 'es') + '</span></div>';
+      L.fixes.forEach(function (F) {
+        h += '<div class="it"><span class="up">\u2191 Start ' + skEscape(F.name) + '</span> <span class="tm">' + skEscape(F.team) +
+          ', plays tonight</span> \u2192 ' + skEscape(F.f.slot || '') +
+          (F.f.out ? '<br><span class="dn">\u2193 over ' + skEscape(F.f.out) + '</span> <span class="tm">' +
+            skEscape(F.f.outTeam || '') + ', no game</span>' : '<br><span class="tm">open slot</span>') + '</div>';
+      });
+      h += '</div>';
+    });
+    h += '<div class="sk-yw-gnote">Leagues with something to fix before tonight\u2019s lock, most fixes first. ' +
+      'Follows the filters above. Tap the banner to go back to players.</div>';
+    panel.innerHTML = h;
+    return;
+  }
+
+  var sortPill = function (v, lbl) {
+    return '<button class="sk-yw-pill' + (_skMpSort === v ? ' on' : '') + '" onclick="skMpSetSort(\'' + sport + '\',\'' + v + '\')">' + lbl + '</button>';
+  };
+  view.sort(function (a, b) {
     if (_skMpSort === 'most') return (b.gThis - a.gThis) || (b.n - a.n);
     if (_skMpSort === 'fewest') return (a.gThis - b.gThis) || (b.n - a.n);
     return (b.flags - a.flags) || (b.n - a.n) || (b.gThis - a.gThis) || (a.name < b.name ? -1 : 1);
   });
-  var light = D.players.filter(function (p) { return p.gThis <= 1 && p.start > 0; }).length;
-  var PL = { yahoo: ['Y', '#7b68ee'], sleeper: ['S', '#fbbf24'], espn: ['E', '#ef4444'], fantrax: ['F', '#34d399'] };
-  var sortPill = function (v, lbl) {
-    return '<button class="sk-yw-pill' + (_skMpSort === v ? ' on' : '') + '" onclick="skMpSetSort(\'' + sport + '\',\'' + v + '\')">' + lbl + '</button>';
-  };
-  var h = _skMpViewToggle(sport);
-  h += '<div class="sk-mp-top">' +
-    (D.flags ? '<span class="bad">\u26a0 ' + D.flags + ' lineup flag' + (D.flags === 1 ? '' : 's') + ' tonight</span>'
-             : '<span class="ok">\u2713 No lineup flags tonight</span>') +
-    '<span class="n">' + D.players.length + ' players' + (light ? ' \u00b7 ' + light + ' starting with 0\u20131 games' : '') + '</span></div>';
   h += '<div class="sk-yw-pills">' + sortPill('exp', 'Exposure') + sortPill('most', 'Most games') + sortPill('fewest', 'Fewest games') + '</div>';
+  if (!view.length) {
+    h += '<div class="sk-yw-empty">' + (_skMpFlagsOnly ? 'No flags with these filters \u2014 lineups look set.' : 'No players with these filters.') + '</div>';
+    panel.innerHTML = h;
+    return;
+  }
   h += '<div class="sk-mp-hdr"><span class="nm">PLAYER</span><span class="wk">' +
     DOW.map(function (d, i) { return '<i' + (i === D.todayIdx ? ' class="t"' : '') + '>' + d + '</i>'; }).join('') +
     '</span><span class="nx">NEXT</span></div>';
-  list.forEach(function (G) {
+  view.forEach(function (G) {
     // Apostrophes stripped here, not just in the onclick: the tap stored the
     // stripped id while this looked up the original, so De'Anthony Melton
     // could never open. SKMP2
@@ -87902,8 +88015,7 @@ function _skMpPaint(sport) {
       if (i === D.todayIdx) cls += ' t';
       return '<i class="' + cls + '"></i>';
     }).join('');
-    h += '<div class="sk-mp-row' + (G.flags ? ' flag' : '') + '" onclick="skMpToggle(\'' + sport + '\',\'' +
-        String(id).replace(/'/g, '') + '\')">' +
+    h += '<div class="sk-mp-row' + (G.flags ? ' flag' : '') + '" onclick="skMpToggle(\'' + sport + '\',\'' + id + '\')">' +
       '<div class="line"><span class="nm">' + skEscape(G.name) + (G.n > 1 ? ' <em>\u00d7' + G.n + '</em>' : '') +
         '<small>' + skEscape(G.team) + '</small></span>' +
         '<span class="wk">' + strip + '</span>' +
@@ -87918,16 +88030,17 @@ function _skMpPaint(sport) {
         var m = PL[x.e.plat] || ['?', '#aaa'];
         h += '<div><b style="color:' + m[1] + '">' + m[0] + '</b> ' + skEscape(x.e.leagueLbl) +
           ' <span class="sl">' + skEscape(x.e.il ? 'IR' : x.e.bench ? 'BN' : (x.e.slot || '')) + '</span>' +
-          (x.flag ? '<br><span class="bad">\u26a0 ' + skEscape(x.flag) + '</span>' : '') + '</div>';
+          (x.flag ? '<br><span class="bad">\u26a0 ' + skEscape(x.flag.txt) + '</span>' : '') + '</div>';
       });
       h += '</div>';
     }
     h += '</div>';
   });
   h += '<div class="sk-yw-gnote">Every roster of this sport on Yahoo, Sleeper and ESPN, one row per real player (matched ' +
-    'by team and name). Dots are this week\u2019s game days; today is outlined. A flag means he\u2019s on your bench ' +
-    'tonight with a game while that league has an open slot he fits, or a starter at his position with no game. ' +
-    'ESPN rosters load once per session (they\u2019re large). Fantrax is next. Tap a player for each league.</div>';
+    'by team and name); the filters narrow which leagues count. Dots are this week\u2019s game days; today is outlined. ' +
+    'A flag means he\u2019s on your bench tonight with a game while that league has an open slot he fits, or a starter at ' +
+    'his position with no game \u2014 tap the red banner for the fix list, grouped by league. ESPN rosters load once per ' +
+    'session (they\u2019re large). Fantrax is next.</div>';
   panel.innerHTML = h;
 }
 
