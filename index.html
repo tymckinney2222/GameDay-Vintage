@@ -87941,7 +87941,7 @@ function skYwPick(sport, key) {
   if (typeof _skHydrateYourWeek === 'function') _skHydrateYourWeek(sport);
 }
 function _skYwPills(sport, leagues, sel) {
-  if (leagues.length < 2) return '';
+  if (leagues.length < 1) return '';
   var pill = function (key, lbl) {
     var on = sel === key;
     return '<button class="sk-yw-pill' + (on ? ' on' : '') + '" onclick="skYwPick(\'' + sport + '\',\'' +
@@ -87951,8 +87951,9 @@ function _skYwPills(sport, leagues, sel) {
   for (var i = 0; i < leagues.length; i++) {
     var l = leagues[i];
     var ld = (typeof skLeagueData === 'object' && skLeagueData) ? skLeagueData[l.league_key] : null;
-    var nm = (typeof _mrNm === 'function') ? _mrNm({ name: l.name, team: ld && ld.team && ld.team.name }) : l.name;
-    h += pill(l.league_key, nm);
+    var tmn = l._slRow ? ((typeof _mrExtTeam === 'function') ? _mrExtTeam(l._slRow) : '') : (ld && ld.team && ld.team.name);
+    var nm = (typeof _mrNm === 'function') ? _mrNm({ name: l.name, team: tmn }) : l.name;
+    h += pill(l.league_key, nm + (l._slRow ? ' \u00b7 S' : ''));
   }
   return h + '</div>';
 }
@@ -88016,9 +88017,75 @@ function _skYwWeek(sport, map, slots, gpw) {
   }
   return out;
 }
+// SKYWSLP — a Sleeper league's roster in the shape Your Week reads.
+function _skYwSleeperItemsToMap(items) {
+  var m = {};
+  (items || []).forEach(function (it, i) {
+    if (!it || !it.playerId) return;
+    var sl = String(it.slot || '').toUpperCase();
+    m['s' + i] = { name: it.name || '', teamAbbr: it.team || '', displayPosition: it.pos || '',
+                   selectedPos: it.starter ? it.slot : (sl === 'IR' || sl === 'TAXI' ? 'IR' : 'BN') };
+  });
+  return m;
+}
+function _skYwSleeperRoster(row) {
+  return new Promise(function (resolve) {
+    if (!row || !row.rosters || !row.myTeamIds) { resolve([]); return; }
+    var myId = null;
+    for (var k in row.myTeamIds) if (row.myTeamIds.hasOwnProperty(k)) { myId = k; break; }
+    var fin = function () {
+      var mine = row.rosters.byTeam[myId];
+      var out = [];
+      ((mine && mine.items) || []).forEach(function (it) {
+        if (!it || !it.playerId || !it.name) return;
+        var sl = String(it.slot || '').toUpperCase();
+        var il = (sl === 'IR' || sl === 'TAXI');
+        out.push({ name: it.name, teamAbbr: it.team || '', pos: it.pos || '',
+                   selectedPos: it.starter ? it.slot : (il ? 'IR' : 'BN'),
+                   isBench: !it.starter && !il, isIL: il, playerKey: 'slp.' + it.playerId });
+      });
+      resolve(out);
+    };
+    try { if (typeof slResolveRosterNames === 'function') slResolveRosterNames(row, fin); else fin(); }
+    catch (e) { fin(); }
+  });
+}
+function _skYwGridLoadSleeper(sport, league, gpw, reqId) {
+  var row = league._slRow;
+  var myId = null;
+  for (var k in row.myTeamIds) if (row.myTeamIds.hasOwnProperty(k)) { myId = k; break; }
+  var mineItems = (row.rosters.byTeam[myId] || {}).items || [];
+  var slots = [];
+  mineItems.forEach(function (it) { if (it.starter && it.slot) slots.push(it.slot); });
+  // This week's opponent, from the matchup the league card already loaded.
+  var oppId = null, oppName = 'Opponent';
+  var g = row.liveScores && row.liveScores.games;
+  (g || []).forEach(function (gm) {
+    if (String(gm.awayId) === String(myId)) { oppId = String(gm.homeId); oppName = gm.home; }
+    else if (String(gm.homeId) === String(myId)) { oppId = String(gm.awayId); oppName = gm.away; }
+  });
+  var oppItems = oppId && row.rosters.byTeam[oppId] ? row.rosters.byTeam[oppId].items : null;
+  if (reqId !== _skYourWeekReq) return;
+  var host = document.getElementById('skYwGrid');
+  if (!host) return;
+  if (!slots.length) { host.innerHTML = ''; return; }
+  var W = _skYwWeek(sport, _skYwSleeperItemsToMap(mineItems), slots, gpw);
+  var T = oppItems ? _skYwWeek(sport, _skYwSleeperItemsToMap(oppItems), slots, gpw) : null;
+  host.innerHTML = _skYwGridHtml(W, T, slots.length, gpw.days, oppName);
+}
+
 function _skYwGridLoad(sport, league, gpw, reqId) {
   var host = document.getElementById('skYwGrid');
   if (!host || !gpw || !gpw.byDay) { if (host) host.innerHTML = ''; return; }
+  if (league && league._slRow) {   // SKYWSLP
+    var row = league._slRow;
+    if (typeof slResolveRosterNames === 'function') {
+      try { slResolveRosterNames(row, function () { _skYwGridLoadSleeper(sport, league, gpw, reqId); }); return; }
+      catch (e) {}
+    }
+    _skYwGridLoadSleeper(sport, league, gpw, reqId);
+    return;
+  }
   var key = league.league_key;
   var ld = (typeof skLeagueData === 'object' && skLeagueData) ? skLeagueData[key] : null;
   var mu = (ld && ld.matchup) || {};
@@ -88100,12 +88167,14 @@ function _skHydrateYourWeek(sport) {
   // SKYWPICK — every league of this sport, and which one is selected (or
   // 'all'). Used to be simply the first league found.
   var sportLeagues = synced.filter(function (l) { return (l.sport || '').toLowerCase() === sport; });
-  // SKMP — the cross-league "All my players" view. It also covers Sleeper,
-  // so it's the default when this sport has no Yahoo league at all.
-  var hasSleeper = ((typeof extSyncedLeagues === 'function') ? extSyncedLeagues() : []).some(function (r) {
-    return r.provider === 'sleeper' && String(r.sport || '').toLowerCase() === sport;
+  // SKYWSLP — Sleeper leagues join the By-league view: each one becomes a
+  // league pill, with its roster, usable-games grid and opponent read from
+  // the Sleeper data already loaded with your leagues.
+  ((typeof extSyncedLeagues === 'function') ? extSyncedLeagues() : []).forEach(function (r) {
+    if (r.provider !== 'sleeper' || String(r.sport || '').toLowerCase() !== sport) return;
+    if (!r.rosters || !r.rosters.byTeam || !r.myTeamIds) return;
+    sportLeagues.push({ league_key: r.key, name: r.name, sport: sport, _slRow: r });
   });
-  if (!sportLeagues.length && hasSleeper) _skMpView[sport] = 'players';
   if (_skMpView[sport] === 'players') { _skMpRender(sport, panel); return; }
   if (!sportLeagues.length) { panel.innerHTML = ''; return; } // no league of this sport synced
   var selKey = _skYwSel[sport];
@@ -88124,6 +88193,11 @@ function _skHydrateYourWeek(sport) {
 
   // Roster: cache-first (60s TTL, same as the detail view), else fetch.
   function getRosterFor(lk) {
+    if (String(lk).indexOf('slp:') === 0) {   // SKYWSLP
+      var sl = null;
+      for (var q = 0; q < sportLeagues.length; q++) if (sportLeagues[q].league_key === lk) sl = sportLeagues[q]._slRow;
+      return _skYwSleeperRoster(sl);
+    }
     var cached = (typeof skDetailRosterCache !== 'undefined') ? skDetailRosterCache[lk] : null;
     if (cached && (Date.now() - cached.ts < 60000)) return Promise.resolve(cached.players);
     return skLoadRosterForLeague(lk).then(function(players) {
@@ -88143,7 +88217,9 @@ function _skHydrateYourWeek(sport) {
       var byKey = {}, out = [];
       lists.forEach(function (lst) {
         (lst || []).forEach(function (p) {
-          var k = p.playerKey || (p.name + '|' + p.teamAbbr);
+          // Same player across platforms: normalized name + team (ids differ).
+          var k = ((typeof _pmNameKey === 'function') ? _pmNameKey(p.name) : p.name) + '|' +
+                  canon(String(p.teamAbbr || '').toUpperCase());
           if (byKey[k]) { byKey[k]._n++; if (!p.isBench && !p.isIL) byKey[k].isBench = false; return; }
           var c = {}; for (var f in p) if (p.hasOwnProperty(f)) c[f] = p[f];
           c._n = 1;
