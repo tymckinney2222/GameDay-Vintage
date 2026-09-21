@@ -141500,6 +141500,223 @@ function _mrCgCollect(kind) {
            pct: _mrClosePct(), kind: kind };
 }
 
+// ── MGRWEEKLY ── Record by week, across every H2H league ──
+// The season record, broken out by calendar week (Mon–Sun): every
+// completed matchup from every H2H league on every platform that week,
+// added up — "18-4-1 the week of Sep 7" — newest first, with this week's
+// live record on top. Tap a week for each league's result that week.
+//
+// The results are the same weekly results Close games reads (points and
+// categories, Yahoo and ESPN). The hard part is DATES: each league
+// numbers its own weeks, and baseball's All-Star week runs two weeks long,
+// so "week 16" isn't the same week everywhere. Each league-week is placed
+// by its own dates:
+//   • Yahoo: the official fantasy-week calendar for that game
+//     (/game/<key>/game_weeks) — fetched once per sport, cached a week;
+//   • ESPN: the league's own schedule settings, which list the days in
+//     each matchup period, counted back from today's scoring period;
+//   • fallback (calendar not loaded yet): counted back from the league's
+//     current week, seven days at a time.
+// A league-week lands in the calendar week containing its midpoint, so an
+// NFL week (Tue–Mon) and a baseball week (Mon–Sun) that cover the same
+// weekend group together, and a two-week All-Star matchup counts once.
+var _mrWkOpen = {}, _mrWkAll = false, _mrGwLoading = {};
+function mrWkToggle(k) { _mrWkOpen[k] = !_mrWkOpen[k]; if (typeof mrRenderBody === 'function') mrRenderBody(); }
+function mrWkAllToggle() { _mrWkAll = !_mrWkAll; if (typeof mrRenderBody === 'function') mrRenderBody(); }
+
+function _mrYmd(d) {
+  var m = d.getMonth() + 1, dd = d.getDate();
+  return d.getFullYear() + '-' + (m < 10 ? '0' : '') + m + '-' + (dd < 10 ? '0' : '') + dd;
+}
+function _mrParseYmd(s) {
+  return new Date(parseInt(s.slice(0, 4), 10), parseInt(s.slice(5, 7), 10) - 1, parseInt(s.slice(8, 10), 10));
+}
+// Yahoo fantasy-week calendar for any game (MLB, NFL, …), shared with the
+// football code's cache (_skGameWeeksMem / sk_game_weeks_v1_<gameKey>).
+function _mrGameWeeks(gk) {
+  if (typeof _skGameWeeksMem === 'object' && _skGameWeeksMem[gk]) return _skGameWeeksMem[gk];
+  try {
+    var cached = JSON.parse(localStorage.getItem('sk_game_weeks_v1_' + gk) || 'null');
+    if (cached && cached.weeks && (Date.now() - cached.ts) < 7 * 86400000) {
+      if (typeof _skGameWeeksMem === 'object') _skGameWeeksMem[gk] = cached.weeks;
+      return cached.weeks;
+    }
+  } catch (e) {}
+  if (!_mrGwLoading[gk] && typeof fyApi === 'function') {
+    _mrGwLoading[gk] = 1;
+    fyApi('/game/' + gk + '/game_weeks').then(function (res) {
+      var weeks = [];
+      try {
+        var g = _yahooArr(res.fantasy_content.game);
+        for (var i = 0; i < g.length; i++) {
+          if (!g[i] || !g[i].game_weeks) continue;
+          var gw = g[i].game_weeks;
+          for (var w = 0; w < (parseInt(gw.count, 10) || 0); w++) {
+            var e = gw[String(w)] && gw[String(w)].game_week;
+            if (e && e.start && e.end) weeks.push({ week: parseInt(e.week, 10) || (w + 1), start: e.start, end: e.end });
+          }
+        }
+      } catch (e2) {}
+      if (weeks.length) {
+        if (typeof _skGameWeeksMem === 'object') _skGameWeeksMem[gk] = weeks;
+        try { localStorage.setItem('sk_game_weeks_v1_' + gk, JSON.stringify({ ts: Date.now(), weeks: weeks })); } catch (e3) {}
+        var ov = document.getElementById('mrOverlay');
+        if (ov && ov.classList.contains('open')) { try { mrRenderBody(); } catch (e4) {} }
+      }
+    }, function () {});
+  }
+  return null;
+}
+// Midpoint date (YYYY-MM-DD) of league-week w.
+function _mrWeekMid(L, w) {
+  var today = new Date(), i;
+  if (L.plat === 'yahoo') {
+    var lg = null, yl = (typeof _skYahooArchLeagues === 'function') ? _skYahooArchLeagues() : [];
+    for (i = 0; i < yl.length; i++) if (yl[i].league_key === L.key) lg = yl[i];
+    var gk = String(L.key).split('.')[0];
+    var weeks = _mrGameWeeks(gk);
+    if (weeks) {
+      for (i = 0; i < weeks.length; i++) {
+        if (weeks[i].week === w) {
+          var a = _mrParseYmd(weeks[i].start), b = _mrParseYmd(weeks[i].end);
+          return _mrYmd(new Date((a.getTime() + b.getTime()) / 2));
+        }
+      }
+    }
+    var cw = lg ? parseInt(lg.current_week, 10) : null;
+    if (cw) {
+      var d0 = _mrParseYmd(_skBankWeekStart(_mrYmd(today)));
+      d0.setDate(d0.getDate() - 7 * (cw - w) + 3);
+      return _mrYmd(d0);
+    }
+    return null;
+  }
+  // ESPN
+  var rows = (typeof extSyncedLeagues === 'function') ? extSyncedLeagues() : [], row = null;
+  for (i = 0; i < rows.length; i++) if (rows[i].key === L.key) row = rows[i];
+  if (!row) return null;
+  var raw = row.raw || {}, sp = String(row.sport || '').toLowerCase();
+  var curSp = parseInt(raw.scoringPeriodId || (raw.status && raw.status.latestScoringPeriod), 10);
+  var mp = raw.settings && raw.settings.scheduleSettings && raw.settings.scheduleSettings.matchupPeriods;
+  var ids = mp && (mp[String(w)] || mp[w]);
+  if (sp !== 'nfl' && sp !== 'cfb' && ids && ids.length && curSp) {
+    var mid = ids[Math.floor(ids.length / 2)];
+    var dm = new Date(today); dm.setDate(dm.getDate() - (curSp - mid));
+    return _mrYmd(dm);
+  }
+  var j = row._espScoreJson;
+  var cwE = parseInt((j && j.status && j.status.currentMatchupPeriod) || (raw.status && raw.status.currentMatchupPeriod), 10);
+  if (cwE) {
+    var d1 = _mrParseYmd(_skBankWeekStart(_mrYmd(today)));
+    d1.setDate(d1.getDate() - 7 * (cwE - w) + 3);
+    return _mrYmd(d1);
+  }
+  return null;
+}
+
+function _mrWeeklyCollect() {
+  var buckets = {}, list = [];
+  ['pts', 'cats'].forEach(function (kind) {
+    var d = (typeof _mrCgCollect === 'function') ? _mrCgCollect(kind) : { leagues: [] };
+    for (var i = 0; i < d.leagues.length; i++) {
+      var L = d.leagues[i];
+      for (var j = 0; j < L.games.length; j++) {
+        var g = L.games[j], mid = _mrWeekMid(L, g.week);
+        if (!mid) continue;
+        var wk = _skBankWeekStart(mid);
+        var B = buckets[wk];
+        if (!B) { B = buckets[wk] = { ws: wk, w: 0, l: 0, t: 0, items: [] }; list.push(B); }
+        if (g.res === 'W') B.w++; else if (g.res === 'L') B.l++; else B.t++;
+        B.items.push({ name: _mrNm(L), plat: L.plat, res: g.res, week: g.week, kind: kind,
+                       score: kind === 'pts' ? g.my.toFixed(1) + '\u2013' + g.opp.toFixed(1)
+                                             : g.my + '\u2013' + g.opp + (g.tied ? '\u2013' + g.tied : '') + ' cats',
+                       opp: g.oppName || '' });
+      }
+    }
+  });
+  list.sort(function (a, b) { return a.ws < b.ws ? 1 : a.ws > b.ws ? -1 : 0; });
+  return list;
+}
+
+function _mrWeeklyHtml(data) {
+  var list = _mrWeeklyCollect();
+  var g = data && data.grand;
+  var liveN = g ? (g.ww + g.wl + g.wt) : 0;
+  if (!list.length && !liveN) return '';
+  var mono = 'font-family:var(--sk-font-mono,monospace);';
+  var MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  var lbl = function (ws) {
+    var a = _mrParseYmd(ws), b = new Date(a); b.setDate(b.getDate() + 6);
+    return MON[a.getMonth()] + ' ' + a.getDate() + '\u2013' + (a.getMonth() === b.getMonth() ? '' : MON[b.getMonth()] + ' ') + b.getDate();
+  };
+  var pct = function (w, l, t) { var n = w + l + t; return n ? ((w + t / 2) / n).toFixed(3).replace(/^0/, '') : ''; };
+  var pcol = function (w, l) { return w > l ? '#4ade80' : w < l ? '#f87171' : 'rgba(255,255,255,0.7)'; };
+  var h = '<div style="background:var(--sk-bg-card,rgba(255,255,255,0.03));' +
+    'border:1px solid rgba(255,255,255,0.07);border-radius:12px;padding:14px;margin:0 0 10px;">' +
+    '<div style="display:flex;align-items:baseline;margin:0 0 10px;">' +
+      '<span style="font-family:var(--sk-font-display,serif);font-size:18px;color:#fff;">Record by week</span>' +
+      '<span style="flex:1;"></span>' +
+      '<span style="font-size:9.5px;letter-spacing:0.12em;color:rgba(255,255,255,0.4);">ALL H2H LEAGUES</span></div>' +
+    '<div style="display:flex;font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
+      'padding:0 0 4px;border-bottom:1px solid rgba(255,255,255,0.08);">' +
+      '<span style="flex:1;">WEEK</span><span style="flex:0 0 40px;text-align:right;">GMS</span>' +
+      '<span style="flex:0 0 50px;text-align:right;">WIN%</span><span style="flex:0 0 70px;text-align:right;">RECORD</span></div>';
+  if (liveN) {
+    h += '<div style="display:flex;align-items:center;padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.04);">' +
+      '<span style="flex:1;font-size:11.5px;color:#fff;">This week <span style="' + mono + 'font-size:8.5px;' +
+        'letter-spacing:0.1em;color:var(--sk-gold,#eab308);margin-left:4px;">LIVE</span></span>' +
+      '<span style="flex:0 0 40px;text-align:right;' + mono + 'font-size:11px;color:rgba(255,255,255,0.5);">' + liveN + '</span>' +
+      '<span style="flex:0 0 50px;text-align:right;' + mono + 'font-size:11px;color:rgba(255,255,255,0.6);">' +
+        pct(g.ww, g.wl, g.wt) + '</span>' +
+      '<span style="flex:0 0 70px;text-align:right;' + mono + 'font-size:12.5px;font-weight:700;color:' + pcol(g.ww, g.wl) + ';">' +
+        g.ww + '-' + g.wl + '-' + g.wt + '</span></div>';
+  }
+  var shown = _mrWkAll ? list : list.slice(0, 6);
+  for (var i = 0; i < shown.length; i++) {
+    var B = shown[i], n = B.w + B.l + B.t, open = !!_mrWkOpen[B.ws];
+    h += '<div style="padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.04);">' +
+      '<div style="display:flex;align-items:center;cursor:pointer;" onclick="mrWkToggle(\'' + B.ws + '\')">' +
+        '<span style="flex:0 0 12px;font-size:9px;color:rgba(255,255,255,0.35);">' + (open ? '\u25be' : '\u25b8') + '</span>' +
+        '<span style="flex:1;font-size:11.5px;color:rgba(255,255,255,0.8);">' + lbl(B.ws) + '</span>' +
+        '<span style="flex:0 0 40px;text-align:right;' + mono + 'font-size:11px;color:rgba(255,255,255,0.5);">' + n + '</span>' +
+        '<span style="flex:0 0 50px;text-align:right;' + mono + 'font-size:11px;color:rgba(255,255,255,0.6);">' + pct(B.w, B.l, B.t) + '</span>' +
+        '<span style="flex:0 0 70px;text-align:right;' + mono + 'font-size:12.5px;font-weight:700;color:' + pcol(B.w, B.l) + ';">' +
+          B.w + '-' + B.l + '-' + B.t + '</span></div>';
+    if (open) {
+      var items = B.items.slice().sort(function (a, b) {
+        var r = function (x) { return x === 'L' ? 0 : x === 'T' ? 1 : 2; };
+        return r(a.res) - r(b.res) || (a.name < b.name ? -1 : 1);
+      });
+      h += '<div style="margin:4px 0 2px 12px;padding:2px 0 2px 10px;border-left:2px solid rgba(234,179,8,0.35);">';
+      for (var q = 0; q < items.length; q++) {
+        var it = items[q], col = it.res === 'W' ? '#4ade80' : it.res === 'L' ? '#f87171' : '#fbbf24';
+        var meta = null;
+        for (var m2 = 0; m2 < MR_PLATFORMS.length; m2++) if (MR_PLATFORMS[m2].key === it.plat) meta = MR_PLATFORMS[m2];
+        h += '<div style="display:flex;align-items:baseline;gap:6px;padding:3px 0;">' +
+          '<span style="flex:0 0 12px;' + mono + 'font-size:10.5px;font-weight:800;color:' + col + ';">' + it.res + '</span>' +
+          '<span style="flex:1;min-width:0;font-size:10.5px;color:rgba(255,255,255,0.75);overflow:hidden;' +
+            'text-overflow:ellipsis;white-space:nowrap;">' + slEsc(it.name) +
+            (it.opp ? ' <span style="color:rgba(255,255,255,0.35);">vs ' + slEsc(it.opp) + '</span>' : '') + '</span>' +
+          '<span style="flex:0 0 auto;font-size:8.5px;font-weight:700;color:' + (meta ? meta.accent : 'rgba(255,255,255,0.5)') + ';">' +
+            slEsc(meta ? meta.label : it.plat) + '</span>' +
+          '<span style="' + mono + 'font-size:10px;color:rgba(255,255,255,0.6);">' + slEsc(it.score) + '</span></div>';
+      }
+      h += '</div>';
+    }
+    h += '</div>';
+  }
+  if (list.length > 6) {
+    h += '<div style="padding:8px 0 0;"><button onclick="mrWkAllToggle()" style="padding:4px 11px;border-radius:999px;' +
+      'border:1px solid rgba(255,255,255,0.16);background:none;color:rgba(255,255,255,0.6);font-size:9.5px;' +
+      'font-weight:700;letter-spacing:0.06em;">' + (_mrWkAll ? 'SHOW RECENT ONLY' : 'SHOW ALL ' + list.length + ' WEEKS') + '</button></div>';
+  }
+  h += '<div style="font-size:9px;line-height:1.5;color:rgba(255,255,255,0.28);margin-top:8px;">' +
+    'Every completed matchup from every H2H league that week, points and categories, grouped Mon\u2013Sun by ' +
+    'each league\u2019s own schedule \u2014 a two-week All-Star matchup counts once. Season-points and roto ' +
+    'leagues have no weekly W-L, so they aren\u2019t in it. Tap a week for each league\u2019s result.</div>';
+  return h + '</div>';
+}
+
 // ── MGRCLOSE5 ── Tap a league in Close games to see its weeks, newest
 // first: opponent, score, result, and the margin (points and as a share of
 // the matchup's average score, or the category split). The close ones show
@@ -141986,6 +142203,8 @@ function mrRenderBody() {
         'font-size:13px;font-weight:700;color:#4ade80;">' + _mrRec(g, true) + '</span>' +
     '</div></div>';
   }
+
+  h += _mrWeeklyHtml(data);   // MGRWEEKLY — overall record, week by week
 
   // ── Sport sections, platform rows inside ──
   var order = [], seen = {}, i, k;
