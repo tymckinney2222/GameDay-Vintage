@@ -91995,6 +91995,33 @@ function _skScoutTx(res, teamKey) {
   return out;
 }
 
+// SKSCOUT6 — earlier meetings with this opponent, from the weekly results
+// already on the device: the History aggregate when it's loaded this
+// session (matched by team key), otherwise the weeks Close games keeps
+// (matched by the opponent's team name). Completed weeks only.
+function _skScoutH2H(leagueKey, oppKey, oppNames) {
+  var out = [], seen = {}, i;
+  var hc = (typeof _skHistoryCache === 'object' && _skHistoryCache) ? _skHistoryCache[leagueKey] : null;
+  var bw = (hc && hc.data && hc.data.byWeek) || [];
+  for (i = 0; i < bw.length; i++) {
+    var e = bw[i];
+    if (!e || e.isLive || e.oppTeamKey !== oppKey || seen[e.week]) continue;
+    seen[e.week] = 1;
+    out.push(e);
+  }
+  var names = {};
+  (oppNames || []).forEach(function (n) { if (n) names[String(n).toLowerCase()] = 1; });
+  var stored = (typeof _mrCgWeeks === 'function') ? (_mrCgWeeks(leagueKey) || []) : [];
+  for (i = 0; i < stored.length; i++) {
+    var s2 = stored[i];
+    if (!s2 || seen[s2.week] || !s2.oppName || !names[String(s2.oppName).toLowerCase()]) continue;
+    seen[s2.week] = 1;
+    out.push(s2);
+  }
+  out.sort(function (a, b) { return a.week - b.week; });
+  return out;
+}
+
 function skOpenScouting(leagueKey) {
   var league = (fyLeagues || []).find(function (l) { return l.league_key === leagueKey; });
   if (!league) return;
@@ -92079,6 +92106,7 @@ function skOpenScouting(leagueKey) {
     var data = { ts: Date.now(), opp: oppKey, me: myKey, st: st, sport: sport, fb: fb,
                  teams: r[0] || {}, form: r[1] || [], hot: r[2] || {}, mine: r[3] || {}, today: r[4], tx: r[5],
                  myForm: r[6] || [] };
+    data.h2h = _skScoutH2H(leagueKey, oppKey, [mu.oppName, data.teams[oppKey] && data.teams[oppKey].name]);   // SKSCOUT6
     _skScoutCache[leagueKey] = data;
     var t = document.getElementById('skWireSheetTitle');
     if (t && data.teams[oppKey] && data.teams[oppKey].name) _skSheetTitle(data.teams[oppKey].name, _skTeamLogo(leagueKey, oppKey));
@@ -92140,6 +92168,39 @@ function _skScoutHtml(league, d) {
   var myLbl = ((typeof _mrYTeam === 'function' && _mrYTeam(key)) || (d.teams[d.me] && d.teams[d.me].name) || 'Your team');
   h += formBlock(d.form, oppLbl, false);
   h += formBlock(d.myForm || [], 'You \u00b7 ' + myLbl, true);
+
+  // ── Head to head this season ── SKSCOUT6 ──
+  var hh = d.h2h || [];
+  h += _skSheetSection('\ud83e\udd4a', 'Head to head', 'this season');
+  if (!hh.length) {
+    h += '<div class="sk-rc-note" style="margin-top:0">You haven\u2019t played them yet this season' +
+      ' \u2014 this week is the first meeting.</div>';
+  } else {
+    var hw = 0, hl = 0, ht = 0, hmy = 0, hop = 0, hpts = 0, hchips = '';
+    for (var hq = 0; hq < hh.length; hq++) {
+      var m = hh[hq];
+      if (m.result === 'W') hw++; else if (m.result === 'L') hl++; else ht++;
+      var hsc = '';
+      if (isPts && m.myPts != null && m.oppPts != null) {
+        hsc = ' ' + Number(m.myPts).toFixed(0) + '\u2013' + Number(m.oppPts).toFixed(0);
+        hmy += Number(m.myPts); hop += Number(m.oppPts); hpts++;
+      } else if (!isPts && m.myCatsWon != null) {
+        hsc = ' ' + m.myCatsWon + '\u2013' + m.oppCatsWon + (m.catsTied ? '\u2013' + m.catsTied : '');
+      }
+      hchips += '<span class="sk-sc-chip ' + (m.result === 'W' ? 'w' : m.result === 'L' ? 'l' : 't') + '">' +
+        'Wk ' + m.week + ' <b>' + (m.result || '\u2013') + '</b>' + skEscape(hsc) + '</span>';
+    }
+    var lead = hw > hl ? 'You lead ' : hw < hl ? 'They lead ' : 'Series level ';
+    var recTxt = (hw > hl ? hw + '\u2013' + hl : hw < hl ? hl + '\u2013' + hw : hw + '\u2013' + hl) + (ht ? '\u2013' + ht : '');
+    h += '<div class="sk-sc-verdict ' + (hw > hl ? 'good' : hw < hl ? 'bad' : 'mid') + '">' + lead + recTxt + '</div>';
+    h += '<div class="sk-sc-chips" style="margin-top:8px">' + hchips + '</div>';
+    if (hpts) {
+      var hd = hmy - hop;
+      h += '<div class="sk-rc-note" style="margin-top:6px">' + skEscape('Combined ' + hmy.toFixed(1) + '\u2013' + hop.toFixed(1) +
+        ' (' + (hd >= 0 ? '+' : '\u2212') + Math.abs(hd).toFixed(1) + ') \u00b7 averaging ' + (hmy / hpts).toFixed(1) +
+        ' to their ' + (hop / hpts).toFixed(1) + ' in these games') + '</div>';
+    }
+  }
 
   // ── Engagement ── SKSCOUT2 ──
   // The first version leaned on "empty slots right now", which misfires in
