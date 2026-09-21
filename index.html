@@ -141496,8 +141496,144 @@ function _mrCgCollect(kind) {
     }
     if (E.games.length) leagues.push(E);
   }
+
+  // SLEEPERWK — Sleeper leagues are all H2H points. Weeks come from the
+  // same on-device store Yahoo uses (_mrCgStore), filled by _mrSlHydrate.
+  if (kind === 'pts') {
+    for (i = 0; i < rows.length; i++) {
+      var srow = rows[i];
+      if (!srow || srow.provider !== 'sleeper') continue;
+      if (typeof skMrCounts === 'function' && !skMrCounts(srow)) continue;
+      var sNeed = _mrSlNeeded(srow);
+      var sbw = _mrCgWeeks(srow.key);
+      if (!sbw) {
+        if (!sNeed.length) continue;                     // season hasn't scored a week yet
+        if (_mrCgFailed[srow.key]) failed.push({ name: _mrNm({ name: srow.name, team: _mrExtTeam(srow) }), why: _mrCgFailed[srow.key] });
+        else pending++;
+        continue;
+      }
+      if (_mrCgInflight[srow.key]) pending++;
+      var sLast = sNeed.length ? sNeed[sNeed.length - 1] : 0;
+      var SL = mkLeague(srow.key, srow.name || srow.key, _mrExtTeam(srow), 'sleeper');
+      for (k = 0; k < sbw.length; k++) {
+        var se = sbw[k];
+        if (!se || se.week > sLast || se.myPts == null || se.oppPts == null) continue;
+        addPts(SL, se.week, se.myPts, se.oppPts, se.oppName);
+      }
+      if (SL.games.length) leagues.push(SL);
+    }
+  }
   return { leagues: leagues, pending: pending, failed: failed, rebuilt: rebuilt,
            pct: _mrClosePct(), kind: kind };
+}
+
+// ── SLEEPERWK ── Sleeper weekly results ──
+// One request per league per week — /league/<id>/matchups/<week>, the
+// endpoint the Sleeper cards already use for the live week. Teams sharing
+// a matchup_id played each other; a week where mine has no matchup_id is a
+// bye or a playoff week I'm out of, recorded as 0 so it's never asked for
+// again. Completed weeks come from the league itself (last_scored_leg);
+// failing that, the sport's current week minus one. Stored in the same
+// on-device weekly store as Yahoo, so a week is fetched exactly once.
+var _slStateWeek = {};   // sport -> current week, once per session
+function _mrSlNeeded(row) {
+  var st = (row.raw && row.raw.settings) || {};
+  var first = parseInt(st.start_week, 10) || 1;
+  var last = parseInt(st.last_scored_leg, 10);
+  if (!last) {
+    var cw = _slStateWeek[String(row.sport || 'nfl')];
+    last = cw ? cw - 1 : 0;
+  }
+  var out = [];
+  for (var w = first; w <= last; w++) out.push(w);
+  return out;
+}
+function _mrSlLoadOne(row) {
+  var key = row.key, id = String(key).slice(4);
+  var mine = row.myTeamIds || {};
+  var st = _mrCgStore(key), miss = [];
+  var need = _mrSlNeeded(row);
+  for (var i = 0; i < need.length; i++) if (!st.w.hasOwnProperty(String(need[i]))) miss.push(need[i]);
+  if (!miss.length) return Promise.resolve('');
+  var names = {};
+  (row.standingsAll || []).forEach(function (r) { names[String(r.teamId)] = r.teamName; });
+  var errs = 0, idx = 0;
+  function one(wk) {
+    return slFetchJson(SLEEPER_BASE + '/league/' + id + '/matchups/' + wk).then(function (mus) {
+      if (!mus || !mus.length) { errs++; return; }
+      var me = null, byMu = {};
+      for (var j = 0; j < mus.length; j++) {
+        var m = mus[j] || {};
+        if (mine[String(m.roster_id)]) me = m;
+        if (m.matchup_id != null) (byMu[m.matchup_id] = byMu[m.matchup_id] || []).push(m);
+      }
+      if (!me || me.matchup_id == null) { st.w[String(wk)] = 0; return; }   // bye / out of the playoffs
+      var pair = byMu[me.matchup_id] || [], opp = null;
+      for (j = 0; j < pair.length; j++) if (pair[j] !== me) opp = pair[j];
+      if (!opp) { st.w[String(wk)] = 0; return; }
+      var a = Number(me.points) || 0, b = Number(opp.points) || 0;
+      _mrCgPut(key, { week: wk, myPts: a, oppPts: b, result: a > b ? 'W' : a < b ? 'L' : 'T',
+                      oppName: names[String(opp.roster_id)] || ('Team ' + opp.roster_id) });
+    }, function () { errs++; });
+  }
+  function next() {
+    if (idx >= miss.length) return Promise.resolve();
+    var batch = miss.slice(idx, idx + 3), ps = [];
+    idx += 3;
+    for (var b = 0; b < batch.length; b++) ps.push(one(batch[b]));
+    return Promise.all(ps).then(next);
+  }
+  return next().then(function () {
+    _mrCgSave(key);
+    return errs ? (errs + ' week' + (errs === 1 ? '' : 's') + ' didn\u2019t load from Sleeper') : '';
+  });
+}
+function _mrSlHydrate(force) {
+  if (typeof slFetchJson !== 'function' || typeof extSyncedLeagues !== 'function') return;
+  var rows = extSyncedLeagues().filter(function (r) { return r && r.provider === 'sleeper' && r.myTeamIds; });
+  if (!rows.length) return;
+  var sports = {};
+  rows.forEach(function (r) { sports[String(r.sport || 'nfl')] = 1; });
+  var statePs = Object.keys(sports).map(function (sp) {
+    if (_slStateWeek[sp]) return Promise.resolve();
+    return slFetchJson(SLEEPER_BASE + '/state/' + sp).then(function (stt) {
+      var wk = parseInt(stt && (stt.week || stt.leg), 10);
+      if (wk) _slStateWeek[sp] = wk;
+    }, function () {});
+  });
+  Promise.all(statePs).then(function () {
+    var queue = rows.filter(function (r) {
+      if (_mrCgInflight[r.key]) return false;
+      if (_mrCgFailed[r.key] && !force) return false;
+      var st = _mrCgStore(r.key), need = _mrSlNeeded(r);
+      for (var i = 0; i < need.length; i++) if (!st.w.hasOwnProperty(String(need[i]))) return true;
+      return false;
+    });
+    var running = 0;
+    function repaint() {
+      var ov = document.getElementById('mrOverlay');
+      if (ov && ov.classList.contains('open')) { try { mrRenderBody(); } catch (e) {} }
+    }
+    function pump() {
+      while (running < 2 && queue.length) {
+        (function (row) {
+          running++;
+          _mrCgInflight[row.key] = 1;
+          delete _mrCgFailed[row.key];
+          _mrSlLoadOne(row).then(function (why) {
+            running--; delete _mrCgInflight[row.key];
+            if (why) _mrCgFailed[row.key] = why;
+            repaint(); pump();
+          }, function () {
+            running--; delete _mrCgInflight[row.key];
+            _mrCgFailed[row.key] = 'load error';
+            repaint(); pump();
+          });
+        })(queue.shift());
+      }
+    }
+    pump();
+  });
 }
 
 // ── MGRWEEKLY ── Record by week, across every H2H league ──
@@ -141589,6 +141725,36 @@ function _mrWeekMid(L, w) {
       return _mrYmd(d0);
     }
     return null;
+  }
+  // Sleeper ── SLEEPERWK ── football by the NFL week calendar (as ESPN
+  // below); basketball and hockey count Monday weeks from the opening
+  // week. Sleeper labels those seasons by their START year.
+  if (L.plat === 'sleeper') {
+    var srows = (typeof extSyncedLeagues === 'function') ? extSyncedLeagues() : [], srow = null;
+    for (i = 0; i < srows.length; i++) if (srows[i].key === L.key) srow = srows[i];
+    if (!srow) return null;
+    var ssp = String(srow.sport || '').toLowerCase();
+    if (ssp === 'nfl') {
+      var yls = (typeof _skYahooArchLeagues === 'function') ? _skYahooArchLeagues() : [];
+      for (i = 0; i < yls.length; i++) {
+        if (String(yls[i].sport || '').toLowerCase() !== 'nfl') continue;
+        var gws = _mrGameWeeks(String(yls[i].league_key).split('.')[0]);
+        if (!gws) continue;
+        for (var ks = 0; ks < gws.length; ks++) {
+          if (gws[ks].week === w) {
+            var as = _mrParseYmd(gws[ks].start), bs = _mrParseYmd(gws[ks].end);
+            return _mrYmd(new Date((as.getTime() + bs.getTime()) / 2));
+          }
+        }
+      }
+    }
+    var syr = Number(srow.season) || new Date().getFullYear();
+    if (ssp === 'nba' || ssp === 'nhl') syr += 1;
+    var swin = (typeof _espSeasonWindow === 'function') ? _espSeasonWindow(ssp, syr) : null;
+    if (!swin) return null;
+    var smon = _mrParseYmd(_skBankWeekStart(_mrYmd(new Date(swin.startMs))));
+    smon.setDate(smon.getDate() + 7 * (w - 1) + 3);
+    return _mrYmd(smon);
   }
   // ESPN ── MGRWEEKLY2 ──
   // The first version counted back from TODAY's scoring period, which put
@@ -141942,7 +142108,7 @@ function _mrCloseGamesHtml(kind) {
       : ('Scored on category wins, so 5-4-1 is a one-category margin. Counted apart from points ' +
          'leagues because the two margins can\u2019t be averaged. ')) +
     'Completed weeks only. A close-game record well away from .500 is mostly luck, and it tends ' +
-    'not to last. Yahoo and ESPN; Sleeper and Fantrax aren\u2019t in yet.' +
+    'not to last. Yahoo, ESPN and Sleeper; Fantrax isn\u2019t in yet.' +
     (d.pending ? (' Loading ' + d.pending + ' more league' + (d.pending === 1 ? '' : 's') + '\u2026') : '');
   if (d.rebuilt.length) {
     var rbn = [];
@@ -141958,7 +142124,7 @@ function _mrCloseGamesHtml(kind) {
       h += '<div style="font-size:10px;line-height:1.45;color:#f59e0b;">' + slEsc(d.failed[i].name) +
         ' couldn\u2019t load: ' + slEsc(d.failed[i].why) + '</div>';
     }
-    h += '<button onclick="mrCgHydrate(true)" style="margin-top:6px;padding:4px 11px;border-radius:999px;' +
+    h += '<button onclick="mrCgHydrate(true);_mrSlHydrate(true)" style="margin-top:6px;padding:4px 11px;border-radius:999px;' +
         'border:1px solid rgba(255,255,255,0.16);background:none;color:rgba(255,255,255,0.6);' +
         'font-size:9.5px;font-weight:700;letter-spacing:0.06em;">RETRY</button></div>';
   }
@@ -142429,6 +142595,7 @@ function openManagerRecord() {
     // which their standings-based record never fetched. Session-cached;
     // failures are marked so the section offers RETRY instead of spinning.
     mrCgHydrate(false);
+    _mrSlHydrate(false);   // SLEEPERWK
     if (typeof _mrPollTallies === 'function') _mrPollTallies(0);
   } catch (e2) {}
 }
