@@ -26464,6 +26464,17 @@
   .slwg-cell.best { border-color: var(--sk-gold, #f5d547); background: rgba(245,213,71,0.1); }
   .slwg-cell.best .slwg-fp { color: var(--sk-gold, #f5d547); }
   .slwg-cell.undated { grid-column: span 1; border-style: dashed; }
+  /* SLLOCKIN — the game Sleeper counts if you never lock one in */
+  .slwg-cell.auto { border-style: dashed; border-color: rgba(255,255,255,0.35); }
+  .slwg-cell.auto.best { border-style: dashed; border-color: var(--sk-gold, #f5d547); }
+  .slwg-tot.lock { color: var(--sk-gold, #f5d547); }
+  .slwg-lk { margin-left: 8px; vertical-align: middle;
+             font-family: var(--sk-font-mono, monospace); font-size: 8.5px; font-weight: 800;
+             letter-spacing: 0.08em; padding: 3px 7px; border-radius: 999px; cursor: pointer;
+             color: rgba(255,255,255,0.45); background: rgba(255,255,255,0.05);
+             border: 1px solid rgba(255,255,255,0.12); }
+  .slwg-lk.on { color: var(--sk-gold, #f5d547); background: rgba(245,213,71,0.12);
+                border-color: rgba(245,213,71,0.55); }
   .slwg-d { font-size: 8px; font-weight: 700; color: rgba(255,255,255,0.4); letter-spacing: 0.06em; }
   .slwg-fp { font-size: 11px; font-weight: 800; color: rgba(255,255,255,0.85); line-height: 1.1; }
   .slwg-opp { font-size: 7.5px; color: rgba(255,255,255,0.4); white-space: nowrap;
@@ -161574,6 +161585,63 @@ function _slpRowByKey(k) {
 //
 // Same data as before: per-game fp and date from Sleeper's log (opponent
 // when the feed provides it), projection, best game highlighted.
+// ── SLLOCKIN ── One game per player, not the week added up.
+// Sleeper basketball can run Lock-In mode: you pick ONE game per player
+// each week and that game IS his week. Leave it unlocked and Sleeper
+// takes his team's LAST game of the week. This grid was summing every
+// game, which reads high in exactly the leagues where a sum can't be
+// right.
+//
+// Sleeper documents no settings flag for the mode, so the mode is found
+// two ways: scan the league's own settings for a lock-ish/best-ball key
+// (whatever they name it, if they expose it at all), and let it be set
+// by hand per league from the Week header. The hand-set answer always
+// wins and sticks on this device.
+var SL_LOCKIN_KEY = 'sk_slp_lockin_v1';
+function _slLockInMap() {
+  try { return JSON.parse(localStorage.getItem(SL_LOCKIN_KEY) || '{}') || {}; }
+  catch (e) { return {}; }
+}
+function _slLockInAuto(row) {
+  var s = null;
+  try { s = (row && row.raw && row.raw.settings) || null; } catch (e) {}
+  if (!s) return false;
+  for (var k in s) {
+    if (!Object.prototype.hasOwnProperty.call(s, k)) continue;
+    // Narrow on purpose: a bare 'lock' would catch unrelated settings and
+    // switch the mode on for leagues that don't run it.
+    var kk = String(k).toLowerCase().replace(/[^a-z]/g, '');
+    if (kk.indexOf('lockin') < 0 && kk.indexOf('bestball') < 0) continue;
+    if (s[k] === true) return true;
+    var v = parseFloat(s[k]);
+    if (!isNaN(v) && v > 0) return true;
+  }
+  return false;
+}
+function _slLockIn(row) {
+  if (!row || !row.key) return false;
+  var m = _slLockInMap(), v = m[String(row.key)];
+  if (v === 1 || v === 0) return v === 1;   // set by hand — final
+  return _slLockInAuto(row);
+}
+function slToggleLockIn(key) {
+  var row = (typeof _slpRowByKey === 'function') ? _slpRowByKey(key) : null;
+  if (!row) return;
+  var m = _slLockInMap();
+  m[String(key)] = _slLockIn(row) ? 0 : 1;
+  try { localStorage.setItem(SL_LOCKIN_KEY, JSON.stringify(m)); } catch (e) {}
+  // Re-render the same week. Every fetch behind it is cached for the
+  // session, so the flip costs no API calls.
+  var ov = null, pane = 'skExtWeekPane';
+  try {
+    if (typeof slState !== 'undefined' && slState) {
+      ov = slState._weekOv || null;
+      if (slState._weekPane) pane = slState._weekPane;
+    }
+  } catch (e2) {}
+  slLoadWeekGames(row, pane, ov ? ov.season : null, ov ? ov.week : null);
+}
+
 var _SLWG_DOW = ['S', 'M', 'T', 'W', 'T', 'F', 'S'];
 var _SLWG_ORDER = [1, 2, 3, 4, 5, 6, 0];   // Mon..Sun, JS getDay() indices
 
@@ -161701,22 +161769,34 @@ function slWeekGamesHtml(list, week, isPreview, season) {
   isPreview = !!isPreview;
   var ceiling = 0, anyGame = false, body = '', projSum = 0, anyProj = false;
   var sportSlug = 'nba';
+  var lgRow = null, lockIn = false;   // SLLOCKIN
   try {
-    var lgRow = (typeof slState !== 'undefined' && slState && slState._weekRow) ? slState._weekRow : null;
+    lgRow = (typeof slState !== 'undefined' && slState && slState._weekRow) ? slState._weekRow : null;
     if (lgRow && lgRow.sport) sportSlug = String(lgRow.sport).toLowerCase();
+    lockIn = _slLockIn(lgRow);
   } catch (e) {}
 
   for (var i = 0; i < list.length; i++) {
     var p = list[i];
     var best = null, bestIdx = -1, played = 0, sum = 0;
+    // SLLOCKIN — autoIdx is the game that counts when nothing is locked
+    // in: the last game of the week. Dates decide it; a log with no dates
+    // falls back to the order the games arrived in.
+    var autoIdx = -1, autoDate = '';
     for (var g = 0; g < p.games.length; g++) {
+      var _gd = String(p.games[g].date || '');
+      if (autoIdx < 0 || _gd >= autoDate) { autoIdx = g; autoDate = _gd; }
       var v = p.games[g].fp;
       if (v == null) continue;
       played++; sum += v;
       if (best === null || v > best) { best = v; bestIdx = g; }
     }
     if (best !== null) { ceiling += best; anyGame = true; }
-    if (p.proj != null) { projSum += p.proj; anyProj = true; }
+    // Only one game can count in lock-in, so his projection for the week
+    // is the best single game's — not every game he happens to play.
+    var pProj = lockIn ? ((p.projBest != null) ? p.projBest : p.proj) : p.proj;
+    if (pProj != null) { projSum += pProj; anyProj = true; }
+    var tot = lockIn ? best : sum;
 
     // Place each game on its weekday. Two games on one day (rare — a
     // rescheduled make-up) keep the first; the count still shows in the total.
@@ -161735,11 +161815,13 @@ function slWeekGamesHtml(list, week, isPreview, season) {
       }
       var gm = p.games[gi];
       var isBest = (gi === bestIdx);
+      var isAuto = (lockIn && gi === autoIdx);   // SLLOCKIN
       var oppTxt = gm.opp ? slEsc(String(gm.opp).toUpperCase()) : '';
       // data-slwg-team/dow let the live-week time fill find this cell. The
       // opp span is always emitted so the schedule can fill it when Sleeper's
       // log had none; the time span only matters for an unplayed game. SLWEEKTIME
-      cells += '<div class="slwg-cell' + (isBest ? ' best' : '') + '"' +
+      cells += '<div class="slwg-cell' + (isBest ? ' best' : '') + (isAuto ? ' auto' : '') + '"' +
+        (isAuto ? ' title="Counts if you never lock a game in"' : '') +
         (p.team ? ' data-slwg-team="' + slEsc(String(p.team).toUpperCase()) + '" data-slwg-dow="' + dow + '"' : '') + '>' +
         '<span class="slwg-d">' + _SLWG_DOW[dow] + '</span>' +
         '<b class="slwg-fp">' + (gm.fp == null ? '\u2014' : gm.fp.toFixed(1)) + '</b>' +
@@ -161767,23 +161849,38 @@ function slWeekGamesHtml(list, week, isPreview, season) {
         '<div class="slwg-who">' +
           '<div class="slwg-name">' + slEsc(p.name) + inj + '</div>' +
           '<div class="slwg-meta">' + (p.pos ? slEsc(p.pos) : '') + (p.team ? ' \u00b7 ' + slEsc(p.team) : '') +
-            (played ? ' \u00b7 ' + played + ' gm' : '') + '</div>' +
+            (played ? ' \u00b7 ' + played + ' gm' : '') +
+            (lockIn && played > 1 ? ' \u00b7 1 counts' : '') + '</div>' +
           (p.espnId ? '<div class="slwg-own" data-slwg-own="' + slEsc(String(p.playerId)) + '"></div>' : '') +   // SLWEEKOWN
         '</div>' +
         '<div class="slwg-right">' +
-          (p.proj != null ? '<span class="slwg-proj">proj ' + p.proj.toFixed(1) + '</span>' : '') +
-          '<b class="slwg-tot">' + (played ? (Math.round(sum * 10) / 10).toFixed(1) : '\u2014') + '</b>' +
+          (pProj != null ? '<span class="slwg-proj">proj ' + pProj.toFixed(1) + '</span>' : '') +
+          '<b class="slwg-tot' + (lockIn ? ' lock' : '') + '">' +
+            (played && tot != null ? (Math.round(tot * 10) / 10).toFixed(1) : '\u2014') + '</b>' +
         '</div>' +
       '</div>' +
       '<div class="slwg-grid">' + cells + '</div>' +
     '</div>';
   }
+  // SLLOCKIN — the mode is a guess until it's told otherwise, so it says
+  // which one it's in and can be switched right here.
+  var lkPill = (lgRow && lgRow.key)
+    ? ' <button class="slwg-lk' + (lockIn ? ' on' : '') + '" onclick="slToggleLockIn(\'' +
+        _jsStr(lgRow.key) + '\')" title="One game per player counts (Sleeper lock-in), ' +
+        'instead of the week added up">LOCK-IN ' + (lockIn ? 'ON' : 'OFF') + '</button>'
+    : '';
   var head = '<div class="slp-w-head">' +
     (isPreview ? ('PREVIEW \u00b7 ' + slEsc(String(season)) + ' Week ' + week) : ('Week ' + week)) +
     (anyGame ? ' \u00b7 best case ' + (Math.round(ceiling * 10) / 10).toFixed(1) + ' FP' : '') +
     (anyProj ? ' \u00b7 proj ' + (Math.round(projSum * 10) / 10).toFixed(1) : '') +
-    '</div><div class="slp-w-sub">Every game played this week. The best score for each player is highlighted; ' +
-    'projections are Sleeper\u2019s, scored by your league\u2019s settings.</div>';
+    lkPill +
+    '</div><div class="slp-w-sub">' +
+    (lockIn
+      ? 'Lock-in league \u2014 one game per player counts, so each total is that single game, never the week added up. ' +
+        'Gold is his best game; the dotted game is the one Sleeper takes if you never lock one in.'
+      : 'Every game played this week. The best score for each player is highlighted; ' +
+        'projections are Sleeper\u2019s, scored by your league\u2019s settings.') +
+    '</div>';
   return head + body;
 }
 
@@ -161810,6 +161907,13 @@ function slLoadWeekGames(row, paneId, ovSeason, ovWeek) {
     pane.innerHTML = '<div class="slp-w-empty">This league exposes no scoring settings.</div>';
     return;
   }
+  // SLLOCKIN — remembered so the lock-in switch can repaint this same week.
+  try {
+    if (typeof slState !== 'undefined' && slState) {
+      slState._weekPane = paneId;
+      slState._weekOv = preview ? { season: season, week: week } : null;
+    }
+  } catch (e0) {}
   var myIds = row.myTeamIds || {};
   var mine = [];
   try {
@@ -161824,11 +161928,11 @@ function slLoadWeekGames(row, paneId, ovSeason, ovWeek) {
   if (!mine.length) { pane.innerHTML = '<div class="slp-w-empty">Roster is empty.</div>'; return; }
   pane.innerHTML = '<div class="slp-w-empty">Loading week ' + week + ' game logs\u2026</div>';
   _slpPacedAll(mine, function(it) {
-    function shell(games, proj) {
+    function shell(games, proj, projBest) {
       // SLWEEKGRID — the card needs the headshot id, position, injury and a
       // per-game date/opponent to place each game on its weekday.
       return { name: it.name || String(it.playerId), slot: it.slot || '',
-        team: it.team || '', games: games, proj: proj,
+        team: it.team || '', games: games, proj: proj, projBest: projBest,   // SLLOCKIN
         playerId: it.playerId, pos: it.pos || '', inj: it.inj || '',
         starter: !!it.starter, espnId: it.espnId || null };   // SLWEEKOWN
     }
@@ -161848,15 +161952,17 @@ function slLoadWeekGames(row, paneId, ovSeason, ovWeek) {
                      opp: (ents[g] && (ents[g].opponent || ents[g].opp)) || '' });   // SLWEEKGRID
       }
       var pents = _slpGameEntries(v[1], week);
-      var proj = null;
+      var proj = null, projBest = null;   // SLLOCKIN — sum and best single game
       for (var q = 0; q < pents.length; q++) {
         var pv = _slpGameFp(pents[q], scoring);
         if (pv == null) continue;
         proj = (proj == null ? 0 : proj) + pv;
+        if (projBest == null || pv > projBest) projBest = pv;
       }
       if (proj != null) proj = Math.round(proj * 10) / 10;
-      return shell(games, proj);
-    }).catch(function() { return shell([], null); });
+      if (projBest != null) projBest = Math.round(projBest * 10) / 10;
+      return shell(games, proj, projBest);
+    }).catch(function() { return shell([], null, null); });
   }, 3).then(function(list) {
     var p2 = document.getElementById(paneId);
     if (p2) {
