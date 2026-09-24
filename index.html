@@ -24513,6 +24513,11 @@
     margin-top: 6px;
   }
   /* NFL projected-margin banner + source note */
+  /* NFLSSNFP — season total next to a starter's name */
+  .sk-h2h-ssn { font-family: var(--sk-font-mono, monospace); font-size: 10px; font-weight: 600;
+    color: var(--sk-text-4, rgba(255,255,255,0.4)); margin-left: 6px; white-space: nowrap; }
+  .sk-h2h-ssn i { font-style: normal; font-size: 7.5px; letter-spacing: 0.08em; margin-left: 2px; opacity: 0.75; }
+  .sk-h2h-side.opp .sk-h2h-ssn { margin-left: 0; margin-right: 6px; }
   .sk-nflmu-margin {
     margin-top: 12px; padding: 7px 10px; border-radius: 9px;
     font-family: var(--sk-font-mono); font-size: 11px; font-weight: 800;
@@ -117498,6 +117503,29 @@ function _skPairNflStarters(mine, opp) {
   return pairs;
 }
 
+// ── NFLSSNFP ── Season-to-date fantasy points for each starter.
+// The week's FP is the big number; this is the season total next to the
+// name, so a 0.0 before kickoff still tells you who you're starting.
+// One roster call per team with season stats, held for the session.
+var _skNflSeasonFp = {};   // teamKey -> { playerKey: fp }
+function _skNflSeasonFpFor(teamKey) {
+  if (!teamKey) return Promise.resolve({});
+  if (_skNflSeasonFp[teamKey]) return Promise.resolve(_skNflSeasonFp[teamKey]);
+  return fyApi('/team/' + teamKey + '/roster/players/stats;type=season').then(function (res) {
+    var out = {};
+    if (res && !res.error && typeof _parseTeamFpResponse === 'function') {
+      var m = _parseTeamFpResponse(res) || {};
+      Object.keys(m).forEach(function (k) {
+        if (k === '_ts') return;
+        var v = m[k] && m[k].fp;
+        if (typeof v === 'number' && !isNaN(v)) out[k] = v;
+      });
+    }
+    _skNflSeasonFp[teamKey] = out;
+    return out;
+  }, function () { return {}; });
+}
+
 function _skBuildNflH2hHTML(pairs, week, statsMeta) {
   if (!pairs || !pairs.length) {
     return '<div class="sk-day-totals-empty">Lineups not available for Week ' + week + ' yet.</div>';
@@ -117528,8 +117556,11 @@ function _skBuildNflH2hHTML(pairs, week, statsMeta) {
     // quieter than a placeholder dash on every player who hasn't played.
     var _line = '';
     try { _line = _skBuildNflStatLine(pl.stats, _meta, pl.slot, 3) || ''; } catch (e) {}
+    // NFLSSNFP — season total beside the name, quiet and small.
+    var _ssn = (typeof pl.seasonFp === 'number' && !isNaN(pl.seasonFp))
+      ? '<span class="sk-h2h-ssn">' + pl.seasonFp.toFixed(1) + '<i>SZN</i></span>' : '';
     return '<div class="sk-h2h-side' + (isOpp ? ' opp' : '') + (win ? ' win' : '') + '">' +
-      '<div class="sk-h2h-name">' + skEscape(_skAbbrevName(pl.name)) + '</div>' +
+      '<div class="sk-h2h-name">' + skEscape(_skAbbrevName(pl.name)) + _ssn + '</div>' +
       '<div class="sk-h2h-sub">' + _sub + '</div>' +
       '<div class="sk-h2h-fp">' + pl.fp.toFixed(1) + '</div>' +
       (_line ? '<div class="sk-h2h-line">' + skEscape(_line) + '</div>' : '') +
@@ -117579,10 +117610,16 @@ function _skHydrateNflH2h(league, week, leagueKeyAtStart) {
   Promise.all([
     fetchTeamFpForWeek(myKey, week, cw),
     fetchTeamFpForWeek(oppKey, week, cw),
-    settingsP
+    settingsP,
+    _skNflSeasonFpFor(myKey),    // NFLSSNFP
+    _skNflSeasonFpFor(oppKey)
   ]).then(function(res) {
     if (skState.activeLeagueKey !== leagueKeyAtStart) return;
-    var pairs = _skPairNflStarters(_skNflActiveStarters(res[0]), _skNflActiveStarters(res[1]));
+    var mineS = _skNflActiveStarters(res[0]), oppS = _skNflActiveStarters(res[1]);
+    var ssnA = res[3] || {}, ssnB = res[4] || {};
+    mineS.forEach(function (p) { if (ssnA[p.playerKey] != null) p.seasonFp = ssnA[p.playerKey]; });
+    oppS.forEach(function (p) { if (ssnB[p.playerKey] != null) p.seasonFp = ssnB[p.playerKey]; });
+    var pairs = _skPairNflStarters(mineS, oppS);
     _skNflH2hState = {
       pairs: pairs,
       statsMeta: (res[2] && res[2].stats) || {},
