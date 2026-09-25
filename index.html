@@ -145038,8 +145038,13 @@ async function fyGetToken() {
 // ══════════════════════════════════════════════════════════════════
 var _fyHealth = { log: [], max: 60 };
 
-function _fyHealthRecord(kind, status, path, errText) {
-  _fyHealth.log.push({ t: Date.now(), kind: kind, status: status || 0, path: path || '', err: errText ? String(errText).slice(0, 400) : '' });
+function _fyHealthRecord(kind, status, path, errText, ms) {
+  // ms — how long the call was on the wire before it failed. The single
+  // most useful number for telling causes apart: an instant failure means
+  // the connection was refused outright, while one that dies after seconds
+  // was accepted and then dropped. FYHMS
+  _fyHealth.log.push({ t: Date.now(), kind: kind, status: status || 0, path: path || '',
+    err: errText ? String(errText).slice(0, 400) : '', ms: (ms != null ? ms : null) });
   if (_fyHealth.log.length > _fyHealth.max) _fyHealth.log.shift();
   _fyHealthUpdateDot();
 }
@@ -145095,6 +145100,45 @@ function _fyHealthUpdateDot() {
   }
 }
 
+// ── FYHPING ── Is the proxy itself reachable, right now?
+// "Failed to fetch" hides two different worlds: the request never left the
+// device, or the Worker answered in a way the browser threw away (an error
+// page carries no CORS headers, and that is indistinguishable from a dead
+// connection). One tiny unauthenticated GET separates them — ANY status
+// coming back, 401 included, proves the Worker is up and CORS is intact,
+// which moves the suspicion onto the individual call instead.
+function _fyPingWorker() {
+  var out = document.getElementById('_fyPingOut');
+  if (out) out.innerHTML = '<span style="color:#94a3b8">testing\u2026</span>';
+  var t0 = Date.now();
+  fetch(YAHOO_WORKER + '/api/users;use_login=1').then(function (r) {
+    var ms = Date.now() - t0;
+    if (!out) return;
+    out.innerHTML = '<span style="color:#4ade80">Worker answered HTTP ' + r.status + ' in ' + ms + 'ms</span>' +
+      '<div style="color:#64748b;margin-top:3px">Any status here \u2014 401 included \u2014 means the proxy is up and CORS is intact, ' +
+      'so the failures are about those particular calls, not the Worker.</div>';
+  }, function (e) {
+    // The same request again with CORS switched off. An opaque answer still
+    // proves the Worker responded — which would mean the failures are a
+    // MISSING CORS HEADER on its response, not a dead connection. The two
+    // look identical from the app, and they need opposite fixes.
+    var msg = skEscapeMaybe((e && e.message) || 'failed');
+    fetch(YAHOO_WORKER + '/api/users;use_login=1', { mode: 'no-cors' }).then(function () {
+      var ms2 = Date.now() - t0;
+      if (!out) return;
+      out.innerHTML = '<span style="color:#f59e0b">The Worker answered in ' + ms2 + 'ms, but the browser threw the answer away</span>' +
+        '<div style="color:#64748b;margin-top:3px">The proxy is up and reachable \u2014 that response came back without the ' +
+        'CORS header, which the app can only ever see as \u201c' + msg + '\u201d. The fix is on the Worker, not the network.</div>';
+    }, function () {
+      var ms3 = Date.now() - t0;
+      if (!out) return;
+      out.innerHTML = '<span style="color:#ef4444">No answer at all after ' + ms3 + 'ms (' + msg + ')</span>' +
+        '<div style="color:#64748b;margin-top:3px">The proxy is unreachable from this device: connectivity, or the Worker itself ' +
+        'is down or out of quota.</div>';
+    });
+  });
+}
+
 // Tap the health dot / refresh area to see a quick breakdown overlay.
 function skShowApiHealth() {
   var s2 = _fyHealthSummary(120000);
@@ -145111,7 +145155,7 @@ function skShowApiHealth() {
   var verdict;
   if (s2.auth > 0) verdict = '<span style="color:#ef4444">Auth errors \u2014 see the status below. A 401 means the token was rejected and re-auth fixes it. A 403 means Yahoo is refusing the APPLICATION itself, and re-authing will NOT help \u2014 check the app\u2019s Fantasy permission at developer.yahoo.com.</span>';
   else if (s2.ratelimit > 0) verdict = '<span style="color:#f59e0b">Rate-limited (429/999) \u2014 too many calls too fast. Waiting a few minutes should restore it; throttling league-switches would prevent it.</span>';
-  else if (s2.network > 0) verdict = '<span style="color:#f59e0b">Connection failures (\u201cFailed to fetch\u201d) \u2014 requests aren\u2019t reaching the server. This is a network/Worker blip, NOT rate-limiting or auth. The app now auto-retries these; if it persists, it\u2019s connectivity or the Worker being down.</span>';
+  else if (s2.network > 0) verdict = '<span style="color:#f59e0b">Connection failures (\u201cFailed to fetch\u201d) \u2014 requests aren\u2019t reaching the server. NOT rate-limiting and not auth. Each one is retried once, and a run of them puts retries on hold for a minute rather than hammering a dead connection. A long run on one endpoint usually means too many heavy calls at once; a run across every endpoint means connectivity or the Worker. \u201cTest the proxy\u201d below settles which.</span>';
   else if (s2.other > 0) verdict = '<span style="color:#f59e0b">Errors landing in \u201cOther\u201d \u2014 the proxy is returning something that isn\u2019t a clean 401/429/999. See the details below to identify the real status the Worker is sending back.</span>';
   else if (s2.timeout >= 2) verdict = '<span style="color:#f59e0b">Timeouts \u2014 calls aren\u2019t returning in 15s. Usually network/proxy, not Yahoo throttling.</span>';
   else verdict = '<span style="color:#4ade80">Healthy \u2014 no recent errors.</span>';
@@ -145126,7 +145170,8 @@ function skShowApiHealth() {
       var ago = Math.round((Date.now() - e.t) / 1000);
       var shortPath = e.path.length > 48 ? ('\u2026' + e.path.slice(-46)) : e.path;
       errBlock += '<div style="background:#0d1220;border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:8px;margin:4px 0;font-size:10px">' +
-        '<div style="color:#fbbf24">' + e.kind + (e.status ? ' \u00b7 HTTP ' + e.status : '') + ' \u00b7 ' + ago + 's ago</div>' +
+        '<div style="color:#fbbf24">' + e.kind + (e.status ? ' \u00b7 HTTP ' + e.status : '') + ' \u00b7 ' + ago + 's ago' +
+          (e.ms != null ? ' \u00b7 died after ' + (e.ms < 1000 ? e.ms + 'ms' : (e.ms / 1000).toFixed(1) + 's') : '') + '</div>' +
         (e.err ? '<div style="color:#cbd5e1;margin-top:3px;word-break:break-word">' + skEscapeMaybe(e.err) + '</div>' : '') +
         '<div style="color:#64748b;margin-top:3px;word-break:break-word">' + skEscapeMaybe(shortPath) + '</div>' +
       '</div>';
@@ -145144,6 +145189,12 @@ function skShowApiHealth() {
     row('\ud83d\udce1 Connection (failed to fetch)', s2.network, s2.network?'#f59e0b':'#64748b') +
     row('\u23f1\ufe0f Timeout', s2.timeout, s2.timeout?'#f59e0b':'#64748b') +
     row('\u2753 Other', s2.other, s2.other?'#f59e0b':'#64748b') +
+    // FYHPING — one tap, one unauthenticated call, a straight answer.
+    '<div style="margin:14px 0 4px">' +
+      '<button onclick="_fyPingWorker()" style="padding:8px 12px;border-radius:8px;border:1px solid rgba(255,255,255,0.2);' +
+      'background:#0d1220;color:#e2e8f0;font-family:inherit;font-size:11px;font-weight:700;letter-spacing:0.06em">TEST THE PROXY</button>' +
+      '<div id="_fyPingOut" style="font-size:10px;margin-top:6px;line-height:1.5"></div>' +
+    '</div>' +
     errBlock +
     '<div style="color:#94a3b8;font-size:11px;margin:16px 0 4px">Last 10 minutes (' + s10.total + ' calls)</div>' +
     row('\u2705 OK', s10.ok, '#4ade80') +
@@ -146241,6 +146292,7 @@ async function _fyApiOnce(path) {
   }
   if (fyDataCache[path] && fyDataCache[path].t > Date.now() - 60000) return fyDataCache[path].d;
   await _fyPace();   // cache hits above are free; only real requests are paced
+  var _fyT0 = Date.now();   // FYHMS
   try {
     var controller = new AbortController();
     var timeout = setTimeout(function() { controller.abort(); }, 15000);
@@ -146305,7 +146357,7 @@ async function _fyApiOnce(path) {
       _fyFetchedAt._global = Date.now();
       var _lkM = path.match(/(\d+\.l\.\d+)/);
       if (_lkM) _fyFetchedAt[_lkM[1]] = Date.now();
-      _fyHealthRecord('ok', res.status, path);
+      _fyHealthRecord('ok', res.status, path, '', Date.now() - _fyT0);
       return data;
     } catch(e) {
       _fyHealthRecord('other', res.status, path, 'Bad JSON: ' + text.slice(0, 200));
@@ -146313,7 +146365,7 @@ async function _fyApiOnce(path) {
     }
   } catch(e) {
     if (e.name === 'AbortError') {
-      _fyHealthRecord('timeout', 0, path);
+      _fyHealthRecord('timeout', 0, path, '', Date.now() - _fyT0);
       return { error: 'Request timed out after 15s' };
     }
     // "Failed to fetch" / TypeError = the request never reached the Worker or
@@ -146321,7 +146373,7 @@ async function _fyApiOnce(path) {
     // handoff). This is NOT rate-limit or auth. Classify it distinctly so it's
     // legible, and let the retry wrapper handle recovery.
     var isNetwork = (e.name === 'TypeError') || /failed to fetch|network|load failed/i.test(e.message || '');
-    _fyHealthRecord(isNetwork ? 'network' : 'other', 0, path, e.message);
+    _fyHealthRecord(isNetwork ? 'network' : 'other', 0, path, e.message, Date.now() - _fyT0);
     return { error: e.message, _network: isNetwork };
   }
 }
@@ -146379,25 +146431,82 @@ function fySetPaused(on) {
 
 function skToggleYahooPause() { fySetPaused(!fyIsPaused()); }
 
+// ── FYGATE ── A ceiling on how many Yahoo calls are in the air at once.
+//
+// The 120ms pacer controls how fast requests START, not how many are
+// OUTSTANDING. The Wire scan, the daily bank and the FP prefetch each walk
+// the whole league list, so on a 29-league account a slow stretch lets
+// twenty-odd large roster requests pile up unfinished — and a pile that
+// size doesn't come back rate-limited, it comes back not at all: the
+// browser stops opening connections and every one of them surfaces as
+// "Failed to fetch". That is the shape of a 27-in-one-second run in the
+// health panel, all on the same heavy endpoint.
+//
+// The cap turns the pile into a queue. Nothing is dropped and nothing is
+// skipped; the work simply arrives in order, a few at a time.
+var FY_MAX_INFLIGHT = 5;
+var _fyInflight = 0, _fyWaitQ = [];
+function _fyGateEnter() {
+  if (_fyInflight < FY_MAX_INFLIGHT) { _fyInflight++; return Promise.resolve(); }
+  return new Promise(function (resolve) { _fyWaitQ.push(resolve); });
+}
+function _fyGateLeave() {
+  var next = _fyWaitQ.shift();
+  if (next) { next(); return; }        // hand the slot straight to the next caller
+  if (_fyInflight > 0) _fyInflight--;
+}
+
+// ── FYNETBRK ── Retry a dropped call once, but know when to stop.
+// One quiet retry rescues a blip. Retrying every call when the connection
+// itself is gone just triples the damage and fills the panel with noise,
+// so eight network failures inside thirty seconds puts retries on hold for
+// a minute. Calls still go out during the hold — they just fail once
+// instead of twice.
+var _fyNetFails = [], _fyNetPauseUntil = 0;
+function _fyNetNoted() {
+  var now = Date.now();
+  _fyNetFails.push(now);
+  while (_fyNetFails.length && (now - _fyNetFails[0]) > 30000) _fyNetFails.shift();
+  if (_fyNetFails.length >= 8) { _fyNetPauseUntil = now + 60000; _fyNetFails.length = 0; }
+}
+function _fyNetCalm() { return Date.now() >= _fyNetPauseUntil; }
+
 async function fyApi(path) {
   // Short-circuit BEFORE the token lookup, so a paused Yahoo triggers no
   // network at all — not even a refresh. Shaped like any other failed
   // call, which every caller already handles.
   if (fyIsPaused()) return { error: 'Yahoo paused', _paused: true };
-  var result = await _fyApiOnce(path);
-  if (result && result.error && result._server) {
-    // Transient 5xx — wait briefly, then try exactly once more.
-    await new Promise(function(resolve){ setTimeout(resolve, 700); });
-    var retry = await _fyApiOnce(path);
-    if (!retry || !retry.error) return retry; // recovered — logged as a clean "ok"
-    // Retry also failed. NOW log the failure to health so it's visible, using
-    // the retry's status/body, then surface the error.
-    if (retry._server) {
-      _fyHealthRecord('other', retry._status || 0, path, 'HTTP ' + (retry._status || '') + ' (after retry): ' + (retry._body || ''));
+  await _fyGateEnter();   // FYGATE
+  try {
+    var result = await _fyApiOnce(path);
+    if (result && result.error && result._server) {
+      // Transient 5xx — wait briefly, then try exactly once more.
+      await new Promise(function(resolve){ setTimeout(resolve, 700); });
+      var retry = await _fyApiOnce(path);
+      if (!retry || !retry.error) return retry; // recovered — logged as a clean "ok"
+      // Retry also failed. NOW log the failure to health so it's visible, using
+      // the retry's status/body, then surface the error.
+      if (retry._server) {
+        _fyHealthRecord('other', retry._status || 0, path, 'HTTP ' + (retry._status || '') + ' (after retry): ' + (retry._body || ''));
+      }
+      return retry;
     }
-    return retry;
+    // FYNETBRK — the connection dropped. One retry, unless the breaker says
+    // the connection is plainly down.
+    if (result && result.error && result._network) {
+      _fyNetNoted();
+      if (_fyNetCalm()) {
+        await new Promise(function(resolve){ setTimeout(resolve, 600); });
+        var again = await _fyApiOnce(path);
+        if (!again || !again.error) return again;   // recovered
+        if (again._network) _fyNetNoted();
+        return again;
+      }
+    }
+    return result;
+  } finally {
+    _fyGateLeave();   // FYGATE
   }
-  return result;
 }
 
 // Retry wrapper for network failures (the "Failed to fetch" case — transient
