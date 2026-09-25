@@ -145139,6 +145139,81 @@ function _fyPingWorker() {
   });
 }
 
+// ── FYPROBE ── Run the failing call four ways and read the pattern.
+//
+// "Failed to fetch" is the browser refusing to tell us why, and the four
+// candidates need opposite fixes. The difference between them is visible
+// only by varying ONE thing at a time on the very call that's failing:
+//
+//   no auth, CORS      — a plain GET. No Authorization header means no
+//                        preflight, so this is the route on its own.
+//   with token, CORS   — the real call. The Authorization header forces a
+//                        preflight OPTIONS round trip first.
+//   no-cors, no auth   — completes even when the answer carries no CORS
+//                        header, so it proves reachability by itself.
+//
+// Route fine but the authorized one dies → the preflight is being refused.
+// Everything fails → nothing is completing, connection level. no-cors alone
+// succeeds → the Worker is answering without the CORS header. All pass →
+// the failure only happens under load, which points back at the burst.
+function _fyProbeLastFailure() {
+  var out = document.getElementById('_fyProbeOut');
+  var errs = _fyHealthRecentErrors(25), path = '';
+  for (var i = 0; i < errs.length; i++) {
+    if (errs[i].kind === 'network' && errs[i].path) { path = errs[i].path; break; }
+  }
+  if (!path) {
+    if (out) out.innerHTML = '<span style="color:#94a3b8">No connection failure logged yet \u2014 nothing to re-run.</span>';
+    return;
+  }
+  var url = YAHOO_WORKER + '/api' + path;
+  var lines = ['<div style="color:#64748b;word-break:break-word">' +
+    skEscapeMaybe(path.length > 58 ? ('\u2026' + path.slice(-56)) : path) + '</div>'];
+  function say(html) { lines.push(html); if (out) out.innerHTML = lines.join(''); }
+  say('<div style="color:#94a3b8">running\u2026</div>');
+  lines.splice(1, 1);
+  function timed(label, opts) {
+    var t0 = Date.now();
+    return fetch(url, opts).then(function (r) {
+      say('<div style="color:#4ade80">' + label + ': ' +
+        (r.type === 'opaque' ? 'answered (opaque)' : 'HTTP ' + r.status) +
+        ' in ' + (Date.now() - t0) + 'ms</div>');
+      return true;
+    }, function () {
+      say('<div style="color:#ef4444">' + label + ': failed after ' + (Date.now() - t0) + 'ms</div>');
+      return false;
+    });
+  }
+  var plain = false, authed = false, opaque = false;
+  timed('no auth, CORS', {}).then(function (a) {
+    plain = a;
+    return fyGetToken();
+  }).then(function (tok) {
+    if (!tok) { say('<div style="color:#f59e0b">with token: no token available</div>'); return false; }
+    return timed('with token, CORS', { headers: { 'Authorization': 'Bearer ' + tok } });
+  }).then(function (b) {
+    authed = b;
+    return timed('no-cors, no auth', { mode: 'no-cors' });
+  }).then(function (c) {
+    opaque = c;
+    var v;
+    if (authed) {
+      v = 'It went through this time. The call itself is fine, so the failures happen only under load \u2014 ' +
+          'a burst thing, not this endpoint.';
+    } else if (plain) {
+      v = 'The route answers unauthenticated but dies with the token attached. The Authorization header forces a ' +
+          'CORS preflight, and that preflight is what\u2019s being refused \u2014 a Worker/edge fix, not connectivity.';
+    } else if (opaque) {
+      v = 'It only completes with CORS switched off, so the server IS answering and the answer arrives without the ' +
+          'CORS header. The browser can only ever show that as \u201cFailed to fetch\u201d. Fix belongs on the Worker.';
+    } else {
+      v = 'Nothing completes, any way it\u2019s asked. That\u2019s connection level \u2014 this device to Cloudflare \u2014 ' +
+          'not something the app or the Worker can work around.';
+    }
+    say('<div style="color:#e2e8f0;margin-top:6px;border-top:1px solid rgba(255,255,255,0.1);padding-top:6px">' + v + '</div>');
+  });
+}
+
 // Tap the health dot / refresh area to see a quick breakdown overlay.
 function skShowApiHealth() {
   var s2 = _fyHealthSummary(120000);
@@ -145189,11 +145264,17 @@ function skShowApiHealth() {
     row('\ud83d\udce1 Connection (failed to fetch)', s2.network, s2.network?'#f59e0b':'#64748b') +
     row('\u23f1\ufe0f Timeout', s2.timeout, s2.timeout?'#f59e0b':'#64748b') +
     row('\u2753 Other', s2.other, s2.other?'#f59e0b':'#64748b') +
+    (_fyPathColdCount() ? row('\ud83e\uddca Set aside (repeat failures)', _fyPathColdCount(), '#7dd3fc') : '') +
     // FYHPING — one tap, one unauthenticated call, a straight answer.
     '<div style="margin:14px 0 4px">' +
       '<button onclick="_fyPingWorker()" style="padding:8px 12px;border-radius:8px;border:1px solid rgba(255,255,255,0.2);' +
       'background:#0d1220;color:#e2e8f0;font-family:inherit;font-size:11px;font-weight:700;letter-spacing:0.06em">TEST THE PROXY</button>' +
       '<div id="_fyPingOut" style="font-size:10px;margin-top:6px;line-height:1.5"></div>' +
+      // FYPROBE — re-run the call that actually failed, four ways.
+      '<button onclick="_fyProbeLastFailure()" style="margin-top:8px;padding:8px 12px;border-radius:8px;' +
+      'border:1px solid rgba(255,255,255,0.2);background:#0d1220;color:#e2e8f0;font-family:inherit;font-size:11px;' +
+      'font-weight:700;letter-spacing:0.06em">DIAGNOSE LAST FAILURE</button>' +
+      '<div id="_fyProbeOut" style="font-size:10px;margin-top:6px;line-height:1.5"></div>' +
     '</div>' +
     errBlock +
     '<div style="color:#94a3b8;font-size:11px;margin:16px 0 4px">Last 10 minutes (' + s10.total + ' calls)</div>' +
@@ -146462,6 +146543,30 @@ function _fyGateLeave() {
 // so eight network failures inside thirty seconds puts retries on hold for
 // a minute. Calls still go out during the hold — they just fail once
 // instead of twice.
+// ── FYPATHCD ── Stop a background sweep grinding on a call that keeps
+// dying. Three network failures on the SAME path and it's set aside for
+// ten minutes: whatever is wrong, hammering it won't fix it, and a loop
+// like that buries every other error in the panel. A success clears the
+// record immediately.
+var _fyPathFail = {};
+function _fyPathNote(path, ok) {
+  if (ok) { if (_fyPathFail[path]) delete _fyPathFail[path]; return; }
+  var e = _fyPathFail[path] || (_fyPathFail[path] = { n: 0, until: 0 });
+  e.n++;
+  if (e.n >= 3) { e.until = Date.now() + 600000; e.n = 0; }
+}
+function _fyPathCold(path) {
+  var e = _fyPathFail[path];
+  return !!(e && e.until && Date.now() < e.until);
+}
+function _fyPathColdCount() {
+  var n = 0, now = Date.now();
+  for (var k in _fyPathFail) {
+    if (_fyPathFail.hasOwnProperty(k) && _fyPathFail[k].until > now) n++;
+  }
+  return n;
+}
+
 var _fyNetFails = [], _fyNetPauseUntil = 0;
 function _fyNetNoted() {
   var now = Date.now();
@@ -146476,6 +146581,8 @@ async function fyApi(path) {
   // network at all — not even a refresh. Shaped like any other failed
   // call, which every caller already handles.
   if (fyIsPaused()) return { error: 'Yahoo paused', _paused: true };
+  // FYPATHCD — this exact call has failed repeatedly; don't queue it again.
+  if (_fyPathCold(path)) return { error: 'Set aside after repeated connection failures', _network: true, _cold: true };
   await _fyGateEnter();   // FYGATE
   try {
     var result = await _fyApiOnce(path);
@@ -146498,11 +146605,14 @@ async function fyApi(path) {
       if (_fyNetCalm()) {
         await new Promise(function(resolve){ setTimeout(resolve, 600); });
         var again = await _fyApiOnce(path);
-        if (!again || !again.error) return again;   // recovered
-        if (again._network) _fyNetNoted();
+        if (!again || !again.error) { _fyPathNote(path, true); return again; }   // recovered
+        if (again._network) { _fyNetNoted(); _fyPathNote(path, false); }
         return again;
       }
+      _fyPathNote(path, false);   // FYPATHCD
+      return result;
     }
+    if (!result || !result.error) _fyPathNote(path, true);
     return result;
   } finally {
     _fyGateLeave();   // FYGATE
