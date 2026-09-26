@@ -117367,6 +117367,31 @@ function skProbeFantraxMatchups() {
             say('home: ' + g.home + ' [' + g.homeId + ']   score: ' + g.homeScore +
                 '   rec: ' + (g.homeRec == null ? '(none)' : g.homeRec) +
                 '   gp: ' + (g.homeGp == null ? '(none)' : g.homeGp));
+            // The reader drops a category with no value and no points, which
+            // is every category before a game has been played. Report the
+            // side objects raw either way — their keys are the last thing
+            // about this payload that is still a guess. FXMATCHPROBE2
+            try {
+              var rawCats = (lst[0] || {}).categories;
+              if (Object.prototype.toString.call(rawCats) === '[object Array]' && rawCats.length) {
+                var c0 = rawCats[0] || {};
+                var ck = [];
+                for (var ckk in c0) { if (c0.hasOwnProperty(ckk)) ck.push(ckk); }
+                say('category entry keys: ' + ck.join(' '));
+                var filled = null, fi;
+                for (fi = 0; fi < rawCats.length; fi++) {
+                  var ce = rawCats[fi] || {}, sideA = ce.away || {};
+                  var nk = 0, kk;
+                  for (kk in sideA) { if (sideA.hasOwnProperty(kk)) nk++; }
+                  if (nk) { filled = ce; break; }
+                }
+                if (filled) {
+                  say('first filled category: ' + JSON.stringify(filled));
+                } else {
+                  say('all category sides are empty {} \u2014 nothing played yet');
+                }
+              }
+            } catch (eCat) {}
             if (!g.cats) say('categories: (none parsed)');
             else {
               say('categories: ' + g.cats.length);
@@ -162970,9 +162995,21 @@ function _fxShapeKeys(data) {
 //     for "count best players" leagues, where the per-category numbers do
 //     not add up to the adjusted team total.
 //
-// The names above are documented; how the array is nested is not, so the
-// reader below accepts the shapes it could plausibly take and the raw probe
-// settles it from an actual response rather than another guess.
+// The raw probe settled the nesting against live leagues. A matchup is:
+//
+//   { away: { teamName, teamId, score, gamesPlayed,
+//             categoryWins, categoryLosses, categoryTies },
+//     home: { ...the same... },
+//     categories: [ { name, shortName, group, away: {}, home: {} } ] }
+//
+// — so the sides are teamName/teamId rather than name/id, categories hangs
+// off the matchup with a side object inside each entry, and each entry also
+// carries a short label and the group it belongs to ("Skaters", "Goalies",
+// "Player"). What is inside those side objects is still unknown, because
+// every league read was in its preseason with nothing played: they came
+// back as {}. The reader accepts the plausible spellings for the value,
+// the display string, the points and the outcome, and the probe now reports
+// those keys the moment a game fills them in.
 // ── FMSKIP ── One level deeper than _fxShapeKeys.
 //
 // getMatchupScores has been parsed against guessed field names, and the
@@ -163057,9 +163094,20 @@ function _fxCatResult(o) {
 function _fxCatRows(m, a, h) {
   try {
     var isArr = function (x) { return Object.prototype.toString.call(x) === '[object Array]'; };
-    var nameOf = function (o) {
-      var v = _fxPick(o, ['name', 'category', 'categoryName', 'abbr',
-                          'abbreviation', 'shortName', 'scoringCategory', 'label']);
+    // The label the panel shows is the short one — "PIM", not "Penalty
+    // Minutes", which has a 64px column to live in. The long name is kept
+    // for the tooltip.
+    var shortOf = function (o) {
+      var v = _fxPick(o, ['shortName', 'abbr', 'abbreviation', 'code', 'shortLabel']);
+      if (v == null) v = _fxPick(o, ['name', 'category', 'categoryName', 'label']);
+      return v == null ? '' : String(v);
+    };
+    var longOf = function (o) {
+      var v = _fxPick(o, ['name', 'categoryName', 'fullName', 'label', 'description']);
+      return v == null ? '' : String(v);
+    };
+    var groupOf = function (o) {
+      var v = _fxPick(o, ['group', 'groupName', 'statGroup', 'section']);
       return v == null ? '' : String(v);
     };
     var sideOf = function (o, pref) {
@@ -163095,7 +163143,7 @@ function _fxCatRows(m, a, h) {
         var c = list[i] || {};
         var A = sideOf(c, 'away'), H = sideOf(c, 'home');
         if (A.value == null && H.value == null && A.points == null && H.points == null) continue;
-        out.push({ name: nameOf(c), away: A, home: H });
+        out.push({ name: shortOf(c), longName: longOf(c), group: groupOf(c), away: A, home: H });
       }
       return out;
     }
@@ -163109,8 +163157,11 @@ function _fxCatRows(m, a, h) {
     function take(lst, key) {
       for (j = 0; j < (lst || []).length; j++) {
         var o = lst[j] || {};
-        nm = nameOf(o) || ('#' + j);
-        if (!byName[nm]) { byName[nm] = { name: nameOf(o), away: {}, home: {} }; order.push(nm); }
+        nm = shortOf(o) || ('#' + j);
+        if (!byName[nm]) {
+          byName[nm] = { name: shortOf(o), longName: longOf(o), group: groupOf(o), away: {}, home: {} };
+          order.push(nm);
+        }
         byName[nm][key] = {
           value: _fxPick(o, ['value', 'score', 'total', 'stat', 'statValue']),
           display: _fxPick(o, ['display', 'displayValue', 'formatted', 'formattedValue']),
@@ -163133,6 +163184,7 @@ function _fxCatRows(m, a, h) {
 // getLeagueInfo; scoringPeriods lists them with their date ranges.
 function _fxLoadMatchupScores(row, period, cb) {
   if (!row) { if (cb) cb(false); return; }
+  if (row.noMatchupScores) { if (cb) cb(false); return; }   // FXNOH2H
   var id = String(row.key || '').slice(4);
   if (!id) { if (cb) cb(false); return; }
   var url = 'https://www.fantrax.com/fxea/general/getMatchupScores?leagueId=' + encodeURIComponent(id);
@@ -163143,6 +163195,14 @@ function _fxLoadMatchupScores(row, period, cb) {
       fxState.rawScores = fxState.rawScores || {};
       fxState.rawScores[id] = data;   // kept for the raw probe
     } catch (e) {}
+    // A rotisserie or season-points league answers with an error envelope:
+    // "Matchup scores are only available for head-to-head leagues." Worth
+    // remembering rather than asking again every time. FXNOH2H
+    if (data && data.error && !data.matchups) {
+      row.noMatchupScores = (data.error.message || 'No matchup scores for this league.');
+      if (cb) cb(false);
+      return;
+    }
     var parsed = _fxExtractMatchupScores(data);
     if (parsed) {
       row.liveScores = parsed;
@@ -167419,6 +167479,10 @@ function _fxCellText(side) {
 }
 function _fxMatchupPanelHtml(row, myIds, accent) {
   try {
+    if (row && row.noMatchupScores && !(row.liveScores && row.liveScores.games)) {
+      return '<div style="color:rgba(255,255,255,0.4);font-size:12px;padding:2px 0 10px;">' +
+        slEsc(String(row.noMatchupScores)) + '</div>';   // FXNOH2H
+    }
     var lp = row && row.liveScores;
     if (!lp || !lp.games || !lp.games.length) return '';
     var g = null, i;
@@ -167463,9 +167527,25 @@ function _fxMatchupPanelHtml(row, myIds, accent) {
       if (g.cats[i][meKey] && g.cats[i][meKey].points != null) anyPts = true;
       if (g.cats[i][meKey] && g.cats[i][meKey].result) anyRes = true;
     }
+    // "Skaters" and "Goalies" come back on every category, and a hockey
+    // league has both. Only worth a heading when there is more than one.
+    var groups = {}, gCount = 0;
+    for (i = 0; i < g.cats.length; i++) {
+      var gn = (g.cats[i] || {}).group || '';
+      if (gn && !groups[gn]) { groups[gn] = 1; gCount++; }
+    }
+    var lastGroup = null, headed = false;
     var rows = '', mePtsTot = 0, opPtsTot = 0, ptsSeen = false;
     for (i = 0; i < g.cats.length; i++) {
       var cat = g.cats[i] || {};
+      headed = false;
+      if (gCount > 1 && cat.group && cat.group !== lastGroup) {
+        lastGroup = cat.group;
+        headed = true;   // the heading draws the rule, so the row below skips it
+        rows += '<div style="font-size:9px;letter-spacing:0.12em;color:rgba(255,255,255,0.28);' +
+          'padding:8px 0 2px;border-top:1px solid rgba(255,255,255,0.05);">' +
+          slEsc(String(cat.group).toUpperCase()) + '</div>';
+      }
       var mine = cat[meKey] || {}, theirs = cat[opKey] || {};
       var res = mine.result || '';
       var win = res === 'W', lose = res === 'L';
@@ -167474,12 +167554,15 @@ function _fxMatchupPanelHtml(row, myIds, accent) {
       var mp = _fxNum(mine.points), op = _fxNum(theirs.points);
       if (mp != null) { mePtsTot += mp; ptsSeen = true; }
       if (op != null) { opPtsTot += op; ptsSeen = true; }
-      rows += '<div style="display:flex;align-items:center;gap:8px;padding:5px 0;border-top:1px solid rgba(255,255,255,0.05);font-size:12px;">' +
+      rows += '<div style="display:flex;align-items:center;gap:8px;padding:5px 0;' +
+        (headed ? '' : 'border-top:1px solid rgba(255,255,255,0.05);') + 'font-size:12px;">' +
         '<span style="flex:1;text-align:right;font-family:monospace;font-weight:' + (win ? '800' : '500') + ';color:' + meCol + ';">' +
           slEsc(_fxCellText(mine)) +
           (mp != null && anyPts ? '<span style="color:rgba(255,255,255,0.3);font-size:9.5px;"> ' + slEsc(String(Math.round(mp * 100) / 100)) + '</span>' : '') +
         '</span>' +
-        '<span style="width:64px;text-align:center;font-size:9.5px;letter-spacing:0.08em;color:' + dim + ';flex-shrink:0;">' +
+        '<span title="' + slEsc(cat.longName || cat.name || '') + '" ' +
+          'style="width:64px;text-align:center;font-size:9.5px;letter-spacing:0.08em;color:' + dim + ';flex-shrink:0;' +
+          'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' +
           slEsc(cat.name || '') + '</span>' +
         '<span style="flex:1;font-family:monospace;font-weight:' + (lose ? '800' : '500') + ';color:' + opCol + ';">' +
           (op != null && anyPts ? '<span style="color:rgba(255,255,255,0.3);font-size:9.5px;">' + slEsc(String(Math.round(op * 100) / 100)) + ' </span>' : '') +
