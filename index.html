@@ -32439,6 +32439,158 @@ async function fetchHockeyTechGames(league) {
   }
 }
 
+// ── HTAFF ── The NHL club behind an AHL team.
+//
+// Same idea as the MLB org mark on a MiLB ticket, and the same reasoning
+// as the G League map next to it: the AHL is a fixed 32-team league whose
+// affiliations are one-to-one with the NHL's 32 clubs and change maybe
+// once a season, so a static map is steadier than a live lookup — and
+// HockeyTech publishes no affiliate field anyway (its team feed carries a
+// division and a logo, nothing about a parent).
+//
+// Keyed by the league's own team code, which is what the scorebar, the
+// standings and the team list all speak. Verified against the 2026-27
+// alignment: Chicago is Carolina's, and Hamilton is the relocated
+// Bridgeport club, so the Islanders'. A code that isn't here (an expansion
+// or relocation) simply gets no mark rather than a wrong one.
+var AHL_PARENT = {
+  ABB: 'VAN', BAK: 'EDM', BEL: 'OTT', CGY: 'CGY', CHI: 'CAR', CLE: 'CBJ',
+  CLT: 'FLA', COL: 'COL', CV: 'SEA', GR: 'DET', HAM: 'NYI', HER: 'WSH',
+  HFD: 'NYR', HSK: 'VGK', IA: 'MIN', LAV: 'MTL', LV: 'PHI', MB: 'WPG',
+  MIL: 'NSH', ONT: 'LA', PRO: 'BOS', RFD: 'CHI', ROC: 'BUF', SD: 'ANA',
+  SJ: 'SJ', SPR: 'STL', SYR: 'TB', TEX: 'DAL', TOR: 'TOR', TUC: 'UTA',
+  UTC: 'NJ', WBS: 'PIT'
+};
+var _HT_PARENT_BY_LEAGUE = { AHL: AHL_PARENT };
+// The NHL club's full name, for the tooltip and the team page line.
+var _NHL_PARENT_NAME = {
+  ANA: 'Anaheim Ducks', BOS: 'Boston Bruins', BUF: 'Buffalo Sabres', CAR: 'Carolina Hurricanes',
+  CBJ: 'Columbus Blue Jackets', CGY: 'Calgary Flames', CHI: 'Chicago Blackhawks', COL: 'Colorado Avalanche',
+  DAL: 'Dallas Stars', DET: 'Detroit Red Wings', EDM: 'Edmonton Oilers', FLA: 'Florida Panthers',
+  LA: 'Los Angeles Kings', MIN: 'Minnesota Wild', MTL: 'Montreal Canadiens', NJ: 'New Jersey Devils',
+  NSH: 'Nashville Predators', NYI: 'New York Islanders', NYR: 'New York Rangers', OTT: 'Ottawa Senators',
+  PHI: 'Philadelphia Flyers', PIT: 'Pittsburgh Penguins', SEA: 'Seattle Kraken', SJ: 'San Jose Sharks',
+  STL: 'St. Louis Blues', TB: 'Tampa Bay Lightning', TOR: 'Toronto Maple Leafs', UTA: 'Utah Mammoth',
+  VAN: 'Vancouver Canucks', VGK: 'Vegas Golden Knights', WPG: 'Winnipeg Jets', WSH: 'Washington Capitals'
+};
+function _htParentAbbr(league, code) {
+  var map = _HT_PARENT_BY_LEAGUE[league];
+  if (!map || !code) return '';
+  return map[String(code).toUpperCase().trim()] || '';
+}
+function _htParentInfo(league, code) {
+  var ab = _htParentAbbr(league, code);
+  if (!ab) return null;
+  var logo = (typeof _nhlTeamLogo === 'function') ? _nhlTeamLogo(ab) : '';
+  if (!logo) logo = 'https://a.espncdn.com/i/teamlogos/nhl/500/' + ab.toLowerCase() + '.png';
+  return { abbr: ab, name: _NHL_PARENT_NAME[ab] || ab, logo: logo };
+}
+
+// ── HTSTAND ── Standings for the leagues below the NHL.
+//
+// HockeyTech's standings come back as a statview: an array whose sections
+// are the divisions, each section a list of {prop, row} pairs — the row
+// holding the numbers, the prop holding the team id behind the name. That
+// is a different arrangement from ESPN's, and the standings screen already
+// speaks ESPN, so this reshapes rather than re-renders and every existing
+// behaviour — sorting a column, starring a club, tapping through to the
+// team — comes along for free.
+//
+// The section titles are empty in this feed; the division name lives on
+// the header of the column the teams are named in.
+function _htStandNum(v) {
+  var n = parseFloat(v);
+  return isNaN(n) ? 0 : n;
+}
+function _htStandStat(name, value, display, abbr) {
+  return { name: name, value: value, displayValue: String(display != null ? display : value),
+           abbreviation: abbr, shortDisplayName: abbr };
+}
+// HTLOGO — logoBy maps team id to the league's OWN logo url. A club that
+// changed its mark this season is filed under a season-suffixed name
+// (411_94.png, not 411.png), so a url built from the id alone 404s for
+// exactly the teams that rebranded — which is why Springfield, Utica,
+// Cleveland, Toronto and Wilkes-Barre came up blank while everyone else
+// was fine. The team list already carries the real url, so it's used, and
+// the built one stays only as a last resort for a team missing from it.
+function _htStandingsAdapt(j, league, logoBy) {
+  var root = (j && j.length ? j[0] : j) || {};
+  var sections = root.sections || [];
+  var client = (HT_LEAGUES[league] && HT_LEAGUES[league].client) || '';
+  logoBy = logoBy || {};
+  var children = [];
+  for (var si = 0; si < sections.length; si++) {
+    var sec = sections[si] || {};
+    var label = sec.title || '';
+    if (!label) {
+      try { label = (sec.headers && sec.headers.name && sec.headers.name.properties &&
+                     sec.headers.name.properties.label) || ''; } catch (e) {}
+    }
+    var rows = sec.data || [];
+    var entries = [];
+    for (var ri = 0; ri < rows.length; ri++) {
+      var d = rows[ri] || {}, r = d.row || {};
+      var id = '';
+      try {
+        id = String((d.prop && ((d.prop.name && d.prop.name.teamLink) ||
+             (d.prop.team_code && d.prop.team_code.teamLink))) || '');
+      } catch (e2) {}
+      var gp = _htStandNum(r.games_played), w = _htStandNum(r.wins), l = _htStandNum(r.losses);
+      // A shootout loss is still a loss beyond regulation, and the league
+      // counts it in the same column on its own site.
+      var otl = _htStandNum(r.ot_losses) + _htStandNum(r.shootout_losses);
+      var pts = _htStandNum(r.points), gf = _htStandNum(r.goals_for), ga = _htStandNum(r.goals_against);
+      var pctStr = (r.percentage != null && r.percentage !== '')
+        ? String(r.percentage)
+        : (gp > 0 ? (pts / (gp * 2)).toFixed(3) : '-');
+      entries.push({
+        team: {
+          id: id, abbreviation: r.team_code || '?', displayName: r.name || r.team_code || '?',
+          logos: (function () {
+            var href = logoBy[String(id)] ||
+              ((client && id) ? ('https://assets.leaguestat.com/' + client + '/logos/' + id + '.png') : '');
+            return href ? [{ href: href }] : [];
+          })(),
+          color: '1a3a5c'
+        },
+        stats: [
+          _htStandStat('playoffSeed', ri + 1, ri + 1, 'SEED'),
+          _htStandStat('wins', w, w, 'W'),
+          _htStandStat('losses', l, l, 'L'),
+          _htStandStat('otLosses', otl, otl, 'OTL'),
+          _htStandStat('points', pts, pts, 'PTS'),
+          _htStandStat('gamesPlayed', gp, gp, 'GP'),
+          _htStandStat('pointPercent', _htStandNum(pctStr), pctStr, 'P%'),
+          _htStandStat('goalsFor', gf, gf, 'GF'),
+          _htStandStat('goalsAgainst', ga, ga, 'GA'),
+          _htStandStat('differential', gf - ga, gf - ga, 'DIFF'),
+          _htStandStat('streak', 0, r.streak || '-', 'STRK')
+        ]
+      });
+    }
+    if (entries.length) children.push({ name: label || (league + ' STANDINGS'), standings: { entries: entries } });
+  }
+  return { children: children };
+}
+function _htStandings(league, groupBy) {
+  // The team list comes along for its logo urls; it's cached, so this is
+  // free after the first look at the league. HTLOGO
+  return Promise.all([
+    _htSeasons(league),
+    _htTeams(league)['catch'](function () { return []; })
+  ]).then(function (pre) {
+    var regs = pre[0] || [], teams = pre[1] || [];
+    var logoBy = {};
+    for (var i = 0; i < teams.length; i++) {
+      if (teams[i] && teams[i].id && teams[i].logo) logoBy[String(teams[i].id)] = teams[i].logo;
+    }
+    var sid = (regs[0] && regs[0].id) || '';
+    return _htFetch(_htQS(league, 'feed=statviewfeed&view=teams&groupTeamsBy=' + (groupBy || 'division') +
+      '&context=overall&special=false&sort=points' + (sid ? '&season_id=' + sid : '')))
+      .then(function (j) { return _htStandingsAdapt(j, league, logoBy); });
+  });
+}
+
 // ── HTTEAM ── Minor-league teams, rosters and season stats.
 //
 // One view does the work of two here: statviewtype carries each player's
@@ -32486,7 +32638,9 @@ function _htTeams(league) {
           // The browser shows this as a small badge, so the division loses
           // its "Division"/"Conference" tail: "Pacific", not "Pacific Division".
           level: String(t.division_long_name || '').replace(/\s+(Division|Conference)$/i, ''),
-          division: t.division_long_name || '', league: league
+          division: t.division_long_name || '', league: league,
+          parentOrg: (function () { var pi = _htParentInfo(league, t.code); return pi ? pi.name : ''; })(),   // HTAFF
+          parentLogo: (function () { var pi = _htParentInfo(league, t.code); return pi ? pi.logo : ''; })()
         });
       }
       out.sort(function (a, b) {
@@ -32579,11 +32733,16 @@ function _htTeamPage(teamId, league) {
       teamPageCurrent.tAbbr = (team && team.abbr) || first.team_code || '';
       teamPageCurrent.tColor = accent;
     }
+    // HTAFF — the NHL club this one feeds, alongside the division.
+    var par = _htParentInfo(league, (team && team.abbr) || first.team_code || '');
     header.innerHTML = '<button class="tp-close" onclick="closeTeamPage()" style="margin-right:4px">✕</button>' +
       (logo ? '<img src="' + logo + '" style="width:36px;height:36px;object-fit:contain">' : '') +
       '<div class="tp-header-info">' +
         '<div class="tp-team-name" style="color:' + accent + '">' + skEscapeMaybe(name) + '</div>' +
-        '<div class="tp-team-meta">' + league + (division ? ' · ' + skEscapeMaybe(division) : '') + '</div>' +
+        '<div class="tp-team-meta">' + league + (division ? ' · ' + skEscapeMaybe(division) : '') +
+          (par ? ' · <img src="' + par.logo + '" style="width:12px;height:12px;vertical-align:middle;object-fit:contain" ' +
+                 'onerror="this.style.display=\'none\'"> ' + skEscapeMaybe(par.name) : '') +
+        '</div>' +
       '</div>';
     var note = '';
     if (st.season) {
@@ -38383,6 +38542,15 @@ function renderCards() {
           _affLogo = '<span class="card-aff-connector"></span>' +
             '<img class="card-aff-logo" src="https://www.mlbstatic.com/team-logos/' +
             _aff.mlbId + '.svg" alt="" title="' + (_aff.mlbName || _aff.mlbAbbr || '') +
+            ' affiliate" onerror="this.style.display=\'none\';if(this.previousSibling)this.previousSibling.style.display=\'none\';">';
+        }
+      }
+      // HTAFF — the AHL's NHL parent, the same mark in the same place.
+      if (!_affLogo && typeof _htParentInfo === 'function') {
+        var _htPar = _htParentInfo(g.league, team.abbr);
+        if (_htPar) {
+          _affLogo = '<span class="card-aff-connector"></span>' +
+            '<img class="card-aff-logo" src="' + _htPar.logo + '" alt="" title="' + _htPar.name +
             ' affiliate" onerror="this.style.display=\'none\';if(this.previousSibling)this.previousSibling.style.display=\'none\';">';
         }
       }
@@ -57597,8 +57765,12 @@ function renderTeamsBrowser() {
   // Team grid
   html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px;padding:8px 20px 24px">';
   filtered.forEach(function(t) {
+    // HTAFF — a parent's logo url can be supplied directly now; MLB's is
+    // still built from its org id when only that is known.
+    var _parentSrc = t.parentLogo ||
+      (t.parentId ? ('https://www.mlbstatic.com/team-logos/' + t.parentId + '.svg') : '');
     var parentBadge = t.parentOrg ? '<div style="font-size:8px;color:rgba(255,255,255,0.25);margin-top:2px;display:flex;align-items:center;gap:3px;justify-content:center">' +
-      (t.parentId ? '<img src="https://www.mlbstatic.com/team-logos/' + t.parentId + '.svg" style="width:10px;height:10px">' : '') +
+      (_parentSrc ? '<img src="' + _parentSrc + '" style="width:10px;height:10px;object-fit:contain" onerror="this.style.display=\'none\'">' : '') +
       t.parentOrg + '</div>' : '';
     var levelBadge = t.level ? '<span style="font-size:8px;background:rgba(255,255,255,0.06);padding:1px 5px;border-radius:3px;color:rgba(255,255,255,0.3)">' + t.level + '</span>' : '';
 
@@ -80688,7 +80860,7 @@ function updateViewToggle() {
 
 function renderStandingsLeaguePills() {
   var el = document.getElementById('stLeaguePills');
-  var exclude = ['AHL', 'ECHL', 'OHL']; // HTHOCKEY — scores only for now
+  var exclude = []; // every league has standings support
   el.innerHTML = Object.entries(LEAGUES).filter(function(entry) {
     return exclude.indexOf(entry[0]) === -1;
   }).map(function(entry) {
@@ -80891,6 +81063,27 @@ function transformMilbTeamRecord(tr) {
 async function fetchStandings(league, levelOverride) {
   if (league === 'MiLB') return fetchMilbStandings();
   if (LEAGUES[league] && LEAGUES[league].bananaBall) return _bbRenderStandingsTable();
+  // HTSTAND — reshaped into the same table the rest of the screen draws.
+  if (LEAGUES[league] && LEAGUES[league].hockeyTech) {
+    var _hGroup = (standingsView === 'division') ? 'division' : 'conference';
+    var _hKey = league + '_ht_' + _hGroup;
+    var _hBody = document.getElementById('stBody');
+    if (standingsCache[_hKey]) {
+      if (levelOverride == null) renderStandings(standingsCache[_hKey], league);
+      return;
+    }
+    if (_hBody && levelOverride == null) _hBody.innerHTML = '<div class="pm-loading">Loading standings\u2026</div>';
+    return _htStandings(league, _hGroup).then(function (d) {
+      standingsCache[_hKey] = d;
+      standingsCache[league] = d;   // the column-sort re-render reads this one
+      if (levelOverride == null) renderStandings(d, league);
+    }, function () {
+      if (_hBody && levelOverride == null) {
+        _hBody.innerHTML = '<div class="pm-loading" style="padding:24px;text-align:center">' +
+          'Standings aren\u2019t available for ' + league + ' right now.</div>';
+      }
+    });
+  }
   var body = document.getElementById('stBody');
   var level = levelOverride != null ? levelOverride : (standingsView === 'division' ? 3 : 2);
   var silent = levelOverride != null; // background fetch (e.g. team-form card)
@@ -81043,7 +81236,7 @@ function renderStandingsGroup(groupName, entries, league, favTeams) {
   var preferred;
   if (league === 'NBA' || league === 'GLEAGUE' || league === 'NBASL' || league === 'NCAAMB') preferred = ['wins','losses','winPercent','gamesBehind','avgPointsFor','avgPointsAgainst','differential','streak'];
   else if (league === 'WNBA') preferred = ['wins','losses','winPercent','gamesBehind','avgPointsFor','avgPointsAgainst','differential','streak'];
-  else if (league === 'NHL') preferred = ['wins','losses','otLosses','points','gamesPlayed','pointPercent','regulationWins','goalsFor','goalsAgainst','differential','streak'];
+  else if (league === 'NHL' || (LEAGUES[league] && LEAGUES[league].hockeyTech)) preferred = ['wins','losses','otLosses','points','gamesPlayed','pointPercent','regulationWins','goalsFor','goalsAgainst','differential','streak'];   // HTSTAND
   else if (league === 'MLB' || league === 'MiLB') preferred = ['wins','losses','winPercent','gamesBehind','runsScored','runsAllowed','differential','streak'];
   else if (league === 'NFL') preferred = ['wins','losses','ties','winPercent','pointsFor','pointsAgainst','differential','streak'];
   else if (league === 'NCAAFB' || league === 'NCAAFB23') preferred = ['overall','wins','losses','streak','home','away'];
