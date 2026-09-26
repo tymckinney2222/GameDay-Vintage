@@ -53865,13 +53865,16 @@ function _skCareerCategories(statsData) {
         var key = c.name || c.displayName || 'stats';
         if (!byName[key]) {
           byName[key] = { name: c.name, displayName: c.displayName,
-                          labels: c.labels, statistics: [] };
+                          labels: c.labels, names: c.names, statistics: [] };
           order.push(key);
         }
         if (c.statistics && c.statistics.length) {
           byName[key].statistics = byName[key].statistics.concat(c.statistics);
         }
         if (!byName[key].labels && c.labels) byName[key].labels = c.labels;
+        // ESPNNAMES — the names array is what tells shots from shootout
+        // goals, so it has to survive this merge as well.
+        if (!byName[key].names && c.names) byName[key].names = c.names;
       });
     });
     return order.map(function(k) { return byName[k]; });
@@ -115639,9 +115642,21 @@ var _FX_DERIVED_FALLBACK = {
   '_PPG': 'PPG', '_PPA': 'PPA', '_SHG': 'SHG', '_SHA': 'SHA',
   '_GWG': 'GWG', '_GAA': 'GAA', '_W': 'W', '_L': 'L', '_SO': 'SO'
 };
-// The season line labels shots SOG; the box says S. Either can be the source
-// depending on which payload a caller has, so both resolve. SEASONTOTALS
-var _FX_LABEL_ALT = { 'S': ['SOG'], 'SOG': ['S'] };
+// ── ESPNNAMES ── This used to read: "the season line labels shots SOG; the
+// box says S", and mapped S to SOG on that basis. The stats probe disproved
+// it. In ESPN's NHL season payload the column labelled SOG is named
+// shootoutGoals — Draisaitl's 15-16 line shows SOG = 1 against 19 goals and
+// a 14.3% shooting percentage, so it cannot be shots. Shots on goal are not
+// in that payload at all; they appear in the overview as S / shotsTotal.
+//
+// So a "shots on goal" category asking for S, finding nothing, and falling
+// back to the SOG label was reading shootout goals. The fallback is gone and
+// the season parser now keys off ESPN's names array instead, which does not
+// collide the way the display labels do.
+//
+// The reverse direction is kept: a map that genuinely holds shots under SOG
+// still resolves for a caller asking for S.
+var _FX_LABEL_ALT = { 'SOG': ['S'] };
 var _FX_DERIVED_SUM = { '_PPP': ['PPG', 'PPA'], '_SHP': ['SHG', 'SHA'] };
 
 var _FX_SPLIT_FALLBACK = {
@@ -137621,6 +137636,54 @@ function _skHydrateNflTargetShare(players, byPlayer) {
 // ("center"), already totals, and adds SOG/SPCT that /overview lacks.
 //
 // Rows are per season in ascending order, so the last one is current.
+// ── ESPNNAMES ── ESPN gives every season column twice: a display label,
+// which is short and collides across categories, and a name, which doesn't.
+// The parser used to keep only the labels, which is how shootout goals came
+// to be read as shots. These tables turn the unambiguous name into the code
+// the alias table already speaks.
+//
+// Read off live payloads by the stats probe, so the spellings are ESPN's own
+// rather than guesses. Anything not listed still falls through to its label,
+// which is what every other column has always used.
+var _ESPN_NAME_CODE = {
+  nhl: {
+    games: 'GP', gamesPlayed: 'GP', goals: 'G', assists: 'A', points: 'P',
+    plusMinus: '+/-', penaltyMinutes: 'PIM',
+    shotsTotal: 'S', shotsOnGoal: 'S', shots: 'S',
+    shootingPct: 'SPCT', shootoutGoals: 'SOGOAL',
+    powerPlayGoals: 'PPG', powerPlayAssists: 'PPA',
+    shortHandedGoals: 'SHG', shortHandedAssists: 'SHA',
+    gameWinningGoals: 'GWG', timeOnIcePerGame: 'TOI/G', production: 'PROD',
+    hits: 'HT', blockedShots: 'BS', takeaways: 'TK', giveaways: 'GV',
+    goalsAgainst: 'GA', shotsAgainst: 'SA', saves: 'SV', savePct: 'SV%',
+    shutouts: 'SO', wins: 'W', losses: 'L'
+  },
+  nba: {
+    gamesPlayed: 'GP', gamesStarted: 'GS', avgMinutes: 'MIN', minutes: 'MIN',
+    points: 'PTS', avgPoints: 'PTS',
+    totalRebounds: 'REB', avgRebounds: 'REB', rebounds: 'REB',
+    offensiveRebounds: 'OREB', avgOffensiveRebounds: 'OREB',
+    defensiveRebounds: 'DREB', avgDefensiveRebounds: 'DREB',
+    assists: 'AST', avgAssists: 'AST',
+    steals: 'STL', avgSteals: 'STL',
+    blocks: 'BLK', avgBlocks: 'BLK',
+    turnovers: 'TO', avgTurnovers: 'TO',
+    fouls: 'PF', avgFouls: 'PF',
+    fieldGoalPct: 'FG%', threePointFieldGoalPct: '3P%', freeThrowPct: 'FT%',
+    'fieldGoalsMade-fieldGoalsAttempted': 'FG',
+    'avgFieldGoalsMade-avgFieldGoalsAttempted': 'FG',
+    'threePointFieldGoalsMade-threePointFieldGoalsAttempted': '3PT',
+    'avgThreePointFieldGoalsMade-avgThreePointFieldGoalsAttempted': '3PT',
+    'freeThrowsMade-freeThrowsAttempted': 'FT',
+    'avgFreeThrowsMade-avgFreeThrowsAttempted': 'FT',
+    doubleDouble: 'DD2', tripleDouble: 'TD3'
+  }
+};
+// A label that means something other than what its spelling suggests. The
+// value is still kept — under the code its NAME earns — but never under the
+// misleading label, so nothing can read it by accident.
+var _ESPN_LABEL_TRAP = { nhl: { SOG: 'shootoutGoals' } };
+
 function _parseEspnSeasonTotals(sj, sportKey) {
   try {
     var cats = (typeof _skCareerCategories === 'function') ? _skCareerCategories(sj) : null;
@@ -137643,6 +137706,7 @@ function _parseEspnSeasonTotals(sj, sportKey) {
     }
     if (!cat) return null;
     var labels = cat.labels || cat.names || [];
+    var names = cat.names || [];
     var rows = cat.statistics || [];
     if (!labels.length || !rows.length) return null;
     // Last row = most recent season. Before opening night that's last season,
@@ -137651,8 +137715,24 @@ function _parseEspnSeasonTotals(sj, sportKey) {
     var vals = row.stats || row.values || [];
     if (!vals.length) return null;
     var out = {};
+    // ESPNNAMES — labels first, then the name-derived codes on top, so an
+    // unlisted column keeps working exactly as before while a named one is
+    // filed under something that can't be confused with another stat.
+    var sk = String(sportKey || '').toLowerCase();
+    var trap = _ESPN_LABEL_TRAP[sk] || {};
+    var nameMap = _ESPN_NAME_CODE[sk] || null;
     for (i = 0; i < labels.length && i < vals.length; i++) {
-      out[String(labels[i])] = vals[i];
+      var lab = String(labels[i]);
+      // A trapped label is dropped rather than written: its value is real,
+      // but under this name it is not the stat the label implies.
+      if (trap[lab] && String(names[i] || '') === trap[lab]) continue;
+      out[lab] = vals[i];
+    }
+    if (nameMap) {
+      for (i = 0; i < names.length && i < vals.length; i++) {
+        var code = nameMap[String(names[i])];
+        if (code) out[code] = vals[i];
+      }
     }
     // Season label, so a caller can tell which year it got.
     out._SEASON = (row.season && (row.season.displayName || row.season.year)) ||
