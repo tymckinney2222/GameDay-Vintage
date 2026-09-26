@@ -29325,6 +29325,12 @@
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
       <span>Probe player search index</span>
     </button>
+    <!-- FXMATCHPROBE — the verbatim matchup payload, so the categories
+         array gets read rather than guessed at again -->
+    <button class="sk-account-item" onclick="skProbeFantraxMatchups(); skCloseAccountMenu();">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h8v14H3zM13 5h8v14h-8z"/><path d="M11 12h2"/></svg>
+      <span>Probe Fantrax matchup payload</span>
+    </button>
     <!-- FXSTANDPROBE — does Fantrax send per-category roto ranks? -->
     <button class="sk-account-item" onclick="skProbeFantraxStandings(); skCloseAccountMenu();">
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V8M10 20V4M16 20v-9M22 20H2"/></svg>
@@ -117296,6 +117302,99 @@ function skProbeSearchIndex() {
   _skGpProbeShow(lines.join('\n'));
 }
 
+// ── FXMATCHPROBE ── The verbatim first matchup from getMatchupScores.
+//
+// The shape probes report key names one level deep, which was enough to see
+// that the old guesses had missed but not enough to write the new reader
+// against. This prints the actual JSON of one matchup, so the nesting of the
+// categories array can be read rather than inferred, and then prints what
+// the parser made of the whole payload so the two can be compared.
+function skProbeFantraxMatchups() {
+  var lines = [];
+  function say(t) { lines.push(t); }
+  var rows = (typeof extLeagues !== 'undefined' && extLeagues) ? extLeagues : [];
+  var fx = [];
+  for (var i = 0; i < rows.length; i++) {
+    if (rows[i] && rows[i].provider === 'fantrax') fx.push(rows[i]);
+  }
+  if (!fx.length) { _skGpProbeShow('No Fantrax leagues synced.'); return; }
+
+  var pending = 0, done = 0;
+  function flush() { _skGpProbeShow(lines.join('\n')); }
+
+  for (var f = 0; f < fx.length; f++) {
+    (function (row) {
+      pending++;
+      var id = String(row.key || '').slice(4);
+      var fmt = (typeof extFormatKey === 'function') ? extFormatKey(row) : '?';
+      fxFetchJson('https://www.fantrax.com/fxea/general/getMatchupScores?leagueId=' +
+        encodeURIComponent(id))
+        .then(function (data) {
+          say('\u2500\u2500 ' + (row.name || row.key) + ' \u2500\u2500');
+          say('sport: ' + String(row.sport || '?').toUpperCase() + '   format: ' + fmt);
+          say('top-level: ' + _fxShapeKeys(data).join(' '));
+          var isArr = function (x) { return Object.prototype.toString.call(x) === '[object Array]'; };
+          var lst = null;
+          if (isArr(data)) lst = data;
+          else if (data && typeof data === 'object') {
+            lst = isArr(data.matchupList) ? data.matchupList
+                : isArr(data.matchups) ? data.matchups
+                : isArr(data.scores) ? data.scores : null;
+          }
+          if (!lst || !lst.length) {
+            say('(no matchup list found)');
+            say(JSON.stringify(data).slice(0, 1200));
+          } else {
+            say('matchups: ' + lst.length);
+            say('');
+            say('── first matchup, verbatim ──');
+            var txt = '';
+            try { txt = JSON.stringify(lst[0], null, 1); }
+            catch (e) { txt = '(could not stringify)'; }
+            if (txt.length > 4000) txt = txt.slice(0, 4000) + '\n… (' + txt.length + ' chars total)';
+            say(txt);
+          }
+          say('');
+          say('── what the parser made of it ──');
+          var p = _fxExtractMatchupScores(data);
+          if (!p) say('(parser returned nothing)');
+          else {
+            say('period: ' + p.period + '   games: ' + p.games.length);
+            var g = p.games[0] || {};
+            say('away: ' + g.away + ' [' + g.awayId + ']   score: ' + g.awayScore +
+                '   rec: ' + (g.awayRec == null ? '(none)' : g.awayRec) +
+                '   gp: ' + (g.awayGp == null ? '(none)' : g.awayGp));
+            say('home: ' + g.home + ' [' + g.homeId + ']   score: ' + g.homeScore +
+                '   rec: ' + (g.homeRec == null ? '(none)' : g.homeRec) +
+                '   gp: ' + (g.homeGp == null ? '(none)' : g.homeGp));
+            if (!g.cats) say('categories: (none parsed)');
+            else {
+              say('categories: ' + g.cats.length);
+              for (var c = 0; c < g.cats.length && c < 30; c++) {
+                var ct = g.cats[c] || {}, A = ct.away || {}, H = ct.home || {};
+                say('  ' + (ct.name || '?') +
+                    '   away v=' + A.value + ' d=' + A.display + ' p=' + A.points + ' r=' + (A.result || '-') +
+                    '   home v=' + H.value + ' d=' + H.display + ' p=' + H.points + ' r=' + (H.result || '-'));
+              }
+            }
+          }
+          say('');
+          done++;
+          if (done === pending) say('(' + done + ' league' + (done === 1 ? '' : 's') + ' read)');
+          flush();
+        })['catch'](function (e) {
+          say('\u2500\u2500 ' + (row.name || row.key) + ' \u2500\u2500');
+          say('FAILED: ' + ((e && e.fxKind) ? e.fxKind : 'error') +
+              ((e && e.fxStatus) ? ' ' + e.fxStatus : ''));
+          say('');
+          done++;
+          flush();
+        });
+    })(fx[f]);
+  }
+  _skGpProbeShow('Reading ' + pending + ' Fantrax league' + (pending === 1 ? '' : 's') + '\u2026');
+}
+
 function skProbeFantraxStandings() {
   var lines = [];
   function say(t) { lines.push(t); }
@@ -162759,6 +162858,34 @@ function _fxExtractStandingsAll(data) {
 // Matchup schedule from getLeagueInfo (shape per the go-fantrax client:
 // matchups = [{period, matchupList:[{away:{id,name}, home:{id,name}}]}]).
 // Team names fall back to the teamInfo map when only ids are present.
+// scoringPeriods from getLeagueInfo — the documented list of period numbers
+// and their date ranges. Only the numbers are kept; the dates are the
+// league's business, not this app's.
+function _fxExtractPeriods(data) {
+  try {
+    var sp = data.scoringPeriods;
+    var out = [], i, p, k;
+    if (Object.prototype.toString.call(sp) === '[object Array]') {
+      for (i = 0; i < sp.length; i++) {
+        p = sp[i];
+        var v = (p && typeof p === 'object')
+          ? _fxPick(p, ['period', 'periodNumber', 'id', 'number'])
+          : p;
+        v = Number(v);
+        if (!isNaN(v)) out.push(v);
+      }
+    } else if (sp && typeof sp === 'object') {
+      // Keyed by period number rather than listed.
+      for (k in sp) {
+        if (!sp.hasOwnProperty(k)) continue;
+        var kn = Number(k);
+        if (!isNaN(kn)) out.push(kn);
+      }
+    }
+    return out.length ? out : null;
+  } catch (e) { return null; }
+}
+
 function _fxExtractMatchups(data) {
   try {
     var mp = data.matchups;
@@ -162826,10 +162953,26 @@ function _fxShapeKeys(data) {
   return keys;
 }
 
-// Live H2H scores from getMatchupScores — per the docs: away and home
-// team (ID and name) + fantasy point total for the CURRENT period.
-// Exact JSON shape unconfirmed, so parse defensively; the probe
-// captures the real keys.
+// ── FXMATCH ── Live H2H scores from getMatchupScores.
+//
+// This used to be parsed against guessed field names. Fantrax publishes
+// them, and the guesses were wrong: the category tally is categoryWins /
+// categoryLosses / categoryTies, none of which this file contained, which
+// is why a categories league never produced a record and fell back to an
+// em-dash. The published shape also carries two things nothing here read —
+// gamesPlayed per side, and a categories array.
+//
+// What that array holds depends on the league:
+//   categories league — each scoring category's stat value for both teams
+//     and which of them won, lost or tied it.
+//   points league — each category's raw stat total (value, plus a formatted
+//     display string) and the fantasy points it contributed. Not returned
+//     for "count best players" leagues, where the per-category numbers do
+//     not add up to the adjusted team total.
+//
+// The names above are documented; how the array is nested is not, so the
+// reader below accepts the shapes it could plausibly take and the raw probe
+// settles it from an actual response rather than another guess.
 // ── FMSKIP ── One level deeper than _fxShapeKeys.
 //
 // getMatchupScores has been parsed against guessed field names, and the
@@ -162876,6 +163019,196 @@ function _fxMatchupShapeKeys(data) {
   return out;
 }
 
+// First of `names` that the object actually carries. Saves writing the same
+// four-deep ternary chain at every field.
+function _fxPick(obj, names) {
+  if (!obj) return null;
+  for (var i = 0; i < names.length; i++) {
+    if (obj[names[i]] != null) return obj[names[i]];
+  }
+  return null;
+}
+// 'W' / 'L' / 'T' from whatever a per-category outcome is spelled as: a
+// letter, a word, or a pair of booleans.
+function _fxCatResult(o) {
+  if (!o) return '';
+  var r = _fxPick(o, ['result', 'outcome', 'winLoss', 'wlt', 'status']);
+  if (r != null) {
+    var s = String(r).toUpperCase();
+    if (s.indexOf('W') === 0) return 'W';
+    if (s.indexOf('L') === 0) return 'L';
+    if (s.indexOf('T') === 0 || s.indexOf('D') === 0) return 'T';
+  }
+  if (o.win === true || o.won === true) return 'W';
+  if (o.loss === true || o.lost === true) return 'L';
+  if (o.tie === true || o.tied === true) return 'T';
+  return '';
+}
+// One normalised row per scoring category, whichever way the response nests
+// them. Three arrangements are accepted:
+//   1. matchup.categories[] with an away/home object inside each entry
+//   2. matchup.categories[] with awayValue/homeValue style flat keys
+//   3. away.categories[] and home.categories[] as separate lists, zipped by
+//      name where the names line up and by position where they don't
+// A row carries, per side: the raw value, the formatted display string, the
+// fantasy points it contributed, and the W/L/T outcome. Any of those may be
+// absent — a categories league has no points, a points league has no
+// outcome.
+function _fxCatRows(m, a, h) {
+  try {
+    var isArr = function (x) { return Object.prototype.toString.call(x) === '[object Array]'; };
+    var nameOf = function (o) {
+      var v = _fxPick(o, ['name', 'category', 'categoryName', 'abbr',
+                          'abbreviation', 'shortName', 'scoringCategory', 'label']);
+      return v == null ? '' : String(v);
+    };
+    var sideOf = function (o, pref) {
+      // Either a nested object, or flat keys prefixed with away/home.
+      var nested = o[pref] || o[pref + 'Team'] || null;
+      var src = (nested && typeof nested === 'object') ? nested : o;
+      var cap = pref.charAt(0).toUpperCase() + pref.slice(1);
+      var val = (src === o)
+        ? _fxPick(o, [pref + 'Value', pref + 'Score', pref + 'Total', pref + 'Stat'])
+        : _fxPick(src, ['value', 'score', 'total', 'stat', 'statValue']);
+      var disp = (src === o)
+        ? _fxPick(o, [pref + 'Display', pref + 'Formatted', pref + 'DisplayValue'])
+        : _fxPick(src, ['display', 'displayValue', 'formatted', 'formattedValue']);
+      var pts = (src === o)
+        ? _fxPick(o, [pref + 'Points', pref + 'Fpts', pref + 'FantasyPoints'])
+        : _fxPick(src, ['points', 'fantasyPoints', 'fpts', 'score']);
+      var res = (src === o)
+        ? (function () {
+            var r = _fxPick(o, [pref + 'Result', pref + 'Outcome', 'result' + cap]);
+            return r == null ? '' : _fxCatResult({ result: r });
+          })()
+        : _fxCatResult(src);
+      return { value: val, display: disp, points: pts, result: res };
+    };
+
+    var list = null;
+    if (m && isArr(m.categories)) list = m.categories;
+    else if (m && isArr(m.categoryScores)) list = m.categoryScores;
+    else if (m && isArr(m.stats)) list = m.stats;
+    if (list) {
+      var out = [];
+      for (var i = 0; i < list.length; i++) {
+        var c = list[i] || {};
+        var A = sideOf(c, 'away'), H = sideOf(c, 'home');
+        if (A.value == null && H.value == null && A.points == null && H.points == null) continue;
+        out.push({ name: nameOf(c), away: A, home: H });
+      }
+      return out;
+    }
+
+    // Per-side lists. Zip by name when both sides name their categories the
+    // same way, which is the normal case, and by position otherwise.
+    var al = (a && isArr(a.categories)) ? a.categories : ((a && isArr(a.stats)) ? a.stats : null);
+    var hl = (h && isArr(h.categories)) ? h.categories : ((h && isArr(h.stats)) ? h.stats : null);
+    if (!al && !hl) return null;
+    var byName = {}, j, nm, order = [];
+    function take(lst, key) {
+      for (j = 0; j < (lst || []).length; j++) {
+        var o = lst[j] || {};
+        nm = nameOf(o) || ('#' + j);
+        if (!byName[nm]) { byName[nm] = { name: nameOf(o), away: {}, home: {} }; order.push(nm); }
+        byName[nm][key] = {
+          value: _fxPick(o, ['value', 'score', 'total', 'stat', 'statValue']),
+          display: _fxPick(o, ['display', 'displayValue', 'formatted', 'formattedValue']),
+          points: _fxPick(o, ['points', 'fantasyPoints', 'fpts']),
+          result: _fxCatResult(o)
+        };
+      }
+    }
+    take(al, 'away');
+    take(hl, 'home');
+    var rows = [];
+    for (j = 0; j < order.length; j++) rows.push(byName[order[j]]);
+    return rows.length ? rows : null;
+  } catch (e) { return null; }
+}
+
+// ── FXPERIOD ── getMatchupScores takes an optional period, which this app
+// never sent — so only the current period was ever reachable and there was
+// no way to look back at a finished week. The period numbers come from
+// getLeagueInfo; scoringPeriods lists them with their date ranges.
+function _fxLoadMatchupScores(row, period, cb) {
+  if (!row) { if (cb) cb(false); return; }
+  var id = String(row.key || '').slice(4);
+  if (!id) { if (cb) cb(false); return; }
+  var url = 'https://www.fantrax.com/fxea/general/getMatchupScores?leagueId=' + encodeURIComponent(id);
+  if (period != null && period !== '') url += '&period=' + encodeURIComponent(period);
+  fxFetchJson(url).then(function (data) {
+    try {
+      fxState.infoShapes['scores:' + id] = _fxShapeKeys(data).concat(_fxMatchupShapeKeys(data));
+      fxState.rawScores = fxState.rawScores || {};
+      fxState.rawScores[id] = data;   // kept for the raw probe
+    } catch (e) {}
+    var parsed = _fxExtractMatchupScores(data);
+    if (parsed) {
+      row.liveScores = parsed;
+      // What was asked for wins over what the payload says, so the stepper
+      // stays put even if the response omits the period it answered with.
+      row.scoresPeriod = (period != null && period !== '') ? Number(period)
+        : ((parsed.period != null) ? Number(parsed.period) : null);
+    }
+    if (cb) cb(!!parsed);
+  })['catch'](function () { if (cb) cb(false); });
+}
+
+// The periods this league has, newest known first. getLeagueInfo's
+// scoringPeriods is the documented list; the schedule it also returns is the
+// fallback when that key isn't there.
+function _fxPeriodList(row) {
+  var out = [], seen = {}, i, p;
+  try {
+    if (row && Object.prototype.toString.call(row.periods) === '[object Array]') {
+      for (i = 0; i < row.periods.length; i++) {
+        p = Number(row.periods[i]);
+        if (!isNaN(p) && !seen[p]) { seen[p] = 1; out.push(p); }
+      }
+    }
+    if (!out.length && row && Object.prototype.toString.call(row.matchups) === '[object Array]') {
+      for (i = 0; i < row.matchups.length; i++) {
+        p = Number((row.matchups[i] || {}).period);
+        if (!isNaN(p) && !seen[p]) { seen[p] = 1; out.push(p); }
+      }
+    }
+  } catch (e) {}
+  out.sort(function (x, y) { return x - y; });
+  return out;
+}
+
+// Step the matchup pane to another scoring period.
+function _fxPeriodStep(key, dir) {
+  var row = null, i;
+  for (i = 0; i < extLeagues.length; i++) {
+    if (extLeagues[i].key === key) { row = extLeagues[i]; break; }
+  }
+  if (!row) return;
+  var list = _fxPeriodList(row);
+  var cur = (row.scoresPeriod != null) ? Number(row.scoresPeriod)
+    : ((row.liveScores && row.liveScores.period != null) ? Number(row.liveScores.period) : null);
+  var want;
+  if (list.length) {
+    var at = -1;
+    for (i = 0; i < list.length; i++) { if (list[i] === cur) { at = i; break; } }
+    if (at === -1) at = list.length - 1;
+    var next = at + dir;
+    if (next < 0 || next >= list.length) return;
+    want = list[next];
+  } else {
+    if (cur == null) return;
+    want = cur + dir;
+    if (want < 1) return;
+  }
+  var el = document.querySelector('[data-extpane="matchup"]');
+  if (el) el.style.opacity = '0.45';
+  _fxLoadMatchupScores(row, want, function () {
+    if (el) el.style.opacity = '';
+    if (typeof extOpenLeague === 'function') extOpenLeague(key);
+  });
+}
+
 function _fxExtractMatchupScores(data) {
   try {
     var isArr = function(x) { return Object.prototype.toString.call(x) === '[object Array]'; };
@@ -162903,15 +163236,11 @@ function _fxExtractMatchupScores(data) {
       // spelling is tried and a tally is only claimed when one is actually
       // present. FTXCARDSCORE
       function tally(side) {
-        var w = (side.wins != null) ? side.wins
-              : (side.catWins != null) ? side.catWins
-              : (side.categoriesWon != null) ? side.categoriesWon : null;
-        var lo = (side.losses != null) ? side.losses
-               : (side.catLosses != null) ? side.catLosses
-               : (side.categoriesLost != null) ? side.categoriesLost : null;
-        var ti = (side.ties != null) ? side.ties
-               : (side.catTies != null) ? side.catTies
-               : (side.categoriesTied != null) ? side.categoriesTied : null;
+        // categoryWins/Losses/Ties are the published names; the rest are the
+        // spellings this file used to guess at, kept as a tail.
+        var w = _fxPick(side, ['categoryWins', 'wins', 'catWins', 'categoriesWon']);
+        var lo = _fxPick(side, ['categoryLosses', 'losses', 'catLosses', 'categoriesLost']);
+        var ti = _fxPick(side, ['categoryTies', 'ties', 'catTies', 'categoriesTied']);
         if (w == null && lo == null) return null;
         return { w: Number(w) || 0, l: Number(lo) || 0, t: Number(ti) || 0 };
       }
@@ -162921,6 +163250,14 @@ function _fxExtractMatchupScores(data) {
         away: a.name || a.teamName || '?', home: h.name || h.teamName || '?',
         awayScore: aScore, homeScore: hScore
       };
+      // Games played by the side's active players in this period — shown in
+      // the matchup page header on Fantrax, and never read here until now.
+      var aGp = _fxPick(a, ['gamesPlayed', 'gamesPlayedCount', 'gp']);
+      var hGp = _fxPick(h, ['gamesPlayed', 'gamesPlayedCount', 'gp']);
+      if (aGp != null) gm.awayGp = Number(aGp);
+      if (hGp != null) gm.homeGp = Number(hGp);
+      var rows = _fxCatRows(m, a, h);
+      if (rows && rows.length) gm.cats = rows;
       if (aT && hT) {
         gm.awayRec = aT.w + '-' + aT.l + '-' + aT.t;
         gm.homeRec = hT.w + '-' + hT.l + '-' + hT.t;
@@ -163678,6 +164015,7 @@ function extEnrichFantrax() {
           fxState.infoShapes[id] = keys;
           row.info = _fxExtractInfo(data || {});
           row.matchups = _fxExtractMatchups(data || {});
+          row.periods = _fxExtractPeriods(data || {});   // FXPERIOD
           row.logos = _fxExtractTeamLogos(data || {});
           // Scoring system — retained for the FP Projector's league
           // dropdown, and mirrored into infoShapes as compact lines so
@@ -163730,17 +164068,10 @@ function extEnrichFantrax() {
           _extRepaintToday();
         })
         .catch(function() { /* best-effort */ });
-      // Live matchup scores (zeros pre-season; live once the period is
-      // underway). Reflects the CURRENT scoring period per the docs.
-      fxFetchJson('https://www.fantrax.com/fxea/general/getMatchupScores?leagueId=' +
-        encodeURIComponent(id))
-        .then(function(data) {
-          fxState.infoShapes['scores:' + id] = _fxShapeKeys(data)
-            .concat(_fxMatchupShapeKeys(data));
-          row.liveScores = _fxExtractMatchupScores(data);
-          _extRepaintToday();
-        })
-        .catch(function() { /* best-effort */ });
+      // Live matchup scores. No period means the current one, which is what
+      // the enrich pass wants; the matchup pane asks for a named period
+      // through the same loader. FXPERIOD
+      _fxLoadMatchupScores(row, null, function () { _extRepaintToday(); });
       // Rosters for the current/upcoming period. Empty until the draft;
       // the probe captures rosterItem keys the moment they exist.
       fxFetchJson('https://www.fantrax.com/fxea/general/getTeamRosters?leagueId=' +
@@ -167066,6 +167397,121 @@ function _fxDayBase(id, rows) {
   return stored.base || {};
 }
 
+// ── FXCATPANEL ── My matchup, category by category.
+//
+// Fantrax returns this and the app threw it away: for a categories league
+// each category's value for both teams and who won it, and for a points
+// league each category's stat total and the fantasy points it contributed.
+// Sleeper has had a slot-by-slot panel here for a while; this is the
+// Fantrax equivalent, built from the league's own arithmetic rather than
+// from the reconstruction the roto board has to do.
+function _fxNum(v) {
+  if (v == null || v === '') return null;
+  var x = Number(v);
+  return isNaN(x) ? null : x;
+}
+function _fxCellText(side) {
+  if (!side) return '\u2014';
+  if (side.display != null && side.display !== '') return String(side.display);
+  var v = _fxNum(side.value);
+  if (v == null) return '\u2014';
+  return (Math.abs(v) < 1 && v !== 0) ? String(v) : String(Math.round(v * 100) / 100);
+}
+function _fxMatchupPanelHtml(row, myIds, accent) {
+  try {
+    var lp = row && row.liveScores;
+    if (!lp || !lp.games || !lp.games.length) return '';
+    var g = null, i;
+    for (i = 0; i < lp.games.length; i++) {
+      var c = lp.games[i];
+      if ((c.awayId && myIds[c.awayId]) || (c.homeId && myIds[c.homeId])) { g = c; break; }
+    }
+    if (!g) return '';
+    var meAway = !!(g.awayId && myIds[g.awayId]);
+    var meKey = meAway ? 'away' : 'home', opKey = meAway ? 'home' : 'away';
+    var meName = meAway ? g.away : g.home, opName = meAway ? g.home : g.away;
+    var meGp = meAway ? g.awayGp : g.homeGp, opGp = meAway ? g.homeGp : g.awayGp;
+    var meRec = meAway ? g.awayRec : g.homeRec, opRec = meAway ? g.homeRec : g.awayRec;
+    var meScore = meAway ? g.awayScore : g.homeScore, opScore = meAway ? g.homeScore : g.awayScore;
+
+    var dim = 'rgba(255,255,255,0.4)';
+    var head = '<div style="display:flex;align-items:baseline;justify-content:space-between;gap:8px;padding:2px 0 8px;">' +
+      '<span style="flex:1;color:' + accent + ';font-weight:800;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' +
+        slEsc(meName) + '</span>' +
+      '<span style="font-family:monospace;font-weight:800;font-size:13px;color:#fff;flex-shrink:0;">' +
+        slEsc(meRec != null ? meRec : (meScore != null ? String(meScore) : '\u2014')) +
+        '<span style="color:rgba(255,255,255,0.3);font-weight:400;"> \u2013 </span>' +
+        slEsc(opRec != null ? opRec : (opScore != null ? String(opScore) : '\u2014')) + '</span>' +
+      '<span style="flex:1;text-align:right;color:#fff;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' +
+        slEsc(opName) + '</span>' +
+    '</div>';
+    // Games played by each side's active players, straight from the feed.
+    if (meGp != null || opGp != null) {
+      head += '<div style="display:flex;justify-content:space-between;font-size:9.5px;letter-spacing:0.08em;color:' + dim + ';padding-bottom:8px;">' +
+        '<span>' + (meGp != null ? slEsc(String(meGp)) + ' GP' : '') + '</span>' +
+        '<span>' + (opGp != null ? slEsc(String(opGp)) + ' GP' : '') + '</span>' +
+      '</div>';
+    }
+    if (!g.cats || !g.cats.length) {
+      return '<div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.06);border-radius:10px;padding:10px 12px;margin-bottom:12px;">' +
+        '<div style="font-size:9.5px;letter-spacing:0.12em;color:' + dim + ';margin-bottom:6px;">MY MATCHUP</div>' +
+        head + '</div>';
+    }
+
+    var anyPts = false, anyRes = false;
+    for (i = 0; i < g.cats.length; i++) {
+      if (g.cats[i][meKey] && g.cats[i][meKey].points != null) anyPts = true;
+      if (g.cats[i][meKey] && g.cats[i][meKey].result) anyRes = true;
+    }
+    var rows = '', mePtsTot = 0, opPtsTot = 0, ptsSeen = false;
+    for (i = 0; i < g.cats.length; i++) {
+      var cat = g.cats[i] || {};
+      var mine = cat[meKey] || {}, theirs = cat[opKey] || {};
+      var res = mine.result || '';
+      var win = res === 'W', lose = res === 'L';
+      var meCol = win ? '#4ade80' : (lose ? 'rgba(255,255,255,0.55)' : '#fff');
+      var opCol = lose ? '#4ade80' : (win ? 'rgba(255,255,255,0.55)' : '#fff');
+      var mp = _fxNum(mine.points), op = _fxNum(theirs.points);
+      if (mp != null) { mePtsTot += mp; ptsSeen = true; }
+      if (op != null) { opPtsTot += op; ptsSeen = true; }
+      rows += '<div style="display:flex;align-items:center;gap:8px;padding:5px 0;border-top:1px solid rgba(255,255,255,0.05);font-size:12px;">' +
+        '<span style="flex:1;text-align:right;font-family:monospace;font-weight:' + (win ? '800' : '500') + ';color:' + meCol + ';">' +
+          slEsc(_fxCellText(mine)) +
+          (mp != null && anyPts ? '<span style="color:rgba(255,255,255,0.3);font-size:9.5px;"> ' + slEsc(String(Math.round(mp * 100) / 100)) + '</span>' : '') +
+        '</span>' +
+        '<span style="width:64px;text-align:center;font-size:9.5px;letter-spacing:0.08em;color:' + dim + ';flex-shrink:0;">' +
+          slEsc(cat.name || '') + '</span>' +
+        '<span style="flex:1;font-family:monospace;font-weight:' + (lose ? '800' : '500') + ';color:' + opCol + ';">' +
+          (op != null && anyPts ? '<span style="color:rgba(255,255,255,0.3);font-size:9.5px;">' + slEsc(String(Math.round(op * 100) / 100)) + ' </span>' : '') +
+          slEsc(_fxCellText(theirs)) +
+        '</span>' +
+      '</div>';
+    }
+    // For a points league the categories are supposed to add up to the team
+    // total. Say so when they do, and say so when they don't rather than
+    // quietly showing two numbers that disagree.
+    var foot = '';
+    if (ptsSeen) {
+      var mr = Math.round(mePtsTot * 100) / 100, orr = Math.round(opPtsTot * 100) / 100;
+      var meT = _fxNum(meScore), opT = _fxNum(opScore);
+      var off = (meT != null && Math.abs(meT - mr) > 0.105) || (opT != null && Math.abs(opT - orr) > 0.105);
+      foot = '<div style="display:flex;align-items:center;gap:8px;padding:6px 0 0;border-top:1px solid rgba(255,255,255,0.12);font-size:12px;">' +
+        '<span style="flex:1;text-align:right;font-family:monospace;font-weight:800;color:' + accent + ';">' + slEsc(String(mr)) + '</span>' +
+        '<span style="width:64px;text-align:center;font-size:9.5px;letter-spacing:0.08em;color:' + dim + ';flex-shrink:0;">SUM</span>' +
+        '<span style="flex:1;font-family:monospace;font-weight:800;color:#fff;">' + slEsc(String(orr)) + '</span>' +
+      '</div>';
+      if (off) {
+        foot += '<div style="font-size:9px;color:rgba(255,255,255,0.35);padding-top:4px;text-align:center;">' +
+          'The categories sum to this; the posted score above is adjusted.</div>';
+      }
+    }
+    var label = anyRes ? 'CATEGORY BREAKDOWN' : (anyPts ? 'SCORING BREAKDOWN' : 'MY MATCHUP');
+    return '<div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.06);border-radius:10px;padding:10px 12px;margin-bottom:12px;">' +
+      '<div style="font-size:9.5px;letter-spacing:0.12em;color:' + dim + ';margin-bottom:6px;">' + label + '</div>' +
+      head + rows + foot + '</div>';
+  } catch (e) { return ''; }
+}
+
 function extOpenLeague(key) {
   var row = null;
   for (var i = 0; i < extLeagues.length; i++) {
@@ -167250,7 +167696,33 @@ function extOpenLeague(key) {
         }
       } catch (e) { try { console.error('Sleeper H2H:', e); } catch (e2) {} }
     }
-    if (lp.period != null) {
+    // FXCATPANEL — Fantrax's own category/points breakdown for my matchup,
+    // above the league-wide list, the way Sleeper's slot panel sits.
+    if (row.provider === 'fantrax' && typeof _fxMatchupPanelHtml === 'function') {
+      try { matchupHtml += _fxMatchupPanelHtml(row, myIds, accent); }
+      catch (e) { try { console.error('Fantrax matchup panel:', e); } catch (e2) {} }
+    }
+    // FXPERIOD — a Fantrax league can be stepped back through its finished
+    // periods now that the loader sends one.
+    var _fxPer = (row.provider === 'fantrax')
+      ? ((row.scoresPeriod != null) ? row.scoresPeriod : lp.period) : null;
+    if (row.provider === 'fantrax' && _fxPer != null) {
+      var _fxList = (typeof _fxPeriodList === 'function') ? _fxPeriodList(row) : [];
+      var _fxAt = -1, _fxI;
+      for (_fxI = 0; _fxI < _fxList.length; _fxI++) { if (_fxList[_fxI] === Number(_fxPer)) _fxAt = _fxI; }
+      var _fxCanBack = _fxList.length ? (_fxAt > 0) : (Number(_fxPer) > 1);
+      var _fxCanFwd = _fxList.length ? (_fxAt !== -1 && _fxAt < _fxList.length - 1) : true;
+      var _fxBtn = function (dir, glyph, on) {
+        return '<button onclick="' + (on ? '_fxPeriodStep(\'' + slEsc(row.key) + '\',' + dir + ')' : '') + '" ' +
+          'style="background:none;border:0;padding:2px 8px;font-size:13px;cursor:' + (on ? 'pointer' : 'default') + ';' +
+          'color:rgba(255,255,255,' + (on ? '0.65' : '0.18') + ');">' + glyph + '</button>';
+      };
+      matchupHtml += '<div style="display:flex;align-items:center;justify-content:center;gap:2px;margin-bottom:6px;">' +
+        _fxBtn(-1, '\u25c0', _fxCanBack) +
+        '<span style="color:rgba(255,255,255,0.4);font-size:10px;letter-spacing:0.1em;">PERIOD ' + slEsc(String(_fxPer)) + '</span>' +
+        _fxBtn(1, '\u25b6', _fxCanFwd) +
+      '</div>';
+    } else if (lp.period != null) {
       matchupHtml += '<div style="color:rgba(255,255,255,0.4);font-size:10px;letter-spacing:0.1em;margin-bottom:4px;">PERIOD ' + slEsc(String(lp.period)) + '</div>';
     }
     for (var lg2 = 0; lg2 < lp.games.length; lg2++) {
@@ -167266,7 +167738,12 @@ function extOpenLeague(key) {
             : (lgm.awayScore != null) ? slEsc(String(lgm.awayScore)) : '\u2014') +
           ' <span style="color:rgba(255,255,255,0.3);font-weight:400;">\u2013</span> ' +
           ((lgm.homeRec != null) ? slEsc(lgm.homeRec)
-            : (lgm.homeScore != null) ? slEsc(String(lgm.homeScore)) : '\u2014') + '</span>' +
+            : (lgm.homeScore != null) ? slEsc(String(lgm.homeScore)) : '\u2014') +
+          ((lgm.awayGp != null || lgm.homeGp != null)
+            ? '<span style="display:block;font-size:8.5px;font-weight:600;color:rgba(255,255,255,0.3);text-align:center;">' +
+              slEsc(String(lgm.awayGp != null ? lgm.awayGp : '\u2014')) + ' GP ' +
+              slEsc(String(lgm.homeGp != null ? lgm.homeGp : '\u2014')) + '</span>'
+            : '') + '</span>' +
         '<span style="flex:1;color:' + (lhMine ? accent : '#fff') + ';font-weight:' + (lhMine ? '800' : '400') + ';overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + _mlH + slEsc(lgm.home) + '</span>' +
       '</div>';
     }
