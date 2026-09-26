@@ -29138,6 +29138,7 @@
   <div style="display:flex;gap:6px;padding:0 20px 10px;align-items:center">
     <button class="league-pill active" id="stViewConf" onclick="setStandingsView('conference')" style="padding:6px 14px;font-size:10px">Conference</button>
     <button class="league-pill" id="stViewDiv" onclick="setStandingsView('division')" style="padding:6px 14px;font-size:10px">Division</button>
+    <button class="league-pill" id="stViewLeaders" onclick="setStandingsView('leaders')" style="padding:6px 14px;font-size:10px;display:none">Leaders</button><!-- HTLEADERS -->
     <span style="font-size:8px;color:rgba(255,255,255,0.2);margin-left:auto">Tap column headers to sort</span>
   </div>
   <div id="stMilbLevelPills" style="display:none;gap:6px;padding:0 20px 10px;flex-wrap:wrap"></div>
@@ -32654,6 +32655,23 @@ function _htTeams(league) {
 }
 // Skaters and goalies for a team, walking back a season at a time until one
 // of them has played a game.
+// HTROWS — every stats list this feed returns ends with rows that aren't
+// people: an "Empty Net" line and a "Totals" line, neither carrying a
+// player_id. Counted as players they filled a preseason roster with two
+// phantom goalies AND made the page believe the current season had data,
+// so it never fell back to the season that did.
+function _htRealPlayers(rows) {
+  var out = [];
+  for (var i = 0; i < (rows || []).length; i++) {
+    var r = rows[i] || {};
+    var pid = String(r.player_id == null ? '' : r.player_id).replace(/^\s+|\s+$/g, '');
+    if (!pid || pid === '0') continue;
+    var nm = String(r.name || '').replace(/^\s+|\s+$/g, '').toLowerCase();
+    if (nm === 'totals' || nm === 'empty net') continue;
+    out.push(r);
+  }
+  return out;
+}
 function _htTeamStats(league, teamId) {
   var ck = league + '|' + teamId;
   if (_htTeamStatsCache[ck]) return Promise.resolve(_htTeamStatsCache[ck]);
@@ -32668,8 +32686,8 @@ function _htTeamStats(league, teamId) {
         _htFetch(_htQS(league, 'feed=modulekit&view=statviewtype&type=goalies&limit=20&team_id=' +
           encodeURIComponent(teamId) + '&season_id=' + sid))['catch'](function () { return null; })
       ]).then(function (r) {
-        var sk = (r[0] && r[0].SiteKit && r[0].SiteKit.Statviewtype) || [];
-        var go = (r[1] && r[1].SiteKit && r[1].SiteKit.Statviewtype) || [];
+        var sk = _htRealPlayers((r[0] && r[0].SiteKit && r[0].SiteKit.Statviewtype) || []);   // HTROWS
+        var go = _htRealPlayers((r[1] && r[1].SiteKit && r[1].SiteKit.Statviewtype) || []);
         if (!sk.length && !go.length) return attempt(i + 1);
         return { skaters: sk, goalies: go, season: tries[i], stale: i > 0 };
       });
@@ -32902,13 +32920,34 @@ function _htRenderPlayerCard(league, pid, d, fallbackName, teamAbbr, accent) {
       '</div>' +
     '</div>' +
     _htPlayerKpis(current, isG, accent) +
+    // HTGAMELOG — button ORDER is what the shared tab switcher maps, so
+    // Seasons sits where 'season' is expected and the log where 'gamelog' is.
     '<div class="pm-tabs" style="--pm-accent:' + accent + '">' +
-      '<button class="pm-tab active">Seasons</button></div>' +
-    '<div class="pm-tab-content active" style="padding:4px 0 18px">' +
+      '<button class="pm-tab active" onclick="switchPlayerTab(\'season\')">Seasons</button>' +
+      '<button class="pm-tab" onclick="switchPlayerTab(\'gamelog\')">Game Log</button>' +
+    '</div>' +
+    '<div id="ptab-season" class="pm-tab-content active" style="padding:4px 0 18px">' +
       _htSeasonTable(rows, isG, accent) +
       '<div class="pm-t8" style="color:rgba(255,255,255,0.2);letter-spacing:0.5px;padding:10px 20px 0">' +
         league + ' · HOCKEYTECH</div>' +
-    '</div>';
+    '</div>' +
+    '<div id="ptab-gamelog" class="pm-tab-content" style="padding:4px 0 18px">' +
+      '<div class="pm-loading">Loading game log…</div></div>';
+
+  // The log is asked for by season, so it waits until the seasons are known.
+  var _logSeason = (reg[0] && reg[0].season_id) || (rows[0] && rows[0].season_id) || '';
+  var _logHost = document.getElementById('ptab-gamelog');
+  if (_logHost && _logSeason) {
+    _htPlayerGames(league, pid, _logSeason).then(function (games) {
+      var h = document.getElementById('ptab-gamelog');
+      if (h) h.innerHTML = _htGameLogHtml(games, accent);
+    }, function () {
+      var h2 = document.getElementById('ptab-gamelog');
+      if (h2) h2.innerHTML = '<div class="pm-loading" style="padding:14px 20px">Game log unavailable.</div>';
+    });
+  } else if (_logHost) {
+    _logHost.innerHTML = '<div class="pm-loading" style="padding:14px 20px">No season to log.</div>';
+  }
 }
 // Opens from the rink box score. The id carried there is prefixed, so the
 // digits come back off before the league is asked about them.
@@ -32936,6 +32975,136 @@ function _htOpenPlayer(rawId, league, teamAbbr, accent) {
       '<button class="pm-close" onclick="closePlayerModal()">✕</button>' +
       '<div class="pm-loading" style="padding:40px;text-align:center">Player card unavailable.</div>';
   });
+}
+
+// ── HTPBP ── Real play-by-play, and with it the shot chart.
+//
+// The game summary carries goals and penalties, and I took that for the
+// whole story. It isn't: the same feed has a verbose play-by-play under
+// its own tab, with every shot, who took it, which goalie faced it, the
+// shot's quality — and x/y coordinates on every shot and goal. So the ice
+// doesn't have to stay bare after all.
+//
+// Coordinates come in the rink graphic's own pixel space, roughly 600
+// wide by 300 tall with centre ice at (300,150). The rink chart speaks the
+// NHL's feet-from-centre instead, so 3 units to the foot across and the
+// lateral axis scaled to a 42.5-foot half-width. The chart folds both ends
+// onto one half itself, so it doesn't matter that this feed reports each
+// team's shots at a fixed end rather than switching them by period.
+var _htPbpCache = {};
+function _htPbp(game) {
+  var ck = game.league + '|' + game.htGameId;
+  var hit = _htPbpCache[ck];
+  if (hit && (Date.now() - hit.t) < 15000) return Promise.resolve(hit.d);
+  return _htFetch(_htQS(game.league, 'feed=gc&tab=pxpverbose&game_id=' +
+      encodeURIComponent(game.htGameId))).then(function (d) {
+    _htPbpCache[ck] = { t: Date.now(), d: d };
+    return d;
+  });
+}
+function _htCoord(e) {
+  if (!e || e.x_location == null || e.y_location == null) return null;
+  var x = parseFloat(e.x_location), y = parseFloat(e.y_location);
+  if (isNaN(x) || isNaN(y)) return null;
+  return { x: (x - 300) / 3, y: ((y - 150) / 150) * 42.5 };
+}
+// Names arrive on shots but goals carry only ids, so the summary's rosters
+// become the lookup for everyone in the game.
+function _htNameIndex(sum) {
+  var idx = {};
+  ['homeTeam', 'visitingTeam'].forEach(function (side) {
+    var t = (sum && sum[side]) || {};
+    ['skaters', 'goalies'].forEach(function (grp) {
+      var list = t[grp] || [];
+      for (var i = 0; i < list.length; i++) {
+        var info = (list[i] && list[i].info) || {};
+        if (info.id == null) continue;
+        idx[String(info.id)] = ((info.firstName || '') + ' ' + (info.lastName || '')).replace(/^ | $/g, '');
+      }
+    });
+  });
+  return idx;
+}
+function _htEvName(e, key, idx) {
+  var nested = e && e[key.replace(/_id$/, '')];
+  if (nested && (nested.first_name || nested.last_name)) {
+    return ((nested.first_name || '') + ' ' + (nested.last_name || '')).replace(/^ | $/g, '');
+  }
+  var id = e && e[key];
+  return (id != null && idx[String(id)]) ? idx[String(id)] : '';
+}
+function _htPbpPlays(pbp, game, sum) {
+  var evs = (pbp && pbp.GC && pbp.GC.Pxpverbose) || [];
+  if (!evs.length) return null;
+  var idx = _htNameIndex(sum);
+  var hid = game.home.id, aid = game.away.id;
+  var plays = [], aRun = 0, hRun = 0;
+  for (var i = 0; i < evs.length; i++) {
+    var e = evs[i] || {};
+    var kind = String(e.event || '');
+    var isHome = String(e.home) === '1';
+    var pnum = parseInt(e.period_id, 10) || 1;
+    var clock = e.time_formatted || e.time || '';
+    var base = {
+      period: { number: pnum },
+      clock: { displayValue: clock },
+      team: { id: isHome ? hid : aid },
+      scoringPlay: false
+    };
+    if (kind === 'goal') {
+      if (isHome) hRun++; else aRun++;
+      var scorer = _htEvName(e, 'goal_player_id', idx) || 'Goal';
+      var a1 = _htEvName(e, 'assist1_player_id', idx);
+      var a2 = _htEvName(e, 'assist2_player_id', idx);
+      var assists = [a1, a2].filter(Boolean);
+      var strength = String(e.power_play) === '1' ? 'PP'
+                   : (String(e.empty_net) === '1' ? 'EN'
+                   : (String(e.short_handed) === '1' ? 'SH' : ''));
+      plays.push({
+        scoringPlay: true, period: base.period, clock: base.clock, team: base.team,
+        awayScore: aRun, homeScore: hRun,
+        type: { text: 'Goal' },
+        text: scorer + (assists.length ? ' assists: ' + assists.join(', ') : ''),
+        scoringType: { displayName: strength || 'Even' },
+        coordinate: _htCoord(e),
+        athlete: { id: e.goal_player_id != null ? ('ht' + e.goal_player_id) : null }
+      });
+    } else if (kind === 'shot') {
+      var shooter = _htEvName(e, 'player_id', idx) || 'Shot';
+      var keeper = _htEvName(e, 'goalie_id', idx);
+      var qual = e.shot_quality_description || '';
+      plays.push({
+        scoringPlay: false, period: base.period, clock: base.clock, team: base.team,
+        type: { text: 'Shot' },
+        text: shooter + ' shot on goal' + (keeper ? ', saved by ' + keeper : '') +
+              (qual ? ' · ' + qual : ''),
+        coordinate: _htCoord(e),
+        athlete: { id: e.player_id != null ? ('ht' + e.player_id) : null }
+      });
+    } else if (kind === 'penalty') {
+      var taker = _htEvName(e, 'player_id', idx);
+      var mins = e.minutes_formatted || ((e.minutes != null ? parseInt(e.minutes, 10) : 2) + ':00');
+      plays.push({
+        scoringPlay: false, period: base.period,
+        clock: { displayValue: e.time_off_formatted || clock },
+        team: base.team,
+        type: { text: 'Penalty' },
+        text: (taker || (String(e.bench) === '1' ? 'Bench' : 'Penalty')) + ' ' +
+              (e.lang_penalty_description || 'penalty') + ' (' + mins + ')'
+      });
+    } else if (kind === 'goalie_change') {
+      var gin = '', gout = '';
+      try { gin = _htSumName(e.goalie_in_info) || (idx[String(e.goalie_in_id)] || ''); } catch (e1) {}
+      try { gout = _htSumName(e.goalie_out_info) || (idx[String(e.goalie_out_id)] || ''); } catch (e2) {}
+      if (!gin && !gout) continue;
+      plays.push({
+        scoringPlay: false, period: base.period, clock: base.clock, team: base.team,
+        type: { text: 'Goalie Change' },
+        text: gin ? (gout ? (gin + ' in for ' + gout) : (gin + ' in net')) : (gout + ' to the bench')
+      });
+    }
+  }
+  return plays;
 }
 
 // ── HTRINK ── The minor leagues, in rink mode.
@@ -33027,7 +33196,7 @@ function _htRinkSide(team, tid, abbr) {
   }
   return { team: { id: tid }, statistics: groups };
 }
-function _htRinkAdapt(sum, game) {
+function _htRinkAdapt(sum, game, pbp) {
   var periods = (sum && sum.periods) || [];
   var home = (sum && sum.homeTeam) || {}, away = (sum && sum.visitingTeam) || {};
   // Team ids come from the SCOREBAR row, not the summary: every lookup
@@ -33035,9 +33204,14 @@ function _htRinkAdapt(sum, game) {
   // them compares with ===.
   var hid = game.home.id, aid = game.away.id;
   var sumHomeId = String((home.info && home.info.id) != null ? home.info.id : '');
-  var plays = [];
+  // HTPBP — the play-by-play is richer and carries coordinates, so it wins
+  // when it's there; the summary's goals and penalties remain the fallback
+  // for a game whose pbp hasn't been filed.
+  var plays = _htPbpPlays(pbp, game, sum);
+  var _fromPbp = !!(plays && plays.length);
+  if (!plays) plays = [];
   var aRun = 0, hRun = 0;
-  for (var pi = 0; pi < periods.length; pi++) {
+  for (var pi = 0; _fromPbp === false && pi < periods.length; pi++) {
     var per = periods[pi] || {};
     var pnum = parseInt((per.info && per.info.id) || (pi + 1), 10) || (pi + 1);
     var goals = per.goals || [];
@@ -33098,6 +33272,9 @@ function _htRinkAdapt(sum, game) {
       teams: [ teamStats(away), teamStats(home) ],
       players: [ _htRinkSide(away, aid, game.away.abbr), _htRinkSide(home, hid, game.home.abbr) ]
     },
+    _htStars: (sum && sum.mostValuablePlayers) || [],   // HTSTARS
+    _htDetails: (sum && sum.details) || null,
+    _htRefs: (sum && sum.referees) || null,
     _hockeyTech: true
   };
 }
@@ -33122,7 +33299,32 @@ function _htGoalStrength(props) {
 function _htRenderModal(game) {
   var host = document.getElementById('modalSummaryStats');
   if (!host) return;
+  // HTPREVIEW — nothing has happened yet in a scheduled game, so the
+  // preview takes the space the summary would have.
+  if (game.state === 'pre') {
+    host.innerHTML = '<div class="modal-loading">Loading preview…</div>';
+    _htPreview(game).then(function (pv) {
+      var h = _htPreviewHtml(pv, game);
+      host.innerHTML = h || '<div class="modal-loading" style="padding:10px 0">No preview for this game.</div>';
+    }, function () {
+      host.innerHTML = '<div class="modal-loading" style="padding:10px 0">No preview for this game.</div>';
+    });
+    return;
+  }
   host.innerHTML = '<div class="modal-loading">Loading summary…</div>';
+  // HTPBP — the Plays tab is filled from the same fetch.
+  _htPbp(game).then(function (pb) {
+    var host2 = document.getElementById('tab-pbp');
+    if (!host2) return;
+    return _htSummary(game).then(function (sm) {
+      var adapted = _htRinkAdapt(sm, game, pb);
+      var h = (typeof renderScoreboardPBP === 'function') ? renderScoreboardPBP(adapted, game, 'modal') : '';
+      host2.innerHTML = h || '<div class="modal-loading">No play-by-play for this game.</div>';
+    });
+  })['catch'](function () {
+    var host3 = document.getElementById('tab-pbp');
+    if (host3) host3.innerHTML = '<div class="modal-loading">No play-by-play for this game.</div>';
+  });
   _htSummary(game).then(function (d) {
     if (!d) throw new Error('empty');
     var periods = d.periods || [];
@@ -39095,7 +39297,7 @@ function openModal(game) {
     <div class="modal-tabs" style="--accent: ${hc}">
       <button class="modal-tab active" onclick="switchTab('teamstats')">Summary</button>
       ${(game.bananaBall || game.hockeyTech) ? '' : `<button class="modal-tab" onclick="switchTab('boxscore')">Box Score</button>`}
-      ${(game.bananaBall || game.hockeyTech) ? '' : `<button class="modal-tab" onclick="switchTab('pbp')">Plays</button>`}
+      ${game.bananaBall ? '' : `<button class="modal-tab" onclick="switchTab('pbp')">Plays</button>`}   <!-- HTPBP -->
       <button class="modal-tab" id="modalFantasyTab" onclick="switchTab('fantasy')" style="color:#a5b4fc;display:none">🏆 Fantasy</button>
     </div>
     <div id="tab-teamstats" class="modal-tab-content active">
@@ -45658,7 +45860,7 @@ function renderTopPerformers(data, game) {
           else if (isPitcher) impact = mlbIP * 3 + mlbK * 2 - mlbER * 2 + (mlbER === 0 && mlbIP >= 5 ? 4 : 0);
         } else if (league === 'NBA' || league === 'GLEAGUE' || league === 'NBASL' || league === 'NCAAMB') {
           impact = pts + (reb * 1.2) + (ast * 1.5);
-        } else if (league === 'NHL') {
+        } else if (league === 'NHL' || (LEAGUES[league] && LEAGUES[league].hockeyTech)) {   // HTSTARS
           impact = (g * 3) + (parseStat(statMap['A'] || '0') * 2) + pts;
         } else {
           impact = yds + (td * 20);
@@ -59664,7 +59866,281 @@ function _nbaPerformersByTeam(all, game, hideTitle, ac, hc) {
   return html;
 }
 
+// ── HTGAMELOG ── Every game a player has played, not just his totals.
+// Same player view as the card's seasons, asked for by game. The log says
+// which side its subject was on, so the opponent (and whether it was a
+// road game) is read off that rather than guessed from the team codes.
+function _htPlayerGames(league, pid, seasonId) {
+  var ck = league + '|' + pid + '|' + seasonId;
+  if (!_htGameLogCache[ck]) {
+    _htGameLogCache[ck] = _htFetch(_htQS(league, 'feed=modulekit&view=player&category=gamebygame' +
+        '&player_id=' + encodeURIComponent(pid) + '&season_id=' + encodeURIComponent(seasonId)))
+      .then(function (j) {
+        var pl = (j && j.SiteKit && j.SiteKit.Player) || {};
+        return pl.games || [];
+      }, function () { return []; });
+  }
+  return _htGameLogCache[ck];
+}
+var _htGameLogCache = {};
+function _htGameLogHtml(games, accent) {
+  if (!games || !games.length) return '<div class="pm-loading" style="padding:14px 20px">No games logged for this season.</div>';
+  var isG = false;
+  for (var g0 = 0; g0 < games.length; g0++) {
+    if (games[g0] && (games[g0].saves != null || games[g0].shots_against != null)) { isG = true; break; }
+  }
+  var labels = isG ? ['DATE', 'OPP', 'SA', 'SV', 'GA', 'DEC'] : ['DATE', 'OPP', 'G', 'A', 'P', 'S', 'PIM'];
+  var html = '<div class="pm-table-wrap"><table class="pm-table"><thead><tr>';
+  for (var L = 0; L < labels.length; L++) html += '<th>' + labels[L] + '</th>';
+  html += '</tr></thead><tbody>';
+  // Newest first — a game log is read from the last game backwards.
+  var rows = games.slice().sort(function (a, b) {
+    return String(b.date_played || '').localeCompare(String(a.date_played || ''));
+  });
+  for (var i = 0; i < rows.length; i++) {
+    var r = rows[i] || {};
+    var wasHome = String(r.home) === '1';
+    var opp = wasHome ? (r.visiting_team_code || '') : (r.home_team_code || '');
+    var d = String(r.date_played || '');
+    var dLabel = d.length === 10 ? (parseInt(d.slice(5, 7), 10) + '/' + parseInt(d.slice(8, 10), 10)) : d;
+    var cells = isG
+      ? [r.shots_against, r.saves, r.goals_against, r.decision || r.result || '']
+      : [r.goals, r.assists, (r.points != null ? r.points : ''), r.shots, r.penalty_minutes];
+    html += '<tr><td style="color:rgba(255,255,255,0.45);white-space:nowrap">' + skEscapeMaybe(dLabel) + '</td>' +
+      '<td style="white-space:nowrap;color:' + (accent || '#7dd3fc') + '">' +
+        (wasHome ? 'vs ' : '@ ') + skEscapeMaybe(opp) + '</td>';
+    for (var c = 0; c < cells.length; c++) {
+      html += '<td>' + (cells[c] != null && cells[c] !== '' ? skEscapeMaybe(cells[c]) : '-') + '</td>';
+    }
+    html += '</tr>';
+  }
+  return html + '</tbody></table></div>';
+}
+
+// ── HTPREVIEW ── What a scheduled game is worth opening for.
+// Before a puck drops there is no summary to show, so the feed's own
+// preview stands in: the season series, the last meetings with scores,
+// and who is scoring for each side.
+var _htPreviewCache = {};
+function _htPreview(game) {
+  var ck = game.league + '|' + game.htGameId;
+  if (!_htPreviewCache[ck]) {
+    _htPreviewCache[ck] = _htFetch(_htQS(game.league, 'feed=gc&tab=preview&game_id=' +
+      encodeURIComponent(game.htGameId))).then(function (j) {
+      var gc = (j && j.GC) || {};
+      return gc.Preview || gc;   // the payload has been seen both ways
+    });
+  }
+  return _htPreviewCache[ck];
+}
+function _htRecLine(r) {
+  if (!r) return '';
+  var w = r.w || 0, l = r.l || 0, otl = (r.otl || 0) + (r.sl || 0);
+  return w + '-' + l + '-' + otl;
+}
+function _htScorerRows(list, accent) {
+  var out = '';
+  for (var i = 0; i < (list || []).length && i < 5; i++) {
+    var p = list[i] || {};
+    var nm = ((p.first_name || '') + ' ' + (p.last_name || '')).replace(/^ | $/g, '') || '?';
+    out += '<tr><td style="white-space:nowrap">' + skEscapeMaybe(nm) +
+      (p.jersey_number ? ' <span style="color:rgba(255,255,255,0.25)">#' + skEscapeMaybe(p.jersey_number) + '</span>' : '') +
+      '</td><td>' + skEscapeMaybe(p.goals != null ? p.goals : '-') + '</td>' +
+      '<td>' + skEscapeMaybe(p.assists != null ? p.assists : '-') + '</td>' +
+      '<td style="color:' + accent + ';font-weight:700">' + skEscapeMaybe(p.points != null ? p.points : '-') + '</td></tr>';
+  }
+  return out;
+}
+function _htPreviewHtml(pv, game) {
+  if (!pv) return '';
+  var ac = '#c8102e', hc = '#7dd3fc';
+  var h2h = pv.HeadToHeadRecord || null;
+  var html = '';
+  if (h2h && (h2h.home_team || h2h.visiting_team)) {
+    html += '<div class="pm-t9" style="color:rgba(255,255,255,0.4);letter-spacing:0.06em;margin:4px 0 6px">SEASON SERIES</div>' +
+      '<div style="display:flex;gap:10px;align-items:center;font-family:var(--sk-font-mono,monospace);font-size:12px">' +
+        '<span style="color:' + ac + ';font-weight:800">' + skEscapeMaybe(game.away.abbr) + '</span>' +
+        '<span style="color:#fff">' + skEscapeMaybe(_htRecLine(h2h.visiting_team)) + '</span>' +
+        '<span style="color:rgba(255,255,255,0.25)">—</span>' +
+        '<span style="color:#fff">' + skEscapeMaybe(_htRecLine(h2h.home_team)) + '</span>' +
+        '<span style="color:' + hc + ';font-weight:800">' + skEscapeMaybe(game.home.abbr) + '</span>' +
+      '</div>';
+  }
+  // HTPREVIEW2 — the feed also carries the longer series record, which is
+  // the more interesting number in September when this season's is 1-0.
+  var five = pv.last5YearsRecord || null;
+  if (five && (five.home_team || five.visiting_team)) {
+    html += '<div class="pm-t9" style="color:rgba(255,255,255,0.4);letter-spacing:0.06em;margin:12px 0 6px">LAST 5 SEASONS</div>' +
+      '<div style="display:flex;gap:10px;align-items:center;font-family:var(--sk-font-mono,monospace);font-size:12px">' +
+        '<span style="color:' + ac + ';font-weight:800">' + skEscapeMaybe(game.away.abbr) + '</span>' +
+        '<span style="color:#fff">' + skEscapeMaybe(_htRecLine(five.visiting_team)) + '</span>' +
+        '<span style="color:rgba(255,255,255,0.25)">—</span>' +
+        '<span style="color:#fff">' + skEscapeMaybe(_htRecLine(five.home_team)) + '</span>' +
+        '<span style="color:' + hc + ';font-weight:800">' + skEscapeMaybe(game.home.abbr) + '</span>' +
+      '</div>';
+  }
+  var prev = pv.previous_meetings || [];
+  if (prev.length) {
+    html += '<div class="pm-t9" style="color:rgba(255,255,255,0.4);letter-spacing:0.06em;margin:12px 0 4px">PREVIOUS MEETINGS</div>';
+    for (var i = 0; i < prev.length && i < 5; i++) {
+      var m = prev[i] || {};
+      html += '<div style="display:flex;gap:8px;padding:4px 0;font-size:11px;' +
+        'border-bottom:1px solid rgba(255,255,255,0.05)">' +
+        '<span style="color:rgba(255,255,255,0.35);min-width:74px;font-family:var(--sk-font-mono,monospace)">' +
+          skEscapeMaybe(m.datePlayed || '') + '</span>' +
+        '<span style="color:#fff">' + skEscapeMaybe(m.visitingCity || '') + ' ' + skEscapeMaybe(m.visitingScore || '') +
+        ' <span style="color:rgba(255,255,255,0.3)">at</span> ' +
+        skEscapeMaybe(m.homeCity || '') + ' ' + skEscapeMaybe(m.homeScore || '') + '</span></div>';
+    }
+  }
+  var away = pv.visitor_team || {}, home = pv.home_team || {};
+  function scorerTable(t, abbr, accent) {
+    var rows = _htScorerRows(t.leadingScorers, accent);
+    if (!rows) return '';
+    return '<div style="margin-top:12px">' +
+      '<div class="pm-t9" style="color:' + accent + ';letter-spacing:0.06em;margin-bottom:4px">' +
+        skEscapeMaybe(abbr) + ' LEADING SCORERS</div>' +
+      '<div class="pm-table-wrap"><table class="pm-table"><thead><tr><th>PLAYER</th><th>G</th><th>A</th><th>P</th></tr></thead>' +
+      '<tbody>' + rows + '</tbody></table></div></div>';
+  }
+  html += scorerTable(away, game.away.abbr, ac) + scorerTable(home, game.home.abbr, hc);
+  return html;
+}
+
+// ── HTLEADERS ── The league's own scoring and goaltending races.
+var _htLeadersCache = {};
+function _htLeaders(league) {
+  if (_htLeadersCache[league]) return _htLeadersCache[league];
+  _htLeadersCache[league] = _htSeasons(league).then(function (regs) {
+    var tries = regs.slice(0, 3);
+    function attempt(i) {
+      if (i >= tries.length) return Promise.resolve({ skaters: [], goalies: [], season: null });
+      var sid = tries[i].id;
+      return Promise.all([
+        _htFetch(_htQS(league, 'feed=modulekit&view=statviewtype&type=topscorers&limit=15&season_id=' + sid))['catch'](function () { return null; }),
+        _htFetch(_htQS(league, 'feed=modulekit&view=statviewtype&type=goalies&limit=15&qualified=all&season_id=' + sid))['catch'](function () { return null; })
+      ]).then(function (r) {
+        var sk = _htRealPlayers((r[0] && r[0].SiteKit && r[0].SiteKit.Statviewtype) || []);   // HTROWS
+        var go = _htRealPlayers((r[1] && r[1].SiteKit && r[1].SiteKit.Statviewtype) || []);
+        if (!sk.length && !go.length) return attempt(i + 1);
+        return { skaters: sk, goalies: go, season: tries[i], stale: i > 0 };
+      });
+    }
+    return attempt(0);
+  });
+  return _htLeadersCache[league];
+}
+function _htLeaderTable(rows, isG, league) {
+  if (!rows || !rows.length) return '';
+  var labels = isG ? ['#', 'PLAYER', 'TEAM', 'GP', 'W', 'GAA', 'SV%', 'SO']
+                   : ['#', 'PLAYER', 'TEAM', 'GP', 'G', 'A', 'P'];
+  var html = '<div class="gym-bx-section"><div class="gym-bx-title"><span>' +
+    (isG ? 'GOALTENDING' : 'SCORING') + '</span></div>' +
+    '<div class="gym-bx-wrap"><table class="gym-bx-table"><thead><tr>';
+  for (var L = 0; L < labels.length; L++) html += '<th>' + labels[L] + '</th>';
+  html += '</tr></thead><tbody>';
+  for (var i = 0; i < rows.length; i++) {
+    var r = rows[i] || {};
+    var cells = isG
+      ? [r.games_played, r.wins,
+         (r.goals_against_average != null ? r.goals_against_average : '-'),
+         (function () { var v = parseFloat(r.save_percentage); return isNaN(v) ? '-' : v.toFixed(3).replace(/^0/, ''); })(),
+         r.shutouts]
+      : [r.games_played, r.goals, r.assists, r.points];
+    html += '<tr style="cursor:pointer" onclick="_htOpenPlayer(\'ht' + skEscapeMaybe(r.player_id) + '\',\'' +
+        league + '\',\'' + _jsStr(r.team_code || '') + '\',\'#7dd3fc\')">' +
+      '<td style="color:rgba(255,255,255,0.3)">' + (i + 1) + '</td>' +
+      '<td style="white-space:nowrap">' + skEscapeMaybe(r.name || r.shortname || '?') + '</td>' +
+      '<td style="color:rgba(255,255,255,0.45)">' + skEscapeMaybe(r.team_code || '') + '</td>';
+    for (var c = 0; c < cells.length; c++) {
+      html += '<td>' + (cells[c] != null && cells[c] !== '' ? skEscapeMaybe(cells[c]) : '-') + '</td>';
+    }
+    html += '</tr>';
+  }
+  return html + '</tbody></table></div></div>';
+}
+function _htRenderLeaders(league) {
+  var body = document.getElementById('stBody');
+  if (!body) return;
+  body.innerHTML = '<div class="pm-loading">Loading leaders…</div>';
+  _htLeaders(league).then(function (d) {
+    var note = d.season
+      ? '<div class="pm-t9" style="padding:10px 20px 0;color:rgba(255,255,255,0.4);letter-spacing:0.06em">' +
+        skEscapeMaybe(d.season.name || d.season.short || '') +
+        (d.stale ? ' · the current season has no games yet' : '') + '</div>'
+      : '';
+    var tables = _htLeaderTable(d.skaters, false, league) + _htLeaderTable(d.goalies, true, league);
+    body.innerHTML = tables
+      ? (note + tables + '<div class="pm-t8" style="color:rgba(255,255,255,0.2);letter-spacing:0.5px;padding:12px 20px">' +
+         league + ' · HOCKEYTECH</div>')
+      : '<div class="pm-loading" style="padding:30px;text-align:center">No leaders published yet.</div>';
+    body.scrollTop = 0;
+  }, function () {
+    body.innerHTML = '<div class="pm-loading" style="padding:30px;text-align:center">Couldn’t load leaders.</div>';
+  });
+}
+
+// ── HTSTARS ── Top performers, chosen by the rink rather than by me.
+//
+// The other sports rank performers with an impact formula because nobody
+// publishes a verdict. Hockey does: the game summary carries the three
+// stars the building actually awarded, with each player's line attached.
+// That beats any heuristic, so when they're there they ARE the top
+// performers, in their awarded order.
+function _htStarsHtml(stars, game, hideTitle) {
+  if (!stars || !stars.length) return '';
+  var ac = (typeof vibrant === 'function') ? vibrant(game.away.color) : '#c8102e';
+  var hc = (typeof vibrant === 'function') ? vibrant(game.home.color) : '#1a3a5c';
+  var ORD = ['1ST STAR', '2ND STAR', '3RD STAR'];
+  var html = hideTitle ? '' : '<div class="crs-perf-title">⭐ TOP PERFORMERS</div>';
+  for (var i = 0; i < stars.length && i < 3; i++) {
+    var st = stars[i] || {};
+    var pl = st.player || {}, info = pl.info || {}, sx = pl.stats || {};
+    var isHome = String(st.homeTeam) === '1' || st.homeTeam === 1;
+    var col = isHome ? hc : ac;
+    var abbr = (st.team && st.team.abbreviation) || (isHome ? game.home.abbr : game.away.abbr);
+    var name = ((info.firstName || '') + ' ' + (info.lastName || '')).replace(/^ | $/g, '') || '?';
+    var line;
+    if (st.isGoalie) {
+      var sa = sx.shotsAgainst || 0, sv = sx.saves || 0;
+      line = sv + ' SV · ' + (sx.goalsAgainst || 0) + ' GA' +
+        (sa > 0 ? ' · ' + (sv / sa).toFixed(3).replace(/^0/, '') : '') +
+        (sx.timeOnIce ? ' · ' + sx.timeOnIce : '');
+    } else {
+      var bits = [];
+      if (sx.goals) bits.push(sx.goals + 'G');
+      if (sx.assists) bits.push(sx.assists + 'A');
+      if (sx.shots) bits.push(sx.shots + 'SOG');
+      if (!bits.length && sx.timeOnIce) bits.push(sx.timeOnIce + ' TOI');
+      line = bits.join(' · ');
+    }
+    var img = st.playerImage ? ('https://' + String(st.playerImage).replace(/^https?:\/\//, '')) : '';
+    html += '<div class="crs-perf-row" style="display:flex;align-items:center;gap:10px;padding:10px 4px;' +
+      'border-bottom:1px solid rgba(255,255,255,0.06)">' +
+      '<span style="font-family:var(--sk-font-mono,monospace);font-size:8.5px;font-weight:800;letter-spacing:0.08em;' +
+        'color:var(--sk-gold,#f5d547);min-width:54px">' + ORD[i] + '</span>' +
+      (img ? '<img src="' + img + '" alt="" style="width:34px;height:34px;border-radius:50%;object-fit:cover;' +
+        'background:rgba(255,255,255,0.06)" onerror="this.style.display=\'none\'">' : '') +
+      '<div style="flex:1;min-width:0">' +
+        '<div style="font-size:13px;font-weight:700;color:#fff">' + skEscapeMaybe(name) +
+          (info.jerseyNumber != null ? ' <span style="font-size:10px;color:rgba(255,255,255,0.35)">#' +
+            skEscapeMaybe(info.jerseyNumber) + '</span>' : '') + '</div>' +
+        '<div style="font-size:10px;color:rgba(255,255,255,0.45);font-family:var(--sk-font-mono,monospace)">' +
+          skEscapeMaybe(line || '—') + '</div>' +
+      '</div>' +
+      '<span style="font-family:var(--sk-font-mono,monospace);font-size:11px;font-weight:800;color:' + col + '">' +
+        skEscapeMaybe(abbr) + '</span>' +
+    '</div>';
+  }
+  return html;
+}
+
 function buildVintagePerformers(data, game, hideTitle) {
+  // HTSTARS — an official verdict outranks a computed one.
+  if (data && data._htStars && data._htStars.length && typeof _htStarsHtml === 'function') {
+    var _hs = _htStarsHtml(data._htStars, game, hideTitle);
+    if (_hs) return _hs;
+  }
   // Football gets a named selection rather than a yards leaderboard. FWPERF
   var _fwLg = (game && game.league) || '';
   if (_fwLg === 'NFL' || _fwLg === 'NCAAFB' || _fwLg === 'NCAAFB23') {
@@ -59719,7 +60195,7 @@ function buildVintagePerformers(data, game, hideTitle) {
         
         if (league === 'NBA' || league === 'GLEAGUE' || league === 'NBASL' || league === 'WNBA' || league === 'NCAAMB') {
           impact = pts + (reb * 1.2) + (ast * 1.5);
-        } else if (league === 'NHL') {
+        } else if (league === 'NHL' || (LEAGUES[league] && LEAGUES[league].hockeyTech)) {   // HTSTARS
           impact = (g * 3) + (parseStat(statMap['A'] || '0') * 2) + pts;
         } else if (league === 'MLB' || league === 'MiLB') {
           var h = parseStat(statMap['H'] || '0');
@@ -59738,7 +60214,7 @@ function buildVintagePerformers(data, game, hideTitle) {
           if (reb > 0) parts.push(reb + 'REB');
           if (ast > 0) parts.push(ast + 'AST');
           statLine = parts.slice(0, 3).join(' ');
-        } else if (league === 'NHL') {
+        } else if (league === 'NHL' || (LEAGUES[league] && LEAGUES[league].hockeyTech)) {   // HTSTARS
           var parts = [];
           if (g > 0) parts.push(g + 'G');
           var assists = parseStat(statMap['A'] || '0');
@@ -60317,12 +60793,31 @@ async function fetchRinkData(game) {
     // translated into the one the rink already reads.
     if (cfg.hockeyTech) {
       try {
-        var _sum = await _htSummary(game);
-        rinkData = _htRinkAdapt(_sum, game);
+        var _both = await Promise.all([
+          _htSummary(game),
+          _htPbp(game)['catch'](function () { return null; })   // HTPBP
+        ]);
+        rinkData = _htRinkAdapt(_both[0], game, _both[1]);
       } catch (_he) {
         rinkData = null;
       }
       renderRink();
+      // HTPREVIEW2 — vintage mode never opens the modal, so a scheduled game
+      // would show an empty board and nothing else. The preview goes under it.
+      if (game.state === 'pre') {
+        _htPreview(game).then(function (pv) {
+          if (!rinkGame || rinkGame.id !== game.id) return;   // moved on
+          var body = document.getElementById('rinkBody');
+          if (!body || document.getElementById('rinkHtPreview')) return;
+          var h = _htPreviewHtml(pv, game);
+          if (!h) return;
+          var wrap = document.createElement('div');
+          wrap.id = 'rinkHtPreview';
+          wrap.style.cssText = 'padding:14px 16px 24px;border-top:1px solid rgba(255,255,255,0.07)';
+          wrap.innerHTML = '<div class="gym-bx-title" style="padding:0 0 8px"><span>PREVIEW</span></div>' + h;
+          body.appendChild(wrap);
+        }, function () {});
+      }
       return;
     }
     var res = await fetch('https://site.api.espn.com/apis/site/v2/sports/' + cfg.sport + '/' + cfg.slug + '/summary?event=' + game.id);
@@ -65944,7 +66439,8 @@ function renderScoreboardPBP(data, game, prefix) {
   
   var league = game.league || '';
   var isNcaaBB = league === 'NCAAMB' || league === 'NCAAWB';
-  var isHockey = league === 'NHL';
+  var isHockey = league === 'NHL' ||
+    (typeof LEAGUES !== 'undefined' && LEAGUES[league] && LEAGUES[league].hockeyTech);   // HTPBP
   var isFootball = league === 'NFL' || league === 'NCAAFB' || league === 'NCAAFB23';
   var emoji = isHockey ? '🏒' : isFootball ? '🏈' : '🏀';
   
@@ -80856,6 +81352,13 @@ function updateViewToggle() {
   var divBtn = document.getElementById('stViewDiv');
   if (confBtn) confBtn.classList.toggle('active', standingsView === 'conference');
   if (divBtn) divBtn.classList.toggle('active', standingsView === 'division');
+  // HTLEADERS — only the HockeyTech leagues publish a leaderboard here.
+  var ldBtn = document.getElementById('stViewLeaders');
+  if (ldBtn) {
+    var isHt = !!(LEAGUES[standingsLeague] && LEAGUES[standingsLeague].hockeyTech);
+    ldBtn.style.display = isHt ? '' : 'none';
+    ldBtn.classList.toggle('active', standingsView === 'leaders');
+  }
 }
 
 function renderStandingsLeaguePills() {
@@ -80872,6 +81375,11 @@ function renderStandingsLeaguePills() {
 }
 
 function switchStandingsLeague(league) {
+  // HTLEADERS — the leaders view belongs to the HockeyTech leagues; leaving
+  // one of them returns to a standings view that exists everywhere.
+  if (standingsView === 'leaders' && !(LEAGUES[league] && LEAGUES[league].hockeyTech)) {
+    standingsView = 'conference';
+  }
   standingsLeague = league;
   standingsSort = {};
   milbLevelFilter = 'All';
@@ -81065,6 +81573,7 @@ async function fetchStandings(league, levelOverride) {
   if (LEAGUES[league] && LEAGUES[league].bananaBall) return _bbRenderStandingsTable();
   // HTSTAND — reshaped into the same table the rest of the screen draws.
   if (LEAGUES[league] && LEAGUES[league].hockeyTech) {
+    if (standingsView === 'leaders') { _htRenderLeaders(league); return; }   // HTLEADERS
     var _hGroup = (standingsView === 'division') ? 'division' : 'conference';
     var _hKey = league + '_ht_' + _hGroup;
     var _hBody = document.getElementById('stBody');
