@@ -149036,7 +149036,12 @@ function _fyProbeLastFailure() {
   function say(html) { lines.push(html); if (out) out.innerHTML = lines.join(''); }
   say('<div style="color:#94a3b8">running\u2026</div>');
   lines.splice(1, 1);
-  function timed(label, opts) {
+  // `soft` marks a probe that is EXPECTED to fail on a correctly configured
+  // server, so it isn't printed in red alongside the real failures. The
+  // custom-header probe is the one: no allow-list has any reason to carry
+  // an invented header, and reading its red line as a fault is what sends
+  // someone off to "fix" a Worker that was never broken.
+  function timed(label, opts, soft) {
     var t0 = Date.now();
     return fetch(url, opts).then(function (r) {
       say('<div style="color:#4ade80">' + label + ': ' +
@@ -149044,7 +149049,9 @@ function _fyProbeLastFailure() {
         ' in ' + (Date.now() - t0) + 'ms</div>');
       return true;
     }, function () {
-      say('<div style="color:#ef4444">' + label + ': failed after ' + (Date.now() - t0) + 'ms</div>');
+      say('<div style="color:' + (soft ? '#94a3b8' : '#ef4444') + '">' + label +
+        ': failed after ' + (Date.now() - t0) + 'ms' +
+        (soft ? ' \u2014 expected, nothing allows this header' : '') + '</div>');
       return false;
     });
   }
@@ -149074,7 +149081,7 @@ function _fyProbeLastFailure() {
   var plain = false, pre = false, ctype = false, authed = false, opaque = false;
   timed('no auth, no preflight', {}).then(function (a) {
     plain = a;
-    return timed('custom header (preflight)', { headers: { 'X-Sk-Probe': '1' } });
+    return timed('custom header (preflight)', { headers: { 'X-Sk-Probe': '1' } }, true);
   }).then(function (pf) {
     pre = pf;
     return timed('content-type (preflight)', { headers: { 'Content-Type': 'application/json' } });
@@ -149133,7 +149140,7 @@ function skShowApiHealth() {
   else if (s2.ratelimit > 0) verdict = '<span style="color:#f59e0b">Rate-limited (429/999) \u2014 too many calls too fast. Waiting a few minutes should restore it; throttling league-switches would prevent it.</span>';
   else if (s2.network > 0) verdict = '<span style="color:#f59e0b">Connection failures (\u201cFailed to fetch\u201d) \u2014 requests aren\u2019t reaching the server. NOT rate-limiting and not auth. Each one is retried twice, spaced out so a retry doesn\u2019t land inside the same burst that caused it, and a run of them puts retries on hold for a minute rather than hammering a dead connection. A long run on one endpoint usually means too many heavy calls at once; a run across every endpoint means connectivity or the Worker. \u201cTest the proxy\u201d below settles which.</span>';
   else if (s2.other > 0) verdict = '<span style="color:#f59e0b">Errors landing in \u201cOther\u201d \u2014 the proxy is returning something that isn\u2019t a clean 401/429/999. See the details below to identify the real status the Worker is sending back.</span>';
-  else if (s2.timeout >= 2) verdict = '<span style="color:#f59e0b">Timeouts \u2014 calls aren\u2019t returning in 15s. Usually network/proxy, not Yahoo throttling.</span>';
+  else if (s2.timeout >= 2) verdict = '<span style="color:#f59e0b">Timeouts \u2014 calls aren\u2019t coming back inside 15s. Not throttling and not auth: a run of these on startup is the app\u2019s own doing, since opening hydrates every league at once and a few calls end up queued behind the rest. Each one is now retried after a pause, so they should recover on their own; if they persist once everything has loaded, the connection itself is slow.</span>';
   else verdict = '<span style="color:#4ade80">Healthy \u2014 no recent errors.</span>';
 
   // Recent error details — the actual status + message, so "Other" is legible.
@@ -150366,7 +150373,16 @@ async function _fyApiOnce(path, isRetry) {
   } catch(e) {
     if (e.name === 'AbortError') {
       _fyHealthRecord('timeout', 0, path, '', Date.now() - _fyT0, isRetry);   // FYHRETRY
-      return { error: 'Request timed out after 15s' };
+      // ── FYTIMERETRY ── Flagged, which it never was.
+      //
+      // A timed-out call came back carrying no marker at all: not _network,
+      // not _server. So it matched neither retry branch in fyApi, fyApiRetry
+      // passed it straight through, and even _fyPathNote was never reached.
+      // One shot and gone — the only failure in the whole engine with no
+      // second chance, and the one most likely to be our own doing, since a
+      // load that hydrates fifty-odd leagues at once is exactly what pushes a
+      // call past fifteen seconds.
+      return { error: 'Request timed out after 15s', _timeout: true };
     }
     // "Failed to fetch" / TypeError = the request never reached the Worker or
     // got no response (transient network blip, Worker cold-start, connectivity
@@ -150537,7 +150553,8 @@ async function fyApi(path) {
     }
     // FYNETBRK — the connection dropped. One retry, unless the breaker says
     // the connection is plainly down.
-    if (result && result.error && result._network) {
+    // FYTIMERETRY — timeouts ride the same path as connection failures now.
+    if (result && result.error && (result._network || result._timeout)) {
       _fyNetNoted();
       if (_fyNetCalm()) {
         // ── FYNETPATIENT ── Two goes, not one, and further apart.
@@ -150551,12 +150568,17 @@ async function fyApi(path) {
         // The breaker still has the last word: if the connection goes down
         // properly, _fyNetCalm turns false and this stops immediately rather
         // than adding load to something already failing.
-        var _delays = [700, 1800], again = result;
+        // A timeout has ALREADY cost fifteen seconds, so it gets one more go
+        // rather than two, and a longer pause first — the point is to land
+        // after the burst that caused it, not to spend another half minute.
+        var _delays = result._timeout ? [1500] : [700, 1800], again = result;
         for (var _a = 0; _a < _delays.length; _a++) {
           await new Promise(function (resolve) { setTimeout(resolve, _delays[_a]); });
           again = await _fyApiOnce(path, true);   // FYHRETRY — marked as a retry
           if (!again || !again.error) { _fyPathNote(path, true); return again; }   // recovered
-          if (!again._network) return again;      // a different failure; retrying won't help
+          // Both kinds are transient by nature; any other failure means
+          // retrying is just noise. FYTIMERETRY
+          if (!(again._network || again._timeout)) return again;
           _fyNetNoted();
           if (!_fyNetCalm()) break;               // the connection is down; stop
         }
@@ -150604,7 +150626,10 @@ async function fyApiRetry(path, tries) {
     // retry two transient cases: network blips (_network) and residual 5xx
     // (_server) that survived fyApi's own single retry. Auth (401) and
     // rate-limit (429/999) are never retried — they don't self-heal.
-    if (!result || !result.error || !(result._network || result._server)) return result;
+    // FYTIMERETRY — a timeout is retryable here too. It used to fall through
+    // this guard and return on the first attempt like a 401 would.
+    if (!result || !result.error ||
+        !(result._network || result._server || result._timeout)) return result;
     // Network failure: back off (0.6s, 1.4s, ...) and retry, unless last try.
     if (attempt < maxTries) {
       var delay = 400 + attempt * 500;
