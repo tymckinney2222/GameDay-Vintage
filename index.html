@@ -115849,7 +115849,7 @@ function _fxScoreStatMap(sport, scoring, statMap, pos, ctx) {
     }
   }
   var alias = _FX_ESPN_ALIAS[String(sport).toUpperCase()] || {};
-  var fp = 0, scored = [], unscored = [], nodata = [], any = false;   // FXNODATA
+  var fp = 0, scored = [], unscored = [], nodata = [], zero = [], any = false;   // FXNODATA / FXRANGE
   for (var i = 0; i < grp.cats.length; i++) {
     var c = grp.cats[i];
     var code = _fxCodeNorm(c.abbr || c.name);
@@ -115875,7 +115875,12 @@ function _fxScoreStatMap(sport, scoring, statMap, pos, ctx) {
     any = true;
     var contrib = val * pts;
     fp += contrib;
-    if (val) scored.push({ code: code, pts: pts, val: val, contrib: contrib });
+    // FXRANGE — a category worth zero contributes nothing whichever reason it
+    // is zero, so it is listed separately rather than as a "\u00d7 0" term that
+    // reads like arithmetic. When the league's own rules page says the
+    // category IS worth something, this list is where it will show up.
+    if (val && pts === 0) zero.push(code + ' (' + val + ')');
+    else if (val) scored.push({ code: code, pts: pts, val: val, contrib: contrib });
   }
   if (!any) return null;
   // Two decimals, kept end-to-end. Fantrax scores a night at 4.15 and the
@@ -115884,7 +115889,8 @@ function _fxScoreStatMap(sport, scoring, statMap, pos, ctx) {
   // CALCULATED figure prints to two places; platform-published figures
   // (Sleeper's own totals, Yahoo's FP) keep one, because one is the precision
   // those providers actually publish. FXPREC
-  return { fp: Math.round(fp * 100) / 100, scored: scored, unscored: unscored, nodata: nodata };
+  return { fp: Math.round(fp * 100) / 100, scored: scored, unscored: unscored,
+           nodata: nodata, zero: zero };
 }
 
 // ── Play-by-play scoring stats ── FXPBP ──
@@ -117073,6 +117079,10 @@ function _fxScoreTitle(res) {
   // column. A goalie's assist is the second kind. FXNODATA
   if (res.unscored && res.unscored.length) t += ' \u00b7 can\u2019t map: ' + res.unscored.join(', ');
   if (res.nodata && res.nodata.length) t += ' \u00b7 no data: ' + res.nodata.join(', ');
+  // FXRANGE — worth nothing per the points field. If the league's rules say
+  // otherwise, the rule is in a form the engine hasn't learned yet, and this
+  // is the line that shows how much is going uncounted.
+  if (res.zero && res.zero.length) t += ' \u00b7 scored at zero: ' + res.zero.join(', ');
   return t;
 }
 
@@ -117743,6 +117753,33 @@ function skProbeFantraxScoring() {
     // league, so the weight is under some other key. This dumps the FIRST
     // config object verbatim plus whatever the candidate reader found, so the
     // real key is read off the payload instead of guessed at.
+    // ── FXRANGE ── Every category whose points read as zero, with its
+    // config verbatim. A league's rules page showing a real value for one of
+    // these means the rule is written in a form the parser can't read, and
+    // the config below is what says how to read it.
+    var _z = [];
+    row.scoring.groups.forEach(function (gz) {
+      (gz.cats || []).forEach(function (cz) {
+        if (typeof _fxCatIsZero === 'function' && _fxCatIsZero(cz)) {
+          _z.push({ g: gz.name, c: cz });
+        }
+      });
+    });
+    if (_z.length) {
+      say('  \u2500 categories scoring ZERO (' + _z.length + ') \u2500');
+      say('  These contribute nothing. If the rules page gives them a value,');
+      say('  the rule is in the config below and the parser can\u2019t read it yet.');
+      for (var _zi = 0; _zi < _z.length && _zi < 12; _zi++) {
+        say('    ' + (_z[_zi].g ? _z[_zi].g + ' \u00b7 ' : '') +
+            (_z[_zi].c.abbr || _z[_zi].c.name) + '  points=' + _z[_zi].c.pts);
+        say('      cfg: ' + (_z[_zi].c.raw || '(not captured \u2014 reopen the league)'));
+      }
+      if (_z.length > 12) say('    \u2026 and ' + (_z.length - 12) + ' more');
+      say('');
+    } else {
+      say('  no category scores zero \u2014 every one carries a flat points value.');
+      say('');
+    }
     if (row.scoring._rawCfg) {
       say('  raw config[0]: ' + row.scoring._rawCfg);
       // Every category with its weight, including the 1s. Listing only the
@@ -162936,6 +162973,28 @@ function _fxExtractInfo(data) {
 // mean something else, and a false positive here silently rescales the whole
 // standing. FXWEIGHT
 var _FX_WEIGHT_KEYS = ['weight', 'multiplier', 'factor'];
+// ── FXRANGE ── A compact, readable copy of a scoring config, minus the
+// scoringCategory object the caller already has. Small enough to carry on
+// every category and to print a dozen of them in a probe.
+function _fxCfgRaw(cfg) {
+  if (!cfg || typeof cfg !== 'object') return '';
+  try {
+    var thin = {}, k;
+    for (k in cfg) {
+      if (!cfg.hasOwnProperty(k) || k === 'scoringCategory') continue;
+      thin[k] = cfg[k];
+    }
+    var s = JSON.stringify(thin);
+    return (s.length > 600) ? (s.slice(0, 600) + '\u2026') : s;
+  } catch (e) { return ''; }
+}
+// Does this category's value come from a rule the engine can't read yet?
+// A zero in `points` is the tell: either the league really does score the
+// category at nothing, or its rule is written in a form that isn't a flat
+// points value. Both are worth naming rather than silently adding zero.
+function _fxCatIsZero(c) {
+  return !!(c && c.pts != null && Number(c.pts) === 0);
+}
 function _fxCfgWeight(cfg) {
   if (!cfg) return 1;
   for (var i = 0; i < _FX_WEIGHT_KEYS.length; i++) {
@@ -162979,7 +163038,18 @@ function _fxExtractScoring(data) {
         // no FP (correct) and no categories either (not correct). Keep it with
         // pts null and a cat flag; the FP scorer already skips a non-numeric
         // pts, so nothing starts being scored that shouldn't be. FXCATS
+        // ── FXRANGE ── A flat category carries its value in `points`, and
+        // those score correctly. A category whose rules page reads "From 1 to
+        // 6500, award 1 point for every 0.1 TOI" evidently does not: `points`
+        // comes back as zero and the real rule lives elsewhere in the config.
+        // Time on ice, plus/minus and penalty minutes are all written that
+        // way in at least one league, and all three were scoring nothing.
+        //
+        // The config is kept verbatim against the category so the probe can
+        // report the shape of a rule the parser can't yet read, and so the
+        // engine can be taught it from a reading rather than a guess.
         cats.push({ abbr: abbr, name: nm, pts: isNaN(pv) ? null : pv, cat: isNaN(pv),
+                    raw: _fxCfgRaw(cfg),
                     // ── Weighted roto ── FXWEIGHT ──
                     // Anarchy's rules page shows a Weight column (PTS 1.5,
                     // AST 1.2, TO 1 …), so a rank point is not worth the same
