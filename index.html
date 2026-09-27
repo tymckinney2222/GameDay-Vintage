@@ -86540,8 +86540,70 @@ function _skGuillotineSurvivalState(l, data) {
   return { alive: aliveCount, myWeekScore: myWeek, cushion: cushion, myRank: myRank, week: week };
 }
 
+// ── SKFINAL ── A season that is over does not need re-downloading.
+//
+// Yahoo says outright when a league has finished, and fysilentInit already
+// parses it onto every league object as is_finished. Nothing ever read it
+// here, so a league that ended in June had its FINAL standings, FINAL
+// scoreboard and FINAL roster fetched again on every single app open,
+// forever. Three calls per dead league per open, for numbers that cannot
+// move.
+//
+// Held for a week rather than for good: Yahoo flips is_finished as soon as
+// the last game ends, but stat corrections can trickle in for a day or two
+// afterwards. A week is comfortably past that and still turns "every open"
+// into "once a week".
+var SK_FINAL_LS_PREFIX = 'sk_final_league_v1_';
+var SK_FINAL_TTL_MS = 7 * 24 * 3600 * 1000;
+
+function _skFinalRead(key) {
+  try {
+    var raw = localStorage.getItem(SK_FINAL_LS_PREFIX + key);
+    if (!raw) return null;
+    var p = JSON.parse(raw);
+    if (!p || !p.ts || !p.data) return null;
+    if ((Date.now() - p.ts) >= SK_FINAL_TTL_MS) return null;
+    // A stored error, or a hydration that produced nothing, is not worth
+    // serving — re-fetch instead of showing a broken card all week.
+    if (p.data.error || !p.data.team) return null;
+    return p.data;
+  } catch (e) {}
+  return null;
+}
+
+function _skFinalWrite(key, data) {
+  if (!data || data.error) return;
+  try {
+    var payload = JSON.stringify({ ts: Date.now(), data: data });
+    if (typeof _skSafeSetItem === 'function') _skSafeSetItem(SK_FINAL_LS_PREFIX + key, payload);
+    else localStorage.setItem(SK_FINAL_LS_PREFIX + key, payload);
+  } catch (e) {}
+}
+
+// Yahoo's own flag only. The user's "done for the season" marker is a
+// different thing — it hides a league from the daily views while its season
+// may still be running — and skipping the fetch on that basis would freeze
+// a live league's standings.
+function _skLeagueIsFinal(league) {
+  return !!(league && (league.is_finished === true || league.is_finished == 1));
+}
+
 async function skHydrateLeague(league) {
   var key = league.league_key;
+  // SKFINAL — served from storage, no network at all.
+  if (_skLeagueIsFinal(league)) {
+    var _fin = _skFinalRead(key);
+    if (_fin) {
+      skLeagueData[key] = _fin;
+      if (_fin.team && _fin.team.team_key) fyMyTeams[key] = _fin.team.team_key;
+      // The card still has to render. Everything else in the live path is
+      // about CHANGE — pulse toasts, live cats charts — and a finished
+      // season has none, so those are deliberately not run.
+      try { skUpdateCard(league); } catch (e) {}
+      try { skRefreshStandingsIfActive(key); } catch (e2) {}
+      return;
+    }
+  }
   try {
     // Run standings + scoreboard in parallel for this single league
     var [standingsRes, scoreboardRes] = await Promise.all([
@@ -86611,6 +86673,9 @@ async function skHydrateLeague(league) {
       is_guillotine: (_skGuillotineCache.hasOwnProperty(key) ? _skGuillotineCache[key] : (league.is_guillotine || false)),
       ts: Date.now()
     };
+    // SKFINAL — the season is over, so this is the last word on it. Keep it.
+    if (_skLeagueIsFinal(league)) _skFinalWrite(key, skLeagueData[key]);
+
     // Cache the team_key for any other code that uses fyMyTeams
     if (team && team.team_key) fyMyTeams[key] = team.team_key;
 
