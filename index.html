@@ -115475,6 +115475,22 @@ function _skRenderGpBoard(league, host) {
 function _fxCodeNorm(code) {
   return String(code || '').toUpperCase().replace(/^(INDIVIDUAL|TEAM)_/, '').replace(/[\s\-]+/g, '_');
 }
+// ── FXGRPSUF ── Fantrax codes a category that exists for more than one
+// position group by appending the group: TIME_ON_ICE_SKATERS alongside
+// TIME_ON_ICE_GOALIES. The alias table names the stat, not the group, so a
+// code that doesn't resolve is tried again with the group stripped off. Two
+// passes, because "(Goalies only)" normalises to a double suffix.
+var _FX_GROUP_SUFFIX = /_(SKATERS|SKATER|GOALIES|GOALIE|ONLY|PLAYERS|PLAYER|TEAM)$/;
+function _fxAliasFor(alias, code) {
+  if (!alias || !code) return null;
+  if (alias[code]) return alias[code];
+  var s = String(code).replace(_FX_GROUP_SUFFIX, '');
+  if (s !== code && alias[s]) return alias[s];
+  var s2 = s.replace(_FX_GROUP_SUFFIX, '');
+  if (s2 !== s && alias[s2]) return alias[s2];
+  return null;
+}
+
 var _FX_ESPN_ALIAS = {
   NHL: {
     GOALS: 'G', ASSISTS: 'A', POINTS: 'P', PLUS_MINUS: '+/-', PENALTY_MINUTES: 'PIM',
@@ -115483,6 +115499,18 @@ var _FX_ESPN_ALIAS = {
     SOG: 'S',
     TAKEAWAYS: 'TK', GIVEAWAYS: 'GV', FACEOFFS_WON: 'FW', FACEOFFS_LOST: 'FL',
     TIME_ON_ICE: 'TOI', SHIFTS: 'SHFT', POWER_PLAY_TIME_ON_ICE: 'PPTOI',
+    // A league that scores time on ice for skaters AND goalies gets two
+    // categories with the same name, which Fantrax tells apart by appending
+    // the group. Both are the same box column. The goalie one is labelled
+    // "Min" rather than "TOI". FXGRPSUF
+    TIME_ON_ICE_SKATERS: 'TOI', TIME_ON_ICE_GOALIES: 'TOI', MIN: 'TOI',
+    // ── Derived from the box and the play-by-play ── FXGP / FXHAT / FXGWG ──
+    // None of these is a box column. Games played is whether he took a shift,
+    // a hat trick is three goals in this game, and the game-winner is the
+    // winner's goal that put them one clear of the loser's final total.
+    GAMES_PLAYED: '_GP', GAMES: '_GP', GP: '_GP',
+    HAT_TRICKS: '_HT3', HAT_TRICK: '_HT3', HATTRICKS: '_HT3',
+    GAME_WINNING_GOALS: '_GWG', GAME_WINNING_GOAL: '_GWG', GWG: '_GWG',
     // goalies
     GOALS_AGAINST: 'GA', SHOTS_AGAINST: 'SA', SAVES: 'SV', SAVE_PERCENTAGE: 'SV%',
     // Derived goalie decisions. These point at synthetic keys that
@@ -115553,8 +115581,9 @@ var _FX_ESPN_DERIVED = {
     SHORT_HANDED_GOALS: 'DONE play-by-play: strength + participants',
     SHORT_HANDED_ASSISTS: 'DONE play-by-play: strength + participants',
     SHORT_HANDED_POINTS: 'DONE play-by-play: SHG + SHA',
-    GAME_WINNING_GOALS: 'play-by-play: final + scoring order',
-    HAT_TRICKS: 'box: G >= 3'
+    GAME_WINNING_GOALS: 'DONE play-by-play: the winner\u2019s (loser score + 1)th goal',
+    HAT_TRICKS: 'DONE box: G >= 3',
+    GAMES_PLAYED: 'DONE box: took a shift'
   },
   NBA: {
     DOUBLE_DOUBLES: 'box: two 10+ categories', TRIPLE_DOUBLES: 'box: three 10+ categories',
@@ -115621,6 +115650,38 @@ function _fxNhlDerived(statMap, pos, ctx) {
     if (statMap.A == null || statMap.A === '') out.A = pbp.a;
     if (statMap.G == null || statMap.G === '') out.G = pbp.g;
     if (statMap.P == null || statMap.P === '') out.P = pbp.g + pbp.a;
+  }
+
+  // ── Games played ── FXGP ──
+  // A box line means he was in the game; a line with a zero clock means he
+  // dressed and never took a shift, which is not a game played. A box with no
+  // clock column at all can only say he was listed, so it counts.
+  var _toiM = _fxClockMinutes(statMap.TOI);
+  out._GP = (_toiM == null) ? 1 : (_toiM > 0 ? 1 : 0);
+
+  // ── Hat trick ── FXHAT ──
+  // No box carries it. It is three goals in this game, which the box does.
+  var _gN = _fxNumOrClock(out.G != null ? out.G : statMap.G);
+  if (_gN != null) out._HT3 = (_gN >= 3) ? 1 : 0;
+
+  // ── Game-winning goal ── FXGWG ──
+  // The standard rule: the winner's goal that put them one clear of the
+  // loser's final total, so a 5-3 win makes the winner's fourth goal the
+  // winner. Everyone on the losing side gets a real zero.
+  //
+  // Never derived for a shootout. The deciding attempt isn't in the
+  // play-by-play, so a zero there would be as much of a claim as a one, and
+  // the category is better left reading as unavailable.
+  if (ctx.final && !ctx.so && pbp && pbp.gOrd) {
+    if (ctx.won !== true) {
+      out._GWG = 0;
+    } else if (ctx.myScore != null && ctx.oppScore != null) {
+      var _want = ctx.oppScore + 1, _hit = 0;
+      for (var _gi = 0; _gi < pbp.gOrd.length; _gi++) {
+        if (pbp.gOrd[_gi] === _want) _hit = 1;
+      }
+      out._GWG = _hit;
+    }
   }
 
   // ── Goalie decision ── FXGOALIE ── final games only.
@@ -115703,6 +115764,20 @@ var _FX_SPLIT_FALLBACK = {
   '3PT:made': '3PM', '3PT:att': '3PA'
 };
 
+// ── FXCLOCK ── A box cell like "19:40" is nineteen minutes forty, and
+// parseFloat reads it as 19. Every scored minute of ice time was losing its
+// seconds — two thirds of a minute on that cell alone — which matters as soon
+// as a league puts a points value on time on ice.
+function _fxNumOrClock(raw) {
+  var s = String(raw == null ? '' : raw).replace('+', '').replace(/^\s+|\s+$/g, '');
+  if (/^\d+:\d{1,2}$/.test(s)) {
+    var m = _fxClockMinutes(s);
+    return (m == null) ? null : m;
+  }
+  var v = parseFloat(s);
+  return isNaN(v) ? null : v;
+}
+
 // Read one alias target out of a stat map. "FG:made" splits an "11-20".
 function _fxStatValue(statMap, target) {
   if (!statMap) return null;
@@ -115718,10 +115793,7 @@ function _fxStatValue(statMap, target) {
     }
     // FXSPLITFB — season shape: FGM / FGA as separate labels.
     var fb = _FX_SPLIT_FALLBACK[String(target)];
-    if (fb && statMap[fb] != null && statMap[fb] !== '') {
-      var fv = parseFloat(String(statMap[fb]).replace('+', ''));
-      return isNaN(fv) ? null : fv;
-    }
+    if (fb && statMap[fb] != null && statMap[fb] !== '') return _fxNumOrClock(statMap[fb]);
     return null;
   }
   if (raw == null || raw === '') {
@@ -115729,8 +115801,8 @@ function _fxStatValue(statMap, target) {
     // season label ESPN actually publishes. SEASONDERIVED
     var db = _FX_DERIVED_FALLBACK[String(target)];
     if (db && statMap[db] != null && statMap[db] !== '') {
-      var dv = parseFloat(String(statMap[db]).replace('+', ''));
-      if (!isNaN(dv)) return dv;
+      var dv = _fxNumOrClock(statMap[db]);
+      if (dv != null) return dv;
     }
     // Same stat, different label between payloads. SEASONTOTALS
     var alt = _FX_LABEL_ALT[String(target)];
@@ -115738,8 +115810,8 @@ function _fxStatValue(statMap, target) {
       for (var ai = 0; ai < alt.length; ai++) {
         var av2 = statMap[alt[ai]];
         if (av2 == null || av2 === '') continue;
-        var an = parseFloat(String(av2).replace('+', ''));
-        if (!isNaN(an)) return an;
+        var an = _fxNumOrClock(av2);
+        if (an != null) return an;
       }
     }
     var ds = _FX_DERIVED_SUM[String(target)];
@@ -115748,15 +115820,14 @@ function _fxStatValue(statMap, target) {
       for (var si = 0; si < ds.length; si++) {
         var sv = statMap[ds[si]];
         if (sv == null || sv === '') continue;
-        var sn = parseFloat(String(sv).replace('+', ''));
-        if (!isNaN(sn)) { sum += sn; got = true; }
+        var sn = _fxNumOrClock(sv);
+        if (sn != null) { sum += sn; got = true; }
       }
       if (got) return sum;
     }
     return null;
   }
-  var n = parseFloat(String(raw).replace('+', ''));
-  return isNaN(n) ? null : n;
+  return _fxNumOrClock(raw);
 }
 
 // -> { fp, scored:[{code,pts,val,contrib}], unscored:[code] } or null when
@@ -115788,7 +115859,7 @@ function _fxScoreStatMap(sport, scoring, statMap, pos, ctx) {
     // falling through to its category line. Check for null explicitly. FXCATS
     var pts = (c.pts == null) ? NaN : Number(c.pts);
     if (isNaN(pts)) continue;
-    var target = alias[code];
+    var target = _fxAliasFor(alias, code);   // FXGRPSUF
     if (!target) { unscored.push(code); continue; }
     var val = _fxStatValue(statMap, target);
     if (val == null) {
@@ -115844,10 +115915,12 @@ function _fxNhlPbpIndex(summary) {
   if (summary._fxPbpIdx !== undefined && summary._fxPbpN === _n) return summary._fxPbpIdx;
   var plays = summary.plays;
   if (!plays || !plays.length) { summary._fxPbpIdx = null; summary._fxPbpN = _n; return null; }
-  var idx = {};
+  var idx = {}, teamGoals = {};
   function bucket(id) {
     var k = String(id);
-    if (!idx[k]) idx[k] = { g: 0, a: 0, ppg: 0, ppa: 0, shg: 0, sha: 0 };
+    // FXGWG — gOrd records which of his own team's goals each one was, so the
+    // game-winner can be picked out once the final score is known.
+    if (!idx[k]) idx[k] = { g: 0, a: 0, ppg: 0, ppa: 0, shg: 0, sha: 0, gOrd: [] };
     return idx[k];
   }
   for (var i = 0; i < plays.length; i++) {
@@ -115862,6 +115935,10 @@ function _fxNhlPbpIndex(summary) {
     // (id 701) first-hand, so power-play and short-handed are matched by word
     // rather than by an exact abbreviation guessed at.
     var isPP = /power/i.test(st), isSH = /short/i.test(st);
+    // FXGWG — count the scoring team's goals in order. A play with no team on
+    // it yields no ordinal, and the game-winner simply isn't derived.
+    var _tid = (pl.team && pl.team.id != null) ? String(pl.team.id) : '';
+    if (_tid) teamGoals[_tid] = (teamGoals[_tid] || 0) + 1;
     var parts = pl.participants || [];
     for (var q = 0; q < parts.length; q++) {
       var ath = parts[q] && parts[q].athlete;
@@ -115870,6 +115947,7 @@ function _fxNhlPbpIndex(summary) {
       if (ty === 'scorer') {
         var bs = bucket(ath.id);
         bs.g++; if (isPP) bs.ppg++; else if (isSH) bs.shg++;
+        if (_tid) bs.gOrd.push(teamGoals[_tid]);
       } else if (ty === 'assister') {
         var ba = bucket(ath.id);
         ba.a++; if (isPP) ba.ppa++; else if (isSH) ba.sha++;
@@ -115887,7 +115965,7 @@ function _fxNhlPbpFor(summary, athleteId) {
   if (!idx) return null;
   // Present in the index means he figured in a scoring play; absent means he
   // didn't, which IS zero — the plays array is complete for the game.
-  return idx[String(athleteId)] || { g: 0, a: 0, ppg: 0, ppa: 0, shg: 0, sha: 0 };
+  return idx[String(athleteId)] || { g: 0, a: 0, ppg: 0, ppa: 0, shg: 0, sha: 0, gOrd: [] };
 }
 
 // Goalie-decision context for ONE team out of an ESPN summary. FXGOALIE
@@ -115904,7 +115982,8 @@ function _fxNhlCtxFor(summary, teamId, stateHint, detailHint, athleteId) {
     // Only the goalie decision needs a finished game. FXPBP
     var pbp = _fxNhlPbpFor(summary, athleteId);
     if (state !== 'post') {
-      return { final: false, ot: false, won: false, goalieCount: 0, pbp: pbp };
+      return { final: false, ot: false, so: false, won: false, goalieCount: 0,
+               myScore: null, oppScore: null, pbp: pbp };
     }
     var detail = String(detailHint ||
       (status && status.type && (status.type.shortDetail || status.type.detail)) || '');
@@ -115913,6 +115992,10 @@ function _fxNhlCtxFor(summary, teamId, stateHint, detailHint, athleteId) {
     // different category from a regulation loss in most Fantrax systems.
     var ot = /\/(OT|SO)\b/i.test(detail) || /\bOT\b|\bSO\b/i.test(detail) ||
              (!isNaN(period) && period > 3);
+    // FXGWG — a shootout is its own case: the deciding attempt credits no
+    // scorer in the play-by-play, so the game-winner can't be read from it.
+    var so = /\/SO\b/i.test(detail) || /\bSO\b/i.test(detail) ||
+             (!isNaN(period) && period > 4);
     var comps = (comp && comp.competitors) || [];
     var won = null, myScore = null, oppScore = null;
     for (var i = 0; i < comps.length; i++) {
@@ -115928,7 +116011,10 @@ function _fxNhlCtxFor(summary, teamId, stateHint, detailHint, athleteId) {
     }
     // ESPN sets a winner flag on finals; scores are the fallback.
     if (won == null && myScore != null && oppScore != null) won = (myScore > oppScore);
-    if (won == null) return { final: false, ot: false, won: false, goalieCount: 0, pbp: pbp };
+    if (won == null) {
+      return { final: false, ot: false, so: false, won: false, goalieCount: 0,
+               myScore: null, oppScore: null, pbp: pbp };
+    }
     // How many goalies this team dressed AND played. The deriver refuses to
     // attribute a decision unless this is exactly one.
     var goalieCount = 0;
@@ -115953,7 +116039,8 @@ function _fxNhlCtxFor(summary, teamId, stateHint, detailHint, athleteId) {
         }
       }
     }
-    return { final: true, ot: !!ot, won: !!won, goalieCount: goalieCount, pbp: pbp };
+    return { final: true, ot: !!ot, so: !!so, won: !!won, goalieCount: goalieCount,
+             myScore: myScore, oppScore: oppScore, pbp: pbp };
   } catch (e) { return null; }
 }
 
@@ -115971,7 +116058,9 @@ function _fxNhlCtxFor(summary, teamId, stateHint, detailHint, athleteId) {
 var _FX_RATE_CATS = {
   NHL: {
     '_GAA': { parts: ['GA', 'TOI'], fn: function (n) {
-      return (n.TOI > 0) ? (n.GA * 60 / n.TOI) : null; }, dp: 2 },
+      // No goalie minutes means no goals-against average exists — an
+      // em-dash, never a NaN. FXGAADEN
+      return (n.TOI > 0 && n.GA != null && !isNaN(n.GA)) ? (n.GA * 60 / n.TOI) : null; }, dp: 2 },
     'SV%':  { parts: ['SV', 'SA'],  fn: function (n) {
       return (n.SA > 0) ? (n.SV / n.SA) : null; }, dp: 3, strip0: true },
     'FO%':  { parts: ['FW', 'FL'],  fn: function (n) {
@@ -115993,8 +116082,13 @@ var _FX_RATE_CATS = {
 
 // Which raw components each sport needs summed for its rate formulas. Read
 // straight off the box labels; "11-20" split pairs are handled below.
+// goalieOnly — GA, SV, SA and the minutes that divide them come from the
+// goalies alone. Summing every skater's ice time into the GAA denominator
+// produced a nonsense rate, and on a day with no goalie at all it produced
+// a literal NaN on the strip. Faceoffs stay open to everyone. FXGAADEN
 var _FX_RATE_PARTS = {
-  NHL: { plain: ['GA', 'SV', 'SA', 'FW', 'FL'], clock: ['TOI'], split: {} },
+  NHL: { plain: ['GA', 'SV', 'SA', 'FW', 'FL'], clock: ['TOI'], split: {},
+         goalieOnly: { GA: 1, SV: 1, SA: 1, TOI: 1 } },
   NBA: { plain: [], clock: ['MIN'],
          split: { FG: ['FGM', 'FGA'], FT: ['FTM', 'FTA'], '3PT': ['TPM', 'TPA'] } }
 };
@@ -116023,7 +116117,7 @@ function _fxDayTotals(sport, scoring, entries) {
     var gcats = (scoring.groups[gi] || {}).cats || [];
     for (var ci = 0; ci < gcats.length; ci++) {
       var gcode = _fxCodeNorm(gcats[ci].abbr || gcats[ci].name);
-      var gtarget = alias[gcode];
+      var gtarget = _fxAliasFor(alias, gcode);   // FXGRPSUF
       if (!gtarget || seenCode[gtarget]) continue;
       seenCode[gtarget] = 1;
       order.push(gtarget);
@@ -116045,13 +116139,21 @@ function _fxDayTotals(sport, scoring, entries) {
     // counts them as categories of their own. Sport-driven so basketball's
     // made/attempted pairs are collected the same way hockey's saves are.
     var _rp = _FX_RATE_PARTS[SPORT] || { plain: [], clock: [], split: {} };
+    // FXGAADEN — a goalie-only component is taken from goalies only.
+    var _isG = (SPORT === 'NHL' && typeof _fxIsGoaliePos === 'function')
+      ? _fxIsGoaliePos(en.pos) : true;
+    var _skip = function (nm) {
+      return !!(_rp.goalieOnly && _rp.goalieOnly[nm] && !_isG);
+    };
     (_rp.clock || []).forEach(function (nm) {
+      if (_skip(nm)) return;
       var cmv = _fxClockMinutes(sm[nm]);
       if (cmv != null) addComp(nm, cmv);
     });
     (_rp.plain || []).forEach(function (nm) {
-      var v = parseFloat(String(sm[nm] == null ? '' : sm[nm]));
-      if (!isNaN(v)) addComp(nm, v);
+      if (_skip(nm)) return;
+      var v = _fxNumOrClock(sm[nm]);
+      if (v != null) addComp(nm, v);
     });
     for (var _sp in (_rp.split || {})) {
       if (!_rp.split.hasOwnProperty(_sp)) continue;
@@ -116211,7 +116313,7 @@ function _fxRotoCats(row) {
     var cats = groups[g].cats || [];
     for (var c = 0; c < cats.length; c++) {
       var code = _fxCodeNorm(cats[c].abbr || cats[c].name);
-      var target = alias[code];
+      var target = _fxAliasFor(alias, code);   // FXGRPSUF
       if (!target || seen[target]) continue;
       seen[target] = 1;
       out.push({ code: code, target: target, label: _fxCatLabel(target, code),
@@ -116793,6 +116895,7 @@ function _fxRotoDelta(row, SPORT) {
 // a synthetic underscore key. FXCATS
 var _FX_CAT_LABEL = {
   '_W': 'W', '_L': 'L', '_OTL': 'OTL', '_SO': 'SHO',
+  '_GP': 'GP', '_HT3': 'HT', '_GWG': 'GWG',   // FXGP / FXHAT / FXGWG
   '_PPG': 'PPG', '_PPA': 'PPA', '_PPP': 'PPP',
   '_SHG': 'SHG', '_SHA': 'SHA', '_SHP': 'SHP', '_GAA': 'GAA',
   '_FGP': 'FG%', '_FTP': 'FT%', '_3PP': '3P%',
@@ -116875,7 +116978,7 @@ function _fxCatStatLine(sport, scoring, statMap, pos, ctx) {
   for (var i = 0; i < grp.cats.length; i++) {
     var c = grp.cats[i];
     var code = _fxCodeNorm(c.abbr || c.name);
-    var target = alias[code];
+    var target = _fxAliasFor(alias, code);   // FXGRPSUF
     if (!target) { missed.push(code); continue; }   // no ESPN equivalent
     var raw = _fxStatValue(statMap, target);
     if (raw == null) {
@@ -117671,7 +117774,8 @@ function skProbeFantraxScoring() {
         var w = _isCats ? 1 : Math.abs(Number(c.pts) || 0);
         total += w;
         var tag = (g.name ? g.name + ' \u00b7 ' : '') + code + (_isCats ? '' : ' (' + (c.pts != null ? c.pts : '?') + ')');
-        if (alias[code]) { mapped += w; mList.push(tag + ' \u2192 ' + alias[code]); }
+        var _al = _fxAliasFor(alias, code);   // FXGRPSUF
+        if (_al) { mapped += w; mList.push(tag + ' \u2192 ' + _al); }
         else if (derived[code]) {
           if (/^play-by-play/.test(derived[code])) { pbp += w; pList.push(tag + ' \u2014 ' + derived[code]); }
           else { deriv += w; dList.push(tag + ' \u2014 ' + derived[code]); }
