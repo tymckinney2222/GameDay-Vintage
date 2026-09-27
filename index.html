@@ -85450,6 +85450,17 @@ function _skSafeSetItem(key, value) {
   if (tokensParam) {
     try {
       var tokens = JSON.parse(decodeURIComponent(tokensParam));
+      // ── FYTOKSTAMP ── When this token was minted, recorded HERE.
+      //
+      // Everything that asks "is the token still good" reads token_time,
+      // and nothing ever wrote it. If the Worker's JSON doesn't carry the
+      // field, token_time is undefined, `(t.token_time || 0)` is 0, and the
+      // expiry lands in 1970 — so every single call concludes the token has
+      // expired and goes off to refresh it before doing anything else.
+      //
+      // Stamped on arrival, so the answer no longer depends on a field the
+      // app doesn't control. An existing value is left alone.
+      if (!tokens.token_time) tokens.token_time = Date.now();
       fyTokens = tokens;
       // Quota-safe: if this throws unguarded, the token is lost AND the
       // two lines below never run, so the user silently lands back on
@@ -148754,30 +148765,79 @@ function skSignOut() {
 // working while we migrate the UI to the account menu.
 function disconnectYahoo() { skSignOut(); }
 
+// ── FYREFLOCK ── The refresh that five calls used to run at once.
+//
+// fyGetToken is called at the top of EVERY api call, and the gate lets five
+// run concurrently. With no lock, five calls that agree the token is stale
+// each fired their own POST to /refresh carrying the SAME refresh_token.
+//
+// Yahoo rotates refresh tokens: the first POST is honoured and retires the
+// grant the other four are still holding, so four of the five come back
+// rejected. Each rejection then ran
+//
+//     fyTokens = null; localStorage.removeItem('fy_tokens');
+//
+// which threw away the good token the winner had just saved. From there
+// every call has no token, and Yahoo is dead until a reload — which is
+// exactly the failure this was reported as.
+//
+// So: one refresh in flight at a time, and everybody waits on that one.
+var _fyRefreshInflight = null;
+
 async function fyGetToken() {
   if (!fyTokens) return null;
-  var now = Date.now();
-  var expiry = (fyTokens.token_time || 0) + (fyTokens.expires_in * 1000) - 60000;
-  if (now > expiry) {
-    try {
-      var res = await fetch(YAHOO_WORKER + '/refresh', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ refresh_token: fyTokens.refresh_token })
-      });
-      if (res.ok) {
-        fyTokens = await res.json();
-        // Same hazard as the OAuth write: a full quota here would drop a
-        // freshly refreshed token. Memory copy survives regardless.
-        _skSafeSetItem('fy_tokens', JSON.stringify(fyTokens));
-      } else {
-        fyTokens = null;
-        localStorage.removeItem('fy_tokens');
-        return null;
+  // FYTOKSTAMP — an unstamped token has no knowable age, so it is treated as
+  // due for refresh. That happens once: the refresh below stamps what it
+  // stores, and from then on the expiry is real.
+  var minted = fyTokens.token_time || 0;
+  var expiry = minted + (fyTokens.expires_in * 1000) - 60000;
+  if (minted && Date.now() <= expiry) return fyTokens.access_token;
+  if (!_fyRefreshInflight) _fyRefreshInflight = _fyRefreshTokens();
+  return await _fyRefreshInflight;
+}
+
+// Refreshes the access token. Never called directly — go through
+// fyGetToken so the single-flight lock applies.
+async function _fyRefreshTokens() {
+  try {
+    var res = await fetch(YAHOO_WORKER + '/refresh', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refresh_token: fyTokens.refresh_token })
+    });
+    if (res.ok) {
+      var next = await res.json();
+      // FYTOKSTAMP — stamp it here too, or the very next call decides this
+      // brand-new token is already expired and refreshes it again.
+      if (!next.token_time) next.token_time = Date.now();
+      // A refresh response that omits the refresh_token would otherwise
+      // leave us with nothing to refresh WITH next time, and the attempt
+      // after that would send undefined and be rejected outright.
+      if (!next.refresh_token && fyTokens && fyTokens.refresh_token) {
+        next.refresh_token = fyTokens.refresh_token;
       }
-    } catch(e) { return null; }
+      fyTokens = next;
+      // Same hazard as the OAuth write: a full quota here would drop a
+      // freshly refreshed token. Memory copy survives regardless.
+      _skSafeSetItem('fy_tokens', JSON.stringify(fyTokens));
+      return fyTokens.access_token;
+    }
+    // Only a DEFINITIVE rejection means the grant is gone. A 400 or a 401
+    // from the refresh endpoint says Yahoo won't honour it; anything else
+    // — a 429, a 5xx, a Cloudflare error page — says nothing about the
+    // grant, and throwing the tokens away over one of those turned a
+    // momentary blip into a full re-authorisation. FYREFKEEP
+    if (res.status === 400 || res.status === 401) {
+      fyTokens = null;
+      try { localStorage.removeItem('fy_tokens'); } catch (eR) {}
+      return null;
+    }
+    return null;   // this attempt failed; the grant survives for the next one
+  } catch (e) {
+    return null;   // network blip — likewise, the grant survives
+  } finally {
+    _fyRefreshInflight = null;
   }
-  return fyTokens.access_token;
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -148938,9 +148998,29 @@ function _fyProbeLastFailure() {
       return false;
     });
   }
-  var plain = false, authed = false, opaque = false;
-  timed('no auth, CORS', {}).then(function (a) {
+  // ── FYPREFLIGHT ── The old verdict here announced that "the Authorization
+  // header forces a CORS preflight, and that preflight is what's being
+  // refused" \u2014 on the strength of one authenticated call failing and one
+  // unauthenticated call working. The first half is simply true; the second
+  // half was never tested, and the two Worker faults it could be want
+  // OPPOSITE fixes.
+  //
+  // A preflight can't be fired directly from fetch (an OPTIONS of our own
+  // would need a preflight of its own), so it's tested by proxy: a GET with
+  // a harmless CUSTOM header. That is not a safelisted header either, so it
+  // forces a preflight, and it carries no credentials \u2014 which separates
+  // "no preflight gets through" from "the authorization header specifically
+  // isn't allowed".
+  var tokLine = (typeof _fyDeepTokenInfo === 'function') ? _fyDeepTokenInfo() : null;
+  if (tokLine && tokLine.line) {
+    say('<div style="color:#64748b">token: ' + skEscapeMaybe(tokLine.line) + '</div>');
+  }
+  var plain = false, pre = false, authed = false, opaque = false;
+  timed('no auth, no preflight', {}).then(function (a) {
     plain = a;
+    return timed('custom header (forces preflight)', { headers: { 'X-Sk-Probe': '1' } });
+  }).then(function (pf) {
+    pre = pf;
     return fyGetToken();
   }).then(function (tok) {
     if (!tok) { say('<div style="color:#f59e0b">with token: no token available</div>'); return false; }
@@ -148954,9 +149034,15 @@ function _fyProbeLastFailure() {
     if (authed) {
       v = 'It went through this time. The call itself is fine, so the failures happen only under load \u2014 ' +
           'a burst thing, not this endpoint.';
-    } else if (plain) {
-      v = 'The route answers unauthenticated but dies with the token attached. The Authorization header forces a ' +
-          'CORS preflight, and that preflight is what\u2019s being refused \u2014 a Worker/edge fix, not connectivity.';
+    } else if (plain && !pre) {
+      v = 'Unauthenticated calls answer; ANY call that needs a preflight dies \u2014 the plain custom header failed ' +
+          'too, and it carried no credentials. So this is not about the token: the OPTIONS request is not being ' +
+          'answered. On the Worker, handle OPTIONS and return 204 with Access-Control-Allow-Origin, ' +
+          'Access-Control-Allow-Headers and Access-Control-Allow-Methods.';
+    } else if (plain && pre) {
+      v = 'The preflight itself is fine \u2014 a custom header went through \u2014 and only the Authorization header ' +
+          'fails. So OPTIONS is answered but that one header is not on the allow list. On the Worker, add ' +
+          'authorization to Access-Control-Allow-Headers.';
     } else if (opaque) {
       v = 'It only completes with CORS switched off, so the server IS answering and the answer arrives without the ' +
           'CORS header. The browser can only ever show that as \u201cFailed to fetch\u201d. Fix belongs on the Worker.';
@@ -149035,6 +149121,11 @@ function skShowApiHealth() {
     row('\u2705 OK', s10.ok, '#4ade80') +
     row('\u26a0\ufe0f Rate-limited', s10.ratelimit, s10.ratelimit?'#f59e0b':'#64748b') +
     row('\ud83d\udd12 Auth', s10.auth, s10.auth?'#ef4444':'#64748b') +
+    // The two-minute table above lists these; this one didn't, so a run of
+    // connection failures showed as "60 calls" with every row on zero — the
+    // one bucket that was filling up being the one not on display.
+    row('\ud83d\udce1 Connection', s10.network, s10.network?'#f59e0b':'#64748b') +
+    row('\u2753 Other', s10.other, s10.other?'#f59e0b':'#64748b') +
     row('\u23f1\ufe0f Timeout', s10.timeout, s10.timeout?'#f59e0b':'#64748b') +
     '<div style="color:#64748b;font-size:10px;margin-top:18px;line-height:1.6">Next time leagues stop loading, open this before re-authing. The \u201cRecent errors\u201d block shows the true status \u2014 screenshot it so we can pin down what the proxy returns.</div>';
   document.body.appendChild(host);
@@ -150121,9 +150212,20 @@ function _fyPace() {
 async function _fyApiOnce(path) {
   var token = await fyGetToken();
   if (!token) {
-    if (document.getElementById('skOverlay').classList.contains('open')) skShowDisconnected();
-    _fyHealthRecord('auth', 0, path);
-    return { error: 'No token' };
+    // FYREFKEEP — two very different situations used to land here together.
+    //
+    // If the tokens are GONE, the user really is disconnected. But if we
+    // still hold them and simply couldn't mint a fresh access token this
+    // instant, that is a transient failure — and calling
+    // skShowDisconnected() for it wiped the tokens, which MADE it the
+    // permanent kind. Tell them apart before doing anything drastic.
+    if (!fyTokens) {
+      if (document.getElementById('skOverlay').classList.contains('open')) skShowDisconnected();
+      _fyHealthRecord('auth', 0, path);
+      return { error: 'No token' };
+    }
+    _fyHealthRecord('network', 0, path, 'token refresh did not land');
+    return { error: 'Token refresh did not land', _network: true };
   }
   if (fyDataCache[path] && fyDataCache[path].t > Date.now() - 60000) return fyDataCache[path].d;
   await _fyPace();   // cache hits above are free; only real requests are paced
@@ -150303,11 +150405,29 @@ function _fyGateLeave() {
 // like that buries every other error in the panel. A success clears the
 // record immediately.
 var _fyPathFail = {};
+// Drop every set-aside path. A single success proves the connection works,
+// and nothing that was set aside during the outage is still worth skipping.
+function _fyPathClearCold() {
+  var k;
+  for (k in _fyPathFail) { if (_fyPathFail.hasOwnProperty(k)) delete _fyPathFail[k]; }
+}
+
 function _fyPathNote(path, ok) {
-  if (ok) { if (_fyPathFail[path]) delete _fyPathFail[path]; return; }
+  if (ok) {
+    if (_fyPathFail[path]) delete _fyPathFail[path];
+    _fyPathClearCold();   // FYCOLDCLR
+    return;
+  }
+  // ── FYCOLDGLOBAL ── When the breaker already says the connection itself
+  // is down, a failure here says nothing about THIS path, and counting it
+  // is what turned a half-minute outage into ten minutes of skipped calls
+  // across every date and league the sweep had touched.
+  if (!_fyNetCalm()) return;
   var e = _fyPathFail[path] || (_fyPathFail[path] = { n: 0, until: 0 });
   e.n++;
-  if (e.n >= 3) { e.until = Date.now() + 600000; e.n = 0; }
+  // Two minutes, not ten. Long enough to stop a hot loop, short enough that
+  // nobody sits waiting for it with the app in front of them.
+  if (e.n >= 3) { e.until = Date.now() + 120000; e.n = 0; }
 }
 function _fyPathCold(path) {
   var e = _fyPathFail[path];
