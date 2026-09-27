@@ -148879,13 +148879,36 @@ async function _fyRefreshTokens() {
 // ══════════════════════════════════════════════════════════════════
 var _fyHealth = { log: [], max: 60 };
 
-function _fyHealthRecord(kind, status, path, errText, ms) {
+function _fyHealthRecord(kind, status, path, errText, ms, isRetry) {
+  // ── FYHRETRY ── A network failure is attempted again inside fyApi, and
+  // BOTH attempts used to land on the board as separate errors. Four failing
+  // calls read as eight, every date appeared twice, and half the 60-entry
+  // log went on duplicates of the same call.
+  //
+  // A retry updates the entry it is a retry OF and carries an attempt count.
+  // Matched by path within a recent window rather than "the last entry",
+  // because five calls run concurrently and others log in between.
+  if (isRetry && path) {
+    var _stop = Math.max(0, _fyHealth.log.length - 12);
+    for (var _hi = _fyHealth.log.length - 1; _hi >= _stop; _hi--) {
+      var _pe = _fyHealth.log[_hi];
+      if (_pe.path === path && _pe.kind === kind && (Date.now() - _pe.t) < 20000) {
+        _pe.t = Date.now();
+        _pe.attempts = (_pe.attempts || 1) + 1;
+        if (ms != null) _pe.ms = ms;
+        if (errText) _pe.err = String(errText).slice(0, 400);
+        _fyHealthUpdateDot();
+        return;
+      }
+    }
+  }
   // ms — how long the call was on the wire before it failed. The single
   // most useful number for telling causes apart: an instant failure means
   // the connection was refused outright, while one that dies after seconds
   // was accepted and then dropped. FYHMS
   _fyHealth.log.push({ t: Date.now(), kind: kind, status: status || 0, path: path || '',
-    err: errText ? String(errText).slice(0, 400) : '', ms: (ms != null ? ms : null) });
+    err: errText ? String(errText).slice(0, 400) : '', ms: (ms != null ? ms : null),
+    attempts: 1 });   // FYHRETRY
   if (_fyHealth.log.length > _fyHealth.max) _fyHealth.log.shift();
   _fyHealthUpdateDot();
 }
@@ -149042,12 +149065,21 @@ function _fyProbeLastFailure() {
   if (tokLine && tokLine.line) {
     say('<div style="color:#64748b">token: ' + skEscapeMaybe(tokLine.line) + '</div>');
   }
-  var plain = false, pre = false, authed = false, opaque = false;
+  // TWO different preflight probes, because one proves nothing on its own.
+  // `X-Sk-Probe` is a header no server has any reason to allow, so its
+  // failure is expected even where CORS is set up correctly.
+  // `Content-Type: application/json` is a header almost every allow-list
+  // carries, so it stands in for "does a preflight get through at all".
+  // Only if BOTH fail is an unanswered OPTIONS the likely story.
+  var plain = false, pre = false, ctype = false, authed = false, opaque = false;
   timed('no auth, no preflight', {}).then(function (a) {
     plain = a;
-    return timed('custom header (forces preflight)', { headers: { 'X-Sk-Probe': '1' } });
+    return timed('custom header (preflight)', { headers: { 'X-Sk-Probe': '1' } });
   }).then(function (pf) {
     pre = pf;
+    return timed('content-type (preflight)', { headers: { 'Content-Type': 'application/json' } });
+  }).then(function (ct) {
+    ctype = ct;
     return fyGetToken();
   }).then(function (tok) {
     if (!tok) { say('<div style="color:#f59e0b">with token: no token available</div>'); return false; }
@@ -149061,15 +149093,17 @@ function _fyProbeLastFailure() {
     if (authed) {
       v = 'It went through this time. The call itself is fine, so the failures happen only under load \u2014 ' +
           'a burst thing, not this endpoint.';
-    } else if (plain && !pre) {
-      v = 'Unauthenticated calls answer; ANY call that needs a preflight dies \u2014 the plain custom header failed ' +
-          'too, and it carried no credentials. So this is not about the token: the OPTIONS request is not being ' +
-          'answered. On the Worker, handle OPTIONS and return 204 with Access-Control-Allow-Origin, ' +
-          'Access-Control-Allow-Headers and Access-Control-Allow-Methods.';
-    } else if (plain && pre) {
-      v = 'The preflight itself is fine \u2014 a custom header went through \u2014 and only the Authorization header ' +
-          'fails. So OPTIONS is answered but that one header is not on the allow list. On the Worker, add ' +
-          'authorization to Access-Control-Allow-Headers.';
+    } else if (plain && (pre || ctype)) {
+      v = 'A preflight DOES get through \u2014 ' + (ctype ? 'the content-type one' : 'the custom-header one') +
+          ' answered \u2014 and only the call carrying the token failed. So OPTIONS is being handled and this is ' +
+          'about that one header or about load. If it fails every time, add authorization to the Worker\u2019s ' +
+          'Access-Control-Allow-Headers; if it only fails in bursts, it is load and the Worker is fine.';
+    } else if (plain && !pre && !ctype) {
+      v = 'Unauthenticated calls answer, and NO preflight gets through \u2014 content-type failed as well as the ' +
+          'custom header, and neither carried credentials. That points at the OPTIONS request going unanswered: ' +
+          'on the Worker, handle OPTIONS and return 204 with Access-Control-Allow-Origin, ' +
+          'Access-Control-Allow-Headers and Access-Control-Allow-Methods. Worth re-running once when nothing ' +
+          'else is loading \u2014 a burst can refuse preflights at the edge and look exactly like this.';
     } else if (opaque) {
       v = 'It only completes with CORS switched off, so the server IS answering and the answer arrives without the ' +
           'CORS header. The browser can only ever show that as \u201cFailed to fetch\u201d. Fix belongs on the Worker.';
@@ -149097,7 +149131,7 @@ function skShowApiHealth() {
   var verdict;
   if (s2.auth > 0) verdict = '<span style="color:#ef4444">Auth errors \u2014 see the status below. A 401 means the token was rejected and re-auth fixes it. A 403 means Yahoo is refusing the APPLICATION itself, and re-authing will NOT help \u2014 check the app\u2019s Fantasy permission at developer.yahoo.com.</span>';
   else if (s2.ratelimit > 0) verdict = '<span style="color:#f59e0b">Rate-limited (429/999) \u2014 too many calls too fast. Waiting a few minutes should restore it; throttling league-switches would prevent it.</span>';
-  else if (s2.network > 0) verdict = '<span style="color:#f59e0b">Connection failures (\u201cFailed to fetch\u201d) \u2014 requests aren\u2019t reaching the server. NOT rate-limiting and not auth. Each one is retried once, and a run of them puts retries on hold for a minute rather than hammering a dead connection. A long run on one endpoint usually means too many heavy calls at once; a run across every endpoint means connectivity or the Worker. \u201cTest the proxy\u201d below settles which.</span>';
+  else if (s2.network > 0) verdict = '<span style="color:#f59e0b">Connection failures (\u201cFailed to fetch\u201d) \u2014 requests aren\u2019t reaching the server. NOT rate-limiting and not auth. Each one is retried twice, spaced out so a retry doesn\u2019t land inside the same burst that caused it, and a run of them puts retries on hold for a minute rather than hammering a dead connection. A long run on one endpoint usually means too many heavy calls at once; a run across every endpoint means connectivity or the Worker. \u201cTest the proxy\u201d below settles which.</span>';
   else if (s2.other > 0) verdict = '<span style="color:#f59e0b">Errors landing in \u201cOther\u201d \u2014 the proxy is returning something that isn\u2019t a clean 401/429/999. See the details below to identify the real status the Worker is sending back.</span>';
   else if (s2.timeout >= 2) verdict = '<span style="color:#f59e0b">Timeouts \u2014 calls aren\u2019t returning in 15s. Usually network/proxy, not Yahoo throttling.</span>';
   else verdict = '<span style="color:#4ade80">Healthy \u2014 no recent errors.</span>';
@@ -149113,7 +149147,9 @@ function skShowApiHealth() {
       var shortPath = e.path.length > 48 ? ('\u2026' + e.path.slice(-46)) : e.path;
       errBlock += '<div style="background:#0d1220;border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:8px;margin:4px 0;font-size:10px">' +
         '<div style="color:#fbbf24">' + e.kind + (e.status ? ' \u00b7 HTTP ' + e.status : '') + ' \u00b7 ' + ago + 's ago' +
-          (e.ms != null ? ' \u00b7 died after ' + (e.ms < 1000 ? e.ms + 'ms' : (e.ms / 1000).toFixed(1) + 's') : '') + '</div>' +
+          (e.ms != null ? ' \u00b7 died after ' + (e.ms < 1000 ? e.ms + 'ms' : (e.ms / 1000).toFixed(1) + 's') : '') +
+          // FYHRETRY — one line per CALL, with how many goes it had.
+          ((e.attempts && e.attempts > 1) ? ' \u00b7 ' + e.attempts + ' attempts' : '') + '</div>' +
         (e.err ? '<div style="color:#cbd5e1;margin-top:3px;word-break:break-word">' + skEscapeMaybe(e.err) + '</div>' : '') +
         '<div style="color:#64748b;margin-top:3px;word-break:break-word">' + skEscapeMaybe(shortPath) + '</div>' +
       '</div>';
@@ -150236,7 +150272,7 @@ function _fyPace() {
   return _fyPaceChain;
 }
 
-async function _fyApiOnce(path) {
+async function _fyApiOnce(path, isRetry) {
   var token = await fyGetToken();
   if (!token) {
     // FYREFKEEP — two very different situations used to land here together.
@@ -150329,7 +150365,7 @@ async function _fyApiOnce(path) {
     }
   } catch(e) {
     if (e.name === 'AbortError') {
-      _fyHealthRecord('timeout', 0, path, '', Date.now() - _fyT0);
+      _fyHealthRecord('timeout', 0, path, '', Date.now() - _fyT0, isRetry);   // FYHRETRY
       return { error: 'Request timed out after 15s' };
     }
     // "Failed to fetch" / TypeError = the request never reached the Worker or
@@ -150337,7 +150373,7 @@ async function _fyApiOnce(path) {
     // handoff). This is NOT rate-limit or auth. Classify it distinctly so it's
     // legible, and let the retry wrapper handle recovery.
     var isNetwork = (e.name === 'TypeError') || /failed to fetch|network|load failed/i.test(e.message || '');
-    _fyHealthRecord(isNetwork ? 'network' : 'other', 0, path, e.message, Date.now() - _fyT0);
+    _fyHealthRecord(isNetwork ? 'network' : 'other', 0, path, e.message, Date.now() - _fyT0, isRetry);
     return { error: e.message, _network: isNetwork };
   }
 }
@@ -150504,10 +150540,27 @@ async function fyApi(path) {
     if (result && result.error && result._network) {
       _fyNetNoted();
       if (_fyNetCalm()) {
-        await new Promise(function(resolve){ setTimeout(resolve, 600); });
-        var again = await _fyApiOnce(path);
-        if (!again || !again.error) { _fyPathNote(path, true); return again; }   // recovered
-        if (again._network) { _fyNetNoted(); _fyPathNote(path, false); }
+        // ── FYNETPATIENT ── Two goes, not one, and further apart.
+        //
+        // These failures arrive in bursts a second or two wide, during a
+        // sweep that asks for a week of dates across every league at once.
+        // A single retry 600ms later lands inside the same burst and fails
+        // with it — which is why a handful of days went missing from the
+        // week-trend bars while the rest of the page loaded fine.
+        //
+        // The breaker still has the last word: if the connection goes down
+        // properly, _fyNetCalm turns false and this stops immediately rather
+        // than adding load to something already failing.
+        var _delays = [700, 1800], again = result;
+        for (var _a = 0; _a < _delays.length; _a++) {
+          await new Promise(function (resolve) { setTimeout(resolve, _delays[_a]); });
+          again = await _fyApiOnce(path, true);   // FYHRETRY — marked as a retry
+          if (!again || !again.error) { _fyPathNote(path, true); return again; }   // recovered
+          if (!again._network) return again;      // a different failure; retrying won't help
+          _fyNetNoted();
+          if (!_fyNetCalm()) break;               // the connection is down; stop
+        }
+        _fyPathNote(path, false);
         return again;
       }
       _fyPathNote(path, false);   // FYPATHCD
