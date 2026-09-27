@@ -85581,6 +85581,9 @@ async function fysilentInit() {
       }
     }
     fyLeagues = leagues;
+    // FYBOOTCAP — we're in. Whatever went wrong before is over, so the next
+    // bad patch gets a full set of retries rather than inheriting these.
+    _skBootstrapTries = 0;
     if (!fyActiveLeague && leagues.length) fyActiveLeague = leagues[0].league_key;
     // Now load all rosters silently
     if (!fyRostersLoaded) await fyAutoLoadAllRosters();
@@ -148916,10 +148919,14 @@ function _fyHealthRecord(kind, status, path, errText, ms, isRetry) {
 // Summarize the last N seconds of calls into counts per kind.
 function _fyHealthSummary(windowMs) {
   var cutoff = Date.now() - (windowMs || 120000); // default last 2 min
-  var out = { ok:0, ratelimit:0, auth:0, timeout:0, network:0, other:0, total:0 };
+  var out = { ok:0, ratelimit:0, auth:0, timeout:0, network:0, other:0, recovered:0, total:0 };
   for (var i = 0; i < _fyHealth.log.length; i++) {
     var e = _fyHealth.log[i];
     if (e.t < cutoff) continue;
+    // FYRECOVERED — counted on its own, never as a failure. Everything that
+    // reads this summary (the warning dot, the verdict, the tables) is
+    // therefore quiet about a blip that fixed itself.
+    if (e.recovered) { out.recovered++; out.total++; continue; }
     if (out[e.kind] != null) out[e.kind]++;
     out.total++;
   }
@@ -148927,6 +148934,29 @@ function _fyHealthSummary(windowMs) {
 }
 
 // Return the most recent error entries (any non-ok kind), newest first.
+// ── FYRECOVERED ── The call came good on a later attempt.
+//
+// The failed attempt stays in the log as history, but it stops counting as
+// an error. It cost nothing: the data arrived, the page rendered, and the
+// user was never short of anything. Reporting it anyway is what made a
+// working app look broken — and it got worse as retries got better, because
+// every call that now recovers used to leave a red mark behind it.
+//
+// Only the most recent unmarked failure for the path is touched: retries are
+// already collapsed onto one entry, so that is the one this call recovered.
+function _fyHealthRecovered(path) {
+  if (!path) return;
+  var stop = Math.max(0, _fyHealth.log.length - 20);
+  for (var i = _fyHealth.log.length - 1; i >= stop; i--) {
+    var e = _fyHealth.log[i];
+    if ((Date.now() - e.t) > 120000) break;   // too old to be this call's
+    if (e.path !== path || e.recovered || e.kind === 'ok') continue;
+    e.recovered = true;
+    break;
+  }
+  if (typeof _fyHealthUpdateDot === 'function') _fyHealthUpdateDot();
+}
+
 function _fyHealthRecentErrors(limit) {
   var out = [];
   for (var i = _fyHealth.log.length - 1; i >= 0 && out.length < (limit || 8); i--) {
@@ -149024,7 +149054,9 @@ function _fyProbeLastFailure() {
   var out = document.getElementById('_fyProbeOut');
   var errs = _fyHealthRecentErrors(25), path = '';
   for (var i = 0; i < errs.length; i++) {
-    if (errs[i].kind === 'network' && errs[i].path) { path = errs[i].path; break; }
+    // FYRECOVERED — skip blips that fixed themselves; there is nothing to
+    // diagnose about a call that worked.
+    if (errs[i].kind === 'network' && errs[i].path && !errs[i].recovered) { path = errs[i].path; break; }
   }
   if (!path) {
     if (out) out.innerHTML = '<span style="color:#94a3b8">No connection failure logged yet \u2014 nothing to re-run.</span>';
@@ -149141,6 +149173,9 @@ function skShowApiHealth() {
   else if (s2.network > 0) verdict = '<span style="color:#f59e0b">Connection failures (\u201cFailed to fetch\u201d) \u2014 requests aren\u2019t reaching the server. NOT rate-limiting and not auth. Each one is retried twice, spaced out so a retry doesn\u2019t land inside the same burst that caused it, and a run of them puts retries on hold for a minute rather than hammering a dead connection. A long run on one endpoint usually means too many heavy calls at once; a run across every endpoint means connectivity or the Worker. \u201cTest the proxy\u201d below settles which.</span>';
   else if (s2.other > 0) verdict = '<span style="color:#f59e0b">Errors landing in \u201cOther\u201d \u2014 the proxy is returning something that isn\u2019t a clean 401/429/999. See the details below to identify the real status the Worker is sending back.</span>';
   else if (s2.timeout >= 2) verdict = '<span style="color:#f59e0b">Timeouts \u2014 calls aren\u2019t coming back inside 15s. Not throttling and not auth: a run of these on startup is the app\u2019s own doing, since opening hydrates every league at once and a few calls end up queued behind the rest. Each one is now retried after a pause, so they should recover on their own; if they persist once everything has loaded, the connection itself is slow.</span>';
+  else if (s2.recovered > 0) verdict = '<span style="color:#4ade80">Healthy \u2014 ' + s2.recovered +
+    ' call' + (s2.recovered === 1 ? '' : 's') + ' had to be retried and came good. Nothing was lost and there is ' +
+    'nothing to fix; a burst of these just means a lot of leagues loaded at once.</span>';
   else verdict = '<span style="color:#4ade80">Healthy \u2014 no recent errors.</span>';
 
   // Recent error details — the actual status + message, so "Other" is legible.
@@ -149152,8 +149187,12 @@ function skShowApiHealth() {
       var e = errs[ei];
       var ago = Math.round((Date.now() - e.t) / 1000);
       var shortPath = e.path.length > 48 ? ('\u2026' + e.path.slice(-46)) : e.path;
-      errBlock += '<div style="background:#0d1220;border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:8px;margin:4px 0;font-size:10px">' +
-        '<div style="color:#fbbf24">' + e.kind + (e.status ? ' \u00b7 HTTP ' + e.status : '') + ' \u00b7 ' + ago + 's ago' +
+      errBlock += '<div style="background:#0d1220;border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:8px;margin:4px 0;font-size:10px' +
+        // FYRECOVERED — dimmed, so the eye goes to what actually failed.
+        (e.recovered ? ';opacity:0.45' : '') + '">' +
+        '<div style="color:' + (e.recovered ? '#64748b' : '#fbbf24') + '">' +
+        (e.recovered ? 'recovered \u00b7 ' : '') +
+        e.kind + (e.status ? ' \u00b7 HTTP ' + e.status : '') + ' \u00b7 ' + ago + 's ago' +
           (e.ms != null ? ' \u00b7 died after ' + (e.ms < 1000 ? e.ms + 'ms' : (e.ms / 1000).toFixed(1) + 's') : '') +
           // FYHRETRY — one line per CALL, with how many goes it had.
           ((e.attempts && e.attempts > 1) ? ' \u00b7 ' + e.attempts + ' attempts' : '') + '</div>' +
@@ -149174,6 +149213,9 @@ function skShowApiHealth() {
     row('\ud83d\udce1 Connection (failed to fetch)', s2.network, s2.network?'#f59e0b':'#64748b') +
     row('\u23f1\ufe0f Timeout', s2.timeout, s2.timeout?'#f59e0b':'#64748b') +
     row('\u2753 Other', s2.other, s2.other?'#f59e0b':'#64748b') +
+    // FYRECOVERED — shown so a burst is still visible, in green because
+    // that is what it was: a problem the app handled.
+    (s2.recovered ? row('\u21bb Recovered by retry', s2.recovered, '#4ade80') : '') +
     (_fyPathColdCount() ? row('\ud83e\uddca Set aside (repeat failures)', _fyPathColdCount(), '#7dd3fc') : '') +
     // FYHPING — one tap, one unauthenticated call, a straight answer.
     '<div style="margin:14px 0 4px">' +
@@ -149195,6 +149237,7 @@ function skShowApiHealth() {
     // connection failures showed as "60 calls" with every row on zero — the
     // one bucket that was filling up being the one not on display.
     row('\ud83d\udce1 Connection', s10.network, s10.network?'#f59e0b':'#64748b') +
+    (s10.recovered ? row('\u21bb Recovered by retry', s10.recovered, '#4ade80') : '') +
     row('\u2753 Other', s10.other, s10.other?'#f59e0b':'#64748b') +
     row('\u23f1\ufe0f Timeout', s10.timeout, s10.timeout?'#f59e0b':'#64748b') +
     '<div style="color:#64748b;font-size:10px;margin-top:18px;line-height:1.6">Next time leagues stop loading, open this before re-authing. The \u201cRecent errors\u201d block shows the true status \u2014 screenshot it so we can pin down what the proxy returns.</div>';
@@ -150575,7 +150618,11 @@ async function fyApi(path) {
         for (var _a = 0; _a < _delays.length; _a++) {
           await new Promise(function (resolve) { setTimeout(resolve, _delays[_a]); });
           again = await _fyApiOnce(path, true);   // FYHRETRY — marked as a retry
-          if (!again || !again.error) { _fyPathNote(path, true); return again; }   // recovered
+          if (!again || !again.error) {
+            _fyPathNote(path, true);
+            _fyHealthRecovered(path);   // FYRECOVERED — it came good; stop calling it an error
+            return again;
+          }
           // Both kinds are transient by nature; any other failure means
           // retrying is just noise. FYTIMERETRY
           if (!(again._network || again._timeout)) return again;
@@ -150603,14 +150650,35 @@ async function fyApi(path) {
 // auto-retry the whole silent init after a short delay, so the user isn't
 // stranded on the empty "No leagues synced" state waiting to re-auth.
 var _skBootstrapRetryPending = false;
+// ── FYBOOTCAP ── Bounded, and it escalates.
+//
+// This rescheduled itself on EVERY bootstrap failure with the same three
+// second gap and no ceiling: fysilentInit fails, calls this, waits 3s, calls
+// fysilentInit, which fails and calls this again. A Yahoo that was genuinely
+// unreachable produced "Connection hiccup — retrying" every three seconds
+// indefinitely, leagues never loaded, and nothing ever said anything more
+// useful than "hiccup".
+//
+// Three goes, spaced further apart each time, and then it says plainly that
+// it has stopped and what to do. The counter resets the moment leagues load.
+var _skBootstrapTries = 0;
+var _SK_BOOT_WAITS = [3000, 8000, 20000];
 function _skShowBootstrapRetry() {
   if (_skBootstrapRetryPending) return;
+  if (_skBootstrapTries >= _SK_BOOT_WAITS.length) {
+    if (typeof skToast === 'function') {
+      skToast('Yahoo still isn\u2019t answering \u2014 tap the refresh icon to try again.');
+    }
+    return;
+  }
+  var wait = _SK_BOOT_WAITS[_skBootstrapTries];
+  _skBootstrapTries++;
   _skBootstrapRetryPending = true;
   if (typeof skToast === 'function') skToast('Connection hiccup \u2014 retrying\u2026');
   setTimeout(function() {
     _skBootstrapRetryPending = false;
     if (!fyLeagues.length && typeof fysilentInit === 'function') fysilentInit();
-  }, 3000);
+  }, wait);
 }
 
 // Retry wrapper for network failures (the "Failed to fetch" case — transient
@@ -150626,6 +150694,11 @@ async function fyApiRetry(path, tries) {
     // retry two transient cases: network blips (_network) and residual 5xx
     // (_server) that survived fyApi's own single retry. Auth (401) and
     // rate-limit (429/999) are never retried — they don't self-heal.
+    // FYRECOVERED — a later attempt succeeded, so the earlier failure on this
+    // path was a blip and is marked as one.
+    if (result && !result.error && attempt > 1 && typeof _fyHealthRecovered === 'function') {
+      _fyHealthRecovered(path);
+    }
     // FYTIMERETRY — a timeout is retryable here too. It used to fall through
     // this guard and return on the first attempt like a 401 would.
     if (!result || !result.error ||
