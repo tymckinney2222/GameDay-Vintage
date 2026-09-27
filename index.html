@@ -164565,6 +164565,86 @@ function _fxEnsureScoring(row, cb) {
 }
 
 // FANTRAX body — ESPN stats, live lines and calculated FP.
+// ── FTXCOLS ── The order the columns read in.
+//
+// Matches the box score's own layout — G A P, then the counting stats, then
+// the ice-time block — with one change asked for: the faceoff trio sits in
+// front of the times rather than after them. Goalies have their own order,
+// where time on ice comes last the way the box score prints it.
+//
+// A label this list doesn't name isn't dropped; it keeps its first-appearance
+// position after everything that is named, so a league scoring something
+// unusual still shows it.
+var FTX_STAT_ORDER = {
+  // G A P BS HT TK +/- is the box score's own run, kept exactly; the stats
+  // it doesn't print follow, and the faceoff trio sits ahead of the times.
+  NHL: ['G', 'A', 'P', 'PTS', 'BS', 'HT', 'TK', '+/-',
+        'S', 'SOG', 'SM', 'GV', 'PN', 'PIM', 'FW', 'FL', 'FO%',
+        'TOI', 'PPTOI', 'SHTOI', 'ESTOI', 'SHFT'],
+  // GAA sits early because a season goalie line leads with it; the live box
+  // carries no GAA at all, so the box's own SA SV SV% run is untouched.
+  NHL_G: ['SA', 'SV', 'GAA', 'SV%', 'ESSV', 'PPSV', 'SHSV', 'GA', 'SO', 'SHO',
+          'W', 'L', 'OTL', 'TOI', 'PPTOI', 'SHTOI', 'ESTOI'],
+  NBA: ['PTS', 'PPG', 'REB', 'RPG', 'OREB', 'DREB', 'AST', 'APG', 'STL', 'SPG',
+        'BLK', 'BPG', 'TO', 'PF', 'FG', 'FG%', '3PT', '3P%', 'FT', 'FT%',
+        '+/-', 'MIN']
+};
+function _ftxColOrder(cols, SPORT) {
+  var key = SPORT, i;
+  if (SPORT === 'NHL') {
+    // A goalie table is recognised by what's in it, not by who's in it, so
+    // this holds wherever the columns come from.
+    for (i = 0; i < cols.length; i++) {
+      if (cols[i] === 'SV' || cols[i] === 'SA' || cols[i] === 'SV%' || cols[i] === 'GAA') {
+        key = 'NHL_G'; break;
+      }
+    }
+  }
+  var want = FTX_STAT_ORDER[key];
+  if (!want) return cols;
+  var rank = {};
+  for (i = 0; i < want.length; i++) rank[want[i]] = i;
+  var known = [], unknown = [];
+  for (i = 0; i < cols.length; i++) {
+    if (rank[cols[i]] != null) known.push(cols[i]); else unknown.push(cols[i]);
+  }
+  known.sort(function (a, b) { return rank[a] - rank[b]; });
+  return known.concat(unknown);
+}
+
+// ── FTXPOSGRP ── Forwards, then defense, then goalies — a box score's own
+// running order. Only hockey gets this: basketball positions don't split the
+// stat sheet the way a goalie does, so those keep the similarity grouping.
+var FTX_POS_BUCKETS = {
+  NHL: [
+    { label: 'FORWARDS', pos: { C: 1, LW: 1, RW: 1, F: 1, W: 1, FWD: 1 } },
+    { label: 'DEFENSE',  pos: { D: 1, LD: 1, RD: 1, DEF: 1 } },
+    { label: 'GOALIES',  pos: { G: 1, GK: 1 } }
+  ]
+};
+function _ftxPosBuckets(list, SPORT) {
+  var defs = FTX_POS_BUCKETS[SPORT];
+  if (!defs) return null;
+  var held = [], other = [], i, j;
+  for (i = 0; i < defs.length; i++) held.push([]);
+  for (i = 0; i < list.length; i++) {
+    var p = String(list[i].slot || '').toUpperCase().split(/[,\/]/)[0].replace(/\s/g, '');
+    var placed = false;
+    for (j = 0; j < defs.length; j++) {
+      if (defs[j].pos[p]) { held[j].push(list[i]); placed = true; break; }
+    }
+    if (!placed) other.push(list[i]);
+  }
+  var out = [];
+  for (j = 0; j < defs.length; j++) {
+    if (held[j].length) out.push({ label: defs[j].label, list: held[j] });
+  }
+  // A position this doesn't recognise gets a table of its own rather than
+  // being filed under a heading that would be a guess about the player.
+  if (other.length) out.push({ label: '', list: other });
+  return out.length ? out : null;
+}
+
 // ── FTXGRID ── One stat line, split into cells.
 //
 // Both lines this modal shows are already delimited: tonight's line joins its
@@ -164592,7 +164672,7 @@ function _ftxStatCells(line) {
 // in the order they first appear, so a league's own stat order is what shows
 // rather than an order invented here. A player missing a column gets a dash,
 // not a zero — a zero would be a claim.
-function _ftxGridHtml(list) {
+function _ftxGridHtml(list, SPORT) {
   var cols = [], seen = {}, i, j;
   for (i = 0; i < list.length; i++) {
     var cs = list[i].cells || [];
@@ -164602,6 +164682,7 @@ function _ftxGridHtml(list) {
       seen[L] = 1; cols.push(L);
     }
   }
+  cols = _ftxColOrder(cols, SPORT);   // FTXCOLS
   var h = '<div class="ftx-grid"><div class="ftx-grid-in">';
   h += '<div class="ftx-gr ftx-gh"><div class="ftx-gc ftx-gc-name">PLAYER</div>';
   for (j = 0; j < cols.length; j++) h += '<div class="ftx-gc">' + slEsc(cols[j]) + '</div>';
@@ -164692,23 +164773,43 @@ function _ftxCluster(list) {
 // them in one grid would leave most of it empty — so they get a table each.
 // With only one of the two present there is nothing to distinguish, and the
 // sub-heading is left off.
-function _ftxStatTableHtml(rows) {
+function _ftxStatTableHtml(rows, SPORT) {
   if (!rows || !rows.length) return '';
-  var today = [], season = [], i, j;
+  var today = [], season = [], i, j, k;
   for (i = 0; i < rows.length; i++) {
     if (rows[i].live) today.push(rows[i]); else season.push(rows[i]);
   }
   var both = !!(today.length && season.length);
+  var phases = [{ label: 'TODAY', list: today }, { label: 'SEASON', list: season }];
   var h = '';
-  if (today.length) {
-    if (both) h += '<div class="ftx-gsec">TODAY \u00b7 ' + today.length + '</div>';
-    var tg = _ftxCluster(today);
-    for (j = 0; j < tg.length; j++) h += _ftxGridHtml(tg[j]);
-  }
-  if (season.length) {
-    if (both) h += '<div class="ftx-gsec">SEASON \u00b7 ' + season.length + '</div>';
-    var sg = _ftxCluster(season);
-    for (j = 0; j < sg.length; j++) h += _ftxGridHtml(sg[j]);
+  for (i = 0; i < phases.length; i++) {
+    var ph = phases[i];
+    if (!ph.list.length) continue;
+    // FTXPOSGRP — hockey groups by position; everything else falls back to
+    // grouping by which players share a stat sheet.
+    var buckets = _ftxPosBuckets(ph.list, SPORT);
+    if (!buckets) {
+      buckets = [];
+      var cl = _ftxCluster(ph.list);
+      for (j = 0; j < cl.length; j++) buckets.push({ label: '', list: cl[j] });
+    }
+    for (j = 0; j < buckets.length; j++) {
+      // A bucket can still hold two stat sheets with nothing in common, so
+      // it gets the same overlap check before it becomes one table.
+      var sub = _ftxCluster(buckets[j].list);
+      for (k = 0; k < sub.length; k++) {
+        var bits = [];
+        if (both) bits.push(ph.label);
+        // Where the sport groups by position, every table says which one it
+        // is — leaving it off the only group would read as an omission.
+        if (buckets[j].label) bits.push(buckets[j].label);
+        if (bits.length) {
+          h += '<div class="ftx-gsec">' + bits.join(' \u00b7 ') +
+            ' \u00b7 ' + sub[k].length + '</div>';
+        }
+        h += _ftxGridHtml(sub[k], SPORT);
+      }
+    }
   }
   return h;
 }
@@ -164932,7 +165033,7 @@ function _fxLineupFill(row, bodyEl, headEl, _retried) {
         })()
       });
     }
-    out += _ftxStatTableHtml(_rows);
+    out += _ftxStatTableHtml(_rows, SPORT);
     }
     // ── Today's totals ── FXDAYTOT ──
     // Scoped to starters when the roster tells us who they are, and to
