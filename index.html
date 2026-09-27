@@ -165376,12 +165376,26 @@ function _ftxCluster(list) {
 // sub-heading is left off.
 function _ftxStatTableHtml(rows, SPORT) {
   if (!rows || !rows.length) return '';
-  var today = [], season = [], i, j, k;
+  // ── FTXSLATE ── Grouped by the day the line is FROM, not by a flat
+  // live/season split that called every game day "today". A row with no date
+  // still lands under TODAY, so nothing regresses where the day is unknown.
+  var i, j, k;
+  var groups = {}, dayOf = {}, order = [];
   for (i = 0; i < rows.length; i++) {
-    if (rows[i].live) today.push(rows[i]); else season.push(rows[i]);
+    var lab = rows[i].live ? _ftxDayLabel(rows[i].day) : 'SEASON';
+    if (!groups[lab]) { groups[lab] = []; dayOf[lab] = rows[i].live ? (rows[i].day || '') : ''; order.push(lab); }
+    groups[lab].push(rows[i]);
   }
-  var both = !!(today.length && season.length);
-  var phases = [{ label: 'TODAY', list: today }, { label: 'SEASON', list: season }];
+  // Most recent game day first, with the season line last — the order the
+  // two-phase version had, generalised to however many days are in hand.
+  order.sort(function (a, b) {
+    if ((a === 'SEASON') !== (b === 'SEASON')) return (a === 'SEASON') ? 1 : -1;
+    if (dayOf[a] === dayOf[b]) return 0;
+    return (dayOf[a] > dayOf[b]) ? -1 : 1;
+  });
+  var both = order.length > 1;
+  var phases = [];
+  for (i = 0; i < order.length; i++) phases.push({ label: order[i], list: groups[order[i]] });
   var h = '';
   for (i = 0; i < phases.length; i++) {
     var ph = phases[i];
@@ -165400,7 +165414,12 @@ function _ftxStatTableHtml(rows, SPORT) {
       var sub = _ftxCluster(buckets[j].list);
       for (k = 0; k < sub.length; k++) {
         var bits = [];
-        if (both) bits.push(ph.label);
+        // FTXSLATE — a lone block still skips the phase heading when it is
+        // today's or the season's, which is what it always did. A block from
+        // some OTHER day always names itself: with nothing to contrast it
+        // against, an unlabelled table reads as today, which is the very
+        // thing being fixed.
+        if (both || (ph.label !== 'TODAY' && ph.label !== 'SEASON')) bits.push(ph.label);
         // Where the sport groups by position, every table says which one it
         // is — leaving it off the only group would read as an omission.
         if (buckets[j].label) bits.push(buckets[j].label);
@@ -165594,6 +165613,7 @@ function _fxLineupFill(row, bodyEl, headEl, _retried) {
         if (_lv.statMap) {
           _dayEntries.push({ statMap: _lv.statMap, pos: _lv.pos || players[p].pos,
                              ctx: _lv.ctx, starter: players[p].starter,
+                             day: _lv.day || '',   // FTXSLATE
                              slot: players[p].slot,
                              // Fantrax's own F/D/G, not ESPN's C/LW/RW — the
                              // FP subtotals group the way the roster does.
@@ -165647,6 +165667,15 @@ function _fxLineupFill(row, bodyEl, headEl, _retried) {
     // lineup slots and said so — a false statement about the provider on
     // every off day. FXDAYTOT
     var _starters = [], _anyFlag = false, _de, _rosterStarters = 0;
+    // FTXSLATE — the day these numbers are actually from. The latest day in
+    // hand, since a slate can straddle midnight in one timezone or another.
+    var _slateDay = '';
+    for (_de = 0; _de < _dayEntries.length; _de++) {
+      var _dd = _dayEntries[_de].day || '';
+      if (_dd && _dd > _slateDay) _slateDay = _dd;
+    }
+    var _slateLab = (typeof _ftxDayLabel === 'function') ? _ftxDayLabel(_slateDay) : 'TODAY';
+    var _slateIsToday = (_slateLab === 'TODAY');
     for (_de = 0; _de < players.length; _de++) {
       if (players[_de].starter === true || players[_de].starter === false) {
         _anyFlag = true;
@@ -165736,9 +165765,10 @@ function _fxLineupFill(row, bodyEl, headEl, _retried) {
         }
       } catch (eRk) {}
       _totHtml = '<div class="fx-daytot">' +
-        '<div class="fx-daytot-head">TODAY \u00b7 ' +
+        '<div class="fx-daytot-head">' + _slateLab + ' \u00b7 ' +
           (_anyFlag
-            ? (_starters.length + ' OF ' + _rosterStarters + ' STARTERS PLAYING')
+            ? (_starters.length + ' OF ' + _rosterStarters + ' STARTERS ' +
+               (_slateIsToday ? 'PLAYING' : 'PLAYED'))
             : (_starters.length + ' PLAYER' + (_starters.length === 1 ? '' : 'S'))) +
           (_anyFlag ? '' : '<span class="fx-daytot-note">all rostered \u2014 no lineup slots from Fantrax</span>') +
         '</div><div class="fx-daytot-row">' + _cells + '</div>' + _fpHtml + _rkHtml + '</div>';
@@ -165746,7 +165776,9 @@ function _fxLineupFill(row, bodyEl, headEl, _retried) {
     bodyEl.innerHTML =
       '<div style="color:rgba(255,255,255,0.42);font-size:10px;letter-spacing:0.12em;margin-bottom:4px">ROSTER \u00b7 ' +
       players.length + '<span style="float:right">' +
-      (liveHit ? (liveHit + ' PLAYING TODAY') : (hit + ' WITH ESPN STATS')) +
+      (liveHit
+        ? (liveHit + (_slateIsToday ? ' PLAYING TODAY' : (' PLAYED ' + _slateLab)))
+        : (hit + ' WITH ESPN STATS')) +
       '</span></div>' + _totHtml + out + note;
   }).catch(function() {
     if (_extLineupOpenKey !== row.key) return;
@@ -167786,7 +167818,8 @@ function _ftxFetchLive(SPORT) {
                                 : (_cs[_c].winner === false) ? false : null });
           }
         } catch (_e) {}
-        live.push({ id: ev.id, state: st.state, detail: st.shortDetail || '', sides: _sides });
+        live.push({ id: ev.id, state: st.state, detail: st.shortDetail || '', sides: _sides,
+                    day: _skLocalDayOf(ev.date) });   // FTXSLATE
       }
       if (!live.length) return { at: Date.now(), byName: {}, games: 0, anyLive: false };
       // Cap the fan-out. A full NHL slate is ~16 games; more than that means
@@ -167818,6 +167851,55 @@ function _ftxFetchLive(SPORT) {
     });
   _ftxLiveInflight[SPORT] = p;
   return p;
+}
+
+// ── FTXSLATE ── Which calendar day a game belongs to, and what to call it.
+//
+// The live slate is fetched from ESPN's scoreboard with no date on it, and
+// every game that isn't still upcoming was taken as "today". ESPN keeps
+// serving the most recent slate until the next one appears, so on a day with
+// no games the modal showed yesterday's finals under a TODAY heading, with
+// yesterday's fantasy points totalled beneath it.
+//
+// Nothing in here throws that data away — on an off day the last slate is
+// exactly what you want to look at. It just stops calling it today.
+
+// ESPN sends an instant ("2026-03-15T19:00Z"); the day that matters is the
+// LOCAL one, the same calendar day the rest of the app works in. A 01:00Z
+// game is the previous evening in every US timezone, and this is what puts
+// it on the right side of midnight.
+function _skLocalDayOf(iso) {
+  if (!iso) return '';
+  var d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  var m = String(d.getMonth() + 1), day = String(d.getDate());
+  if (m.length < 2) m = '0' + m;
+  if (day.length < 2) day = '0' + day;
+  return d.getFullYear() + '-' + m + '-' + day;
+}
+
+var FTX_DAYNAME = ['SUNDAY', 'MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY'];
+
+function _ftxDayDate(day) {
+  var p = String(day || '').split('-');
+  if (p.length !== 3) return null;
+  var d = new Date(Number(p[0]), Number(p[1]) - 1, Number(p[2]));
+  return isNaN(d.getTime()) ? null : d;
+}
+
+// TODAY / YESTERDAY / SATURDAY / 3/15 — whichever names the day most plainly.
+// An unknown day reads as TODAY, which is the behaviour everything had before
+// a day was carried at all: no date, no new claim.
+function _ftxDayLabel(day) {
+  if (!day) return 'TODAY';
+  var t = _ftxDayDate(_todayDateString()), d = _ftxDayDate(day);
+  if (!t || !d) return 'TODAY';
+  var off = Math.round((t.getTime() - d.getTime()) / 86400000);
+  if (off === 0) return 'TODAY';
+  if (off === 1) return 'YESTERDAY';
+  if (off === -1) return 'TOMORROW';
+  if (off > 1 && off < 7) return FTX_DAYNAME[d.getDay()];
+  return (d.getMonth() + 1) + '/' + d.getDate();
 }
 
 // One game's box score, flattened to name -> { line, live, detail }.
@@ -167858,6 +167940,8 @@ function _ftxParseBox(j, SPORT, g) {
               var _sm = {};
               for (var _v = 0; _v < labels.length && _v < vals.length; _v++) _sm[String(labels[_v] || '')] = vals[_v];
               out[keys[kk]] = { line: bits.join('\u0001'), live: (g.state === 'in'),
+                                day: g.day || '',   // FTXSLATE
+
                                 detail: g.detail || '', statMap: _sm,
                                 pos: (who.position && who.position.abbreviation) || '',
                                 // Goalie decision context for THIS athlete's
