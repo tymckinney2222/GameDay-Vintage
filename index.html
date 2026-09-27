@@ -115858,7 +115858,16 @@ function _fxScoreStatMap(sport, scoring, statMap, pos, ctx) {
     // cats league would have reported a calculated "+0.00 FP" instead of
     // falling through to its category line. Check for null explicitly. FXCATS
     var pts = (c.pts == null) ? NaN : Number(c.pts);
-    if (isNaN(pts)) continue;
+    // ── FXRANGE ── A per-game range rule is a scoring rule in its own
+    // right: the category is scored from it whether or not a flat points
+    // value sits alongside. A rule scored over any other span (a season
+    // total, say) cannot be applied to one game's box line, so it is set
+    // aside and the category falls through to whatever its flat value says
+    // — which lands it on the "scored at zero" line, named, instead of
+    // being charged the wrong amount here.
+    var rule = c.rng || null;
+    var ruleOff = !!(rule && rule.type && rule.type !== 'PER_GAME');
+    if (isNaN(pts) && (!rule || ruleOff)) continue;
     var target = _fxAliasFor(alias, code);   // FXGRPSUF
     if (!target) { unscored.push(code); continue; }
     var val = _fxStatValue(statMap, target);
@@ -115873,14 +115882,32 @@ function _fxScoreStatMap(sport, scoring, statMap, pos, ctx) {
       continue;
     }
     any = true;
-    var contrib = val * pts;
+    var band = ruleOff ? null : _fxRangeBand(rule, val);   // FXRANGE
+    if (band) {
+      // "award 1 point for every 0.1 TOI": 20.55 minutes is 205.50 points.
+      var rcontrib = (val / band.step) * band.pts;
+      fp += rcontrib;
+      if (val) scored.push({ code: code, pts: pts, val: val, contrib: rcontrib,
+                             rule: _fxBandText(band) });
+      continue;
+    }
+    // A flat points value — and an absent one counts as nothing rather than
+    // poisoning the total with NaN, which it could now that a category may
+    // arrive carrying a rule instead of a number.
+    var flat = isNaN(pts) ? 0 : pts;
+    var contrib = val * flat;
     fp += contrib;
     // FXRANGE — a category worth zero contributes nothing whichever reason it
     // is zero, so it is listed separately rather than as a "\u00d7 0" term that
-    // reads like arithmetic. When the league's own rules page says the
-    // category IS worth something, this list is where it will show up.
-    if (val && pts === 0) zero.push(code + ' (' + val + ')');
-    else if (val) scored.push({ code: code, pts: pts, val: val, contrib: contrib });
+    // reads like arithmetic. The reason is named, because "the league scores
+    // this at nothing" and "the rule doesn't cover this value" look identical
+    // in the total and want telling apart on sight.
+    if (val && flat === 0) {
+      zero.push(code + ' (' + val +
+                (ruleOff ? ', ' + rule.type + ' rule' : (rule ? ', outside its range' : '')) + ')');
+    } else if (val) {
+      scored.push({ code: code, pts: pts, val: val, contrib: contrib });
+    }
   }
   if (!any) return null;
   // Two decimals, kept end-to-end. Fantrax scores a night at 4.15 and the
@@ -117071,7 +117098,14 @@ function _fxStadiumStatMap(espnId) {
 // Compact "how this number was built" for a tooltip. FXENGINE
 function _fxScoreTitle(res) {
   if (!res) return '';
-  var bits = res.scored.map(function (x) { return x.val + ' ' + x.code.replace(/_/g, ' ').toLowerCase() + ' \u00d7 ' + x.pts; });
+  var bits = res.scored.map(function (x) {
+    var nm = x.val + ' ' + x.code.replace(/_/g, ' ').toLowerCase();
+    // FXRANGE — a range rule has no single multiplier to print, so the term
+    // shows the rule and what it came to: "20.55 time on ice skaters @ 1 per
+    // 0.1 = 205.50".
+    if (x.rule) return nm + ' @ ' + x.rule + ' = ' + (Math.round(x.contrib * 100) / 100);
+    return nm + ' \u00d7 ' + x.pts;
+  });
   var t = bits.join(' + ');
   // Two distinct gaps, named separately so it's clear which is which:
   // "can't map" is a category the engine has no ESPN equivalent for at all;
@@ -117765,6 +117799,37 @@ function skProbeFantraxScoring() {
         }
       });
     });
+    // ── FXRANGE ── The range rules, as the engine now reads them. Each
+    // line is meant to be checked straight against the league's own rules
+    // page: "From 1 to 6500, award 1 point(s) for every 0.1 TOI".
+    var _rr = [];
+    row.scoring.groups.forEach(function (gr) {
+      (gr.cats || []).forEach(function (cr) {
+        if (cr && cr.rng) _rr.push({ g: gr.name, c: cr });
+      });
+    });
+    if (_rr.length) {
+      say('  \u2500 RANGE RULES, as read (' + _rr.length + ') \u2500');
+      for (var _ri = 0; _ri < _rr.length; _ri++) {
+        var _rc = _rr[_ri].c, _rl = _rc.rng;
+        var _bt = [];
+        for (var _bi = 0; _bi < _rl.bands.length; _bi++) {
+          var _b = _rl.bands[_bi];
+          _bt.push('from ' + (_b.from == null ? '\u2212\u221e' : _b.from) +
+                   ' to ' + (_b.to == null ? '\u221e' : _b.to) +
+                   ', award ' + _b.pts + ' per ' + _b.step);
+        }
+        say('    ' + (_rr[_ri].g ? _rr[_ri].g + ' \u00b7 ' : '') +
+            (_rc.abbr || _rc.name) + '  [' + (_rl.type || 'no rangeType') + ']');
+        say('      ' + _bt.join('  |  '));
+        var _rt = _fxRangeRate(_rl);
+        if (_rt != null) say('      = ' + _rt + ' points per unit of the stat');
+        if (_rl.type && _rl.type !== 'PER_GAME') {
+          say('      NOT per game \u2014 not applied to a single game\u2019s box line.');
+        }
+      }
+      say('');
+    }
     if (_z.length) {
       say('  \u2500 categories scoring ZERO (' + _z.length + ') \u2500');
       say('  These contribute nothing. If the rules page gives them a value,');
@@ -117777,7 +117842,8 @@ function skProbeFantraxScoring() {
       if (_z.length > 12) say('    \u2026 and ' + (_z.length - 12) + ' more');
       say('');
     } else {
-      say('  no category scores zero \u2014 every one carries a flat points value.');
+      say('  no category scores zero \u2014 every one carries a flat points value'
+          + (_rr.length ? ' or a range rule.' : '.'));
       say('');
     }
     if (row.scoring._rawCfg) {
@@ -117808,7 +117874,17 @@ function skProbeFantraxScoring() {
         var code = _fxCodeNorm(rawCode);   // FXCODES
         // Points leagues weight by how much a category is worth; a cats
         // league has no weights, so each category counts once.
-        var w = _isCats ? 1 : Math.abs(Number(c.pts) || 0);
+        //
+        // A range category's worth is its rate, not its flat `points` — that
+        // reads 0, which weighted time on ice at nothing and is how this
+        // league reported "box 100%" while the single biggest category in it
+        // was contributing zero. FXRANGE
+        var _cw = Number(c.pts) || 0;
+        if (!_cw && c.rng) {
+          var _cr = _fxRangeRate(c.rng);
+          if (_cr != null) _cw = _cr;
+        }
+        var w = _isCats ? 1 : Math.abs(_cw);
         total += w;
         var tag = (g.name ? g.name + ' \u00b7 ' : '') + code + (_isCats ? '' : ' (' + (c.pts != null ? c.pts : '?') + ')');
         var _al = _fxAliasFor(alias, code);   // FXGRPSUF
@@ -139609,10 +139685,18 @@ function _fppExtToPseudoSettings(leagueKey, mk) {
              abbrUp === 'FW' || abbrUp === 'FL')) {
           abbrUp = '';
         }
+        // FXRANGE — a range category's flat `points` is 0, so the projector
+        // was told time on ice was worth nothing. It holds one multiplier,
+        // and the rule's points-per-unit is that multiplier.
+        var _pm = cat.pts;
+        if (!_pm && cat.rng && typeof _fxRangeRate === 'function') {
+          var _pr = _fxRangeRate(cat.rng);
+          if (_pr != null) _pm = _pr;
+        }
         stats['ftx_' + g + '_' + c] = {
           abbr: abbrUp,
           displayName: cat.name || cat.abbr || '',
-          pointModifier: cat.pts
+          pointModifier: _pm
         };
         n++;
       }
@@ -162989,11 +163073,96 @@ function _fxCfgRaw(cfg) {
   } catch (e) { return ''; }
 }
 // Does this category's value come from a rule the engine can't read yet?
-// A zero in `points` is the tell: either the league really does score the
-// category at nothing, or its rule is written in a form that isn't a flat
-// points value. Both are worth naming rather than silently adding zero.
+// A zero in `points` is the tell — but only for a category with no range
+// rule, because a range rule is read now and a category that has one is
+// scored from it however its flat `points` field reads. FXRANGE
 function _fxCatIsZero(c) {
-  return !!(c && c.pts != null && Number(c.pts) === 0);
+  if (!c || c.rng) return false;
+  return !!(c.pts != null && Number(c.pts) === 0);
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// ── FXRANGE ── The second form a Fantrax category can take.
+//
+// Most carry a flat "points per unit" value and those always scored. The
+// scoring probe on Ultimate Roulette Hockey showed the other form, which
+// did not, for time on ice, plus/minus and penalty minutes alike:
+//
+//   {"ranges":[{"range":{"start":1,"end":6500},"points":1,"interval":0.1}],
+//    "rangeType":"PER_GAME","cumulative":true,"points":0}
+//
+// That is the league's rules page read literally: "From 1 to 6500, award
+// 1 point(s) for every 0.1 TOI". Top-level `points` is 0 on all of them,
+// which is exactly why they contributed nothing — the engine only ever
+// looked at that field.
+//
+// Parsed into bands, plural, because `ranges` is an array and a league is
+// free to tier a category even though none seen so far does. `rangeType`
+// is kept: a rule evaluated per game is the only kind this engine may
+// apply to a single game's box line.
+// ══════════════════════════════════════════════════════════════════════
+function _fxCfgRanges(cfg) {
+  if (!cfg) return null;
+  var rs = cfg.ranges;
+  if (Object.prototype.toString.call(rs) !== '[object Array]' || !rs.length) return null;
+  var bands = [];
+  for (var i = 0; i < rs.length; i++) {
+    var r = rs[i] || {};
+    var b = r.range || {};
+    var pts = parseFloat(r.points);
+    if (isNaN(pts)) continue;
+    var step = parseFloat(r.interval);
+    // An absent or nonsensical interval means "per 1 of the stat", which is
+    // what a rule with no interval reads as on the rules page.
+    if (isNaN(step) || step <= 0) step = 1;
+    var from = parseFloat(b.start), to = parseFloat(b.end);
+    bands.push({ from: isNaN(from) ? null : from, to: isNaN(to) ? null : to,
+                 pts: pts, step: step });
+  }
+  if (!bands.length) return null;
+  return { type: String(cfg.rangeType || ''), bands: bands };
+}
+
+// The band covering a value, or null when none does. Ultimate Roulette's
+// plus/minus band runs 1 to 1000, so a NEGATIVE plus/minus falls outside
+// every band and earns nothing at all. That is what the config says, and
+// it is reported as such rather than quietly passed off as a zero — if the
+// league means a minus to cost points, the rules page will show a second
+// band for it and this will pick that band up without further change.
+function _fxRangeBand(rule, val) {
+  if (!rule || !rule.bands || val == null || isNaN(val)) return null;
+  for (var i = 0; i < rule.bands.length; i++) {
+    var b = rule.bands[i];
+    if (b.from != null && val < b.from) continue;
+    if (b.to != null && val > b.to) continue;
+    return b;
+  }
+  return null;
+}
+
+// "award `pts` for every `step`" applied to a value, as a rate rather than
+// a count of completed steps: 20.55 time on ice at 1 per 0.1 is 205.50, not
+// 205. That is the ordinary fantasy reading of a per-unit rule, and it is
+// the one place to change if Fantrax proves to round a partial step down.
+function _fxRangePoints(rule, val) {
+  var b = _fxRangeBand(rule, val);
+  if (!b) return null;
+  return (val / b.step) * b.pts;
+}
+
+// The rule as a single points-per-unit multiplier, for the two places that
+// can only hold one number: the probe's coverage weighting, and the FP
+// Projector's stat definitions. The first band is the whole rule in every
+// league seen, and a tiered rule has no single rate to give.
+function _fxRangeRate(rule) {
+  if (!rule || !rule.bands || rule.bands.length !== 1) return null;
+  var b = rule.bands[0];
+  return (b.step > 0) ? (b.pts / b.step) : null;
+}
+
+// "1 per 0.1" — how a band reads in a tooltip.
+function _fxBandText(b) {
+  return b ? (b.pts + ' per ' + b.step) : '';
 }
 function _fxCfgWeight(cfg) {
   if (!cfg) return 1;
@@ -163048,7 +163217,14 @@ function _fxExtractScoring(data) {
         // The config is kept verbatim against the category so the probe can
         // report the shape of a rule the parser can't yet read, and so the
         // engine can be taught it from a reading rather than a guess.
-        cats.push({ abbr: abbr, name: nm, pts: isNaN(pv) ? null : pv, cat: isNaN(pv),
+        //
+        // `rng` is that reading, now that the probe has supplied the shape.
+        // A category with one is a scoring category even when `points` is
+        // absent, so it must not be mistaken for a CATEGORIES league's
+        // pointless category — hence the extra term on `cat`. FXRANGE
+        var _rng = _fxCfgRanges(cfg);
+        cats.push({ abbr: abbr, name: nm, pts: isNaN(pv) ? null : pv,
+                    cat: isNaN(pv) && !_rng, rng: _rng,
                     raw: _fxCfgRaw(cfg),
                     // ── Weighted roto ── FXWEIGHT ──
                     // Anarchy's rules page shows a Weight column (PTS 1.5,
