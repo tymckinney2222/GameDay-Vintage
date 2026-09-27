@@ -86278,7 +86278,53 @@ var skHydrationInFlight = false;
 // l.is_guillotine + skLeagueData[key].is_guillotine so the card + standings
 // renderers can branch on it. Scoped to NFL (the only guillotine sport) and
 // cached, so it's at most a handful of one-time calls.
+// ── GUILPERSIST ── Whether a league is a guillotine league, kept.
+//
+// This was an in-memory map, so it started empty on every open. Resolving it
+// costs a FULL settings fetch — the whole scoring system, roster slots, stat
+// modifiers, playoff config — and all that is read for is one boolean.
+// Every NFL league, every open, one heavy call for one bit.
+//
+// A league cannot stop being a guillotine league. It is fixed when the league
+// is created, and the league_key carries the game id (477.l.9971 is a 2026
+// NFL league), so the key is already season-unique and a stored answer can
+// never be applied to the wrong season.
+//
+// Kept for a season. A league that is deleted just leaves a dead boolean
+// behind, which is a few bytes.
+var SK_GUIL_LS = 'sk_guillotine_v1';
+var SK_GUIL_TTL_MS = 180 * 24 * 3600 * 1000;   // a season
 var _skGuillotineCache = {}; // league_key -> true/false (RESOLVED answers only)
+var _skGuilLoaded = false;
+
+function _skGuilLoad() {
+  if (_skGuilLoaded) return;
+  _skGuilLoaded = true;
+  try {
+    var raw = localStorage.getItem(SK_GUIL_LS);
+    if (!raw) return;
+    var parsed = JSON.parse(raw);
+    if (!parsed || !parsed.ts || !parsed.map) return;
+    if ((Date.now() - parsed.ts) >= SK_GUIL_TTL_MS) return;
+    for (var k in parsed.map) {
+      // Only ever restore a real resolved boolean. Anything else would be an
+      // unresolved answer masquerading as a settled one, which is the exact
+      // failure GUILRETRY exists to prevent.
+      if (!parsed.map.hasOwnProperty(k)) continue;
+      if (parsed.map[k] === true || parsed.map[k] === false) {
+        if (!_skGuillotineCache.hasOwnProperty(k)) _skGuillotineCache[k] = parsed.map[k];
+      }
+    }
+  } catch (e) {}
+}
+
+function _skGuilSave() {
+  try {
+    var entry = { ts: Date.now(), map: _skGuillotineCache };
+    if (typeof _skSafeSetItem === 'function') _skSafeSetItem(SK_GUIL_LS, JSON.stringify(entry));
+    else localStorage.setItem(SK_GUIL_LS, JSON.stringify(entry));
+  } catch (e) {}
+}
 var _skGuillotinePending = {}; // league_key -> 1 while a settings fetch is in flight
 
 function _skReadGuillotineFlag(settingsRes) {
@@ -86316,6 +86362,7 @@ function _skEnrichGuillotine(league) {
   var key = league.league_key;
   if (!key) return;
   if (String(league.sport || '').toLowerCase() !== 'nfl') return; // NFL only
+  _skGuilLoad();   // GUILPERSIST — last session already answered this
   if (_skGuillotineCache.hasOwnProperty(key)) {
     // Already resolved — make sure the flag is stamped (covers re-hydration).
     var cached = _skGuillotineCache[key];
@@ -86341,6 +86388,7 @@ function _skEnrichGuillotine(league) {
     if (!res || res.error) return;
     var isG = _skReadGuillotineFlag(res);
     _skGuillotineCache[key] = isG;
+    _skGuilSave();   // GUILPERSIST — so the next open doesn't buy this again
     league.is_guillotine = isG;
     if (skLeagueData[key]) skLeagueData[key].is_guillotine = isG;
     // When it resolves true, refresh anywhere this league is shown so the
