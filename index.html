@@ -115533,6 +115533,15 @@ var _FX_ESPN_ALIAS = {
     PPG: '_PPG', PPA: '_PPA', PPP: '_PPP',
     SHORT_HANDED_GOALS: '_SHG', SHORT_HANDED_ASSISTS: '_SHA', SHORT_HANDED_POINTS: '_SHP',
     SHG: '_SHG', SHA: '_SHA', SHP: '_SHP',
+    // ── FXSTP ── Special teams points: what a player did with the man
+    // advantage or a man down, which is the power-play and short-handed
+    // points added together. Both halves already come off the play-by-play,
+    // and the two strength states are mutually exclusive, so there is nothing
+    // to double count. North Of 49 scores it and it was reading as unknown.
+    SPECIAL_TEAMS_POINTS: '_STP', SPECIAL_TEAMS: '_STP', STP: '_STP',
+    // ── FXGS ── Goalie starts. Derived, with a hard limit on when it can be
+    // claimed at all — see _fxNhlDerived.
+    GAMES_STARTED: '_GS', GOALIE_STARTS: '_GS', STARTS: '_GS', GS: '_GS',
     // short forms, in case a league exports them
     G: 'G', A: 'A', PTS: 'P', PIM: 'PIM', SOG: 'S', HIT: 'HT', BLK: 'BS', GA: 'GA', SV: 'SV',
     // Identity forms — a provider that names a category with ESPN's own box
@@ -115557,7 +115566,11 @@ var _FX_ESPN_ALIAS = {
     FIELD_GOAL_PERCENTAGE: '_FGP', FG_PERCENTAGE: '_FGP', 'FG%': '_FGP',
     FREE_THROW_PERCENTAGE: '_FTP', FT_PERCENTAGE: '_FTP', 'FT%': '_FTP',
     THREE_POINT_PERCENTAGE: '_3PP', '3P%': '_3PP', 'THREE_POINT_PCT': '_3PP',
-    MINUTES_PLAYED: 'MIN', MIN: 'MIN'
+    MINUTES_PLAYED: 'MIN', MIN: 'MIN',
+    // ── FXNBAWIN ── Whether his team won. No box line carries a result, so
+    // it comes from the game. The Hardwood Mafia scores it and it was
+    // reading as unknown.
+    WINS: '_W', W: '_W'
   }
 };
 // Derivable — from the box plus game state, or from play-by-play. The
@@ -115574,7 +115587,10 @@ var _FX_ESPN_DERIVED = {
     OVERTIME_LOSSES: 'DONE game state: Final/OT or Final/SO',
     SHUTOUTS: 'DONE box: GA 0, sole goalie, on a final',
     GOALIE_ASSISTS: 'DONE play-by-play: participants type=assister',
-    GOALS_AGAINST_AVERAGE: 'box: GA / TOI', GOALIE_STARTS: 'box: TOI > 0',
+    GOALS_AGAINST_AVERAGE: 'box: GA / TOI',
+    GOALIE_STARTS: 'DONE box: sole goalie, with his own ice time',
+    GAMES_STARTED: 'DONE box: sole goalie, with his own ice time',
+    SPECIAL_TEAMS_POINTS: 'DONE play-by-play: PPG + PPA + SHG + SHA',
     POWER_PLAY_GOALS: 'DONE play-by-play: strength + participants',
     POWER_PLAY_ASSISTS: 'DONE play-by-play: strength + participants',
     POWER_PLAY_POINTS: 'DONE play-by-play: PPG + PPA',
@@ -115586,11 +115602,96 @@ var _FX_ESPN_DERIVED = {
     GAMES_PLAYED: 'DONE box: took a shift'
   },
   NBA: {
+    WINS: 'DONE game state: final, his team won, and he played',
     DOUBLE_DOUBLES: 'box: two 10+ categories', TRIPLE_DOUBLES: 'box: three 10+ categories',
     FIELD_GOAL_PERCENTAGE: 'box: FG made/att', FREE_THROW_PERCENTAGE: 'box: FT made/att',
     THREE_POINT_PERCENTAGE: 'box: 3PT made/att'
   }
 };
+
+// ── NBA derived ── FXNBAWIN ──
+// One category, and one no box score carries: whether the player's team won.
+// ESPN's NBA line is MIN / PTS / FG / 3PT / FT / REB / AST / TO / STL / BLK /
+// OREB / DREB / PF / +/- — the result is a property of the game, not the line.
+//
+// Only ever claimed on a final, and a loss is a real zero rather than a gap:
+// the game was played and he didn't win it.
+//
+// A player who didn't play didn't win anything either. ESPN gives a
+// did-not-play an EMPTY stats array, so in practice such a line never reaches
+// the scorer at all; the minutes check covers the case where one does.
+function _fxNbaDerived(statMap, pos, ctx) {
+  var out = {};
+  if (!ctx || !statMap || !ctx.final) return out;
+  var raw = statMap.MIN;
+  var played;
+  if (raw == null || raw === '') {
+    played = true;               // no minutes column to judge him by
+  } else {
+    var m = _fxNumOrClock(raw);  // "13", and a clock if one ever shows up
+    played = (m != null && m > 0);
+  }
+  out._W = (played && ctx.won === true) ? 1 : 0;
+  return out;
+}
+
+// ── One place to ask what a sport derives ── FXDERIVE ──
+// The FP scorer and the day strip each used to carry their own copy of this
+// dispatch and their own copy of the merge below, which is how a category
+// could end up scoring in one and missing from the other.
+function _fxDerivedFor(sport, statMap, pos, ctx) {
+  if (!ctx || !statMap) return {};
+  var sp = String(sport || '').toUpperCase();
+  if (sp === 'NHL' && typeof _fxNhlDerived === 'function') return _fxNhlDerived(statMap, pos, ctx);
+  if (sp === 'NBA' && typeof _fxNbaDerived === 'function') return _fxNbaDerived(statMap, pos, ctx);
+  return {};
+}
+
+// The box line with its derived values alongside, as a COPY — the cached
+// stat map stays exactly what ESPN sent. The original is handed back
+// untouched when there is nothing to add.
+function _fxWithDerived(sport, statMap, pos, ctx) {
+  var d = _fxDerivedFor(sport, statMap, pos, ctx), k, has = false;
+  for (k in d) { if (d.hasOwnProperty(k)) { has = true; break; } }
+  if (!has) return statMap;
+  var copy = {};
+  for (k in statMap) { if (statMap.hasOwnProperty(k)) copy[k] = statMap[k]; }
+  for (k in d) { if (d.hasOwnProperty(k)) copy[k] = d[k]; }
+  return copy;
+}
+
+// ── Game state without a play-by-play ── FXWONCTX ──
+// A sport that derives nothing from plays still needs to know how the game
+// ended. This takes it from the SCOREBOARD entry rather than the summary:
+// the scoreboard is fetched first regardless, and its competitors carry the
+// result outright — {homeAway, score, winner: true|false, team:{id}}, which
+// is confirmed shape. So the context costs no extra request and does not
+// depend on the summary carrying a header.
+function _fxWonCtx(g, teamId) {
+  if (!g || teamId == null) return null;
+  var sides = g.sides || [];
+  if (!sides.length) return null;
+  var mine = null, theirs = null;
+  for (var i = 0; i < sides.length; i++) {
+    if (String(sides[i].id) === String(teamId)) mine = sides[i];
+    else if (!theirs) theirs = sides[i];
+  }
+  if (!mine) return null;
+  var won = (mine.winner === true) ? true
+          : (mine.winner === false) ? false
+          : ((mine.score != null && theirs && theirs.score != null)
+              ? (mine.score > theirs.score) : null);
+  // Not finished, or no result to read: the same empty shape the hockey
+  // context returns, so a caller can't tell the two apart and mishandle one.
+  if (g.state !== 'post' || won == null) {
+    return { final: false, ot: false, so: false, won: false, goalieCount: 0,
+             myScore: null, oppScore: null, pbp: null };
+  }
+  var detail = String(g.detail || '');
+  return { final: true, ot: /\bOT\b|\bSO\b/i.test(detail), so: /\bSO\b/i.test(detail),
+           won: !!won, goalieCount: 0,
+           myScore: mine.score, oppScore: theirs ? theirs.score : null, pbp: null };
+}
 
 // ── Fantrax live FP engine ── FXENGINE ──
 // Fantrax publishes no per-player daily stats, so fantasy points are
@@ -115647,6 +115748,9 @@ function _fxNhlDerived(statMap, pos, ctx) {
   if (pbp) {
     out._PPG = pbp.ppg; out._PPA = pbp.ppa; out._PPP = pbp.ppg + pbp.ppa;
     out._SHG = pbp.shg; out._SHA = pbp.sha; out._SHP = pbp.shg + pbp.sha;
+    // FXSTP — power play plus short handed. Those two strengths can't both
+    // apply to one goal, so this is a sum and not an overlap.
+    out._STP = pbp.ppg + pbp.ppa + pbp.shg + pbp.sha;
     if (statMap.A == null || statMap.A === '') out.A = pbp.a;
     if (statMap.G == null || statMap.G === '') out.G = pbp.g;
     if (statMap.P == null || statMap.P === '') out.P = pbp.g + pbp.a;
@@ -115697,7 +115801,31 @@ function _fxNhlDerived(statMap, pos, ctx) {
     out._GAA = Math.round((_gaN * 60 / _mins) * 100) / 100;
   }
 
+  // ── Is this line the goalie who actually played? ── FXGS ──
+  // goalieCount says the team used exactly one goalie. It does NOT say that
+  // this is his line: where ESPN lists a dressed backup, the backup would
+  // have been handed the starter's win. His own clock is what settles it.
+  var _gMin = _fxClockMinutes(statMap.TOI);
+  var _played = (_gMin == null) ? true : (_gMin > 0);
+
+  // ── Games started ── FXGS ──
+  // ESPN's NHL goalie group is GA / SA / SOS / SOSA / SV / SV% / ESSV / PPSV
+  // / SHSV / TOI / YTDG / PIM, and it carries no starter flag. That is an
+  // absence rather than an oversight on our side: the NBA box in the same API
+  // DOES flag its starters, and the hockey one has no such key on any goalie.
+  //
+  // Ice time cannot stand in for it, either — a starter pulled after ten
+  // minutes has LESS of it than the man who relieved him, so "most minutes"
+  // would name the wrong goalie exactly in the games where it matters.
+  //
+  // So a start is claimed only where it is not in doubt: the team used one
+  // goalie, and this is him. Where a team used two, the starter genuinely is
+  // not in the data, and the category reports as unavailable rather than
+  // guessed — the same line the win, loss and shutout already take.
+  if (ctx.goalieCount === 1) out._GS = _played ? 1 : 0;
+
   if (ctx.goalieCount !== 1) return out;   // can't attribute the decision
+  if (!_played) return out;                // and this isn't the goalie who played
   if (ctx.won) { out._W = 1; out._L = 0; out._OTL = 0; }
   else if (ctx.ot) { out._W = 0; out._L = 0; out._OTL = 1; }
   else { out._W = 0; out._L = 1; out._OTL = 0; }
@@ -115756,7 +115884,9 @@ var _FX_DERIVED_FALLBACK = {
 // The reverse direction is kept: a map that genuinely holds shots under SOG
 // still resolves for a caller asking for S.
 var _FX_LABEL_ALT = { 'SOG': ['S'] };
-var _FX_DERIVED_SUM = { '_PPP': ['PPG', 'PPA'], '_SHP': ['SHG', 'SHA'] };
+// FXSTP — special teams points is the four parts a season line does carry.
+var _FX_DERIVED_SUM = { '_PPP': ['PPG', 'PPA'], '_SHP': ['SHG', 'SHA'],
+                        '_STP': ['PPG', 'PPA', 'SHG', 'SHA'] };
 
 var _FX_SPLIT_FALLBACK = {
   'FG:made': 'FGM', 'FG:att': 'FGA',
@@ -115836,18 +115966,8 @@ function _fxScoreStatMap(sport, scoring, statMap, pos, ctx) {
   var grp = _fxGroupFor(scoring, sport, pos);
   if (!grp || !statMap) return null;
   // Derived values ride alongside the box labels in a COPY, so the cached
-  // stat map stays exactly what ESPN sent. FXGOALIE
-  if (String(sport).toUpperCase() === 'NHL' && ctx) {
-    var _d = _fxNhlDerived(statMap, pos, ctx);
-    var _has = false, _dk;
-    for (_dk in _d) { if (_d.hasOwnProperty(_dk)) { _has = true; break; } }
-    if (_has) {
-      var _copy = {};
-      for (_dk in statMap) { if (statMap.hasOwnProperty(_dk)) _copy[_dk] = statMap[_dk]; }
-      for (_dk in _d) { if (_d.hasOwnProperty(_dk)) _copy[_dk] = _d[_dk]; }
-      statMap = _copy;
-    }
-  }
+  // stat map stays exactly what ESPN sent. FXGOALIE / FXDERIVE
+  statMap = _fxWithDerived(sport, statMap, pos, ctx);
   var alias = _FX_ESPN_ALIAS[String(sport).toUpperCase()] || {};
   var fp = 0, scored = [], unscored = [], nodata = [], zero = [], any = false;   // FXNODATA / FXRANGE
   for (var i = 0; i < grp.cats.length; i++) {
@@ -115963,11 +116083,24 @@ function _fxNhlPbpIndex(summary) {
     // so period 5+ is skipped. Regulation is 1-3, overtime is 4.
     var pnum = pl.period && pl.period.number;
     if (pnum != null && Number(pnum) > 4) continue;
-    var st = (pl.strength && (pl.strength.abbreviation || pl.strength.text)) || '';
-    // Matched loosely on purpose: the probe only proved "even-strength"
-    // (id 701) first-hand, so power-play and short-handed are matched by word
-    // rather than by an exact abbreviation guessed at.
-    var isPP = /power/i.test(st), isSH = /short/i.test(st);
+    // ── FXSTRENGTH ── Read BOTH fields, not the first one present.
+    //
+    // This used to be `abbreviation || text` matched on the words "power" and
+    // "short". The words were the cautious choice — the probe proved
+    // even-strength (id 701) first-hand and nothing else — but pairing them
+    // with a read that PREFERS the abbreviation undid that caution: if ESPN
+    // spells a power play "PP" there, the word test never fires and every
+    // power-play and short-handed stat silently reads zero, which would take
+    // special teams points down with it.
+    //
+    // Still unconfirmed against a real payload (the plays feed refused the
+    // read). So both fields are searched, by word and by the abbreviation's
+    // own prefix, which makes the match independent of which field carries it.
+    // "Probe NHL play-by-play" on any finished game settles it for good.
+    var _stA = String((pl.strength && pl.strength.abbreviation) || '');
+    var _stT = String((pl.strength && pl.strength.text) || '');
+    var isPP = /power/i.test(_stT) || /power/i.test(_stA) || /^PP/i.test(_stA);
+    var isSH = /short/i.test(_stT) || /short/i.test(_stA) || /^SH/i.test(_stA);
     // FXGWG — count the scoring team's goals in order. A play with no team on
     // it yields no ordinal, and the game-winner simply isn't derived.
     var _tid = (pl.team && pl.team.id != null) ? String(pl.team.id) : '';
@@ -116162,12 +116295,9 @@ function _fxDayTotals(sport, scoring, entries) {
     var en = entries[e] || {};
     var sm = en.statMap;
     if (!sm) continue;
-    if (SPORT === 'NHL' && en.ctx && typeof _fxNhlDerived === 'function') {
-      var d = _fxNhlDerived(sm, en.pos, en.ctx), c2 = {}, kk;
-      for (kk in sm) { if (sm.hasOwnProperty(kk)) c2[kk] = sm[kk]; }
-      for (kk in d) { if (d.hasOwnProperty(kk)) c2[kk] = d[kk]; }
-      sm = c2;
-    }
+    // FXDERIVE — the same merge the FP scorer uses, so a derived category
+    // can't score in one place and go missing from the other.
+    if (typeof _fxWithDerived === 'function') sm = _fxWithDerived(SPORT, sm, en.pos, en.ctx);
     // Components for the rate formulas, always, whether or not the league
     // counts them as categories of their own. Sport-driven so basketball's
     // made/attempted pairs are collected the same way hockey's saves are.
@@ -116931,6 +117061,7 @@ var _FX_CAT_LABEL = {
   '_GP': 'GP', '_HT3': 'HT', '_GWG': 'GWG',   // FXGP / FXHAT / FXGWG
   '_PPG': 'PPG', '_PPA': 'PPA', '_PPP': 'PPP',
   '_SHG': 'SHG', '_SHA': 'SHA', '_SHP': 'SHP', '_GAA': 'GAA',
+  '_STP': 'STP', '_GS': 'GS',   // FXSTP / FXGS
   '_FGP': 'FG%', '_FTP': 'FT%', '_3PP': '3P%',
   '3PT:made': '3PM', '3PT:att': '3PA', 'FG:made': 'FGM', 'FG:att': 'FGA',
   'FT:made': 'FTM', 'FT:att': 'FTA'
@@ -167522,7 +167653,20 @@ function _ftxFetchLive(SPORT) {
         // begin has no stats to contribute and is skipped rather than
         // fetched.
         if (st.state === 'pre') continue;
-        live.push({ id: ev.id, state: st.state, detail: st.shortDetail || '' });
+        // FXWONCTX — the result, from the entry that already has it. The
+        // summary fetch below is per game; this costs nothing.
+        var _sides = [];
+        try {
+          var _cs = ((ev.competitions || [])[0] || {}).competitors || [];
+          for (var _c = 0; _c < _cs.length; _c++) {
+            var _sc = parseFloat(_cs[_c].score);
+            _sides.push({ id: String((_cs[_c].team && _cs[_c].team.id) || ''),
+                          score: isNaN(_sc) ? null : _sc,
+                          winner: (_cs[_c].winner === true) ? true
+                                : (_cs[_c].winner === false) ? false : null });
+          }
+        } catch (_e) {}
+        live.push({ id: ev.id, state: st.state, detail: st.shortDetail || '', sides: _sides });
       }
       if (!live.length) return { at: Date.now(), byName: {}, games: 0, anyLive: false };
       // Cap the fan-out. A full NHL slate is ~16 games; more than that means
@@ -167599,10 +167743,16 @@ function _ftxParseBox(j, SPORT, g) {
                                 // Goalie decision context for THIS athlete's
                                 // team, resolved while we still have the
                                 // summary in hand. FXGOALIE
+                                // Hockey reads the summary, because it also
+                                // needs the play-by-play. Every other sport
+                                // takes the result off the scoreboard entry,
+                                // which already carries it. FXPBP / FXWONCTX
                                 ctx: (SPORT === 'NHL' && typeof _fxNhlCtxFor === 'function')
                                   ? _fxNhlCtxFor(j, (teams[t].team && teams[t].team.id) || null,
-                                                 g.state, g.detail, who.id)   // FXPBP
-                                  : null };
+                                                 g.state, g.detail, who.id)
+                                  : ((typeof _fxWonCtx === 'function')
+                                      ? _fxWonCtx(g, (teams[t].team && teams[t].team.id) || null)
+                                      : null) };
             }
           }
         }
