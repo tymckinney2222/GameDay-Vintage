@@ -29421,6 +29421,11 @@
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
       <span>Probe rink stats (open game)</span>
     </button>
+    <!-- FHUBALL — does the merged hub collector agree with the three? -->
+    <button class="sk-account-item" onclick="skProbeFantasyHubMerge(); skCloseAccountMenu();">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M4 12h16M4 17h10"/><circle cx="19" cy="17" r="2.5"/></svg>
+      <span>Probe merged fantasy hub</span>
+    </button>
     <!-- MGRWEEKPROBE — where Record by week put each ESPN matchup, and why -->
     <button class="sk-account-item" onclick="skProbeEspnWeeks(); skCloseAccountMenu();">
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M3 10h18M8 2v4M16 2v4"/></svg>
@@ -77262,8 +77267,14 @@ function _crsCollectFantasyHub() {
     if (!nm) return;
     var norm = (typeof _skNormalizeName === 'function') ? _skNormalizeName(nm) : nm.toLowerCase();
     if (seen[norm]) return;
-    // Yahoo rows only. ESPN has its own hub — Yahoo's terms ask that their
-    // fantasy data not be commingled with other providers. ESPNFHUB3
+    // Yahoo rows only, because this is Yahoo's hub. FHUBALL — the note
+    // that used to sit here said Yahoo's terms ask that their fantasy DATA
+    // not be commingled with other providers'. Checked against Yahoo's
+    // developer portal, the published rule is about MARKS: "do not combine
+    // the Yahoo Fantasy word marks and logos with other brands and/or
+    // marks", plus the attribution line and their official logo. No hub
+    // renders a provider mark, so the merged collector below is free to
+    // carry every platform. See its header for the full note.
     var rows = _buildSkipperFpRows(nm, true, _hubSport); // includeEmpty: show every rostered league
     if (!rows.length) return;
     seen[norm] = true;
@@ -77286,6 +77297,265 @@ function _crsCollectFantasyHub() {
     return a.name.localeCompare(b.name);
   });
   return out;
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// ONE HUB, EVERY PLATFORM ── FHUBALL ──
+//
+// Step one of collapsing the three stadium hubs into one: a single
+// collector that answers "who in this game is mine, and what is he doing
+// for each of my teams" across Yahoo, ESPN, Sleeper and Fantrax at once.
+//
+// NOTHING RENDERS FROM THIS YET and the three hubs are untouched. Shipping
+// it alone is the point: it can be CHECKED against them first.
+// skProbeFantasyHubMerge compares this collector's player/league pairs with
+// the union of the three, so a disagreement is a bug this FOUND rather than
+// one it introduced. Only once they agree does the UI move.
+//
+// It deliberately REUSES the three existing row builders instead of
+// reimplementing them. _buildSkipperFpRows, _espFhubRowsFor and
+// _extFhubRowsFor each carry provider-specific correctness worth keeping —
+// Fantrax's surname-first dictionary, Sleeper's lazily resolved names,
+// ESPN's exact id join, the tri-state bench flag, the sport scoping that
+// stops a Phillies pitcher answering for a Knicks guard. None of that is
+// worth rewriting in order to merge a list.
+//
+// ── ON YAHOO'S MARKS ──
+// The file used to say Yahoo's terms ask that their fantasy DATA not be
+// commingled with other providers'. Checked against Yahoo's developer
+// portal, the published rule is about MARKS:
+//
+//     "Do not combine the Yahoo Fantasy word marks and logos with other
+//      brands and/or marks."
+//
+// alongside the attribution line "Fantasy data provided by Yahoo Fantasy"
+// with a link back, and their official logo.
+//
+// No hub renders a provider mark today. The images inside them are the PRO
+// TEAM's logo and the user's own FANTASY TEAM's logo; provider identity is
+// carried by colour (EXT_FHUB_PROVIDERS is a palette, not a badge set). The
+// required attribution and official logo stand alone in the Skipper footer,
+// which is already how the rest of the app reads the rule — Yahoo data sits
+// on dozens of cards with no per-card logo.
+//
+// So: if this hub ever grows provider LOGOS in place of the colour accents,
+// that is the moment the rule bites and Yahoo's rows must stay mark-free.
+// ══════════════════════════════════════════════════════════════════════
+
+// One identity for a stadium athlete. Prefers the exact id where the
+// stadium is ESPN-sourced and falls back to the normalised name, which is
+// all the MLB stadium (MLB Stats API) can offer.
+//
+// The three collectors disagreed here: ESPN and the ext hub keyed on
+// espnId-or-name, Yahoo's keyed on name alone. Two players sharing a
+// normalised name in one game therefore collapsed to one entry on Yahoo and
+// stayed two everywhere else. This takes the id where there is one, so they
+// stay two — and the probe reports the difference rather than hiding it.
+function _fhubAllKey(at) {
+  if (!at) return '';
+  if (at.espnId) return 'id:' + at.espnId;
+  var nm = at.name || '';
+  var norm = (typeof _skNormalizeName === 'function')
+    ? _skNormalizeName(nm) : String(nm).toLowerCase();
+  return norm ? ('nm:' + norm) : '';
+}
+
+// Every rostered row for one athlete, from every platform, in one list.
+function _fhubRowsForAthlete(at, espIdx, extIdx, sport) {
+  var rows = [];
+  if (!at) return rows;
+  // Yahoo is name-keyed. includeEmpty, so a league you roster him in still
+  // shows on a day he scored nothing — that IS the answer to "is he mine".
+  if (typeof _buildSkipperFpRows === 'function' && at.name) {
+    try { rows = rows.concat(_buildSkipperFpRows(at.name, true, sport) || []); } catch (e1) {}
+  }
+  if (espIdx && espIdx.n && typeof _espFhubRowsFor === 'function') {
+    try { rows = rows.concat(_espFhubRowsFor(at, espIdx, sport) || []); } catch (e2) {}
+  }
+  if (extIdx && extIdx.n && typeof _extFhubRowsFor === 'function') {
+    try { rows = rows.concat(_extFhubRowsFor(at, extIdx, sport) || []); } catch (e3) {}
+  }
+  return rows;
+}
+
+function _fhubCollectAll() {
+  var out = [];
+  if (typeof _crsActiveStadiumPlayers !== 'function') return out;
+  var ctx = _crsActiveStadiumPlayers();
+  if (!ctx || !ctx.athletes || !ctx.athletes.length) return out;
+  // Which sport's stadium is open. Load-bearing, not decorative: a name
+  // alone is not an identity. FHUBSPORT
+  var sport = (typeof _extStadiumSport === 'function') ? _extStadiumSport() : '';
+  // Built ONCE for the whole pass rather than per athlete. Each index walks
+  // every synced league's rosters, and against a 20-row box score that is
+  // the five-figure loop _extDotIndex warns about — the single biggest
+  // reason three hubs cost more than one. FHUBALL
+  var espIdx = (typeof _espFhubIndex === 'function') ? _espFhubIndex() : null;
+  var extIdx = (typeof _extFhubIndex === 'function') ? _extFhubIndex() : null;
+  var seen = {}, a, r;
+
+  for (a = 0; a < ctx.athletes.length; a++) {
+    var at = ctx.athletes[a];
+    var k = _fhubAllKey(at);
+    if (!k || seen[k]) continue;
+    var rows = _fhubRowsForAthlete(at, espIdx, extIdx, sport);
+    if (!rows.length) continue;
+    seen[k] = 1;
+
+    var total = null, nFp = 0, nCalc = 0, byProv = {}, lineup = null, injury = '';
+    for (r = 0; r < rows.length; r++) {
+      var row = rows[r] || {};
+      if (row.provider) byProv[row.provider] = (byProv[row.provider] || 0) + 1;
+      // Categories and roto rows carry no fantasy points and must never be
+      // summed into one. A cats row is fp == null on all three builders.
+      if (row.fp != null && !row.isCats) {
+        total = (total || 0) + Number(row.fp);
+        nFp++;
+        if (row.calc) nCalc++;
+      }
+      if (!lineup && row.lineup) lineup = row.lineup;
+      if (!injury && row.injury) injury = row.injury;
+    }
+    // Two decimals only when EVERY points row was calculated from a box
+    // line, matching the rows underneath; anything mixed rounds to one, the
+    // way the ext hub already does. FXPREC
+    if (total != null) {
+      total = (nFp > 0 && nFp === nCalc)
+        ? Math.round(total * 100) / 100
+        : Math.round(total * 10) / 10;
+    }
+
+    out.push({ key: k, name: at.name, pos: at.pos, teamAbbr: at.teamAbbr,
+               teamLogo: at.teamLogo, accent: at.accent,
+               rows: rows, total: total, byProv: byProv,
+               lineup: lineup, injury: injury });
+  }
+
+  // Same order the Yahoo and ext hubs already use: what this game is worth,
+  // most first, then the players it is worth nothing measurable to.
+  out.sort(function (x, y) {
+    if (x.total != null && y.total != null) return y.total - x.total;
+    if (x.total != null) return -1;
+    if (y.total != null) return 1;
+    return String(x.name || '').localeCompare(String(y.name || ''));
+  });
+  return out;
+}
+
+// ── FHUBALL ── Does the merged collector agree with the three it replaces?
+//
+// Compares PAIRS — one player in one league — because that is the unit the
+// hub renders and the unit that can go missing. A pair present on one side
+// and not the other is the finding; a total that differs on a pair both
+// sides have is the other.
+function _fhubPairId(name, row) {
+  var norm = (typeof _skNormalizeName === 'function')
+    ? _skNormalizeName(name || '') : String(name || '').toLowerCase();
+  var lg = (row && (row.leagueKey || row.lgKey || row.leagueName)) || '?';
+  return norm + ' | ' + ((row && row.provider) || '?') + ' | ' + lg;
+}
+function _fhubPairSet(players) {
+  var set = {}, i, j;
+  for (i = 0; i < (players || []).length; i++) {
+    var p = players[i] || {};
+    for (j = 0; j < (p.rows || []).length; j++) {
+      set[_fhubPairId(p.name, p.rows[j])] = {
+        fp: p.rows[j].fp, player: p.name, row: p.rows[j]
+      };
+    }
+  }
+  return set;
+}
+
+function skProbeFantasyHubMerge() {
+  var L = [];
+  function say(t) { L.push(t == null ? '' : String(t)); }
+
+  say('MERGED FANTASY HUB — AGREEMENT PROBE');
+  var sport = (typeof _extStadiumSport === 'function') ? _extStadiumSport() : '';
+  say('stadium sport: ' + (sport || '(none)'));
+  var ctx = (typeof _crsActiveStadiumPlayers === 'function') ? _crsActiveStadiumPlayers() : null;
+  var nAth = (ctx && ctx.athletes) ? ctx.athletes.length : 0;
+  say('athletes in the open game: ' + nAth);
+  if (!nAth) {
+    say('');
+    say('Open a game in stadium mode first — this compares what the hubs');
+    say('would show for the game on screen.');
+    if (typeof _skGpProbeShow === 'function') _skGpProbeShow(L.join('\n'));
+    return;
+  }
+  say('');
+
+  var y = [], e = [], x = [], m = [];
+  try { y = (typeof _crsCollectFantasyHub === 'function') ? _crsCollectFantasyHub() : []; } catch (e1) { say('yahoo collector threw: ' + e1.message); }
+  try { e = (typeof _espCollectFantasyHub === 'function') ? _espCollectFantasyHub() : []; } catch (e2) { say('espn collector threw: ' + e2.message); }
+  try { x = (typeof _extCollectFantasyHub === 'function') ? _extCollectFantasyHub() : []; } catch (e3) { say('ext collector threw: ' + e3.message); }
+  try { m = _fhubCollectAll(); } catch (e4) { say('merged collector threw: ' + e4.message); }
+
+  var oldSet = {}, k;
+  [y, e, x].forEach(function (lst) {
+    var s = _fhubPairSet(lst);
+    for (var kk in s) { if (s.hasOwnProperty(kk)) oldSet[kk] = s[kk]; }
+  });
+  var newSet = _fhubPairSet(m);
+
+  function count(o) { var c = 0, q; for (q in o) if (o.hasOwnProperty(q)) c++; return c; }
+  say('-- COUNTS --');
+  say('  players : yahoo ' + y.length + '   espn ' + e.length + '   slp/ftx ' + x.length +
+      '   |  merged ' + m.length);
+  say('  pairs   : three hubs ' + count(oldSet) + '   |  merged ' + count(newSet));
+  say('');
+
+  var onlyOld = [], onlyNew = [], diff = [];
+  for (k in oldSet) { if (oldSet.hasOwnProperty(k) && !newSet[k]) onlyOld.push(k); }
+  for (k in newSet) { if (newSet.hasOwnProperty(k) && !oldSet[k]) onlyNew.push(k); }
+  for (k in newSet) {
+    if (!newSet.hasOwnProperty(k) || !oldSet[k]) continue;
+    var A = oldSet[k].fp, B = newSet[k].fp;
+    if (A == null && B == null) continue;
+    if (A == null || B == null || Math.abs(Number(A) - Number(B)) > 0.005) {
+      diff.push(k + '   old ' + (A == null ? '—' : A) + '   merged ' + (B == null ? '—' : B));
+    }
+  }
+  onlyOld.sort(); onlyNew.sort(); diff.sort();
+
+  say('-- IN THE THREE HUBS BUT NOT THE MERGED ONE (' + onlyOld.length + ') --');
+  if (!onlyOld.length) say('  none');
+  for (k = 0; k < onlyOld.length && k < 40; k++) say('  ' + onlyOld[k]);
+  if (onlyOld.length > 40) say('  … and ' + (onlyOld.length - 40) + ' more');
+  say('');
+  say('-- IN THE MERGED ONE BUT NOT THE THREE (' + onlyNew.length + ') --');
+  if (!onlyNew.length) say('  none');
+  for (k = 0; k < onlyNew.length && k < 40; k++) say('  ' + onlyNew[k]);
+  if (onlyNew.length > 40) say('  … and ' + (onlyNew.length - 40) + ' more');
+  say('');
+  say('-- SAME PAIR, DIFFERENT POINTS (' + diff.length + ') --');
+  if (!diff.length) say('  none');
+  for (k = 0; k < diff.length && k < 30; k++) say('  ' + diff[k]);
+  say('');
+
+  say('-- MERGED, BY PLATFORM --');
+  var tot = {};
+  for (k = 0; k < m.length; k++) {
+    var bp = m[k].byProv || {};
+    for (var pv in bp) { if (bp.hasOwnProperty(pv)) tot[pv] = (tot[pv] || 0) + bp[pv]; }
+  }
+  var bits = [];
+  for (k in tot) { if (tot.hasOwnProperty(k)) bits.push(k + '=' + tot[k]); }
+  bits.sort();
+  say('  ' + (bits.length ? bits.join('  ') : 'no rows'));
+  say('');
+  say('-- TOP OF THE MERGED LIST --');
+  for (k = 0; k < m.length && k < 12; k++) {
+    var pl = m[k], pb = [];
+    for (var pv2 in (pl.byProv || {})) { if (pl.byProv.hasOwnProperty(pv2)) pb.push(pv2 + '×' + pl.byProv[pv2]); }
+    pb.sort();
+    say('  ' + (pl.total == null ? '  —  ' : ('  ' + pl.total + '  ')) +
+        (pl.name || '?') + '  [' + pl.rows.length + ' league' + (pl.rows.length === 1 ? '' : 's') +
+        ': ' + pb.join(' ') + ']');
+  }
+
+  if (typeof _skGpProbeShow === 'function') _skGpProbeShow(L.join('\n'));
 }
 
 // Show/hide + count the Fantasy Hub header button for the NBA/NHL stadiums
