@@ -77666,6 +77666,28 @@ function _fhubAllTabs() {
   return h + '</div>';
 }
 
+// Does this league score in points? Categories and roto rows carry a
+// category line and no points at all; a points row that simply hasn't
+// scored yet still reads 0.0, which is a number rather than an absence —
+// the same test the line renderer uses to decide whether to print an FP
+// column, so the grouping and the rendering can't disagree. FHUBSORT
+function _fhubAllIsPts(fr) {
+  if (!fr) return false;
+  if (fr.isCats === true) return false;
+  if (fr.noFp === true) return false;
+  return true;
+}
+
+// Points leagues first, categories under them, each group keeping the order
+// it arrived in. FHUBSORT
+function _fhubAllSortRows(rows) {
+  var pts = [], cat = [], i;
+  for (i = 0; i < (rows || []).length; i++) {
+    if (_fhubAllIsPts(rows[i])) pts.push(rows[i]); else cat.push(rows[i]);
+  }
+  return pts.concat(cat);
+}
+
 // One league line under a player. The three builders name the category
 // field differently, which _fhubAllCats settles.
 function _fhubAllLeagueLine(fr, benched) {
@@ -77707,7 +77729,9 @@ function _fhubAllLeagueLine(fr, benched) {
 function _fhubAllPlayersHtml(players) {
   var html = '', i, j;
   for (i = 0; i < players.length; i++) {
-    var pl = players[i], rows = pl.rows || [];
+    // FHUBSORT — a copy, ordered points-then-cats. pl.rows is left alone;
+    // the agreement probe and the BY TEAM tab read the original.
+    var pl = players[i], rows = _fhubAllSortRows(pl.rows);
     // Active and benched are totalled separately. The headline is what he is
     // ACTUALLY earning you, which is also what the BY TEAM tab totals, so the
     // two tabs reconcile. What he is producing on a bench is the other half
@@ -77839,11 +77863,47 @@ function _fhubAllTeamsHtml(players) {
 }
 
 
+// Make sure the lazily-resolved name data every provider needs is on its
+// way. Calls back with true only if something actually landed, so the
+// caller knows whether a repaint would show anything new. FHUBLAZY
+function _fhubEnsureNames(done) {
+  var landed = false, waiting = 1;
+  function finish() { if (--waiting === 0 && done) done(landed); }
+  try {
+    var list = (typeof extSyncedLeagues === 'function') ? extSyncedLeagues() : [];
+    for (var i = 0; i < list.length; i++) {
+      var row = list[i];
+      if (!row || row.provider !== 'sleeper') continue;
+      if (row._slNamesDone || row._slNamesBusy) continue;
+      if (typeof slEnsureRosterNames !== 'function') continue;
+      waiting++;
+      (function (r) {
+        slEnsureRosterNames(r, function () { landed = true; finish(); });
+      })(row);
+    }
+  } catch (e) {}
+  if (typeof _extEnsureFtxNames === 'function') {
+    waiting++;
+    _extEnsureFtxNames(function (ok) { if (ok) landed = true; finish(); });
+  }
+  finish();
+}
+
 // One button per stadium now, where there were three.
-function _fhubAllUpdateBtn(btnId, countId) {
+function _fhubAllUpdateBtn(btnId, countId, _retried) {
   try {
     var btn = document.getElementById(btnId);
     if (!btn) return;
+    // FHUBLAZY — Sleeper names and the Fantrax dictionary resolve lazily, so
+    // those leagues are invisible until they land. Ask once, and repaint if
+    // anything arrived. _retried stops a genuinely empty game from looping.
+    if (!_retried) {
+      _fhubEnsureNames(function (landed) {
+        if (!landed) return;
+        try { if (typeof _extDotCache !== 'undefined') _extDotCache = null; } catch (eD) {}
+        _fhubAllUpdateBtn(btnId, countId, true);
+      });
+    }
     var players = _fhubCollectAll();
     if (players.length) {
       var ct = document.getElementById(countId);
