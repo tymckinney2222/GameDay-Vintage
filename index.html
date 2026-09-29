@@ -29427,6 +29427,11 @@
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19h16M7 16V9M12 16V5M17 16v-4"/></svg>
       <span>Probe ESPN live stat entries</span>
     </button>
+    <!-- ESPCATPROBE2 — where do ESPN's category numbers come from? -->
+    <button class="sk-account-item" onclick="skProbeEspnCats(); skCloseAccountMenu();">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l3 8 4-16 3 8h4"/></svg>
+      <span>Probe ESPN category matchup</span>
+    </button>
     <!-- SEASONLABELS — what does ESPN's season line actually contain? -->
     <button class="sk-account-item" onclick="skProbeSeasonLabels(); skCloseAccountMenu();">
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18M7 15l4-4 3 3 5-6"/></svg>
@@ -118653,6 +118658,185 @@ function skProbeEspnStats() {
   _skGpProbeShow(lines.join('\n'));
 }
 
+function _espCatProbeName(game, id) {
+  var s = (typeof espStatName === 'function') ? espStatName(game, id) : '';
+  return s || ('#' + id);
+}
+
+function _espCatProbeVal(v) {
+  if (v == null) return '-';
+  var n = Number(v);
+  if (isNaN(n)) return String(v);
+  return (Math.round(n * 1000) / 1000) + '';
+}
+
+// "mine / opp" in a fixed width, so the columns stack.
+function _espCatProbePair(a, b) {
+  var s = _espCatProbeVal(a) + '/' + _espCatProbeVal(b);
+  while (s.length < 13) s += ' ';
+  return s;
+}
+
+function skProbeEspnCats() {
+  var lines = [];
+  function say(t) { lines.push(t); }
+  var rows = (typeof extLeagues !== 'undefined' && extLeagues) ? extLeagues : [];
+  var picked = [], i;
+  for (i = 0; i < rows.length; i++) {
+    var r = rows[i];
+    if (!r || r.provider !== 'espn') continue;
+    if (typeof espIsCats !== 'function' || !espIsCats(r)) continue;
+    if (!r._espScoreJson || !r.rosters) continue;
+    picked.push(r);
+    if (picked.length >= 2) break;
+  }
+  if (!picked.length) {
+    _skGpProbeShow('No ESPN categories league is loaded yet.\n\n' +
+      'Open one, wait for its Matchup tab to finish, then run this again.');
+    return;
+  }
+
+  var refetch = null;
+  picked.forEach(function (row) {
+    var game = (typeof _espGameCode === 'function') ? _espGameCode(row) : 'flb';
+    var j = row._espScoreJson;
+    say('══ ' + (row.name || row.key) + '  (' +
+        String(row.sport || '?').toUpperCase() + ' / ' + game + ') ══');
+    var ids = (typeof espScoredIds === 'function') ? espScoredIds(row) : [];
+    var idTxt = [], q;
+    for (q = 0; q < ids.length; q++) idTxt.push(ids[q] + '=' + _espCatProbeName(game, ids[q]));
+    say('  scored ids (' + ids.length + '): ' + idTxt.join('  '));
+    var rateTxt = [], rm = (typeof ESP_RATE_BY_NAME !== 'undefined')
+      ? (ESP_RATE_BY_NAME[game] || {}) : {}, rk;
+    for (rk in rm) { if (rm.hasOwnProperty(rk)) rateTxt.push(rk); }
+    say('  treated as RATES here: ' + (rateTxt.join(' ') || '(none)') +
+        '   — these are the ones never summed and never rebuilt outside baseball');
+
+    var period = (j.status && j.status.currentMatchupPeriod);
+    say('  currentMatchupPeriod: ' + period +
+        '   scoringPeriodId: ' + (j.status && j.status.scoringPeriodId));
+
+    var myIds = row.myTeamIds || {}, mine = null, opp = null, k;
+    for (k = 0; k < (j.schedule || []).length; k++) {
+      var m = j.schedule[k] || {};
+      if (Number(m.matchupPeriodId) !== Number(period)) continue;
+      var a = m.away || {}, h = m.home || {};
+      if (a.teamId != null && myIds[String(a.teamId)]) { mine = a; opp = h; break; }
+      if (h.teamId != null && myIds[String(h.teamId)]) { mine = h; opp = a; break; }
+    }
+    if (!mine) { say('  (my team has no matchup in this period)'); say(''); return; }
+
+    var ms = (mine.cumulativeScore || {}).scoreByStat || null;
+    var os = (opp.cumulativeScore || {}).scoreByStat || null;
+    var myToday = (typeof espTodayByStat === 'function')
+      ? espTodayByStat(row.rosters, mine.teamId, game) : null;
+    var opToday = (typeof espTodayByStat === 'function')
+      ? espTodayByStat(row.rosters, opp.teamId, game) : null;
+    var myLive = (typeof espLiveCatValues === 'function')
+      ? espLiveCatValues(ms, myToday, game) : {};
+    var opLive = (typeof espLiveCatValues === 'function')
+      ? espLiveCatValues(os, opToday, game) : {};
+    say('  scoreByStat keys : mine=' + (ms ? Object.keys(ms).length : 'NULL') +
+        '  opp=' + (os ? Object.keys(os).length : 'NULL'));
+    say('  todayByStat keys : mine=' + (myToday ? Object.keys(myToday).length : 'NULL') +
+        '  opp=' + (opToday ? Object.keys(opToday).length : 'NULL'));
+    say('');
+    // STORED is what ESPN banked through the last completed day, TODAY is what
+    // this app sums off the live rosters, LIVE is STORED+TODAY — the number
+    // that actually gets scored. A category where LIVE is twice TODAY means
+    // ESPN had already folded today into STORED and this app added it again.
+    say('  CAT     STORED m/o   TODAY m/o    LIVE m/o     inel');
+    var seen = {}, list = [];
+    for (k in (ms || {})) { if (!seen[k]) { seen[k] = 1; list.push(k); } }
+    for (k in (os || {})) { if (!seen[k]) { seen[k] = 1; list.push(k); } }
+    for (q = 0; q < ids.length; q++) {
+      if (!seen[ids[q]]) { seen[ids[q]] = 1; list.push(String(ids[q])); }
+    }
+    for (q = 0; q < list.length; q++) {
+      var id = list[q];
+      var nmT = _espCatProbeName(game, id);
+      while (nmT.length < 7) nmT += ' ';
+      say('  ' + nmT + ' ' +
+          _espCatProbePair(_espStatVal(ms && ms[id]), _espStatVal(os && os[id])) +
+          _espCatProbePair(myToday && myToday[id], opToday && opToday[id]) +
+          _espCatProbePair(myLive && myLive[id], opLive && opLive[id]) +
+          _espInel(ms && ms[id]) + '/' + _espInel(os && os[id]));
+    }
+
+    // The per-player numbers the TODAY column was summed from, so a missing
+    // category can be traced to the player rather than to the sum.
+    say('');
+    var t = row.rosters && row.rosters.byTeam && row.rosters.byTeam[String(mine.teamId)];
+    var items = (t && t.items) || [];
+    var nStart = 0;
+    for (q = 0; q < items.length; q++) {
+      var it = items[q];
+      if (!it.starter) continue;
+      nStart++;
+      var w = it.windows && it.windows.today;
+      var stx = (w && w.stats) ? JSON.stringify(w.stats) : (w ? '{} (window, no stats)' : 'NO today window');
+      say('   ' + (it.name || it.playerId) + '  [' + (it.slot || '?') + ']  ' + stx);
+    }
+    say('  (' + nStart + ' starters)');
+    say('');
+    if (!refetch) refetch = row;
+  });
+
+  // ── The unfiltered payload, for the FIRST league only. ──
+  // windows.today.stats is already narrowed to the ids the league scores, so
+  // it cannot answer "does ESPN even send TOI". This asks the roster view
+  // again and prints one skater's raw stat entries whole.
+  function finish() { _skGpProbeShow(lines.join('\n')); }
+  if (!refetch || typeof espFindSaved !== 'function' ||
+      typeof espCurrentSeason !== 'function' || typeof espFetchLeague !== 'function') {
+    finish(); return;
+  }
+  var sv = null;
+  try { sv = espFindSaved(String(refetch.key).slice(4)); } catch (eS) {}
+  if (!sv) { finish(); return; }
+  say('── RAW payload · ' + (refetch.name || refetch.key) + ' ──');
+  espCurrentSeason(sv.game).then(function (season) {
+    return espFetchLeague(sv.game, sv.id, season, '?view=mRoster');
+  }).then(function (jr) {
+    var teams = (jr && jr.teams) || [], ti, ei;
+    var myIds2 = refetch.myTeamIds || {};
+    var shown = 0;
+    for (ti = 0; ti < teams.length && shown < 2; ti++) {
+      if (!myIds2[String(teams[ti].id)]) continue;
+      var ents = (teams[ti].roster && teams[ti].roster.entries) || [];
+      for (ei = 0; ei < ents.length && shown < 2; ei++) {
+        var pl = ((ents[ei].playerPoolEntry || {}).player) || {};
+        var st = pl.stats || [];
+        var pick = null, si;
+        for (si = 0; si < st.length; si++) {
+          if (st[si] && st[si].stats && Object.keys(st[si].stats).length > 4) { pick = st[si]; break; }
+        }
+        if (!pick) continue;
+        shown++;
+        say('  ' + (pl.fullName || ents[ei].playerId) + '  slot ' + ents[ei].lineupSlotId);
+        for (si = 0; si < st.length && si < 8; si++) {
+          var en = st[si] || {};
+          say('    src=' + en.statSourceId + ' split=' + en.statSplitTypeId +
+              ' season=' + en.seasonId + ' period=' + en.scoringPeriodId +
+              ' keys=' + (en.stats ? Object.keys(en.stats).length : 0));
+        }
+        var kk, bits = [];
+        for (kk in (pick.stats || {})) {
+          if (!pick.stats.hasOwnProperty(kk)) continue;
+          bits.push(kk + '=' + pick.stats[kk] + '(' + _espCatProbeName(
+            (typeof _espGameCode === 'function') ? _espGameCode(refetch) : 'flb', kk) + ')');
+        }
+        say('    FULL stats (src=' + pick.statSourceId + ' split=' + pick.statSplitTypeId +
+            ' period=' + pick.scoringPeriodId + '):');
+        say('      ' + bits.join('  '));
+      }
+    }
+    if (!shown) say('  (no player on my roster carries a stat entry yet)');
+  }).catch(function (e) {
+    say('  refetch failed: ' + (e && e.message ? e.message : e));
+  }).then(finish, finish);
+}
+
 function skProbeSeasonLabels() {
   var lines = [];
   function say(t) { lines.push(t); }
@@ -158893,6 +159077,20 @@ function _espStatResult(v) {
 //
 // So the row is constructed here and nowhere else. A rule added to the
 // verdict now reaches every surface that shows a category record.
+// ESPCATNOTE — what the footnote can honestly claim, per sport. Baseball
+// rebuilds its rates from components; nothing else has a recipe, so its rate
+// categories are still whatever the last completed day left behind, and the
+// line says so instead of naming three baseball stats.
+function _espCatNote(game) {
+  var g = (typeof espFlagGame === 'function') ? espFlagGame(game) : game;
+  if (g === 'flb') return 'Includes today \u00b7 AVG / WHIP / ERA rebuilt from components';
+  var names = [], m = (typeof ESP_RATE_BY_NAME !== 'undefined') ? (ESP_RATE_BY_NAME[g] || {}) : {}, k;
+  for (k in m) { if (m.hasOwnProperty(k)) names.push(k); }
+  if (!names.length) return 'Includes today';
+  return 'Includes today \u00b7 ' + names.join(' / ') +
+    ' still as of the last completed day';
+}
+
 function _espCatRow(id, myEntry, opEntry, myLive, opLive, game) {
   var pm = _espStatVal(myEntry);
   var po = _espStatVal(opEntry);
@@ -159000,7 +159198,7 @@ function espCatBreakdown(j, row) {
           ow: _oc.wins, ol: _oc.losses, ot: _oc.ties }
       : null;
     return { rows: rows, period: period, live: !!(myToday || opToday),
-             espnRec: espnRec,
+             espnRec: espnRec, game: _cbGame,   // ESPCATNOTE
              tally: espCatTally(rows) };
   }
   return null;
@@ -159228,9 +159426,8 @@ function _espCatBreakdownHtml(row) {
   h += '<div style="color:rgba(255,255,255,0.28);font-size:9.5px;line-height:1.5;margin:8px 0 0;' +
     'cursor:pointer;text-decoration:underline;text-decoration-color:rgba(255,255,255,0.15);" ' +
     'onclick="if(typeof skToast===\'function\')skToast(\'' + _probeTxt + '\')">' +
-    (cb.live
-      ? 'Includes today \u00b7 AVG / WHIP / ERA rebuilt from components'
-      : 'Through the last completed day') +
+    (cb.live ? _espCatNote(cb.game || (typeof _espGameCode === 'function' ? _espGameCode(row) : 'flb'))
+             : 'Through the last completed day') +
     // ESPCATINEL — a record with seven ties needs to say where they came from.
     (_inelN
       ? (' \u00b7 ' + _inelN + ' categor' + (_inelN === 1 ? 'y' : 'ies') +
