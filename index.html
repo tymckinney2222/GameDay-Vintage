@@ -102983,6 +102983,22 @@ function _computeWeekContributors() {
       }
     }
     
+    // SKCONTRIBSLOT — the active slot this player actually filled this week,
+    // so the renderer can group NHL goaltenders apart from the skaters. First
+    // active slot found wins; a player benched all week leaves it blank and
+    // falls through to eligibility.
+    var slotUsed = '';
+    for (var di4 = 0; di4 < skCurrentWeeklyFp.dates.length; di4++) {
+      var d4 = skCurrentWeeklyFp.dates[di4];
+      var m4 = teamFpCache[myTeamKey + '|' + d4.date];
+      if (!m4 || !m4[k]) continue;
+      var s4 = String(m4[k].selectedPos || '').toUpperCase();
+      if (!s4) continue;
+      if (typeof _isActiveSlot === 'function' && !_isActiveSlot(s4)) continue;
+      slotUsed = s4;
+      break;
+    }
+
     arr.push({
       playerKey: k,
       name: p.name,
@@ -102991,6 +103007,8 @@ function _computeWeekContributors() {
       weekFp: fp,
       pct: (totalPositive > 0 && fp > 0) ? (fp / totalPositive) * 100 : 0,
       isPitcher: isPitcher,
+      selectedPos: slotUsed,                 // SKCONTRIBSLOT
+      displayPos: p.displayPos || '',         // SKCONTRIBSLOT
       weekStats: weekStatsByPlayer[k] || {},
     });
   });
@@ -103127,6 +103145,17 @@ function skToggleContributorRow(rowEl) {
   }
 }
 
+// SKCONTRIBSLOT — G or GK, whether it arrives as a single slot ("G") or as
+// an eligibility list ("G,LW"). The old test compared the whole string, so
+// anything with a second position attached read as a skater.
+function _skWcIsGoalie(s) {
+  var parts = String(s || '').toUpperCase().split(/[,\/ ]+/);
+  for (var i = 0; i < parts.length; i++) {
+    if (parts[i] === 'G' || parts[i] === 'GK') return true;
+  }
+  return false;
+}
+
 function skRenderWeekContributors() {
   var bodyEl = document.getElementById('skContributorsBody');
   var totalEl = document.getElementById('skContributorsTotal');
@@ -103156,7 +103185,7 @@ function skRenderWeekContributors() {
   data.contributors.forEach(function(c) {
     if (_wcSport === 'nhl') {
       var sl = String(c.selectedPos || c.displayPos || '').toUpperCase();
-      if (sl === 'G' || sl === 'GK') pitchers.push(c); else batters.push(c);
+      if (_skWcIsGoalie(sl)) pitchers.push(c); else batters.push(c);   // SKCONTRIBSLOT
     } else if (_wcSport === 'nba') {
       batters.push(c);
     } else {
@@ -104026,6 +104055,10 @@ function _skPdCloseSheet() {
   var bd = document.getElementById('skPdSheetBackdrop');
   if (sheet) sheet.classList.remove('open');
   if (bd) bd.classList.remove('open');
+  // SKCONTRIBLOOP — retire this open's generation and forget what it asked
+  // for, so reopening retries a day that came back empty exactly once more.
+  if (typeof _skPdPointsGen !== 'undefined') _skPdPointsGen++;
+  if (typeof _skPdPointsAsked !== 'undefined') _skPdPointsAsked = {};
 }
 
 // Resolve a Yahoo player to an MLB ID, then fetch season stats and
@@ -104634,8 +104667,16 @@ function _skPdRenderPace(contrib, season, kind) {
 //   3. Daily Breakdown — box-score-style vertical list with FP per day
 //   4. Week vs Season Avg — FP/game compared to season pace
 // ════════════════════════════════════════════════════════════════
+// SKCONTRIBLOOP — bumped on every open and every close, so a fetch
+// callback can tell whether the sheet it was started for is still the one on
+// screen. _skPdPointsAsked is cleared on close: within a single open each day
+// gets exactly one attempt, and reopening still gives it a fresh one.
+var _skPdPointsGen = 0;
+var _skPdPointsAsked = {};
+
 function _skPdOpenPointsSheet(playerKey) {
   _skPdEnsureSheet();
+  var _pdGen = ++_skPdPointsGen;
   
   // Fetch the points-league contrib for this player. Mirrors the
   // cats sheet's lookup but uses _computeWeekContributors() (the
@@ -104693,15 +104734,37 @@ function _skPdOpenPointsSheet(playerKey) {
     var ldForFetch = lkForFetch && skLeagueData && skLeagueData[lkForFetch];
     var tkForFetch = ldForFetch && ldForFetch.team && ldForFetch.team.team_key;
     if (tkForFetch) {
+      // SKCONTRIBLOOP — collect first, then fire once. The old shape re-opened
+      // the sheet from inside each day's callback, with nothing to stop it when
+      // a day returned no data.
+      var _pdWant = [];
       days.forEach(function(d) {
         if (d.future || !d.date || d.date > todayStr) return;
         var ck = tkForFetch + '|' + d.date;
-        if (skCatsRosterCache && skCatsRosterCache[ck]) return; // already cached
-        skFetchCatsRosterForDate(tkForFetch, d.date).then(function() {
+        if (skCatsRosterCache && skCatsRosterCache[ck]) return;   // already cached
+        if (_skPdPointsAsked[ck]) return;   // asked once already this open
+        _skPdPointsAsked[ck] = 1;
+        _pdWant.push(d.date);
+      });
+      if (_pdWant.length) {
+        var _pdLeft = _pdWant.length;
+        var _pdLanded = false;
+        var _pdSettle = function() {
+          if (--_pdLeft > 0) return;              // wait for the whole batch
+          if (!_pdLanded) return;                 // nothing new to draw
+          if (_pdGen !== _skPdPointsGen) return;  // closed, or another player
           var sheet = document.getElementById('skPdSheet');
           if (sheet && sheet.classList.contains('open')) _skPdOpenPointsSheet(playerKey);
-        }).catch(function() {});
-      });
+        };
+        _pdWant.forEach(function(dt) {
+          var p;
+          try { p = skFetchCatsRosterForDate(tkForFetch, dt); } catch (e) { p = null; }
+          if (!p || typeof p.then !== 'function') { _pdSettle(); return; }
+          p.then(function(res) { if (res) _pdLanded = true; })
+           .catch(function() {})
+           .then(_pdSettle, _pdSettle);
+        });
+      }
     }
   }
   // negative=red (rare but possible in points leagues with neg cats).
