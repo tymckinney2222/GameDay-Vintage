@@ -118681,14 +118681,52 @@ function skProbeEspnCats() {
   var lines = [];
   function say(t) { lines.push(t); }
   var rows = (typeof extLeagues !== 'undefined' && extLeagues) ? extLeagues : [];
-  var picked = [], i;
+  // ESPCATPROBE3 — rank before picking. A league with live numbers today
+  // answers the question; one whose season hasn't started cannot.
+  var openKey = null;
+  try { if (typeof _extPaneOwnerKey === 'function') openKey = _extPaneOwnerKey(); } catch (eO) {}
+  function _liveN(r) {
+    var tot = 0, tk, it2, q2;
+    var bt = (r.rosters && r.rosters.byTeam) || {};
+    for (tk in bt) {
+      if (!bt.hasOwnProperty(tk)) continue;
+      it2 = (bt[tk] || {}).items || [];
+      for (q2 = 0; q2 < it2.length; q2++) {
+        var w2 = it2[q2].windows && it2[q2].windows.today;
+        if (w2 && w2.stats && Object.keys(w2.stats).length) tot++;
+      }
+    }
+    return tot;
+  }
+  var cand = [], i;
   for (i = 0; i < rows.length; i++) {
     var r = rows[i];
     if (!r || r.provider !== 'espn') continue;
     if (typeof espIsCats !== 'function' || !espIsCats(r)) continue;
     if (!r._espScoreJson || !r.rosters) continue;
-    picked.push(r);
-    if (picked.length >= 2) break;
+    cand.push({ row: r, ord: i, live: _liveN(r), open: (openKey && r.key === openKey) ? 1 : 0 });
+  }
+  cand.sort(function (a, b) {
+    if (a.open !== b.open) return b.open - a.open;
+    if ((a.live > 0) !== (b.live > 0)) return (b.live > 0) ? 1 : -1;
+    if (a.live !== b.live) return b.live - a.live;
+    return a.ord - b.ord;
+  });
+  var picked = [], skipped = [];
+  for (i = 0; i < cand.length; i++) {
+    if (picked.length < 2) picked.push(cand[i].row);
+    else skipped.push((cand[i].row.name || cand[i].row.key) + ' (' + cand[i].live + ' live)');
+  }
+  if (cand.length) {
+    var _hdr = [];
+    for (i = 0; i < cand.length && i < 2; i++) {
+      _hdr.push((cand[i].row.name || cand[i].row.key) + ' \u2014 ' + cand[i].live +
+                ' player' + (cand[i].live === 1 ? '' : 's') + ' with numbers today' +
+                (cand[i].open ? ', open on screen' : ''));
+    }
+    lines.push('Showing: ' + _hdr.join('   |   '));
+    if (skipped.length) lines.push('Not shown: ' + skipped.join(', '));
+    lines.push('');
   }
   if (!picked.length) {
     _skGpProbeShow('No ESPN categories league is loaded yet.\n\n' +
@@ -118713,8 +118751,11 @@ function skProbeEspnCats() {
         '   — these are the ones never summed and never rebuilt outside baseball');
 
     var period = (j.status && j.status.currentMatchupPeriod);
+    var _spid = (j.status && j.status.scoringPeriodId);
+    if (_spid == null) _spid = row.scoringPeriodId;
+    if (_spid == null) _spid = j.scoringPeriodId;
     say('  currentMatchupPeriod: ' + period +
-        '   scoringPeriodId: ' + (j.status && j.status.scoringPeriodId));
+        '   scoringPeriodId: ' + (_spid == null ? '(not in payload)' : _spid));
 
     var myIds = row.myTeamIds || {}, mine = null, opp = null, k;
     for (k = 0; k < (j.schedule || []).length; k++) {
@@ -118763,6 +118804,24 @@ function skProbeEspnCats() {
           _espInel(ms && ms[id]) + '/' + _espInel(os && os[id]));
     }
 
+    // Whether a rate CAN be rebuilt comes down to this: are its components in
+    // the stored baseline and in today? ESPCATPROBE3
+    var _comps = (typeof _espComponentsFor === 'function') ? _espComponentsFor(game) : null;
+    if (_comps && _comps.length) {
+      var _inS = [], _outS = [], _inT = [], ci3;
+      for (ci3 = 0; ci3 < _comps.length; ci3++) {
+        var _cid = _comps[ci3], _lab = _cid + '=' + _espCatProbeName(game, _cid);
+        if (ms && ms[_cid] != null) _inS.push(_lab + ':' + _espCatProbeVal(_espStatVal(ms[_cid])));
+        else _outS.push(_lab);
+        if (myToday && myToday[_cid] != null) _inT.push(_lab + ':' + _espCatProbeVal(myToday[_cid]));
+      }
+      say('');
+      say('  rate components in scoreByStat : ' + (_inS.join('  ') || '(none)'));
+      say('  rate components MISSING there  : ' + (_outS.join('  ') || '(none)'));
+      say('  rate components in today       : ' + (_inT.join('  ') || '(none)'));
+      say('  \u2014 a rate rebuilds only when its parts are in BOTH columns above.');
+    }
+
     // The per-player numbers the TODAY column was summed from, so a missing
     // category can be traced to the player rather than to the sum.
     say('');
@@ -118807,10 +118866,21 @@ function skProbeEspnCats() {
       for (ei = 0; ei < ents.length && shown < 2; ei++) {
         var pl = ((ents[ei].playerPoolEntry || {}).player) || {};
         var st = pl.stats || [];
-        var pick = null, si;
+        // ESPCATPROBE3 — the DAILY entry is the one in question. Last run
+        // printed a 45-key season line, which says nothing about what arrives
+        // on a game night. Prefer an entry carrying a real scoring period;
+        // fall back to the fullest one and label it.
+        var pick = null, si, fallback = null;
         for (si = 0; si < st.length; si++) {
-          if (st[si] && st[si].stats && Object.keys(st[si].stats).length > 4) { pick = st[si]; break; }
+          var cand2 = st[si];
+          if (!cand2 || !cand2.stats || !Object.keys(cand2.stats).length) continue;
+          if (Number(cand2.scoringPeriodId) > 0 && !pick) pick = cand2;
+          if (!fallback || Object.keys(cand2.stats).length > Object.keys(fallback.stats).length) {
+            fallback = cand2;
+          }
         }
+        var isDaily = !!pick;
+        if (!pick) pick = fallback;
         if (!pick) continue;
         shown++;
         say('  ' + (pl.fullName || ents[ei].playerId) + '  slot ' + ents[ei].lineupSlotId);
@@ -118827,8 +118897,24 @@ function skProbeEspnCats() {
             (typeof _espGameCode === 'function') ? _espGameCode(refetch) : 'flb', kk) + ')');
         }
         say('    FULL stats (src=' + pick.statSourceId + ' split=' + pick.statSplitTypeId +
-            ' period=' + pick.scoringPeriodId + '):');
+            ' period=' + pick.scoringPeriodId + ')' +
+            (isDaily ? '  \u2190 DAILY' : '  \u2190 NOT a daily entry \u2014 no dated one exists yet') + ':');
         say('      ' + bits.join('  '));
+        // ESPCATPROBE3 — the single question this probe exists to answer:
+        // are the parts a rate is built from actually in the payload?
+        var pg = (typeof _espGameCode === 'function') ? _espGameCode(refetch) : 'flb';
+        var comps = (typeof _espComponentsFor === 'function') ? _espComponentsFor(pg) : null;
+        if (comps && comps.length) {
+          var have = [], missing = [], ci2;
+          for (ci2 = 0; ci2 < comps.length; ci2++) {
+            var cid = comps[ci2];
+            var lbl2 = cid + '=' + _espCatProbeName(pg, cid);
+            if (pick.stats && pick.stats[cid] != null) have.push(lbl2 + ':' + pick.stats[cid]);
+            else missing.push(lbl2);
+          }
+          say('    rate components PRESENT: ' + (have.join('  ') || '(none)'));
+          say('    rate components MISSING: ' + (missing.join('  ') || '(none)'));
+        }
       }
     }
     if (!shown) say('  (no player on my roster carries a stat entry yet)');
@@ -156718,7 +156804,7 @@ function espLoadRosters(row) {
   return espCurrentSeason(sv.game).then(function (season) {
     return espFetchLeague(sv.game, sv.id, season, '?view=mRoster');
   }).then(function (j) {
-    row.rosters = espRosters(j, sv.game, espScoredIds(row), row.sport);
+    row.rosters = espRosters(j, sv.game, espSliceIds(row), row.sport);   // ESPSLICEIDS
     row._espRosterBusy = 0;
     // Today's team totals and the live category math both need rosters,
     // and the score payload was fetched before they existed. Recompute off
@@ -157593,6 +157679,11 @@ function espBuildWindows(pl, season, period, scoredIds, game) {
       var t = espAppliedTotal(e);
       if (t != null) total = (total == null ? 0 : total) + t;
     }
+    // ESPRATESPORT — a daily entry carries the COUNTS (ice time, makes and
+    // attempts); the season AVERAGE is a season thing and isn't in it, which
+    // is why a skater with 3:46 of ice time read ATOI 0:00. Rebuilt from the
+    // parts now, and left exactly as it was wherever the parts are missing.
+    if (typeof _espApplyRates === 'function') st = _espApplyRates(st, game, true);
     if (total != null) total = Math.round(total * 10) / 10;
     // appliedAverage is ESPN's own per-game number - the app's AVG column.
     // Ohtani reads 287 total / 2.9 avg, exactly what the app shows.
@@ -157616,25 +157707,23 @@ function espScoredIds(row) {
       out.push(items[i].statId);
     }
   }
-  // A categories league needs AB/H/IP/ER/BB kept too, or AVG, WHIP and ERA
-  // can't be rebuilt once today's numbers are folded in. ESPNSLICE2N
-  //
-  // BASEBALL ONLY. ESP_RATE_COMPONENTS is a list of MLB stat ids, and the
-  // same numbers mean something else in every other sport — 34 is OUTS in
-  // baseball and nothing at all in hockey, which is how an NHL category
-  // strip came to read "0.2 #34". The rate recipes these components feed are
-  // MLB-keyed too, so outside baseball they have nothing to serve.
-  // ESPSPORTIDS
-  var _scGame = (typeof _espGameCode === 'function') ? _espGameCode(row) : 'flb';
-  if (_scGame === 'flb' &&
-      typeof espIsCats === 'function' && espIsCats(row) &&
-      typeof ESP_RATE_COMPONENTS !== 'undefined') {
-    for (i = 0; i < ESP_RATE_COMPONENTS.length; i++) {
-      if (!seen[ESP_RATE_COMPONENTS[i]]) {
-        seen[ESP_RATE_COMPONENTS[i]] = 1;
-        out.push(ESP_RATE_COMPONENTS[i]);
-      }
-    }
+  return out;
+}
+
+// ESPSLICEIDS — the ids the roster slice has to KEEP: the league's own
+// categories plus this sport's rate components, so AVG, ATOI or FG% can be
+// rebuilt from parts the league doesn't itself score. Deliberately NOT what
+// the stat lines iterate; that stays espScoredIds, or the components show up
+// as categories nobody plays.
+function espSliceIds(row) {
+  var out = espScoredIds(row), seen = {}, i;
+  for (i = 0; i < out.length; i++) seen[out[i]] = 1;
+  if (typeof espIsCats !== 'function' || !espIsCats(row)) return out;
+  var game = (typeof _espGameCode === 'function') ? _espGameCode(row) : 'flb';
+  var comps = (typeof _espComponentsFor === 'function') ? _espComponentsFor(game) : null;
+  if (!comps) return out;
+  for (i = 0; i < comps.length; i++) {
+    if (!seen[comps[i]]) { seen[comps[i]] = 1; out.push(comps[i]); }
   }
   return out;
 }
@@ -157712,7 +157801,7 @@ function espRefreshLive(row, force) {
       espFetchLeague(sv.game, sv.id, season, espScoreView(row))
     ]);
   }).then(function (res) {
-    var built = espRosters(res[0], sv.game, espScoredIds(row), row.sport);
+    var built = espRosters(res[0], sv.game, espSliceIds(row), row.sport);   // ESPSLICEIDS
     if (built) row.rosters = built;
     row._espScoreJson = res[1];
     var ls = espLiveScores(res[1], row.standingsAll, row.rosters, espIsCats(row), row);
@@ -158413,16 +158502,22 @@ function espOutlookWhy(key) {
 // averaged, which would be meaningless across a lineup.
 var ESP_PITCH_STAT = { 34: 1, 37: 1, 39: 1, 41: 1, 45: 1, 47: 1, 48: 1, 53: 1, 54: 1, 57: 1, 60: 1 };
 
-function _espApplyRates(sums, game) {
+// keepUncomputable: a rate whose parts are missing is LEFT as it is instead
+// of being removed. The per-player pass wants that — a roster line should not
+// lose its ATOI column because ESPN hasn't sent the ice time yet — while the
+// group totals still prefer a dash over a stale number. ESPRATESPORT
+function _espApplyRates(sums, game, keepUncomputable) {
   var out = {}, k, i;
   for (k in sums) { if (sums.hasOwnProperty(k)) out[k] = sums[k]; }
-  if (typeof ESP_RATE_RECIPE === 'undefined') return out;
-  // ESPSPORTIDS — the recipes are MLB-keyed. Told which sport this is, refuse
-  // to run them on any other; told nothing, behave as before.
-  if (game && game !== 'flb') return out;
-  for (k in ESP_RATE_RECIPE) {
-    if (!ESP_RATE_RECIPE.hasOwnProperty(k)) continue;
-    var r = ESP_RATE_RECIPE[k];
+  // ESPSPORTIDS / ESPRATESPORT — each sport's own recipes, never another's.
+  // Told nothing, assume baseball, which is what every caller meant before
+  // the parameter existed.
+  var RECIPES = (typeof _espRecipesFor === 'function')
+    ? _espRecipesFor(game || 'flb') : null;
+  if (!RECIPES) return out;
+  for (k in RECIPES) {
+    if (!RECIPES.hasOwnProperty(k)) continue;
+    var r = RECIPES[k];
     // Numerator presence matters as much as the denominator's: total bases
     // missing beside a real at-bat count would give slugging of .000 rather
     // than no value at all. Presence, not truthiness — 0 earned runs is a
@@ -158436,7 +158531,10 @@ function _espApplyRates(sums, game) {
       if (out[r.den[i]] != null) have = true;
       den += out[r.den[i]] || 0;
     }
-    if (!haveNum || !have || !den) { delete out[k]; continue; }
+    if (!haveNum || !have || !den) {
+      if (!keepUncomputable) delete out[k];   // ESPRATESPORT
+      continue;
+    }
     if (r.mode === 'ratio') out[k] = num / den;
     else if (r.mode === 'whip') out[k] = num / (den / 3);
     else if (r.mode === 'era') out[k] = num * 9 / (den / 3);
@@ -159084,11 +159182,24 @@ function _espStatResult(v) {
 function _espCatNote(game) {
   var g = (typeof espFlagGame === 'function') ? espFlagGame(game) : game;
   if (g === 'flb') return 'Includes today \u00b7 AVG / WHIP / ERA rebuilt from components';
-  var names = [], m = (typeof ESP_RATE_BY_NAME !== 'undefined') ? (ESP_RATE_BY_NAME[g] || {}) : {}, k;
-  for (k in m) { if (m.hasOwnProperty(k)) names.push(k); }
-  if (!names.length) return 'Includes today';
-  return 'Includes today \u00b7 ' + names.join(' / ') +
-    ' still as of the last completed day';
+  var m = (typeof ESP_RATE_BY_NAME !== 'undefined') ? (ESP_RATE_BY_NAME[g] || {}) : {};
+  var rec = (typeof _espRecipesFor === 'function') ? (_espRecipesFor(g) || {}) : {};
+  var built = {}, k;
+  for (k in rec) {
+    if (!rec.hasOwnProperty(k)) continue;
+    var nm = (typeof espStatName === 'function') ? espStatName(g, k) : '';
+    if (nm) built[nm] = 1;
+  }
+  var hot = [], cold = [];
+  for (k in m) {
+    if (!m.hasOwnProperty(k)) continue;
+    if (built[k]) hot.push(k); else cold.push(k);
+  }
+  var parts = [];
+  if (hot.length) parts.push(hot.join(' / ') + ' rebuilt from components');
+  if (cold.length) parts.push(cold.join(' / ') + ' as of the last completed day');
+  if (!parts.length) return 'Includes today';
+  return 'Includes today \u00b7 ' + parts.join(' \u00b7 ');
 }
 
 function _espCatRow(id, myEntry, opEntry, myLive, opLive, game) {
@@ -159611,6 +159722,42 @@ var ESP_RATE_RECIPE = {
 // ESPCAT4
 var ESP_RATE_COMPONENTS = [0, 1, 8, 34, 37, 39, 45, 48];
 
+// ── The same two tables, per sport. ESPRATESPORT ──
+// Baseball's stay exactly as they are; the other sports get their own rather
+// than borrowing MLB's ids, which is what put a hockey "0.2 #34" on screen
+// and could have invented a goalie loss out of games started.
+var ESP_RATE_RECIPE_BY_GAME = {
+  flb: ESP_RATE_RECIPE,
+  fhl: {
+    // ATOI = total ice time over games played. Verified against ESPN's own
+    // team row: 1024 + 226 + 955 + 236 = 2441s over 4 skaters = 10:10.
+    27: { num: [26], den: [30], mode: 'ratio' },
+    // Saves over shots against — a count over a count, no units involved.
+    11: { num: [6],  den: [3],  mode: 'ratio' }
+  },
+  fba: {
+    19: { num: [13], den: [14], mode: 'ratio' },   // FG%
+    20: { num: [15], den: [16], mode: 'ratio' },   // FT%
+    21: { num: [17], den: [18], mode: 'ratio' }    // 3P%
+  }
+};
+
+var ESP_RATE_COMPONENTS_BY_GAME = {
+  flb: ESP_RATE_COMPONENTS,
+  fhl: [26, 30, 6, 3],
+  fba: [13, 14, 15, 16, 17, 18]
+};
+
+function _espRecipesFor(game) {
+  var g = (typeof espFlagGame === 'function') ? espFlagGame(game) : game;
+  return ESP_RATE_RECIPE_BY_GAME[g] || null;
+}
+
+function _espComponentsFor(game) {
+  var g = (typeof espFlagGame === 'function') ? espFlagGame(game) : game;
+  return ESP_RATE_COMPONENTS_BY_GAME[g] || null;
+}
+
 // Which categories you WANT to be lower. Everything else is higher-better.
 // Note 10 (batter walks) and 39 (walks allowed) are different ids, so
 // there's no collision between the good BB and the bad one. ESPNSLICE2O
@@ -159718,9 +159865,10 @@ function espLiveCatValues(scoreByStat, todayByStat, game) {
   // recomputing it here would only introduce rounding drift (their .230
   // against our 26/113 = .2301). Leave it alone. ESPNSLICE2N
   if (!todayByStat) return out;
-  for (k in ESP_RATE_RECIPE) {
-    if (!ESP_RATE_RECIPE.hasOwnProperty(k)) continue;
-    var r = ESP_RATE_RECIPE[k];
+  var _LCR = (typeof _espRecipesFor === 'function') ? (_espRecipesFor(game) || {}) : {};
+  for (k in _LCR) {           // ESPRATESPORT — this sport's recipes
+    if (!_LCR.hasOwnProperty(k)) continue;
+    var r = _LCR[k];
     // Every component must come from the SAME scope. `out` here is the
     // period total plus today, but a component the league doesn't score is
     // absent from scoreByStat and therefore carries TODAY's value only.
