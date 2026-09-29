@@ -49218,7 +49218,11 @@ function _buildSkipperFpRows(playerName, includeEmpty, sportFilter) {
         // FHUBYTEAM — the prefetched name first; _skMyTeamName needs the
         // league to have been hydrated, which is why some lines showed a
         // league name and others a team name.
-        teamName: r.myTeamName || _skMyTeamName(r.leagueKey), fp: null, catHtml: catHtml, isCats: true, teamLogo: r.myTeamLogo || '', lineup: lineup });
+        teamName: r.myTeamName || _skMyTeamName(r.leagueKey), fp: null, catHtml: catHtml, isCats: true, teamLogo: r.myTeamLogo || '', lineup: lineup,
+        // FHUBCATSUM — the NUMBERS behind catHtml. The hub's BY TEAM tab
+        // needs to add these up across the team, and a rendered string is
+        // the one form they can't be added up in.
+        catStats: stats, catMeta: statsMeta });
     } else if (includeEmpty) {
       // Unknown scoring type but the player is rostered here — still surface
       // the league in the hub so nothing the user owns goes missing.
@@ -76248,6 +76252,14 @@ function _espFhubRowsFor(at, idx, sport) {
     var w = it.windows && it.windows.today;
     rows.push({
       provider: 'espn',
+      // FHUBCATSUM — the league row and its key. The grouper keyed ESPN
+      // groups by league NAME for want of a key, and _fhubAllBadge needs the
+      // row to name the format, which is why ESPN cards showed no badge while
+      // every other provider's did.
+      lgKey: row.key,
+      lg: row,
+      // The numbers behind catHtml, same reasoning as the Yahoo builder.
+      catStats: (w && w.stats) || null,
       leagueName: row.name || row.key,
       // standings is a separate sync and can be cold; the roster payload names
       // the team too, and it's present whenever there are items to show. CRSESPFP
@@ -77064,8 +77076,86 @@ function _extFhubByLeague(players) {
         }
       }
     } catch (eCT) {}
+    // FHUBCATSUM — the Yahoo and ESPN equivalents. Each returns finished
+    // markup from its own renderer rather than {label,value} pairs, because
+    // reusing the renderer is what keeps a team's strip consistent with the
+    // player lines above it.
+    if (!g.catTotals && !g.catHtml) {
+      try { g.catHtml = _fhubCatHtmlFor(g); } catch (eCH) { g.catHtml = ''; }
+    }
   }
   return _fhubSortGroups(out);
+}
+
+// Is this group a categories league? Read off the rows, which every builder
+// marks, rather than re-deriving the format per provider. FHUBCATSUM
+function _fhubGroupIsCats(g) {
+  var list = (g && g.live) || [];
+  for (var i = 0; i < list.length; i++) {
+    if (list[i].row && list[i].row.isCats === true) return true;
+  }
+  return false;
+}
+
+// One team's category production in this game, for the providers whose rows
+// carry numbers rather than a statMap. Returns '' when there is nothing to
+// add up, which leaves the card exactly as it is today. FHUBCATSUM
+function _fhubCatHtmlFor(g) {
+  if (!g || !_fhubGroupIsCats(g)) return '';
+  var list = g.live || [], i, k;
+
+  // ── Yahoo ── sum by Yahoo stat id, counting stats only, then hand the
+  // totals to the very builder that drew each player's line.
+  if (g.provider === 'yahoo') {
+    if (typeof _skBuildCatStatLine !== 'function' ||
+        typeof _skIsCountingCatStat !== 'function') return '';
+    var meta = null, sums = {}, any = false;
+    for (i = 0; i < list.length; i++) {
+      var fr = list[i].row;
+      if (!fr || !fr.catStats) continue;
+      if (!meta && fr.catMeta) meta = fr.catMeta;
+      for (k in fr.catStats) {
+        if (!fr.catStats.hasOwnProperty(k)) continue;
+        // A rate is not additive. _skIsCountingCatStat is the same test the
+        // per-player line uses, so the two can't disagree about what counts.
+        if (!meta || !_skIsCountingCatStat(meta[k])) continue;
+        var yv = Number(fr.catStats[k]);
+        if (isNaN(yv)) continue;
+        sums[k] = (sums[k] || 0) + yv;
+        any = true;
+      }
+    }
+    if (!any || !meta) return '';
+    return _skBuildCatStatLine(sums, meta, 6) || '';
+  }
+
+  // ── ESPN ── sum by ESPN stat id, skipping rates, then rebuild the rates
+  // that have a recipe and render through ESPN's own line builder.
+  if (g.provider === 'espn') {
+    if (typeof _espFhubStatHtml !== 'function' || !g.lg) return '';
+    var game = (typeof _espGameCode === 'function') ? _espGameCode(g.lg) : 'flb';
+    var es = {}, seen = false;
+    for (i = 0; i < list.length; i++) {
+      var er = list[i].row;
+      if (!er || !er.catStats) continue;
+      for (k in er.catStats) {
+        if (!er.catStats.hasOwnProperty(k)) continue;
+        if (typeof espIsRate === 'function' && espIsRate(game, k)) continue;
+        var ev = Number(er.catStats[k]);
+        if (isNaN(ev)) continue;
+        es[k] = (es[k] || 0) + ev;
+        seen = true;
+      }
+    }
+    if (!seen) return '';
+    // AVG / ERA / WHIP and friends come back from their components. A rate
+    // with no recipe is simply absent, which is the honest answer — better a
+    // missing category than eight goalies' save percentages added together.
+    if (typeof _espApplyRates === 'function') es = _espApplyRates(es);
+    return _espFhubStatHtml(g.lg, { windows: { today: { stats: es } } }) || '';
+  }
+
+  return '';
 }
 
 var _FX_FMT_BADGE = { headpoint: 'H2H PTS', point: 'SEASON PTS', head: 'H2H CATS',
@@ -77844,6 +77934,10 @@ function _fhubAllTeamsHtml(players) {
           slEsc(g.catTotals[c].label) + '</span>';
       }
       catStrip = '<div class="fxh-lgcats">' + cb + '</div>';
+    } else if (g.catHtml) {
+      // FHUBCATSUM — Yahoo and ESPN arrive as finished markup from their own
+      // renderers. Same wrapper, so the strip sits and spaces identically.
+      catStrip = '<div class="fxh-lgcats">' + g.catHtml + '</div>';
     }
     var badge = _fhubAllBadge(g);
     var lgName = g.leagueName || '';
