@@ -6917,6 +6917,19 @@
      — but he contributed nothing to the total above, so he reads quieter. */
   .crs-fhub-row.fxh-bench { opacity: 0.5; }
 
+  /* ── Plays today ── SKPLAYTODAY ──
+     A gold surround on a Today's Lineup row whose real-life team has a
+     game today. Drawn ONLY on a confirmed game: an unmarked row means
+     "no game, or we don't know yet", and those two must not be told
+     apart by their styling, because silence is not evidence. */
+  .sk-contrib-row.sk-plays-today {
+    border: 1px solid rgba(245,197,24,0.55);
+    border-radius: 8px;
+    background: rgba(245,197,24,0.045);
+    padding-left: 6px; padding-right: 6px;
+    margin: 2px 0;
+  }
+
   .crs-fhub-cats { flex: 1; min-width: 0; overflow: hidden; }
   /* Fantrax categories-league stat line — the league's own categories, read
      off the same box the FP engine uses. No FP exists in a cats league, so
@@ -98361,6 +98374,130 @@ async function _skTodayRefresh(isInitial) {
 
 // Paint the cats-flavored sub line: "X-Y-Z cats · vs OppName"
 // ─────────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+// WHO HAS A GAME TODAY ── SKPLAYTODAY ──
+//
+// One day's ESPN scoreboard per sport, reduced to a set of team abbrs, so
+// Today's Lineup can mark the players who are actually playing.
+//
+// THE HARD PART IS THE ABBREVIATION, not the fetch. A Yahoo roster says AZ,
+// CHW, WAS, TBR; ESPN says ARI, CWS, WSH, TB; and the app already carries
+// three different canonicalisers for the overlap (nhsNhlCanon, nspNbaCanon,
+// _skNormalizeTeamAbbr). Rather than pick one and hope, every form of every
+// team is registered on the way in AND every form of the player's team is
+// tried on the way out — the same belt-and-braces the MLB probables lookup
+// settled on for exactly this reason.
+//
+// Tri-state on purpose: true, false, or null for "not loaded yet". The
+// caller draws the box only on true, so a slow or failed fetch leaves the
+// list exactly as it is today rather than telling you nobody is playing.
+var _skPlayTodayCache = {};      // "sport|YYYYMMDD" -> { set: {}, ts }
+var _skPlayTodayInflight = {};   // "sport|YYYYMMDD" -> 1
+
+function _skPlayTodayKey(sport) {
+  var d = new Date();
+  return String(sport || '').toLowerCase() + '|' +
+    d.getFullYear() + String(d.getMonth() + 1) + String(d.getDate());
+}
+
+// Football has no canonicaliser in the file, and it is the one sport whose
+// abbreviations genuinely disagree across providers. Measured, not guessed:
+// a pass over the known pairs matched 21 of 23, and the two misses were both
+// NFL — JAX/JAC and LAR/LA. Both spellings of each map to one token so
+// either side resolves. Scoped to NFL on purpose: "LA" means the Rams in
+// football and the Kings in hockey. SKPLAYTODAY
+var _SK_PT_NFL_ALIAS = {
+  JAC: 'JAX', JAX: 'JAX',
+  LA: 'LAR', LAR: 'LAR',
+  WAS: 'WSH', WSH: 'WSH',
+  ARZ: 'ARI', ARI: 'ARI',
+  GNB: 'GB', GB: 'GB',
+  KAN: 'KC', KC: 'KC',
+  NWE: 'NE', NE: 'NE',
+  NOR: 'NO', NO: 'NO',
+  SFO: 'SF', SF: 'SF',
+  TAM: 'TB', TB: 'TB',
+  LVR: 'LV', LV: 'LV', OAK: 'LV',
+  SD: 'LAC', LAC: 'LAC'
+};
+
+// Every spelling of one team, so a lookup from either side resolves.
+function _skPlayTodayForms(sport, abbr) {
+  var out = [], seen = {}, i;
+  var raw = String(abbr || '').toUpperCase();
+  if (!raw) return out;
+  var sp = String(sport || '').toLowerCase();
+  var cands = [raw];
+  if (sp === 'nfl' && _SK_PT_NFL_ALIAS[raw]) cands.push(_SK_PT_NFL_ALIAS[raw]);
+  try { if (typeof _skNormalizeTeamAbbr === 'function') cands.push(_skNormalizeTeamAbbr(raw)); } catch (e) {}
+  try { if (sp === 'nhl' && typeof nhsNhlCanon === 'function') cands.push(nhsNhlCanon(raw)); } catch (e2) {}
+  try { if (sp === 'nba' && typeof nspNbaCanon === 'function') cands.push(nspNbaCanon(raw)); } catch (e3) {}
+  for (i = 0; i < cands.length; i++) {
+    var c = String(cands[i] || '').toUpperCase();
+    if (c && !seen[c]) { seen[c] = 1; out.push(c); }
+  }
+  return out;
+}
+
+// Kick off today's scoreboard for a sport. Repaints the lineup when it
+// lands, the way _mrGameWeeks repaints Record by week.
+function _skPlayTodayLoad(sport) {
+  var sp = String(sport || '').toLowerCase();
+  var ck = _skPlayTodayKey(sp);
+  if (_skPlayTodayCache[ck] || _skPlayTodayInflight[ck]) return;
+  var cfg = (typeof LEAGUES !== 'undefined') ? LEAGUES[sp.toUpperCase()] : null;
+  if (!cfg || !cfg.sport || !cfg.slug) return;     // not a sport we can ask about
+  if (typeof fetch !== 'function') return;
+  _skPlayTodayInflight[ck] = 1;
+  // nspFmtDate is what skGamesPerWeek already feeds this same endpoint.
+  var d = new Date();
+  var ds = (typeof nspFmtDate === 'function') ? nspFmtDate(d) : null;
+  if (!ds) { delete _skPlayTodayInflight[ck]; return; }
+  fetch('https://site.api.espn.com/apis/site/v2/sports/' + cfg.sport + '/' + cfg.slug +
+        '/scoreboard?dates=' + ds)
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (data) {
+      var set = {}, i, j, k;
+      var evs = (data && data.events) || [];
+      for (i = 0; i < evs.length; i++) {
+        var comps = evs[i] && evs[i].competitions && evs[i].competitions[0];
+        var cl = (comps && comps.competitors) || [];
+        for (j = 0; j < cl.length; j++) {
+          var ab = cl[j] && cl[j].team && cl[j].team.abbreviation;
+          var forms = _skPlayTodayForms(sp, ab);
+          for (k = 0; k < forms.length; k++) set[forms[k]] = 1;
+        }
+      }
+      _skPlayTodayCache[ck] = { set: set, ts: Date.now() };
+      delete _skPlayTodayInflight[ck];
+      // Only worth a repaint if somebody is actually playing.
+      if (evs.length && typeof _skTodayRenderBody === 'function') {
+        try { _skTodayRenderBody(false); } catch (e) {}
+      }
+    })
+    .catch(function () {
+      delete _skPlayTodayInflight[ck];
+      // Left uncached deliberately: a failed day should be retried on the
+      // next open rather than remembered as "nobody plays today".
+    });
+}
+
+// true / false / null. Null means not loaded — never styled.
+function _skPlaysToday(sport, abbr) {
+  var ck = _skPlayTodayKey(sport);
+  var hit = _skPlayTodayCache[ck];
+  if (!hit) { _skPlayTodayLoad(sport); return null; }
+  var forms = _skPlayTodayForms(sport, abbr);
+  if (!forms.length) return null;
+  for (var i = 0; i < forms.length; i++) if (hit.set[forms[i]]) return true;
+  return false;
+}
+
+// The class for one lineup row, and the count for a header. SKPLAYTODAY
+function _skPlaysTodayClass(sport, abbr) {
+  return (_skPlaysToday(sport, abbr) === true) ? ' sk-plays-today' : '';
+}
+
 // TODAY'S LINEUP — Daily Contributors view
 // ─────────────────────────────────────────────────────────────────
 // Body of the Today's Lineup sheet, modelled on the cats-league Week
@@ -98672,6 +98809,12 @@ function _skTodayBuildCatsDailyBody(players, statsMeta) {
       ? '<span class="sk-pace-badge steady" style="opacity:0.6">\u2022 awaiting stats</span>'
       : '';
     var keyAttr = (r.playerKey + '').replace(/"/g, '&quot;');
+    // SKPLAYTODAY — gold surround when this player's real team has a game
+    // today. The cats renderer takes the sport the same way the points one
+    // does, rather than assuming the two agree.
+    var _ptSportC = (typeof _skActiveSport === 'function') ? _skActiveSport() : '';
+    var playCls = (typeof _skPlaysTodayClass === 'function')
+      ? _skPlaysTodayClass(_ptSportC, r.teamAbbr) : '';
     // Stash data the today opener will need. Done AS we render so the
     // opener has guaranteed-fresh context for whatever's on screen.
     _skTodayPlayerLookup[r.playerKey] = {
@@ -98683,7 +98826,7 @@ function _skTodayBuildCatsDailyBody(players, statsMeta) {
       statsMeta: statsMeta,
       paceBadge: paceBadge,
     };
-    return '<div class="sk-contrib-row"' +
+    return '<div class="sk-contrib-row' + playCls + '"' +
       ' data-player-key="' + keyAttr + '"' +
       ' onclick="_skTodayOpenPlayerSheet(this.getAttribute(\'data-player-key\'))">' +
       '<div class="sk-cats-contrib-row-main">' +
@@ -98818,6 +98961,9 @@ function _skTodayBuildPointsDailyBody(myFpMap, statsMeta) {
     var fpLine = '<span class="' + fpClass + '">' + fpStr + '</span>FP';
     var statLine = r.fp > 0 ? _skFpStatLine(r.stats, r.selectedPos, null, statsMeta) : '';
     var keyAttr = (r.playerKey + '').replace(/"/g, '&quot;');
+    // SKPLAYTODAY — gold surround when this player's real team plays today.
+    var playCls = (typeof _skPlaysTodayClass === 'function')
+      ? _skPlaysTodayClass(sport, r.teamAbbr) : '';
     _skTodayPlayerLookup[r.playerKey] = {
       kind: 'points',
       name: r.name,
@@ -98827,7 +98973,7 @@ function _skTodayBuildPointsDailyBody(myFpMap, statsMeta) {
       stats: r.stats,
       paceBadge: paceBadge,
     };
-    return '<div class="sk-contrib-row"' +
+    return '<div class="sk-contrib-row' + playCls + '"' +
       ' data-player-key="' + keyAttr + '"' +
       ' onclick="_skTodayOpenPlayerSheet(this.getAttribute(\'data-player-key\'))">' +
       '<div class="sk-cats-contrib-row-main">' +
