@@ -29440,6 +29440,11 @@
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19h16M7 16V9M12 16V5M17 16v-4"/></svg>
       <span>Probe ESPN live stat entries</span>
     </button>
+    <!-- ROTODAILY1 — can one call fetch every team's daily categories? -->
+    <button class="sk-account-item" onclick="skProbeRotoDaily(); skCloseAccountMenu();">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M3 10h18M8 2v4M16 2v4"/></svg>
+      <span>Probe Yahoo roto daily stats</span>
+    </button>
     <!-- ESPCATPROBE2 — where do ESPN's category numbers come from? -->
     <button class="sk-account-item" onclick="skProbeEspnCats(); skCloseAccountMenu();">
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l3 8 4-16 3 8h4"/></svg>
@@ -106558,7 +106563,8 @@ function skBuildDetailHTML(league) {
           (activeTab !== 'analysis' ? ' style="display:none"' : '') + '>' +
           '<div id="skAnalysisContent">' +
             (_isRotoLg
-              ? _skBuildRotoPressureHTML(league, data)       // ROTOPRESS
+              ? (_skBuildRotoPressureHTML(league, data) +    // ROTOPRESS
+                 _skRotoSeasonGridHtml(league, data))        // ROTOSEASON
               : (isCatsLeague
                   ? _skBuildCatsAnalysisHTML(league, data)
                   : _skBuildPointsAnalysisHTML(league, data))) +
@@ -120296,6 +120302,385 @@ function skBuildRotoCategoryTable(league, leagueData, allTeams) {
       'the team above you \u2014 one rank point. A dash means you already lead it, ' +
       'or the raw totals aren\u2019t in yet.</div>' +
   '</div>';
+}
+
+// ── Can Yahoo give a whole league's daily category totals in ONE call? ──
+// ROTODAILY1
+//
+// The per-TEAM form is already proven: /team/{key}/stats;type=date;date=X has
+// been running in this app for a while, parsed and cached. So a daily grid is
+// buildable today at one request per team — twenty for a twenty-team league,
+// every day.
+//
+// The collection form would make it one. The app already calls
+// /league/{key}/teams/stats;type=season successfully, so the date variant of
+// that same path is the obvious candidate — but Yahoo's published docs don't
+// list the coverage types the team stats sub-resource accepts at all, so it
+// cannot be settled from the outside. This asks.
+//
+// The control matters as much as the candidate. A candidate that returns
+// SOMETHING is not a win: it could be returning season totals under a date
+// label, which would look perfectly reasonable and be silently wrong all day.
+// So the per-team call is made too, and the two are compared stat by stat for
+// my own team. Agreement is the only result that counts.
+function skProbeRotoDaily() {
+  var lines = [];
+  function say(t) { lines.push(t); }
+  var all = (typeof fyLeagues !== 'undefined' && fyLeagues) ? fyLeagues : [];
+  var picked = [], i;
+  for (i = 0; i < all.length; i++) {
+    if (String(all[i].scoring_type) === 'roto') picked.push(all[i]);
+    if (picked.length >= 2) break;
+  }
+  if (!picked.length) {
+    _skGpProbeShow('No Yahoo roto league is synced, so there is nothing to ask about.');
+    return;
+  }
+  var day = (typeof _todayDateString === 'function') ? _todayDateString() : '';
+  say('date under test: ' + day);
+  say('');
+
+  function statsOf(node) {
+    var out = {};
+    try {
+      var arr = node && node.team_stats && node.team_stats.stats;
+      if (!arr) return out;
+      var list = (typeof _yahooArr === 'function') ? _yahooArr(arr) : arr;
+      for (var q = 0; q < list.length; q++) {
+        var s = list[q] && list[q].stat;
+        if (s && s.stat_id != null) out[String(s.stat_id)] = String(s.value);
+      }
+    } catch (e) {}
+    return out;
+  }
+
+  var pending = picked.length;
+  function done() { if (!--pending) _skGpProbeShow(lines.join('\n')); }
+
+  picked.forEach(function (lg) {
+    var k = lg.league_key;
+    var myTk = '';
+    try {
+      var d = (typeof skLeagueData !== 'undefined') ? skLeagueData[k] : null;
+      myTk = (d && d.team && d.team.team_key) || '';
+    } catch (e) {}
+    say('══ ' + (lg.name || k) + '  (' + String(lg.sport || '?').toUpperCase() + ') ══');
+    if (!myTk) { say('  my team key unknown — open the league once, then re-run.'); say(''); done(); return; }
+
+    var ctlPath = '/team/' + myTk + '/stats;type=date;date=' + day;
+    var candPath = '/league/' + k + '/teams/stats;type=date;date=' + day;
+    say('  control  : ' + ctlPath);
+    say('  candidate: ' + candPath);
+
+    var ctl = fyApi(ctlPath).then(function (r) { return r; }, function (e) { return { _err: e }; });
+    var cand = fyApi(candPath).then(function (r) { return r; }, function (e) { return { _err: e }; });
+
+    Promise.all([ctl, cand]).then(function (res) {
+      // ── control ──
+      var cStats = {};
+      if (res[0] && res[0]._err) {
+        say('  CONTROL FAILED: ' + (res[0]._err && res[0]._err.message ? res[0]._err.message : res[0]._err));
+      } else {
+        try { cStats = statsOf(res[0].fantasy_content.team[1]); } catch (e) {}
+        say('  control returned ' + Object.keys(cStats).length + ' stats for my team');
+      }
+      // ── candidate ──
+      if (res[1] && res[1]._err) {
+        say('  CANDIDATE FAILED: ' + (res[1]._err && res[1]._err.message ? res[1]._err.message : res[1]._err));
+        say('  → one call per team it is.');
+        say(''); done(); return;
+      }
+      var teamsNode = null;
+      try { teamsNode = res[1].fantasy_content.league[1].teams; } catch (e) {}
+      if (!teamsNode) {
+        say('  candidate parsed, but no teams collection in it.');
+        try { say('  top-level keys: ' + Object.keys(res[1].fantasy_content || {}).join(' ')); } catch (e2) {}
+        say(''); done(); return;
+      }
+      var cnt = parseInt(teamsNode.count, 10) || 0;
+      say('  candidate returned ' + cnt + ' teams');
+      // Find my team inside it and compare, stat for stat.
+      var mineStats = null, ti;
+      for (ti = 0; ti < cnt; ti++) {
+        var tw = teamsNode[String(ti)] && teamsNode[String(ti)].team;
+        if (!tw) continue;
+        var tkFound = '';
+        try {
+          var head = tw[0];
+          for (var hj = 0; hj < head.length; hj++) {
+            if (head[hj] && head[hj].team_key) tkFound = head[hj].team_key;
+          }
+        } catch (e) {}
+        if (tkFound === myTk) { mineStats = statsOf(tw[1]); break; }
+      }
+      if (!mineStats) { say('  my team was not in the candidate response.'); say(''); done(); return; }
+      say('  candidate returned ' + Object.keys(mineStats).length + ' stats for my team');
+
+      var same = 0, diff = [], kk;
+      for (kk in cStats) {
+        if (!cStats.hasOwnProperty(kk)) continue;
+        if (mineStats[kk] === cStats[kk]) same++;
+        else diff.push(kk + ': control ' + cStats[kk] + ' vs candidate ' +
+                       (mineStats[kk] == null ? '(absent)' : mineStats[kk]));
+      }
+      say('');
+      if (!diff.length && same) {
+        say('  ✓ IDENTICAL on all ' + same + ' stats — one call can replace ' + cnt + '.');
+      } else {
+        say('  ✗ ' + diff.length + ' of ' + (same + diff.length) + ' stats differ:');
+        for (var dj = 0; dj < diff.length && dj < 10; dj++) say('     ' + diff[dj]);
+        say('  → the candidate is answering a different question. One call per team.');
+      }
+      say(''); done();
+    }).catch(function (e) {
+      say('  probe threw: ' + (e && e.message ? e.message : e));
+      say(''); done();
+    });
+  });
+}
+
+// ── Roto season grid ── ROTOSEASON ──
+//
+// Every team's season total in every category, which is the table the ESPN
+// side has had under Standings and Yahoo hasn't. It needs NO new request:
+// Yahoo publishes team_stats.stats in the same /standings payload as the rank
+// points, and the parser has been keeping it as catStats since ROTOCATS. The
+// Category Pressure card above already reads it — this is the same numbers
+// for the whole league instead of one row of them.
+//
+// Laid out the way the ESPN grid is, deliberately: sticky team column, the
+// league's own scoring order left to right, tap a heading to sort and TEAM to
+// go back. Two roto tables in one app that sort differently would be its own
+// small bug.
+var _skRsSort = {};   // league key -> { id, dir }
+
+// First tap sorts BEST first, which is not the same as biggest first: in GAA
+// or losses the best number is the smallest. Tapping again reverses.
+function skSetRotoSort(key, statId) {
+  var cur = _skRsSort[key];
+  if (!statId) delete _skRsSort[key];
+  else if (cur && cur.id === statId) cur.dir = -cur.dir;
+  else _skRsSort[key] = { id: statId, dir: 1 };
+  var host = document.getElementById('skRotoSeasonGrid');
+  if (!host) return;
+  var lk = (typeof skState !== 'undefined' && skState.activeLeagueKey) || key;
+  var lg = null, all = (typeof fyLeagues !== 'undefined' && fyLeagues) ? fyLeagues : [], i;
+  for (i = 0; i < all.length; i++) if (all[i].league_key === lk) lg = all[i];
+  var data = (typeof skLeagueData !== 'undefined') ? skLeagueData[lk] : null;
+  if (!lg || !data) return;
+  try { host.outerHTML = _skRotoSeasonGridHtml(lg, data); } catch (e) {}
+}
+
+// The teams, their raw totals and their published points, in one shape.
+function _skRotoGridTeams(data) {
+  var allTeams = (data && data.allTeams) || {};
+  var out = [], k;
+  for (k in allTeams) {
+    if (!allTeams.hasOwnProperty(k)) continue;
+    var t = allTeams[k];
+    if (!t || !t.catStats) continue;
+    out.push({ key: k, name: t.name || k, raw: t.catStats,
+               pts: t.catPoints || null, rank: t.rank });
+  }
+  return out;
+}
+
+// Roto points worked out from the raw totals, so they can be set against the
+// ones Yahoo published. Ties share the average of the ranks they occupy —
+// two teams tied for 3rd of 20 take 18.5 each, not 18 and 17. ROTOSEASON
+function _skRotoDerivePoints(teams, order, statsMeta) {
+  var out = {}, i, j, c;
+  for (i = 0; i < teams.length; i++) out[teams[i].key] = 0;
+  var n = teams.length;
+  for (c = 0; c < order.length; c++) {
+    var id = String(order[c]);
+    var m = statsMeta[id] || {};
+    if (m.isOnlyDisplayStat || m.enabled === false) continue;
+    var lowerWins = (m.sortOrder === 0);
+    // Only teams that HAVE a value are ranked; a category nobody has scored
+    // yet would otherwise hand everyone the same invented number.
+    var vals = [];
+    for (i = 0; i < teams.length; i++) {
+      var v = parseFloat(teams[i].raw[id]);
+      vals.push(isNaN(v) ? null : v);
+    }
+    for (i = 0; i < teams.length; i++) {
+      if (vals[i] == null) continue;
+      var better = 0, same = 0;
+      for (j = 0; j < teams.length; j++) {
+        if (vals[j] == null) continue;
+        if (vals[j] === vals[i]) same++;
+        else if (lowerWins ? (vals[j] < vals[i]) : (vals[j] > vals[i])) better++;
+      }
+      if (!same) continue;
+      var tot = 0, q;
+      for (q = 0; q < same; q++) tot += (n - (better + q));
+      out[teams[i].key] += tot / same;
+    }
+  }
+  return out;
+}
+
+// Derived against published. The grid is the input to the derivation, so the
+// check that the derivation reads Yahoo correctly belongs directly under it —
+// and if a category's direction is being read backwards, this is where it
+// shows. ROTOSEASON
+function _skRotoReconcileHtml(teams, order, statsMeta, myKey) {
+  var derived = _skRotoDerivePoints(teams, order, statsMeta);
+  var mono = 'font-family:var(--sk-font-mono,monospace);font-size:9.5px;';
+  var rows = '', agree = 0, seen = 0, i, c;
+  var cats = 0;
+  for (c = 0; c < order.length; c++) {
+    var m0 = statsMeta[String(order[c])] || {};
+    if (!m0.isOnlyDisplayStat && m0.enabled !== false) cats++;
+  }
+  for (i = 0; i < teams.length; i++) {
+    var t = teams[i];
+    if (!t.pts) continue;
+    var pub = 0, k2, any = false;
+    for (k2 in t.pts) {
+      if (!t.pts.hasOwnProperty(k2)) continue;
+      var pv = parseFloat(t.pts[k2]);
+      if (!isNaN(pv)) { pub += pv; any = true; }
+    }
+    if (!any) continue;
+    seen++;
+    var der = Math.round(derived[t.key] * 10) / 10;
+    pub = Math.round(pub * 10) / 10;
+    var ok = Math.abs(der - pub) < 0.051;
+    if (ok) agree++;
+    rows += '<div style="display:flex;gap:8px;' + mono +
+      'color:rgba(255,255,255,0.45);padding:1px 0;">' +
+      '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' +
+      (t.key === myKey ? 'color:rgba(255,255,255,0.85);font-weight:700;' : '') + '">' +
+      slEsc(_skRsShort(t.name)) + '</span>' +
+      '<span style="color:' + (ok ? 'rgba(255,255,255,0.45)' : '#f87171') + '">' +
+      der.toFixed(1) + ' vs ' + pub.toFixed(1) + ' ' + (ok ? '✓' : '✗') + '</span>' +
+    '</div>';
+  }
+  if (!seen) return '';
+  var head = (agree === seen)
+    ? '<div style="color:#4ade80;' + mono + 'margin-bottom:4px;">RECONCILES · ' +
+      seen + ' teams · ' + cats + ' categories</div>'
+    : '<div style="color:#f87171;' + mono + 'margin-bottom:4px;">' +
+      (seen - agree) + ' of ' + seen + ' DISAGREE · ' + cats + ' categories</div>';
+  return '<div style="margin-top:10px;padding:9px 11px;border:1px solid rgba(255,255,255,0.07);' +
+    'border-radius:9px;">' +
+    '<div style="' + mono + 'letter-spacing:0.08em;color:rgba(255,255,255,0.35);' +
+    'margin-bottom:4px;">ROTO POINTS · DERIVED VS YAHOO</div>' + head + rows + '</div>';
+}
+
+function _skRsShort(nm) {
+  nm = String(nm || '?');
+  return (nm.length <= 14) ? nm : (nm.slice(0, 13) + '…');
+}
+
+function _skRotoSeasonGridHtml(league, data, metaOverride) {
+  if (!league || league.scoring_type !== 'roto') return '';
+  var key = league.league_key;
+  var teams = _skRotoGridTeams(data);
+  var myKey = (data && data.team && data.team.team_key) || '';
+  function shell(msg) {
+    return '<div class="sk-rp" id="skRotoSeasonGrid">' +
+      '<div class="sk-rp-head"><div class="sk-rp-title">SEASON BY CATEGORY</div>' +
+      '<div class="sk-rp-sub">every team’s totals, from Yahoo’s own numbers</div></div>' +
+      '<div class="sk-rp-empty">' + skEscape(msg) + '</div></div>';
+  }
+  if (teams.length < 2) return shell('Waiting on league standings.');
+
+  var meta = metaOverride ||
+    ((typeof leagueSettingsCache !== 'undefined' && leagueSettingsCache[key])
+      ? leagueSettingsCache[key] : null);
+  var statsMeta = (meta && meta.stats) || {};
+  var order = (meta && meta.statOrder) || [];
+  if (!order.length) {
+    var seed = teams[0].raw, sid;
+    for (sid in seed) if (seed.hasOwnProperty(sid)) order.push(sid);
+  }
+  var cols = [], c;
+  for (c = 0; c < order.length; c++) {
+    var id = String(order[c]);
+    var m = statsMeta[id] || {};
+    if (m.isOnlyDisplayStat || m.enabled === false) continue;
+    var lbl = m.abbr || m.displayName || m.name || ('#' + id);
+    cols.push({ id: id, label: lbl, lowerWins: (m.sortOrder === 0) });
+  }
+  if (!cols.length) return shell('No categories yet — this fills in once the season’s scoring.');
+
+  // Default order is the standings, which is what you expect to see first.
+  teams.sort(function (a, b) {
+    var ra = parseInt(a.rank, 10), rb = parseInt(b.rank, 10);
+    if (!isNaN(ra) && !isNaN(rb) && ra !== rb) return ra - rb;
+    return String(a.name).localeCompare(String(b.name));
+  });
+  var sort = _skRsSort[key] || null;
+  if (sort) {
+    var sCol = null;
+    for (c = 0; c < cols.length; c++) if (cols[c].id === sort.id) sCol = cols[c];
+    if (sCol) {
+      teams.sort(function (a, b) {
+        var va = parseFloat(a.raw[sort.id]), vb = parseFloat(b.raw[sort.id]);
+        var na = isNaN(va) ? null : va, nb = isNaN(vb) ? null : vb;
+        // No value sinks in BOTH directions: ascending led by every team with
+        // nothing reads as data rather than as absence.
+        if (na == null && nb == null) return 0;
+        if (na == null) return 1;
+        if (nb == null) return -1;
+        var best = sCol.lowerWins ? (na - nb) : (nb - na);
+        return best * sort.dir;
+      });
+    }
+  }
+
+  var mono = 'font-family:var(--sk-font-mono,monospace);';
+  var pad = 'padding:5px 7px;text-align:right;white-space:nowrap;';
+  var stick = 'position:sticky;left:0;z-index:2;background:var(--sk-bg-card);';
+  var kAttr = String(key).replace(/'/g, '');
+  var h = '<div class="sk-rp" id="skRotoSeasonGrid">' +
+    '<div class="sk-rp-head"><div class="sk-rp-title">SEASON BY CATEGORY</div>' +
+    '<div class="sk-rp-sub">every team’s totals, from Yahoo’s own numbers</div></div>' +
+    '<div style="overflow-x:auto;-webkit-overflow-scrolling:touch;padding:0 12px;">' +
+    '<table style="border-collapse:collapse;font-size:11.5px;min-width:100%;">';
+
+  h += '<thead><tr style="color:rgba(255,255,255,0.42);font-size:9px;letter-spacing:0.08em;">' +
+    '<th onclick="skSetRotoSort(\'' + kAttr + '\',\'\')" style="' + stick + pad +
+    'text-align:left;cursor:pointer;' + (sort ? '' : 'color:var(--sk-gold);') + '">TEAM</th>';
+  for (c = 0; c < cols.length; c++) {
+    var on = !!(sort && sort.id === cols[c].id);
+    h += '<th onclick="skSetRotoSort(\'' + kAttr + '\',\'' + cols[c].id + '\')" style="' +
+      pad + 'cursor:pointer;' + (on ? 'color:var(--sk-gold);' : '') + '">' +
+      slEsc(cols[c].label) + (on ? (sort.dir > 0 ? ' ▾' : ' ▴') : '') + '</th>';
+  }
+  h += '</tr></thead><tbody>';
+
+  for (var i = 0; i < teams.length; i++) {
+    var t = teams[i];
+    var mine = (t.key === myKey);
+    var bg = mine ? 'background:rgba(245,197,24,0.07);' : '';
+    h += '<tr>' +
+      '<td style="' + stick + pad + 'text-align:left;max-width:118px;overflow:hidden;' +
+      'text-overflow:ellipsis;' + (mine ? 'background:#1d1a10;' : '') +
+      'color:' + (mine ? 'var(--sk-gold);font-weight:700' : 'rgba(255,255,255,0.82)') + ';">' +
+      slEsc(_skRsShort(t.name)) + '</td>';
+    for (c = 0; c < cols.length; c++) {
+      var raw = t.raw[cols[c].id];
+      var hot = !!(sort && sort.id === cols[c].id);
+      // Yahoo's own string, not a reformatted number: it already writes a
+      // save percentage as .930 and an ice time the way the site does.
+      h += '<td style="' + pad + mono + bg +
+        (hot ? 'background:rgba(245,197,24,0.06);' : '') +
+        'color:rgba(255,255,255,' + (mine ? '0.95' : '0.72') + ');">' +
+        ((raw == null || raw === '') ? '—' : slEsc(String(raw))) + '</td>';
+    }
+    h += '</tr>';
+  }
+  h += '</tbody></table></div>';
+  h += '<div style="color:rgba(255,255,255,0.28);font-size:9.5px;margin:8px 12px 0;line-height:1.5;">' +
+    'Season totals from Yahoo’s own per-team values · in this league’s scoring order ' +
+    '· tap a column to sort, TEAM to reset · swipe sideways for the rest.</div>';
+  h += '<div style="padding:0 12px 10px;">' +
+    _skRotoReconcileHtml(teams, order, statsMeta, myKey) + '</div>';
+  return h + '</div>';
 }
 
 // ── Roto category pressure ── ROTOPRESS ──
