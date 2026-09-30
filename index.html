@@ -159731,7 +159731,9 @@ var ESP_RATE_RECIPE_BY_GAME = {
   fhl: {
     // ATOI = total ice time over games played. Verified against ESPN's own
     // team row: 1024 + 226 + 955 + 236 = 2441s over 4 skaters = 10:10.
-    27: { num: [26], den: [30], mode: 'ratio' },
+    // viaRate: ESPN's baseline carries TOI but not GP, so the stored
+    // denominator is recovered as TOI / ATOI. ESPGPDERIVE
+    27: { num: [26], den: [30], mode: 'ratio', viaRate: true },
     // Saves over shots against — a count over a count, no units involved.
     11: { num: [6],  den: [3],  mode: 'ratio' }
   },
@@ -159744,7 +159746,7 @@ var ESP_RATE_RECIPE_BY_GAME = {
 
 var ESP_RATE_COMPONENTS_BY_GAME = {
   flb: ESP_RATE_COMPONENTS,
-  fhl: [26, 30, 6, 3],
+  fhl: [26, 30, 6, 3, 4, 8],   // TOI, GP, SV, SA, + GA and goalie TOI for GAA
   fba: [13, 14, 15, 16, 17, 18]
 };
 
@@ -159876,13 +159878,30 @@ function espLiveCatValues(scoreByStat, todayByStat, game) {
     // figure of .027 against a real .351 — arithmetic on two different
     // timeframes. If a part is missing from the period baseline, the recipe
     // can't be run and ESPN's own value stands. ESPRATESCOPE
+    // ESPGPDERIVE — a denominator the baseline genuinely does not carry can
+    // still be recovered from the stored numerator and the stored RATE,
+    // which between them define it. Anything else still refuses.
+    var denFix = 0;
     if (scoreByStat) {
-      var mixed = false, ci;
+      var mixed = false, ci, missDen = [];
       for (ci = 0; ci < r.num.length; ci++) {
         if (scoreByStat[r.num[ci]] == null) mixed = true;
       }
       for (ci = 0; ci < r.den.length; ci++) {
-        if (scoreByStat[r.den[ci]] == null) mixed = true;
+        if (scoreByStat[r.den[ci]] == null) missDen.push(r.den[ci]);
+      }
+      if (missDen.length) {
+        var sNum = (r.num.length === 1) ? _espNum(scoreByStat[r.num[0]]) : null;
+        var sRate = _espNum(scoreByStat[k]);
+        if (!r.viaRate || r.den.length !== 1 || sNum == null) {
+          mixed = true;              // nothing to recover it from, honestly
+        } else if (!sNum) {
+          denFix = 0;                // nothing banked yet, so today over today
+        } else if (sRate) {
+          denFix = sNum / sRate;     // GP = TOI / ATOI, exact
+        } else {
+          mixed = true;              // time banked but no rate to divide it by
+        }
       }
       if (mixed) continue;
     }
@@ -159901,6 +159920,7 @@ function espLiveCatValues(scoreByStat, todayByStat, game) {
       if (out[r.den[i]] != null) haveDen = true;
       den += out[r.den[i]] || 0;
     }
+    den += denFix;   // ESPGPDERIVE — the part the baseline didn't spell out
     if (!haveNum || !haveDen || !den) continue;   // leave the existing value alone
     if (r.mode === 'ratio') out[k] = num / den;
     else if (r.mode === 'whip') out[k] = num / (den / 3);
