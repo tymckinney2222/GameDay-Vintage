@@ -23806,6 +23806,13 @@
   }
   .sk-rp-rank, .sk-rp-pts { color: var(--sk-text-3); text-align: right; }
   .sk-rp-up { color: var(--sk-green); text-align: right; }
+  /* ROTOWORTH — the rank points a move is worth, beside how far it is. Dim
+     and small on purpose: the raw number is the instruction, this is the
+     reason. */
+  .sk-rp-worth {
+    font-style: normal; font-size: 9px; color: var(--sk-text-4);
+    margin-left: 4px;
+  }
   .sk-rp-dn { color: var(--sk-text-2); text-align: right; }
   .sk-rp-row.hd .sk-rp-cat, .sk-rp-row.hd .sk-rp-up, .sk-rp-row.hd .sk-rp-dn { color: var(--sk-text-4); font-weight: 700; }
   .sk-rp-empty { padding: 4px 14px 14px; font-size: 11px; color: var(--sk-text-4); }
@@ -120350,6 +120357,7 @@ function _skRotoCatStates(league, data, metaOverride) {
     return String(Math.round(v * 1000) / 1000);
   }
 
+  var sj2;   // ROTOWORTH
   var groups = { CONTESTED: [], CLIMBABLE: [], EXPOSED: [], LOCKED: [] };
   var byStat = {};
   var gainTotal = 0, riskTotal = 0, scored = 0;
@@ -120430,8 +120438,59 @@ function _skRotoCatStates(league, data, metaOverride) {
     var tieSwing = tiedN ? (tiedN / 2) : 0;
     var upNear = (upC != null && upC <= _SK_RP_NEAR && ptsUp > 0);
     var downNear = (downC != null && downC <= _SK_RP_NEAR && ptsDown > 0);
-    var gainHere = tieSwing + (upNear ? ptsUp : 0);
-    var riskHere = tieSwing + (downNear ? ptsDown : 0);
+
+    // ROTOWORTH — re-rank the category with one value changed and read my new
+    // points off it. This is the only way to get a figure that matches the raw
+    // amount printed beside it; subtracting two published totals answers a
+    // different question (passing them, not reaching them).
+    var rawAll = [];
+    for (sj2 = 0; sj2 < teams.length; sj2++) {
+      var rv2 = num(teams[sj2].raw[id]);
+      if (rv2 != null) rawAll.push(rv2);
+    }
+    function ptsAt(vals, v) {
+      var better = 0, same = 0, q;
+      for (q = 0; q < vals.length; q++) {
+        if (vals[q] === v) same++;
+        else if (higherWins ? (vals[q] > v) : (vals[q] < v)) better++;
+      }
+      if (!same) return null;
+      var tot = 0, kk;
+      for (kk = 0; kk < same; kk++) tot += (vals.length - (better + kk));
+      return tot / same;
+    }
+    // Trust it only if it reproduces what Yahoo already published for me.
+    var upWorth = null, dnWorth = null;
+    if (myRaw != null && rawAll.length === teams.length) {
+      var simNow = ptsAt(rawAll, myRaw);
+      if (simNow != null && Math.abs(simNow - myPts) < 0.001) {
+        var meAt = rawAll.indexOf(myRaw);
+        if (above && meAt >= 0) {
+          var aR = num(above.raw[id]);
+          if (aR != null) {
+            var v1 = rawAll.slice(); v1[meAt] = aR;           // I draw level
+            var p1 = ptsAt(v1, aR);
+            if (p1 != null) upWorth = Math.round((p1 - myPts) * 100) / 100;
+          }
+        }
+        if (below) {
+          var bR = num(below.raw[id]);
+          if (bR != null) {
+            var bAt = rawAll.indexOf(bR);
+            if (bAt >= 0) {
+              var v2 = rawAll.slice(); v2[bAt] = myRaw;       // they draw level
+              var p2 = ptsAt(v2, myRaw);
+              if (p2 != null) dnWorth = Math.round((myPts - p2) * 100) / 100;
+            }
+          }
+        }
+      }
+    }
+
+    // The larger, never the sum: reaching the team above already breaks any
+    // tie on the way, so adding the tie swing on top double-counts it.
+    var gainHere = Math.max(tieSwing, (upNear && upWorth != null) ? upWorth : 0);
+    var riskHere = Math.max(tieSwing, (downNear && dnWorth != null) ? dnWorth : 0);
     gainTotal += gainHere;
     riskTotal += riskHere;
 
@@ -120452,6 +120511,7 @@ function _skRotoCatStates(league, data, metaOverride) {
       // a "+" there would read backwards. Sign it by direction.
       upTxt: (gapUp == null) ? '\u2014' : ((higherWins ? '+' : '\u2212') + fmtRaw(gapUp)),
       downTxt: (cushion == null) ? '\u2014' : fmtRaw(cushion),
+      upWorth: upWorth, dnWorth: dnWorth,   // ROTOWORTH — in rank points
       sortC: Math.min(upC == null ? 9 : upC, downC == null ? 9 : downC)
     });
   }
@@ -120475,6 +120535,12 @@ function _skBuildRotoPressureHTML(league, data, metaOverride) {
     return n + (s[(v - 20) % 10] || s[v] || s[0]);
   }
   function f1(n) { return (Math.round(n * 10) / 10).toFixed(1); }
+  // ROTOWORTH — what that move is worth in rank points, dim, beside the raw
+  // amount. The raw figure answers "how far"; this answers "so what".
+  function worth(v) {
+    if (v == null || !v) return '';
+    return '<i class="sk-rp-worth">' + f1(Math.abs(v)) + 'p</i>';
+  }
 
   var groups = res.groups;
   var gainTotal = res.gain, riskTotal = res.risk;
@@ -120507,8 +120573,8 @@ function _skBuildRotoPressureHTML(league, data, metaOverride) {
         '<span class="sk-rp-cat">' + skEscape(String(r.label)) + '</span>' +
         '<span class="sk-rp-rank">' + (r.tied ? 'T' : '') + ordinal(r.rank) + '</span>' +
         '<span class="sk-rp-pts">' + f1(r.pts) + '</span>' +
-        '<span class="sk-rp-up">' + r.upTxt + '</span>' +
-        '<span class="sk-rp-dn">' + r.downTxt + '</span>' +
+        '<span class="sk-rp-up">' + r.upTxt + worth(r.upWorth) + '</span>' +
+        '<span class="sk-rp-dn">' + r.downTxt + worth(r.dnWorth) + '</span>' +
       '</div>';
     }
   }
@@ -120525,13 +120591,13 @@ function _skBuildRotoPressureHTML(league, data, metaOverride) {
         '<span class="sk-rp-tot-val neg">' + f1(riskTotal) + '</span></div>' +
     '</div>' +
     body +
-    '<div class="sk-rp-note">TO GAIN is the raw amount that would reach the nearest team '
-      + 'you are not already level with; CUSHION is how much you hold over the nearest team below. '
-      + 'A T on the rank means you are LEVEL with someone \u2014 worth half a point each way per '
-      + 'team, immediately, which is why those are never locked. \u201cClose\u201d is judged against '
-      + 'the league\u2019s own spread in each category, so a few rebounds and a few thousandths of a '
-      + 'percentage are weighed the same way. WITHIN REACH and EXPOSED add up the rank points one '
-      + 'move away in each direction.</div>' +
+    '<div class="sk-rp-note">TO GAIN is how much more of the STAT would draw you level with '
+      + 'the nearest team you are not already tied with \u2014 faceoffs, blocks, shots \u2014 not rank '
+      + 'points. The small grey figure beside it is what that move is worth in rank points. CUSHION '
+      + 'is the stat lead you hold over the nearest team below, and what losing it would cost. A T on '
+      + 'the rank means you are LEVEL with someone, worth half a point each way per team, immediately. '
+      + '\u201cClose\u201d is judged against the league\u2019s own spread in each category, so a few '
+      + 'blocks and a few thousandths of a percentage are weighed the same way.</div>' +
   '</div>';
 }
 
