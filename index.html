@@ -29440,6 +29440,11 @@
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19h16M7 16V9M12 16V5M17 16v-4"/></svg>
       <span>Probe ESPN live stat entries</span>
     </button>
+    <!-- ROTOLIVE1 — does the season total already contain today? -->
+    <button class="sk-account-item" onclick="skProbeRotoLive(); skCloseAccountMenu();">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v20M2 12h20"/><circle cx="12" cy="12" r="9"/></svg>
+      <span>Probe roto live totals</span>
+    </button>
     <!-- ROTODAILY1 — can one call fetch every team's daily categories? -->
     <button class="sk-account-item" onclick="skProbeRotoDaily(); skCloseAccountMenu();">
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M3 10h18M8 2v4M16 2v4"/></svg>
@@ -120509,6 +120514,136 @@ function _skRotoDayLoad(leagueKey, dateStr) {
       // Left uncached on purpose: a failed day should be retried on the next
       // open rather than remembered as an empty one.
     });
+}
+
+function _skRlDayList(lg) {
+  var out = [], today = (typeof _todayDateString === 'function') ? _todayDateString() : '';
+  if (!today) return out;
+  var start = String(lg.start_date || '');
+  // Walk back from today to the season opener, but never more than a
+  // fortnight: the test only needs the season to be short, and a long one
+  // would make the probe expensive without making it more decisive.
+  var d = new Date(today + 'T12:00:00'), i;
+  for (i = 0; i < 14; i++) {
+    var y = d.getFullYear(), m = d.getMonth() + 1, day = d.getDate();
+    var s = y + '-' + (m < 10 ? '0' : '') + m + '-' + (day < 10 ? '0' : '') + day;
+    out.unshift(s);
+    if (start && s <= start) break;
+    d.setDate(d.getDate() - 1);
+  }
+  return out;
+}
+
+function skProbeRotoLive() {
+  var lines = [];
+  function say(t) { lines.push(t); }
+  var all = (typeof fyLeagues !== 'undefined' && fyLeagues) ? fyLeagues : [];
+  var lg = null, i;
+  for (i = 0; i < all.length; i++) {
+    if (String(all[i].scoring_type) !== 'roto') continue;
+    var dd = (typeof skLeagueData !== 'undefined') ? skLeagueData[all[i].league_key] : null;
+    if (dd && dd.team && dd.team.team_key) { lg = all[i]; break; }
+  }
+  if (!lg) {
+    _skGpProbeShow('Open a Yahoo roto league once, then run this again.');
+    return;
+  }
+  var key = lg.league_key;
+  var data = skLeagueData[key];
+  var myTk = data.team.team_key;
+  var season = ((data.allTeams || {})[myTk] || {}).catStats || {};
+  var meta = (typeof leagueSettingsCache !== 'undefined') ? leagueSettingsCache[key] : null;
+  var statsMeta = (meta && meta.stats) || {};
+  var order = (meta && meta.statOrder) || [];
+  var days = _skRlDayList(lg);
+  var today = days.length ? days[days.length - 1] : '';
+
+  say('══ ' + (lg.name || key) + ' ══');
+  say('  season opened ' + (lg.start_date || '?') + ', testing ' + days.length +
+      ' day' + (days.length === 1 ? '' : 's') + ': ' + days.join(' '));
+  say('');
+
+  var got = [];
+  var chain = Promise.resolve();
+  days.forEach(function (dt) {
+    chain = chain.then(function () {
+      return fyApi('/team/' + myTk + '/stats;type=date;date=' + dt).then(function (r) {
+        var one = {};
+        try {
+          var arr = r.fantasy_content.team[1].team_stats.stats;
+          var list = (typeof _yahooArr === 'function') ? _yahooArr(arr) : arr;
+          for (var q = 0; q < list.length; q++) {
+            var s = list[q] && list[q].stat;
+            if (s && s.stat_id != null) one[String(s.stat_id)] = s.value;
+          }
+        } catch (e) {}
+        got.push({ date: dt, stats: one });
+      }, function (e) {
+        got.push({ date: dt, stats: null, err: (e && e.message) ? e.message : String(e) });
+      });
+    });
+  });
+
+  chain.then(function () {
+    var d, id, j;
+    for (j = 0; j < got.length; j++) {
+      if (got[j].stats == null) say('  ' + got[j].date + ': FAILED — ' + got[j].err);
+    }
+    say('  CAT     SEASON      days 1..today   days 1..yesterday');
+    var incl = 0, excl = 0, tested = 0;
+    for (var oi = 0; oi < order.length; oi++) {
+      id = String(order[oi]);
+      var m = statsMeta[id] || {};
+      // Counting stats only: a rate does not add across days, so summing one
+      // would prove nothing about either hypothesis.
+      if (typeof _skIsCountingCatStat === 'function' && !_skIsCountingCatStat(m)) continue;
+      var sv = parseFloat(season[id]);
+      if (isNaN(sv)) continue;
+      var sumAll = 0, sumPrior = 0, haveAny = false;
+      for (j = 0; j < got.length; j++) {
+        if (!got[j].stats) continue;
+        var dv = parseFloat(got[j].stats[id]);
+        if (isNaN(dv)) continue;
+        haveAny = true;
+        sumAll += dv;
+        if (got[j].date !== today) sumPrior += dv;
+      }
+      if (!haveAny) continue;
+      tested++;
+      var okAll = Math.abs(sumAll - sv) < 0.001;
+      var okPri = Math.abs(sumPrior - sv) < 0.001;
+      if (okAll) incl++;
+      if (okPri) excl++;
+      var lbl = (m.abbr || m.displayName || ('#' + id));
+      while (lbl.length < 7) lbl += ' ';
+      say('  ' + lbl + ' ' + _skRlPad(sv) + _skRlPad(sumAll) + (okAll ? '✓' : ' ') +
+          '        ' + _skRlPad(sumPrior) + (okPri ? '✓' : ' '));
+    }
+    say('');
+    if (!tested) {
+      say('  No counting category has numbers yet — run this after a night of games.');
+    } else if (incl === tested && excl !== tested) {
+      say('  → SEASON ALREADY INCLUDES TODAY (' + incl + '/' + tested + ').');
+      say('    The standings are live as they stand; adding today would double it.');
+    } else if (excl === tested && incl !== tested) {
+      say('  → SEASON STOPS AT YESTERDAY (' + excl + '/' + tested + ').');
+      say('    Live standings = season + today, re-ranked.');
+    } else if (incl === tested && excl === tested) {
+      say('  → Both match, which means today is still all zeros. Re-run once');
+      say('    a game has finished today.');
+    } else {
+      say('  → NEITHER matches cleanly (incl ' + incl + '/' + tested +
+          ', excl ' + excl + '/' + tested + ').');
+      say('    The season total is not a plain sum of these days — do not add.');
+    }
+    _skGpProbeShow(lines.join('\n'));
+  });
+}
+
+function _skRlPad(v) {
+  var s = String(Math.round(v * 1000) / 1000);
+  while (s.length < 11) s += ' ';
+  return s;
 }
 
 // ── Roto season grid ── ROTOSEASON ──
