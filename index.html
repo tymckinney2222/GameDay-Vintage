@@ -120439,6 +120439,78 @@ function skProbeRotoDaily() {
   });
 }
 
+var _skRotoDayCache = {};      // "leagueKey|date" -> { vals: {teamKey:{id:str}}, ts }
+var _skRotoDayBusy = {};
+var _skRsMode = {};            // league key -> 'season' | 'today'
+
+function skSetRotoGridMode(key, mode) {
+  _skRsMode[key] = mode;
+  delete _skRsSort[key];       // the two views sort on different numbers
+  var host = document.getElementById('skRotoSeasonGrid');
+  if (!host) return;
+  var lk = (typeof skState !== 'undefined' && skState.activeLeagueKey) || key;
+  var lg = null, all = (typeof fyLeagues !== 'undefined' && fyLeagues) ? fyLeagues : [], i;
+  for (i = 0; i < all.length; i++) if (all[i].league_key === lk) lg = all[i];
+  var data = (typeof skLeagueData !== 'undefined') ? skLeagueData[lk] : null;
+  if (!lg || !data) return;
+  try { host.outerHTML = _skRotoSeasonGridHtml(lg, data); } catch (e) {}
+}
+
+// One request, every team, one day. ROTODAILY2
+function _skRotoDayLoad(leagueKey, dateStr) {
+  var ck = leagueKey + '|' + dateStr;
+  var hit = _skRotoDayCache[ck];
+  var today = (typeof _todayDateString === 'function') ? _todayDateString() : '';
+  if (hit) {
+    if (dateStr < today) return;                               // past days are settled
+    if (hit.ts && (Date.now() - hit.ts) < 5 * 60 * 1000) return;
+  }
+  if (_skRotoDayBusy[ck]) return;
+  if (typeof fyApi !== 'function') return;
+  _skRotoDayBusy[ck] = 1;
+  fyApi('/league/' + leagueKey + '/teams/stats;type=date;date=' + dateStr)
+    .then(function (res) {
+      var vals = {};
+      try {
+        var teamsNode = res.fantasy_content.league[1].teams;
+        var cnt = parseInt(teamsNode.count, 10) || 0, ti, hj, q;
+        for (ti = 0; ti < cnt; ti++) {
+          var tw = teamsNode[String(ti)] && teamsNode[String(ti)].team;
+          if (!tw) continue;
+          var tk = '';
+          var head = tw[0] || [];
+          for (hj = 0; hj < head.length; hj++) {
+            if (head[hj] && head[hj].team_key) tk = head[hj].team_key;
+          }
+          if (!tk) continue;
+          var one = {};
+          var arr = tw[1] && tw[1].team_stats && tw[1].team_stats.stats;
+          var list = arr ? ((typeof _yahooArr === 'function') ? _yahooArr(arr) : arr) : [];
+          for (q = 0; q < list.length; q++) {
+            var s = list[q] && list[q].stat;
+            if (s && s.stat_id != null) one[String(s.stat_id)] = String(s.value);
+          }
+          vals[tk] = one;
+        }
+      } catch (e) {}
+      _skRotoDayCache[ck] = { vals: vals, ts: Date.now() };
+      delete _skRotoDayBusy[ck];
+      // Repaint only if this league's grid is still the one on screen and
+      // still asking for that day.
+      try {
+        var lk = (typeof skState !== 'undefined' && skState.activeLeagueKey) || '';
+        if (lk === leagueKey && _skRsMode[leagueKey] === 'today') {
+          skSetRotoGridMode(leagueKey, 'today');
+        }
+      } catch (e2) {}
+    })
+    .catch(function () {
+      delete _skRotoDayBusy[ck];
+      // Left uncached on purpose: a failed day should be retried on the next
+      // open rather than remembered as an empty one.
+    });
+}
+
 // ── Roto season grid ── ROTOSEASON ──
 //
 // Every team's season total in every category, which is the table the ESPN
@@ -120505,12 +120577,19 @@ function _skRotoDerivePoints(teams, order, statsMeta) {
       vals.push(isNaN(v) ? null : v);
     }
     for (i = 0; i < teams.length; i++) {
-      if (vals[i] == null) continue;
+      var mineV = vals[i];
       var better = 0, same = 0;
       for (j = 0; j < teams.length; j++) {
-        if (vals[j] == null) continue;
-        if (vals[j] === vals[i]) same++;
-        else if (lowerWins ? (vals[j] < vals[i]) : (vals[j] > vals[i])) better++;
+        var vj = vals[j];
+        if (mineV == null) {
+          // ROTONULLRANK — nothing scored yet is LAST, and every team in the
+          // same position is tied with me there.
+          if (vj == null) same++; else better++;
+        } else {
+          if (vj == null) continue;          // they are behind me, not ahead
+          if (vj === mineV) same++;
+          else if (lowerWins ? (vj < mineV) : (vj > mineV)) better++;
+        }
       }
       if (!same) continue;
       var tot = 0, q;
@@ -120580,13 +120659,39 @@ function _skRotoSeasonGridHtml(league, data, metaOverride) {
   var key = league.league_key;
   var teams = _skRotoGridTeams(data);
   var myKey = (data && data.team && data.team.team_key) || '';
+  // ROTODAILY2 — same grid, two sources. SEASON is already in memory; TODAY is
+  // one request for the whole league, which the probe confirmed matches the
+  // per-team numbers exactly.
+  var mode = (_skRsMode[key] === 'today') ? 'today' : 'season';
+  var day = (typeof _todayDateString === 'function') ? _todayDateString() : '';
+  var dayHit = (mode === 'today') ? _skRotoDayCache[key + '|' + day] : null;
+  if (mode === 'today') _skRotoDayLoad(key, day);
+  function toggle() {
+    var kA = String(key).replace(/'/g, '');
+    function btn(m, lbl) {
+      var on = (mode === m);
+      return '<button onclick="skSetRotoGridMode(\'' + kA + '\',\'' + m + '\')" ' +
+        'style="font-family:var(--sk-font-mono,monospace);font-size:9px;font-weight:700;' +
+        'letter-spacing:0.09em;padding:5px 11px;border-radius:7px;cursor:pointer;' +
+        'border:1px solid ' + (on ? 'var(--sk-gold)' : 'var(--sk-border)') + ';' +
+        'background:' + (on ? 'rgba(245,197,24,0.10)' : 'transparent') + ';' +
+        'color:' + (on ? 'var(--sk-gold)' : 'var(--sk-text-3)') + ';">' + lbl + '</button>';
+    }
+    return '<div style="display:flex;gap:6px;padding:0 12px 8px;">' +
+      btn('season', 'SEASON') + btn('today', 'TODAY') + '</div>';
+  }
   function shell(msg) {
     return '<div class="sk-rp" id="skRotoSeasonGrid">' +
-      '<div class="sk-rp-head"><div class="sk-rp-title">SEASON BY CATEGORY</div>' +
+      '<div class="sk-rp-head"><div class="sk-rp-title">BY CATEGORY</div>' +
       '<div class="sk-rp-sub">every team’s totals, from Yahoo’s own numbers</div></div>' +
-      '<div class="sk-rp-empty">' + skEscape(msg) + '</div></div>';
+      toggle() + '<div class="sk-rp-empty">' + skEscape(msg) + '</div></div>';
   }
   if (teams.length < 2) return shell('Waiting on league standings.');
+  if (mode === 'today') {
+    if (!dayHit) return shell('Loading today’s numbers\u2026');
+    var dv = dayHit.vals || {}, dt;
+    for (dt = 0; dt < teams.length; dt++) teams[dt].raw = dv[teams[dt].key] || {};
+  }
 
   var meta = metaOverride ||
     ((typeof leagueSettingsCache !== 'undefined' && leagueSettingsCache[key])
@@ -120637,8 +120742,9 @@ function _skRotoSeasonGridHtml(league, data, metaOverride) {
   var stick = 'position:sticky;left:0;z-index:2;background:var(--sk-bg-card);';
   var kAttr = String(key).replace(/'/g, '');
   var h = '<div class="sk-rp" id="skRotoSeasonGrid">' +
-    '<div class="sk-rp-head"><div class="sk-rp-title">SEASON BY CATEGORY</div>' +
+    '<div class="sk-rp-head"><div class="sk-rp-title">BY CATEGORY</div>' +
     '<div class="sk-rp-sub">every team’s totals, from Yahoo’s own numbers</div></div>' +
+    toggle() +
     '<div style="overflow-x:auto;-webkit-overflow-scrolling:touch;padding:0 12px;">' +
     '<table style="border-collapse:collapse;font-size:11.5px;min-width:100%;">';
 
@@ -120676,10 +120782,20 @@ function _skRotoSeasonGridHtml(league, data, metaOverride) {
   }
   h += '</tbody></table></div>';
   h += '<div style="color:rgba(255,255,255,0.28);font-size:9.5px;margin:8px 12px 0;line-height:1.5;">' +
-    'Season totals from Yahoo’s own per-team values · in this league’s scoring order ' +
+    (mode === 'today'
+      ? 'Today’s totals for every team, in one request · ' + slEsc(day)
+      : 'Season totals from Yahoo’s own per-team values') +
+    ' · in this league’s scoring order ' +
     '· tap a column to sort, TEAM to reset · swipe sideways for the rest.</div>';
-  h += '<div style="padding:0 12px 10px;">' +
-    _skRotoReconcileHtml(teams, order, statsMeta, myKey) + '</div>';
+  // The season totals are what the roto points are derived FROM, so the check
+  // that the derivation reads them right belongs under those and nowhere else:
+  // a single day has no published points to be checked against. ROTODAILY2
+  if (mode !== 'today') {
+    h += '<div style="padding:0 12px 10px;">' +
+      _skRotoReconcileHtml(teams, order, statsMeta, myKey) + '</div>';
+  } else {
+    h += '<div style="height:10px"></div>';
+  }
   return h + '</div>';
 }
 
