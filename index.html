@@ -117346,7 +117346,13 @@ function _fxScoreStatMap(sport, scoring, statMap, pos, ctx) {
       var rcontrib = _fxRangeContrib(band, val);
       fp += rcontrib;
       if (val) scored.push({ code: code, pts: pts, val: val, contrib: rcontrib,
-                             rule: _fxBandText(band), band: band });
+                             rule: _fxBandText(band), band: band,
+                             // FXRANGEFLOOR - the config this band was read
+                             // out of, so the probe shows the source and the
+                             // result together.
+                             rngType: (rule && rule.type) || '',
+                             rngCum: !!(rule && rule.cum),
+                             raw: c.raw || '' });
       continue;
     }
     // A flat points value — and an absent one counts as nothing rather than
@@ -119551,10 +119557,22 @@ function skProbeFantraxScoring() {
           var _b = _rl.bands[_bi];
           _bt.push('from ' + (_b.from == null ? '\u2212\u221e' : _b.from) +
                    ' to ' + (_b.to == null ? '\u221e' : _b.to) +
-                   ', award ' + _b.pts + ' per ' + _b.step);
+                   ', award ' + _b.pts + ' per ' + _b.step +
+                   // FXRANGEFLOOR - this line is read straight against the
+                   // league's rules page, so it has to say where the steps
+                   // are counted from, not just the rate.
+                   (_fxBandBase(_b)
+                      ? ' (counted from ' + _fxBandBase(_b) + ')'
+                      : ((_b.from != null && Number(_b.from) > 0)
+                           ? ' (above a minimum of ' + _b.from + ', whole value scores)'
+                           : '')) +
+                   (_b.hadInt ? '' : ' [interval defaulted]'));
         }
         say('    ' + (_rr[_ri].g ? _rr[_ri].g + ' \u00b7 ' : '') +
-            (_rc.abbr || _rc.name) + '  [' + (_rl.type || 'no rangeType') + ']');
+            (_rc.abbr || _rc.name) + '  [' + (_rl.type || 'no rangeType') +
+            ', cumulative=' + (_rl.cum ? 'true' : 'false') + ']');
+        // FXRANGEFLOOR - the config verbatim, next to the reading of it.
+        if (_rc.raw) say('      cfg: ' + _rc.raw);
         say('      ' + _bt.join('  |  '));
         var _rt = _fxRangeRate(_rl);
         if (_rt != null) say('      = ' + _rt + ' points per unit of the stat');
@@ -120397,7 +120415,17 @@ function skProbeFantraxFp() {
         if (x.band) {
           body.push('         band: from ' + (x.band.from == null ? '(none)' : x.band.from) +
             '  to ' + (x.band.to == null ? '(none)' : x.band.to) +
-            '  step ' + x.band.step + '  pts ' + x.band.pts);
+            '  step ' + x.band.step + '  pts ' + x.band.pts +
+            (x.band.hadInt ? '  interval declared' : '  interval DEFAULTED to 1'));
+          // FXRANGEFLOOR - the two readings of a lower bound, and which one
+          // this band got. The raw config is the only thing that can settle
+          // whether the engine picked right.
+          var _bb = (typeof _fxBandBase === 'function') ? _fxBandBase(x.band) : 0;
+          body.push('         steps counted from ' + _bb +
+            (_bb ? '  (bound read as a TIER)' : '  (bound read as a MINIMUM)') +
+            '  cumulative=' + (x.rngCum ? 'true' : 'false') +
+            '  ' + (x.rngType || 'no rangeType'));
+          if (x.raw) body.push('         cfg : ' + x.raw);
         }
       }
       if (res.unscored && res.unscored.length) body.push('     can’t map : ' + res.unscored.join(', '));
@@ -166325,10 +166353,23 @@ function _fxCfgRanges(cfg) {
     if (isNaN(step) || step <= 0) step = 1;
     var from = parseFloat(b.start), to = parseFloat(b.end);
     bands.push({ from: isNaN(from) ? null : from, to: isNaN(to) ? null : to,
-                 pts: pts, step: step });
+                 pts: pts, step: step,
+                 // Did the config DECLARE an interval, or did the default of 1
+                 // above supply it? A band that names its own interval is a
+                 // stepped award; one that doesn't may be a flat award for
+                 // landing in the range at all. Nothing branches on this yet
+                 // - it is here so the probe can show which kind each band is
+                 // instead of showing the default back as if it were data.
+                 // FXRANGEFLOOR
+                 hadInt: !isNaN(parseFloat(r.interval)) });
   }
   if (!bands.length) return null;
-  return { type: String(cfg.rangeType || ''), bands: bands };
+  // `cumulative` is true on the one range config ever dumped. If it turns out
+  // to be the field that separates a band measured from its own floor from one
+  // that scores the whole value, this is the flag to branch on - which is why
+  // it is carried rather than dropped. FXRANGEFLOOR
+  return { type: String(cfg.rangeType || ''), cum: (cfg.cumulative === true),
+           bands: bands };
 }
 
 // The band covering a value, or null when none does. Ultimate Roulette's
@@ -166358,10 +166399,46 @@ function _fxRangeBand(rule, val) {
 //
 // A band with no lower bound behaves as it always did apart from the
 // rounding, so this cannot overcharge a league that has no threshold.
+// ---- FXRANGEFLOOR ----
+// Where a band's steps are counted FROM. A band's lower bound turns out to
+// mean one of two things, and the measurements say which:
+//
+//   TIME ON ICE   from 1, step 0.1, 1 pt   2:21 -> 13    4:55 -> 39
+//                                          8:02 -> 70    4:41 -> 36
+//     All four are floor((minutes - 1) / 0.1). Counted from zero they would
+//     be 23, 49, 80 and 46. The floor of 1 is a tier boundary: the first
+//     minute pays nothing and the band scores only what sits above it.
+//
+//   PLUS/MINUS    from 1, step 1,  10 pts  +1 -> 10
+//     Counted from the floor that is 0, which is what this engine paid for a
+//     +1 game until this change and what Fantrax does not. Counted from zero
+//     it is 10, which Fantrax does. Here the floor of 1 is a MINIMUM the
+//     stat has to clear, after which the whole value scores.
+//
+// Both bands carry from = 1, so the bound alone cannot tell them apart. What
+// separates them in the data available is how far the bound sits above zero
+// in units of the band's own step: ten steps up for time on ice, one step up
+// for plus/minus. A bound one step above zero is the smallest bound that can
+// still exclude a value of nothing, which is what a minimum is for; a bound
+// many steps up is excluding real quantity, which is what a tier is for.
+//
+// Two steps is therefore the line. It is a reading of five measurements, not
+// a rule read off Fantrax's own config, and it predicts +3 plus/minus pays 30
+// rather than 20 - sensible for a per-unit category, still unconfirmed. The
+// probe now dumps each band's raw config so `cumulative` or a declared
+// interval can replace this with something read rather than inferred.
+function _fxBandBase(b) {
+  if (!b || b.from == null) return 0;
+  var from = Number(b.from);
+  if (isNaN(from) || from <= 0) return 0;
+  var step = Number(b.step);
+  if (!(step > 0)) return 0;
+  return (from >= step * 2) ? from : 0;
+}
+
 function _fxRangeContrib(b, val) {
   if (!b || val == null || isNaN(val) || !b.step) return 0;
-  var base = (b.from != null) ? Number(b.from) : 0;
-  if (isNaN(base)) base = 0;
+  var base = _fxBandBase(b);
   var steps = (val - base) / b.step;
   if (steps < 0) steps = 0;
   // The epsilon is for binary fractions, not for generosity: 2 / 0.1 is
@@ -166388,7 +166465,15 @@ function _fxRangeRate(rule) {
 
 // "1 per 0.1" — how a band reads in a tooltip.
 function _fxBandText(b) {
-  return b ? (b.pts + ' per ' + b.step) : '';
+  if (!b) return '';
+  var t = b.pts + ' per ' + b.step;
+  // FXRANGEFLOOR - "1 per 0.1 above 1" and "10 per 1 (min 1)" are different
+  // sums, and which one a term got is the first thing to check when a total
+  // disagrees with Fantrax's own breakdown by a round amount.
+  var base = _fxBandBase(b);
+  if (base) return t + ' above ' + base;
+  if (b.from != null && Number(b.from) > 0) return t + ' (min ' + b.from + ')';
+  return t;
 }
 function _fxCfgWeight(cfg) {
   if (!cfg) return 1;
