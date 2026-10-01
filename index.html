@@ -18505,6 +18505,54 @@
   .sk-lg-row .pl { font-family: var(--sk-font-mono); font-size: 10.5px; color: var(--sk-text-3); }
   .sk-lg-row .pl.lead { color: var(--sk-gold); font-weight: 700; }
   .sk-lg-row .pl.top { color: #4ade80; } .sk-lg-row .pl.low { color: #f87171; }
+  /* ---- SKCATBOARD ---- Yahoo-shaped category board. Three columns with a
+     fixed centre so every category chip lines up down the page however wide
+     the numbers get; the winning side is a filled pill rather than coloured
+     text, which is what reads at a glance on a phone. */
+  .sk-cb { margin: 0 0 14px; }
+  .sk-cb-head {
+    display: flex; align-items: flex-start; gap: 8px;
+    padding: 10px 12px 12px; border-bottom: 1px solid rgba(255,255,255,0.08);
+  }
+  .sk-cb-side { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+  .sk-cb-side.r { text-align: right; }
+  .sk-cb-side .nm {
+    font-size: 12.5px; font-weight: 700; color: rgba(255,255,255,0.9);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .sk-cb-side .gp {
+    font-family: var(--sk-font-mono, monospace); font-size: 9.5px;
+    color: rgba(255,255,255,0.34); letter-spacing: 0.04em;
+  }
+  .sk-cb-score {
+    flex: 0 0 auto; text-align: center; font-family: var(--sk-font-mono, monospace);
+    font-size: 19px; font-weight: 700; color: #fff; line-height: 1.1;
+  }
+  .sk-cb-score i { font-style: normal; color: rgba(255,255,255,0.3); margin: 0 3px; }
+  .sk-cb-score span {
+    display: block; font-size: 8.5px; letter-spacing: 0.12em;
+    color: rgba(255,255,255,0.3); font-weight: 400; margin-top: 2px;
+  }
+  .sk-cb-grp {
+    text-align: center; font-size: 11px; font-weight: 700;
+    color: rgba(255,255,255,0.72); padding: 12px 0 6px;
+  }
+  .sk-cb-row { display: flex; align-items: center; gap: 8px; padding: 3px 12px; }
+  .sk-cb-row .v {
+    flex: 1; min-width: 0; text-align: center; padding: 7px 4px;
+    font-family: var(--sk-font-mono, monospace); font-size: 13px;
+    color: rgba(255,255,255,0.88);
+  }
+  .sk-cb-row .c {
+    flex: 0 0 52px; text-align: center; padding: 4px 0; border-radius: 5px;
+    background: rgba(255,255,255,0.07); font-size: 10px; font-weight: 700;
+    letter-spacing: 0.04em; color: rgba(255,255,255,0.62);
+  }
+  .sk-cb-note {
+    font-size: 10px; line-height: 1.5; color: rgba(255,255,255,0.3);
+    padding: 10px 12px 2px;
+  }
+
   /* SKMP — All my players */
   .sk-mp-top { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin: 4px 0 8px; font-size: 12px; }
   .sk-mp-top .bad { color: #f87171; font-weight: 700; } .sk-mp-top .ok { color: #4ade80; font-weight: 700; }
@@ -92862,35 +92910,38 @@ function _skYwExtRoster(row) {
 }
 // Kept for callers of the Sleeper-only name.
 function _skYwSleeperRoster(row) { return _skYwExtRoster(row); }
-function _skYwGridLoadExt(sport, league, gpw, reqId) {
-  var row = league._slRow;
-  _skExtPrep(row).then(function () {
-    if (reqId !== _skYourWeekReq) return;
-    var host = document.getElementById('skYwGrid');
-    if (!host) return;
-    var myId = _skExtMyId(row);
-    var mineItems = ((row.rosters && row.rosters.byTeam && row.rosters.byTeam[myId]) || {}).items || [];
-    var slots = [];
-    mineItems.forEach(function (it) { if (it.starter && it.slot) slots.push(it.slot); });
-    if (!slots.length) { host.innerHTML = ''; return; }
-    var oppId = null, oppName = 'Opponent';
-    ((row.liveScores && row.liveScores.games) || []).forEach(function (gm) {
-      if (String(gm.awayId) === String(myId)) { oppId = String(gm.homeId); oppName = gm.home; }
-      else if (String(gm.homeId) === String(myId)) { oppId = String(gm.awayId); oppName = gm.away; }
-    });
-    var oppItems = oppId && row.rosters.byTeam[oppId] ? row.rosters.byTeam[oppId].items : null;
-    var W = _skYwWeek(sport, _skYwExtItemsToMap(row, mineItems), slots, gpw);
-    var T = oppItems ? _skYwWeek(sport, _skYwExtItemsToMap(row, oppItems), slots, gpw) : null;
-    host.innerHTML = _skYwGridHtml(W, T, slots.length, gpw.days, oppName || 'Opponent');
-  });
-}
-
-function _skYwGridLoad(sport, league, gpw, reqId) {
-  var host = document.getElementById('skYwGrid');
-  if (!host || !gpw || !gpw.byDay) { if (host) host.innerHTML = ''; return; }
-  if (league && league._slRow) {   // SKYWSLP / SKYWESP
-    _skYwGridLoadExt(sport, league, gpw, reqId);
-    return;
+// ── SKYWALL ── One league's week, as numbers rather than as markup.
+//
+// This was two loaders that each fetched AND rendered. The all-leagues
+// summary needs the same numbers for every league at once, and a second
+// implementation of "what does this league's week look like" is exactly the
+// kind of thing that drifts until the modal and the card disagree in front
+// of you. So the fetching lives here and returns data; the two callers below
+// render it, and so does the summary.
+//
+// Resolves { W, T, nSlots, oppName } — W is this team's per-day
+// {playing, usable}, T the opponent's where there is one — or null when the
+// league has no usable lineup to measure.
+function _skYwRowsFor(sport, league, gpw) {
+  if (!gpw || !gpw.byDay) return Promise.resolve(null);
+  if (league && league._slRow) {
+    var row = league._slRow;
+    return _skExtPrep(row).then(function () {
+      var myId = _skExtMyId(row);
+      var mineItems = ((row.rosters && row.rosters.byTeam && row.rosters.byTeam[myId]) || {}).items || [];
+      var slots = [];
+      mineItems.forEach(function (it) { if (it.starter && it.slot) slots.push(it.slot); });
+      if (!slots.length) return null;
+      var oppId = null, oppName = 'Opponent';
+      ((row.liveScores && row.liveScores.games) || []).forEach(function (gm) {
+        if (String(gm.awayId) === String(myId)) { oppId = String(gm.homeId); oppName = gm.home; }
+        else if (String(gm.homeId) === String(myId)) { oppId = String(gm.awayId); oppName = gm.away; }
+      });
+      var oppItems = oppId && row.rosters.byTeam[oppId] ? row.rosters.byTeam[oppId].items : null;
+      return { W: _skYwWeek(sport, _skYwExtItemsToMap(row, mineItems), slots, gpw),
+               T: oppItems ? _skYwWeek(sport, _skYwExtItemsToMap(row, oppItems), slots, gpw) : null,
+               nSlots: slots.length, oppName: oppName || 'Opponent' };
+    })['catch'](function () { return null; });
   }
   var key = league.league_key;
   var ld = (typeof skLeagueData === 'object' && skLeagueData) ? skLeagueData[key] : null;
@@ -92900,12 +92951,9 @@ function _skYwGridLoad(sport, league, gpw, reqId) {
   var today = (typeof _todayDateString === 'function') ? _todayDateString() : '';
   var pm = myKey ? fetchTeamFpForDate(myKey, today)['catch'](function () { return null; }) : Promise.resolve(null);
   var po = oppKey ? fetchTeamFpForDate(oppKey, today)['catch'](function () { return null; }) : Promise.resolve(null);
-  Promise.all([pm, po]).then(function (r) {
-    if (reqId !== _skYourWeekReq) return;
-    var h2 = document.getElementById('skYwGrid');
-    if (!h2) return;
+  return Promise.all([pm, po]).then(function (r) {
     var mine = r[0], theirs = r[1];
-    if (!mine) { h2.innerHTML = ''; return; }
+    if (!mine) return null;
     // Lineup slots: the league's settings, or today's lineup shape.
     var slots = (typeof _skBankSlots === 'function') ? _skBankSlots(key) : [];
     if (!slots.length) {
@@ -92915,16 +92963,32 @@ function _skYwGridLoad(sport, league, gpw, reqId) {
         if (sp && sp !== 'BN' && sp !== 'IL' && sp !== 'IL+' && sp !== 'IR' && sp !== 'IR+' && sp !== 'NA') slots.push(mine[k].selectedPos);
       }
     }
-    var W = _skYwWeek(sport, mine, slots, gpw);
-    var T = theirs ? _skYwWeek(sport, theirs, slots, gpw) : null;
-    h2.innerHTML = _skYwGridHtml(W, T, slots.length, gpw.days, mu.oppName || 'Opponent');
+    return { W: _skYwWeek(sport, mine, slots, gpw),
+             T: theirs ? _skYwWeek(sport, theirs, slots, gpw) : null,
+             nSlots: slots.length, oppName: mu.oppName || 'Opponent' };
+  })['catch'](function () { return null; });
+}
+
+function _skYwGridLoad(sport, league, gpw, reqId) {
+  var host = document.getElementById('skYwGrid');
+  if (!host || !gpw || !gpw.byDay) { if (host) host.innerHTML = ''; return; }
+  _skYwRowsFor(sport, league, gpw).then(function (R) {
+    if (reqId !== _skYourWeekReq) return;
+    var h2 = document.getElementById('skYwGrid');
+    if (!h2) return;
+    h2.innerHTML = R ? _skYwGridHtml(R.W, R.T, R.nSlots, gpw.days, R.oppName, sport) : '';
   });
 }
-function _skYwGridHtml(W, T, nSlots, days, oppName) {
+
+function _skYwGridHtml(W, T, nSlots, days, oppName, sport) {
   var DOW = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
   var todayD = new Date(); todayD.setHours(0, 0, 0, 0);
   var play = 0, use = 0, tUse = 0, i, open = [], over = [];
-  var h = '<div class="sk-yw-grid"><div class="sk-yw-gh">Usable games <span>' + nSlots + ' active slots</span></div>' +
+  // SKYWALL - the header opens the same question asked of every league.
+  var h = '<div class="sk-yw-grid"><div class="sk-yw-gh" style="cursor:pointer" ' +
+    'onclick="skYwTodayAll(\'' + (sport || '') + '\')">Usable games <span>' + nSlots +
+    ' active slots</span><span style="float:right;color:var(--sk-gold,#f5c518);font-size:9px;' +
+    'letter-spacing:0.08em;">ALL LEAGUES \u203a</span></div>' +
     '<div class="sk-yw-gtbl"><div class="sk-yw-gr lbl"><span></span><span>Playing</span><span>Usable</span>' +
     (T ? '<span>Them</span>' : '') + '</div>';
   for (i = 0; i < W.length; i++) {
@@ -92958,6 +93022,169 @@ function _skYwGridHtml(W, T, nSlots, days, oppName) {
   return h;
 }
 
+// SKYWALL — every league of one sport, Yahoo and the ext providers alike.
+// Lifted out of _skHydrateYourWeek so the all-leagues summary asks the same
+// question of the same list; two filters would eventually disagree about
+// which leagues count.
+function _skYwSportLeagues(sport) {
+  var synced = (typeof skSyncedLeagues === 'function') ? skSyncedLeagues() : (fyLeagues || []);
+  var out = synced.filter(function (l) { return (l.sport || '').toLowerCase() === sport; });
+  ((typeof extSyncedLeagues === 'function') ? extSyncedLeagues() : []).forEach(function (r) {
+    if (_skIsDone(r.key)) return;   // SKDONE
+    if (String(r.sport || '').toLowerCase() !== sport || !r.myTeamIds) return;
+    if (r.provider === 'sleeper' && (!r.rosters || !r.rosters.byTeam)) return;
+    if (r.provider !== 'sleeper' && r.provider !== 'espn') return;   // SKYWESP — ESPN too
+    out.push({ league_key: r.key, name: r.name, sport: sport, _slRow: r });
+  });
+  return out;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// TONIGHT, EVERY LEAGUE ── SKYWALL ──
+// ──────────────────────────────────────────────────────────────────
+// The Usable Games card answers "how is tonight going to go" for ONE league,
+// and the only way to ask it of all of them was to tap each pill in turn.
+// This asks every league at once and puts the answers in one list, sorted by
+// what needs doing: games about to be wasted on a bench first, then empty
+// slots, then everything already set.
+//
+// It is the same _skYwRowsFor the card uses, run across the list, so a row
+// here and the card for that league can never disagree.
+var _skYwAllBusy = false;
+
+function _skYwTodayIdx(gpw) {
+  var today = (typeof _todayDateString === 'function') ? _todayDateString() : '';
+  var days = (gpw && gpw.days) || [];
+  for (var i = 0; i < days.length; i++) {
+    var d = days[i];
+    var str = (typeof d === 'string') ? d.slice(0, 10)
+      : (typeof _skLocalDayOf === 'function' ? _skLocalDayOf(d) : '');
+    if (str && str === today) return i;
+  }
+  return -1;
+}
+
+function skYwCloseAll() {
+  var el = document.getElementById('skYwAllSheet');
+  if (el && el.parentNode) el.parentNode.removeChild(el);
+}
+
+function _skYwAllShow(inner) {
+  var el = document.getElementById('skYwAllSheet');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'skYwAllSheet';
+    el.style.cssText = 'position:fixed;inset:0;z-index:9000;background:rgba(4,6,12,0.82);' +
+      'display:flex;align-items:flex-end;justify-content:center;';
+    el.onclick = function (ev) { if (ev.target === el) skYwCloseAll(); };
+    document.body.appendChild(el);
+  }
+  el.innerHTML = '<div style="width:100%;max-width:620px;max-height:86vh;overflow:auto;' +
+    'background:var(--sk-bg-card,#0e1320);border-top-left-radius:16px;border-top-right-radius:16px;' +
+    'border:1px solid var(--sk-border,rgba(255,255,255,0.1));border-bottom:0;padding:14px 14px 22px;">' + inner + '</div>';
+}
+
+function skYwTodayAll(sport) {
+  sport = String(sport || '').toLowerCase();
+  var leagues = _skYwSportLeagues(sport);
+  var mono = 'font-family:var(--sk-font-mono,monospace);';
+  function head(extra) {
+    return '<div style="display:flex;align-items:baseline;gap:8px;margin-bottom:10px;">' +
+      '<b style="' + mono + 'font-size:11px;letter-spacing:0.12em;color:var(--sk-gold,#f5c518);">TONIGHT, EVERY LEAGUE</b>' +
+      '<span style="color:rgba(255,255,255,0.32);font-size:10px;">' + extra + '</span>' +
+      '<button onclick="skYwCloseAll()" style="margin-left:auto;' + mono + 'font-size:10px;' +
+      'letter-spacing:0.1em;padding:5px 11px;border-radius:7px;cursor:pointer;' +
+      'border:1px solid var(--sk-border,rgba(255,255,255,0.14));background:transparent;' +
+      'color:rgba(255,255,255,0.6);">CLOSE</button></div>';
+  }
+  if (!leagues.length) { _skYwAllShow(head('') + '<div style="color:rgba(255,255,255,0.4);font-size:12px;">No ' +
+    skEscape(sport.toUpperCase()) + ' leagues synced.</div>'); return; }
+  if (_skYwAllBusy) return;
+  _skYwAllBusy = true;
+  _skYwAllShow(head(leagues.length + ' leagues') +
+    '<div style="color:rgba(255,255,255,0.4);font-size:12px;">Reading tonight\u2019s lineups\u2026</div>');
+
+  skGamesPerWeek(sport, 0).then(function (gpw) {
+    var idx = _skYwTodayIdx(gpw);
+    return Promise.all(leagues.map(function (l) {
+      return _skYwRowsFor(sport, l, gpw)['catch'](function () { return null; })
+        .then(function (R) { return { l: l, R: R }; });
+    })).then(function (rows) { return { rows: rows, idx: idx }; });
+  }).then(function (res) {
+    _skYwAllBusy = false;
+    var idx = res.idx;
+    if (idx < 0) {
+      _skYwAllShow(head('') + '<div style="color:rgba(255,255,255,0.4);font-size:12px;">' +
+        'Today isn\u2019t inside the loaded schedule week.</div>');
+      return;
+    }
+    var out = [], tPlay = 0, tUse = 0, tWaste = 0, misses = 0;
+    res.rows.forEach(function (x) {
+      if (!x.R || !x.R.W || !x.R.W[idx]) { misses++; return; }
+      var w = x.R.W[idx];
+      var them = (x.R.T && x.R.T[idx]) ? x.R.T[idx].usable : null;
+      var wasted = w.playing - w.usable;
+      var openN = w.playing ? (x.R.nSlots - w.usable) : 0;
+      tPlay += w.playing; tUse += w.usable; tWaste += Math.max(0, wasted);
+      out.push({ name: x.l.name || x.l.league_key, plat: x.l._slRow ? x.l._slRow.provider : 'yahoo',
+                 playing: w.playing, usable: w.usable, wasted: wasted,
+                 open: openN, them: them, oppName: x.R.oppName, slots: x.R.nSlots });
+    });
+    // Sort by what wants doing: wasted games first, then empty slots.
+    out.sort(function (a, b) {
+      return (b.wasted - a.wasted) || (b.open - a.open) || (b.playing - a.playing);
+    });
+    var PL = { yahoo: ['Y', '#7b68ee'], sleeper: ['S', '#fbbf24'], espn: ['E', '#ef4444'], fantrax: ['F', '#34d399'] };
+    var h = head(out.length + ' of ' + leagues.length + ' leagues');
+    h += '<div style="' + mono + 'font-size:9px;letter-spacing:0.09em;color:rgba(255,255,255,0.3);' +
+      'display:flex;gap:8px;padding:0 2px 5px;"><span style="flex:1">LEAGUE</span>' +
+      '<span style="width:34px;text-align:right">PLAY</span>' +
+      '<span style="width:46px;text-align:right">USABLE</span>' +
+      '<span style="width:44px;text-align:right">THEM</span></div>';
+    out.forEach(function (r) {
+      var m = PL[r.plat] || ['?', '#aaa'];
+      var col = r.wasted > 0 ? '#f87171' : (r.open > 0 ? '#f5c518' : '#4ade80');
+      h += '<div style="display:flex;gap:8px;align-items:baseline;padding:7px 2px;' +
+        'border-top:1px solid rgba(255,255,255,0.06);">' +
+        '<span style="flex:1;min-width:0;font-size:12px;color:rgba(255,255,255,0.86);' +
+        'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' +
+        '<b style="color:' + m[1] + '">' + m[0] + '</b> ' + skEscape(r.name) + '</span>' +
+        '<span style="width:34px;text-align:right;' + mono + 'font-size:12px;color:rgba(255,255,255,0.6);">' + r.playing + '</span>' +
+        '<span style="width:46px;text-align:right;' + mono + 'font-size:12px;color:' + col + ';">' + r.usable +
+          (r.wasted > 0 ? '<i style="font-style:normal;font-size:10px;opacity:0.85;">\u2212' + r.wasted + '</i>' : '') + '</span>' +
+        '<span style="width:44px;text-align:right;' + mono + 'font-size:12px;color:rgba(255,255,255,0.38);">' +
+          (r.them == null ? '\u2014' : r.them) + '</span>' +
+      '</div>';
+      var note = [];
+      if (r.wasted > 0) note.push('<span style="color:#f87171">' + r.wasted + ' on the bench</span>');
+      if (r.open > 0 && r.playing > 0) note.push('<span style="color:#f5c518">' + r.open + ' open slot' + (r.open === 1 ? '' : 's') + '</span>');
+      if (!note.length && r.playing) note.push('<span style="color:#4ade80">lineup full</span>');
+      if (!r.playing) note.push('no games tonight');
+      if (r.them != null) note.push(skEscape(r.oppName) + ' ' + r.them);
+      h += '<div style="font-size:10px;color:rgba(255,255,255,0.34);padding:0 2px 4px;">' +
+        note.join(' \u00b7 ') + '</div>';
+    });
+    h += '<div style="margin-top:10px;padding-top:9px;border-top:1px solid rgba(255,255,255,0.12);' +
+      mono + 'font-size:11.5px;color:rgba(255,255,255,0.75);">' +
+      '<b style="color:var(--sk-gold,#f5c518)">' + tUse + '</b> of ' + tPlay + ' games usable tonight' +
+      (tWaste ? ' \u00b7 <span style="color:#f87171">' + tWaste + ' heading for a bench</span>' : '') +
+      '</div>';
+    if (misses) {
+      h += '<div style="font-size:10px;color:rgba(255,255,255,0.3);margin-top:5px;">' + misses +
+        ' league' + (misses === 1 ? '' : 's') + ' couldn\u2019t be read \u2014 no lineup loaded yet.</div>';
+    }
+    h += '<div style="font-size:10px;color:rgba(255,255,255,0.3);margin-top:8px;line-height:1.5;">' +
+      'Same arithmetic as the Usable Games card, run across every league. ' +
+      'USABLE is the most of tonight\u2019s games your active slots can hold; the red \u2212N would ' +
+      'sit on your bench. Sorted by what wants doing first.</div>';
+    _skYwAllShow(h);
+  })['catch'](function () {
+    _skYwAllBusy = false;
+    _skYwAllShow(head('') + '<div style="color:rgba(255,255,255,0.4);font-size:12px;">' +
+      'Couldn\u2019t read tonight\u2019s lineups.</div>');
+  });
+}
+
 var _skYourWeekReq = 0; // guards against stale async paints on fast re-render
 function _skHydrateYourWeek(sport) {
   sport = String(sport || '').toLowerCase();
@@ -92969,20 +93196,7 @@ function _skHydrateYourWeek(sport) {
   // (skLoadRosterForLeague is Yahoo-shaped); if the user has several of this
   // sport, use the first — the schedule strength is league-agnostic (it's the
   // player's real NBA/NHL team schedule, not fantasy matchups).
-  var synced = (typeof skSyncedLeagues === 'function') ? skSyncedLeagues() : (fyLeagues || []);
-  // SKYWPICK — every league of this sport, and which one is selected (or
-  // 'all'). Used to be simply the first league found.
-  var sportLeagues = synced.filter(function (l) { return (l.sport || '').toLowerCase() === sport; });
-  // SKYWSLP — Sleeper leagues join the By-league view: each one becomes a
-  // league pill, with its roster, usable-games grid and opponent read from
-  // the Sleeper data already loaded with your leagues.
-  ((typeof extSyncedLeagues === 'function') ? extSyncedLeagues() : []).forEach(function (r) {
-    if (_skIsDone(r.key)) return;   // SKDONE
-    if (String(r.sport || '').toLowerCase() !== sport || !r.myTeamIds) return;
-    if (r.provider === 'sleeper' && (!r.rosters || !r.rosters.byTeam)) return;
-    if (r.provider !== 'sleeper' && r.provider !== 'espn') return;   // SKYWESP — ESPN too
-    sportLeagues.push({ league_key: r.key, name: r.name, sport: sport, _slRow: r });
-  });
+  var sportLeagues = _skYwSportLeagues(sport);
   if (_skMpView[sport] === 'players') { _skMpRender(sport, panel); return; }
   if (!sportLeagues.length) { panel.innerHTML = ''; return; } // no league of this sport synced
   var selKey = _skYwSel[sport];
@@ -107329,6 +107543,109 @@ function _skClassifyCat(rawMy, rawOpp, sortOrder, isRate, daysPlayed, daysRemain
 
 // Build the Analysis pane HTML. Cats leagues only.
 // Returns "" if the data isn't ready yet (caller renders a placeholder).
+// ══════════════════════════════════════════════════════════════════
+// CATS SCOREBOARD ── SKCATBOARD ──
+// ──────────────────────────────────────────────────────────────────
+// The category matchup laid out the way Yahoo's own app lays it out: your
+// number on the left, the category in the middle, your opponent's on the
+// right, the side that is winning it filled in. Grouped by position type,
+// which is where "Forwards/Defensemen Total" and "Goaltenders Total" come
+// from — Yahoo tags every stat with one and the app already keeps it.
+//
+// WHO IS WINNING is Yahoo's own answer, not a recomputation. matchup.statWins
+// carries the stat_winners node, which already settles the rate categories
+// and the ties. Where Yahoo hasn't said, the comparison falls back to
+// sortOrder (0 means lower wins) and an exact tie reads as a tie.
+//
+// This sits ABOVE the tier analysis rather than replacing it. The tiers
+// answer "where can this still move", which is the question Yahoo's screen
+// does not answer; the board answers "where does it stand", which is the one
+// it does. Losing either would be a worse screen.
+function _skCatsBoardHTML(league, leagueData) {
+  var m = leagueData && leagueData.matchup;
+  if (!m || !m.hasMatchup) return '';
+  var myCats = m.myCats || {}, oppCats = m.oppCats || {};
+  if (!Object.keys(myCats).length) return '';
+  var settings = (typeof leagueSettingsCache !== 'undefined') ? leagueSettingsCache[league.league_key] : null;
+  var statsMeta = (settings && settings.stats) || {};
+  var order = (settings && settings.statOrder) || [];
+  if (!order.length) { for (var k0 in myCats) if (myCats.hasOwnProperty(k0)) order.push(k0); }
+
+  // Yahoo's own winner, where it said. SKCATBOARD
+  var sw = m.statWins || {};
+  function winnerOf(sid, mv, ov, meta) {
+    var rec = sw[String(sid)];
+    if (rec) {
+      if (rec.ties) return 'tie';
+      if (rec.wins) return 'me';
+      if (rec.losses) return 'opp';
+    }
+    var a = parseFloat(mv), b = parseFloat(ov);
+    if (isNaN(a) || isNaN(b)) return '';
+    if (a === b) return 'tie';
+    var lowerWins = (meta.sortOrder === 0);
+    return (lowerWins ? (a < b) : (a > b)) ? 'me' : 'opp';
+  }
+
+  // Position type splits the table the way Yahoo splits it. A league that
+  // tags nothing lands in one unnamed group, which is still correct.
+  var GRP = { P: 'Forwards/Defensemen Total', G: 'Goaltenders Total',
+              B: 'Batting Total', '': 'Total' };
+  var groups = [], byG = {};
+  for (var i = 0; i < order.length; i++) {
+    var sid = String(order[i]), meta = statsMeta[sid] || {};
+    if (meta.enabled === false || meta.isOnlyDisplayStat) continue;
+    if (myCats[sid] == null && oppCats[sid] == null) continue;
+    var gk = String(meta.positionType || '');
+    if (!byG[gk]) { byG[gk] = { key: gk, label: GRP[gk] || 'Total', rows: [] }; groups.push(byG[gk]); }
+    byG[gk].rows.push({
+      abbr: (meta.abbr || meta.displayName || meta.name || sid),
+      mine: (myCats[sid] == null || myCats[sid] === '') ? '\u2014' : String(myCats[sid]),
+      theirs: (oppCats[sid] == null || oppCats[sid] === '') ? '\u2014' : String(oppCats[sid]),
+      win: winnerOf(sid, myCats[sid], oppCats[sid], meta)
+    });
+  }
+  if (!groups.length) return '';
+
+  var W = (m.wins != null) ? m.wins : null, L = m.losses, T = m.ties;
+  var cap = (settings && settings.maxGamesPlayed) ? Number(settings.maxGamesPlayed) : null;
+  function gpLine(rem) {
+    if (rem == null || rem === '') return '';
+    var r = parseFloat(rem);
+    if (isNaN(r)) return '';
+    // Yahoo prints "7/32 Games Played" beside "25 Remaining"; the played
+    // figure is the cap less what is left. Without a cap only the remaining
+    // number is honest, so only that is shown.
+    if (cap && cap > 0) return (Math.max(0, cap - r)) + '/' + cap;
+    return r + ' left';
+  }
+  var hit = (typeof skEscape === 'function') ? skEscape : function (x) { return x; };
+  var fill = 'background:rgba(123,104,238,0.22);border-radius:6px;';
+  var h = '<div class="sk-cb">' +
+    '<div class="sk-cb-head">' +
+      '<div class="sk-cb-side"><span class="nm">' + hit(m.myName || 'You') + '</span>' +
+        '<span class="gp">' + hit(gpLine(m.myRemGames)) + '</span></div>' +
+      '<div class="sk-cb-score">' + (W == null ? '' : (W + '<i>\u2013</i>' + L + (T ? '<i>\u2013</i>' + T : ''))) +
+        '<span>categories</span></div>' +
+      '<div class="sk-cb-side r"><span class="nm">' + hit(m.oppName || 'Opponent') + '</span>' +
+        '<span class="gp">' + hit(gpLine(m.oppRemGames)) + '</span></div>' +
+    '</div>';
+  groups.forEach(function (G) {
+    h += '<div class="sk-cb-grp">' + hit(G.label) + '</div>';
+    G.rows.forEach(function (R) {
+      h += '<div class="sk-cb-row">' +
+        '<span class="v" style="' + (R.win === 'me' ? fill : '') + '">' + hit(R.mine) + '</span>' +
+        '<span class="c">' + hit(R.abbr) + '</span>' +
+        '<span class="v" style="' + (R.win === 'opp' ? fill : '') + '">' + hit(R.theirs) + '</span>' +
+      '</div>';
+    });
+  });
+  h += '<div class="sk-cb-note">Category totals as Yahoo reports them, with the side ' +
+    'currently winning each one filled in \u2014 Yahoo\u2019s own call on the rates and the ties. ' +
+    'Where each one can still move is below.</div>';
+  return h + '</div>';
+}
+
 function _skBuildCatsAnalysisHTML(league, leagueData) {
   if (!league || !leagueData) return '';
   var matchup = leagueData.matchup;
@@ -107340,6 +107657,9 @@ function _skBuildCatsAnalysisHTML(league, leagueData) {
   if (!Object.keys(myCats).length) {
     return '<div class="sk-empty-state" style="padding:24px 16px">Cat totals still loading\u2026</div>';
   }
+  // SKCATBOARD — the standings view first, the movement view under it.
+  var _board = '';
+  try { _board = _skCatsBoardHTML(league, leagueData) || ''; } catch (eB) { _board = ''; }
   var settings = leagueSettingsCache[league.league_key];
   var statsMeta = (settings && settings.stats) || {};
 
@@ -107588,7 +107908,11 @@ function _skBuildCatsAnalysisHTML(league, leagueData) {
       rowsHTML +
     '</div>';
 
-  return tableHTML;
+  // SKCATBOARD - the Yahoo-shaped standing first, the tier view under it.
+  // The two read left-to-right differently on purpose: the board is YOU on
+  // the left the way Yahoo prints it, the tier table keeps its own order
+  // because its columns are labelled with the team names.
+  return _board + tableHTML;
 }
 
 // ─────────────────────────────────────────────────────────────────
