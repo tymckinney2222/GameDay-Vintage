@@ -120839,19 +120839,179 @@ function _skRotoIsRateCat(m) {
 
 // season + today per team per category. Rates pass through untouched and are
 // named in `rates` so the caller can say so. ROTOLIVE2
+// ---- ROTOLIVE3 ----
+// A rate CAN be carried forward - just not by averaging it.
+//
+// Averaging season with today weights a handful of shots the same as a whole
+// season of them. A goalie on .917 for the year who faces 24 shots tonight
+// and stops 20 is .833 today; the mean of those two is .875, and the real
+// figure is 520/569 = .914. On a one-save night the mean reads .959 against
+// a true .918. The error is not small and it is not consistent in sign.
+//
+// The correct weight for each piece is its own DENOMINATOR, and a mean
+// weighted by denominators is algebraically identical to just adding the
+// components up:
+//
+//   (SVs + SVt) / (SAs + SAt)
+//
+// So a rate is rebuilt from its parts rather than averaged. Those parts are
+// usually scored categories in their own right - this league scores SV and
+// GA alongside SV% - and Yahoo also returns values for its display-only
+// stats, which is where a component like goalie minutes lives.
+//
+// ---- The gate ----
+// Matching a component by its label is a guess, and a wrong one would be
+// invisible: a plausible number in the right range, ranked against twenty
+// teams. So no recipe is ever trusted on sight. Each one is rebuilt from
+// SEASON components and checked against the season rate Yahoo published, for
+// every team that has one. It is used for the live number only if it
+// reproduces the published number everywhere. Otherwise the category is held
+// at its season value and the reason is named on screen.
+function _rcp(lbl, re) { return { lbl: lbl, re: re }; }
+var SK_ROTO_RATE_RECIPES = [
+  // NHL
+  { re: /^SV%$|SAVE\s*(PCT|PERCENT)/i,
+    num: [_rcp('SV', /^SV$|^SAVES$/i)],
+    den: [_rcp('SV', /^SV$|^SAVES$/i), _rcp('GA', /^GA$|^GOALS\s*AGAINST$/i)], scale: 1 },
+  { re: /^GAA$|GOALS\s*AGAINST\s*AVERAGE/i,
+    num: [_rcp('GA', /^GA$|^GOALS\s*AGAINST$/i)],
+    den: [_rcp('goalie minutes', /^MIN$|^MINS$|^MINUTES$|GOALIE\s*MINUTES/i)], scale: 60 },
+  // NBA
+  { re: /^FG%$|FIELD\s*GOAL\s*(PCT|PERCENT)/i,
+    num: [_rcp('FGM', /^FGM$|FIELD\s*GOALS?\s*MADE/i)],
+    den: [_rcp('FGA', /^FGA$|FIELD\s*GOALS?\s*ATTEMPT/i)], scale: 1 },
+  { re: /^FT%$|FREE\s*THROW\s*(PCT|PERCENT)/i,
+    num: [_rcp('FTM', /^FTM$|FREE\s*THROWS?\s*MADE/i)],
+    den: [_rcp('FTA', /^FTA$|FREE\s*THROWS?\s*ATTEMPT/i)], scale: 1 },
+  { re: /^3PT?%$|THREE\s*POINT\s*(PCT|PERCENT)/i,
+    num: [_rcp('3PTM', /^3PTM$|^3PM$/i)], den: [_rcp('3PTA', /^3PTA$|^3PA$/i)], scale: 1 },
+  // MLB
+  { re: /^AVG$|BATTING\s*AVERAGE/i,
+    num: [_rcp('H', /^H$|^HITS$/i)], den: [_rcp('AB', /^AB$|AT\s*BATS/i)], scale: 1 },
+  { re: /^ERA$|EARNED\s*RUN\s*AVERAGE/i,
+    num: [_rcp('ER', /^ER$|EARNED\s*RUNS$/i)], den: [_rcp('IP', /^IP$|INNINGS/i)], scale: 9 },
+  { re: /^WHIP$/i,
+    num: [_rcp('H', /^H$|^HITS$/i), _rcp('BB', /^BB$|^WALKS$/i)],
+    den: [_rcp('IP', /^IP$|INNINGS/i)], scale: 1 },
+  { re: /^K\/9$/i,
+    num: [_rcp('K', /^K$|^SO$|STRIKEOUTS/i)], den: [_rcp('IP', /^IP$|INNINGS/i)], scale: 9 }
+];
+
+function _skRotoCatLabel(m) {
+  if (!m) return '';
+  return String(m.abbr || m.displayName || m.name || '');
+}
+
+// A component may be a scored category or a display-only one - Yahoo returns
+// values for both, and goalie minutes is exactly the second kind.
+function _skRotoFindCat(order, statsMeta, matchers) {
+  var i, c;
+  for (c = 0; c < order.length; c++) {
+    var id = String(order[c]), m = statsMeta[id] || {};
+    var labels = [String(m.abbr || ''), String(m.displayName || ''), String(m.name || '')];
+    for (i = 0; i < matchers.length; i++) {
+      for (var z = 0; z < labels.length; z++) {
+        if (labels[z] && matchers[i].test(labels[z])) return id;
+      }
+    }
+  }
+  return null;
+}
+
+function _skRotoRateParts(id, order, statsMeta) {
+  var label = _skRotoCatLabel(statsMeta[id]);
+  if (!label) return null;
+  for (var r = 0; r < SK_ROTO_RATE_RECIPES.length; r++) {
+    var rc = SK_ROTO_RATE_RECIPES[r];
+    if (!rc.re.test(label)) continue;
+    var num = [], den = [], i, got, miss = [];
+    for (i = 0; i < rc.num.length; i++) {
+      got = _skRotoFindCat(order, statsMeta, [rc.num[i].re]);
+      if (got) num.push(got); else miss.push(rc.num[i].lbl);
+    }
+    for (i = 0; i < rc.den.length; i++) {
+      got = _skRotoFindCat(order, statsMeta, [rc.den[i].re]);
+      if (got) den.push(got); else miss.push(rc.den[i].lbl);
+    }
+    if (miss.length) {
+      // SV is both numerator and denominator of SV%, so a league without it
+      // would otherwise be told it carries no "SV or SV or GA".
+      var uniq = [], um = {}, q;
+      for (q = 0; q < miss.length; q++) { if (!um[miss[q]]) { um[miss[q]] = 1; uniq.push(miss[q]); } }
+      return { why: 'this league doesn\u2019t carry ' + uniq.join(' or ') };
+    }
+    return { num: num, den: den, scale: rc.scale };
+  }
+  return null;
+}
+
+function _skRotoSumIds(row, ids) {
+  var t = 0, i;
+  for (i = 0; i < ids.length; i++) {
+    var v = parseFloat((row || {})[ids[i]]);
+    if (!isNaN(v)) t += v;
+  }
+  return t;
+}
+
+// Rebuilt season vs Yahoo's published season, for every team that has one.
+// Two agreeing teams is the floor: a league where nobody has faced a shot
+// yet proves nothing, and 0/0 agreeing with null is not evidence.
+function _skRotoRateVerify(parts, teams, id) {
+  var ok = 0, i;
+  for (i = 0; i < teams.length; i++) {
+    var raw = teams[i].raw || {};
+    var pub = parseFloat(raw[id]);
+    if (isNaN(pub)) continue;
+    var den = _skRotoSumIds(raw, parts.den);
+    if (!den) continue;
+    var mine = parts.scale * _skRotoSumIds(raw, parts.num) / den;
+    var tol = Math.max(0.0015, Math.abs(pub) * 0.005);
+    if (Math.abs(mine - pub) > tol) return { ok: false, checked: ok + 1 };
+    ok++;
+  }
+  return { ok: ok >= 2, checked: ok };
+}
+
+// Yahoo writes .915 and 2.47; a rebuilt number has to be written the same
+// way or the column stops lining up with itself.
+function _skRotoRateFmt(v, sample) {
+  var str = String(sample == null ? '' : sample);
+  var dot = str.indexOf('.');
+  var places = (dot >= 0) ? (str.length - dot - 1) : 2;
+  if (places < 0 || places > 6) places = 3;
+  var out = v.toFixed(places);
+  // ".915", not "0.915", when that is how Yahoo wrote it.
+  if (/^\./.test(str) && /^0\./.test(out)) out = out.slice(1);
+  return out;
+}
+
 function _skRotoLiveTotals(teams, dayVals, order, statsMeta) {
   var out = {}, rates = [], touched = 0, i, c;
   for (i = 0; i < teams.length; i++) out[teams[i].key] = {};
+  // Pass 1 - every additive category, which is also what the rate rebuild
+  // reads its components out of.
+  var rateJobs = [];
   for (c = 0; c < order.length; c++) {
     var id = String(order[c]);
     var m = statsMeta[id] || {};
     if (m.isOnlyDisplayStat || m.enabled === false) continue;
-    var rate = _skRotoIsRateCat(m);
-    if (rate) rates.push(m.abbr || m.displayName || m.name || ('#' + id));
+    if (_skRotoIsRateCat(m)) {
+      var parts = _skRotoRateParts(id, order, statsMeta);
+      var lab = _skRotoCatLabel(m) || ('#' + id);
+      if (!parts) { rates.push(lab + ' (no recipe)'); continue; }
+      if (parts.why) { rates.push(lab + ' (' + parts.why + ')'); continue; }
+      var vr = _skRotoRateVerify(parts, teams, id);
+      if (!vr.ok) {
+        rates.push(lab + (vr.checked ? ' (recipe disagreed with Yahoo)' : ' (nothing to check it against yet)'));
+        continue;
+      }
+      rateJobs.push({ id: id, parts: parts, label: lab });
+      continue;
+    }
     for (i = 0; i < teams.length; i++) {
       var tk = teams[i].key;
       var sv = (teams[i].raw || {})[id];
-      if (rate) { out[tk][id] = sv; continue; }
       var dRow = dayVals[tk] || {};
       var sn = parseFloat(sv), dn = parseFloat(dRow[id]);
       // Never scored and nothing today stays NULL, not zero: ROTONULLRANK
@@ -120862,7 +121022,31 @@ function _skRotoLiveTotals(teams, dayVals, order, statsMeta) {
       out[tk][id] = (isNaN(sn) ? 0 : sn) + (isNaN(dn) ? 0 : dn);
     }
   }
-  return { vals: out, rates: rates, touched: touched };
+  // Pass 2 - held-back categories keep their season value verbatim.
+  for (c = 0; c < order.length; c++) {
+    var id2 = String(order[c]);
+    var m2 = statsMeta[id2] || {};
+    if (m2.isOnlyDisplayStat || m2.enabled === false) continue;
+    if (!_skRotoIsRateCat(m2)) continue;
+    for (i = 0; i < teams.length; i++) {
+      if (out[teams[i].key][id2] === undefined) out[teams[i].key][id2] = (teams[i].raw || {})[id2];
+    }
+  }
+  // Pass 3 - the verified rates, rebuilt from season + today components.
+  var rebuilt = [];
+  for (var j = 0; j < rateJobs.length; j++) {
+    var job = rateJobs[j];
+    rebuilt.push(job.label);
+    for (i = 0; i < teams.length; i++) {
+      var tk3 = teams[i].key;
+      var sRow = teams[i].raw || {}, dRow3 = dayVals[tk3] || {};
+      var den = _skRotoSumIds(sRow, job.parts.den) + _skRotoSumIds(dRow3, job.parts.den);
+      if (!den) { out[tk3][job.id] = (sRow[job.id] == null ? null : sRow[job.id]); continue; }
+      var num = _skRotoSumIds(sRow, job.parts.num) + _skRotoSumIds(dRow3, job.parts.num);
+      out[tk3][job.id] = _skRotoRateFmt(job.parts.scale * num / den, sRow[job.id]);
+    }
+  }
+  return { vals: out, rates: rates, rebuilt: rebuilt, touched: touched };
 }
 
 // A standings payload as it stands RIGHT NOW. Same shape as the one Yahoo
@@ -120937,7 +121121,8 @@ function _skRotoLiveView(league, data, metaOverride) {
                   rankFrom: seasonRank[tk], rankTo: liveRank[tk] };
   }
   var myKey = (data && data.team && data.team.team_key) || '';
-  return { data: live, day: day, rates: lt.rates, touched: lt.touched,
+  return { data: live, day: day, rates: lt.rates, rebuilt: lt.rebuilt || [],
+           touched: lt.touched,
            moved: moved, me: moved[myKey] || null, myKey: myKey,
            teams: teams.length };
 }
@@ -120962,15 +121147,35 @@ function skProbeEspnRotoLive() {
   var lines = [];
   function say(t) { lines.push(t); }
   var rows = (typeof extLeagues !== 'undefined' && extLeagues) ? extLeagues : [];
-  var row = null, i;
+  // ESPROTOLIVE - a league whose season has not started reports zero three
+  // times over and settles nothing, so the one with the most ACTUAL numbers
+  // in valuesByStat is the one worth asking. The first run picked an NBA
+  // league in a 2027 preseason and came back all zeros.
+  var cand = [], i, j;
   for (i = 0; i < rows.length; i++) {
     var r = rows[i];
     if (!r || r.provider !== 'espn') continue;
     if (typeof extFormatKey !== 'function' || extFormatKey(r) !== 'roto') continue;
     if (!r.raw || !r.raw.teams) continue;
-    row = r; break;
+    var filled = 0, ts = r.raw.teams;
+    for (j = 0; j < ts.length; j++) {
+      var vb0 = ts[j] && ts[j].valuesByStat;
+      if (!vb0) continue;
+      for (var kk in vb0) {
+        if (vb0.hasOwnProperty(kk) && parseFloat(vb0[kk])) filled++;
+      }
+    }
+    cand.push({ row: r, filled: filled });
   }
-  if (!row) { _skGpProbeShow('No ESPN roto league is synced. Open one once, then run this.'); return; }
+  cand.sort(function (a, b) { return b.filled - a.filled; });
+  if (!cand.length) { _skGpProbeShow('No ESPN roto league is synced. Open one once, then run this.'); return; }
+  var row = cand[0].row;
+  if (!cand[0].filled) {
+    _skGpProbeShow('Every synced ESPN roto league still reads zero in every category \u2014 ' +
+      'none of them has played yet, so there is nothing for this to compare. ' +
+      'Run it again once an ESPN roto league has games in the books.');
+    return;
+  }
 
   var game = (typeof _espSsGame === 'function') ? _espSsGame(row) : 'fhl';
   // The saved league entry carries the id and the game code; the row's key is
@@ -120986,6 +121191,9 @@ function skProbeEspnRotoLive() {
   say('══ ' + (row.name || lid) + '  (' + String(row.sport || '?').toUpperCase() + ' roto) ══');
   say('  league ' + lid + ' · season ' + season + ' · scoringPeriodId ' +
       (isNaN(sp) ? '(absent)' : sp));
+  say('  ' + cand[0].filled + ' non-zero season values across ' + teams.length + ' teams' +
+      (cand.length > 1 ? ('  (picked over ' + (cand.length - 1) + ' other roto league' +
+                          (cand.length === 2 ? '' : 's') + ')') : ''));
   say('');
 
   // Two teams is enough to show a pattern and short enough to read.
@@ -121027,9 +121235,15 @@ function skProbeEspnRotoLive() {
     jobs.push(espFetchLeague(game, lid, season, '?view=mTeam&scoringPeriodId=' + sp)
       .then(function (j) { return snap((j || {}).teams, 'fetched, scoringPeriodId=' + sp + ' (today)'); })
       ['catch'](function (e) { return { label: 'today fetch FAILED: ' + (e && e.message), vals: null }; }));
-    jobs.push(espFetchLeague(game, lid, season, '?view=mTeam&scoringPeriodId=' + (sp - 1))
-      .then(function (j) { return snap((j || {}).teams, 'fetched, scoringPeriodId=' + (sp - 1) + ' (yesterday)'); })
-      ['catch'](function (e) { return { label: 'yesterday fetch FAILED: ' + (e && e.message), vals: null }; }));
+    // Period 1 is the first there is; 0 is not a period, and asking for it
+    // returned a third column of zeros that read like an answer.
+    if (sp > 1) {
+      jobs.push(espFetchLeague(game, lid, season, '?view=mTeam&scoringPeriodId=' + (sp - 1))
+        .then(function (j) { return snap((j || {}).teams, 'fetched, scoringPeriodId=' + (sp - 1) + ' (yesterday)'); })
+        ['catch'](function (e) { return { label: 'yesterday fetch FAILED: ' + (e && e.message), vals: null }; }));
+    } else {
+      jobs.push(Promise.resolve({ label: 'no yesterday \u2014 this IS scoring period 1', vals: null }));
+    }
   }
   _skGpProbeShow('Fetching ESPN\u2019s league twice\u2026');
 
@@ -121548,8 +121762,11 @@ function _skRotoSeasonGridHtml(league, data, metaOverride) {
       ? 'Today’s totals for every team, in one request · ' + slEsc(day)
       : mode === 'live'
         ? ('Season + today, re-ranked \u00b7 ' + slEsc(day) +
+           ((liveV && liveV.rebuilt && liveV.rebuilt.length)
+             ? ' \u00b7 rates rebuilt from components: ' + slEsc(liveV.rebuilt.join(', '))
+             : '') +
            ((liveV && liveV.rates.length)
-             ? ' \u00b7 held at season (a rate cannot be added): ' + slEsc(liveV.rates.join(', '))
+             ? ' \u00b7 held at season: ' + slEsc(liveV.rates.join(', '))
              : ''))
       : 'Season totals from Yahoo’s own per-team values') +
     ' · in this league’s scoring order ' +
@@ -121917,8 +122134,11 @@ function _skBuildRotoPressureHTML(league, data, metaOverride) {
     if (!d) return '<span style="color:rgba(255,255,255,0.30);">\u2014</span>';
     var good = higherIsBetter ? (d > 0) : (d < 0);
     var mag = Math.round(Math.abs(d) * 10) / 10;
+    // ROTOLIVE3 - the arrow points the way you MOVED, not the way the number
+    // went. 11th to 17th is a fall down the table and draws a down arrow,
+    // even though the number 17 is the larger one.
     return '<span style="color:' + (good ? '#4ade80' : '#f87171') + ';">' +
-      (d > 0 ? '\u25b2' : '\u25bc') + mag + '</span>';
+      (good ? '\u25b2' : '\u25bc') + mag + '</span>';
   }
   var liveBar = '';
   if (_rpMode === 'live') {
@@ -121942,9 +122162,13 @@ function _skBuildRotoPressureHTML(league, data, metaOverride) {
           : '') +
         (_lv.touched ? '' : '<br><i style="color:rgba(255,255,255,0.40);">nothing has been ' +
                             'recorded today yet \u2014 this matches the settled table.</i>') +
+        (_lv.rebuilt && _lv.rebuilt.length
+          ? ('<br><i style="color:rgba(255,255,255,0.40);">rebuilt from components (checked ' +
+             'against Yahoo\u2019s season figure): ' + slEsc(_lv.rebuilt.join(', ')) + '</i>')
+          : '') +
         (_lv.rates.length
-          ? ('<br><i style="color:rgba(255,255,255,0.40);">held at season (a rate cannot be ' +
-             'added): ' + slEsc(_lv.rates.join(', ')) + '</i>')
+          ? ('<br><i style="color:rgba(255,255,255,0.40);">held at season: ' +
+             slEsc(_lv.rates.join(', ')) + '</i>')
           : '') +
       '</div>';
     }
