@@ -104361,11 +104361,190 @@ function _skPdCloseSheet() {
 // project them per-game vs this week's per-game to show under/over
 // pace per category. Best-effort — if resolution fails we just leave
 // the section blank.
+// ══════════════════════════════════════════════════════════════════
+// SEASON TOTALS, EVERY SPORT ── PDSEASONYH ──
+// ──────────────────────────────────────────────────────────────────
+// This block was baseball and nothing else: it resolved the player to an MLB
+// Stats API id and read season totals from there. An NHL or NBA contributor
+// had no id to resolve, so every one of them read "Season stats unavailable"
+// — not a failure, just a path that was never built.
+//
+// Yahoo already answers the question, for any sport, in one request:
+//   /league/{key}/players;player_keys={pk}/stats;type=season
+// and it answers it in the SAME numeric stat_id space the league's own
+// categories use. So there is no name resolution, no cross-provider matching
+// and no per-sport stat table to maintain — the categories this league
+// tracks are the categories that come back, and Yahoo's own strings are used
+// verbatim rather than reformatted into something that disagrees with its
+// app by a decimal place.
+//
+// Baseball keeps the MLB path, which carries derived values Yahoo does not
+// publish (outs from innings, H/AB, fielding) and feeds the pace maths below.
+var _skPdYsCache = {};
+
+// The sport, from two independent signals. The league record is read first;
+// the league's own CATEGORIES settle it when that is missing, because they
+// are unmistakable — nothing but baseball scores AB and ERA, nothing but
+// hockey scores SOG and PIM.
+function _skPdSportOf(leagueKey, statsMeta) {
+  try {
+    var all = (typeof fyLeagues !== 'undefined' && fyLeagues) ? fyLeagues : [];
+    for (var i = 0; i < all.length; i++) {
+      if (String(all[i].league_key) !== String(leagueKey)) continue;
+      var sp = String(all[i].sport || all[i].game_code || '').toLowerCase();
+      if (sp) return sp;
+    }
+  } catch (e) {}
+  var ab = {}, sid;
+  for (sid in (statsMeta || {})) {
+    if (!statsMeta.hasOwnProperty(sid)) continue;
+    var m = statsMeta[sid] || {};
+    ab[String(m.abbr || m.displayName || m.name || '').toUpperCase()] = 1;
+  }
+  if (ab['AB'] || ab['ERA'] || ab['WHIP'] || ab['OBP'] || ab['IP']) return 'mlb';
+  if (ab['SOG'] || ab['PIM'] || ab['SHG'] || ab['GAA'] || ab['PPP']) return 'nhl';
+  if (ab['REB'] || ab['AST'] || ab['FG%'] || ab['3PTM'] || ab['FT%']) return 'nba';
+  return '';
+}
+
+function _skPdFetchYahooSeason(leagueKey, playerKey) {
+  var ck = leagueKey + '|' + playerKey;
+  if (_skPdYsCache[ck]) return Promise.resolve(_skPdYsCache[ck]);
+  if (typeof fyApi !== 'function' || !leagueKey || !playerKey) return Promise.resolve(null);
+  return fyApi('/league/' + leagueKey + '/players;player_keys=' + playerKey +
+               '/stats;type=season')
+    .then(function (res) {
+      var out = null;
+      try {
+        var node = _skwUnwrapPlayer(res);
+        if (node && node.length) {
+          for (var i = 1; i < node.length; i++) {
+            var seg = node[i];
+            if (!seg || !seg.player_stats || !seg.player_stats.stats) continue;
+            var list = (typeof _yahooArr === 'function')
+              ? _yahooArr(seg.player_stats.stats) : seg.player_stats.stats;
+            out = {};
+            for (var q = 0; q < list.length; q++) {
+              var st = list[q] && list[q].stat;
+              if (st && st.stat_id != null) out[String(st.stat_id)] = String(st.value);
+            }
+            break;
+          }
+        }
+      } catch (e) {}
+      // An empty map is a real answer (nothing played yet) and is cached;
+      // a failure is not, so it can be retried on the next open.
+      if (out) _skPdYsCache[ck] = out;
+      return out;
+    })['catch'](function () { return null; });
+}
+
+// Yahoo's own season numbers, in the league's own categories and order.
+// PDSEASONYH
+function _skPdRenderSeasonFromYahoo(contrib, bySid) {
+  var section = document.getElementById('skPdSeasonSection');
+  if (!section) return false;
+  var statsMeta = contrib.statsMeta || {};
+  var entries = [], sid, any = false;
+  for (sid in statsMeta) {
+    if (!statsMeta.hasOwnProperty(sid)) continue;
+    var m = statsMeta[sid] || {};
+    if (m.isOnlyDisplayStat || m.enabled === false) continue;
+    var abbr = m.abbr || m.displayName || m.name || ('#' + sid);
+    var raw = bySid[String(sid)];
+    // Yahoo writes "-" for a stat the player cannot have (a skater's wins).
+    if (raw === '-' || raw === '') raw = null;
+    var txt = (raw == null) ? '\u2014' : String(raw);
+    if (raw != null && parseFloat(raw)) any = true;
+    entries.push({ abbr: abbr, displayVal: txt,
+                   isZero: (raw == null || parseFloat(raw) === 0),
+                   sortOrder: parseInt(sid, 10) || 999 });
+  }
+  if (!entries.length) return false;
+  entries.sort(function (a, b) { return a.sortOrder - b.sortOrder; });
+
+  // Games played, when the league tracks it, as the sub-label — the same
+  // context baseball's block carries. Skipped when GP is itself one of the
+  // league's categories, because then it already has a cell in the grid and
+  // the sub-label is the same number printed twice.
+  var sub = '', shown = {};
+  for (sid = 0; sid < entries.length; sid++) shown[String(entries[sid].abbr).toUpperCase()] = 1;
+  for (sid in statsMeta) {
+    if (!statsMeta.hasOwnProperty(sid)) continue;
+    var ma = String((statsMeta[sid] || {}).abbr || '').toUpperCase();
+    if (ma !== 'GP' && ma !== 'G' && ma !== 'GS') continue;
+    if (shown[ma]) break;
+    var gv = bySid[String(sid)];
+    if (gv == null || gv === '-' || !parseFloat(gv)) continue;
+    sub = '<span style="color:var(--sk-text-4);font-weight:400;letter-spacing:0;' +
+          'text-transform:none;margin-left:6px;">(' + skEscape(String(gv)) + ' ' +
+          skEscape(ma) + ')</span>';
+    break;
+  }
+
+  var cells = entries.map(function (e) {
+    var hex = _skCatColorHex(e.abbr);
+    var valStyle = (hex && !e.isZero) ? ('color:' + hex + ';') : '';
+    return '<div class="sk-pd-totals-cell' + (e.isZero ? ' zero' : '') + '">' +
+      '<div class="sk-pd-totals-val" style="' + valStyle + '">' + skEscape(e.displayVal) + '</div>' +
+      '<div class="sk-pd-totals-label">' + skEscape(e.abbr) + '</div>' +
+    '</div>';
+  }).join('');
+  section.innerHTML =
+    '<div class="sk-pd-section-title">Season Totals' + sub + '</div>' +
+    '<div class="sk-pd-totals-grid">' + cells + '</div>' +
+    (any ? '' : '<div style="color:var(--sk-text-3);font-size:10.5px;margin-top:6px;">' +
+                'Nothing on the board yet this season.</div>');
+  return true;
+}
+
+// PDSEASONYH — the non-baseball route. Season totals from Yahoo, and a pace
+// line only when the league tracks games played; without a denominator there
+// is no per-game rate to compare a week against, and inventing one from
+// active days would be a different number wearing the same label.
+function _skPdLoadSeasonYahoo(contrib) {
+  var paceSection = document.getElementById('skPdPaceSection');
+  var leagueKey = (typeof skCurrentCatsWeekly !== 'undefined' && skCurrentCatsWeekly)
+    ? skCurrentCatsWeekly.leagueKey : '';
+  function fail(msg) {
+    var ss = document.getElementById('skPdSeasonSection');
+    if (ss) {
+      ss.innerHTML = '<div class="sk-pd-section-title">Season Totals</div>' +
+        '<div style="color:var(--sk-text-3);font-size:11px;">' + skEscape(msg) + '</div>';
+    }
+    if (paceSection) {
+      paceSection.innerHTML = '<div class="sk-pd-section-title">Week vs Season Avg</div>' +
+        '<div style="color:var(--sk-text-3);font-size:11px;">Season pace unavailable.</div>';
+    }
+  }
+  if (!leagueKey || !contrib.playerKey) { fail('Season stats unavailable.'); return; }
+  _skPdFetchYahooSeason(leagueKey, contrib.playerKey).then(function (bySid) {
+    if (!bySid) { fail('Yahoo didn\u2019t return season stats for this player.'); return; }
+    if (!_skPdRenderSeasonFromYahoo(contrib, bySid)) {
+      fail('This league tracks no categories to show.');
+      return;
+    }
+    if (paceSection) {
+      paceSection.innerHTML = '<div class="sk-pd-section-title">Week vs Season Avg</div>' +
+        '<div style="color:var(--sk-text-3);font-size:11px;">' +
+        'Season totals are in. The week-vs-season pace line is baseball-only ' +
+        'so far \u2014 it needs a per-game denominator worked out per sport.</div>';
+    }
+  });
+}
+
 function _skPdLoadSeasonPace(contrib) {
   if (!contrib) return;
   var paceSection = document.getElementById('skPdPaceSection');
   if (!paceSection) return;
-  
+
+  // PDSEASONYH - everything below this line is the MLB Stats API, which has
+  // no answer for a skater or a guard. Those go to Yahoo instead.
+  var _lk = (typeof skCurrentCatsWeekly !== 'undefined' && skCurrentCatsWeekly)
+    ? skCurrentCatsWeekly.leagueKey : '';
+  var _sp = _skPdSportOf(_lk, contrib.statsMeta);
+  if (_sp && _sp !== 'mlb') { _skPdLoadSeasonYahoo(contrib); return; }
+
   var resolveMlbId = function() {
     // Try the today MLB player index first (no extra fetch in most cases)
     if (typeof _skTodayMlbPlayerCache !== 'undefined' && _skTodayMlbPlayerCache.byNormName) {
