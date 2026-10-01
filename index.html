@@ -118747,8 +118747,12 @@ function skProbeEspnStats() {
     if (!(row.rosters && row.rosters.byTeam)) return;
     var raw = row.rawRosterJson || row._rawRoster || null;
     say('\u2500\u2500 ' + (row.name || row.key) + '  (' + String(row.sport || '?').toUpperCase() + ') \u2500\u2500');
-    say('  scoringPeriodId: ' + (row.scoringPeriodId != null ? row.scoringPeriodId : '?') +
-        '   seasonId: ' + (row.seasonId != null ? row.seasonId : '?'));
+    // ESPSPID - this read row.scoringPeriodId, which the row parser never
+    // sets, so it printed "?" for every league ever probed.
+    var _spd = (typeof _espScoringPeriod === 'function') ? _espScoringPeriod(row) : null;
+    say('  scoringPeriodId: ' + (_spd == null ? '?' : _spd) +
+        '   seasonId: ' + (row.season != null ? row.season
+                          : ((row.raw && row.raw.seasonId) != null ? row.raw.seasonId : '?')));
     var ids = (typeof espScoredIds === 'function') ? espScoredIds(row) : [];
     // FULL list. Truncating this hid the answer last time: the question is
     // whether the ids a player actually has intersect the ids the league
@@ -118824,9 +118828,10 @@ function skProbeEspnStats() {
     var st = (pl && pl.stats) || pick.rawStats || null;
     if (!st) {
       say('');
-      say('  RAW stats array not retained on the roster item.');
-      say('  (That alone may be the bug — espBuildWindows runs at parse time');
-      say('   and the source array is dropped afterwards.)');
+      say('  RAW stats array not retained on the roster item \u2014 expected.');
+      say('  (espBuildWindows runs at parse time and the source array is dropped');
+      say('   afterwards on purpose. This was once the leading suspect; the');
+      say('   windows above are built correctly, so it is not. Nothing to do.)');
     } else {
       say('');
       say('  raw stats entries (' + st.length + '):');
@@ -120046,6 +120051,12 @@ function skProbeEspnWeeks() {
   if (typeof _skGpProbeShow === 'function') _skGpProbeShow(L.join('\n'));
 }
 
+// ---- SKPROBETITLE ----
+// Set by the wrapper below, read by the sheet. A probe that shows its sheet
+// from inside a .then() still gets the right title, because this is set when
+// the probe is CALLED and the sheet is the only thing that reads it.
+var _skProbeTitle = 'PROBE';
+
 function _skGpProbeShow(text) {
   var old = document.getElementById('skGpProbeSheet');
   if (old && old.parentNode) old.parentNode.removeChild(old);
@@ -120054,7 +120065,8 @@ function _skGpProbeShow(text) {
   wrap.className = 'sk-gpprobe';
   wrap.innerHTML =
     '<div class="sk-gpprobe-bar">' +
-      '<span class="sk-gpprobe-title">GP CAP PROBE</span>' +
+      '<span class="sk-gpprobe-title">' +
+        skEscape(_skProbeTitle || 'PROBE') + '</span>' +
       '<button class="sk-gpprobe-btn" onclick="_skGpProbeCopy()">COPY</button>' +
       '<button class="sk-gpprobe-btn" onclick="_skGpProbeClose()">CLOSE</button>' +
     '</div>' +
@@ -120581,6 +120593,35 @@ function _skFxProbeRender(rows, lines, say) {
   }
   _skGpProbeShow(lines.join('\n'));
 }
+// ---- SKPROBETITLE ----
+// Wrap every skProbe* in a function that names the sheet after itself.
+// Done by walking the globals rather than by editing twenty call sites, so
+// the next probe is covered the moment it is written.
+(function _skProbeTitles() {
+  function pretty(n) {
+    return String(n).replace(/^skProbe/, '')
+      .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+      .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+      .toUpperCase() || 'PROBE';
+  }
+  var names = [], k;
+  for (k in window) {
+    try {
+      if (k.indexOf('skProbe') !== 0) continue;
+      if (typeof window[k] !== 'function') continue;
+      names.push(k);
+    } catch (e) {}
+  }
+  for (var i = 0; i < names.length; i++) {
+    (function (name, fn) {
+      window[name] = function () {
+        _skProbeTitle = pretty(name);
+        return fn.apply(this, arguments);
+      };
+    })(names[i], window[names[i]]);
+  }
+})();
+
 function _skFxPad(s, w) {
   s = String(s == null ? '' : s);
   w = w || 16;
@@ -120897,6 +120938,22 @@ var SK_ROTO_RATE_RECIPES = [
     num: [_rcp('K', /^K$|^SO$|STRIKEOUTS/i)], den: [_rcp('IP', /^IP$|INNINGS/i)], scale: 9 }
 ];
 
+// ---- ESPSPID ----
+// ESPN's current scoring period, from the places it is actually published.
+// NOT currentMatchupPeriod: in a daily league a matchup period spans several
+// scoring periods, so reading one as the other is silently off by days.
+function _espScoringPeriod(row) {
+  var j = (row && row.raw) || {};
+  var st = j.status || {};
+  var cands = [j.scoringPeriodId, st.latestScoringPeriod, st.currentScoringPeriod,
+               row && row.scoringPeriodId];
+  for (var i = 0; i < cands.length; i++) {
+    var n = parseInt(cands[i], 10);
+    if (!isNaN(n) && n > 0) return n;
+  }
+  return null;
+}
+
 function _skRotoCatLabel(m) {
   if (!m) return '';
   return String(m.abbr || m.displayName || m.name || '');
@@ -121185,12 +121242,15 @@ function skProbeEspnRotoLive() {
   try { sv = (typeof espFindSaved === 'function') ? espFindSaved(String(row.key || '').slice(4)) : null; } catch (e) {}
   var lid = (sv && sv.id) || String(row.key || '').slice(4) || '';
   var season = row.season || '';
-  var sp = parseInt(row.raw.scoringPeriodId, 10);
+  // ESPSPID - resolved from where ESPN publishes it, and FETCHED if the
+  // synced payload has none. Reading it off the row returned nothing, which
+  // would have left this probe printing one column and no comparison at all.
+  var sp = (typeof _espScoringPeriod === 'function') ? _espScoringPeriod(row) : null;
   var teams = row.raw.teams || [];
 
   say('══ ' + (row.name || lid) + '  (' + String(row.sport || '?').toUpperCase() + ' roto) ══');
   say('  league ' + lid + ' · season ' + season + ' · scoringPeriodId ' +
-      (isNaN(sp) ? '(absent)' : sp));
+      (sp == null ? '(absent — fetching it)' : sp));
   say('  ' + cand[0].filled + ' non-zero season values across ' + teams.length + ' teams' +
       (cand.length > 1 ? ('  (picked over ' + (cand.length - 1) + ' other roto league' +
                           (cand.length === 2 ? '' : 's') + ')') : ''));
@@ -121230,8 +121290,9 @@ function skProbeEspnRotoLive() {
   }
 
   var have = snap(teams, 'in memory (mTeam sync)');
+  function _go(sp) {
   var jobs = [];
-  if (typeof espFetchLeague === 'function' && lid && season && !isNaN(sp)) {
+  if (typeof espFetchLeague === 'function' && lid && season && sp != null) {
     jobs.push(espFetchLeague(game, lid, season, '?view=mTeam&scoringPeriodId=' + sp)
       .then(function (j) { return snap((j || {}).teams, 'fetched, scoringPeriodId=' + sp + ' (today)'); })
       ['catch'](function (e) { return { label: 'today fetch FAILED: ' + (e && e.message), vals: null }; }));
@@ -121244,6 +121305,8 @@ function skProbeEspnRotoLive() {
     } else {
       jobs.push(Promise.resolve({ label: 'no yesterday \u2014 this IS scoring period 1', vals: null }));
     }
+  } else if (sp == null) {
+    jobs.push(Promise.resolve({ label: 'no scoringPeriodId anywhere in the payload', vals: null }));
   }
   _skGpProbeShow('Fetching ESPN\u2019s league twice\u2026');
 
@@ -121282,6 +121345,16 @@ function skProbeEspnRotoLive() {
     say('     valuesByStat; a different route is needed to split today out.');
     _skGpProbeShow(lines.join('\n'));
   });
+}
+
+  // The period is normally in the synced payload. When it isn't, one small
+  // settings call gets it rather than the probe reporting nothing. ESPSPID
+  if (sp != null || typeof espFetchLeague !== 'function' || !lid || !season) { _go(sp); }
+  else {
+    espFetchLeague(game, lid, season, '?view=mSettings')
+      .then(function (j) { _go(_espScoringPeriod({ raw: j })); })
+      ['catch'](function () { _go(null); });
+  }
 }
 
 function _skRlDayList(lg) {
