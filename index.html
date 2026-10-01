@@ -30226,11 +30226,79 @@
 </nav>
 
 <script>
+// ---- SKJSERR ----
+// Every script this page pulls from another origin registers here while it
+// is in flight. An error thrown inside one of those comes back to window
+// .onerror stripped of its message, file and line - the browser's
+// same-origin rule, not a bug - and "Script error. (line 0)" is all that
+// survives. The registry is what turns that into a sentence worth reading.
+var _skExtScripts = [];
+function _skExtScriptNote(what) {
+  var e = { what: what, at: Date.now(), done: false };
+  _skExtScripts.push(e);
+  if (_skExtScripts.length > 12) _skExtScripts.shift();
+  return e;
+}
+function _skExtScriptsInFlight() {
+  var out = [], now = Date.now(), i;
+  for (i = 0; i < _skExtScripts.length; i++) {
+    if (!_skExtScripts[i].done && (now - _skExtScripts[i].at) < 30000) {
+      out.push(_skExtScripts[i].what);
+    }
+  }
+  return out;
+}
+
+// One banner, not a stack. A repeat of the same message bumps a count rather
+// than burying the app under identical bars, and either kind can be tapped
+// away - which the old one could not.
+var _skJsErrSeen = {};
+function _skJsErrShow(text, soft) {
+  var id = 'skJsErrBar';
+  var bar = document.getElementById(id);
+  if (!bar) {
+    bar = document.createElement('div');
+    bar.id = id;
+    bar.onclick = function () { if (bar.parentNode) bar.parentNode.removeChild(bar); };
+    document.body.appendChild(bar);
+  }
+  bar.style.cssText = 'position:fixed;bottom:0;left:0;right:0;z-index:99999;background:' +
+    (soft ? '#8a6d1f' : '#e53e3e') +
+    ';color:#fff;padding:10px 12px;font-size:11px;line-height:1.45;font-family:monospace;' +
+    'word-break:break-word;max-height:40vh;overflow:auto;cursor:pointer';
+  _skJsErrSeen[text] = (_skJsErrSeen[text] || 0) + 1;
+  var n = _skJsErrSeen[text];
+  bar.textContent = (soft ? 'NOTE: ' : 'JS ERROR: ') + text +
+    (n > 1 ? '  (x' + n + ')' : '') + '   - tap to dismiss';
+  // A cross-origin notice is informational and clears itself; a real error
+  // stays until it is read.
+  if (soft) {
+    if (bar._t) clearTimeout(bar._t);
+    bar._t = setTimeout(function () {
+      if (bar.parentNode && bar.textContent.indexOf('NOTE:') === 0) bar.parentNode.removeChild(bar);
+    }, 12000);
+  }
+}
+
 window.onerror = function(msg, url, line, col, err) {
-  var d = document.createElement('div');
-  d.style.cssText = 'position:fixed;bottom:0;left:0;right:0;z-index:99999;background:#e53e3e;color:#fff;padding:12px;font-size:11px;font-family:monospace;word-break:break-all;max-height:200px;overflow:auto';
-  d.textContent = 'JS ERROR: ' + msg + ' (line ' + line + ')';
-  document.body.appendChild(d);
+  var text = String(msg == null ? 'error' : msg);
+  // The browser's opaque form: no file, no line, and the message replaced
+  // with the literal string "Script error."
+  var opaque = /^script error\.?$/i.test(text) || (!url && !line);
+  if (opaque) {
+    var busy = [];
+    try { busy = _skExtScriptsInFlight(); } catch (e) {}
+    text = 'An outside script errored. The browser withholds the detail ' +
+      '(cross-origin), so there is no line to look at. ' +
+      (busy.length ? 'In flight right now: ' + busy.join(', ') + '.'
+                   : 'Nothing of ours was loading, so it is most likely the ' +
+                     'browser or an extension.') +
+      ' Skipper\u2019s own code is unaffected.';
+    _skJsErrShow(text, true);
+    return;
+  }
+  var file = url ? String(url).split('/').pop() : '?';
+  _skJsErrShow(text + '  (' + file + ':' + (line || 0) + ':' + (col || 0) + ')', false);
 };
 
 // Cleanup any leftover tap-probe localStorage flag from earlier
@@ -32425,8 +32493,14 @@ function _htJsonp(qs) {
   return new Promise(function (resolve, reject) {
     var cb = '_htCb' + (++_htCbSeq) + '_' + Date.now();
     var el = document.createElement('script');
+    // SKJSERR - this script runs whatever the feed returns, and anything it
+    // throws reaches window.onerror with no message, file or line. Noting it
+    // here is the only way the banner can name it.
+    var _note = (typeof _skExtScriptNote === 'function')
+      ? _skExtScriptNote('HockeyTech JSONP') : null;
     var done = false, timer = null;
     function cleanup() {
+      if (_note) _note.done = true;
       if (timer) clearTimeout(timer);
       try { delete window[cb]; } catch (e) { window[cb] = undefined; }
       if (el && el.parentNode) el.parentNode.removeChild(el);
@@ -120371,7 +120445,33 @@ function skProbeFantraxFp() {
     return;
   }
 
-  var shown = 0;
+  var SPORTS = {}, r0;
+  for (r0 = 0; r0 < rows.length && r0 < 2; r0++) {
+    SPORTS[String(rows[r0].sport || '').toUpperCase()] = 1;
+  }
+  var want = [], sp;
+  for (sp in SPORTS) { if (SPORTS.hasOwnProperty(sp) && sp) want.push(sp); }
+
+  // ---- FXPROBESRC ----
+  // The hub scores a player from _ftxLiveCache, which indexes EVERY started
+  // game today by player name. _fxStadiumStatMap only ever sees the single
+  // box the stadium modal is holding, so it is the fallback here, not the
+  // source. Fetching first means the probe works from the account menu
+  // without the Fantrax pane having been opened.
+  var gets = [];
+  for (var w = 0; w < want.length; w++) {
+    gets.push((typeof _ftxFetchLive === 'function')
+      ? _ftxFetchLive(want[w])['catch'](function () { return null; })
+      : Promise.resolve(null));
+  }
+  _skGpProbeShow('Fetching today\u2019s box scores\u2026');
+  Promise.all(gets).then(function () { _skFxProbeRender(rows, lines, say); },
+                         function () { _skFxProbeRender(rows, lines, say); });
+}
+
+// Split out so the fetch above has something to come back to. FXPROBESRC
+function _skFxProbeRender(rows, lines, say) {
+  var shown = 0, funnel = [];
   for (var r = 0; r < rows.length && shown < 2; r++) {
     var row = rows[r];
     var SPORT = String(row.sport || '').toUpperCase();
@@ -120381,45 +120481,57 @@ function skProbeFantraxFp() {
       if (!my) my = (row.myRoster && row.myRoster.items) || row.myItems || [];
       items = my || [];
     } catch (e2) { items = []; }
-    if (!items.length) continue;
 
-    var any = 0, body = [];
+    // ---- FXPROBESRC ----
+    // The funnel. Every earlier version of this ended on one sentence that
+    // named no cause, so "no box line" covered an unsynced roster, a player
+    // with no ESPN id, an empty live cache and a league whose scoring the
+    // engine declines - four different problems with four different fixes.
+    var cache = null;
+    try { cache = (typeof _ftxLiveCache !== 'undefined' && _ftxLiveCache) ? _ftxLiveCache[SPORT] : null; } catch (eC) {}
+    var nItems = items.length, nId = 0, nLine = 0, nScored = 0;
+
+    var body = [];
     for (var p = 0; p < items.length; p++) {
       var it = items[p];
       var eid = it.espnId || it.espn_id || null;
-      if (!eid) continue;
+      if (eid) nId++;
       var lv = null;
-      try { lv = _fxStadiumStatMap(eid); } catch (e3) { lv = null; }
+      // Hub source first, stadium box second.
+      try {
+        if (typeof _ftxLiveFor === 'function') lv = _ftxLiveFor(SPORT, it.name);
+      } catch (e3a) { lv = null; }
+      if ((!lv || !lv.statMap) && eid && typeof _fxStadiumStatMap === 'function') {
+        try { lv = _fxStadiumStatMap(eid); } catch (e3) { lv = null; }
+      }
       if (!lv || !lv.statMap) continue;
+      nLine++;
       var res = null;
       try { res = _fxScoreStatMap(SPORT, row.scoring, lv.statMap, lv.pos || it.pos, lv.ctx); }
       catch (e4) { res = null; }
       if (!res) continue;
-      any++;
-      body.push('  ── ' + (it.name || eid) + '  [' + (lv.pos || it.pos || '?') + '] ──');
+      nScored++;
+      body.push('  \u2500\u2500 ' + (it.name || eid) + '  [' + (lv.pos || it.pos || '?') + '] \u2500\u2500');
       body.push('     Skipper FP: ' + (Math.round(res.fp * 100) / 100));
       // The raw box line the score was built from, so a disagreement can be
       // pinned on the numbers or on the rules, never left ambiguous.
       var sm = lv.statMap || {}, keys = [], k;
-      for (k in sm) { if (sm.hasOwnProperty(k)) keys.push(k + '=' + sm[k]); }
+      for (k in sm) { if (sm.hasOwnProperty(k)) keys.push(k + '=' + _skFxNum(sm[k])); }
       body.push('     box line : ' + (keys.join('  ') || '(empty)'));
       var sc = res.scored || [];
       for (var s = 0; s < sc.length; s++) {
         var x = sc[s];
-        body.push('       ' + _skFxPad(x.code) +
-          _skFxPad(String(x.val)) +
-          (x.rule ? ('@ ' + x.rule) : ('× ' + x.pts)) +
+        body.push('       ' + _skFxPad(x.code, 22) +
+          _skFxPad(_skFxNum(x.val), 10) +
+          (x.rule ? ('@ ' + x.rule) : ('\u00d7 ' + x.pts)) +
           '  = ' + (Math.round(x.contrib * 100) / 100));
-        // FXRANGESTEP — the band's own bounds, which decide where the steps
+        // FXRANGEFLOOR - the band's own bounds, which decide where the steps
         // are counted from. "1 per 0.1" alone never showed them.
         if (x.band) {
           body.push('         band: from ' + (x.band.from == null ? '(none)' : x.band.from) +
             '  to ' + (x.band.to == null ? '(none)' : x.band.to) +
             '  step ' + x.band.step + '  pts ' + x.band.pts +
             (x.band.hadInt ? '  interval declared' : '  interval DEFAULTED to 1'));
-          // FXRANGEFLOOR - the two readings of a lower bound, and which one
-          // this band got. The raw config is the only thing that can settle
-          // whether the engine picked right.
           var _bb = (typeof _fxBandBase === 'function') ? _fxBandBase(x.band) : 0;
           body.push('         steps counted from ' + _bb +
             (_bb ? '  (bound read as a TIER)' : '  (bound read as a MINIMUM)') +
@@ -120428,32 +120540,53 @@ function skProbeFantraxFp() {
           if (x.raw) body.push('         cfg : ' + x.raw);
         }
       }
-      if (res.unscored && res.unscored.length) body.push('     can’t map : ' + res.unscored.join(', '));
+      if (res.unscored && res.unscored.length) body.push('     can\u2019t map : ' + res.unscored.join(', '));
       if (res.nodata && res.nodata.length) body.push('     no data  : ' + res.nodata.join(', '));
       if (res.zero && res.zero.length) body.push('     at zero  : ' + res.zero.join(', '));
       body.push('');
     }
-    if (!any) continue;
+
+    funnel.push('\u2550\u2550 ' + (row.name || row.key) + '  (' + (SPORT || '?') + ') \u2550\u2550');
+    funnel.push('   roster items        : ' + nItems);
+    funnel.push('   with an ESPN id     : ' + nId);
+    funnel.push('   today\u2019s box scores  : ' +
+      (cache ? ((cache.games || 0) + ' games, ' + (cache.players || 0) +
+                ' players indexed, ' + (cache.anyLive ? 'some LIVE' : 'none live'))
+             : '(not loaded \u2014 ESPN did not answer)'));
+    funnel.push('   players with a line : ' + nLine);
+    funnel.push('   players scored      : ' + nScored);
+    if (!nItems) funnel.push('   \u2192 the roster is empty. Re-sync this league.');
+    else if (!cache) funnel.push('   \u2192 ESPN\u2019s box scores never arrived, so nothing could be ' +
+                                 'matched. Check the connection and run this again.');
+    else if (!nLine) funnel.push('   \u2192 nobody on this roster is in a started game right now.');
+    else if (!nScored) funnel.push('   \u2192 lines found but nothing scored \u2014 a categories league has no FP.');
+    funnel.push('');
+    if (!nScored) continue;
     shown++;
-    say('══ ' + (row.name || row.key) + '  (' + (SPORT || '?') + ') ══');
-    say('  ' + any + ' player' + (any === 1 ? '' : 's') + ' with a box line right now');
-    say('');
-    for (var b = 0; b < body.length; b++) say(body[b]);
+    funnel = funnel.concat(body);
   }
+  for (var f = 0; f < funnel.length; f++) say(funnel[f]);
   if (!shown) {
-    say('No Fantrax player has a box line yet — run this while games are on.');
+    say('Nothing to score yet. The counts above say which step came up empty.');
   } else {
-    say('Compare each term against the league’s own scoring page. A term that');
-    say('is here and not there is one the engine shouldn’t be scoring; a term');
-    say('there and not here is in "can’t map" or "no data" above.');
+    say('Compare each term against the league\u2019s own scoring page. A term that');
+    say('is here and not there is one the engine shouldn\u2019t be scoring; a term');
+    say('there and not here is in "can\u2019t map" or "no data" above.');
   }
   _skGpProbeShow(lines.join('\n'));
 }
-
-function _skFxPad(s) {
+function _skFxPad(s, w) {
   s = String(s == null ? '' : s);
-  while (s.length < 16) s += ' ';
+  w = w || 16;
+  while (s.length < w) s += ' ';
   return s;
+}
+// A raw box value can be 8.033333333333333. Four decimals is past anything
+// Fantrax reports and still fits a column. FXPROBESRC
+function _skFxNum(v) {
+  var n = parseFloat(v);
+  if (isNaN(n)) return String(v == null ? '' : v);
+  return String(Math.round(n * 10000) / 10000);
 }
 
 function skProbeRotoDaily() {
@@ -154727,7 +154860,15 @@ function drawMatchupChart(canvas, scores, oppScores, labels, ri) {
   if (typeof Chart === 'undefined') {
     var s = document.createElement('script');
     s.src = 'https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js';
-    s.onload = function() { drawMatchupChart(canvas, scores, oppScores, labels, ri); };
+    // SKJSERR - same reason as the JSONP feed: cross-origin, so anything it
+    // throws arrives anonymous.
+    var _cnote = (typeof _skExtScriptNote === 'function')
+      ? _skExtScriptNote('Chart.js (cdnjs)') : null;
+    s.onload = function() {
+      if (_cnote) _cnote.done = true;
+      drawMatchupChart(canvas, scores, oppScores, labels, ri);
+    };
+    s.onerror = function() { if (_cnote) _cnote.done = true; };
     document.head.appendChild(s);
     return;
   }
