@@ -117341,11 +117341,12 @@ function _fxScoreStatMap(sport, scoring, statMap, pos, ctx) {
     any = true;
     var band = ruleOff ? null : _fxRangeBand(rule, val);   // FXRANGE
     if (band) {
-      // "award 1 point for every 0.1 TOI": 20.55 minutes is 205.50 points.
-      var rcontrib = (val / band.step) * band.pts;
+      // FXRANGESTEP — completed steps above the band's own floor. 4:55 of ice
+      // time on "1 per 0.1 from 1.0" is 39, which is what Fantrax pays.
+      var rcontrib = _fxRangeContrib(band, val);
       fp += rcontrib;
       if (val) scored.push({ code: code, pts: pts, val: val, contrib: rcontrib,
-                             rule: _fxBandText(band) });
+                             rule: _fxBandText(band), band: band });
       continue;
     }
     // A flat points value — and an absent one counts as nothing rather than
@@ -120391,6 +120392,13 @@ function skProbeFantraxFp() {
           _skFxPad(String(x.val)) +
           (x.rule ? ('@ ' + x.rule) : ('× ' + x.pts)) +
           '  = ' + (Math.round(x.contrib * 100) / 100));
+        // FXRANGESTEP — the band's own bounds, which decide where the steps
+        // are counted from. "1 per 0.1" alone never showed them.
+        if (x.band) {
+          body.push('         band: from ' + (x.band.from == null ? '(none)' : x.band.from) +
+            '  to ' + (x.band.to == null ? '(none)' : x.band.to) +
+            '  step ' + x.band.step + '  pts ' + x.band.pts);
+        }
       }
       if (res.unscored && res.unscored.length) body.push('     can’t map : ' + res.unscored.join(', '));
       if (res.nodata && res.nodata.length) body.push('     no data  : ' + res.nodata.join(', '));
@@ -166340,14 +166348,32 @@ function _fxRangeBand(rule, val) {
   return null;
 }
 
-// "award `pts` for every `step`" applied to a value, as a rate rather than
-// a count of completed steps: 20.55 time on ice at 1 per 0.1 is 205.50, not
-// 205. That is the ordinary fantasy reading of a per-unit rule, and it is
-// the one place to change if Fantrax proves to round a partial step down.
+// COMPLETED steps above the band's own floor. FXRANGESTEP
+//
+// This was a rate — value over step, partial steps included, measured from
+// zero — and the comment that stood here said it was the one place to change
+// if Fantrax ever proved to round a partial step down. It has, twice over:
+// 2:21 of ice time is 13.5 steps and pays 13, and 4:55 is 49 steps from zero
+// but pays 39, which is 39 steps above the band's lower bound of one minute.
+//
+// A band with no lower bound behaves as it always did apart from the
+// rounding, so this cannot overcharge a league that has no threshold.
+function _fxRangeContrib(b, val) {
+  if (!b || val == null || isNaN(val) || !b.step) return 0;
+  var base = (b.from != null) ? Number(b.from) : 0;
+  if (isNaN(base)) base = 0;
+  var steps = (val - base) / b.step;
+  if (steps < 0) steps = 0;
+  // The epsilon is for binary fractions, not for generosity: 2 / 0.1 is
+  // 20.000000000000004 in IEEE754 one way and 19.999999999999996 the other,
+  // and a floor on the second answer silently loses a whole step.
+  return Math.floor(steps + 1e-9) * b.pts;
+}
+
 function _fxRangePoints(rule, val) {
   var b = _fxRangeBand(rule, val);
   if (!b) return null;
-  return (val / b.step) * b.pts;
+  return _fxRangeContrib(b, val);
 }
 
 // The rule as a single points-per-unit multiplier, for the two places that
