@@ -29450,6 +29450,12 @@
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v20M2 12h20"/><circle cx="12" cy="12" r="9"/></svg>
       <span>Probe roto live totals</span>
     </button>
+    <!-- ESPROTOLIVE — same question on the ESPN side: does valuesByStat
+         already contain today, and does scoringPeriodId filter it? -->
+    <button class="sk-account-item" onclick="skProbeEspnRotoLive(); skCloseAccountMenu();">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+      <span>Probe ESPN roto live totals</span>
+    </button>
     <!-- ROTODAILY1 — can one call fetch every team's daily categories? -->
     <button class="sk-account-item" onclick="skProbeRotoDaily(); skCloseAccountMenu();">
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M3 10h18M8 2v4M16 2v4"/></svg>
@@ -120707,7 +120713,27 @@ function skProbeRotoDaily() {
 
 var _skRotoDayCache = {};      // "leagueKey|date" -> { vals: {teamKey:{id:str}}, ts }
 var _skRotoDayBusy = {};
-var _skRsMode = {};            // league key -> 'season' | 'today'
+var _skRsMode = {};            // league key -> 'season' | 'today' | 'live'
+var _skRpMode = {};            // ROTOLIVE2 - pressure card: 'live' | 'season'
+
+// ROTOLIVE2 - both roto cards read the same day cache, so they are repainted
+// together. One refreshed and the other not is two different answers to the
+// same question, side by side.
+function _skRotoRepaint(leagueKey) {
+  var lg = null, all = (typeof fyLeagues !== 'undefined' && fyLeagues) ? fyLeagues : [], i;
+  for (i = 0; i < all.length; i++) if (all[i].league_key === leagueKey) lg = all[i];
+  var data = (typeof skLeagueData !== 'undefined') ? skLeagueData[leagueKey] : null;
+  if (!lg || !data) return;
+  var card = document.getElementById('skRotoPressCard');
+  if (card) { try { card.outerHTML = _skBuildRotoPressureHTML(lg, data); } catch (e) {} }
+  var host = document.getElementById('skRotoSeasonGrid');
+  if (host) { try { host.outerHTML = _skRotoSeasonGridHtml(lg, data); } catch (e2) {} }
+}
+
+function skSetRotoPressMode(key, mode) {
+  _skRpMode[key] = mode;
+  _skRotoRepaint(key);
+}
 
 function skSetRotoGridMode(key, mode) {
   _skRsMode[key] = mode;
@@ -120765,9 +120791,9 @@ function _skRotoDayLoad(leagueKey, dateStr) {
       // still asking for that day.
       try {
         var lk = (typeof skState !== 'undefined' && skState.activeLeagueKey) || '';
-        if (lk === leagueKey && _skRsMode[leagueKey] === 'today') {
-          skSetRotoGridMode(leagueKey, 'today');
-        }
+        // ROTOLIVE2 - the live card wants this day too, not just the grid in
+        // TODAY mode, so the repaint is no longer conditional on the mode.
+        if (lk === leagueKey) _skRotoRepaint(leagueKey);
       } catch (e2) {}
     })
     .catch(function () {
@@ -120775,6 +120801,273 @@ function _skRotoDayLoad(leagueKey, dateStr) {
       // Left uncached on purpose: a failed day should be retried on the next
       // open rather than remembered as an empty one.
     });
+}
+
+// ══════════════════════════════════════════════════════════════════
+// LIVE ROTO ── ROTOLIVE2 ──
+// ──────────────────────────────────────────────────────────────────
+// What the probe settled, on a two-day-old season with games in progress:
+//
+//   CAT   SEASON   days 1..today   days 1..yesterday
+//   +/-   0        -1              0  ✓        (and 8 others agreeing)
+//   → SEASON STOPS AT YESTERDAY.
+//
+// So Yahoo's standings - the rank points, the raw totals, the whole table -
+// describe a league that has not played today. Every number on the roto
+// board was a day behind while games were on, which is the one time anyone
+// looks at it.
+//
+// Live = season + today, RE-RANKED. Re-ranking is the part that matters:
+// adding today's stats changes the order of the league, and roto points come
+// from the order, not from the totals. A team can gain in every category and
+// still lose rank points.
+//
+// ── What CANNOT be added ──
+// A rate is not a sum. Season SV% plus today's SV% is not a save percentage,
+// and a league with ERA, WHIP, FG% or ATOI would be handed nonsense by a
+// blind addition. Yahoo publishes no flag for this, so a rate is recognised
+// by its own label and HELD AT ITS SEASON VALUE, and every surface that
+// shows a live number says which categories those were. A wrong number
+// presented as live is worse than an honest stale one.
+var SK_ROTO_RATE_RE = /(%|PCT|AVG|OBP|SLG|OPS|ERA|WHIP|GAA|ATOI|K\/9|\/9|RATIO)/i;
+function _skRotoIsRateCat(m) {
+  if (!m) return false;
+  return SK_ROTO_RATE_RE.test(String(m.abbr || '') + ' ' +
+                              String(m.displayName || '') + ' ' +
+                              String(m.name || ''));
+}
+
+// season + today per team per category. Rates pass through untouched and are
+// named in `rates` so the caller can say so. ROTOLIVE2
+function _skRotoLiveTotals(teams, dayVals, order, statsMeta) {
+  var out = {}, rates = [], touched = 0, i, c;
+  for (i = 0; i < teams.length; i++) out[teams[i].key] = {};
+  for (c = 0; c < order.length; c++) {
+    var id = String(order[c]);
+    var m = statsMeta[id] || {};
+    if (m.isOnlyDisplayStat || m.enabled === false) continue;
+    var rate = _skRotoIsRateCat(m);
+    if (rate) rates.push(m.abbr || m.displayName || m.name || ('#' + id));
+    for (i = 0; i < teams.length; i++) {
+      var tk = teams[i].key;
+      var sv = (teams[i].raw || {})[id];
+      if (rate) { out[tk][id] = sv; continue; }
+      var dRow = dayVals[tk] || {};
+      var sn = parseFloat(sv), dn = parseFloat(dRow[id]);
+      // Never scored and nothing today stays NULL, not zero: ROTONULLRANK
+      // ranks an absent value last, and inventing a 0 would rank it as a
+      // real result.
+      if (isNaN(sn) && isNaN(dn)) { out[tk][id] = (sv == null ? null : sv); continue; }
+      if (!isNaN(dn) && dn !== 0) touched++;
+      out[tk][id] = (isNaN(sn) ? 0 : sn) + (isNaN(dn) ? 0 : dn);
+    }
+  }
+  return { vals: out, rates: rates, touched: touched };
+}
+
+// A standings payload as it stands RIGHT NOW. Same shape as the one Yahoo
+// sent, so every roto surface consumes it with no live-specific branch.
+// Returns null while today's numbers are still on the way - and asks for
+// them. ROTOLIVE2
+function _skRotoLiveView(league, data, metaOverride) {
+  if (!league || league.scoring_type !== 'roto') return null;
+  var key = league.league_key;
+  var day = (typeof _todayDateString === 'function') ? _todayDateString() : '';
+  if (!key || !day) return null;
+  var hit = _skRotoDayCache[key + '|' + day];
+  if (!hit) { try { _skRotoDayLoad(key, day); } catch (e) {} return null; }
+
+  var allTeams = (data && data.allTeams) || {};
+  var teams = [], k;
+  for (k in allTeams) {
+    if (!allTeams.hasOwnProperty(k)) continue;
+    var t = allTeams[k];
+    if (!t || !t.catStats) continue;
+    teams.push({ key: k, name: t.name || k, raw: t.catStats,
+                 pub: t.catPoints || null, rank: t.rank });
+  }
+  if (teams.length < 2) return null;
+
+  var meta = metaOverride ||
+    ((typeof leagueSettingsCache !== 'undefined' && leagueSettingsCache[key])
+      ? leagueSettingsCache[key] : null);
+  var statsMeta = (meta && meta.stats) || {};
+  var order = (meta && meta.statOrder) || [];
+  if (!order.length) { var sd = teams[0].raw, sid; for (sid in sd) if (sd.hasOwnProperty(sid)) order.push(sid); }
+  if (!order.length) return null;
+
+  var lt = _skRotoLiveTotals(teams, hit.vals || {}, order, statsMeta);
+
+  // Both sides of the comparison come from the SAME derivation. Setting a
+  // live derived total against Yahoo's published one would fold any
+  // disagreement in the derivation into what is meant to read as today's
+  // movement. The reconciliation card is where derived-vs-published belongs.
+  var seasonTeams = [], liveTeams = [], i;
+  for (i = 0; i < teams.length; i++) {
+    seasonTeams.push({ key: teams[i].key, raw: teams[i].raw });
+    liveTeams.push({ key: teams[i].key, raw: lt.vals[teams[i].key] });
+  }
+  var seasonTot = _skRotoDerivePoints(seasonTeams, order, statsMeta);
+  var liveCat = _skRotoDeriveCatPoints(liveTeams, order, statsMeta);
+  var liveTot = {}, id;
+  for (i = 0; i < teams.length; i++) {
+    var sum = 0, row = liveCat[teams[i].key] || {};
+    for (id in row) { if (row.hasOwnProperty(id)) sum += row[id]; }
+    liveTot[teams[i].key] = sum;
+  }
+  function rankMap(tot) {
+    var ks = [], r = {};
+    for (i = 0; i < teams.length; i++) ks.push(teams[i].key);
+    ks.sort(function (a, b) { return (tot[b] - tot[a]) || String(a).localeCompare(String(b)); });
+    // Competition ranking: equal totals share the better place.
+    for (var z = 0; z < ks.length; z++) {
+      r[ks[z]] = (z > 0 && tot[ks[z]] === tot[ks[z - 1]]) ? r[ks[z - 1]] : (z + 1);
+    }
+    return r;
+  }
+  var seasonRank = rankMap(seasonTot), liveRank = rankMap(liveTot);
+
+  var live = { allTeams: {}, team: (data && data.team) || null };
+  var moved = {};
+  for (i = 0; i < teams.length; i++) {
+    var tk = teams[i].key;
+    live.allTeams[tk] = { name: teams[i].name, rank: liveRank[tk],
+                          catStats: lt.vals[tk], catPoints: liveCat[tk] };
+    moved[tk] = { ptsFrom: seasonTot[tk], ptsTo: liveTot[tk],
+                  rankFrom: seasonRank[tk], rankTo: liveRank[tk] };
+  }
+  var myKey = (data && data.team && data.team.team_key) || '';
+  return { data: live, day: day, rates: lt.rates, touched: lt.touched,
+           moved: moved, me: moved[myKey] || null, myKey: myKey,
+           teams: teams.length };
+}
+
+// ══════════════════════════════════════════════════════════════════
+// ESPROTOLIVE — does ESPN's season total already contain today?
+// ──────────────────────────────────────────────────────────────────
+// The Yahoo answer is settled: its standings stop at yesterday, so live roto
+// there is season + today. ESPN is a DIFFERENT API and the answer does not
+// carry over — teams[].valuesByStat may well update through a game, in which
+// case adding today again would double-count every stat on the board. That
+// is the failure this probe exists to prevent.
+//
+// Three snapshots of the same numbers, side by side:
+//   1. what the app already holds from its mTeam sync
+//   2. the league fetched for TODAY's scoringPeriodId
+//   3. the league fetched for YESTERDAY's
+// If 3 is smaller than 1, season is cumulative-through-today and the ESPN
+// board is already live. If 1, 2 and 3 are identical, the parameter does not
+// filter and a different route is needed. Either way it is read, not guessed.
+function skProbeEspnRotoLive() {
+  var lines = [];
+  function say(t) { lines.push(t); }
+  var rows = (typeof extLeagues !== 'undefined' && extLeagues) ? extLeagues : [];
+  var row = null, i;
+  for (i = 0; i < rows.length; i++) {
+    var r = rows[i];
+    if (!r || r.provider !== 'espn') continue;
+    if (typeof extFormatKey !== 'function' || extFormatKey(r) !== 'roto') continue;
+    if (!r.raw || !r.raw.teams) continue;
+    row = r; break;
+  }
+  if (!row) { _skGpProbeShow('No ESPN roto league is synced. Open one once, then run this.'); return; }
+
+  var game = (typeof _espSsGame === 'function') ? _espSsGame(row) : 'fhl';
+  // The saved league entry carries the id and the game code; the row's key is
+  // "espn" + that id, which is how every other ESPN fetch in this file gets
+  // there. ESPROTOLIVE
+  var sv = null;
+  try { sv = (typeof espFindSaved === 'function') ? espFindSaved(String(row.key || '').slice(4)) : null; } catch (e) {}
+  var lid = (sv && sv.id) || String(row.key || '').slice(4) || '';
+  var season = row.season || '';
+  var sp = parseInt(row.raw.scoringPeriodId, 10);
+  var teams = row.raw.teams || [];
+
+  say('══ ' + (row.name || lid) + '  (' + String(row.sport || '?').toUpperCase() + ' roto) ══');
+  say('  league ' + lid + ' · season ' + season + ' · scoringPeriodId ' +
+      (isNaN(sp) ? '(absent)' : sp));
+  say('');
+
+  // Two teams is enough to show a pattern and short enough to read.
+  var pick = [];
+  for (i = 0; i < teams.length && pick.length < 2; i++) {
+    if (teams[i] && teams[i].valuesByStat) pick.push(String(teams[i].id));
+  }
+  if (!pick.length) { _skGpProbeShow('This league carries no valuesByStat yet.'); return; }
+
+  // The scored categories, so the dump is the league's own columns and not
+  // every stat ESPN tracks.
+  var ids = [];
+  try {
+    var items = (((row.raw.settings || {}).scoringSettings) || {}).scoringItems || [];
+    for (i = 0; i < items.length && ids.length < 12; i++) {
+      if (items[i] && items[i].statId != null) ids.push(String(items[i].statId));
+    }
+  } catch (e2) {}
+
+  function snap(teamsArr, label) {
+    var map = {}, q, z;
+    for (q = 0; q < (teamsArr || []).length; q++) {
+      var t = teamsArr[q];
+      if (!t || !t.valuesByStat) continue;
+      map[String(t.id)] = t.valuesByStat;
+    }
+    var out = {};
+    for (q = 0; q < pick.length; q++) {
+      var vb = map[pick[q]] || {}, row2 = {};
+      for (z = 0; z < ids.length; z++) row2[ids[z]] = vb[ids[z]];
+      out[pick[q]] = row2;
+    }
+    return { label: label, vals: out };
+  }
+
+  var have = snap(teams, 'in memory (mTeam sync)');
+  var jobs = [];
+  if (typeof espFetchLeague === 'function' && lid && season && !isNaN(sp)) {
+    jobs.push(espFetchLeague(game, lid, season, '?view=mTeam&scoringPeriodId=' + sp)
+      .then(function (j) { return snap((j || {}).teams, 'fetched, scoringPeriodId=' + sp + ' (today)'); })
+      ['catch'](function (e) { return { label: 'today fetch FAILED: ' + (e && e.message), vals: null }; }));
+    jobs.push(espFetchLeague(game, lid, season, '?view=mTeam&scoringPeriodId=' + (sp - 1))
+      .then(function (j) { return snap((j || {}).teams, 'fetched, scoringPeriodId=' + (sp - 1) + ' (yesterday)'); })
+      ['catch'](function (e) { return { label: 'yesterday fetch FAILED: ' + (e && e.message), vals: null }; }));
+  }
+  _skGpProbeShow('Fetching ESPN\u2019s league twice\u2026');
+
+  Promise.all(jobs).then(function (got) {
+    var snaps = [have].concat(got), si, pi, zi;
+    function lbl(id) {
+      try { return (typeof espStatLabel === 'function') ? (espStatLabel(game, id) || ('#' + id)) : ('#' + id); }
+      catch (e3) { return '#' + id; }
+    }
+    for (pi = 0; pi < pick.length; pi++) {
+      var tid = pick[pi], nm = tid;
+      for (zi = 0; zi < teams.length; zi++) {
+        if (String(teams[zi].id) === tid) nm = teams[zi].abbrev || teams[zi].name || tid;
+      }
+      say('  ── ' + nm + ' ──');
+      say('    ' + _skFxPad('CAT', 8) +
+          _skFxPad('memory', 12) + _skFxPad('today', 12) + 'yesterday');
+      for (zi = 0; zi < ids.length; zi++) {
+        var cells = [], anyDiff = false, first = null;
+        for (si = 0; si < snaps.length; si++) {
+          var v = snaps[si].vals ? snaps[si].vals[tid][ids[zi]] : undefined;
+          var txt = (v == null) ? '-' : String(Math.round(v * 1000) / 1000);
+          if (si === 0) first = txt; else if (snaps[si].vals && txt !== first) anyDiff = true;
+          cells.push(_skFxPad(txt, 12));
+        }
+        say('    ' + _skFxPad(lbl(ids[zi]), 8) + cells.join('') + (anyDiff ? '  <<' : ''));
+      }
+      say('');
+    }
+    for (si = 0; si < snaps.length; si++) say('  [' + si + '] ' + snaps[si].label);
+    say('');
+    say('  Read it like this:');
+    say('   · yesterday SMALLER than memory  -> ESPN season already contains');
+    say('     today, so the board is live and nothing may be added.');
+    say('   · all three identical            -> scoringPeriodId does not filter');
+    say('     valuesByStat; a different route is needed to split today out.');
+    _skGpProbeShow(lines.join('\n'));
+  });
 }
 
 function _skRlDayList(lg) {
@@ -120956,7 +121249,65 @@ function _skRotoGridTeams(data) {
 // Roto points worked out from the raw totals, so they can be set against the
 // ones Yahoo published. Ties share the average of the ranks they occupy —
 // two teams tied for 3rd of 20 take 18.5 each, not 18 and 17. ROTOSEASON
+// ---- ROTOLIVE2 ----
+// The same ranking, reported per category instead of as one total:
+// { teamKey: { statId: points } }. The live view re-ranks every category
+// from scratch, so it needs the breakdown, and the card that reads
+// catPoints needs it in Yahoo's own shape.
+function _skRotoDeriveCatPoints(teams, order, statsMeta) {
+  var out = {}, i, j, c;
+  for (i = 0; i < teams.length; i++) out[teams[i].key] = {};
+  var n = teams.length;
+  for (c = 0; c < order.length; c++) {
+    var id = String(order[c]);
+    var m = statsMeta[id] || {};
+    if (m.isOnlyDisplayStat || m.enabled === false) continue;
+    var lowerWins = (m.sortOrder === 0);
+    var vals = [];
+    for (i = 0; i < teams.length; i++) {
+      var v = parseFloat(teams[i].raw[id]);
+      vals.push(isNaN(v) ? null : v);
+    }
+    for (i = 0; i < teams.length; i++) {
+      var mineV = vals[i];
+      var better = 0, same = 0;
+      for (j = 0; j < teams.length; j++) {
+        var vj = vals[j];
+        if (mineV == null) {
+          // ROTONULLRANK - nothing scored yet is LAST, and every team in the
+          // same position is tied with me there.
+          if (vj == null) same++; else better++;
+        } else {
+          if (vj == null) continue;          // they are behind me, not ahead
+          if (vj === mineV) same++;
+          else if (lowerWins ? (vj < mineV) : (vj > mineV)) better++;
+        }
+      }
+      if (!same) continue;
+      var tot = 0, q;
+      for (q = 0; q < same; q++) tot += (n - (better + q));
+      out[teams[i].key][id] = tot / same;
+    }
+  }
+  return out;
+}
+
 function _skRotoDerivePoints(teams, order, statsMeta) {
+  var per = _skRotoDeriveCatPoints(teams, order, statsMeta);
+  var out = {}, i, id;
+  for (i = 0; i < teams.length; i++) {
+    var sum = 0, row = per[teams[i].key] || {};
+    for (id in row) { if (row.hasOwnProperty(id)) sum += row[id]; }
+    out[teams[i].key] = sum;
+  }
+  return out;
+}
+
+// The previous all-in-one derivation, kept UNUSED by the app on purpose:
+// it is the reference the per-category rewrite above is checked against, over
+// hundreds of generated leagues with ties and unscored categories in them.
+// Delete it and the rewrite has nothing to be wrong against. ROTOLIVE2
+function _skRotoDerivePointsOld(teams, order, statsMeta) {
   var out = {}, i, j, c;
   for (i = 0; i < teams.length; i++) out[teams[i].key] = 0;
   var n = teams.length;
@@ -121058,10 +121409,15 @@ function _skRotoSeasonGridHtml(league, data, metaOverride) {
   // ROTODAILY2 — same grid, two sources. SEASON is already in memory; TODAY is
   // one request for the whole league, which the probe confirmed matches the
   // per-team numbers exactly.
-  var mode = (_skRsMode[key] === 'today') ? 'today' : 'season';
+  var mode = (_skRsMode[key] === 'today') ? 'today'
+           : (_skRsMode[key] === 'live') ? 'live' : 'season';
   var day = (typeof _todayDateString === 'function') ? _todayDateString() : '';
   var dayHit = (mode === 'today') ? _skRotoDayCache[key + '|' + day] : null;
   if (mode === 'today') _skRotoDayLoad(key, day);
+  // ROTOLIVE2 - season + today, re-ranked. Null while today is still coming,
+  // and asking for it on the way past.
+  var liveV = null;
+  if (mode === 'live') { try { liveV = _skRotoLiveView(league, data, metaOverride); } catch (eL) {} }
   function toggle() {
     var kA = String(key).replace(/'/g, '');
     function btn(m, lbl) {
@@ -121074,7 +121430,7 @@ function _skRotoSeasonGridHtml(league, data, metaOverride) {
         'color:' + (on ? 'var(--sk-gold)' : 'var(--sk-text-3)') + ';">' + lbl + '</button>';
     }
     return '<div style="display:flex;gap:6px;padding:0 12px 8px;">' +
-      btn('season', 'SEASON') + btn('today', 'TODAY') + '</div>';
+      btn('season', 'SEASON') + btn('live', 'LIVE') + btn('today', 'TODAY') + '</div>';
   }
   function shell(msg) {
     return '<div class="sk-rp" id="skRotoSeasonGrid">' +
@@ -121087,6 +121443,16 @@ function _skRotoSeasonGridHtml(league, data, metaOverride) {
     if (!dayHit) return shell('Loading today’s numbers\u2026');
     var dv = dayHit.vals || {}, dt;
     for (dt = 0; dt < teams.length; dt++) teams[dt].raw = dv[teams[dt].key] || {};
+  }
+  if (mode === 'live') {
+    if (!liveV) return shell('Loading today\u2019s numbers\u2026');
+    var la = liveV.data.allTeams, lt2;
+    for (lt2 = 0; lt2 < teams.length; lt2++) {
+      var lrow = la[teams[lt2].key];
+      if (!lrow) continue;
+      teams[lt2].raw = lrow.catStats;
+      teams[lt2].rank = lrow.rank;          // live order, not yesterday's
+    }
   }
 
   var meta = metaOverride ||
@@ -121180,13 +121546,20 @@ function _skRotoSeasonGridHtml(league, data, metaOverride) {
   h += '<div style="color:rgba(255,255,255,0.28);font-size:9.5px;margin:8px 12px 0;line-height:1.5;">' +
     (mode === 'today'
       ? 'Today’s totals for every team, in one request · ' + slEsc(day)
+      : mode === 'live'
+        ? ('Season + today, re-ranked \u00b7 ' + slEsc(day) +
+           ((liveV && liveV.rates.length)
+             ? ' \u00b7 held at season (a rate cannot be added): ' + slEsc(liveV.rates.join(', '))
+             : ''))
       : 'Season totals from Yahoo’s own per-team values') +
     ' · in this league’s scoring order ' +
     '· tap a column to sort, TEAM to reset · swipe sideways for the rest.</div>';
   // The season totals are what the roto points are derived FROM, so the check
   // that the derivation reads them right belongs under those and nowhere else:
   // a single day has no published points to be checked against. ROTODAILY2
-  if (mode !== 'today') {
+  // Derived against published, which only SEASON has: a day on its own and a
+  // live total have no published points to be checked against. ROTODAILY2
+  if (mode === 'season') {
     h += '<div style="padding:0 12px 10px;">' +
       _skRotoReconcileHtml(teams, order, statsMeta, myKey) + '</div>';
   } else {
@@ -121440,12 +121813,46 @@ function _skRotoCatStates(league, data, metaOverride) {
 function _skBuildRotoPressureHTML(league, data, metaOverride) {
   if (!league || league.scoring_type !== 'roto') return '';
   function shell(msg) {
-    return '<div class="sk-rp">' +
+    // ROTOLIVE2 - the toggle rides along, or switching to LIVE on a slow
+    // connection takes away the only control that switches back.
+    return '<div class="sk-rp" id="skRotoPressCard">' +
       '<div class="sk-rp-head"><div class="sk-rp-title">CATEGORY PRESSURE</div>' +
       '<div class="sk-rp-sub">where your rank points can actually move</div></div>' +
+      (typeof _rpToggle === 'function' ? _rpToggle() : '') +
       '<div class="sk-rp-empty">' + skEscape(msg) + '</div></div>';
   }
-  var res = _skRotoCatStates(league, data, metaOverride);
+  // ---- ROTOLIVE2 ----
+  // Yahoo's standings stop at yesterday - the probe proved it on a two-day
+  // season, nine categories out of nine. During games that makes every number
+  // on this card a day old, which is the one time it is being read. LIVE
+  // re-ranks the league on season + today; SEASON is still a tap away because
+  // the settled table is what the league's own standings page shows.
+  //
+  // ESPN comes through here with a metaOverride and its own adapter, and its
+  // season totals have NOT been shown to stop at yesterday. Until that is
+  // established the same way, it gets no live toggle rather than a guess.
+  var _rpKey = (!metaOverride && league.league_key) ? league.league_key : '';
+  var _rpMode = _rpKey ? ((_skRpMode[_rpKey] === 'season') ? 'season' : 'live') : 'season';
+  var _lv = null;
+  if (_rpMode === 'live') { try { _lv = _skRotoLiveView(league, data, metaOverride); } catch (eLv) {} }
+
+  function _rpToggle() {
+    if (!_rpKey) return '';
+    var kA = String(_rpKey).replace(/'/g, '');
+    function btn(m, lbl) {
+      var on = (_rpMode === m);
+      return '<button onclick="skSetRotoPressMode(\'' + kA + '\',\'' + m + '\')" ' +
+        'style="font-family:var(--sk-font-mono,monospace);font-size:9px;font-weight:700;' +
+        'letter-spacing:0.09em;padding:5px 11px;border-radius:7px;cursor:pointer;' +
+        'border:1px solid ' + (on ? 'var(--sk-gold)' : 'var(--sk-border)') + ';' +
+        'background:' + (on ? 'rgba(245,197,24,0.10)' : 'transparent') + ';' +
+        'color:' + (on ? 'var(--sk-gold)' : 'var(--sk-text-3)') + ';">' + lbl + '</button>';
+    }
+    return '<div style="display:flex;gap:6px;padding:0 12px 8px;">' +
+      btn('live', 'LIVE') + btn('season', 'SEASON') + '</div>';
+  }
+
+  var res = _skRotoCatStates(league, (_lv ? _lv.data : data), metaOverride);
   if (!res) return shell('Waiting on league standings.');
   if (!res.scored) return shell('No category values yet \u2014 this fills in once the season\u2019s scoring.');
 
@@ -121500,11 +121907,55 @@ function _skBuildRotoPressureHTML(league, data, metaOverride) {
     }
   }
 
-  return '<div class="sk-rp">' +
+  // ---- ROTOLIVE2 ----
+  // What today has done to me, in the two units that matter: rank points and
+  // placing. Both sides come from the SAME derivation, so this reads as the
+  // effect of today's games and not as a disagreement with Yahoo's published
+  // points - that comparison has its own card under the grid.
+  function _rpArrow(from, to, higherIsBetter) {
+    var d = to - from;
+    if (!d) return '<span style="color:rgba(255,255,255,0.30);">\u2014</span>';
+    var good = higherIsBetter ? (d > 0) : (d < 0);
+    var mag = Math.round(Math.abs(d) * 10) / 10;
+    return '<span style="color:' + (good ? '#4ade80' : '#f87171') + ';">' +
+      (d > 0 ? '\u25b2' : '\u25bc') + mag + '</span>';
+  }
+  var liveBar = '';
+  if (_rpMode === 'live') {
+    if (!_lv) {
+      liveBar = '<div style="margin:0 12px 10px;padding:7px 10px;border-radius:8px;' +
+        'background:rgba(255,255,255,0.04);color:rgba(255,255,255,0.45);font-size:10px;' +
+        'font-family:var(--sk-font-mono,monospace);">Loading today\u2019s numbers\u2026 ' +
+        'showing the settled table meanwhile.</div>';
+    } else {
+      var meM = _lv.me;
+      liveBar = '<div style="margin:0 12px 10px;padding:8px 10px;border-radius:8px;' +
+        'background:rgba(245,197,24,0.07);border:1px solid rgba(245,197,24,0.22);' +
+        'font-family:var(--sk-font-mono,monospace);font-size:10px;' +
+        'color:rgba(255,255,255,0.72);line-height:1.6;">' +
+        '<b style="color:var(--sk-gold);letter-spacing:0.08em;">LIVE</b> \u00b7 season + today \u00b7 ' +
+        slEsc(_lv.day) +
+        (meM
+          ? ('<br>' + f1(meM.ptsTo) + ' rank points ' + _rpArrow(meM.ptsFrom, meM.ptsTo, true) +
+             ' \u00b7 ' + ordinal(meM.rankTo) + ' ' + _rpArrow(meM.rankFrom, meM.rankTo, false) +
+             ' of ' + _lv.teams)
+          : '') +
+        (_lv.touched ? '' : '<br><i style="color:rgba(255,255,255,0.40);">nothing has been ' +
+                            'recorded today yet \u2014 this matches the settled table.</i>') +
+        (_lv.rates.length
+          ? ('<br><i style="color:rgba(255,255,255,0.40);">held at season (a rate cannot be ' +
+             'added): ' + slEsc(_lv.rates.join(', ')) + '</i>')
+          : '') +
+      '</div>';
+    }
+  }
+
+  return '<div class="sk-rp" id="skRotoPressCard">' +
     '<div class="sk-rp-head">' +
       '<div class="sk-rp-title">CATEGORY PRESSURE</div>' +
       '<div class="sk-rp-sub">where your rank points can actually move</div>' +
     '</div>' +
+    _rpToggle() + liveBar +
     '<div class="sk-rp-tot">' +
       '<div class="sk-rp-tot-cell"><span class="sk-rp-tot-lbl">WITHIN REACH</span>' +
         '<span class="sk-rp-tot-val pos">' + f1(gainTotal) + '</span></div>' +
@@ -121512,7 +121963,9 @@ function _skBuildRotoPressureHTML(league, data, metaOverride) {
         '<span class="sk-rp-tot-val neg">' + f1(riskTotal) + '</span></div>' +
     '</div>' +
     body +
-    '<div class="sk-rp-note">YOU is your season total in that category, straight from Yahoo. '
+    '<div class="sk-rp-note">YOU is your ' +
+      (_rpMode === 'live' && _lv ? 'total including today\u2019s games' : 'season total') +
+      ' in that category. '
       + 'TO GAIN is how much more of the STAT would draw you level with '
       + 'the nearest team you are not already tied with \u2014 faceoffs, blocks, shots \u2014 not rank '
       + 'points. The small grey figure beside it is what that move is worth in rank points. CUSHION '
