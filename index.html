@@ -34376,6 +34376,128 @@ function _seasonYearFor(league) {
 // seasons. That is the year-mixing, and this is where it stops.
 function _seasonSpansYears(league) { return !!_SEASON_SPAN[league]; }
 
+// ---- SEASONPICK ----
+// Which of an athlete's splits is THIS season, and is it actually this
+// season's?
+//
+// This chain used to live inline in the team page, and the starred-team
+// prefetch had its own one-liner — splits.find(/season|regular/) with no year
+// test at all — writing into the SAME teamPageCache entry. So a starred team
+// got whichever split ESPN happened to list first, and the roster table
+// showed a 66-game line beside a 1-game line for a team that had played once.
+// One rule, one place, both callers.
+//
+// Returns { split, stale }. `stale` means the best split available is from an
+// earlier season: the player has nothing this season, which is a fact about
+// the player and renders as "No current stats" rather than as last year's
+// numbers in a column headed GP.
+// ---- SEASONPICK ----
+// A team's games played, from the record on its own endpoint. The shapes
+// differ by league and by view, so all three are tried rather than assumed.
+function _espTeamGPFrom(teamObj) {
+  if (!teamObj) return null;
+  var t = teamObj.team || teamObj;
+  var sum = '';
+  if (typeof t.record === 'string') sum = t.record;
+  else if (t.recordSummary) sum = t.recordSummary;
+  else if (t.record && t.record.items) {
+    var items = t.record.items;
+    for (var i = 0; i < items.length; i++) {
+      if (items[i] && items[i].type === 'total') { sum = items[i].summary || ''; break; }
+    }
+    if (!sum && items[0]) sum = items[0].summary || '';
+  }
+  return (typeof _sbTeamGP === 'function') ? _sbTeamGP({ record: sum }) : null;
+}
+
+function _espSeasonSplitFor(stats, league, teamGP) {
+  var splits = (stats && Array.isArray(stats.splits)) ? stats.splits : [];
+  if (!splits.length) return { split: null, stale: false };
+  var yr = _seasonYearFor(league);
+  var prevYr = String(yr - 1);
+  var pick = null;
+
+  // 1 — the split for THIS season.
+  pick = splits.find(function (s) { return _seasonSplitMatches(s.displayName, league, yr); });
+  // 1b — last season, for a season that has just ended.
+  if (!pick) {
+    pick = splits.find(function (s) {
+      var dn = (s.displayName || '').toLowerCase();
+      return dn.indexOf(prevYr) !== -1 && !/career|all.?time/i.test(dn);
+    });
+  }
+  // 2 — any non-career "season"/"regular" split.
+  if (!pick) {
+    pick = splits.find(function (s) {
+      var dn = (s.displayName || '').toLowerCase();
+      return /season|regular/i.test(dn) && !/career|all.?time/i.test(dn);
+    });
+  }
+  // 3 — the first non-career split.
+  if (!pick) {
+    pick = splits.find(function (s) {
+      return !/career|all.?time/i.test(s.displayName || '');
+    });
+  }
+  // 4 — fewest games played wins: a career line always has more.
+  if (!pick && splits.length > 1) {
+    var gpLabel = ((stats && stats.labels) || []).findIndex(function (l) { return l === 'GP'; });
+    if (gpLabel !== -1) {
+      var nonCareer = splits.filter(function (s) { return !/career|all.?time/i.test(s.displayName || ''); });
+      if (nonCareer.length) {
+        nonCareer.sort(function (a, b) {
+          return (parseStat((a.stats || [])[gpLabel]) || 0) - (parseStat((b.stats || [])[gpLabel]) || 0);
+        });
+        pick = nonCareer[0];
+      }
+    }
+  }
+  if (!pick) pick = splits[splits.length - 1] || splits[0] || null;
+
+  // Is what we landed on actually this season? The year in the label decides.
+  var stale = false;
+  var dn2 = (pick && pick.displayName) ? String(pick.displayName).toLowerCase() : '';
+  // The last-resort pick above takes whatever is left, which for a player
+  // with only a career line is that career line — 400 games in a column
+  // headed GP for a season one game old. A career total is never this
+  // season, whatever else it is.
+  if (/career|all.?time/.test(dn2)) return { split: pick, stale: true };
+  var ym = dn2.match(/(\d{4})/);
+  if (ym) {
+    var statYear = parseInt(ym[1], 10);
+    // A span season labelled "2026-27" matches on its FIRST year, which is
+    // the season year itself — so anything below that is a previous season.
+    if (statYear < yr) stale = true;
+  }
+
+  // ---- The test that doesn't depend on a label ----
+  // A split can carry no year at all — ESPN labels some of them just
+  // "Regular Season" — and one that does may belong to another competition
+  // in the same season. Either way the label test has nothing to bite on,
+  // which is how a 25-game line survived on a team that had played once.
+  //
+  // So ask the question that needs no label: A PLAYER CANNOT HAVE APPEARED
+  // IN MORE GAMES THAN HIS TEAM HAS PLAYED. The team's own record settles
+  // it, and a split that fails it is not this team's season whatever it
+  // calls itself.
+  if (!stale && teamGP != null && pick) {
+    var gpIdx = ((stats && stats.labels) || []).findIndex(function (l) { return l === 'GP'; });
+    if (gpIdx !== -1) {
+      var pgp = parseStat((pick.stats || [])[gpIdx]);
+      // A TRADED player legitimately carries games from his old team, and
+      // schedules are uneven, so the cap is not exactly the team's own
+      // count. The slack scales with the season: no team can be many games
+      // ahead of yours in October, while by March a trade can put a player
+      // several games clear. min(5, teamGP) is tight when tightness is
+      // possible and generous once it has to be — and at zero games played
+      // it is still zero, because nobody has appeared in any.
+      var slack = Math.min(5, teamGP);
+      if (pgp != null && !isNaN(pgp) && pgp > (teamGP + slack)) stale = true;
+    }
+  }
+  return { split: pick, stale: stale };
+}
+
 function _seasonSplitMatches(displayName, league, yr) {
   var dn = String(displayName || '').toLowerCase();
   if (/career|all.?time/.test(dn)) return false;
@@ -35943,6 +36065,8 @@ async function prefetchTeamStats(teamId, league) {
     var rawAthletes = teamObj.athletes || [];
     var playerStats = [];
     var statLabels = [];
+    // SEASONPICK — same games-played gate as the team page.
+    var _pfTeamGP = _espTeamGPFrom(data);
 
     rawAthletes.forEach(function(groupOrAthlete) {
       var items = groupOrAthlete.items || [groupOrAthlete];
@@ -35952,11 +36076,16 @@ async function prefetchTeamStats(teamId, league) {
         if (!statGroup) return;
         var labels = statGroup.labels || [];
         if (labels.length && !statLabels.length) statLabels = labels;
-        var splits = statGroup.splits || [];
-        var season = splits.find(function(s) {
-          return /season|regular/i.test(s.displayName || '');
-        }) || splits[0];
+        // SEASONPICK - this used to be splits.find(/season|regular/) with no
+        // year test, which is how a starred team's cached roster came back
+        // carrying last season. Same rule as the team page now, and the same
+        // staleness verdict, because both write this one cache entry.
+        var _pk = _espSeasonSplitFor(statGroup, league, _pfTeamGP);
+        var season = _pk.split;
         if (!season || !season.stats || !season.stats.length) return;
+        var _gpIdx = labels.findIndex(function (l) { return l === 'GP'; });
+        var _gp = (_gpIdx !== -1 && season.stats[_gpIdx] != null)
+          ? parseStat(season.stats[_gpIdx]) : -1;
         var rosterStatus = ((a.status && a.status.type) || '').toLowerCase();
         playerStats.push({
           id: a.id,
@@ -35966,9 +36095,11 @@ async function prefetchTeamStats(teamId, league) {
           jersey: a.jersey || '',
           stats: season.stats,
           playerLabels: labels,
-          gp: -1,
-          dnp: rosterStatus && !/^active$/.test(rosterStatus),
-          injuryNote: '',
+          // SEASONPICK - gp was hard-coded -1 here, so every consumer that
+          // gates on games played saw "unknown" for a starred team.
+          gp: _gp,
+          dnp: !!(rosterStatus && !/^active$/.test(rosterStatus)) || _pk.stale || _gp === 0,
+          injuryNote: _pk.stale ? 'No current stats' : '',
         });
       });
     });
@@ -58203,6 +58334,62 @@ var tbMilbLevel = 'All';
 var tbSearch = '';
 var tbView = 'list';   // HTMAP — 'list' or 'map', hockeyTech leagues only
 
+// ══════════════════════════════════════════════════════════════════
+// BROWSE TEAMS RECORDS ── TBRECSEASON ──
+// ──────────────────────────────────────────────────────────────────
+// The grid read "COL · 55-16-11, 121 PTS" on a day the team page for the
+// same club read "1-0-0". Two endpoints, two seasons: the per-team call
+// carries the live record, the bulk /teams list does not.
+//
+// Rather than guess at a season parameter that may or may not exist on that
+// endpoint, the app checks for itself against records it already KNOWS are
+// current — today's scoreboard, and any team page already opened. If a
+// trusted record exists for a team, it is simply used. And if a trusted one
+// CONTRADICTS the list by more games than a season can explain, that is
+// proof the whole list is on another season, so no stale record is shown for
+// any team in it.
+function _tbTrustedRecord(teamId, league) {
+  var id = String(teamId == null ? '' : teamId);
+  if (!id) return '';
+  // Today's scoreboard — current by definition.
+  try {
+    var gs = (typeof allGames === 'object' && allGames) ? (allGames[league] || []) : [];
+    for (var i = 0; i < gs.length; i++) {
+      var g = gs[i];
+      if (g.home && String(g.home.id) === id && g.home.record) return String(g.home.record);
+      if (g.away && String(g.away.id) === id && g.away.record) return String(g.away.record);
+    }
+  } catch (e) {}
+  // A team page already opened fetched the per-team endpoint, which is the
+  // source the header record comes from.
+  try {
+    var tp = (typeof teamPageCache === 'object' && teamPageCache)
+      ? teamPageCache[id + '_' + league] : null;
+    if (tp && tp.tRecord) return String(tp.tRecord);
+  } catch (e2) {}
+  return '';
+}
+
+// Does the list disagree with something we know? One contradiction is
+// enough: these records all come from one response, so if one is from
+// another season they all are. TBRECSEASON
+function _tbRecordsStale(list, league) {
+  if (!list || !list.length) return false;
+  for (var i = 0; i < list.length; i++) {
+    var t = list[i];
+    if (!t || !t.record) continue;
+    var trusted = _tbTrustedRecord(t.id, league);
+    if (!trusted) continue;
+    var a = _sbTeamGP({ record: trusted });
+    var b = _sbTeamGP({ record: t.record });
+    if (a == null || b == null) continue;
+    // The same slack the roster uses, for the same reason: schedules are
+    // uneven and a record can be a game or two behind the scoreboard.
+    if (b > a + Math.min(5, a) || a > b + Math.min(5, b)) return true;
+  }
+  return false;
+}
+
 function openTeamsBrowser() {
   document.getElementById('tbOverlay').classList.add('open');
   renderTeamsBrowser();
@@ -59523,9 +59710,23 @@ function renderTeamsBrowser() {
     return;
   }
 
+  // TBRECSEASON — is this league's list serving another season?
+  var _tbStale = false;
+  try { _tbStale = _tbRecordsStale(filtered, tbLeague); } catch (eS) { _tbStale = false; }
+  if (_tbStale) {
+    html += '<div style="padding:0 20px 6px;font-size:9.5px;color:rgba(255,255,255,0.3);line-height:1.5">' +
+      'Records here are last season\u2019s \u2014 the list ESPN serves for a whole league ' +
+      'lags the per-team one. Open a team for its current record.</div>';
+  }
+
   // Team grid
   html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px;padding:8px 20px 24px">';
   filtered.forEach(function(t) {
+    // TBRECSEASON — a record we know is current wins; one we know is not is
+    // left off rather than shown as though it were this season's.
+    var _rec = '';
+    try { _rec = _tbTrustedRecord(t.id, t.league || tbLeague) || (_tbStale ? '' : (t.record || '')); }
+    catch (eR) { _rec = t.record || ''; }
     // HTAFF — a parent's logo url can be supplied directly now; MLB's is
     // still built from its org id when only that is known.
     var _parentSrc = t.parentLogo ||
@@ -59548,7 +59749,7 @@ function renderTeamsBrowser() {
       (t.logo ? '<img src="' + t.logo + '" style="width:40px;height:40px;object-fit:contain;margin:0 auto 6px;display:block" onerror="this.style.display=\'none\'">' :
         '<div style="width:40px;height:40px;margin:0 auto 6px;background:rgba(255,255,255,0.06);border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:700;color:rgba(255,255,255,0.3)">' + (t.abbr?.[0] || '?') + '</div>') +
       '<div style="font-size:11px;font-weight:700;color:#fff;font-family:Outfit,sans-serif">' + t.name + '</div>' +
-      '<div style="font-size:9px;color:rgba(255,255,255,0.35);margin-top:2px">' + t.abbr + (t.record ? ' · ' + t.record : '') + ' ' + levelBadge + '</div>' +
+      '<div style="font-size:9px;color:rgba(255,255,255,0.35);margin-top:2px">' + t.abbr + (_rec ? ' · ' + _rec : '') + ' ' + levelBadge + '</div>' +
       homeBadge +   // HTHOME
       parentBadge +
     '</div>';
@@ -65638,6 +65839,61 @@ function _sbLeadFmt(v, fmt) {
   return (Math.round(v * 10) / 10).toFixed(1);   // averages
 }
 
+// ---- SBLEADSEASON ----
+// Which SEASON are these numbers from?
+//
+// The leaders came back reading 44 goals and 130 points for a team that had
+// played one game, because both sources happily serve last season when the
+// new one is empty: ESPN's athlete overview returns splits[0], which is the
+// previous season until the current one has rows in it, and the scoreboard's
+// own leaders node does the same.
+//
+// There is no need to guess at a season field to catch this, because the
+// payload contradicts itself: A PLAYER CANNOT HAVE APPEARED IN MORE GAMES
+// THAN HIS TEAM HAS PLAYED. The team's record is right there on the game —
+// "0-1-0" is one game — so any row carrying a higher GP is from another
+// season, provably, with nothing inferred.
+//
+// A team that has played NO games has no leader in anything, which is the
+// one case where the honest answer is an empty panel rather than a number.
+function _sbTeamGP(side) {
+  var rec = side && side.record;
+  if (rec == null || rec === '') return null;
+  // ESPN writes an NHL summary as "55-16-11, 121 PTS". The record is the
+  // part before the comma; everything after it is standings points, which
+  // are not games.
+  var txt = String(rec).split(',')[0];
+  var parts = txt.split('-');
+  // A record is at least W-L, and every part is a bare integer. parseInt is
+  // too forgiving on its own: it reads "1st in Metro" as 1, which would call
+  // a team one game into its season and condemn every leader it has.
+  if (parts.length < 2) return null;
+  var total = 0, i;
+  for (i = 0; i < parts.length; i++) {
+    if (!/^\s*\d+\s*$/.test(parts[i])) return null;
+    total += parseInt(parts[i], 10);
+  }
+  return total;
+}
+
+// The rows that can belong to THIS season, and whether we have positive
+// evidence that the feed is serving another one. SBLEADSEASON
+function _sbSeasonRows(rows, teamGP) {
+  if (!rows || !rows.length) return { rows: null, stale: false };
+  if (teamGP == null) return { rows: rows, stale: false };   // nothing to test against
+  if (teamGP === 0) return { rows: null, stale: true };
+  var keep = [];
+  for (var i = 0; i < rows.length; i++) {
+    var gp = Number(rows[i] && rows[i].gp);
+    if (!isNaN(gp) && gp > teamGP) continue;                  // impossible this season
+    keep.push(rows[i]);
+  }
+  // Every row impossible means the whole block is last season's — and that
+  // is evidence about the FEED, not just about these rows, so the caller
+  // uses it to distrust the scoreboard's leaders node too.
+  return { rows: keep.length ? keep : null, stale: !keep.length };
+}
+
 function _gymLeadersFromPlayerStats(playerStats, cfg) {
   if (!playerStats || !playerStats.length) return null;
   cfg = cfg || _SB_LEAD_CFG.BASKETBALL;
@@ -65702,16 +65958,28 @@ function _gymTeamPlayerRows_get(teamId, league) {
   return null;
 }
 
-function _gymTeamAvgs_get(teamId, league) {
+function _gymTeamAvgs_get(teamId, league, teamGP) {
+  // SBLEADSEASON - keyed by the cap as well as the team: the same roster
+  // yields a different (and sometimes empty) leader set once the rows that
+  // cannot belong to this season are dropped.
   var ck = teamId + '_' + league;
-  if (_gymTeamAvgs[ck]) return _gymTeamAvgs[ck];
-  // Warm team-page cache is free — no request at all.
-  if (typeof teamPageCache === 'object' && teamPageCache && teamPageCache[ck] &&
-      teamPageCache[ck].playerStats) {
-    var derived = _gymLeadersFromPlayerStats(teamPageCache[ck].playerStats, _sbLeadCfg(league));
-    if (derived) { _gymTeamAvgs[ck] = derived; return derived; }
+  var mk = ck + '|' + (teamGP == null ? 'x' : teamGP);
+  if (_gymTeamAvgs[mk]) return _gymTeamAvgs[mk];
+  var raw = null;
+  if (_gymTeamPlayerRows[ck]) raw = _gymTeamPlayerRows[ck];
+  else {
+    try {
+      if (typeof teamPageCache === 'object' && teamPageCache && teamPageCache[ck] &&
+          teamPageCache[ck].playerStats) raw = teamPageCache[ck].playerStats;
+    } catch (e) {}
   }
-  return null;
+  if (!raw) return null;
+  var sel = _sbSeasonRows(raw, teamGP);
+  if (!sel.rows) { _gymTeamAvgs[mk] = { _stale: true }; return _gymTeamAvgs[mk]; }
+  var derived = _gymLeadersFromPlayerStats(sel.rows, _sbLeadCfg(league));
+  if (!derived) return null;
+  _gymTeamAvgs[mk] = derived;
+  return derived;
 }
 
 // Same two-stage walk the team page does — roster, then each athlete's
@@ -66140,14 +66408,21 @@ function _sbPregameLeaders(data, game, awayAccent, homeAccent, divStyle) {
   // fill the gaps from the season averages the team page already computes.
   // Warm cache costs nothing; a cold one kicks off a single fetch per team and
   // re-renders when it lands, the same pattern _fetchEspnTeamStats uses.
-  var avgA = _gymTeamAvgs_get(game.away.id, game.league);
-  var avgH = _gymTeamAvgs_get(game.home.id, game.league);
+  // SBLEADSEASON - the team's own record says how many games it has played,
+  // which is what makes a stale leader detectable.
+  var gpA = _sbTeamGP(game.away), gpH = _sbTeamGP(game.home);
+  var avgA = _gymTeamAvgs_get(game.away.id, game.league, gpA);
+  var avgH = _gymTeamAvgs_get(game.home.id, game.league, gpH);
+  var staleA = !!(avgA && avgA._stale) || gpA === 0;
+  var staleH = !!(avgH && avgH._stale) || gpH === 0;
+  if (staleA) avgA = null;
+  if (staleH) avgH = null;
   // Re-render the stadium this game actually belongs to.
   var _rerender = (game.league === 'NHL')
     ? (typeof renderRinkStadium === 'function' ? renderRinkStadium : null)
     : (typeof renderGymStadium === 'function' ? renderGymStadium : null);
-  if (!avgA) _gymFetchTeamAvgs(game.away.id, game.league, _rerender);
-  if (!avgH) _gymFetchTeamAvgs(game.home.id, game.league, _rerender);
+  if (!avgA && !staleA) _gymFetchTeamAvgs(game.away.id, game.league, _rerender);
+  if (!avgH && !staleH) _gymFetchTeamAvgs(game.home.id, game.league, _rerender);
   function fromAvg(side, key) {
     var src = (side === 'away') ? avgA : avgH;
     return (src && src[key]) ? src[key] : null;
@@ -66184,9 +66459,18 @@ function _sbPregameLeaders(data, game, awayAccent, homeAccent, divStyle) {
   var cfg = _sbLeadCfg(game.league);   // SBLEADCFG
   for (var r = 0; r < cfg.length; r++) {
     var def = cfg[r];
-    // Payload first (it's the live/official line), season averages second.
-    var a = find('away', def.payload) || fromAvg('away', def.key);
-    var h = find('home', def.payload) || fromAvg('home', def.key);
+    // SBLEADSEASON - season-verified rows FIRST now. The payload used to
+    // lead because it is the official line, but it carries no games-played
+    // figure, so there is no way to tell a current leader from last
+    // season's inside it. The derived rows have been checked against the
+    // team's own record; where they have an answer it is the trustworthy
+    // one, and the payload still fills the categories they don't cover.
+    //
+    // A side whose rows were ALL impossible gets nothing from either source:
+    // that is positive evidence this team's feed is on last season, which
+    // condemns the payload leaders just as much.
+    var a = staleA ? null : (fromAvg('away', def.key) || find('away', def.payload));
+    var h = staleH ? null : (fromAvg('home', def.key) || find('home', def.payload));
     // A row with neither side is not a row — ESPN doesn't publish every
     // category for every league, and an empty pair says nothing.
     if (!a && !h) continue;
@@ -85392,10 +85676,13 @@ async function fetchTeamPage(teamId, league) {
     // Build player stat entries — NEVER silently drop players
     var playerStats = [];
     var statLabels = [];
-    // League-aware season year. CFB and college volleyball open in August, so
-    // the old September cutoff pulled last season's stats through Week 1.
-    var currentSeasonYear = _seasonYearFor(league);   // SEASONYR
+    // SEASONPICK — the season year and the whole split-priority chain now
+    // live in _espSeasonSplitFor, which the starred-team prefetch calls too.
     
+    // SEASONPICK — the team's own games played, so a split that claims more
+    // can be rejected without trusting its label.
+    var _tpTeamGP = _espTeamGPFrom(teamData);
+
     rosterAthletes.forEach(function(a, i) {
       var athlete = a.athlete || a;
       var pid = a.id || (athlete.id) || '';
@@ -85417,58 +85704,14 @@ async function fetchTeamPage(teamId, league) {
       }
 
       var stats = overview.statistics || {};
-      var splits = Array.isArray(stats.splits) ? stats.splits : [];
-      
-      // Smart season detection — avoid career stats
-      var seasonEntry = null;
-      // currentYr / nextYr are gone: _seasonSplitMatches owns that comparison
-      // now, so leaving them here would be two ways to answer one question.
-      // prevYr still backs the 1b fallback below. SEASONYR
-      var prevYr = String(currentSeasonYear - 1);
-      
-      // Priority 1: the split for THIS season. Single-year sports match one
-      // year only; span sports may also match the following year, since
-      // ESPN labels those "2025-26" or by the end year. SEASONYR
-      seasonEntry = splits.find(function(s) {
-        return _seasonSplitMatches(s.displayName, league, currentSeasonYear);
-      });
-      // Priority 1b: try previous year (for seasons that recently ended)
-      if (!seasonEntry) {
-        seasonEntry = splits.find(function(s) {
-          var dn = (s.displayName || '').toLowerCase();
-          return dn.indexOf(prevYr) !== -1 && !/career|all.time/i.test(dn);
-        });
-      }
-      // Priority 2: find any split with "season" or "regular" that's NOT career
-      if (!seasonEntry) {
-        seasonEntry = splits.find(function(s) {
-          var dn = (s.displayName || '').toLowerCase();
-          return /season|regular/i.test(dn) && !/career|all.time/i.test(dn);
-        });
-      }
-      // Priority 3: find first non-career split
-      if (!seasonEntry) {
-        seasonEntry = splits.find(function(s) {
-          var dn = (s.displayName || '').toLowerCase();
-          return !/career|all.time/i.test(dn);
-        });
-      }
-      // Priority 4: if still nothing, pick split with lowest GP (current season, not career)
-      if (!seasonEntry && splits.length > 1) {
-        var gpLabel = (stats.labels || []).findIndex(function(l) { return l === 'GP'; });
-        if (gpLabel !== -1) {
-          var nonCareer = splits.filter(function(s) { return !/career|all.time/i.test(s.displayName || ''); });
-          if (nonCareer.length) {
-            nonCareer.sort(function(a, b) { return (parseStat(a.stats?.[gpLabel]) || 0) - (parseStat(b.stats?.[gpLabel]) || 0); });
-            seasonEntry = nonCareer[0];
-          }
-        }
-      }
-      // Last resort: pick the LAST split (ESPN often puts career first, season last)
-      if (!seasonEntry) seasonEntry = splits[splits.length - 1] || splits[0] || {};
-      
+      // SEASONPICK — the shared rule, so this page and the starred-team
+      // prefetch can never land on different seasons for the same roster.
+      var _pick = _espSeasonSplitFor(stats, league, _tpTeamGP);
+      var seasonEntry = _pick.split || {};
+      var isStaleStats = _pick.stale;
+
       var vals = seasonEntry.stats || [];
-      
+
       if (!statLabels.length && stats.labels) statLabels = stats.labels;
 
       // Detect DNP — active status is always the source of truth
@@ -85487,20 +85730,6 @@ async function fetchTeamPage(teamId, league) {
         }
         // Explicit out/IR status from roster
         if (/^(out|injured|injured_reserve|ir)$/.test(rosterStatus)) isOFS = true;
-      }
-
-      var seasonName = (seasonEntry.displayName || '').toLowerCase();
-      var isStaleStats = false;
-      var yearMatch = seasonName.match(/(\d{4})/);
-      if (yearMatch) {
-        var statYear = parseInt(yearMatch[1]);
-        // Was `< currentSeasonYear - 1`, which let LAST season through as
-        // current. That tolerance existed to paper over the season-year bug
-        // above; with the year computed correctly it only serves to put one
-        // player's 2025 line in the same table as another player's 2026 line,
-        // which is the mixing this whole fix is about. A player with nothing
-        // this season now reads as no stats rather than as last year's. SEASONYR
-        if (statYear < currentSeasonYear) isStaleStats = true;
       }
 
       var gpIdx = (stats.labels || []).findIndex(function(l) { return l === 'GP'; });
