@@ -121200,161 +121200,212 @@ function _skRotoLiveView(league, data, metaOverride) {
 // If 3 is smaller than 1, season is cumulative-through-today and the ESPN
 // board is already live. If 1, 2 and 3 are identical, the parameter does not
 // filter and a different route is needed. Either way it is read, not guessed.
+// ══════════════════════════════════════════════════════════════════
+// ESPROTOLIVE2 — does ESPN's season total already contain today?
+// ──────────────────────────────────────────────────────────────────
+// The first version of this asked scoringPeriodId to filter valuesByStat.
+// It does not: memory, today and yesterday came back byte-identical on a
+// league two days into its season. That is a real answer, just not the one
+// wanted, so the parameter is gone and two tests that stand on their own
+// have taken its place.
+//
+// TEST 1 — the inequality. A team cannot have FEWER for the season than its
+// own starters have put up today. So if any counting category shows
+//   team.valuesByStat[cat]  <  sum of starters' windows.today[cat]
+// then the season total provably excludes today, and live = season + today.
+// Rates are excluded (they are not sums) and so is any category that goes
+// negative anywhere in the league: a +/- of -3 on the season against 0 today
+// is ordinary, not evidence. This direction only ever PROVES exclusion; no
+// violation is not proof of the opposite, which is what test 2 is for.
+//
+// TEST 2 — the delta. Read valuesByStat, wait, read it again. If anything
+// moved while games were on, ESPN is accruing live and nothing may be added.
+// Between them the two cover both answers.
 function skProbeEspnRotoLive() {
   var lines = [];
   function say(t) { lines.push(t); }
   var rows = (typeof extLeagues !== 'undefined' && extLeagues) ? extLeagues : [];
-  // ESPROTOLIVE - a league whose season has not started reports zero three
-  // times over and settles nothing, so the one with the most ACTUAL numbers
-  // in valuesByStat is the one worth asking. The first run picked an NBA
-  // league in a 2027 preseason and came back all zeros.
-  var cand = [], i, j;
+  var cand = [], i, j, k;
   for (i = 0; i < rows.length; i++) {
     var r = rows[i];
     if (!r || r.provider !== 'espn') continue;
     if (typeof extFormatKey !== 'function' || extFormatKey(r) !== 'roto') continue;
     if (!r.raw || !r.raw.teams) continue;
-    var filled = 0, ts = r.raw.teams;
-    for (j = 0; j < ts.length; j++) {
-      var vb0 = ts[j] && ts[j].valuesByStat;
+    var filled = 0, ts0 = r.raw.teams;
+    for (j = 0; j < ts0.length; j++) {
+      var vb0 = ts0[j] && ts0[j].valuesByStat;
       if (!vb0) continue;
-      for (var kk in vb0) {
-        if (vb0.hasOwnProperty(kk) && parseFloat(vb0[kk])) filled++;
-      }
+      for (var kk in vb0) { if (vb0.hasOwnProperty(kk) && parseFloat(vb0[kk])) filled++; }
     }
-    cand.push({ row: r, filled: filled });
+    // A league with rosters can run test 1; one without can only run test 2.
+    cand.push({ row: r, filled: filled, hasRosters: !!(r.rosters && r.rosters.byTeam) });
   }
-  cand.sort(function (a, b) { return b.filled - a.filled; });
+  cand.sort(function (a, b) {
+    if (a.hasRosters !== b.hasRosters) return a.hasRosters ? -1 : 1;
+    return b.filled - a.filled;
+  });
   if (!cand.length) { _skGpProbeShow('No ESPN roto league is synced. Open one once, then run this.'); return; }
   var row = cand[0].row;
   if (!cand[0].filled) {
     _skGpProbeShow('Every synced ESPN roto league still reads zero in every category \u2014 ' +
-      'none of them has played yet, so there is nothing for this to compare. ' +
-      'Run it again once an ESPN roto league has games in the books.');
+      'none of them has played yet, so there is nothing to compare. Run it again ' +
+      'once an ESPN roto league has games in the books.');
     return;
   }
 
   var game = (typeof _espSsGame === 'function') ? _espSsGame(row) : 'fhl';
-  // The saved league entry carries the id and the game code; the row's key is
-  // "espn" + that id, which is how every other ESPN fetch in this file gets
-  // there. ESPROTOLIVE
   var sv = null;
   try { sv = (typeof espFindSaved === 'function') ? espFindSaved(String(row.key || '').slice(4)) : null; } catch (e) {}
   var lid = (sv && sv.id) || String(row.key || '').slice(4) || '';
   var season = row.season || '';
-  // ESPSPID - resolved from where ESPN publishes it, and FETCHED if the
-  // synced payload has none. Reading it off the row returned nothing, which
-  // would have left this probe printing one column and no comparison at all.
   var sp = (typeof _espScoringPeriod === 'function') ? _espScoringPeriod(row) : null;
   var teams = row.raw.teams || [];
 
-  say('══ ' + (row.name || lid) + '  (' + String(row.sport || '?').toUpperCase() + ' roto) ══');
-  say('  league ' + lid + ' · season ' + season + ' · scoringPeriodId ' +
-      (sp == null ? '(absent — fetching it)' : sp));
-  say('  ' + cand[0].filled + ' non-zero season values across ' + teams.length + ' teams' +
-      (cand.length > 1 ? ('  (picked over ' + (cand.length - 1) + ' other roto league' +
-                          (cand.length === 2 ? '' : 's') + ')') : ''));
-  say('');
-
-  // Two teams is enough to show a pattern and short enough to read.
-  var pick = [];
-  for (i = 0; i < teams.length && pick.length < 2; i++) {
-    if (teams[i] && teams[i].valuesByStat) pick.push(String(teams[i].id));
+  function lbl(id) {
+    try { return (typeof espStatLabel === 'function') ? (espStatLabel(game, id) || ('#' + id)) : ('#' + id); }
+    catch (e3) { return '#' + id; }
   }
-  if (!pick.length) { _skGpProbeShow('This league carries no valuesByStat yet.'); return; }
+  function nameOf(tid) {
+    for (var z = 0; z < teams.length; z++) {
+      if (String(teams[z].id) === String(tid)) return teams[z].abbrev || teams[z].name || tid;
+    }
+    return String(tid);
+  }
 
-  // The scored categories, so the dump is the league's own columns and not
-  // every stat ESPN tracks.
   var ids = [];
   try {
     var items = (((row.raw.settings || {}).scoringSettings) || {}).scoringItems || [];
-    for (i = 0; i < items.length && ids.length < 12; i++) {
+    for (i = 0; i < items.length; i++) {
       if (items[i] && items[i].statId != null) ids.push(String(items[i].statId));
     }
   } catch (e2) {}
 
-  function snap(teamsArr, label) {
-    var map = {}, q, z;
-    for (q = 0; q < (teamsArr || []).length; q++) {
-      var t = teamsArr[q];
-      if (!t || !t.valuesByStat) continue;
-      map[String(t.id)] = t.valuesByStat;
-    }
-    var out = {};
-    for (q = 0; q < pick.length; q++) {
-      var vb = map[pick[q]] || {}, row2 = {};
-      for (z = 0; z < ids.length; z++) row2[ids[z]] = vb[ids[z]];
-      out[pick[q]] = row2;
-    }
-    return { label: label, vals: out };
-  }
+  say('\u2550\u2550 ' + (row.name || lid) + '  (' + String(row.sport || '?').toUpperCase() + ' roto) \u2550\u2550');
+  say('  league ' + lid + ' \u00b7 season ' + season + ' \u00b7 scoringPeriodId ' +
+      (sp == null ? '(absent)' : sp));
+  say('  ' + cand[0].filled + ' non-zero season values across ' + teams.length + ' teams');
+  say('');
 
-  var have = snap(teams, 'in memory (mTeam sync)');
-  function _go(sp) {
-  var jobs = [];
-  if (typeof espFetchLeague === 'function' && lid && season && sp != null) {
-    jobs.push(espFetchLeague(game, lid, season, '?view=mTeam&scoringPeriodId=' + sp)
-      .then(function (j) { return snap((j || {}).teams, 'fetched, scoringPeriodId=' + sp + ' (today)'); })
-      ['catch'](function (e) { return { label: 'today fetch FAILED: ' + (e && e.message), vals: null }; }));
-    // Period 1 is the first there is; 0 is not a period, and asking for it
-    // returned a third column of zeros that read like an answer.
-    if (sp > 1) {
-      jobs.push(espFetchLeague(game, lid, season, '?view=mTeam&scoringPeriodId=' + (sp - 1))
-        .then(function (j) { return snap((j || {}).teams, 'fetched, scoringPeriodId=' + (sp - 1) + ' (yesterday)'); })
-        ['catch'](function (e) { return { label: 'yesterday fetch FAILED: ' + (e && e.message), vals: null }; }));
-    } else {
-      jobs.push(Promise.resolve({ label: 'no yesterday \u2014 this IS scoring period 1', vals: null }));
-    }
-  } else if (sp == null) {
-    jobs.push(Promise.resolve({ label: 'no scoringPeriodId anywhere in the payload', vals: null }));
-  }
-  _skGpProbeShow('Fetching ESPN\u2019s league twice\u2026');
-
-  Promise.all(jobs).then(function (got) {
-    var snaps = [have].concat(got), si, pi, zi;
-    function lbl(id) {
-      try { return (typeof espStatLabel === 'function') ? (espStatLabel(game, id) || ('#' + id)) : ('#' + id); }
-      catch (e3) { return '#' + id; }
-    }
-    for (pi = 0; pi < pick.length; pi++) {
-      var tid = pick[pi], nm = tid;
-      for (zi = 0; zi < teams.length; zi++) {
-        if (String(teams[zi].id) === tid) nm = teams[zi].abbrev || teams[zi].name || tid;
-      }
-      say('  ── ' + nm + ' ──');
-      say('    ' + _skFxPad('CAT', 8) +
-          _skFxPad('memory', 12) + _skFxPad('today', 12) + 'yesterday');
-      for (zi = 0; zi < ids.length; zi++) {
-        var cells = [], anyDiff = false, first = null;
-        for (si = 0; si < snaps.length; si++) {
-          var v = snaps[si].vals ? snaps[si].vals[tid][ids[zi]] : undefined;
-          var txt = (v == null) ? '-' : String(Math.round(v * 1000) / 1000);
-          if (si === 0) first = txt; else if (snaps[si].vals && txt !== first) anyDiff = true;
-          cells.push(_skFxPad(txt, 12));
-        }
-        say('    ' + _skFxPad(lbl(ids[zi]), 8) + cells.join('') + (anyDiff ? '  <<' : ''));
-      }
-      say('');
-    }
-    for (si = 0; si < snaps.length; si++) say('  [' + si + '] ' + snaps[si].label);
+  // ---- TEST 1 ----
+  say('  \u2500\u2500 TEST 1 \u00b7 is the season total BEHIND today? \u2500\u2500');
+  if (!cand[0].hasRosters) {
+    say('    Rosters are not loaded for this league, so today\u2019s starter totals');
+    say('    cannot be summed. Open the league\u2019s Roster tab once and re-run.');
     say('');
-    say('  Read it like this:');
-    say('   · yesterday SMALLER than memory  -> ESPN season already contains');
-    say('     today, so the board is live and nothing may be added.');
-    say('   · all three identical            -> scoringPeriodId does not filter');
-    say('     valuesByStat; a different route is needed to split today out.');
-    _skGpProbeShow(lines.join('\n'));
-  });
-}
-
-  // The period is normally in the synced payload. When it isn't, one small
-  // settings call gets it rather than the probe reporting nothing. ESPSPID
-  if (sp != null || typeof espFetchLeague !== 'function' || !lid || !season) { _go(sp); }
-  else {
-    espFetchLeague(game, lid, season, '?view=mSettings')
-      .then(function (j) { _go(_espScoringPeriod({ raw: j })); })
-      ['catch'](function () { _go(null); });
+  } else {
+    // Which categories can carry proof: counts only, and nothing that goes
+    // negative anywhere in this league.
+    var today = {}, signed = {}, anyToday = 0;
+    for (i = 0; i < teams.length; i++) {
+      var tid = String(teams[i].id);
+      var d = null;
+      try { d = espDailyTeamStats(row.rosters, tid, game); } catch (eD) { d = null; }
+      today[tid] = d || {};
+      for (k in today[tid]) { if (today[tid].hasOwnProperty(k) && today[tid][k]) anyToday++; }
+    }
+    for (i = 0; i < teams.length; i++) {
+      var vbS = teams[i].valuesByStat || {}, tS = today[String(teams[i].id)] || {};
+      for (j = 0; j < ids.length; j++) {
+        if (parseFloat(vbS[ids[j]]) < 0 || parseFloat(tS[ids[j]]) < 0) signed[ids[j]] = 1;
+      }
+    }
+    var proofs = [], excluded = [];
+    for (j = 0; j < ids.length; j++) {
+      var id = ids[j];
+      var isRate = false;
+      try { isRate = !!(typeof espIsRate === 'function' && espIsRate(game, id)); } catch (eR) {}
+      if (isRate) { excluded.push(lbl(id) + ' (rate)'); continue; }
+      if (signed[id]) { excluded.push(lbl(id) + ' (goes negative)'); continue; }
+      for (i = 0; i < teams.length; i++) {
+        var tid2 = String(teams[i].id);
+        var sVal = parseFloat((teams[i].valuesByStat || {})[id]);
+        var tVal = parseFloat((today[tid2] || {})[id]);
+        if (isNaN(sVal) || isNaN(tVal) || !tVal) continue;
+        if (sVal < tVal) {
+          proofs.push('    ' + _skFxPad(nameOf(tid2), 8) + _skFxPad(lbl(id), 7) +
+            'season ' + _skFxPad(String(sVal), 7) + 'today ' + tVal + '   <<');
+        }
+      }
+    }
+    say('    A team cannot have fewer for the SEASON than its starters have TODAY.');
+    say('    ' + anyToday + ' non-zero values across today\u2019s starting lineups.');
+    say('');
+    if (proofs.length) {
+      for (i = 0; i < proofs.length && i < 14; i++) say(proofs[i]);
+      if (proofs.length > 14) say('    \u2026 and ' + (proofs.length - 14) + ' more');
+      say('');
+      say('    \u2192 PROVED: ESPN\u2019s season total does NOT contain today.');
+      say('      Live standings = season + today, re-ranked.');
+    } else if (!anyToday) {
+      say('    Nothing has been recorded today yet, so there is nothing that could');
+      say('    be behind. Run this again with games in progress.');
+    } else {
+      say('    No category is behind. That does NOT settle it the other way \u2014');
+      say('    a season total simply big enough to cover today looks the same');
+      say('    either way. Test 2 is the one that answers it from here.');
+    }
+    if (excluded.length) say('    not usable as proof: ' + excluded.join(', '));
+    say('');
   }
+
+  // ---- TEST 2 ----
+  say('  \u2500\u2500 TEST 2 \u00b7 does valuesByStat move while games are on? \u2500\u2500');
+  say('    Reading it again in 75 seconds\u2026 leave this open.');
+  _skGpProbeShow(lines.join('\n'));
+
+  function snapshot(src) {
+    var m = {}, q, z;
+    for (q = 0; q < (src || []).length; q++) {
+      var t = src[q];
+      if (!t || !t.valuesByStat) continue;
+      var one = {};
+      for (z = 0; z < ids.length; z++) one[ids[z]] = t.valuesByStat[ids[z]];
+      m[String(t.id)] = one;
+    }
+    return m;
+  }
+  var before = snapshot(teams);
+  if (typeof espFetchLeague !== 'function' || !lid || !season) {
+    say('    (cannot re-fetch this league)');
+    _skGpProbeShow(lines.join('\n'));
+    return;
+  }
+  setTimeout(function () {
+    espFetchLeague(game, lid, season, '?view=mTeam').then(function (jj) {
+      var after = snapshot((jj || {}).teams);
+      var moved = [], tk;
+      for (tk in before) {
+        if (!before.hasOwnProperty(tk) || !after[tk]) continue;
+        for (var z = 0; z < ids.length; z++) {
+          var a = before[tk][ids[z]], b2 = after[tk][ids[z]];
+          if (a == null && b2 == null) continue;
+          if (String(a) !== String(b2)) {
+            moved.push('    ' + _skFxPad(nameOf(tk), 8) + _skFxPad(lbl(ids[z]), 7) +
+              String(a) + '  \u2192  ' + String(b2));
+          }
+        }
+      }
+      lines.pop();
+      if (moved.length) {
+        say('    ' + moved.length + ' value' + (moved.length === 1 ? '' : 's') + ' changed in 75 seconds:');
+        for (var q2 = 0; q2 < moved.length && q2 < 12; q2++) say(moved[q2]);
+        if (moved.length > 12) say('    \u2026 and ' + (moved.length - 12) + ' more');
+        say('');
+        say('    \u2192 ESPN IS accruing live. Season already contains today and');
+        say('      nothing may be added to it.');
+      } else {
+        say('    Nothing moved in 75 seconds.');
+        say('    \u2192 Consistent with a season total that stops at yesterday,');
+        say('      PROVIDED games were actually on. If the slate was quiet this');
+        say('      proves nothing \u2014 re-run it mid-game.');
+      }
+      _skGpProbeShow(lines.join('\n'));
+    })['catch'](function (e) {
+      lines.pop();
+      say('    re-fetch failed: ' + (e && e.message));
+      _skGpProbeShow(lines.join('\n'));
+    });
+  }, 75000);
 }
 
 function _skRlDayList(lg) {
@@ -159378,6 +159429,10 @@ function espStatFmt(id, v, game) {
   if (v == null) return '\u2014';
   var n = Number(v);
   if (isNaN(n)) return '\u2014';
+  // ESPINF - and neither is a division that ran away. ESPN's season table
+  // printed the literal word "Infinity" for a GAA with no ice time behind
+  // it, because isNaN(Infinity) is false and every guard here tested for NaN.
+  if (!isFinite(n)) return '\u2014';
   // Time on ice arrives as SECONDS — 1110.012 is 18:30, and printing the raw
   // number for a category called "average time on ice" is unreadable.
   // ESPFHLIDS
