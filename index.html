@@ -29440,6 +29440,11 @@
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19h16M7 16V9M12 16V5M17 16v-4"/></svg>
       <span>Probe ESPN live stat entries</span>
     </button>
+    <!-- FXWHYFP — which terms make up a Fantrax fantasy-point total? -->
+    <button class="sk-account-item" onclick="skProbeFantraxFp(); skCloseAccountMenu();">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M4 12h10M4 17h7"/><circle cx="18" cy="16" r="3"/></svg>
+      <span>Probe Fantrax FP breakdown</span>
+    </button>
     <!-- ROTOLIVE1 — does the season total already contain today? -->
     <button class="sk-account-item" onclick="skProbeRotoLive(); skCloseAccountMenu();">
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v20M2 12h20"/><circle cx="12" cy="12" r="9"/></svg>
@@ -120328,6 +120333,93 @@ function skBuildRotoCategoryTable(league, leagueData, allTeams) {
 // label, which would look perfectly reasonable and be silently wrong all day.
 // So the per-team call is made too, and the two are compared stat by stat for
 // my own team. Agreement is the only result that counts.
+function skProbeFantraxFp() {
+  var lines = [];
+  function say(t) { lines.push(t); }
+  var rows = [];
+  try {
+    var list = (typeof extSyncedLeagues === 'function') ? extSyncedLeagues() : [];
+    for (var i = 0; i < list.length; i++) {
+      if (list[i] && list[i].provider === 'fantrax' && list[i].scoring) rows.push(list[i]);
+    }
+  } catch (e) {}
+  if (!rows.length) {
+    _skGpProbeShow('No Fantrax league with scoring settings is synced.');
+    return;
+  }
+  if (typeof _fxScoreStatMap !== 'function' || typeof _fxStadiumStatMap !== 'function') {
+    _skGpProbeShow('The Fantrax scoring engine isn’t loaded in this build.');
+    return;
+  }
+
+  var shown = 0;
+  for (var r = 0; r < rows.length && shown < 2; r++) {
+    var row = rows[r];
+    var SPORT = String(row.sport || '').toUpperCase();
+    var items = [];
+    try {
+      var my = (typeof extMyRosterItems === 'function') ? extMyRosterItems(row) : null;
+      if (!my) my = (row.myRoster && row.myRoster.items) || row.myItems || [];
+      items = my || [];
+    } catch (e2) { items = []; }
+    if (!items.length) continue;
+
+    var any = 0, body = [];
+    for (var p = 0; p < items.length; p++) {
+      var it = items[p];
+      var eid = it.espnId || it.espn_id || null;
+      if (!eid) continue;
+      var lv = null;
+      try { lv = _fxStadiumStatMap(eid); } catch (e3) { lv = null; }
+      if (!lv || !lv.statMap) continue;
+      var res = null;
+      try { res = _fxScoreStatMap(SPORT, row.scoring, lv.statMap, lv.pos || it.pos, lv.ctx); }
+      catch (e4) { res = null; }
+      if (!res) continue;
+      any++;
+      body.push('  ── ' + (it.name || eid) + '  [' + (lv.pos || it.pos || '?') + '] ──');
+      body.push('     Skipper FP: ' + (Math.round(res.fp * 100) / 100));
+      // The raw box line the score was built from, so a disagreement can be
+      // pinned on the numbers or on the rules, never left ambiguous.
+      var sm = lv.statMap || {}, keys = [], k;
+      for (k in sm) { if (sm.hasOwnProperty(k)) keys.push(k + '=' + sm[k]); }
+      body.push('     box line : ' + (keys.join('  ') || '(empty)'));
+      var sc = res.scored || [];
+      for (var s = 0; s < sc.length; s++) {
+        var x = sc[s];
+        body.push('       ' + _skFxPad(x.code) +
+          _skFxPad(String(x.val)) +
+          (x.rule ? ('@ ' + x.rule) : ('× ' + x.pts)) +
+          '  = ' + (Math.round(x.contrib * 100) / 100));
+      }
+      if (res.unscored && res.unscored.length) body.push('     can’t map : ' + res.unscored.join(', '));
+      if (res.nodata && res.nodata.length) body.push('     no data  : ' + res.nodata.join(', '));
+      if (res.zero && res.zero.length) body.push('     at zero  : ' + res.zero.join(', '));
+      body.push('');
+    }
+    if (!any) continue;
+    shown++;
+    say('══ ' + (row.name || row.key) + '  (' + (SPORT || '?') + ') ══');
+    say('  ' + any + ' player' + (any === 1 ? '' : 's') + ' with a box line right now');
+    say('');
+    for (var b = 0; b < body.length; b++) say(body[b]);
+  }
+  if (!shown) {
+    say('No Fantrax player has a box line yet — run this while games are on.');
+  } else {
+    say('Compare each term against the league’s own scoring page. A term that');
+    say('is here and not there is one the engine shouldn’t be scoring; a term');
+    say('there and not here is in "can’t map" or "no data" above.');
+  }
+  _skGpProbeShow(lines.join('\n'));
+}
+
+function _skFxPad(s) {
+  s = String(s == null ? '' : s);
+  while (s.length < 16) s += ' ';
+  return s;
+}
+
 function skProbeRotoDaily() {
   var lines = [];
   function say(t) { lines.push(t); }
@@ -159559,6 +159651,30 @@ function _espTodayCatsHtml(row, game, accent) {
     return _gpos[a] - _gpos[b];
   });
 
+  // ESPTOIROW — the component behind each single-part rate, inserted just
+  // ahead of it. After the grouping sort, so an id the group map doesn't know
+  // can't scramble the order.
+  try {
+    var _rec = (typeof _espRecipesFor === 'function') ? (_espRecipesFor(game) || {}) : {};
+    var _have = {}, _ins = [], _q;
+    for (i = 0; i < ids.length; i++) _have[ids[i]] = 1;
+    for (i = 0; i < ids.length; i++) {
+      var _rr = _rec[ids[i]];
+      if (!_rr || !_rr.num || _rr.num.length !== 1) continue;
+      var _comp = _rr.num[0];
+      if (_have[_comp]) continue;
+      if ((mine && mine[_comp] != null) || (opp && opp[_comp] != null)) {
+        _have[_comp] = 1;
+        _ins.push({ at: ids[i], id: _comp });
+      }
+    }
+    for (i = 0; i < _ins.length; i++) {
+      for (_q = 0; _q < ids.length; _q++) {
+        if (ids[_q] === _ins[i].at) { ids.splice(_q, 0, _ins[i].id); break; }
+      }
+    }
+  } catch (eTR) {}
+
   var me = _espTeamCard(row, pair.mineId);
   var th = _espTeamCard(row, pair.oppId);
   // Absent versus zero, once more. If a side has ANY stats today then its
@@ -159588,7 +159704,9 @@ function _espTodayCatsHtml(row, game, accent) {
         'color:rgba(255,255,255,0.26);padding:' + (i ? '9px' : '1px') + ' 2px 3px;">' +
         _glLabel(_g) + '</div>';
     }
-    var isRate = !!ESP_STAT_RATE[id];
+    // ESPDAILYSPORT — espIsRate knows the sport; ESP_STAT_RATE is baseball's
+    // list, and on a hockey line id 17 is penalty minutes, not a rate.
+    var isRate = (typeof espIsRate === 'function') ? espIsRate(game, id) : !!ESP_STAT_RATE[id];
     mv = (mine[id] != null) ? mine[id] : ((meLive && !isRate) ? 0 : null);
     ov = (opp[id] != null) ? opp[id] : ((opLive && !isRate) ? 0 : null);
     res = espCatResult(id, mv, ov, game);   // ESPSPORTFLAG
@@ -160871,13 +160989,15 @@ function espDailyRates(vals, game) {
   // It now delegates. The recipe table is the single definition of how a rate
   // is rebuilt, so adding one there reaches every surface at once.
   //
-  // The baseball gate stays: ESP_RATE_RECIPE is keyed by MLB stat ids, and
-  // those same numbers mean different things in basketball and hockey, so
-  // running the recipes on another sport would invent values rather than
-  // compute them. ESPONERATE
-  if (game !== 'flb' || !vals) return vals;
+  // The baseball gate is GONE, and deliberately. It existed because the
+  // recipes were MLB-keyed and running them on another sport would invent
+  // values rather than compute them — true then, handled now: _espApplyRates
+  // selects the sport's own table and leaves the sums alone where a sport has
+  // none. Keeping the gate only stopped hockey and basketball rebuilding the
+  // rates they now have recipes for. ESPDAILYSPORT / ESPONERATE
+  if (!vals) return vals;
   if (typeof _espApplyRates !== 'function') return vals;
-  var rebuilt = _espApplyRates(vals);
+  var rebuilt = _espApplyRates(vals, game);
   // Callers pass an object and expect the same one back, so copy in place
   // rather than swapping the reference. Rates the recipe could not compute
   // are removed, which is what renders them as a dash.
