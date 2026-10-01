@@ -122151,7 +122151,7 @@ function _skRotoCatStates(league, data, metaOverride) {
   return { groups: groups, byStat: byStat, gain: gainTotal, risk: riskTotal, scored: scored };
 }
 
-function _skBuildRotoPressureHTML(league, data, metaOverride) {
+function _skBuildRotoPressureHTML(league, data, metaOverride, liveOpt) {
   if (!league || league.scoring_type !== 'roto') return '';
   function shell(msg) {
     // ROTOLIVE2 - the toggle rides along, or switching to LIVE on a slow
@@ -122172,10 +122172,16 @@ function _skBuildRotoPressureHTML(league, data, metaOverride) {
   // ESPN comes through here with a metaOverride and its own adapter, and its
   // season totals have NOT been shown to stop at yesterday. Until that is
   // established the same way, it gets no live toggle rather than a guess.
-  var _rpKey = (!metaOverride && league.league_key) ? league.league_key : '';
+  // ESPROTOLIVE3 - ESPN arrives with a metaOverride AND a prepared live view;
+  // Yahoo arrives with neither and builds its own. Either way one card.
+  var _rpKey = (liveOpt && liveOpt.key) ? liveOpt.key
+             : ((!metaOverride && league.league_key) ? league.league_key : '');
   var _rpMode = _rpKey ? ((_skRpMode[_rpKey] === 'season') ? 'season' : 'live') : 'season';
   var _lv = null;
-  if (_rpMode === 'live') { try { _lv = _skRotoLiveView(league, data, metaOverride); } catch (eLv) {} }
+  if (_rpMode === 'live') {
+    if (liveOpt) _lv = liveOpt.view || null;
+    else { try { _lv = _skRotoLiveView(league, data, metaOverride); } catch (eLv) {} }
+  }
 
   function _rpToggle() {
     if (!_rpKey) return '';
@@ -122193,7 +122199,8 @@ function _skBuildRotoPressureHTML(league, data, metaOverride) {
       btn('live', 'LIVE') + btn('season', 'SEASON') + '</div>';
   }
 
-  var res = _skRotoCatStates(league, (_lv ? _lv.data : data), metaOverride);
+  var res = _skRotoCatStates(league, (_lv ? _lv.data : data),
+                             (_lv && _lv.meta) ? _lv.meta : metaOverride);
   if (!res) return shell('Waiting on league standings.');
   if (!res.scored) return shell('No category values yet \u2014 this fills in once the season\u2019s scoring.');
 
@@ -162371,7 +162378,14 @@ function _espDailyH2HHtml(row, game) {
 //      ignores), every team's total lands off by the same shape.
 // Both surface as a per-team mismatch against ESPN's own published total, so
 // the caller gates on the reconciled flag rather than trusting this blind.
-function _espRotoAdapt(row) {
+// ---- ESPROTOLIVE3 ----
+// `valsOverride` replaces teams[].valuesByStat with {teamId: {statId: value}}.
+// Roto points come from the ORDER of the league, so live points cannot be
+// derived from live totals by any shortcut - the whole ranking has to run
+// again. It runs here, on the same code that reconciles against ESPN's own
+// published totals, rather than in a parallel implementation that would
+// drift.
+function _espRotoAdapt(row, valsOverride) {
   if (!row || row.provider !== 'espn') return null;
   if (typeof extFormatKey !== 'function' || extFormatKey(row) !== 'roto') return null;
   var raw = row.raw || {};
@@ -162394,7 +162408,7 @@ function _espRotoAdapt(row) {
     if (seen[key]) continue;
     var any = false;
     for (j = 0; j < teamsRaw.length; j++) {
-      var vb0 = teamsRaw[j] && teamsRaw[j].valuesByStat;
+      var vb0 = vbOf(teamsRaw[j]);
       if (vb0 && num(vb0[key]) != null) { any = true; break; }
     }
     if (!any) continue;
@@ -162406,6 +162420,12 @@ function _espRotoAdapt(row) {
     });
   }
   if (!cats.length) return null;
+
+  function vbOf(t) {
+    if (!t) return null;
+    if (valsOverride) return valsOverride[String(t.id)] || null;
+    return t.valuesByStat || null;
+  }
 
   var out = {};
   for (i = 0; i < teamsRaw.length; i++) {
@@ -162421,7 +162441,7 @@ function _espRotoAdapt(row) {
     var c = cats[i];
     var list = [];
     for (j = 0; j < teamsRaw.length; j++) {
-      var vb = teamsRaw[j] && teamsRaw[j].valuesByStat;
+      var vb = vbOf(teamsRaw[j]);
       var v = vb ? num(vb[c.id]) : null;
       if (v == null) continue;
       list.push({ key: String(teamsRaw[j].id), v: v });
@@ -165665,6 +165685,155 @@ function espHasRotoPressure(row) {
 // DERIVED here, not published, and a derivation that's off by a reversed
 // category produces numbers that look completely reasonable. A blank pane
 // costs nothing; a confidently wrong pressure board costs a roster move.
+// ══════════════════════════════════════════════════════════════════
+// LIVE ROTO, ESPN ── ESPROTOLIVE3 ──
+// ──────────────────────────────────────────────────────────────────
+// Settled, from the league's own standings screen against this app's derived
+// season points, team by team:
+//
+//   TEAM   ESPN TOT   CHG     TOT-CHG    Skipper derived
+//   WWT      73.5     +4.5      69.0        69.0   exact
+//   BLUE     51.0     -5.5      56.5        56.5   exact
+//   POZ      48.5     +5.5      43.0        43.0   exact
+//   BBT      47.0     +8.0      39.0        39.0   exact
+//   Ho6      45.0     -9.0      54.0        54.0   exact
+//   Stan     41.5     +4.0      37.5        37.5   exact
+//
+// Six of six. So teams[].valuesByStat and record.overall both describe a
+// league that has NOT played today, ESPN's displayed total is the live one,
+// and its CHG column is the difference. Same shape as Yahoo, reached by a
+// different route, and with an oracle: what this computes should equal the
+// TOT and CHG on ESPN's own standings screen.
+//
+// A rate is rebuilt from components through the recipe table ESPN ids
+// already have - no label matching needed here - and only after the SEASON
+// rebuild has been checked against ESPN's own published season rate. One
+// that fails, or has no recipe (GAA has none; the goalie time unit was never
+// confirmed), holds at its season value and is named.
+function _espRotoLiveStats(row) {
+  var game = (typeof _espSsGame === 'function') ? _espSsGame(row) : 'fhl';
+  var teamsRaw = ((row.raw || {}).teams) || [];
+  if (!teamsRaw.length) return null;
+  if (!row.rosters || !row.rosters.byTeam) return null;
+
+  var vals = {}, todayAny = 0, i, k;
+  var seasonOnly = {};
+  for (i = 0; i < teamsRaw.length; i++) {
+    var tid = String(teamsRaw[i].id);
+    var se = teamsRaw[i].valuesByStat || {};
+    var td = null;
+    try { td = espDailyTeamStats(row.rosters, tid, game); } catch (eT) { td = null; }
+    td = td || {};
+    var sums = {};
+    // Counts add. Rates are left out entirely and rebuilt below - adding two
+    // save percentages is not a save percentage. ESPRATESUM
+    for (k in se) {
+      if (!se.hasOwnProperty(k)) continue;
+      if (espIsRate(game, k)) continue;
+      var sn = Number(se[k]);
+      if (!isNaN(sn)) sums[k] = sn;
+    }
+    for (k in td) {
+      if (!td.hasOwnProperty(k)) continue;
+      if (espIsRate(game, k)) continue;
+      var dn = Number(td[k]);
+      if (isNaN(dn)) continue;
+      sums[k] = (sums[k] || 0) + dn;
+      if (dn) todayAny++;
+    }
+    seasonOnly[tid] = se;
+    vals[tid] = _espApplyRates(sums, game);
+  }
+
+  // The gate: a rate is only carried live if rebuilding it from SEASON
+  // components reproduces the season figure ESPN published. Checked across
+  // every team that has one, exactly as the Yahoo side does. ROTOLIVE3
+  var rebuilt = [], held = [], seen = {};
+  var items = (((row.raw.settings || {}).scoringSettings) || {}).scoringItems || [];
+  for (i = 0; i < items.length; i++) {
+    var sid = items[i] && items[i].statId;
+    if (sid == null) continue;
+    var id = String(sid);
+    if (seen[id]) continue;
+    seen[id] = 1;
+    if (!espIsRate(game, id)) continue;
+    var label = (typeof espStatLabel === 'function') ? (espStatLabel(game, id) || ('#' + id)) : ('#' + id);
+    var ok = 0, bad = 0, t2;
+    for (t2 = 0; t2 < teamsRaw.length; t2++) {
+      var tk = String(teamsRaw[t2].id);
+      var pub = parseFloat((seasonOnly[tk] || {})[id]);
+      if (isNaN(pub) || !isFinite(pub)) continue;
+      var dry = {};
+      for (k in seasonOnly[tk]) {
+        if (!seasonOnly[tk].hasOwnProperty(k) || espIsRate(game, k)) continue;
+        var vn = Number(seasonOnly[tk][k]);
+        if (!isNaN(vn)) dry[k] = vn;
+      }
+      var mine = _espApplyRates(dry, game)[id];
+      if (mine == null || !isFinite(mine)) { bad++; continue; }
+      if (Math.abs(mine - pub) > Math.max(0.0015, Math.abs(pub) * 0.005)) bad++;
+      else ok++;
+    }
+    if (ok >= 2 && !bad) { rebuilt.push(label); continue; }
+    held.push(label + (bad ? ' (rebuild disagreed with ESPN)' : ' (no recipe for it)'));
+    // Put the season value back, verbatim, for every team.
+    for (t2 = 0; t2 < teamsRaw.length; t2++) {
+      var tk2 = String(teamsRaw[t2].id);
+      var sv2 = (seasonOnly[tk2] || {})[id];
+      if (sv2 == null) { delete vals[tk2][id]; } else { vals[tk2][id] = sv2; }
+    }
+  }
+  return { vals: vals, rebuilt: rebuilt, held: held, todayAny: todayAny };
+}
+
+// Settled and live side by side, with the movement ESPN prints as CHG.
+function _espRotoLiveView(row) {
+  var base = null;
+  try { base = _espRotoAdapt(row); } catch (e) { base = null; }
+  if (!base) return null;
+  var ls = _espRotoLiveStats(row);
+  if (!ls) return null;
+  var live = null;
+  try { live = _espRotoAdapt(row, ls.vals); } catch (e2) { live = null; }
+  if (!live) return null;
+
+  function totals(a) {
+    var out = {}, tk, id;
+    for (tk in a.allTeams) {
+      if (!a.allTeams.hasOwnProperty(tk)) continue;
+      var sum = 0, cp = a.allTeams[tk].catPoints || {};
+      for (id in cp) { if (cp.hasOwnProperty(id)) sum += cp[id]; }
+      out[tk] = sum;
+    }
+    return out;
+  }
+  function ranks(tot) {
+    var ks = [], r = {}, tk;
+    for (tk in tot) { if (tot.hasOwnProperty(tk)) ks.push(tk); }
+    ks.sort(function (x, y) { return (tot[y] - tot[x]) || String(x).localeCompare(String(y)); });
+    for (var z = 0; z < ks.length; z++) {
+      r[ks[z]] = (z > 0 && tot[ks[z]] === tot[ks[z - 1]]) ? r[ks[z - 1]] : (z + 1);
+    }
+    return r;
+  }
+  var sT = totals(base), lT = totals(live);
+  var sR = ranks(sT), lR = ranks(lT);
+  var moved = {}, tk2;
+  for (tk2 in sT) {
+    if (!sT.hasOwnProperty(tk2)) continue;
+    moved[tk2] = { ptsFrom: sT[tk2], ptsTo: lT[tk2], rankFrom: sR[tk2], rankTo: lR[tk2] };
+  }
+  var n = 0, q;
+  for (q in sT) { if (sT.hasOwnProperty(q)) n++; }
+  return {
+    data: { allTeams: live.allTeams, team: { team_key: base.myKey } },
+    meta: live.meta,
+    day: (typeof _todayDateString === 'function') ? _todayDateString() : '',
+    rates: ls.held, rebuilt: ls.rebuilt, touched: ls.todayAny,
+    moved: moved, me: moved[base.myKey] || null, myKey: base.myKey, teams: n
+  };
+}
+
 function _espRotoPressurePaneHtml(row) {
   var h = '<div data-espstand>';
   h += _espStandToggleHtml(row, 'press');
@@ -165695,8 +165864,15 @@ function _espRotoPressurePaneHtml(row) {
 
   var fakeLeague = { league_key: String(row.key || 'espn'), scoring_type: 'roto' };
   var fakeData = { allTeams: a.allTeams, team: { team_key: a.myKey } };
+  // ESPROTOLIVE3 - season + today, re-ranked. Null when rosters haven't been
+  // fetched for this league yet, and the card simply stays on SEASON.
+  var lv = null;
+  try { lv = _espRotoLiveView(row); } catch (eLv) { lv = null; }
   var board = '';
-  try { board = _skBuildRotoPressureHTML(fakeLeague, fakeData, a.meta) || ''; } catch (e) { board = ''; }
+  try {
+    board = _skBuildRotoPressureHTML(fakeLeague, fakeData, a.meta,
+              lv ? { key: String(row.key || 'espn'), view: lv } : null) || '';
+  } catch (e) { board = ''; }
   if (!board) return shell('No category values yet.');
   return h + board + '</div>';
 }
