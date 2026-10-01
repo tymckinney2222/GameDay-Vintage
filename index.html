@@ -168296,6 +168296,45 @@ function _fxExtractStandings(data, myTeamIds) {
   return out;
 }
 
+// ---- EXTSEASONPT ----
+// A season-points league's running total, whoever runs the league.
+//
+// The card only ever asked ESPN. Fantrax has the number too, just under a
+// different field: fxea puts a W-L-T RECORD in `points` when the league has
+// one and a numeric total there when it doesn't, with totalPointsFor
+// alongside — so the parser files it as `pf` for some leagues and `points`
+// for others, and reading only `pf` is why the Fantrax card showed a rank
+// with no score beside it.
+//
+// ESPN's live figure wins where there is one: team.points covers COMPLETED
+// scoring periods only, and the card sat beside a standings tab reading a
+// different number. ESPLIVETOT
+function _skExtSeasonTotal(l) {
+  if (!l) return null;
+  if (l.provider === 'espn' && typeof espMyLiveTotal === 'function') {
+    var lt = espMyLiveTotal(l);
+    if (lt != null && !isNaN(Number(lt))) return Number(lt);
+  }
+  var hs = l.standings || {};
+  var cands = [hs.pf, hs.points];
+  for (var i = 0; i < cands.length; i++) {
+    if (cands[i] == null || cands[i] === '') continue;
+    // A record string is not a total. The parser already separates the two,
+    // but a league whose shape it misreads must not print "5-2-1" as a score.
+    if (/^\d+-\d+(-\d+)?$/.test(String(cands[i]))) continue;
+    var n = Number(cands[i]);
+    if (!isNaN(n)) return n;
+  }
+  return null;
+}
+
+// Is this a season-points league? extFormatKey answers for every provider,
+// which is what makes the card uniform rather than ESPN-shaped. EXTSEASONPT
+function _skExtIsSeasonPts(l) {
+  try { return (typeof extFormatKey === 'function') && extFormatKey(l) === 'point'; }
+  catch (e) { return false; }
+}
+
 // The getLeagues row includes the team name(s)/ID(s) the user owns in
 // each league (per the fxea docs). Field name isn't pinned down, so
 // harvest ids from the plausible spots into a lookup set.
@@ -170705,12 +170744,14 @@ function skBuildExtCardHTML(l) {
     // to be the live one, and the rank has to come from the live ordering —
     // otherwise the header could read "3095 · 7th" beside a standings tab
     // showing 3126 and 6th. ESPLIVETOT
+    // EXTSEASONPT - one accessor, so the header can't disagree with the
+    // score line under it.
     var _hLive = (l.provider === 'espn' && typeof espIsSeasonPts === 'function' &&
                   espIsSeasonPts(l) && typeof espMyLiveTotal === 'function')
       ? espMyLiveTotal(l) : null;
     var _hRank = (_hLive != null && typeof espMyLiveRank === 'function')
       ? espMyLiveRank(l) : null;
-    var _hPf = (_hLive != null) ? _hLive : hs.pf;
+    var _hPf = _skExtSeasonTotal(l);
     var recPart = hs.record ? hs.record
       : (_hPf != null && Number(_hPf) > 0) ? (Math.round(Number(_hPf) * 10) / 10 + '')
       : '';
@@ -170809,8 +170850,7 @@ function skBuildExtCardHTML(l) {
     // total plus today's movement and how the day went against the team
     // immediately ahead — the same read as the Yahoo season card.
     // ESPNSLICE2Q / ESPN3D
-    ((l.provider === 'espn' && typeof espIsSeasonPts === 'function' && espIsSeasonPts(l) &&
-      l.standings && l.standings.pf != null)
+    ((_skExtIsSeasonPts(l) && _skExtSeasonTotal(l) != null)
       ? (function () {
           // ── ESPKO4 ── A knockout card leads with THIS WEEK.
           //
@@ -170824,7 +170864,7 @@ function skBuildExtCardHTML(l) {
           // toggle, which the Today screen never reaches, so espIsKnockout was
           // always false on the card and it fell through to season points.
           if (typeof _espKoWarm === 'function') { try { _espKoWarm(l); } catch (e9) {} }
-          var _ko = (typeof espIsKnockout === 'function') && espIsKnockout(l);
+          var _ko = (l.provider === 'espn') && (typeof espIsKnockout === 'function') && espIsKnockout(l);
           if (_ko) {
             var _mid = (typeof espMyTeamId === 'function') ? espMyTeamId(l) : null;
             var _wk = (_mid != null && typeof espTodayTeamTotal === 'function')
@@ -170839,33 +170879,47 @@ function skBuildExtCardHTML(l) {
                 (l.standings.pf != null ? l.standings.pf : '?') + ' season</span>' +
             '</div>';
           }
-          // The live total, not team.points — that figure covers COMPLETED
-          // scoring periods only, so the card was reading 3095 while the
-          // standings tab beside it read 3126. ESPLIVETOT
-          var _lt = (typeof espMyLiveTotal === 'function') ? espMyLiveTotal(l) : null;
-          if (_lt == null) _lt = l.standings.pf;
+          // EXTSEASONPT - the shared accessor; ESPN's live figure where it
+          // has one, the provider's own total otherwise.
+          var _lt = _skExtSeasonTotal(l);
+          var _ltTxt = (Math.round(Number(_lt) * 10) / 10) + '';
           return '<div class="sk-card-score-row">' +
-            '<span class="sk-ext-myscore" style="color:' + accent + '">' + _lt + '</span>' +
+            '<span class="sk-ext-myscore" style="color:' + accent + '">' + slEsc(_ltTxt) + '</span>' +
             '<span class="sk-ext-oppname"> season points</span>' +
           '</div>' +
-          ((typeof _espSeasonPaceHtml === 'function') ? _espSeasonPaceHtml(l, accent) : '');
+          ((l.provider === 'espn' && typeof _espSeasonPaceHtml === 'function')
+            ? _espSeasonPaceHtml(l, accent) : '');
         })()
       : '') +
-    // Lineup CTA — the external cousin of Yahoo's "Today's Lineup" row.
-    // Only shown once a roster actually exists. stopPropagation keeps the
-    // card's own detail-view tap from firing underneath it.
+    // EXTCARDROWS - these were plain .sk-card-status-row divs, which inherit
+    // the card's body type: large, left-aligned, no rule, no icon. Beside a
+    // Yahoo card using .sk-card-today-row the two looked like different
+    // products. Same classes, same icons, same order now; only the accent
+    // colour still says who runs the league.
     ((l.rosters && l.rosters.byTeam)
-      ? '<div class="sk-card-status-row" style="cursor:pointer" ' +
+      ? '<div class="sk-card-today-row" ' +
         'onclick="event.stopPropagation(); extOpenLineup(\'' + l.key + '\')">' +
-        (l.provider === 'fantrax' ? 'ROSTER STATS'
-          : l.provider === 'espn' ? 'TODAY\u2019S LINEUP'
-          : 'THIS WEEK\u2019S LINEUP') + ' \u203a</div>'
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" ' +
+          'stroke-linecap="round" stroke-linejoin="round">' +
+          '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 10h18M9 10v10"/>' +
+        '</svg>' +
+        '<span>' + (l.provider === 'fantrax' ? 'Roster stats'
+          : l.provider === 'espn' ? 'Today\u2019s lineup'
+          : 'This week\u2019s lineup') + '</span>' +
+        '<span class="arrow">\u203a</span></div>'
       : '') +
     // SKDEEP2 — straight to this team in the platform's own app or site.
     ((typeof _skLineupUrl === 'function' && _skLineupUrl(l.provider, l.key, l.sport))
-      ? '<a class="sk-card-status-row sk-card-deep" href="' + skEscape(_skLineupUrl(l.provider, l.key, l.sport)) +
-        '" target="_blank" rel="noopener" onclick="event.stopPropagation()">OPEN IN ' +
-        ({ espn: 'ESPN', sleeper: 'SLEEPER', fantrax: 'FANTRAX' })[l.provider] + ' \u2197</a>'
+      ? '<a class="sk-card-today-row sk-card-deep" href="' + skEscape(_skLineupUrl(l.provider, l.key, l.sport)) +
+        '" target="_blank" rel="noopener" onclick="event.stopPropagation()">' +
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" ' +
+          'stroke-linecap="round" stroke-linejoin="round">' +
+          '<path d="M14 4h6v6"/><path d="M20 4l-9 9"/>' +
+          '<path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/>' +
+        '</svg>' +
+        '<span>Open in ' +
+        ({ espn: 'ESPN', sleeper: 'Sleeper', fantrax: 'Fantrax' })[l.provider] + '</span>' +
+        '<span class="arrow">\u2197</span></a>'
       : '') +
     // SKDONE
     '<div class="sk-card-done" onclick="event.stopPropagation(); skMarkDone(\'' + String(l.key).replace(/'/g, '') + '\', ' +
@@ -170882,7 +170936,11 @@ function skBuildExtCardHTML(l) {
     // ESPNSLICE2H
     ((l.provider === 'espn' && typeof _espTopTodayHtml === 'function')
       ? _espTopTodayHtml(l, accent) : '') +
-    '<div class="sk-card-status-row">' + statusTxt + (hasDetail ? ' \u203a' : '') + '</div>' +
+    // EXTCARDROWS - an empty status with a chevron beside it rendered as a
+    // lone "›" floating under the card, pointing at nothing.
+    (statusTxt
+      ? ('<div class="sk-card-status-row">' + statusTxt + (hasDetail ? ' \u203a' : '') + '</div>')
+      : '') +
     '</div>';
 }
 
