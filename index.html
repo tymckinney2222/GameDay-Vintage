@@ -164293,8 +164293,24 @@ function espNhlCaps(row) { return espGameCaps(row); }
 // Nothing here is allowed to pass itself off as complete. Games played before
 // the ledger started exist in ESPN's aggregate and not in the split, and
 // espGpSlotTotals reports that difference instead of burying it.
-var ESP_GP_SLOT_PREFIX = 'esp_gp_slot_v1_';
-var ESP_GP_BASE_PREFIX = 'esp_gp_base_v1_';
+var ESP_GP_SLOT_PREFIX = 'esp_gp_slot_v2_';
+var ESP_GP_BASE_PREFIX = 'esp_gp_base_v2_';
+
+// v1 counted a dressed-but-idle goalie as a game played - see ESPGPSTRICT.
+// Those days are wrong and unfixable in place, so they are dropped rather
+// than left to quietly inflate every total built on them.
+(function () {
+  try {
+    var kill = [], i, k;
+    for (i = 0; i < localStorage.length; i++) {
+      k = localStorage.key(i);
+      if (k && (k.indexOf('esp_gp_slot_v1_') === 0 || k.indexOf('esp_gp_base_v1_') === 0)) {
+        kill.push(k);
+      }
+    }
+    for (i = 0; i < kill.length; i++) localStorage.removeItem(kill[i]);
+  } catch (e) {}
+})();
 
 function _espGpSlotKey(leagueKey, period) {
   return ESP_GP_SLOT_PREFIX + leagueKey + '_' + period;
@@ -164308,12 +164324,20 @@ function _espGpSlotKey(leagueKey, period) {
 // way: a player with a line for the day played that day, and two lines mean
 // two games. The fallback matters because it keeps this honest on a league
 // whose payload omits the stat entirely.
-function _espGpOfWindow(w, sid) {
+function _espGpOfWindow(w, sid, strict) {
   if (!w) return 0;
   if (w.stats && sid != null && w.stats[sid] != null) {
     var v = Number(w.stats[sid]);
     if (!isNaN(v) && v >= 0) return v;
   }
+  // ESPGPSTRICT - when the day's payload DOES carry the games-played stat,
+  // its absence on one player is information, not a gap to paper over: he was
+  // not charged. Counting his stat entry instead is what charged a backup
+  // goalie who dressed and never left the bench, and ESPN's own team total
+  // disagreed by exactly that one game.
+  if (strict) return 0;
+  // Only where the stat is absent from the whole day does entry-counting
+  // stand in, and the caller says so rather than presenting it as measured.
   var g = Number(w.games);
   return (!isNaN(g) && g > 0) ? g : 0;
 }
@@ -164342,6 +164366,23 @@ function espGpSlotFromRosters(ros, caps) {
   if (!ros || !ros.byTeam || ros.period == null || !caps) return null;
   var sid = String(caps.statId);
   var byTeam = {}, totalByTeam = {}, any = false, tid, i;
+
+  // ESPGPSTRICT - decide the rule once for the DAY, never per player. If the
+  // games-played stat appears anywhere in this period's windows then the
+  // payload carries it, and every player without it simply was not charged.
+  // Deciding per player instead means a missing stat silently becomes a game.
+  var strict = false;
+  for (tid in ros.byTeam) {
+    if (!ros.byTeam.hasOwnProperty(tid)) continue;
+    var scan = (ros.byTeam[tid] || {}).items || [];
+    for (i = 0; i < scan.length; i++) {
+      var si = scan[i];
+      if (!si || !si.starter) continue;
+      var sw = si.windows && si.windows.today;
+      if (sw && sw.stats && sw.stats[sid] != null) { strict = true; break; }
+    }
+    if (strict) break;
+  }
   for (tid in ros.byTeam) {
     if (!ros.byTeam.hasOwnProperty(tid)) continue;
     var items = (ros.byTeam[tid] || {}).items || [];
@@ -164349,7 +164390,7 @@ function espGpSlotFromRosters(ros, caps) {
     for (i = 0; i < items.length; i++) {
       var it = items[i];
       if (!it || !it.starter || it.slotId == null) continue;
-      var n = _espGpOfWindow(it.windows && it.windows.today, sid);
+      var n = _espGpOfWindow(it.windows && it.windows.today, sid, strict);
       if (!(n > 0)) continue;
       var k = String(it.slotId);
       slots[k] = (slots[k] || 0) + n;
@@ -164360,7 +164401,10 @@ function espGpSlotFromRosters(ros, caps) {
     if (tot > 0) any = true;
   }
   if (!any) return null;
-  return { period: ros.period, byTeam: byTeam, totalByTeam: totalByTeam };
+  // method travels with the day so the reconciliation can say which rule
+  // produced it rather than implying both are equally sound.
+  return { period: ros.period, byTeam: byTeam, totalByTeam: totalByTeam,
+           method: strict ? 'stat' : 'entries' };
 }
 
 function espGpSlotToday(row) {
@@ -164374,7 +164418,7 @@ function _espGpSlotPut(leagueKey, day) {
   var rec = {
     ts: Date.now(), leagueKey: leagueKey, period: day.period,
     date: (typeof _todayDateString === 'function') ? _todayDateString() : '',
-    byTeam: day.byTeam
+    byTeam: day.byTeam, method: day.method || 'entries'
   };
   var k = _espGpSlotKey(leagueKey, day.period);
   var json = JSON.stringify(rec);
@@ -164596,7 +164640,7 @@ function _espPeriodSpan(row) {
   var st = ((row || {}).raw || {}).status || {};
   // ESPN's own last period of the season, when it ships one. Nothing derived.
   var fin = parseInt(st.finalScoringPeriod, 10);
-  if (!isNaN(fin) && fin > cur) return { cur: cur, total: fin, src: 'ESPN' };
+  if (!isNaN(fin) && fin > cur) return _espSpanActive(row, cur, fin, 'ESPN');
   // Otherwise the season window, converted at the sport's own period length -
   // a scoring period is one DAY where clubs play most nights and one WEEK in
   // football. Not a guess at ESPN's numbering, and labelled as the weaker
@@ -164607,27 +164651,83 @@ function _espPeriodSpan(row) {
   var perDays = (String((row && row.sport) || '').toLowerCase() === 'nfl') ? 7 : 1;
   var total = Math.round(((w.endMs - w.startMs) / 86400000) / perDays);
   if (!(total > cur)) return null;
-  return { cur: cur, total: total, src: 'calendar' };
+  return _espSpanActive(row, cur, total, 'calendar');
+}
+
+// == ACTIVE PERIODS == ESPGPACTIVE ==
+//
+// Scoring periods start before the season does. ESPN's period 1 for hockey
+// lands in late September, days before the first puck drop, and a rate
+// divided by periods that COULD NOT have charged a game understates every
+// projection on this board by exactly that head start - enough, four days in,
+// to turn a team on pace to blow through its cap into one that looks like it
+// is leaving six hundred games unused.
+//
+// So the dead head start is measured rather than assumed. Every sync banks a
+// snapshot carrying each team's games played and the period it was taken in;
+// the latest of those showing a league-wide ZERO is positive evidence that
+// nothing had been charged by then, and the season's first live period is the
+// one after it. No snapshot showing a zero means no evidence, and the span
+// falls back to counting from period 1 and says so.
+function espGpFirstActivePeriod(row) {
+  var snaps = (typeof espListPtsSnapshots === 'function')
+    ? (espListPtsSnapshots(row && row.key) || []) : [];
+  var lastDead = null, firstLive = null, i, k;
+  for (i = 0; i < snaps.length; i++) {
+    var g = snaps[i].gpByTeam;
+    var p = Number(snaps[i].period);
+    if (!g || isNaN(p) || p < 1) continue;
+    var live = false;
+    for (k in g) {
+      if (g.hasOwnProperty(k) && Number(g[k]) > 0) { live = true; break; }
+    }
+    if (live) { if (firstLive == null || p < firstLive) firstLive = p; }
+    else if (lastDead == null || p > lastDead) lastDead = p;
+  }
+  if (lastDead == null) return null;
+  // A live period at or before the last dead one means the two readings
+  // contradict each other - a league reset, a period renumbering - and the
+  // honest move is to claim nothing.
+  if (firstLive != null && firstLive <= lastDead) return null;
+  return lastDead + 1;
+}
+
+function _espSpanActive(row, cur, total, src) {
+  var fa = espGpFirstActivePeriod(row);
+  var measured = (fa != null && fa >= 1 && fa <= cur);
+  var first = measured ? fa : 1;
+  return {
+    cur: cur, total: total, src: src,
+    firstActive: first, measuredStart: measured,
+    active: cur - first + 1,
+    totalActive: total - first + 1
+  };
 }
 
 // Usage -> where it finishes. Null below two periods, where one night's
 // schedule is the entire sample and the number produced would be noise
 // wearing a decimal point.
 function espGpProject(used, span, cap) {
-  if (used == null || isNaN(used) || !span || !(span.cur >= 2)) return null;
-  var rate = used / span.cur;
-  var proj = Math.round(rate * span.total);
+  if (used == null || isNaN(used) || !span) return null;
+  // ESPGPACTIVE - rate over the periods that could actually charge a game,
+  // never over the calendar's head start.
+  var act = (span.active != null) ? span.active : span.cur;
+  var tot = (span.totalActive != null) ? span.totalActive : span.total;
+  if (!(act >= 2)) return null;
+  var rate = used / act;
+  var proj = Math.round(rate * tot);
   var out = {
     rate: Math.round(rate * 100) / 100,
     proj: proj,
-    periods: span.cur,
+    periods: act,
     src: span.src,
+    measuredStart: !!span.measuredStart,
     over: (cap != null) ? (proj - cap) : null,
     capsIn: null
   };
   // Finishing over the cap means the cap arrives before April does. Say when.
   if (cap != null && rate > 0 && proj > cap) {
-    out.capsIn = Math.max(0, Math.ceil(cap / rate) - span.cur);
+    out.capsIn = Math.max(0, Math.ceil(cap / rate) - act);
   }
   return out;
 }
@@ -164736,6 +164836,16 @@ function _espNhlCapHtml(row, accent, mono) {
     'cap ' + caps.total + ' total \u00b7 one full season per starting slot, so ' +
     'the only way to run short is to waste games</div>';
 
+  // A bare arrow and a number invited exactly one wrong reading - that it was
+  // games REMAINING. Name the columns.
+  h += '<div style="display:flex;align-items:center;gap:8px;padding:0 6px 3px;' +
+    'font-size:8px;letter-spacing:0.09em;color:rgba(255,255,255,0.26);">' +
+    '<span style="flex:1;"></span>' +
+    '<span style="flex:0 0 62px;"></span>' +
+    '<span style="flex:0 0 74px;text-align:right;">USED / CAP</span>' +
+    '<span style="flex:0 0 66px;text-align:right;">FINISH</span>' +
+  '</div>';
+
   if (!cw.anyUsed) {
     h += '<div style="font-size:10.5px;line-height:1.55;color:rgba(255,255,255,0.35);' +
       'padding:6px 0 2px;">Nobody has played a game yet \u2014 this fills in from ' +
@@ -164791,15 +164901,23 @@ function _espNhlCapHtml(row, accent, mono) {
   h += '<div style="color:rgba(255,255,255,0.22);font-size:8.5px;margin-top:4px;' +
     'line-height:1.5;">' +
     (_projAny
-      ? ('Projected finish — games started to date carried over the ' +
-         'season’s ' + (_sp0 ? _sp0.periods : '?') + ' scoring periods so ' +
-         'far to all ' + ((_espPeriodSpan(row) || {}).total || '?') + ', against a ' +
-         caps.total + '-game allowance. Red finishes OVER, which means the team ' +
-         'stops scoring before the season ends; under means games left unused. ' +
-         'Season length from ' + (_sp0 ? _sp0.src : '?') + '.')
+      ? ('FINISH is where the whole season ends up — total games played by ' +
+         'April, not games left. It takes each team’s games started over the ' +
+         (_sp0 ? _sp0.periods : '?') + ' scoring period' +
+         ((_sp0 && _sp0.periods === 1) ? '' : 's') + ' that have actually ' +
+         'charged a game and carries that rate across all ' +
+         ((_espPeriodSpan(row) || {}).totalActive || '?') + ', against a ' +
+         caps.total + '-game allowance. Red finishes OVER the cap, which means ' +
+         'the team stops scoring before the season ends; under means games ' +
+         'left unused. Season length from ' + (_sp0 ? _sp0.src : '?') +
+         (_sp0 && !_sp0.measuredStart
+           ? '. Counting from scoring period 1 — no banked snapshot shows ' +
+             'when the first game was charged, and ESPN’s periods begin ' +
+             'before the season does, so this runs LOW until one does.'
+           : '.'))
       : ('Over/under is against the share of the allowance the season has ' +
          'offered so far. A projected finish replaces it once two scoring ' +
-         'periods have run.')) +
+         'periods have charged a game.')) +
     '</div>';
 
   h += _espGpSlotHtml(row, accent, mono);
@@ -164906,8 +165024,24 @@ function _espGpSlotHtml(row, accent, mono) {
       ' — usually a player who changed slots or left the roster. The ' +
       'per-slot numbers are a floor, not a total.';
   }
+  // Which rule charged these days. Entry-counting is the weaker one and must
+  // never be presented as if it were ESPN's own count.
+  var byEntries = false;
+  try {
+    var _rr = espGpSlotRecords(row && row.key), _ri;
+    for (_ri = 0; _ri < _rr.length; _ri++) {
+      if (_rr[_ri] && _rr[_ri].method === 'entries') byEntries = true;
+    }
+  } catch (eM) {}
+
   h += '<div style="color:rgba(255,255,255,0.22);font-size:8.5px;margin-top:6px;' +
     'line-height:1.5;">' + recon +
+    (byEntries
+      ? ' Some days were counted by whether a player had a stat line rather ' +
+        'than by ESPN\u2019s games-played figure, which the payload did not ' +
+        'carry \u2014 a player who dressed without appearing can be charged a ' +
+        'game he did not play on those days.'
+      : '') +
     (bd.projects
       ? ' Projected finish is this team’s own rate in each slot over the ' +
         'days tracked, carried to the end of the season.'
