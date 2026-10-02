@@ -143060,6 +143060,15 @@ async function _skFetchEspnSeasonStats(sportKey, teamKey, players, useTotals) {
           .catch(function() { return { playerKey: pl.playerKey, id: null, name: pl.name }; });
       });
       var withId = resolved.filter(function(r) { return r && r.id; });
+      // FTXSEASONMISS - who fell out, and at which step. A player with no
+      // line is otherwise indistinguishable from a player with no stats,
+      // and the two want completely different fixes.
+      var _missed = {};
+      for (var _mi = 0; _mi < resolved.length; _mi++) {
+        if (resolved[_mi] && !resolved[_mi].id) {
+          _missed[resolved[_mi].playerKey] = 'noid';
+        }
+      }
       if (typeof __skDiag !== 'undefined' && __skDiag.push) {
         var noId = resolved.filter(function(r) { return !r.id; });
         __skDiag.push({ stage: 'espn-season:ids', note: sportKey + ' ' + withId.length + '/' + resolved.length + ' resolved' +
@@ -143119,7 +143128,14 @@ async function _skFetchEspnSeasonStats(sportKey, teamKey, players, useTotals) {
       if (typeof __skDiag !== 'undefined' && __skDiag.push) {
         __skDiag.push({ stage: 'espn-season:done', note: sportKey + ' parsed ' + nParsed + ', nullResp ' + nNullResp + (sampleKeys ? ' · ' + sampleKeys : '') });
       }
-      var entry = { ts: Date.now(), byPlayerKey: byPlayerKey };
+      // Anything that resolved to an id but came back with nothing to parse
+      // failed at the stats step, which is the transient one.
+      for (var _ni = 0; _ni < withId.length; _ni++) {
+        if (!byPlayerKey[withId[_ni].playerKey]) {
+          _missed[withId[_ni].playerKey] = 'nostats';
+        }
+      }
+      var entry = { ts: Date.now(), byPlayerKey: byPlayerKey, missed: _missed };
       // Only cache a NON-empty result. An empty map usually means a transient
       // ESPN hiccup or a cold name-resolution cache; caching it would blank the
       // sub-lines for the full TTL. Leaving it uncached lets the next roster
@@ -174644,6 +174660,8 @@ function _extMyIds(row) {
 // that makes K'Andre Miller match KAndre Miller.
 var _ftxSeasonAsked = {};
 var _ftxSeasonByName = {};   // leagueKey -> { nameKey: flatStats }
+var _ftxSeasonMiss = {};     // leagueKey -> { nameKey: 'noid' | 'nostats' | 'skipped' }
+var _ftxSeasonTries = {};    // leagueKey -> retries spent
 
 function _ftxEnsureSeason(row, myTeam) {
   var lk = String(row.key || '');
@@ -174655,7 +174673,19 @@ function _ftxEnsureSeason(row, myTeam) {
 
   var items = (myTeam && myTeam.items) || [];
   var players = [];
-  for (var i = 0; i < items.length && i < 40; i++) {
+  // FTXSEASONMISS - this was a flat 40, which silently dropped everyone past
+  // the fortieth roster slot in a deep league: their rows rendered blank with
+  // nothing to say they had never been asked about. The cap is still here -
+  // it guards the connection pool, which is a real constraint - but it is now
+  // high enough to cover a full Fantrax roster and whatever it does skip is
+  // recorded rather than lost.
+  var _cap = 80;
+  var _skipNames = [];
+  for (var _si = _cap; _si < items.length; _si++) {
+    var _sr = _extRosterItemName(items[_si] || {}, SPORT);
+    if (_sr && _sr.name && _sr.name !== '?') _skipNames.push(_ftxDisplayName(_sr.name));
+  }
+  for (var i = 0; i < items.length && i < _cap; i++) {
     var it = items[i] || {};
     var res = _extRosterItemName(it, SPORT);
     if (!res.name || res.name === '?' || res.unresolved) continue;
@@ -174668,6 +174698,10 @@ function _ftxEnsureSeason(row, myTeam) {
     });
   }
   if (!players.length) return;
+  // FTXSEASONMISS - marked in flight, not done. A run that comes back
+  // short used to latch this league out of ever asking again for the whole
+  // session, so one failed athlete fetch meant a permanently blank row.
+  // The latch is released below unless the run actually covered everyone.
   _ftxSeasonAsked[lk] = 1;
 
   _skFetchEspnSeasonStats(sportKey, lk, players).then(function (entry) {
@@ -174685,6 +174719,31 @@ function _ftxEnsureSeason(row, myTeam) {
           if (nk) map[nk] = flat;
         }
         _ftxSeasonByName[lk] = map;
+        // Record the misses against the same name key the renderer reads, so
+        // a blank row can say which step lost it.
+        var miss = {}, anyMiss = false;
+        var _em = (entry && entry.missed) || {};
+        for (var m = 0; m < players.length; m++) {
+          var why = _em[players[m].playerKey];
+          if (!why) continue;
+          var mk = (typeof _pmNameKey === 'function')
+            ? _pmNameKey(players[m].name) : String(players[m].name).toLowerCase();
+          if (mk) { miss[mk] = why; anyMiss = true; }
+        }
+        for (var sk = 0; sk < _skipNames.length; sk++) {
+          var sKey = (typeof _pmNameKey === 'function')
+            ? _pmNameKey(_skipNames[sk]) : String(_skipNames[sk]).toLowerCase();
+          if (sKey && !miss[sKey]) miss[sKey] = 'skipped';
+        }
+        _ftxSeasonMiss[lk] = miss;
+        // Let the league ask again when something genuinely failed. The
+        // retry is one per league per paint at worst, and only while a miss
+        // is outstanding, so a league ESPN simply has no page for settles
+        // after its second attempt rather than looping.
+        if (anyMiss && (_ftxSeasonTries[lk] || 0) < 2) {
+          _ftxSeasonTries[lk] = (_ftxSeasonTries[lk] || 0) + 1;
+          _ftxSeasonAsked[lk] = 0;
+        }
       }
       // EXTPANEOWNER — same stale-repaint risk as the ESPN loads.
       var pane = (typeof _espRosterPaneFor === 'function') ? _espRosterPaneFor(row) : null;
@@ -174693,6 +174752,22 @@ function _ftxEnsureSeason(row, myTeam) {
       }
     } catch (e) {}
   })['catch'](function () {});
+}
+
+// Why this player has no season line, in words, or '' when there is no
+// recorded reason (in which case ESPN answered and simply had nothing).
+function _ftxSeasonMissFor(row, rawName) {
+  try {
+    var miss = _ftxSeasonMiss[String(row.key || '')];
+    if (!miss) return '';
+    var nk = (typeof _pmNameKey === 'function')
+      ? _pmNameKey(_ftxDisplayName(rawName)) : String(rawName).toLowerCase();
+    var why = nk ? miss[nk] : '';
+    if (why === 'noid') return 'no ESPN match for this name';
+    if (why === 'nostats') return 'ESPN stats didn\u2019t load \u2014 reopen to retry';
+    if (why === 'skipped') return 'roster too long to fetch';
+    return '';
+  } catch (e) { return ''; }
 }
 
 // One player's season line, formatted for display.
@@ -174918,7 +174993,18 @@ function _ftxRosterRowsHtml(row, myTeam) {
             try {
               body = _lv ? _lv.line : _ftxSeasonFor(row, e.res.name, e.res.pos);
             } catch (eB) { body = ''; }
-            if (!body) return '';
+            // FTXSEASONMISS - a row with nothing on it is the one state that
+            // taught us nothing. Say which step lost the player, so "ESPN has
+            // no page for him" and "the fetch failed, try again" stop looking
+            // identical.
+            if (!body) {
+              var _why = '';
+              try { _why = _ftxSeasonMissFor(row, e.res.name); } catch (eW) { _why = ''; }
+              if (!_why) return '';
+              return '<div class="ftx-rline"><span style="font-size:8.5px;' +
+                'color:rgba(255,255,255,0.26);letter-spacing:0.04em;">' +
+                slEsc(_why) + '</span></div>';
+            }
             // FTXRLINE — chips that wrap, rather than one block per stat.
             var _chips = (typeof _ftxRosterStatsHtml === 'function')
               ? _ftxRosterStatsHtml(body) : '';
