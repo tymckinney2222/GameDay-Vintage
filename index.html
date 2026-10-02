@@ -62441,6 +62441,10 @@ function toggleRinkMode(mode) {
 // {g,a,p} map, then renderRink() is called to fill the SEASON block.
 // The raw boxscore is stashed on window._nhlSeasonRaw for inspection.
 var _NHL_PROXY_BASE = (typeof _BK_PROXY !== 'undefined' ? _BK_PROXY : 'https://bracket-proxy.tymckinney2222.workers.dev') + '/nhl';
+// RKSEASONLIVE - how stale a live game's season totals may get. The rink
+// already polls the box score; this is just the gate that stops the season
+// block being re-read every single time that happens.
+var NHL_SEASON_LIVE_TTL = 45 * 1000;
 var _nhlAbbrFix = { 'TB': 'TBL', 'SJ': 'SJS', 'LA': 'LAK', 'NJ': 'NJD' };
 function _nhlNorm(ab) {
   var a = String(ab || '').toUpperCase();
@@ -62460,10 +62464,38 @@ async function _fetchNhlSeasonStats(game) {
   if (!game || !game.id) return;
   window._nhlSeasonStats = window._nhlSeasonStats || {};
   window._nhlSeasonDebug = window._nhlSeasonDebug || {};
+  window._nhlSeasonAt = window._nhlSeasonAt || {};
+  window._nhlSeasonInflight = window._nhlSeasonInflight || {};
   var dbg = { steps: [], gameId: game.id };
   window._nhlSeasonDebug[game.id] = dbg;
   function log(msg) { dbg.steps.push(msg); }
-  if (window._nhlSeasonStats[game.id]) { log('cache hit'); renderRink(); return; } // cached
+  // ── RKSEASONLIVE ──
+  // This used to be a permanent cache: fetched once per game id and never
+  // again for the life of the page. Opening a live game therefore froze the
+  // SEASON TOTALS at whatever they were BEFORE the puck dropped, so a player
+  // could score in the box score above and still read 0 goals underneath it.
+  // The box score refreshed around it, which made the stale block look like
+  // it was simply wrong rather than old.
+  //
+  // A finished game is genuinely immutable and still caches forever. A game
+  // that is live, or whose state is unknown, re-reads on the same cadence the
+  // rink already polls at - the caller runs on every refresh, so this gate is
+  // the only thing that was stopping it.
+  var _sSt = String((game && (game.state || game.status)) || '').toLowerCase();
+  var _sFinal = (_sSt === 'post' || _sSt === 'final');
+  var _sAge = Date.now() - (window._nhlSeasonAt[game.id] || 0);
+  if (window._nhlSeasonStats[game.id] && (_sFinal || _sAge < NHL_SEASON_LIVE_TTL)) {
+    log('cache hit' + (_sFinal ? ' (final)' : ' (' + Math.round(_sAge / 1000) + 's old)'));
+    renderRink();
+    return;
+  }
+  // One fetch at a time per game. Stamped rather than flagged, so a path that
+  // returns without clearing it cannot wedge the game permanently.
+  if (Date.now() - (window._nhlSeasonInflight[game.id] || 0) < 20000) {
+    log('fetch already in flight');
+    return;
+  }
+  window._nhlSeasonInflight[game.id] = Date.now();
 
   var homeAb = _nhlNorm(game.home && game.home.abbr);
   var awayAb = _nhlNorm(game.away && game.away.abbr);
@@ -62592,7 +62624,14 @@ async function _fetchNhlSeasonStats(game) {
   });
   var n = Object.keys(byName).length;
   log('matched season players: ' + n);
-  if (n) window._nhlSeasonStats[game.id] = byName;
+  // RKSEASONLIVE - stamp only a SUCCESSFUL read. A failed one leaves the
+  // previous totals in place and lets the next refresh try again, rather than
+  // resetting the clock on data that never arrived.
+  if (n) {
+    window._nhlSeasonStats[game.id] = byName;
+    window._nhlSeasonAt[game.id] = Date.now();
+  }
+  window._nhlSeasonInflight[game.id] = 0;
   renderRink();
 }
 
@@ -64326,7 +64365,25 @@ function _rkSeasonDebugPanel(game) {
 // (window._nhlSeasonStats[espnGameId], a name→{g,a,p} map). Returns ''
 // when the cache isn't ready yet (the async fetch re-renders on arrival)
 // or when nothing matched. Skaters only; grouped/filtered by the pills.
+// ── RKSEASONADD ──
+// The season figures come from the NHL's club-stats endpoint, which reports
+// COMPLETED games. For a game in progress that makes it, precisely, each
+// player's totals ENTERING tonight - so a player could score in the box score
+// directly above and still read 0 underneath it. Re-fetching more often does
+// not help and never could: the source itself excludes the game being watched.
+//
+// The missing half is already on screen. This function reads each player's
+// goals, assists and points for TONIGHT out of the box score to decide who
+// belongs in each category, so the running total is entering + tonight, with
+// no extra request and nothing inferred.
+//
+// Only while the game is unfinished. Once it is final the NHL absorbs it into
+// club-stats, and adding then would count the same goal twice; the window
+// between the final horn and that update shows the entering figures briefly
+// and corrects itself on the next refresh.
 function _rkBuildSeasonTotals(boxPlayers, game, sides, ns) {
+  var _st = String((game && (game.state || game.status)) || '').toLowerCase();
+  var _addTonight = (_st !== 'post' && _st !== 'final');
   var cache = (window._nhlSeasonStats && window._nhlSeasonStats[game.id]) || null;
   if (!cache) return '';
 
@@ -64366,9 +64423,13 @@ function _rkBuildSeasonTotals(boxPlayers, game, sides, ns) {
         // Skip players who did nothing this game.
         if (gGame <= 0 && aGame <= 0 && pGame <= 0) return;
         any = true;
+        // RKSEASONADD - entering tonight, plus tonight.
+        var _sg = (s.g || 0) + (_addTonight ? gGame : 0);
+        var _sa = (s.a || 0) + (_addTonight ? aGame : 0);
+        var _sp = (s.p || 0) + (_addTonight ? pGame : 0);
         perTeam[side.side].push({
           name: ath.shortName || dispName || '?',
-          g: s.g, a: s.a, p: s.p,           // season totals (shown)
+          g: _sg, a: _sa, p: _sp,           // season totals through tonight (shown)
           gGame: gGame, aGame: aGame, pGame: pGame  // this game (gating)
         });
       });
@@ -64389,7 +64450,13 @@ function _rkBuildSeasonTotals(boxPlayers, game, sides, ns) {
 
   var html = '';
   html += '<div class="rk-season-wrap" style="border-top:1px solid rgba(255,255,255,0.07)">';
-  html += '<div class="gym-bx-title" style="padding:14px 16px 4px"><span>SEASON TOTALS</span></div>';
+  // RKSEASONADD - say which it is. "Season totals" that stop at last night
+  // and "season totals through this shift" are different numbers, and on a
+  // live game the difference is the whole point.
+  html += '<div class="gym-bx-title" style="padding:14px 16px 4px"><span>SEASON TOTALS' +
+    (_addTonight ? '</span><span style="color:rgba(255,255,255,0.35);font-weight:400">' +
+                   ' \u00b7 incl. tonight</span>'
+                 : '</span>') + '</div>';
 
   sides.forEach(function(side, idx) {
     var rows = perTeam[side.side] || [];
