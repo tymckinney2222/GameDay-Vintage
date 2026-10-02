@@ -142204,6 +142204,94 @@ function _espnTeamSlug(sportKey, abbr) {
   return a;
 }
 
+// == CLUB ROSTERS, NOT SEARCH == ESPNCLUBFIRST ==
+//
+// Resolving a name through ESPN's search endpoint was the first thing tried
+// and the least reliable thing available. It is fuzzy, it is inconsistent on
+// punctuated and transliterated names, and a whole fantasy roster meant up to
+// three search calls per player - sixty to two hundred requests in a burst.
+// ESPN throttles that, and a throttled search returns 200 with nothing in it
+// rather than an error, which looked exactly like "this player does not
+// exist". That is how a player whose card opens perfectly well, with a real
+// ESPN id, rendered "no ESPN match for this name" on the roster beside it.
+//
+// A club's roster is the opposite in every way: one request returns a few
+// dozen exact names with their ids, it cannot match the wrong person, and a
+// twenty-player fantasy roster spans about fifteen clubs. So the clubs are
+// fetched once each, cached for the session, and every player is matched
+// inside his own club's list. Search is what happens afterwards, for whoever
+// is left - usually nobody.
+var _espnIdMiss = {};         // cache key -> when the lookup last came up empty
+var ESPN_ID_MISS_TTL = 10 * 60 * 1000;
+var _espnClubIdx = {};        // sportKey|slug -> { byKey, people } | null
+var _espnClubInflight = {};
+
+function _espnClubPeople(rd) {
+  var out = [];
+  function take(a) { if (a && a.id) out.push(a); }
+  var grps = (rd && rd.athletes) || [];
+  for (var g = 0; g < grps.length; g++) {
+    var gg = grps[g];
+    if (gg && gg.items) { for (var i = 0; i < gg.items.length; i++) take(gg.items[i]); }
+    else take(gg);
+  }
+  return out;
+}
+
+function _espnClubKey(sportKey, teamAbbr) {
+  var slug = (typeof _espnTeamSlug === 'function') ? _espnTeamSlug(sportKey, teamAbbr) : '';
+  return slug ? (sportKey + '|' + slug) : '';
+}
+
+function _espnClubIndex(sportKey, teamAbbr) {
+  var cfg = _ESPN_SPORT_CFG[sportKey];
+  var ck = _espnClubKey(sportKey, teamAbbr);
+  if (!cfg || !ck) return Promise.resolve(null);
+  if (_espnClubIdx.hasOwnProperty(ck)) return Promise.resolve(_espnClubIdx[ck]);
+  if (_espnClubInflight[ck]) return _espnClubInflight[ck];
+  var slug = ck.slice(ck.indexOf('|') + 1);
+  var p = fetch('https://site.api.espn.com/apis/site/v2/sports/' + cfg.sport + '/' +
+                cfg.slug + '/teams/' + encodeURIComponent(slug) + '/roster')
+    .then(function (r) { return (r && r.ok) ? r.json() : null; })
+    .then(function (rd) {
+      var people = _espnClubPeople(rd), byKey = {}, list = [], i;
+      for (i = 0; i < people.length; i++) {
+        var nm = people[i].displayName || people[i].fullName || '';
+        if (!nm) continue;
+        var nk = (typeof _pmNameKey === 'function') ? _pmNameKey(nm) : nm.toLowerCase();
+        if (nk && !byKey[nk]) byKey[nk] = String(people[i].id);
+        list.push({ n: nm, id: String(people[i].id) });
+      }
+      // An empty list is a failed fetch, not an empty club, so it is NOT
+      // cached - otherwise one throttled moment blanks that club all session.
+      var idx = list.length ? { byKey: byKey, people: list } : null;
+      if (idx) _espnClubIdx[ck] = idx;
+      delete _espnClubInflight[ck];
+      return idx;
+    })['catch'](function () {
+      delete _espnClubInflight[ck];
+      return null;
+    });
+  _espnClubInflight[ck] = p;
+  return p;
+}
+
+// Fetch every club a player list touches, a few at a time, before any name is
+// looked up. This is what turns the burst into one request per club.
+function _espnWarmClubs(sportKey, players) {
+  var seen = {}, abbrs = [], i;
+  for (i = 0; i < (players || []).length; i++) {
+    var a = String((players[i].teamAbbr || players[i].team || '')).toUpperCase();
+    if (!a || seen[a]) continue;
+    seen[a] = 1;
+    abbrs.push(a);
+  }
+  if (!abbrs.length) return Promise.resolve([]);
+  return _espnMapLimited(abbrs, 3, function (ab) {
+    return _espnClubIndex(sportKey, ab);
+  });
+}
+
 async function _resolveEspnAthleteId(sportKey, name, teamAbbr) {
   if (!name) return null;
   var cfg = _ESPN_SPORT_CFG[sportKey];
@@ -142216,6 +142304,27 @@ async function _resolveEspnAthleteId(sportKey, name, teamAbbr) {
   var pKey = (typeof _pmNameKey === 'function') ? _pmNameKey(name) : String(name).toLowerCase();
   var key = _espnIdKey(sportKey, searchName, teamAbbr);
   if (_espnIdCache.hasOwnProperty(key)) return _espnIdCache[key];
+  // ESPNCLUBFIRST - a miss is remembered only briefly. It used to be cached
+  // for the whole session, so one throttled search left a player permanently
+  // blank no matter how many times the tab was reopened.
+  if (_espnIdMiss[key] && (Date.now() - _espnIdMiss[key]) < ESPN_ID_MISS_TTL) return null;
+
+  // ESPNCLUBFIRST - his own club's roster, which is exact, before any search.
+  if (teamAbbr) {
+    try {
+      var _ci = await _espnClubIndex(sportKey, teamAbbr);
+      if (_ci) {
+        var _chit = _ci.byKey[pKey];
+        if (_chit) { _espnIdCache[key] = _chit; return _chit; }
+        // Same club, same surname, first name in another form. On one roster
+        // a single match cannot be the wrong person.
+        var _cl = _ci.people.filter(function (pp) {
+          return (typeof _pmNameLoose === 'function') && _pmNameLoose(name, pp.n);
+        });
+        if (_cl.length === 1) { _espnIdCache[key] = _cl[0].id; return _cl[0].id; }
+      }
+    } catch (_eCi) {}
+  }
   if (_espnIdInflight[key]) return _espnIdInflight[key];
 
   // Query variants, tried in order. ESPN's search matches on the literal
@@ -142351,7 +142460,10 @@ async function _resolveEspnAthleteId(sportKey, name, teamAbbr) {
       // cannot pick the wrong player the way a surname search can. The same
       // /teams/{abbr}/roster endpoint the stadium hub already uses; ESPN
       // accepts the abbreviation in place of the numeric id.
-      if (teamAbbr) {
+      // ESPNCLUBFIRST - only when the club index above never loaded. If it
+      // did, it already said this player is not on that roster and refetching
+      // the same list per player is the burst this change exists to remove.
+      if (teamAbbr && !_espnClubIdx.hasOwnProperty(_espnClubKey(sportKey, teamAbbr))) {
         try {
           var _slug = _espnTeamSlug(sportKey, teamAbbr);
           var _rr = await fetch('https://site.api.espn.com/apis/site/v2/sports/' +
@@ -142395,7 +142507,11 @@ async function _resolveEspnAthleteId(sportKey, name, teamAbbr) {
       var _lc = _literalCands || [];
       var match = _lc.find(function(r) { return inSport(r); }) || _lc[0] || null;
       var id = match ? idOf(match) : null;
-      if (_anyOk) _espnIdCache[key] = id;
+      // ESPNCLUBFIRST - only a POSITIVE answer is remembered. A miss gets a
+      // short timestamp instead, so a throttled minute costs ten minutes
+      // rather than the rest of the session.
+      if (id) _espnIdCache[key] = id;
+      else if (_anyOk) _espnIdMiss[key] = Date.now();
       return id;
     } catch (e) {
       // Transient (network) — don't poison the cache; allow a retry later.
@@ -143054,6 +143170,10 @@ async function _skFetchEspnSeasonStats(sportKey, teamKey, players, useTotals) {
       // Stage 1: resolve ESPN athlete ids — capped at 3 concurrent so we don't
       // saturate the connection pool (this is what broke football before: a
       // 20-player burst starved the Yahoo FP calls until they timed out).
+      // ESPNCLUBFIRST - every club this roster touches, once, before a single
+      // name is looked up. Fifteen deterministic requests in place of up to
+      // two hundred fuzzy ones.
+      try { await _espnWarmClubs(sportKey, players || []); } catch (eW) {}
       var resolved = await _espnMapLimited(players || [], 3, function(pl) {
         return _resolveEspnAthleteId(sportKey, pl.name, pl.teamAbbr || pl.team)
           .then(function(id) { return { playerKey: pl.playerKey, id: id, name: pl.name }; })
