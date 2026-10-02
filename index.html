@@ -77103,6 +77103,140 @@ function _extFhubIndex() {
 // Returns true/false, or undefined when the item carries no status at all,
 // so a caller can tell "this player is benched" from "this provider didn't
 // say". Applies to every Fantrax league in every sport, not one league.
+// == TODAY'S LINEUP, AFTER FANTRAX ROLLS THE DATE == FXLOCK ==
+//
+// Fantrax advances its calendar to the NEXT day while the current day's games
+// are still being played. getTeamRosters carries no date - it returns the
+// lineup as it stands RIGHT NOW - so from the moment of that rollover the
+// statuses describe tomorrow. Every total built on "who is active" then
+// quietly changes meaning: a player who played tonight and is benched for
+// tomorrow drops out of tonight's score, and a player benched tonight but
+// starting tomorrow is added to it. Nothing errors; the numbers just stop
+// matching Fantrax's.
+//
+// There is no date parameter to ask for instead, so the lineup is recorded
+// rather than re-requested - and the rule for WHEN to stop recording is taken
+// from Fantrax itself: it locks each player when his game starts. So does
+// this. A player's status keeps updating while his game has not begun, and
+// freezes the moment it has.
+//
+// "His game has begun" needs no new source either. The live cache only
+// indexes games that have STARTED, so a player with a box line is a player
+// whose game is under way - and a player with no line contributes nothing to
+// any total whatever his status, so he is the one case that does not matter.
+//
+// The gap is honest and reported: if Skipper is first opened after the
+// rollover, the first status it ever sees for a player is already tomorrow's,
+// and that record is marked as captured late rather than presented as
+// measured.
+var FX_LINEUP_PREFIX = 'fx_lineup_v1_';
+
+function _fxLineupKey(leagueKey) {
+  var d = (typeof _todayDateString === 'function') ? _todayDateString() : '';
+  return FX_LINEUP_PREFIX + leagueKey + '_' + d;
+}
+
+function _fxLineupRead(leagueKey) {
+  if (!leagueKey) return null;
+  try {
+    var raw = localStorage.getItem(_fxLineupKey(leagueKey));
+    if (raw) {
+      var o = JSON.parse(raw);
+      if (o && o.by) return o;
+    }
+  } catch (e) {}
+  return { by: {} };
+}
+
+function _fxLineupWrite(leagueKey, rec) {
+  try { localStorage.setItem(_fxLineupKey(leagueKey), JSON.stringify(rec)); }
+  catch (e) {}
+}
+
+// The player id a roster item is filed under. Falls back to the name so a
+// league whose items carry no id still gets the protection.
+function _fxLineupPid(it) {
+  if (!it) return '';
+  var id = it.id || it.playerId || it.scorerId || '';
+  if (id) return String(id);
+  var nm = it.name || it.playerName || '';
+  return nm ? ('n:' + String(nm).toLowerCase()) : '';
+}
+
+// Record one player's status for today, under the lock rule above.
+//   hasLine  his game has started (he has a box line today)
+// Returns true when the stored record changed.
+function _fxLineupNote(rec, it, hasLine) {
+  if (!rec || !it) return false;
+  var pid = _fxLineupPid(it);
+  if (!pid) return false;
+  var active = _fxItemIsActive(it);
+  if (active !== true && active !== false) return false;   // provider said nothing
+  var cur = rec.by[pid];
+  if (hasLine) {
+    // Locked. The first value seen while his game was still to come is the
+    // one Fantrax scored, and nothing after kickoff may overwrite it.
+    if (cur) return false;
+    rec.by[pid] = { a: active ? 1 : 0, pre: 0 };   // never saw him before his game
+    return true;
+  }
+  // Still editable, so the newest reading is the best one.
+  if (cur && cur.a === (active ? 1 : 0) && cur.pre === 1) return false;
+  rec.by[pid] = { a: active ? 1 : 0, pre: 1 };
+  return true;
+}
+
+// Fold a whole roster into today's record in one pass and one write.
+// hasLineFor(it) answers whether that player's game has started.
+function _fxLineupTouch(leagueKey, items, hasLineFor) {
+  if (!leagueKey || !items || !items.length) return;
+  var rec = _fxLineupRead(leagueKey), dirty = false, i;
+  for (i = 0; i < items.length; i++) {
+    var started = false;
+    try { started = !!hasLineFor(items[i]); } catch (e) { started = false; }
+    if (_fxLineupNote(rec, items[i], started)) dirty = true;
+  }
+  if (dirty) _fxLineupWrite(leagueKey, rec);
+}
+
+// Was this player active for TODAY - not for whatever day Fantrax has rolled
+// on to. The recorded answer when there is one, the live status otherwise, so
+// a league with no history behaves exactly as it did before.
+function _fxActiveToday(leagueKey, it) {
+  var live = _fxItemIsActive(it);
+  if (!leagueKey || !it) return live;
+  var rec = _fxLineupRead(leagueKey);
+  var r = rec && rec.by && rec.by[_fxLineupPid(it)];
+  if (!r || (r.a !== 0 && r.a !== 1)) return live;
+  return r.a === 1;
+}
+
+// How much of today's lineup is recorded, and how much of it was caught too
+// late to be sure of. { n, late } - late counts players whose first sighting
+// was already after their game had started.
+// Record and resolve together. Keeping these one call is deliberate: a caller
+// that recorded with one notion of "started" and then read with another would
+// produce a status for a lock that never happened.
+function _fxLockedStarter(row, it, hasLine) {
+  if (!row || row.provider !== 'fantrax') return _fxItemIsActive(it);
+  var rec = _fxLineupRead(row.key);
+  if (_fxLineupNote(rec, it, !!hasLine)) _fxLineupWrite(row.key, rec);
+  return _fxActiveToday(row.key, it);
+}
+
+function _fxLineupCoverage(leagueKey) {
+  var rec = _fxLineupRead(leagueKey);
+  var n = 0, late = 0, k;
+  if (rec && rec.by) {
+    for (k in rec.by) {
+      if (!rec.by.hasOwnProperty(k)) continue;
+      n++;
+      if (!rec.by[k].pre) late++;
+    }
+  }
+  return { n: n, late: late };
+}
+
 function _fxItemIsActive(it) {
   if (!it) return undefined;
   var st = String(it.status || '').toUpperCase();
@@ -77186,7 +77320,12 @@ function _extFhubRowsFor(at, idx, sport) {
       // an === true test threw away the difference between "provider says he's
       // benched" and "this provider says nothing", and the totals downstream
       // need exactly that difference. FXBENCH
-      starter: _fxItemIsActive(it),                   // FXACTIVE
+      // FXLOCK - today's status, not whatever day Fantrax has rolled on to.
+      // _sm is non-null exactly when this player has a box line, which is the
+      // same test the ledger uses to decide he is locked.
+      starter: (row.provider === 'fantrax')
+        ? _fxLockedStarter(row, it, !!_sm)
+        : _fxItemIsActive(it),                        // FXACTIVE
       statusLabel: _fxItemStatusLabel(it),            // FXACTIVE
       injury: it.injury ? String(it.injury).toUpperCase() : ''
     });
@@ -171862,7 +172001,10 @@ function _fxLineupFill(row, bodyEl, headEl, _retried) {
       // answers; until it does, _fxStarterSet falls back to counting
       // everyone and says so. FXDAYTOT
       slot: it.slot || it.position || '',
-      starter: _fxItemIsActive(it), status: it.status || ''   // FXACTIVE
+      // FXLOCK - the live status for now; the ledger is applied once the box
+      // scores land, which is when "his game has started" can be answered.
+      starter: _fxItemIsActive(it), status: it.status || '',   // FXACTIVE
+      item: it
     });
   }
   var note = '<div style="color:rgba(255,255,255,0.3);font-size:9.5px;line-height:1.6;margin-top:16px">' +
@@ -171874,7 +172016,24 @@ function _fxLineupFill(row, bodyEl, headEl, _retried) {
       // instead is the category totals above. FXROTO
       : 'This league scores categories, not points \u2014 the totals above are today\u2019s ' +
         'category production for this league\u2019s own categories, from the ESPN box line.') +
-    ' Players with no game today show season stats.</div>';
+    ' Players with no game today show season stats.' +
+    // FXLOCK - say it plainly when the lineup shown is the one reconstructed
+    // for today rather than the one Fantrax is currently serving.
+    ((row.provider === 'fantrax' && typeof _fxLineupCoverage === 'function')
+      ? (function () {
+          var c = _fxLineupCoverage(row.key);
+          if (!c.n) return '';
+          return ' Fantrax rolls its calendar to the next day while tonight\u2019s ' +
+            'games are still on, so the lineup it serves stops being tonight\u2019s. ' +
+            'Active/reserve here is recorded through the day and frozen when each ' +
+            'player\u2019s game starts, the way Fantrax locks him' +
+            (c.late
+              ? ('. ' + c.late + ' of ' + c.n + ' were first seen after their game had ' +
+                 'already begun, so those are best-effort.')
+              : ('. All ' + c.n + ' were recorded before their games began.'));
+        })()
+      : '') +
+    '</div>';
 
   if (!_ESPN_SPORT_CFG[sportKey]) {
     var basic = '';
@@ -171911,6 +172070,37 @@ function _fxLineupFill(row, bodyEl, headEl, _retried) {
     if (_extLineupOpenKey !== row.key) return;
     var by = (entry && entry.byPlayerKey) || {};
     var out = '', hit = 0, liveHit = 0, _dayEntries = [];   // FXDAYTOT
+
+    // ── FXLOCK ── Fold today's lineup into the ledger now that the box
+    // scores are in, then read each player's status back out of it. This is
+    // the first moment "his game has started" can be answered, and it is the
+    // answer the lock rule turns on. Both the ACTIVE/RESERVE sections and the
+    // totals strip read from here, so they cannot disagree.
+    if (row.provider === 'fantrax') {
+      try {
+        var _lkRec = _fxLineupRead(row.key), _lkDirty = false, _lkP;
+        for (_lkP = 0; _lkP < players.length; _lkP++) {
+          var _lkIt = players[_lkP].item;
+          if (!_lkIt) continue;
+          var _lkLive = (typeof _ftxLiveFor === 'function')
+            ? _ftxLiveFor(SPORT, players[_lkP].name) : null;
+          if (_fxLineupNote(_lkRec, _lkIt, !!_lkLive)) _lkDirty = true;
+        }
+        if (_lkDirty) _fxLineupWrite(row.key, _lkRec);
+        for (_lkP = 0; _lkP < players.length; _lkP++) {
+          if (!players[_lkP].item) continue;
+          var _was = players[_lkP].starter;
+          var _now = _fxActiveToday(row.key, players[_lkP].item);
+          if (_now === _was) continue;
+          players[_lkP].starter = _now;
+          // The section label has to move with it, or a player would sit
+          // under RESERVE while being counted in the active totals.
+          if (players[_lkP].status) {
+            players[_lkP].status = _now ? 'ACTIVE' : 'RESERVE';
+          }
+        }
+      } catch (_eLk) {}
+    }
 
     // ── Same status split the roster tab uses ── FXROSTERSPLIT ──
     // ACTIVE first, then RESERVE, then INJURED_RESERVE, so this modal and the
