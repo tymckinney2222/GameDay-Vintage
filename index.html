@@ -160418,6 +160418,18 @@ function espScoredIds(row) {
 function espSliceIds(row) {
   var out = espScoredIds(row), seen = {}, i;
   for (i = 0; i < out.length; i++) seen[out[i]] = 1;
+  // ESPGPSLOT - the games-played stat the league's own CAPS name. A league
+  // almost never SCORES it, so it was being filtered out of every window,
+  // and that filter is the only reason the per-slot split ever looked
+  // impossible: ESPN reports games played once per TEAM, but the per-PLAYER
+  // figure sits in the same payload and this line was dropping it. One extra
+  // id per player costs nothing and is what makes the slot breakdown exact
+  // rather than inferred from whether a stat line exists.
+  var _gc = (typeof espGameCaps === 'function') ? espGameCaps(row) : null;
+  if (_gc && _gc.statId != null && !seen[_gc.statId]) {
+    seen[_gc.statId] = 1;
+    out.push(Number(_gc.statId));
+  }
   if (typeof espIsCats !== 'function' || !espIsCats(row)) return out;
   var game = (typeof _espGameCode === 'function') ? _espGameCode(row) : 'flb';
   var comps = (typeof _espComponentsFor === 'function') ? _espComponentsFor(game) : null;
@@ -163744,6 +163756,11 @@ function espMaybeSnapshot(row) {
   if (existing && (existing.hadRosters || !hasRosters)) return;
 
   try { espWritePtsSnapshot(row, d); } catch (e2) {}
+  // ESPGPSLOT - the per-slot ledger rides the same hook. It needs rosters,
+  // which the first call of the day usually does not have; the memo above
+  // lets a later call through once they land, and the write upserts the
+  // period, so the day fills in rather than doubling.
+  try { espGpSlotWrite(row); } catch (e3) {}
 }
 
 // Force a capture for one league right now, overwriting today's record.
@@ -164251,6 +164268,397 @@ function _espGameCode(row) {
 // Kept so nothing that already calls the hockey name has to change.
 function espNhlCaps(row) { return espGameCaps(row); }
 
+// == PER-SLOT GAMES PLAYED == ESPGPSLOT ==
+//
+// ESPN caps games played PER LINEUP SLOT and then reports usage as a single
+// number per team. That is why this board has only ever tracked the aggregate,
+// and no amount of looking at the team object will change it: the split is not
+// in there.
+//
+// It is recoverable from the other end. A game is charged against the cap when
+// a player sat in a STARTING slot and his real club played, and the roster
+// payload carries both halves - the slot he occupies, and whether he has a
+// stat line for that scoring period. Counting those by slot reproduces exactly
+// what ESPN charged the team that day.
+//
+// The one thing it cannot do is look backwards. A roster call answers for ONE
+// scoring period, so a day that has passed is gone unless it was written down.
+// So it gets written down: one record per period, upserted, which means
+// re-syncing the same day corrects that day rather than counting it twice.
+//
+// Keyed by slot ID, never by label. espGameCaps resolves labels without the
+// universal-slot map and espRosters resolves them with it, so the two can
+// disagree on an unmapped slot; the numeric id is the same on both sides.
+//
+// Nothing here is allowed to pass itself off as complete. Games played before
+// the ledger started exist in ESPN's aggregate and not in the split, and
+// espGpSlotTotals reports that difference instead of burying it.
+var ESP_GP_SLOT_PREFIX = 'esp_gp_slot_v1_';
+var ESP_GP_BASE_PREFIX = 'esp_gp_base_v1_';
+
+function _espGpSlotKey(leagueKey, period) {
+  return ESP_GP_SLOT_PREFIX + leagueKey + '_' + period;
+}
+
+// How many games one window charges.
+//
+// ESPN's own games-played stat when the payload carries it - espSliceIds now
+// keeps the id the caps name, so for a capped league it normally does. The
+// fallback counts STAT ENTRIES, which answers the same question a different
+// way: a player with a line for the day played that day, and two lines mean
+// two games. The fallback matters because it keeps this honest on a league
+// whose payload omits the stat entirely.
+function _espGpOfWindow(w, sid) {
+  if (!w) return 0;
+  if (w.stats && sid != null && w.stats[sid] != null) {
+    var v = Number(w.stats[sid]);
+    if (!isNaN(v) && v >= 0) return v;
+  }
+  var g = Number(w.games);
+  return (!isNaN(g) && g > 0) ? g : 0;
+}
+
+// ESPN's own per-team games played - the number the cap is actually enforced
+// against, and therefore the arbiter every split below is checked against.
+function espGpAggregate(row) {
+  var caps = (typeof espGameCaps === 'function') ? espGameCaps(row) : null;
+  if (!caps) return null;
+  var teams = ((row && row.raw) || {}).teams || [];
+  var out = {}, any = false, i;
+  for (i = 0; i < teams.length; i++) {
+    var vb = teams[i] && teams[i].valuesByStat;
+    var v = (vb && vb[String(caps.statId)] != null) ? Number(vb[String(caps.statId)]) : null;
+    if (v == null || isNaN(v)) continue;
+    out[String(teams[i].id)] = v;
+    any = true;
+  }
+  return any ? out : null;
+}
+
+// One scoring period's charge, by slot, for every team. The single
+// implementation of the rule - today's sync and the backfill both come here,
+// so there is no way for the two to drift apart.
+function espGpSlotFromRosters(ros, caps) {
+  if (!ros || !ros.byTeam || ros.period == null || !caps) return null;
+  var sid = String(caps.statId);
+  var byTeam = {}, totalByTeam = {}, any = false, tid, i;
+  for (tid in ros.byTeam) {
+    if (!ros.byTeam.hasOwnProperty(tid)) continue;
+    var items = (ros.byTeam[tid] || {}).items || [];
+    var slots = {}, tot = 0;
+    for (i = 0; i < items.length; i++) {
+      var it = items[i];
+      if (!it || !it.starter || it.slotId == null) continue;
+      var n = _espGpOfWindow(it.windows && it.windows.today, sid);
+      if (!(n > 0)) continue;
+      var k = String(it.slotId);
+      slots[k] = (slots[k] || 0) + n;
+      tot += n;
+    }
+    byTeam[String(tid)] = slots;
+    totalByTeam[String(tid)] = tot;
+    if (tot > 0) any = true;
+  }
+  if (!any) return null;
+  return { period: ros.period, byTeam: byTeam, totalByTeam: totalByTeam };
+}
+
+function espGpSlotToday(row) {
+  var caps = (typeof espGameCaps === 'function') ? espGameCaps(row) : null;
+  if (!caps) return null;
+  return espGpSlotFromRosters(row && row.rosters, caps);
+}
+
+function _espGpSlotPut(leagueKey, day) {
+  if (!leagueKey || !day || day.period == null) return null;
+  var rec = {
+    ts: Date.now(), leagueKey: leagueKey, period: day.period,
+    date: (typeof _todayDateString === 'function') ? _todayDateString() : '',
+    byTeam: day.byTeam
+  };
+  var k = _espGpSlotKey(leagueKey, day.period);
+  var json = JSON.stringify(rec);
+  try { localStorage.setItem(k, json); return rec; } catch (e) {}
+  // Same escalating cleanup the points snapshot uses, and for the same
+  // reason - a day that is not captured now cannot be captured later.
+  try { if (typeof _espPurgeOldPtsSnapshots === 'function') _espPurgeOldPtsSnapshots(); } catch (e2) {}
+  try { if (typeof _purgeOldCatsSnapshots === 'function') _purgeOldCatsSnapshots(); } catch (e3) {}
+  try { localStorage.setItem(k, json); return rec; } catch (e4) {}
+  return null;
+}
+
+// Games each team had banked BEFORE the ledger's first record, pinned once so
+// the split can always be reconciled against ESPN's total however late
+// tracking began. Pinned, not recomputed: the aggregate keeps moving, and a
+// baseline that moved with it would absorb every discrepancy it exists to
+// expose.
+function _espGpPinBaseline(row, day) {
+  var k = ESP_GP_BASE_PREFIX + row.key;
+  try {
+    var have = localStorage.getItem(k);
+    if (have) return JSON.parse(have);
+  } catch (e) {}
+  var agg = espGpAggregate(row);
+  if (!agg) return null;
+  var base = {}, tid;
+  for (tid in agg) {
+    if (!agg.hasOwnProperty(tid)) continue;
+    var b = Number(agg[tid]) - (Number((day && day.totalByTeam) ? day.totalByTeam[tid] : 0) || 0);
+    base[tid] = (b > 0) ? b : 0;
+  }
+  var out = {
+    leagueKey: row.key, period: day ? day.period : null,
+    date: (typeof _todayDateString === 'function') ? _todayDateString() : '',
+    byTeam: base
+  };
+  try { localStorage.setItem(k, JSON.stringify(out)); } catch (e2) { return null; }
+  return out;
+}
+
+function espGpSlotWrite(row) {
+  if (!row || !row.key) return null;
+  var day = espGpSlotToday(row);
+  if (!day) return null;
+  var rec = _espGpSlotPut(row.key, day);
+  if (rec) { try { _espGpPinBaseline(row, day); } catch (e) {} }
+  return rec;
+}
+
+function espGpSlotRecords(leagueKey) {
+  var prefix = ESP_GP_SLOT_PREFIX + leagueKey + '_';
+  var out = [], i;
+  try {
+    for (i = 0; i < localStorage.length; i++) {
+      var k = localStorage.key(i);
+      if (!k || k.indexOf(prefix) !== 0) continue;
+      try {
+        var v = localStorage.getItem(k);
+        if (v) out.push(JSON.parse(v));
+      } catch (e) {}
+    }
+  } catch (e2) {}
+  out.sort(function (a, b) { return Number(a.period) - Number(b.period); });
+  return out;
+}
+
+// The split for one team, with its own completeness stated.
+//   slots         games by slot id, from the ledger
+//   tracked       their sum
+//   baseline      games banked before the ledger started
+//   agg           ESPN's own total for the team
+//   unattributed  agg - baseline - tracked; 0 means the split accounts for
+//                 every game ESPN has charged
+function espGpSlotTotals(row, teamId) {
+  var recs = espGpSlotRecords(row && row.key);
+  var id = String(teamId);
+  var slots = {}, tracked = 0, days = 0, fromDate = '', minP = null, i, k;
+  for (i = 0; i < recs.length; i++) {
+    var bt = (recs[i].byTeam || {})[id];
+    if (!bt) continue;
+    var dayTot = 0;
+    for (k in bt) {
+      if (!bt.hasOwnProperty(k)) continue;
+      var n = Number(bt[k]);
+      if (isNaN(n) || n <= 0) continue;
+      slots[k] = (slots[k] || 0) + n;
+      dayTot += n;
+    }
+    if (dayTot <= 0) continue;
+    tracked += dayTot;
+    days++;
+    if (!fromDate) fromDate = recs[i].date || '';
+    if (minP == null) minP = Number(recs[i].period);
+  }
+
+  // Nothing precedes period 1, so a ledger that reaches it needs no pinned
+  // baseline and carries none of its uncertainty.
+  var baseline = null;
+  if (minP === 1) baseline = 0;
+  else {
+    try {
+      var r = localStorage.getItem(ESP_GP_BASE_PREFIX + (row && row.key));
+      var b = r ? JSON.parse(r) : null;
+      if (b && b.byTeam && b.byTeam[id] != null) baseline = Number(b.byTeam[id]);
+    } catch (e) {}
+  }
+
+  var agg = espGpAggregate(row);
+  var aggN = (agg && agg[id] != null) ? Number(agg[id]) : null;
+  var unatt = (aggN != null && baseline != null) ? (aggN - baseline - tracked) : null;
+  return {
+    slots: slots, tracked: tracked, days: days, fromDate: fromDate,
+    firstPeriod: minP, baseline: baseline, agg: aggN,
+    unattributed: unatt,
+    complete: (unatt != null && Math.abs(unatt) < 0.5)
+  };
+}
+
+// == BACKFILL == ESPGPBACK ==
+//
+// A roster payload measured 1.5MB, so filling in a past period costs a real
+// download and this never runs on its own - it is a button, with the number of
+// days on it.
+//
+// Whether ESPN returns the lineup AS IT STOOD on a past period, or today's
+// lineup carrying that period's stats, is not documented and could not be
+// tested from here. It does not have to be. The split is checked against
+// ESPN's own per-team total afterwards either way: if every game is accounted
+// for, the numbers are right whichever way the endpoint behaves, and if they
+// are not, the shortfall is shown rather than papered over.
+var ESP_GP_BACKFILL_MAX = 14;
+
+function espGpBackfillGaps(row) {
+  var caps = (typeof espGameCaps === 'function') ? espGameCaps(row) : null;
+  if (!caps) return null;
+  var cur = (typeof _espScoringPeriod === 'function') ? _espScoringPeriod(row) : null;
+  if (cur == null || cur < 1) return null;
+  var have = {}, recs = espGpSlotRecords(row.key), i;
+  for (i = 0; i < recs.length; i++) have[String(recs[i].period)] = 1;
+  var out = [];
+  for (i = 1; i <= cur; i++) if (!have[String(i)]) out.push(i);
+  return out;
+}
+
+function espGpBackfill(key) {
+  var row = null, list = [], i;
+  try { if (typeof extSyncedLeaguesAll === 'function') list = extSyncedLeaguesAll() || []; } catch (e) {}
+  for (i = 0; i < list.length; i++) {
+    if (list[i] && String(list[i].key) === String(key)) { row = list[i]; break; }
+  }
+  if (!row || row._espGpBusy) return;
+  var gaps = espGpBackfillGaps(row);
+  if (!gaps || !gaps.length) {
+    if (typeof skToast === 'function') skToast('Nothing to fill in');
+    return;
+  }
+  if (gaps.length > ESP_GP_BACKFILL_MAX) gaps = gaps.slice(-ESP_GP_BACKFILL_MAX);
+  var caps = espGameCaps(row);
+  var sv = (typeof espFindSaved === 'function') ? espFindSaved(String(row.key).slice(4)) : null;
+  if (!caps || !sv) return;
+  row._espGpBusy = 1;
+  var done = 0, failed = 0;
+
+  function finish() {
+    row._espGpBusy = 0;
+    if (typeof skToast === 'function') {
+      skToast('Filled in ' + done + ' day' + (done === 1 ? '' : 's') +
+        (failed ? (' · ' + failed + ' unavailable') : ''));
+    }
+    if (typeof espRepaintStandPane === 'function') espRepaintStandPane(row.key);
+  }
+
+  function step(season, n) {
+    if (n >= gaps.length) { finish(); return; }
+    var p = gaps[n];
+    if (typeof skToast === 'function') {
+      skToast('Day ' + (n + 1) + ' of ' + gaps.length + '…');
+    }
+    espFetchLeague(sv.game, sv.id, season, '?view=mRoster&scoringPeriodId=' + p)
+      .then(function (j) {
+        var ros = espRosters(j, sv.game, espSliceIds(row), row.sport);
+        // ESPN echoes the period it actually answered for. Trust THAT, never
+        // the number asked for - a request for a period the season has not
+        // reached comes back as the current one, and filing that under the
+        // requested day would invent a day that never happened.
+        if (ros && ros.period != null && Number(ros.period) === Number(p)) {
+          var day = espGpSlotFromRosters(ros, caps);
+          if (day) { _espGpSlotPut(row.key, day); done++; }
+          else failed++;
+        } else failed++;
+      })
+      .catch(function () { failed++; })
+      .then(function () { step(season, n + 1); });
+  }
+
+  espCurrentSeason(sv.game).then(function (season) {
+    step(season, 0);
+  }).catch(function () { finish(); });
+}
+
+// == PROJECTED FINISH == ESPGPPROJ ==
+//
+// The board's over/under has always been measured against the CALENDAR: the
+// season has offered this share of the allowance, so a team is ahead of or
+// behind that line. That answers "am I early?" and not the question a season
+// actually turns on, which is "where do I land?".
+//
+// This answers that one, and from games actually started rather than from a
+// calendar assumption: usage to date divided by the scoring periods that have
+// run, carried to the last period of the season. A team burning games faster
+// than its slots can afford finishes OVER the cap, which means it stops
+// scoring before April. One running cold finishes UNDER, which means it threw
+// games away. Both are visible months ahead, which is the entire point.
+
+// { cur, total, src } - how far into the season, in ESPN's own periods.
+function _espPeriodSpan(row) {
+  var cur = (typeof _espScoringPeriod === 'function') ? _espScoringPeriod(row) : null;
+  if (cur == null || cur < 1) return null;
+  var st = ((row || {}).raw || {}).status || {};
+  // ESPN's own last period of the season, when it ships one. Nothing derived.
+  var fin = parseInt(st.finalScoringPeriod, 10);
+  if (!isNaN(fin) && fin > cur) return { cur: cur, total: fin, src: 'ESPN' };
+  // Otherwise the season window, converted at the sport's own period length -
+  // a scoring period is one DAY where clubs play most nights and one WEEK in
+  // football. Not a guess at ESPN's numbering, and labelled as the weaker
+  // source wherever it is used.
+  var w = (typeof _espSeasonWindow === 'function')
+    ? _espSeasonWindow(row && row.sport, row && row.season) : null;
+  if (!w) return null;
+  var perDays = (String((row && row.sport) || '').toLowerCase() === 'nfl') ? 7 : 1;
+  var total = Math.round(((w.endMs - w.startMs) / 86400000) / perDays);
+  if (!(total > cur)) return null;
+  return { cur: cur, total: total, src: 'calendar' };
+}
+
+// Usage -> where it finishes. Null below two periods, where one night's
+// schedule is the entire sample and the number produced would be noise
+// wearing a decimal point.
+function espGpProject(used, span, cap) {
+  if (used == null || isNaN(used) || !span || !(span.cur >= 2)) return null;
+  var rate = used / span.cur;
+  var proj = Math.round(rate * span.total);
+  var out = {
+    rate: Math.round(rate * 100) / 100,
+    proj: proj,
+    periods: span.cur,
+    src: span.src,
+    over: (cap != null) ? (proj - cap) : null,
+    capsIn: null
+  };
+  // Finishing over the cap means the cap arrives before April does. Say when.
+  if (cap != null && rate > 0 && proj > cap) {
+    out.capsIn = Math.max(0, Math.ceil(cap / rate) - span.cur);
+  }
+  return out;
+}
+
+// My per-slot board: used, cap, and - once the ledger holds enough days to
+// mean anything - where each slot finishes. The aggregate can read "on
+// budget" while one slot is already doomed, which is the whole reason this
+// exists.
+function espGpSlotBoard(row, teamId) {
+  var caps = (typeof espGameCaps === 'function') ? espGameCaps(row) : null;
+  if (!caps) return null;
+  var tot = espGpSlotTotals(row, teamId);
+  if (!tot || !tot.days) return null;
+  var span = _espPeriodSpan(row);
+  // A slot's rate can only be measured over the periods the ledger actually
+  // covers, which is not the same as the periods the season has run.
+  var trackedSpan = (span && tot.days >= 5)
+    ? { cur: tot.days, total: span.total - span.cur + tot.days, src: span.src }
+    : null;
+  var rows = [], i;
+  for (i = 0; i < caps.slots.length; i++) {
+    var sl = caps.slots[i];
+    var used = Number(tot.slots[String(sl.slot)]) || 0;
+    rows.push({
+      slot: sl.slot, label: sl.label, cap: sl.cap, used: used,
+      proj: trackedSpan ? espGpProject(used, trackedSpan, sl.cap) : null
+    });
+  }
+  return { caps: caps, rows: rows, totals: tot, span: span, projects: !!trackedSpan };
+}
+
 function espNhlCapWatch(row) {
   var caps = espNhlCaps(row);
   if (!caps) return null;
@@ -164287,8 +164695,13 @@ function espNhlCapWatch(row) {
         waste = Math.round(used - budget);
       }
     }
+    // ESPGPPROJ - where this usage FINISHES, from games actually started
+    // rather than from the calendar share above. Null until two periods have
+    // run, because one night's schedule is not a rate.
+    var proj = null;
+    try { proj = espGpProject(used, _espPeriodSpan(row), caps.total); } catch (eP) {}
     out.push({
-      teamId: r.teamId, teamName: r.teamName,
+      teamId: r.teamId, teamName: r.teamName, proj: proj,
       used: Math.round(used), cap: caps.total, left: Math.round(left),
       perWk: (perWk == null) ? null : Math.round(perWk * 10) / 10,
       wksToCap: (wksToCap == null) ? null : Math.round(wksToCap * 10) / 10,
@@ -164353,20 +164766,154 @@ function _espNhlCapHtml(row, accent, mono) {
         '%;background:' + barCol + ';"></span></span>' +
       '<span style="flex:0 0 74px;text-align:right;' + mono + 'font-size:11px;' +
         'color:rgba(255,255,255,0.7);">' + g.used + '/' + caps.total + '</span>' +
+      // ESPGPPROJ - the projected finish, which is the number that decides a
+      // season: over the cap means the team stops scoring before April, under
+      // it means games were thrown away. The calendar over/under it replaces
+      // only ever said whether a team was early. Before two periods have run
+      // there is no rate to project, so that older reading still fills the
+      // column rather than leaving it blank.
       '<span style="flex:0 0 66px;text-align:right;' + mono + 'font-size:10px;color:' +
-        (g.freezes ? '#f87171' : wCol) + ';">' +
-        (g.freezes && g.wksToCap != null
-          ? ('caps in ' + g.wksToCap + 'w')
-          : slEsc(wTxt)) + '</span>' +
+        (g.proj
+          ? (g.proj.over > 0 ? '#f87171' : 'rgba(255,255,255,0.46)')
+          : (g.freezes ? '#f87171' : wCol)) + ';">' +
+        (g.proj
+          ? ('\u2192' + g.proj.proj)
+          : (g.freezes && g.wksToCap != null
+              ? ('caps in ' + g.wksToCap + 'w')
+              : slEsc(wTxt))) + '</span>' +
     '</div>';
   }
 
+  var _projAny = false, _pi;
+  for (_pi = 0; _pi < cw.rows.length; _pi++) if (cw.rows[_pi].proj) _projAny = true;
+  var _sp0 = cw.rows.length ? cw.rows[0].proj : null;
+
   h += '<div style="color:rgba(255,255,255,0.22);font-size:8.5px;margin-top:4px;' +
-    'line-height:1.5;">ESPN caps each position separately but reports games ' +
-    'played as a single total, so this tracks the aggregate. Over/under is ' +
-    'against the share of the allowance the season has offered so far. A team ' +
-    'can sit on budget overall and still run dry in one position \u2014 the ' +
-    'per-slot split needs a source ESPN doesn\u2019t expose.</div>';
+    'line-height:1.5;">' +
+    (_projAny
+      ? ('Projected finish — games started to date carried over the ' +
+         'season’s ' + (_sp0 ? _sp0.periods : '?') + ' scoring periods so ' +
+         'far to all ' + ((_espPeriodSpan(row) || {}).total || '?') + ', against a ' +
+         caps.total + '-game allowance. Red finishes OVER, which means the team ' +
+         'stops scoring before the season ends; under means games left unused. ' +
+         'Season length from ' + (_sp0 ? _sp0.src : '?') + '.')
+      : ('Over/under is against the share of the allowance the season has ' +
+         'offered so far. A projected finish replaces it once two scoring ' +
+         'periods have run.')) +
+    '</div>';
+
+  h += _espGpSlotHtml(row, accent, mono);
+  return h;
+}
+
+// == MY GAMES BY SLOT == ESPGPSLOT ==
+//
+// The board above tracks the aggregate because that is all ESPN publishes per
+// team. Its own footnote used to end by admitting that a team can sit on
+// budget overall and still run dry in one position, and that the split needed
+// a source ESPN doesn't expose. The first half is true. The second was wrong:
+// the split is not published, but it is recoverable, one day at a time, from
+// the lineup - see ESPGPSLOT. This is that measurement.
+function _espGpSlotHtml(row, accent, mono) {
+  var myId = (typeof espMyTeamId === 'function') ? espMyTeamId(row) : null;
+  if (myId == null) return '';
+  var key = String((row && row.key) || '').replace(/'/g, '');
+
+  var nGap = 0;
+  try {
+    var gaps = espGpBackfillGaps(row);
+    nGap = (gaps && gaps.length) ? gaps.length : 0;
+  } catch (eG) {}
+  var fillBtn = '';
+  if (nGap > 0) {
+    var ask = (nGap > ESP_GP_BACKFILL_MAX) ? ESP_GP_BACKFILL_MAX : nGap;
+    fillBtn = '<button onclick="espGpBackfill(\'' + key + '\')" ' +
+      'style="padding:4px 11px;border-radius:999px;border:1px solid rgba(255,255,255,0.16);' +
+      'background:none;color:rgba(255,255,255,0.5);font-size:9px;font-weight:700;' +
+      'letter-spacing:0.08em;">FILL IN ' + ask + ' DAY' + (ask === 1 ? '' : 'S') + '</button>';
+  }
+
+  var bd = null;
+  try { bd = espGpSlotBoard(row, myId); } catch (eB) {}
+
+  var h = '<div style="font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
+    'margin:18px 0 3px;">MY GAMES BY SLOT</div>';
+
+  if (!bd) {
+    h += '<div style="font-size:10.5px;line-height:1.55;color:rgba(255,255,255,0.35);">' +
+      'ESPN publishes games played as one number per team, so the per-position ' +
+      'split is rebuilt here from the daily lineup — every starter whose ' +
+      'club played, charged to the slot he filled. It banks one day at a time ' +
+      'from here on' +
+      (nGap ? ', and the days already gone can be fetched.' : '.') + '</div>' +
+      (fillBtn ? ('<div style="margin-top:9px;">' + fillBtn + '</div>') : '');
+    return h;
+  }
+
+  var t = bd.totals, i;
+  h += '<div style="font-size:9.5px;color:rgba(255,255,255,0.3);margin:0 0 7px;">' +
+    'tracked ' + t.days + ' day' + (t.days === 1 ? '' : 's') +
+    (t.fromDate ? (' from ' + slEsc(t.fromDate)) : '') + '</div>';
+
+  for (i = 0; i < bd.rows.length; i++) {
+    var sl = bd.rows[i];
+    var pct = sl.cap > 0 ? Math.round((sl.used / sl.cap) * 100) : 0;
+    var over = sl.proj && sl.proj.over > 0;
+    h += '<div style="display:flex;align-items:center;gap:8px;padding:4px 6px;">' +
+      '<span style="flex:0 0 46px;font-size:11px;' + mono +
+        'color:rgba(255,255,255,0.72);">' + slEsc(sl.label) + '</span>' +
+      '<span style="flex:1;height:5px;border-radius:3px;' +
+        'background:rgba(255,255,255,0.08);overflow:hidden;">' +
+        '<span style="display:block;height:100%;width:' +
+        // Every row here is my own team, so the accent cannot also mean
+        // "mine" the way it does on the board above. Red is reserved for the
+        // slot that finishes OVER its cap; the rest stay neutral, or the one
+        // row that matters is the same colour as the three that don't.
+        Math.max(0, Math.min(100, pct)) + '%;background:' +
+        (over ? accent : 'rgba(255,255,255,0.28)') + ';"></span></span>' +
+      '<span style="flex:0 0 72px;text-align:right;' + mono + 'font-size:11px;' +
+        'color:rgba(255,255,255,0.7);">' + sl.used + '/' + sl.cap + '</span>' +
+      '<span style="flex:0 0 58px;text-align:right;' + mono + 'font-size:10px;color:' +
+        (over ? '#f87171' : 'rgba(255,255,255,0.42)') + ';">' +
+        (sl.proj ? ('→' + sl.proj.proj) : '') + '</span>' +
+    '</div>';
+  }
+
+  // Reconciliation. The split is only worth reading if it accounts for every
+  // game ESPN has charged, so the arithmetic is shown rather than asserted:
+  // games banked before tracking began, plus games tracked since, against
+  // ESPN's own total for the team. Anything left over is named, not hidden.
+  var recon = '';
+  if (t.agg == null) {
+    recon = 'ESPN has not reported a team total to check this against yet.';
+  } else if (t.baseline == null) {
+    recon = t.tracked + ' of ' + t.agg + ' games charged so far are split out ' +
+      'above — the rest were played before tracking began and cannot be ' +
+      'attributed to a slot after the fact.';
+  } else if (t.complete) {
+    recon = 'Every one of ESPN’s ' + t.agg + ' charged games is accounted ' +
+      'for' + (t.baseline > 0
+        ? (', including ' + t.baseline + ' played before tracking began — ' +
+           'those are real games against the cap but their slot is gone, so ' +
+           'they sit outside the split.')
+        : ', from the first day of the season.');
+  } else {
+    var miss = t.unattributed;
+    recon = (miss > 0 ? (miss + ' game' + (miss === 1 ? '' : 's') + ' ESPN has ' +
+             'charged are missing from the split') :
+             ((-miss) + ' game' + (miss === -1 ? '' : 's') + ' more are split ' +
+              'out than ESPN has charged')) +
+      ' — usually a player who changed slots or left the roster. The ' +
+      'per-slot numbers are a floor, not a total.';
+  }
+  h += '<div style="color:rgba(255,255,255,0.22);font-size:8.5px;margin-top:6px;' +
+    'line-height:1.5;">' + recon +
+    (bd.projects
+      ? ' Projected finish is this team’s own rate in each slot over the ' +
+        'days tracked, carried to the end of the season.'
+      : ' A per-slot projection needs five tracked days; until then these are ' +
+        'counts.') + '</div>' +
+    (fillBtn ? ('<div style="margin-top:9px;">' + fillBtn + '</div>') : '');
   return h;
 }
 
