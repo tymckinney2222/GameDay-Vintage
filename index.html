@@ -89240,6 +89240,14 @@ function skBuildCardHTML(l) {
   }
   if (!record) record = '—';
   var rankText = (team && team.rank) ? (skOrdinal(team.rank) + ' of ' + (l.num_teams || '?')) : '';
+  // ROTOCARDLIVE - Yahoo publishes no points_for on a roto standings row, so
+  // this corner read a bare dash however far into the night the games ran.
+  // The live derivation is the only thing that can fill it.
+  var _yLv = (typeof _skRotoCardLive === 'function') ? _skRotoCardLive(l) : null;
+  if (_yLv) {
+    record = _yLv.pts + '';
+    rankText = skOrdinal(_yLv.rank) + ' of ' + (_yLv.teams || l.num_teams || '?');
+  }
   var headerRight = team
     ? record + (rankText ? ' · ' + rankText : '')
     : '—';
@@ -89414,6 +89422,8 @@ function skBuildCardHTML(l) {
     // No daily matchup — show rank, record, and points-for if we have it
     if (team) {
       var rankNum = (team.rank && team.rank !== '—') ? team.rank : '—';
+      // ROTOCARDLIVE - the live standing leads once today has moved it.
+      if (_yLv) rankNum = _yLv.rank;
       var pf = team.points_for != null ? team.points_for.toFixed(1) : null;
       // Today-focused peek: my today's FP, plus how today went versus
       // the team adjacent to me in the season standings (whoever I'm
@@ -89422,7 +89432,16 @@ function skBuildCardHTML(l) {
       var todayCard = skTodayCardCache[l.league_key];
       var hasTodayData = todayCard && todayCard.myFp != null && !todayCard.fetching;
       var gapHtml = '';
-      if (hasTodayData) {
+      // ROTOCARDLIVE - a roto league takes the live-ladder line ahead of the
+      // fantasy-points one. "+12.4 today" is a points-league sentence: roto
+      // is settled in rank points, and today's FP total says nothing about
+      // whether any of them moved. Checked FIRST, or the live line would be
+      // skipped in exactly the case it exists for - a night mid-flight, when
+      // today's FP has loaded.
+      var _yLive = _yLv ? _skRotoLiveDeltaHtml(_yLv, skOrdinal) : '';
+      if (_yLive) {
+        gapHtml = _yLive;
+      } else if (hasTodayData) {
         var myT = todayCard.myFp;
         var nbT = todayCard.neighborFp;
         var nbRank = todayCard.neighborRank;
@@ -169641,12 +169660,120 @@ function _skExtSeasonTotal(l) {
 // from the SAME published column, never one side live and the other stored,
 // which would be a gap between two different measurements rather than between
 // two teams.
+// == LIVE ROTO ON THE CARD == ROTOCARDLIVE ==
+//
+// The pressure board already re-ranks a roto league on season + today. The
+// cards did not: they read the provider's published standing, which in roto
+// stops at yesterday, so a night that moved three categories showed up
+// nowhere until the next morning.
+//
+// The rule for WHEN to use the live ladder matters more than the arithmetic.
+// Both providers' live totals hold back any rate category that cannot be
+// rebuilt and verified against the published season figure, so a live total
+// is not always the same quantity the provider's own app shows. While nothing
+// has been recorded today the two agree exactly - live IS season - and the
+// published figures are used, so the card matches Yahoo or ESPN to the
+// decimal. Only once today has actually moved something does the card switch
+// to the live ladder, because only then is there something to show that the
+// published numbers cannot say. The switch is labelled.
+//
+// Null whenever the live view cannot be built - rosters not fetched, the day
+// cache not loaded, no roto league - and every caller falls back to exactly
+// what it rendered before.
+function _skRotoCardLive(l) {
+  if (!l) return null;
+  var v = null;
+  try {
+    if (l.provider) {
+      // ESPN is the only external provider with a live roto derivation.
+      if (l.provider !== 'espn') return null;
+      if (typeof _espRotoLiveView !== 'function') return null;
+      v = _espRotoLiveView(l);
+    } else {
+      if (typeof _skRotoLiveView !== 'function') return null;
+      var key = l.league_key;
+      var data = (typeof skLeagueData === 'object' && skLeagueData) ? skLeagueData[key] : null;
+      if (!data) return null;
+      v = _skRotoLiveView(l, data);
+    }
+  } catch (e) { return null; }
+  if (!v || !v.me) return null;
+  // Nothing recorded today means live and published are the same ladder, and
+  // the published one is the provider's own. Say nothing rather than restate
+  // it through a different derivation.
+  if (!v.touched) return null;
+  var me = v.me;
+  if (me.ptsTo == null || me.rankTo == null) return null;
+  return {
+    pts: Math.round(Number(me.ptsTo) * 10) / 10,
+    rank: Number(me.rankTo),
+    ptsFrom: Math.round(Number(me.ptsFrom) * 10) / 10,
+    rankFrom: Number(me.rankFrom),
+    // Positive means climbed: rank 11 -> 9 is two places gained.
+    places: Number(me.rankFrom) - Number(me.rankTo),
+    gain: Math.round((Number(me.ptsTo) - Number(me.ptsFrom)) * 10) / 10,
+    teams: v.teams, moved: v.moved
+  };
+}
+
+// The gap to the team one place up the LIVE ladder - or one place down, at
+// the top, where there is nobody to chase. Both sides come off the same live
+// derivation, never one live and one published, which would report the
+// distance between two different measurements rather than between two teams.
+function _skRotoLiveGap(lv) {
+  if (!lv || !lv.moved || !lv.rank) return null;
+  var want = (lv.rank > 1) ? (lv.rank - 1) : (lv.rank + 1);
+  var k, near = null;
+  for (k in lv.moved) {
+    if (!lv.moved.hasOwnProperty(k)) continue;
+    if (Number(lv.moved[k].rankTo) === want) { near = lv.moved[k]; break; }
+  }
+  if (!near || near.ptsTo == null) return null;
+  return { rank: want, delta: Math.round((lv.pts - Number(near.ptsTo)) * 10) / 10 };
+}
+
+// The card's second line: distance to the next team on the live ladder, how
+// far today has moved me, and a mark saying these are live figures and will
+// not match the provider's own app while a category is held back.
+function _skRotoLiveDeltaHtml(lv, ord) {
+  if (!lv) return '';
+  var g = _skRotoLiveGap(lv);
+  var cls = '', txt = '';
+  if (g) {
+    cls = (g.delta >= 0) ? 'up' : 'down';
+    txt = (g.delta >= 0 ? '+' + g.delta + ' ahead of ' : '\u2212' + Math.abs(g.delta) + ' behind ') +
+      ord(g.rank);
+  } else {
+    txt = lv.pts + ' roto pts';
+  }
+  var mv = '';
+  if (lv.places > 0) {
+    mv = '<span style="color:var(--sk-green)"> \u25b2' + lv.places + '</span>';
+  } else if (lv.places < 0) {
+    mv = '<span style="color:var(--sk-red)"> \u25bc' + Math.abs(lv.places) + '</span>';
+  }
+  return '<div class="sk-card-delta ' + cls + '">' + txt + mv +
+    '<span style="color:var(--sk-text-3);font-weight:400"> \u00b7 live</span></div>';
+}
+
 function _skExtRotoHeroHtml(l, accent) {
   if (!l || !_skExtIsRoto(l)) return '';
   var hs = l.standings || {};
   var rank = parseInt(hs.rank, 10);
   if (isNaN(rank) || rank < 1) return '';
   var total = hs.total || (l.standingsAll ? l.standingsAll.length : null);
+
+  // ROTOCARDLIVE - the live ladder when today has moved something.
+  var _lv = (typeof _skRotoCardLive === 'function') ? _skRotoCardLive(l) : null;
+  if (_lv) {
+    return '<div class="sk-card-score-row">' +
+      '<div class="sk-card-score-main">' +
+        '<span style="color:' + accent + '">' + _skOrdinal(_lv.rank) + '</span>' +
+        '<span style="font-size:14px;color:var(--sk-text-3)"> of ' +
+          (_lv.teams || total || '?') + '</span>' +
+      '</div>' + _skRotoLiveDeltaHtml(_lv, _skOrdinal) +
+    '</div>';
+  }
 
   var gap = '';
   var rows = l.standingsAll || [];
@@ -172134,6 +172261,14 @@ function skBuildExtCardHTML(l) {
       : (_hPf != null && Number(_hPf) > 0) ? (Math.round(Number(_hPf) * 10) / 10 + '')
       : '';
     var rankPart = _skOrdinal(_hRank || hs.rank) + ' of ' + (hs.total || '?');
+    // ROTOCARDLIVE - roto has no record to show here, so the corner carries
+    // the roto point total, and it has to be the same ladder the hero below
+    // it reads or the two disagree on the same card.
+    var _cLv = (typeof _skRotoCardLive === 'function') ? _skRotoCardLive(l) : null;
+    if (_cLv) {
+      recPart = _cLv.pts + '';
+      rankPart = _skOrdinal(_cLv.rank) + ' of ' + (_cLv.teams || hs.total || '?');
+    }
     headerRight = recPart ? (recPart + ' \u00b7 ' + rankPart) : rankPart;
   }
 
