@@ -1299,6 +1299,37 @@
     width: 52px; flex: none; text-align: right; color: rgba(255,255,255,0.75);
   }
   .sk-gpb-cell small { color: rgba(255,255,255,0.3); font-size: 9px; }
+  /* GPPROJ - my own slots, read down rather than across */
+  .sk-gpb-mine { margin-top: 16px; }
+  .sk-gpb-mine-h {
+    font-size: 9px; letter-spacing: 0.09em; color: rgba(255,255,255,0.32);
+    margin-bottom: 5px;
+  }
+  .sk-gpb-mine-row {
+    display: flex; align-items: center; gap: 8px; padding: 5px 6px;
+    font-family: var(--sk-font-mono, monospace); font-size: 12px;
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+  }
+  .sk-gpb-mine-row.head {
+    font-size: 8px; letter-spacing: 0.09em; color: rgba(255,255,255,0.26);
+    border-bottom: none; padding-bottom: 1px;
+  }
+  .sk-gpb-mine-pos { flex: 1 1 auto; color: rgba(255,255,255,0.78); }
+  .sk-gpb-mine-n {
+    flex: 0 0 76px; text-align: right; color: rgba(255,255,255,0.7);
+  }
+  .sk-gpb-mine-n small { color: rgba(255,255,255,0.3); font-size: 9px; }
+  .sk-gpb-mine-n.over { color: #f87171; }
+  .sk-gpb-mine-note {
+    color: rgba(255,255,255,0.24); font-size: 8.5px; line-height: 1.5;
+    margin-top: 6px;
+  }
+  .sk-gpb-fill {
+    margin-top: 9px; padding: 5px 12px; border-radius: 999px;
+    border: 1px solid rgba(255,255,255,0.16); background: none;
+    color: rgba(255,255,255,0.5); font-size: 9px; font-weight: 700;
+    letter-spacing: 0.08em;
+  }
   .sk-gpb-cell.near { color: #fbbf24; }
   .sk-gpb-cell.full { color: #f87171; font-weight: 700; }
   .sk-gpb-cov {
@@ -117355,20 +117386,65 @@ function _skGpDateRange(league) {
 // still accruing, so writing it would freeze a partial count.
 var GP_LS_PREFIX = 'gptal_v1_';
 
+// GPKEEP - why this used to lose every day it counted.
+//
+// The guard above read "today and yesterday are still moving, so don't write
+// them" - correct in itself, and fatal in combination with when this is
+// called. A date is fetched on the day it IS today. By the time it becomes
+// immutable, two days later, nothing goes back to fetch it again. So the
+// write never fired, the roster map it came from was evicted by the 140-entry
+// trim, and at midnight the day was simply gone. That is the reset: numbers
+// climbing through the evening and a board reading 0 of 4 days the next
+// morning.
+//
+// So every day is written, and the record carries whether it has SETTLED.
+// The one-directional rule does the job the guard was reaching for: a settled
+// day is never replaced by a provisional one, while a provisional day is
+// always replaced, because a later read of the same day knows more. A day
+// captured at nine in the evening is very close to final, and a count that is
+// nearly right beats a zero by the whole value of the feature.
 function _skGpWriteTally(teamKey, date, fpMap, isImmutable) {
-  if (!isImmutable) return;                 // today/yesterday still moving
   var day = _skGpCountDate(fpMap);
-  var keys = Object.keys(day);
-  if (!keys.length) return;                 // nobody played — nothing to keep
+  if (!Object.keys(day).length) return;     // nobody played - nothing to keep
+  var k = GP_LS_PREFIX + _fpKey(teamKey, date);
+  var prev = null;
   try {
-    localStorage.setItem(GP_LS_PREFIX + _fpKey(teamKey, date), JSON.stringify(day));
-  } catch (e) { /* quota: the board just reports lower coverage */ }
+    var raw = localStorage.getItem(k);
+    if (raw) prev = JSON.parse(raw);
+  } catch (e) {}
+  // Settled beats provisional, whatever arrives later.
+  if (prev && _skGpRecSettled(prev) && !isImmutable) return;
+  try {
+    localStorage.setItem(k, JSON.stringify({ d: day, s: isImmutable ? 1 : 0 }));
+  } catch (e2) { /* quota: the board just reports lower coverage */ }
+}
+
+// Records come in two shapes. The original was a bare { POS: n } map, written
+// only when the date was already final, so anything without the wrapper is
+// settled by construction. Reading both means no migration and no lost days.
+function _skGpRecSettled(rec) {
+  if (!rec || typeof rec !== 'object') return false;
+  if (rec.d === undefined) return true;     // legacy bare map
+  return !!rec.s;
+}
+function _skGpRecMap(rec) {
+  if (!rec || typeof rec !== 'object') return null;
+  return (rec.d === undefined) ? rec : rec.d;
+}
+
+// Is this team's count for this date final, or still open to revision?
+function _skGpDateSettled(teamKey, date) {
+  try {
+    var raw = localStorage.getItem(GP_LS_PREFIX + _fpKey(teamKey, date));
+    if (raw) return _skGpRecSettled(JSON.parse(raw));
+  } catch (e) {}
+  return false;
 }
 
 function _skGpReadTally(teamKey, date) {
   try {
     var raw = localStorage.getItem(GP_LS_PREFIX + _fpKey(teamKey, date));
-    if (raw) return JSON.parse(raw);
+    if (raw) return _skGpRecMap(JSON.parse(raw));
   } catch (e) {}
   // Fall back to a full roster map if one happens to still be around.
   var m = _skGpReadCachedMap(teamKey, date);
@@ -117413,6 +117489,122 @@ function _skGpCommonDates(league, teamKeys) {
 }
 
 // Usage for one team, over a supplied date list (or the whole season so far).
+// GPCATCH - dates inside the shared window that no team has settled yet, most
+// recent first. Re-fetching one costs a call per team, so the board offers it
+// as a button with the number on it rather than doing it quietly.
+function _skGpUnsettledDates(league, teamKeys, limit) {
+  var dates = _skGpDateRange(league);
+  var today = _todayDateString();
+  var out = [], i, t;
+  for (i = dates.length - 1; i >= 0; i--) {
+    if (dates[i] >= today) continue;        // today is still being written
+    var need = false;
+    for (t = 0; t < teamKeys.length; t++) {
+      if (!_skGpDateSettled(teamKeys[t], dates[i])) { need = true; break; }
+    }
+    if (need) out.push(dates[i]);
+    if (limit && out.length >= limit) break;
+  }
+  return out;
+}
+
+var _skGpCatchBusy = false;
+function skGpCatchUp(leagueKey) {
+  if (_skGpCatchBusy) return;
+  var lg = (typeof fyLeagues !== 'undefined' && fyLeagues)
+    ? fyLeagues.filter(function (l) { return l.league_key === leagueKey; })[0] : null;
+  var data = (typeof skLeagueData === 'object' && skLeagueData)
+    ? skLeagueData[leagueKey] : null;
+  var allTeams = (data && data.allTeams) || {};
+  var teamKeys = Object.keys(allTeams);
+  if (!lg || !teamKeys.length) return;
+  var dates = _skGpUnsettledDates(lg, teamKeys, SK_GP_CATCH_DAYS);
+  if (!dates.length) {
+    if (typeof skToast === 'function') skToast('Nothing to fill in');
+    return;
+  }
+  _skGpCatchBusy = true;
+  var jobs = [], di, ti;
+  for (di = 0; di < dates.length; di++) {
+    for (ti = 0; ti < teamKeys.length; ti++) jobs.push([teamKeys[ti], dates[di]]);
+  }
+  var n = 0, ok = 0;
+  function step() {
+    if (n >= jobs.length) {
+      _skGpCatchBusy = false;
+      if (typeof skToast === 'function') {
+        skToast('Filled in ' + dates.length + ' day' + (dates.length === 1 ? '' : 's') +
+          ' \u00b7 ' + ok + ' of ' + jobs.length + ' lineups');
+      }
+      try { _skRenderGpBoardFor(leagueKey); } catch (e) {}
+      return;
+    }
+    var job = jobs[n++];
+    if (typeof skToast === 'function' && (n === 1 || n % 10 === 0)) {
+      skToast('Lineup ' + n + ' of ' + jobs.length + '\u2026');
+    }
+    fetchTeamFpForDate(job[0], job[1]).then(function (m) {
+      if (m && Object.keys(m).length) ok++;
+    }).catch(function () {}).then(step);
+  }
+  step();
+}
+
+// Repaint the board wherever it currently lives, without knowing its host.
+function _skRenderGpBoardFor(leagueKey) {
+  var host = document.getElementById('skCapWatchContent');
+  if (!host) return;
+  var lg = (typeof fyLeagues !== 'undefined' && fyLeagues)
+    ? fyLeagues.filter(function (l) { return l.league_key === leagueKey; })[0] : null;
+  if (lg) _skRenderGpBoard(lg, host);
+}
+
+// A full day of lineups for every team is a real number of calls, so the
+// catch-up reaches back a bounded distance and says how far it went.
+var SK_GP_CATCH_DAYS = 5;
+
+// == PER-SLOT PROJECTION == GPPROJ ==
+//
+// Same question the ESPN board answers, from a weaker source, and it has to
+// say so. Yahoo publishes no games-played counter at all, so usage here is
+// derived from cached lineups and is a LOWER BOUND - a day nobody cached is a
+// day of games that simply isn't in the total.
+//
+// That makes the rate the trustworthy part and the total the shaky one. Games
+// per COUNTED DAY is measured honestly: those days were counted, and what
+// happened on them is known. So the projection runs on the rate, carried
+// across the season's full length, rather than on the running total - which
+// is also what keeps it from inheriting the coverage gap twice over.
+//
+// Counted days are days this team actually appeared somewhere, so the dead
+// run-up before opening night never lands in the denominator.
+function _skGpProjectSlots(league, usage, maxByPos, positions) {
+  var w = (typeof _skSeasonWindow === 'function') ? _skSeasonWindow(league) : null;
+  var days = usage && usage.daysCounted;
+  var DAY = 86400000;
+  var seasonDays = w ? Math.round((w.endMs - w.startMs) / DAY) : null;
+  var leftDays = w ? Math.max(0, Math.round((w.endMs - Date.now()) / DAY)) : null;
+  var canProject = !!(w && seasonDays > 0 && days >= 2);
+  var out = [], i;
+  for (i = 0; i < positions.length; i++) {
+    var pos = positions[i];
+    var mx = maxByPos[pos];
+    if (!mx) continue;
+    var used = (usage.byPos[pos] || 0);
+    var rate = days > 0 ? (used / days) : null;
+    var proj = canProject ? Math.round(rate * seasonDays) : null;
+    out.push({
+      pos: pos, used: used, max: mx,
+      left: Math.max(0, mx - used),
+      rate: (rate == null) ? null : Math.round(rate * 100) / 100,
+      proj: proj,
+      over: (proj == null) ? null : (proj - mx)
+    });
+  }
+  return { rows: out, days: days, seasonDays: seasonDays, daysLeft: leftDays,
+           projects: canProject };
+}
+
 function _skGpUsageForTeam(league, teamKey, dateList) {
   var dates = dateList || _skGpDateRange(league);
   var byPos = {}, counted = 0;
@@ -117642,8 +117834,67 @@ function _skRenderGpBoard(league, host) {
       'Usage is derived from cached daily lineups, not published by Yahoo \u2014 ' +
       'treat it as an estimate and spot-check against Team \u2192 Max Games Played.</div>' +
     '<div class="sk-gpb">' + head + body + '</div>' +
-    '<div class="sk-gpb-note">Coverage grows on its own: opening this league each ' +
-      'day caches every team\u2019s lineup for that date.</div>';
+    _skGpMinePanel(league, rows, maxByPos, positions, myKey, _win) +
+    '<div class="sk-gpb-note">Coverage grows on its own now: every day this ' +
+      'league is opened is written down and kept, where before it was held ' +
+      'only until midnight.</div>';
+}
+
+// == MY SLOTS == GPPROJ ==
+// The grid compares teams. This answers the question a manager actually acts
+// on - which position runs out first, and how much room is left in it.
+function _skGpMinePanel(league, rows, maxByPos, positions, myKey, win) {
+  var mine = null, i;
+  for (i = 0; i < rows.length; i++) if (rows[i].isMine) mine = rows[i];
+  if (!mine) return '';
+  var pr = _skGpProjectSlots(league, mine.usage, maxByPos, positions);
+  if (!pr.rows.length) return '';
+
+  var lk = league.league_key;
+  var teamKeys = Object.keys((skLeagueData[lk] && skLeagueData[lk].allTeams) || {});
+  var gaps = [];
+  try { gaps = _skGpUnsettledDates(league, teamKeys, SK_GP_CATCH_DAYS) || []; } catch (e) {}
+
+  var h = '<div class="sk-gpb-mine">' +
+    '<div class="sk-gpb-mine-h">MY SLOTS \u00b7 ' +
+      (pr.days ? (pr.days + ' counted day' + (pr.days === 1 ? '' : 's')) : 'nothing counted yet') +
+      (pr.daysLeft != null ? (' \u00b7 ' + pr.daysLeft + ' days left in the season') : '') +
+    '</div>' +
+    '<div class="sk-gpb-mine-row head">' +
+      '<span class="sk-gpb-mine-pos"></span>' +
+      '<span class="sk-gpb-mine-n">USED / MAX</span>' +
+      '<span class="sk-gpb-mine-n">LEFT</span>' +
+      '<span class="sk-gpb-mine-n">FINISH</span>' +
+    '</div>';
+
+  for (i = 0; i < pr.rows.length; i++) {
+    var r = pr.rows[i];
+    var over = (r.over != null && r.over > 0);
+    h += '<div class="sk-gpb-mine-row">' +
+      '<span class="sk-gpb-mine-pos">' + skEscape(_skGpPosLabel(lk, r.pos)) + '</span>' +
+      '<span class="sk-gpb-mine-n">' + r.used + '<small>/' + r.max + '</small></span>' +
+      '<span class="sk-gpb-mine-n">' + r.left + '</span>' +
+      '<span class="sk-gpb-mine-n' + (over ? ' over' : '') + '">' +
+        (r.proj == null ? '\u2014' : ('\u2192' + r.proj)) + '</span>' +
+    '</div>';
+  }
+
+  h += '<div class="sk-gpb-mine-note">' +
+    (pr.projects
+      ? ('FINISH is the whole season\u2019s total, not games left: this team\u2019s ' +
+         'games per counted day carried across all ' + pr.seasonDays + '. Red ' +
+         'finishes past the cap, which means that slot stops scoring early. ' +
+         'LEFT is measured against counted days only, so it reads HIGH by ' +
+         'whatever the coverage above is missing.')
+      : 'A projection needs two counted days. LEFT is games remaining against ' +
+        'what has been counted so far, which reads high until coverage fills in.') +
+    '</div>' +
+    (gaps.length
+      ? ('<button class="sk-gpb-fill" onclick="skGpCatchUp(\'' + lk + '\')">FILL IN ' +
+         gaps.length + ' DAY' + (gaps.length === 1 ? '' : 'S') + '</button>')
+      : '') +
+  '</div>';
+  return h;
 }
 
 // ── Fantrax scoring coverage probe ── FXPROBE ──
