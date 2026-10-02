@@ -92922,16 +92922,25 @@ function _skMpCollect(sport) {
   ext.forEach(function (row) {
     if (_skIsDone(row.key)) return;   // SKDONE
     if (String(row.sport || '').toLowerCase() !== sport || !row.myTeamIds) return;
-    if (row.provider !== 'sleeper' && row.provider !== 'espn') return;          // SKYWESP
-    if (row.provider === 'sleeper' && (!row.rosters || !row.rosters.byTeam)) return;
+    // SKYWFTX - Fantrax joins Yahoo, Sleeper and ESPN here. It was held out
+    // because its roster items carry no names and its format could not be
+    // read without the scoring settings; _skExtPrep now loads both.
+    if (row.provider !== 'sleeper' && row.provider !== 'espn' &&
+        row.provider !== 'fantrax') return;                                    // SKYWESP
+    if ((row.provider === 'sleeper' || row.provider === 'fantrax') &&
+        (!row.rosters || !row.rosters.byTeam)) return;
     var lbl = (typeof _mrNm === 'function') ? _mrNm({ name: row.name, team: _mrExtTeam(row) }) : row.name;
     jobs.push(_skExtPrep(row).then(function () {
       var mine = row.rosters && row.rosters.byTeam && row.rosters.byTeam[_skExtMyId(row)];
       if (!mine) return;
+      // SKYWFTX - one normalised list, whoever sent it.
+      var _items = (row.provider === 'fantrax')
+        ? _skFxNormItems(row) : (mine.items || []);
+      if (!_items.length) return;
       var slots = [];
-      (mine.items || []).forEach(function (it) { if (it.starter && it.slot) slots.push(it.slot); });
+      _items.forEach(function (it) { if (it.starter && it.slot) slots.push(it.slot); });
       leagues[row.key] = { plat: row.provider, lbl: lbl, slots: slots };
-      (mine.items || []).forEach(function (it) {
+      _items.forEach(function (it) {
         if (!it.playerId || !it.name) return;
         var il = _skExtIsIL(it);
         entries.push({ name: it.name, team: _skExtTeamAbbr(row, it),
@@ -93318,6 +93327,35 @@ function _skExtPrep(row) {
       catch (e) {}
       resolve(row); return;
     }
+    // SKYWFTX - Fantrax needs two things loaded before it can take part, and
+    // this is why it sat out: the names live in a separate player dictionary
+    // (a raw roster item is an id, a position and a status), and the FORMAT
+    // is derived from the league's scoring settings, so without them every
+    // Fantrax league would have been filed under the wrong format pill. Both
+    // are one call each and already have loaders.
+    if (row.provider === 'fantrax') {
+      var _fNeedNames = false;
+      try {
+        var _fSport = String(row.sport || '').toUpperCase();
+        var _fMine = row.rosters && row.rosters.byTeam &&
+                     row.rosters.byTeam[_skExtMyId(row)];
+        var _fIt = (_fMine && _fMine.items) || [];
+        for (var _fi = 0; _fi < _fIt.length && _fi < 10; _fi++) {
+          var _fr = _extRosterItemName(_fIt[_fi] || {}, _fSport);
+          if (!_fr || !_fr.name || _fr.name === '?' || _fr.unresolved) { _fNeedNames = true; break; }
+        }
+        if (!_fIt.length) _fNeedNames = false;
+      } catch (_eF) {}
+      var _fNeedScoring = !row.scoring;
+      var _fLeft = (_fNeedNames ? 1 : 0) + (_fNeedScoring ? 1 : 0);
+      if (!_fLeft) { resolve(row); return; }
+      var _fDone = function () { if (--_fLeft <= 0) resolve(row); };
+      if (_fNeedNames && typeof _extEnsureFtxNames === 'function') _extEnsureFtxNames(_fDone);
+      else if (_fNeedNames) _fDone();
+      if (_fNeedScoring && typeof _fxEnsureScoring === 'function') _fxEnsureScoring(row, _fDone);
+      else if (_fNeedScoring) _fDone();
+      return;
+    }
     if (row.provider === 'espn') {
       var sv = (typeof espFindSaved === 'function') ? espFindSaved(String(row.key).slice(4)) : null;
       var loadR = (row.rosters || typeof espLoadRosters !== 'function') ? Promise.resolve() : espLoadRosters(row);
@@ -93345,6 +93383,47 @@ function _skExtTeamAbbr(row, it) {
 function _skExtIsIL(it) {
   var sl = String(it.slot || '').toUpperCase();
   return sl === 'IR' || sl === 'TAXI' || sl === 'IL';
+}
+
+// SKYWFTX - a Fantrax roster item carries an id, a position and a lineup
+// status, and nothing else; the name and pro team come from the player
+// dictionary. This puts one in the shape every other provider already sends,
+// so the schedule, the lineup-flag logic and the format pills need no
+// Fantrax-shaped branch anywhere downstream.
+//
+// The active/reserve reading goes through _fxActiveToday, not the raw status,
+// for the reason FXLOCK exists: Fantrax rolls its calendar to the next day
+// while tonight's games are still on, and the raw status stops describing
+// tonight the moment it does.
+function _skFxNormItems(row) {
+  var SPORT = String(row.sport || '').toUpperCase();
+  var mine = row.rosters && row.rosters.byTeam && row.rosters.byTeam[_skExtMyId(row)];
+  var items = (mine && mine.items) || [], out = [], i;
+  for (i = 0; i < items.length; i++) {
+    var it = items[i] || {};
+    var res = (typeof _extRosterItemName === 'function')
+      ? _extRosterItemName(it, SPORT) : null;
+    if (!res || !res.name || res.name === '?' || res.unresolved) continue;
+    var active = (typeof _fxActiveToday === 'function')
+      ? _fxActiveToday(row.key, it) : (it.status === 'ACTIVE');
+    var st = String(it.status || '').toUpperCase();
+    var il = (st === 'INJURED_RESERVE' || st === 'IR' || st === 'IL');
+    var pos = String(res.pos || '');
+    out.push({
+      playerId: String(it.id || it.playerId || res.name),
+      name: (typeof _ftxDisplayName === 'function') ? _ftxDisplayName(res.name) : res.name,
+      team: res.team || '',
+      pos: pos,
+      // Every slot the player may fill, so an open-slot flag can tell whether
+      // he is actually eligible for it. Fantrax lists them comma-separated.
+      elig: pos ? pos.split(/[,\/]/).map(function (x) { return x.trim(); })
+                     .filter(function (x) { return !!x; })
+                : [],
+      starter: active === true,
+      slot: (active === true) ? (pos.split(/[,\/]/)[0] || '') : (il ? 'IR' : 'BN')
+    });
+  }
+  return out;
 }
 // A roster's items in the shape _skYwWeek reads.
 function _skYwExtItemsToMap(row, items) {
