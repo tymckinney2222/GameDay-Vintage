@@ -1320,6 +1320,19 @@
   }
   .sk-gpb-mine-n small { color: rgba(255,255,255,0.3); font-size: 9px; }
   .sk-gpb-mine-n.over { color: #f87171; }
+  /* GPPACE */
+  .sk-gpb-pace-slot {
+    flex: 0 0 52px; text-align: right; color: rgba(255,255,255,0.6);
+    font-size: 11px;
+  }
+  .sk-gpb-pace-slot small { color: rgba(255,255,255,0.3); font-size: 8.5px; }
+  .sk-gpb-pace-out {
+    flex: 0 0 62px; text-align: right; color: rgba(255,255,255,0.42);
+    font-size: 11px;
+  }
+  .sk-gpb-pace-out.over { color: #f87171; }
+  .sk-gpb-mine-row.mine { background: rgba(245,197,24,0.07); }
+  .sk-gpb-mine-row.mine .sk-gpb-mine-pos { color: #f5c518; font-weight: 700; }
   .sk-gpb-mine-note {
     color: rgba(255,255,255,0.24); font-size: 8.5px; line-height: 1.5;
     margin-top: 6px;
@@ -117605,6 +117618,46 @@ function _skGpProjectSlots(league, usage, maxByPos, positions) {
            projects: canProject };
 }
 
+// == WHO RUNS OUT FIRST == GPPACE ==
+//
+// One team's pace, reduced to the single fact that decides its season: which
+// position hits its ceiling first, and how long that takes.
+//
+// The slot that runs out first is NOT always the one furthest over at
+// season's end. A position can project well past its cap and still have
+// months of room, while another sits nearly full and needs only a few more
+// starts. So the ranking is DAYS UNTIL THE CEILING - games still available
+// divided by the measured rate - not the size of the eventual overrun.
+//
+// Usage is a lower bound here, same as everywhere on this board, so the days
+// read generously. A team shown running out in forty days will not last
+// forty days; it will run out sooner.
+function _skGpTeamPace(league, usage, maxByPos, positions) {
+  var pr = _skGpProjectSlots(league, usage, maxByPos, positions);
+  if (!pr.projects) return null;
+  var worst = null, overCount = 0, i;
+  for (i = 0; i < pr.rows.length; i++) {
+    var r = pr.rows[i];
+    if (r.over != null && r.over > 0) overCount++;
+    var dtc = (r.rate > 0) ? ((r.max - r.used) / r.rate) : null;
+    var cand = {
+      pos: r.pos, used: r.used, max: r.max, proj: r.proj, over: r.over,
+      days: (dtc == null) ? null : Math.round(dtc)
+    };
+    // A slot with no measured rate can never be the one that runs out first,
+    // so it only stands as "worst" while nothing better-evidenced exists.
+    if (!worst) { worst = cand; continue; }
+    if (cand.days == null) continue;
+    if (worst.days == null || cand.days < worst.days) worst = cand;
+  }
+  if (!worst) return null;
+  return {
+    worst: worst, overCount: overCount,
+    daysLeft: pr.daysLeft, days: pr.days, seasonDays: pr.seasonDays,
+    runsOut: !!(worst.days != null && pr.daysLeft != null && worst.days < pr.daysLeft)
+  };
+}
+
 function _skGpUsageForTeam(league, teamKey, dateList) {
   var dates = dateList || _skGpDateRange(league);
   var byPos = {}, counted = 0;
@@ -117834,10 +117887,82 @@ function _skRenderGpBoard(league, host) {
       'Usage is derived from cached daily lineups, not published by Yahoo \u2014 ' +
       'treat it as an estimate and spot-check against Team \u2192 Max Games Played.</div>' +
     '<div class="sk-gpb">' + head + body + '</div>' +
+    _skGpPaceBoard(league, rows, maxByPos, positions) +
     _skGpMinePanel(league, rows, maxByPos, positions, myKey, _win) +
     '<div class="sk-gpb-note">Coverage grows on its own now: every day this ' +
       'league is opened is written down and kept, where before it was held ' +
       'only until midnight.</div>';
+}
+
+// == PACE BOARD == GPPACE ==
+// The grid compares every team in every position, which is the right shape
+// for reading a column and the wrong shape for the question "who is burning
+// games?". This answers that one directly: one line per team, naming the
+// position that runs out first and when, soonest first.
+function _skGpPaceBoard(league, rows, maxByPos, positions) {
+  var lk = league.league_key;
+  var list = [], i;
+  for (i = 0; i < rows.length; i++) {
+    var pc = _skGpTeamPace(league, rows[i].usage, maxByPos, positions);
+    if (!pc) continue;
+    list.push({ name: rows[i].name, mine: rows[i].isMine, pace: pc });
+  }
+  if (!list.length) return '';
+
+  // Soonest to run out first; teams that never do fall to the bottom.
+  list.sort(function (a, b) {
+    var ad = a.pace.worst.days, bd = b.pace.worst.days;
+    if (ad == null && bd == null) return 0;
+    if (ad == null) return 1;
+    if (bd == null) return -1;
+    return ad - bd;
+  });
+
+  var anyOut = false;
+  for (i = 0; i < list.length; i++) if (list[i].pace.runsOut) anyOut = true;
+  var daysLeft = list[0].pace.daysLeft;
+
+  var h = '<div class="sk-gpb-mine">' +
+    '<div class="sk-gpb-mine-h">WHO RUNS OUT FIRST' +
+      (daysLeft != null ? (' \u00b7 ' + daysLeft + ' days left') : '') + '</div>' +
+    '<div class="sk-gpb-mine-row head">' +
+      '<span class="sk-gpb-mine-pos"></span>' +
+      '<span class="sk-gpb-pace-slot">SLOT</span>' +
+      '<span class="sk-gpb-mine-n">FINISH</span>' +
+      '<span class="sk-gpb-pace-out">RUNS OUT</span>' +
+    '</div>';
+
+  for (i = 0; i < list.length; i++) {
+    var t = list[i], w = t.pace.worst;
+    var out = t.pace.runsOut;
+    h += '<div class="sk-gpb-mine-row' + (t.mine ? ' mine' : '') + '">' +
+      '<span class="sk-gpb-mine-pos">' + skEscape(t.name) + '</span>' +
+      '<span class="sk-gpb-pace-slot">' + skEscape(_skGpPosLabel(lk, w.pos)) +
+        // How many OTHER positions also finish past their cap. One team can
+        // be in trouble in several places at once and the headline slot
+        // would hide it.
+        (t.pace.overCount > 1
+          ? ('<small>+' + (t.pace.overCount - 1) + '</small>') : '') +
+      '</span>' +
+      '<span class="sk-gpb-mine-n' + (out ? ' over' : '') + '">' +
+        (w.proj == null ? '\u2014' : ('\u2192' + w.proj)) +
+        '<small>/' + w.max + '</small></span>' +
+      '<span class="sk-gpb-pace-out' + (out ? ' over' : '') + '">' +
+        (out ? (w.days + 'd') : 'lasts') + '</span>' +
+    '</div>';
+  }
+
+  h += '<div class="sk-gpb-mine-note">' +
+    (anyOut
+      ? ('RUNS OUT is days until that team\u2019s first position hits its ' +
+         'ceiling at the rate it has been going \u2014 after which that slot ' +
+         'scores nothing for the rest of the season. \u201clasts\u201d means ' +
+         'no position runs dry before the season ends.')
+      : 'No team is on pace to exhaust a position before the season ends.') +
+    ' Counted usage is a lower bound, so every figure here is generous: a ' +
+    'team runs out sooner than it says, never later.</div>' +
+  '</div>';
+  return h;
 }
 
 // == MY SLOTS == GPPROJ ==
