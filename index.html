@@ -77676,6 +77676,47 @@ function _fhubRowBenched(fr) {
 // row rendering (Yahoo's terms ask that their data not be commingled with
 // other providers), but the grouping and the arithmetic are one implementation
 // so they can't drift apart. FXHUBGRP
+// == WHAT FORMAT IS THIS GROUP == FHUBFMT ==
+//
+// A hub group is not always a league row. The external providers carry one
+// (g.lg) and Yahoo does not - its rows carry only a league KEY - so asking
+// extFormatKey alone answered '' for every Yahoo card, which is why none of
+// them showed a matchup and why they sorted as though format-less. The badge
+// builder already knew how to resolve both; this is that knowledge, lifted
+// out so the matchup gate, the sort and the badge cannot disagree.
+function _fhubFmtOf(g) {
+  if (!g) return '';
+  if (g.fmt) return g.fmt;
+  try {
+    if (g.lg && typeof extFormatKey === 'function') {
+      var f = extFormatKey(g.lg);
+      if (f) return f;
+    }
+    if (typeof fyLeagues !== 'undefined' && fyLeagues) {
+      var want = String(g.key || g.lgKey || '');
+      for (var i = 0; i < fyLeagues.length; i++) {
+        if (String(fyLeagues[i].league_key) === want) {
+          return (typeof _skFmtKeyOf === 'function') ? _skFmtKeyOf(fyLeagues[i]) : '';
+        }
+      }
+    }
+  } catch (e) {}
+  return '';
+}
+
+// Reading order for the team list: the leagues settled head-to-head this week
+// first, because those are the ones a lineup decision still moves, then the
+// season-long formats where today is one day of a hundred.
+//   H2H points -> H2H categories -> season points -> roto -> anything else
+function _fhubFmtRank(g) {
+  var f = _fhubFmtOf(g);
+  if (f === 'headpoint') return 0;
+  if (f === 'head' || f === 'headone') return 1;
+  if (f === 'point') return 2;
+  if (f === 'roto') return 3;
+  return 4;
+}
+
 // == MATCHUP SCORE ON A HUB CARD == FHUBMATCH ==
 //
 // The hub already knows what this game is worth to each team. What it could
@@ -77736,7 +77777,7 @@ function _fhubMatchupFor(g) {
   // happened to parse. EXTCARDFMT
   if (!lg.liveScores || !lg.liveScores.games || !lg.liveScores.games.length) return null;
   if (!lg.myTeamIds) return null;
-  var fmt = (typeof extFormatKey === 'function') ? extFormatKey(lg) : '';
+  var fmt = _fhubFmtOf(g);
   if (fmt !== 'head' && fmt !== 'headone' && fmt !== 'headpoint') return null;
   var mg = null, meAway = false, i;
   for (i = 0; i < lg.liveScores.games.length; i++) {
@@ -77859,6 +77900,9 @@ function _fhubGroupRows(players) {
 // the game, which is the same question one layer coarser. FXHUBGRP
 function _fhubSortGroups(out) {
   out.sort(function (a, b) {
+    // FHUBFMT - format first, value within it.
+    var ar = _fhubFmtRank(a), br = _fhubFmtRank(b);
+    if (ar !== br) return ar - br;
     var av = (a.total == null) ? -1e9 : a.total;
     var bv = (b.total == null) ? -1e9 : b.total;
     if (av !== bv) return bv - av;
@@ -78544,20 +78588,79 @@ function _fhubAllAccent(p) { return FHUB_ALL_ACCENT[p] || '#9aa4b2'; }
 // The league's format badge. ESPN/Sleeper/Fantrax rows carry the league row
 // itself; Yahoo's don't, so theirs is looked up by key.
 function _fhubAllBadge(g) {
+  // FHUBFMT - one resolver, so the badge and the matchup line can never
+  // disagree about what this league is.
+  try { return _FX_FMT_BADGE[_fhubFmtOf(g)] || ''; } catch (e) { return ''; }
+}
+
+// == FETCH THE MISSING MATCHUPS == FHUBWARM ==
+//
+// The matchup line only ever appeared for leagues whose scores happened to be
+// loaded already - whichever ones had been opened this session - which made it
+// look arbitrary: some ESPN leagues had it, Yahoo never did. Nothing was wrong
+// with the lookup; the data simply wasn't there yet.
+//
+// So the hub asks for it. Each provider already has a loader, and each league
+// is warmed at most once per session, three at a time, with one repaint when
+// they have all landed rather than a flicker per arrival.
+var _fhubWarmed = {};
+
+function _fhubWarmOne(g) {
+  var fmt = _fhubFmtOf(g);
+  if (fmt !== 'head' && fmt !== 'headone' && fmt !== 'headpoint') return null;
+  // Already answerable - nothing to fetch.
+  try { if (_fhubMatchupFor(g)) return null; } catch (e0) {}
+  var lg = g.lg;
   try {
-    if (g.lg && typeof extFormatKey === 'function') {
-      return _FX_FMT_BADGE[extFormatKey(g.lg)] || '';
+    if (lg && lg.provider === 'espn' && typeof espRefreshLive === 'function') {
+      return Promise.resolve(espRefreshLive(lg, 1));
     }
-    if (g.provider === 'yahoo' && typeof fyLeagues !== 'undefined' && fyLeagues) {
+    if (lg && lg.provider === 'fantrax' && typeof _fxLoadMatchupScores === 'function') {
+      return new Promise(function (res) {
+        try { _fxLoadMatchupScores(lg, null, function () { res(null); }); }
+        catch (e1) { res(null); }
+      });
+    }
+    if (!lg && typeof skHydrateLeague === 'function' &&
+        typeof fyLeagues !== 'undefined' && fyLeagues) {
+      var want = String(g.key || '');
       for (var i = 0; i < fyLeagues.length; i++) {
-        if (fyLeagues[i].league_key === g.key) {
-          var fk = (typeof _skFmtKeyOf === 'function') ? _skFmtKeyOf(fyLeagues[i]) : '';
-          return _FX_FMT_BADGE[fk] || '';
+        if (String(fyLeagues[i].league_key) === want) {
+          return Promise.resolve(skHydrateLeague(fyLeagues[i]));
         }
       }
     }
-  } catch (e) {}
-  return '';
+  } catch (e2) {}
+  return null;
+}
+
+// true when something was actually fetched, so the caller knows a repaint is
+// coming. done() runs once, after every job settles.
+function _fhubWarmMatchups(groups, done) {
+  var todo = [], i;
+  for (i = 0; i < (groups || []).length; i++) {
+    var g = groups[i];
+    var k = String(g && g.key || '');
+    if (!k || _fhubWarmed[k]) continue;
+    var fmt = _fhubFmtOf(g);
+    if (fmt !== 'head' && fmt !== 'headone' && fmt !== 'headpoint') continue;
+    try { if (_fhubMatchupFor(g)) continue; } catch (e) {}
+    _fhubWarmed[k] = 1;
+    todo.push(g);
+  }
+  if (!todo.length) return false;
+  function settle() { try { done(); } catch (e3) {} }
+  var run = (typeof _espnMapLimited === 'function')
+    ? _espnMapLimited(todo, 3, function (g2) {
+        var p = _fhubWarmOne(g2);
+        return p ? p['catch'](function () { return null; }) : Promise.resolve(null);
+      })
+    : Promise.all(todo.map(function (g2) {
+        var p = _fhubWarmOne(g2);
+        return p ? p['catch'](function () { return null; }) : Promise.resolve(null);
+      }));
+  Promise.resolve(run).then(settle, settle);
+  return true;
 }
 
 // One row's category production, whichever field its builder used.
@@ -78599,6 +78702,17 @@ function openFantasyHubAll(players) {
 
   body.innerHTML = _fhubAllTabs() +
     (_fhubAllTab === 'TEAMS' ? _fhubAllTeamsHtml(players) : _fhubAllPlayersHtml(players));
+  // FHUBWARM - fetch the matchups none of these leagues has loaded, then draw
+  // once more. Guarded against re-entering itself: a league is warmed at most
+  // once per session, so the second pass finds nothing to do and stops.
+  if (_fhubAllTab === 'TEAMS') {
+    try {
+      _fhubWarmMatchups(window._fhubLastGroups || [], function () {
+        var m2 = document.getElementById('fhubAllModal');
+        if (m2 && m2.classList.contains('open')) openFantasyHubAll(players);
+      });
+    } catch (eW) {}
+  }
   modal.classList.add('open');
 }
 
@@ -78818,11 +78932,17 @@ function _fhubAllTeamsHtml(players) {
   var groups = (typeof _extFhubByLeague === 'function')
     ? _extFhubByLeague(players) : _fhubGroupRows(players);
   groups.sort(function (a, b) {
+    // FHUBFMT - H2H points, then H2H cats, then season points, then roto.
+    var ar = _fhubFmtRank(a), br = _fhubFmtRank(b);
+    if (ar !== br) return ar - br;
     if (a.total != null && b.total != null) return b.total - a.total;
     if (a.total != null) return -1;
     if (b.total != null) return 1;
     return String(a.teamName || '').localeCompare(String(b.teamName || ''));
   });
+  // FHUBWARM - the groups this hub is about to draw, so the opener can fetch
+  // the matchups none of them have yet.
+  try { window._fhubLastGroups = groups; } catch (eG) {}
 
   var html = '', grand = null, i, c;
   for (i = 0; i < groups.length; i++) {
