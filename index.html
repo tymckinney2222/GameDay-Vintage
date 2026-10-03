@@ -63540,6 +63540,47 @@ function _rinkBuildScoringSummary(data, game, awayAccent, homeAccent) {
   return html + '</div>';
 }
 
+// == WHICH GOALIE ACTUALLY PLAYED == AHLGOALIE ==
+//
+// "Take the first one listed" holds in ESPN's NHL feed, where the starter
+// leads the group. The AHL feed does not order them that way: a dressed
+// backup who never left the bench can sit first, and the card then reported
+// him as the goaltender with 0/0 saves and no ice time while the man who
+// faced 36 shots went unmentioned.
+//
+// Ice time settles it - a goalie who played has some and a backup has none.
+// Shots faced is the fallback for a feed that sends no TOI, and the original
+// order is the last resort, which is where this started.
+function _rinkGoalieMinutes(sm) {
+  var t = String(sm['TOI'] || sm['MIN'] || sm['TIMEONICE'] || '').trim();
+  if (!t) return null;
+  var parts = t.split(':');
+  var m = parseFloat(parts[0]);
+  if (isNaN(m)) return null;
+  var sec = (parts.length > 1) ? (parseInt(parts[1], 10) || 0) : 0;
+  return m * 60 + sec;
+}
+
+function _rinkGoalieShotsFaced(sm) {
+  var sa = parseFloat(sm['SA'] || sm['SHOTSAGAINST']);
+  if (!isNaN(sa)) return sa;
+  // Some feeds send saves and goals but no shots-against; SA is their sum.
+  var sv = parseFloat(sm['SV'] || sm['SAVES']);
+  var ga = parseFloat(sm['GA'] || sm['GOALSAGAINST']);
+  if (!isNaN(sv) || !isNaN(ga)) return (isNaN(sv) ? 0 : sv) + (isNaN(ga) ? 0 : ga);
+  return null;
+}
+
+// Higher is "more likely the one who played". Ties keep the listed order,
+// so a feed that does order them starter-first is unaffected.
+function _rinkGoalieRank(sm) {
+  var toi = _rinkGoalieMinutes(sm);
+  if (toi != null && toi > 0) return 1000000 + toi;
+  var faced = _rinkGoalieShotsFaced(sm);
+  if (faced != null && faced > 0) return 1000 + faced;
+  return 0;
+}
+
 function _rinkBuildGoalieSection(data, game, homeAccent, awayAccent, divStyle) {
   var boxPlayers = (data.boxscore && data.boxscore.players) || [];
   if (boxPlayers.length < 2) return '';
@@ -63554,11 +63595,13 @@ function _rinkBuildGoalieSection(data, game, homeAccent, awayAccent, divStyle) {
       if (!/goaltend|goalie/i.test(t)) return;
       var labels = sg.labels || [];
       (sg.athletes||[]).forEach(function(a) {
-        if (goalies[side]) return; // take first (starter)
         var stats = a.stats || [];
         if (!stats.length) return;
         var sm = {};
         labels.forEach(function(l,i){sm[l.toUpperCase()]=stats[i];});
+        // AHLGOALIE - the one who played, by ice time, then by shots faced.
+        var _rank = _rinkGoalieRank(sm);
+        if (goalies[side] && _rank <= goalies[side].rank) return;
         var athlete = a.athlete || {};
         var id = athlete.id ? String(athlete.id) : '';
         var name = athlete.shortName || athlete.displayName || '?';
@@ -63587,7 +63630,7 @@ function _rinkBuildGoalieSection(data, game, homeAccent, awayAccent, divStyle) {
             };
           }
         }
-        goalies[side] = { id: id, name: name, sm: sm, athlete: athlete };
+        goalies[side] = { id: id, name: name, sm: sm, athlete: athlete, rank: _rank };
       });
     });
   });
@@ -64169,11 +64212,18 @@ function _rinkBuildShotChart(data, homeAccent, awayAccent, divStyle, game) {
         if (!/goaltend|goalie/i.test(sg.type||sg.name||'')) return;
         var lbls = sg.labels || [];
         (sg.athletes||[]).forEach(function(a){
-          if (goalieSA[sideKey] != null) return; // starter only
+          // AHLGOALIE - the opposing team's shots on goal are what this
+          // team's goaltending faced in total, so they SUM. Reading one
+          // goalie's figure was right only while that goalie played the
+          // whole game; it put a 0 on the board when the AHL feed listed an
+          // unused backup first, and it undercounted any game with a change
+          // in net.
           var m = {};
           lbls.forEach(function(l,i){ m[String(l).toUpperCase()] = (a.stats||[])[i]; });
-          var saVal = parseInt(m['SA'] || m['SHOTSAGAINST'], 10);
-          if (!isNaN(saVal)) goalieSA[sideKey] = saVal;
+          var saVal = _rinkGoalieShotsFaced(m);
+          if (saVal != null && !isNaN(saVal)) {
+            goalieSA[sideKey] = (goalieSA[sideKey] || 0) + saVal;
+          }
         });
       });
     });
