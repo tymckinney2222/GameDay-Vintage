@@ -23981,6 +23981,30 @@
   }
   .sk-catch-flip-sum b { color: var(--sk-text-1); }
   .sk-catch-flip-more { display: block; color: var(--sk-text-4); font-size: 8.5px; margin-top: 1px; }
+  /* ROTOLIVEDELTA - tonight's movement against this rival. */
+  .sk-catch-flips.live { border-color: rgba(56,189,248,0.25); background: rgba(56,189,248,0.04); }
+  .sk-catch-flips.live .sk-catch-flips-hd { display: flex; justify-content: space-between; gap: 8px; }
+  .sk-live-tot { font-weight: 800; letter-spacing: 0; }
+  .sk-live-row {
+    display: grid; grid-template-columns: 1fr auto auto; gap: 8px;
+    align-items: baseline; padding: 2px 0;
+    font-family: var(--sk-font-mono); font-size: 11px;
+  }
+  .sk-live-row.flip { background: rgba(255,255,255,0.04); border-radius: 4px;
+                      padding-left: 4px; padding-right: 4px; margin: 1px -4px; }
+  .sk-live-cat { color: var(--sk-text-2); font-weight: 700; letter-spacing: 0.03em;
+                 white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sk-live-cat em { font-style: normal; font-size: 8px; font-weight: 800;
+                    letter-spacing: 0.08em; margin-left: 5px; padding: 1px 4px;
+                    border-radius: 3px; vertical-align: 1px; }
+  .sk-live-cat em.won { color: #052e16; background: #4ade80; }
+  .sk-live-cat em.lost { color: #450a0a; background: #f87171; }
+  .sk-live-stat { font-size: 10px; letter-spacing: 0; white-space: nowrap; }
+  .sk-live-stat i { font-style: normal; color: var(--sk-text-4); margin: 0 2px; }
+  .sk-live-net { font-weight: 800; font-size: 10px; min-width: 42px; text-align: right; }
+  .sk-live-row .up, .sk-live-tot.up, .sk-live-net.up { color: #4ade80; }
+  .sk-live-row .dn, .sk-live-tot.dn, .sk-live-net.dn { color: #f87171; }
+  .sk-live-row .flat, .sk-live-tot.flat, .sk-live-net.flat { color: var(--sk-text-4); }
 
   .sk-standings-logo {
     width: 18px; height: 18px;
@@ -123489,6 +123513,11 @@ function _skRotoLiveView(league, data, metaOverride) {
     liveTeams.push({ key: teams[i].key, raw: lt.vals[teams[i].key] });
   }
   var seasonTot = _skRotoDerivePoints(seasonTeams, order, statsMeta);
+  // ROTOLIVEDELTA - the per-category season ladder, from the SAME derivation
+  // as the live one. Diffing live against Yahoo's published points instead
+  // would fold any disagreement in the derivation into what is meant to read
+  // as today's movement.
+  var seasonCat = _skRotoDeriveCatPoints(seasonTeams, order, statsMeta);
   var liveCat = _skRotoDeriveCatPoints(liveTeams, order, statsMeta);
   var liveTot = {}, id;
   for (i = 0; i < teams.length; i++) {
@@ -123523,9 +123552,16 @@ function _skRotoLiveView(league, data, metaOverride) {
     var _cm = statsMeta[String(order[_cq])] || {};
     if (!_cm.isOnlyDisplayStat && _cm.enabled !== false) _catsN++;
   }
+  // ROTOLIVEDELTA - season side of the comparison, plus what it took to
+  // build it, so a consumer can diff the two ladders without re-deriving
+  // them and arriving somewhere else.
+  var seasonRaw = {};
+  for (i = 0; i < teams.length; i++) seasonRaw[teams[i].key] = teams[i].raw;
   return { data: live, day: day, rates: lt.rates, rebuilt: lt.rebuilt || [],
            cats: _catsN, src: 'Yahoo',
            touched: lt.touched,
+           seasonCat: seasonCat, seasonRaw: seasonRaw,
+           order: order, statsMeta: statsMeta,
            moved: moved, me: moved[myKey] || null, myKey: myKey,
            teams: teams.length };
 }
@@ -124746,6 +124782,156 @@ function skBuildPacePerWeekTable(rows, myKey, league) {
 // aren't the same distance — so closeness is the need as a share of the
 // league's own spread in that category. Reads catPoints / catStats off the
 // standings payload, same as the Category Board; no extra request.
+// == WHAT TODAY HAS ACTUALLY DONE == ROTOLIVEDELTA ==
+//
+// The flips panel is a standing position: what it would take to pass someone.
+// It says nothing about whether tonight's games have already moved any of it.
+// With games live those are different questions, and the second one is the
+// one you can still act on.
+//
+// Two movements per category, because they answer different things:
+//   stat  - what the players actually did. Four goals is four goals whether
+//           or not it moved a place.
+//   roto  - whether that changed anything. A category can take a big stat
+//           swing and hold its rank, or move on nothing at all.
+// The net column is the one that matters against a rival: my rank points in
+// that category minus theirs, which is how the gap itself moves.
+//
+// Both ladders come from _skRotoLiveView, which derives them the same way,
+// so a difference here is today's play and never a difference in method.
+// lvIn: a ladder already derived this paint. Deriving it re-ranks every
+// category for every team, so a panel with eight rivals above you would do
+// that eight times over for one unchanging answer. The caller derives it once
+// and hands it down.
+function _skRotoLiveDelta(league, allTeams, myKey, rivalKey, lvIn) {
+  if (!league || league.scoring_type !== 'roto' || !allTeams || !myKey || !rivalKey) return null;
+  var lv = lvIn || null;
+  if (!lv) {
+    try {
+      lv = _skRotoLiveView(league, { allTeams: allTeams, team: { team_key: myKey } });
+    } catch (e) { return null; }
+  }
+  // Null while today's numbers are still on the way; asking for them is what
+  // _skRotoLiveView just did, and its own repaint brings us back here.
+  if (!lv || !lv.seasonCat || !lv.touched) return null;
+
+  var liveAll = (lv.data && lv.data.allTeams) || {};
+  var myLive = liveAll[myKey], rvLive = liveAll[rivalKey];
+  if (!myLive || !rvLive) return null;
+  var mySeasonCat = lv.seasonCat[myKey] || {}, rvSeasonCat = lv.seasonCat[rivalKey] || {};
+  var mySeasonRaw = (lv.seasonRaw && lv.seasonRaw[myKey]) || {};
+  var rvSeasonRaw = (lv.seasonRaw && lv.seasonRaw[rivalKey]) || {};
+  var order = lv.order || [], statsMeta = lv.statsMeta || {};
+
+  function num(v) { var n = parseFloat(v); return isNaN(n) ? null : n; }
+  function d(a, b) {
+    var x = num(a), y = num(b);
+    if (x == null || y == null) return null;
+    return x - y;
+  }
+
+  var rows = [], netTotal = 0, myPtsTotal = 0;
+  for (var i = 0; i < order.length; i++) {
+    var id = String(order[i]);
+    var m = statsMeta[id] || {};
+    if (m.isOnlyDisplayStat || m.enabled === false) continue;
+
+    var myStat = d((myLive.catStats || {})[id], mySeasonRaw[id]);
+    var rvStat = d((rvLive.catStats || {})[id], rvSeasonRaw[id]);
+    var myPts  = d((myLive.catPoints || {})[id], mySeasonCat[id]);
+    var rvPts  = d((rvLive.catPoints || {})[id], rvSeasonCat[id]);
+    var moved = (myStat || rvStat || myPts || rvPts);
+    if (!moved) continue;
+
+    var net = (myPts != null && rvPts != null) ? (myPts - rvPts) : null;
+    if (net) netTotal += net;
+    if (myPts) myPtsTotal += myPts;
+
+    // Did this category change hands today? Compare who led it on the season
+    // ladder with who leads it now - the single most actionable thing on a
+    // live card, and invisible from the stat movement alone.
+    var wasAhead = null, nowAhead = null;
+    var sMine = num(mySeasonCat[id]), sTheirs = num(rvSeasonCat[id]);
+    var lMine = num((myLive.catPoints || {})[id]), lTheirs = num((rvLive.catPoints || {})[id]);
+    if (sMine != null && sTheirs != null) wasAhead = (sMine > sTheirs) ? 1 : ((sMine < sTheirs) ? -1 : 0);
+    if (lMine != null && lTheirs != null) nowAhead = (lMine > lTheirs) ? 1 : ((lMine < lTheirs) ? -1 : 0);
+    var flipped = (wasAhead != null && nowAhead != null && wasAhead !== nowAhead);
+
+    rows.push({
+      id: id,
+      label: (typeof _skRotoCatLabel === 'function' ? _skRotoCatLabel(m) : '') ||
+             m.abbr || m.displayName || ('#' + id),
+      myStat: myStat, rvStat: rvStat,
+      myPts: myPts, rvPts: rvPts, net: net,
+      flipped: flipped, gained: (flipped && nowAhead > wasAhead)
+    });
+  }
+  if (!rows.length) return null;
+  // Biggest swing on the gap first; a category that changed hands outranks
+  // everything, because it is the only kind you can lose again tonight.
+  rows.sort(function (a, b) {
+    if (!!b.flipped !== !!a.flipped) return b.flipped ? 1 : -1;
+    return Math.abs(b.net || 0) - Math.abs(a.net || 0);
+  });
+  return { rows: rows, day: lv.day,
+           netTotal: Math.round(netTotal * 10) / 10,
+           myPtsTotal: Math.round(myPtsTotal * 10) / 10 };
+}
+
+// One rival's live movement, as a block on their card. Named for the panel
+// it belongs to, not the data: _skRotoLiveDeltaHtml already exists further
+// down for the league card, and the later definition silently wins. Renders nothing at all
+// when nothing has moved - an empty "TODAY" panel on a quiet afternoon is
+// worse than no panel, because it reads as a broken one.
+function _skCatchLiveHtml(league, allTeams, myKey, rivalKey, maxRows, lvIn) {
+  var dl = null;
+  try { dl = _skRotoLiveDelta(league, allTeams, myKey, rivalKey, lvIn); } catch (e) { return ''; }
+  if (!dl || !dl.rows.length) return '';
+
+  function sgn(v, dp) {
+    if (v == null) return '\u00b7';
+    var r = (dp ? (Math.round(v * 10) / 10).toFixed(1) : String(Math.round(v * 1000) / 1000));
+    return (v > 0 ? '+' : '') + r;
+  }
+  function cls(v) { return (v > 0) ? 'up' : ((v < 0) ? 'dn' : 'flat'); }
+
+  var cap = (typeof maxRows === 'number' && maxRows > 0) ? maxRows : 5;
+  var shown = dl.rows.slice(0, cap);
+  var rows = '';
+  shown.forEach(function (r) {
+    rows += '<div class="sk-live-row' + (r.flipped ? ' flip' : '') + '">' +
+      '<span class="sk-live-cat">' + skEscape(String(r.label)) +
+        (r.flipped
+          ? ('<em class="' + (r.gained ? 'won' : 'lost') + '">' +
+             (r.gained ? 'TAKEN' : 'LOST') + '</em>')
+          : '') +
+      '</span>' +
+      '<span class="sk-live-stat">' +
+        '<b class="' + cls(r.myStat) + '">' + sgn(r.myStat) + '</b>' +
+        '<i>/</i>' +
+        '<b class="' + cls(r.rvStat) + '">' + sgn(r.rvStat) + '</b>' +
+      '</span>' +
+      '<span class="sk-live-net ' + cls(r.net) + '">' + sgn(r.net, 1) + '</span>' +
+    '</div>';
+  });
+
+  var netCls = cls(dl.netTotal);
+  return '<div class="sk-catch-flips live">' +
+    '<div class="sk-catch-flips-hd">' +
+      '<span>TODAY \u00b7 you / them \u00b7 net roto</span>' +
+      '<span class="sk-live-tot ' + netCls + '">' + sgn(dl.netTotal, 1) + ' on them</span>' +
+    '</div>' + rows +
+    '<div class="sk-catch-flip-sum">' +
+      'stat movement is what your players did; net roto is what it changed ' +
+      'against them' +
+      (dl.rows.length > shown.length
+        ? ('<span class="sk-catch-flip-more">' + dl.rows.length +
+           ' categories moving in all</span>')
+        : '') +
+    '</div>' +
+  '</div>';
+}
+
 // == BOTH DIRECTIONS == ROTOFLIP2 ==
 //
 // The card only ever asked what you can take off a rival. The same arithmetic
@@ -125285,6 +125471,15 @@ function skBuildCatchTheLeaders(rows, myKey, league, allTeams) {
     return html;
   }
 
+  // ROTOLIVEDELTA - one live ladder for the whole panel. Null until today's
+  // numbers arrive; _skRotoLiveView asks for them and repaints us when they do.
+  var _lvOnce = null;
+  if (_isRoto) {
+    try {
+      _lvOnce = _skRotoLiveView(league, { allTeams: allTeams, team: { team_key: me.key } });
+    } catch (eLv) { _lvOnce = null; }
+  }
+
   ahead.forEach(function(t) {
     var gap        = t.pf - me.pf;                 // points I trail by (>0)
     var theirPerWk = t.pf / weeksElapsed;
@@ -125374,6 +125569,11 @@ function skBuildCatchTheLeaders(rows, myKey, league, allTeams) {
       var _flipHtml = '';
       try { _flipHtml = _skBuildRotoFlips(league, me.key, t.key, allTeams, 3, gap) || ''; } catch (e) {}
       html += _flipHtml;
+      // ROTOLIVEDELTA - what tonight has already done to all of the above.
+      // Silent until something has actually moved.
+      try {
+        html += _skCatchLiveHtml(league, allTeams, me.key, t.key, 5, _lvOnce) || '';
+      } catch (eLd) {}
     }
 
     // Freeze-adjusted line (only when this rival is projected to hit their IP
