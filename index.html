@@ -42030,6 +42030,48 @@ function _fpKey(teamKey, date) { return teamKey + '|' + date; }
 // Returns the start date when it is still in the future, else null.
 // Yahoo gives it as YYYY-MM-DD, the same shape the app's own date strings
 // use, so a string compare is the whole comparison.
+// == NOTHING TO ASK ABOUT YET == PREDRAFTQUIET ==
+//
+// A league that has not drafted has no roster, no standings and no matchups.
+// Not "empty ones" - none. Asking Yahoo for them returns an error, and because
+// the proxy cannot attach CORS headers to a response it did not get cleanly,
+// the browser reports that error as "Failed to fetch". So a perfectly healthy
+// connection fills the health panel with network failures the moment you sync
+// a league that drafts next week.
+//
+// The season-start date is a SEPARATE question and is deliberately not treated
+// the same way. A drafted league in its pre-season has a real roster and real
+// 0-0 standings; those calls answer correctly and Today's Lineup renders from
+// them. SKPRESEASON4 is the scar from gating that too widely once already.
+//
+// -> null when the league is live, else { reason, when }.
+function _skLeagueNotStarted(leagueOrKey) {
+  var l = leagueOrKey;
+  try {
+    if (typeof l === 'string') {
+      var lgKey = l.split('.t.')[0];
+      var lgs = (typeof fyLeagues !== 'undefined' && fyLeagues) ? fyLeagues : [];
+      l = null;
+      for (var i = 0; i < lgs.length; i++) {
+        if (lgs[i].league_key === lgKey) { l = lgs[i]; break; }
+      }
+    }
+    if (!l) return null;
+    var st = String(l.draft_status || '').toLowerCase();
+    // An ABSENT status is not a pre-draft league. Leagues loaded before this
+    // field was captured, and any shape Yahoo sends that we have not seen,
+    // must keep behaving exactly as they did - silence is never inferred.
+    if (st !== 'predraft' && st !== 'pre_draft') return null;
+    var when = null;
+    try {
+      var d = (typeof _skDraftY !== 'undefined') ? _skDraftY[l.league_key] : null;
+      if (d && d.time != null) when = d.time;
+    } catch (eD) {}
+    return { reason: 'predraft', when: when };
+  } catch (e) {}
+  return null;
+}
+
 function _skLeaguePreseason(leagueKeyOrTeamKey) {
   try {
     var lgKey = String(leagueKeyOrTeamKey || '').split('.t.')[0];
@@ -88977,6 +89019,22 @@ async function skHydrateLeague(league) {
       return;
     }
   }
+  // PREDRAFTQUIET - no draft, no standings and no scoreboard to fetch. The
+  // stub carries a ts so the card stops saying "Loading..." and renders the
+  // pre-draft state instead of an empty scoreline.
+  var _ns = (typeof _skLeagueNotStarted === 'function') ? _skLeagueNotStarted(league) : null;
+  if (_ns) {
+    skLeagueData[key] = {
+      team: null, allTeams: [], matchup: null, weekRecords: null,
+      standings: [], divisions: [], notStarted: _ns,
+      league: { league_key: key, name: league.name, sport: league.sport,
+                scoring_type: league.scoring_type },
+      ts: Date.now()
+    };
+    try { skUpdateCard(league); } catch (eU) {}
+    try { skRefreshStandingsIfActive(key); } catch (eR) {}
+    return;
+  }
   try {
     // Run standings + scoreboard in parallel for this single league
     var [standingsRes, scoreboardRes] = await Promise.all([
@@ -90328,7 +90386,24 @@ function skBuildCardHTML(l) {
   var _nflSt = String(l.scoring_type || '');
   var _isNflH2H = !_isGuillotine && _skIsNflLeague(l) && (_nflSt === 'head' || _nflSt === 'headone' || _nflSt === 'headpoint');
 
-  if (_isGuillotine) {
+  // PREDRAFTQUIET - every branch below reads a score, a matchup or a rank,
+  // and before the draft there are none. Left to them the card renders as a
+  // load that failed, which is the opposite of what is true.
+  var _cardNs = (typeof _skLeagueNotStarted === 'function') ? _skLeagueNotStarted(l) : null;
+  if (_cardNs) {
+    var _dTxt = 'Draft not scheduled yet';
+    if (_cardNs.when != null && typeof _skDraftWhen === 'function') {
+      var _dw = _skDraftWhen(_cardNs.when);
+      if (_dw && _dw.when) _dTxt = 'Drafts ' + _dw.when + (_dw.rel ? ' \u00b7 ' + _dw.rel : '');
+    }
+    scoreRow =
+      '<div class="sk-card-score-main">' +
+      '  <span style="color:var(--sk-text-3)">\u2014</span>' +
+      '</div>' +
+      '<div class="sk-card-delta">' + skEscape(_dTxt) + '</div>';
+    statusRow = '<div class="sk-card-status">PRE-DRAFT \u00b7 ' +
+                skEscape(fmt.label || String(l.scoring_type || '').toUpperCase()) + '</div>';
+  } else if (_isGuillotine) {
     // ── NFL GUILLOTINE (survival) ── Weekly total-points battle royale. No
     // opponent; the lowest weekly score is eliminated. Headline = my weekly
     // score + cushion above the elimination line (the lowest surviving score).
@@ -91719,6 +91794,8 @@ async function skLoadRosterForDate(leagueKey, dateStr) {
   // it's the most likely spot to catch Yahoo mid-hiccup (a transient 5xx / HTML
   // error page). fyApiRetry gives residual 5xx several spaced attempts, which
   // is why tapping into a league a moment later already succeeds.
+  // PREDRAFTQUIET - same before the draft, on every date.
+  if (typeof _skLeagueNotStarted === 'function' && _skLeagueNotStarted(leagueKey)) return [];
   var data = await fyApiRetry(path);
   if (!data || data.error) throw new Error((data && data.error) || 'no data');
   var teamsData = data.fantasy_content.league[1].teams;
@@ -129274,6 +129351,8 @@ function skBuildWinProbBar(pct) {
 // Returns array of { name, teamAbbr, pos, displayPos, selectedPos, isPitcher,
 // isBench, isIL, imageUrl, playerKey }.
 async function skLoadRosterForLeague(leagueKey) {
+  // PREDRAFTQUIET - an undrafted league has no roster to return.
+  if (typeof _skLeagueNotStarted === 'function' && _skLeagueNotStarted(leagueKey)) return [];
   var data = await fyApi('/league/' + leagueKey + '/teams;is_owned_by_current_login=1/roster');
   if (!data || data.error) throw new Error(data && data.error || 'no data');
   var teamsData = data.fantasy_content.league[1].teams;
@@ -158038,6 +158117,9 @@ async function fyAutoLoadAllRosters() {
 
   async function _loadOneRoster(lg) {
     try {
+      // PREDRAFTQUIET - this fan-out hits every league at once, so one
+      // undrafted league here is one guaranteed failure per sweep.
+      if (typeof _skLeagueNotStarted === 'function' && _skLeagueNotStarted(lg)) return;
       var data = await fyApi('/league/' + lg.league_key + '/teams;is_owned_by_current_login=1/roster');
       if (!data) return;
       var teamsData = data.fantasy_content.league[1].teams;
