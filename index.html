@@ -1223,6 +1223,12 @@
     color: #7dd3fc;
   }
   .ht-lead-dots { margin-left: 6px; font-size: 9px; letter-spacing: 1px; }
+  /* HTCALLUP - the club he is with right now, if it is an NHL one. */
+  .ht-lead-up {
+    margin-left: 6px; padding: 1px 4px; border-radius: 3px; vertical-align: 1px;
+    font-family: var(--sk-font-mono, monospace); font-size: 8px; font-weight: 800;
+    letter-spacing: 0.06em; color: #052e16; background: #4ade80;
+  }
   .ht-lead-note {
     font-size: 9px; line-height: 1.5; color: rgba(255,255,255,0.3);
     padding: 6px 16px 0;
@@ -61963,6 +61969,79 @@ function _htLeaders(league) {
 // thing in October as in March.
 var _htLeadSort = { sk: 'points', go: 'wins' };
 
+// == IS HE UP? == HTCALLUP ==
+//
+// An ownership dot says the fantasy world rates a name. It does not say where
+// the man is tonight. The thing worth acting on is narrower: he is on an NHL
+// roster right now.
+//
+// ESPN answers that deterministically - one roster per club, 33 of them - and
+// the app already has that machinery from the stat-lookup work: _espnClubIndex
+// fetches a club once, caches it, and refuses to cache an empty answer so a
+// throttled moment cannot blank a club for the session. Asking ESPN's search
+// to find each name instead is the burst that got throttled last time.
+//
+// Fetched once per session, in the background, after the tables are already
+// on screen. Until it lands the column says nothing rather than asserting
+// that everybody is still in the minors.
+var _htCallup = { state: 'idle', byKey: {} };
+
+function _htNhlClubAbbrs() {
+  var out = [], k;
+  try {
+    for (k in NHL_ARENA_THEMES) {
+      if (!NHL_ARENA_THEMES.hasOwnProperty(k)) continue;
+      // ARI and UTA are the same franchise; only the current one has a roster.
+      if (k === 'ARI') continue;
+      out.push(k);
+    }
+  } catch (e) {}
+  return out;
+}
+
+function _htLoadCallups(done) {
+  if (_htCallup.state === 'loading' || _htCallup.state === 'ready') return false;
+  if (typeof _espnClubIndex !== 'function' || typeof _espnMapLimited !== 'function') {
+    _htCallup.state = 'failed';
+    return false;
+  }
+  var abbrs = _htNhlClubAbbrs();
+  if (!abbrs.length) { _htCallup.state = 'failed'; return false; }
+  _htCallup.state = 'loading';
+  var got = 0;
+  _espnMapLimited(abbrs, 3, function (ab) {
+    return _espnClubIndex('nhl', ab).then(function (idx) {
+      if (!idx || !idx.byKey) return null;
+      got++;
+      var nk;
+      for (nk in idx.byKey) {
+        if (!idx.byKey.hasOwnProperty(nk)) continue;
+        if (!_htCallup.byKey[nk]) _htCallup.byKey[nk] = { abbr: ab, id: idx.byKey[nk] };
+      }
+      return idx;
+    })['catch'](function () { return null; });
+  }).then(function () {
+    // No club answered at all - the network, not an empty league. Saying so
+    // beats a column of blanks that reads as "none of them are up".
+    _htCallup.state = got ? 'ready' : 'failed';
+    try { done(); } catch (e) {}
+  }, function () {
+    _htCallup.state = 'failed';
+    try { done(); } catch (e) {}
+  });
+  return true;
+}
+
+// -> { abbr } when this name is on an NHL roster, else null. Null while the
+// index is still loading, which the caller renders as nothing.
+function _htCallupOf(name) {
+  if (_htCallup.state !== 'ready' || !name) return null;
+  var nk = (typeof _pmNameKey === 'function')
+    ? _pmNameKey(name) : String(name).toLowerCase();
+  if (!nk) return null;
+  return _htCallup.byKey[nk] || null;
+}
+
 function htSetLeadSort(which, key) {
   if (which !== 'sk' && which !== 'go') return;
   _htLeadSort[which] = key;
@@ -62067,11 +62146,17 @@ function _htLeaderTable(rows, isG, league) {
          (function () { var v = parseFloat(r.save_percentage); return isNaN(v) ? '-' : v.toFixed(3).replace(/^0/, ''); })(),
          r.shutouts]
       : [r.games_played, r.goals, r.assists, r.points];
-    var dots = _htLeadOwnDots(r.name || r.shortname || '');
+    var _nm = r.name || r.shortname || '';
+    var dots = _htLeadOwnDots(_nm);
+    // HTCALLUP - where he is, which is a different question from who rates him.
+    var up = _htCallupOf(_nm);
+    var upTag = up
+      ? ('<span class="ht-lead-up">' + skEscapeMaybe(up.abbr) + '</span>')
+      : '';
     html += '<tr style="cursor:pointer" onclick="_htOpenPlayer(\'ht' + skEscapeMaybe(r.player_id) + '\',\'' +
         league + '\',\'' + _jsStr(r.team_code || '') + '\',\'#7dd3fc\')">' +
       '<td style="color:rgba(255,255,255,0.3)">' + (i + 1) + '</td>' +
-      '<td style="white-space:nowrap">' + skEscapeMaybe(r.name || r.shortname || '?') +
+      '<td style="white-space:nowrap">' + skEscapeMaybe(r.name || r.shortname || '?') + upTag +
         (dots ? '<span class="ht-lead-dots">' + dots + '</span>' : '') + '</td>' +
       '<td style="color:rgba(255,255,255,0.45)">' + skEscapeMaybe(r.team_code || '') + '</td>';
     for (var c = 0; c < cells.length; c++) {
@@ -62095,6 +62180,13 @@ function _htRenderLeaders(league) {
   var body = document.getElementById('stBody');
   if (!body) return;
   window._htLeadLeague = league;   // HTWATCH - the sort pills repaint this
+  // HTCALLUP - 33 club rosters, once per session, in the background. The
+  // tables draw immediately; the badges appear when it lands.
+  try {
+    _htLoadCallups(function () {
+      if (window._htLeadLeague === league) _htRenderLeaders(league);
+    });
+  } catch (eCu) {}
   body.innerHTML = '<div class="pm-loading">Loading leaders…</div>';
   _htLeaders(league).then(function (d) {
     var note = d.season
@@ -62105,9 +62197,15 @@ function _htRenderLeaders(league) {
     var tables = _htLeaderTable(d.skaters, false, league) + _htLeaderTable(d.goalies, true, league);
     body.innerHTML = tables
       ? (note + tables +
-         '<div class="ht-lead-note" style="padding:2px 20px 0">A dot beside a name '
-         + 'means somebody in one of your leagues already rosters him \u2014 which is '
-         + 'usually the tell that he has been up before, or is up now.</div>' +
+         '<div class="ht-lead-note" style="padding:2px 20px 0">' +
+         (_htCallup.state === 'ready'
+           ? 'A club badge means he is on that NHL roster right now. '
+           : (_htCallup.state === 'loading'
+               ? 'Checking NHL rosters\u2026 '
+               : (_htCallup.state === 'failed'
+                   ? 'NHL rosters could not be checked just now, so no club badges. '
+                   : ''))) +
+         'A dot means somebody in one of your leagues already rosters him.</div>' +
          '<div class="pm-t8" style="color:rgba(255,255,255,0.2);letter-spacing:0.5px;padding:12px 20px">' +
          league + ' · HOCKEYTECH</div>')
       : '<div class="pm-loading" style="padding:30px;text-align:center">No leaders published yet.</div>';
