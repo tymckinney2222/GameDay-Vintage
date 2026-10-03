@@ -6942,6 +6942,18 @@
     color: rgba(255,255,255,0.35);
   }
   .fxh-lgcount { margin-left: auto; color: rgba(255,255,255,0.28); flex-shrink: 0; }
+  /* FHUBMATCH - the matchup this game is feeding into. */
+  .fxh-match {
+    display: flex; align-items: baseline; gap: 5px; margin: -3px 0 7px;
+    font-family: var(--sk-font-mono, monospace); font-size: 11px;
+  }
+  .fxh-match-me { font-weight: 800; }
+  .fxh-match-sep { color: rgba(255,255,255,0.25); }
+  .fxh-match-op { color: rgba(255,255,255,0.5); }
+  .fxh-match-opp {
+    margin-left: auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; font-size: 9px; color: rgba(255,255,255,0.3);
+  }
   /* Category production for the whole team in this game — the cats/roto
      equivalent of the FP headline, since those leagues have no points. */
   .fxh-lgcats {
@@ -76954,7 +76966,7 @@ function openEspFantasyHub() {
         '<div class="fxh-lgsub">' + slEsc(g.leagueName) +
           '<span class="fxh-lgcount">' + g.activeN + ' in this game' +
             (g.benchN ? (' \u00b7 ' + g.benchN + ' benched') : '') + '</span>' +
-        '</div>' + rowsHtml +
+        '</div>' + _fhubMatchupHtml(g) + rowsHtml +
       '</div>';
     }
     // Every league in this hub is rostered from the game on screen, so they
@@ -77664,6 +77676,121 @@ function _fhubRowBenched(fr) {
 // row rendering (Yahoo's terms ask that their data not be commingled with
 // other providers), but the grouping and the arithmetic are one implementation
 // so they can't drift apart. FXHUBGRP
+// == MATCHUP SCORE ON A HUB CARD == FHUBMATCH ==
+//
+// The hub already knows what this game is worth to each team. What it could
+// not say is whether that is winning anything - which, in a head-to-head
+// league, is the only question. The matchup is the context the FP figure has
+// always been missing.
+//
+// Nothing new is fetched. Every external provider already normalises its
+// matchup into row.liveScores.games, and Yahoo keeps its own on
+// skLeagueData[key].matchup, because the league cards read both already.
+//
+// Returns null for anything that is not head-to-head, which is the correct
+// answer rather than a gap: a roto or season-points league has no opponent
+// and printing one would invent a matchup the format does not have.
+//   { isCat, my, opp, oppName, lead }
+function _fhubMatchupFor(g) {
+  if (!g) return null;
+  var lg = g.lg || null;
+  var prov = String(g.provider || (lg && lg.provider) || '').toLowerCase();
+
+  // ---- Yahoo ----
+  if (!lg || prov === 'yahoo') {
+    var key = g.key || g.lgKey || (lg && lg.league_key) || '';
+    var d = null;
+    try { d = (typeof skLeagueData === 'object' && skLeagueData) ? skLeagueData[key] : null; }
+    catch (e) { d = null; }
+    var m = d && d.matchup;
+    if (!m || !m.hasMatchup) return null;
+    // A categories league is settled in CATEGORIES won, not points, and
+    // statWins already holds the per-category verdict the matchup view uses.
+    var sw = m.statWins;
+    if (sw) {
+      var w = 0, l = 0, t = 0, sid;
+      for (sid in sw) {
+        if (!sw.hasOwnProperty(sid)) continue;
+        if (sw[sid] === 'win') w++;
+        else if (sw[sid] === 'loss') l++;
+        else if (sw[sid] === 'tie') t++;
+      }
+      if (w + l + t > 0) {
+        return { isCat: true, my: w + '-' + l + '-' + t, opp: l + '-' + w + '-' + t,
+                 oppName: m.oppName || '', lead: w - l };
+      }
+    }
+    if (m.myScore == null) return null;
+    var ya = Number(m.myScore);
+    var yb = (m.oppScore != null) ? Number(m.oppScore) : null;
+    if (isNaN(ya)) return null;
+    return { isCat: false, my: ya.toFixed(1),
+             opp: (yb != null && !isNaN(yb)) ? yb.toFixed(1) : '\u2014',
+             oppName: m.oppName || '',
+             lead: (yb != null && !isNaN(yb)) ? (ya - yb) : null };
+  }
+
+  // ---- ESPN, Fantrax, Sleeper ----
+  // Same resolution the league card uses, down to asking the LEAGUE what
+  // format it is rather than inferring it from whether a W-L-T tally
+  // happened to parse. EXTCARDFMT
+  if (!lg.liveScores || !lg.liveScores.games || !lg.liveScores.games.length) return null;
+  if (!lg.myTeamIds) return null;
+  var fmt = (typeof extFormatKey === 'function') ? extFormatKey(lg) : '';
+  if (fmt !== 'head' && fmt !== 'headone' && fmt !== 'headpoint') return null;
+  var mg = null, meAway = false, i;
+  for (i = 0; i < lg.liveScores.games.length; i++) {
+    var gm = lg.liveScores.games[i];
+    if (gm.awayId != null && lg.myTeamIds[String(gm.awayId)]) { mg = gm; meAway = true; break; }
+    if (gm.homeId != null && lg.myTeamIds[String(gm.homeId)]) { mg = gm; meAway = false; break; }
+  }
+  if (!mg) return null;
+  var oppName = (meAway ? mg.home : mg.away) || '';
+  var isCat = (fmt === 'head' || fmt === 'headone');
+  if (isCat) {
+    var myRec = meAway ? mg.awayRec : mg.homeRec;
+    var opRec = meAway ? mg.homeRec : mg.awayRec;
+    // An unparsed tally is a dash, never 0-0-0: an unknown record is not a
+    // tied one, and printing one would assert a result nobody reached.
+    if (myRec == null) return null;
+    var lead = null;
+    try {
+      var mp = String(myRec).split('-');
+      if (mp.length >= 2) lead = (parseInt(mp[0], 10) || 0) - (parseInt(mp[1], 10) || 0);
+    } catch (e2) {}
+    return { isCat: true, my: String(myRec), opp: (opRec != null) ? String(opRec) : '\u2014',
+             oppName: oppName, lead: lead };
+  }
+  var sMy = meAway ? mg.awayScore : mg.homeScore;
+  var sOp = meAway ? mg.homeScore : mg.awayScore;
+  if (sMy == null) return null;
+  var a = Number(sMy), b = (sOp != null) ? Number(sOp) : null;
+  if (isNaN(a)) return null;
+  return { isCat: false, my: a.toFixed(1),
+           opp: (b != null && !isNaN(b)) ? b.toFixed(1) : '\u2014',
+           oppName: oppName, lead: (b != null && !isNaN(b)) ? (a - b) : null };
+}
+
+// One line under the league name: my score, theirs, and who it belongs to.
+// Green when ahead, red when behind - the same reading the league cards use.
+function _fhubMatchupHtml(g) {
+  var m = null;
+  try { m = _fhubMatchupFor(g); } catch (e) { m = null; }
+  if (!m) return '';
+  var col = (m.lead == null || m.lead === 0) ? 'rgba(255,255,255,0.55)'
+          : (m.lead > 0 ? '#4ade80' : '#f87171');
+  var esc = (typeof slEsc === 'function') ? slEsc
+          : ((typeof skEscapeMaybe === 'function') ? skEscapeMaybe : function (x) { return x; });
+  return '<div class="fxh-match">' +
+    '<span class="fxh-match-me" style="color:' + col + '">' + esc(m.my) + '</span>' +
+    '<span class="fxh-match-sep">\u2013</span>' +
+    '<span class="fxh-match-op">' + esc(m.opp) + '</span>' +
+    (m.oppName
+      ? '<span class="fxh-match-opp">vs ' + esc(m.oppName) + '</span>'
+      : '') +
+  '</div>';
+}
+
 function _fhubGroupRows(players) {
   var byKey = {}, order = [], i, j;
   for (i = 0; i < players.length; i++) {
@@ -78067,7 +78194,7 @@ function openExtFantasyHub() {
         '<div class="fxh-lgsub">' + slEsc(lgName) +
           '<span class="fxh-lgcount">' + g.activeN + ' in this game' +
             (g.benchN ? (' \u00b7 ' + g.benchN + ' benched') : '') + '</span>' +
-        '</div>' +
+        '</div>' + _fhubMatchupHtml(g) +
         catStrip + rowsHtml +
       '</div>';
     }
@@ -78737,7 +78864,7 @@ function _fhubAllTeamsHtml(players) {
       '<div class="fxh-lgsub">' + slEsc(lgName) +
         '<span class="fxh-lgcount">' + g.activeN + ' in this game' +
           (g.benchN ? (' · ' + g.benchN + ' benched') : '') + '</span>' +
-      '</div>' + catStrip +
+      '</div>' + _fhubMatchupHtml(g) + catStrip +
       // FHUBTEAMROSTER — the players behind the total, under it.
       _fhubAllTeamRosterHtml(g, col) +
     '</div>';
@@ -78922,7 +79049,7 @@ function openCrsFantasyHub() {
         '<div class="fxh-lgsub">' + skEscapeMaybe(g.leagueName) +
           '<span class="fxh-lgcount">' + g.activeN + ' in this game' +
             (g.benchN ? (' \u00b7 ' + g.benchN + ' benched') : '') + '</span>' +
-        '</div>' + rowsHtml +
+        '</div>' + _fhubMatchupHtml(g) + rowsHtml +
       '</div>';
     });
     // Every row here comes from fyFullRosters / teamFpCache / fyLeagues —
