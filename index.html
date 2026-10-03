@@ -23981,6 +23981,15 @@
   }
   .sk-catch-flip-sum b { color: var(--sk-text-1); }
   .sk-catch-flip-more { display: block; color: var(--sk-text-4); font-size: 8.5px; margin-top: 1px; }
+  /* ROTOPATH - the row that finally covers the gap, and the running total. */
+  .sk-catch-flip.clears { background: rgba(74,222,128,0.08); border-radius: 4px;
+                          margin: 1px -4px; padding-left: 4px; padding-right: 4px; }
+  .sk-flip-tick { font-style: normal; font-size: 7.5px; font-weight: 800;
+                  letter-spacing: 0.08em; margin-left: 5px; padding: 1px 4px;
+                  border-radius: 3px; color: #052e16; background: #4ade80;
+                  vertical-align: 1px; }
+  .sk-flip-cum { display: block; font-size: 8px; font-weight: 600;
+                 color: var(--sk-text-4); letter-spacing: 0; margin-top: -1px; }
   /* ROTOLIVEDELTA - tonight's movement against this rival. */
   .sk-catch-flips.live { border-color: rgba(56,189,248,0.25); background: rgba(56,189,248,0.04); }
   .sk-catch-flips.live .sk-catch-flips-hd { display: flex; justify-content: space-between; gap: 8px; }
@@ -125016,31 +125025,52 @@ function _skRotoFlipData(league, myKey, rivalKey, allTeams) {
   return out;
 }
 
-// How many categories actually have to change hands to erase the gap.
+// == THE WHOLE PATH, NOT THE FIRST THREE == ROTOPATH ==
 //
-// The card used to answer this with Math.ceil(gap) - one rank point per pass -
-// and then print a sentence underneath explaining that a pass is worth more
-// than one point. Both could not be true. A 7.5 gap read as "about 8 passes"
-// when two of the three flips already on screen covered it.
+// Showing the three closest categories answers "what is nearest" and leaves
+// the actual question open: a card that says "these 3 are worth 14.5, 4 short
+// of the gap" has told you that three is not the answer without telling you
+// what is. So the list runs on until it clears.
 //
-// Taking the biggest swings first gives the fewest categories that can do it.
-// enough:false means the gap cannot be closed on this rival's categories at
-// all - every one of them turned over still leaves you short, and the rest has
-// to come from the teams between you.
-function _skRotoFlipsToClear(fd, gap) {
-  var res = { n: null, enough: false, total: (fd && fd.gainTotal) || 0 };
+// Easiest first, by the league's own spread in each category, because that is
+// the order you would really take them in. The running total is carried so the
+// row that finally covers the gap can be marked - that row is the answer to
+// "what do I need", and everything above it is the price.
+//
+// enough:false means every category this rival leads, all turned over, still
+// does not cover the gap. That is worth saying plainly: the rest has to come
+// from the teams between you dropping points, not from anything you do.
+function _skRotoFlipPath(fd, gap) {
+  var res = { rows: [], enough: false, total: (fd && fd.gainTotal) || 0,
+              need: gap, fewest: null };
   if (!fd || !fd.gain.length || !(gap > 0)) return res;
-  var byWorth = fd.gain.slice().sort(function (a, b) { return b.worth - a.worth; });
-  var acc = 0;
-  for (var i = 0; i < byWorth.length; i++) {
-    acc += byWorth[i].worth;
-    if (acc >= gap) { res.n = i + 1; res.enough = true; return res; }
+  var acc = 0, i;
+  for (i = 0; i < fd.gain.length; i++) {
+    var r = fd.gain[i];
+    acc += r.worth;
+    res.rows.push({ label: r.label, need: r.need, worth: r.worth,
+                    cum: Math.round(acc * 10) / 10,
+                    clears: (acc >= gap && !res.enough) });
+    if (acc >= gap) { res.enough = true; break; }
   }
-  res.n = byWorth.length;
+  // The same gap taken by value instead of by ease. When that is a shorter
+  // list it is worth naming, because one big category can save five small
+  // ones - and the easiest route is not always the one you want.
+  var byWorth = fd.gain.slice().sort(function (a, b) { return b.worth - a.worth; });
+  var acc2 = 0;
+  for (i = 0; i < byWorth.length; i++) {
+    acc2 += byWorth[i].worth;
+    if (acc2 >= gap) { res.fewest = i + 1; break; }
+  }
   return res;
 }
 
-// \u2500\u2500 Closest flips \u2500\u2500 ROTOFLIP \u2500\u2500
+// Kept for the daily table, which wants the count alone.
+function _skRotoFlipsToClear(fd, gap) {
+  var p = _skRotoFlipPath(fd, gap);
+  return { n: p.rows.length || null, enough: p.enough, total: p.total };
+}
+
 function _skBuildRotoFlips(league, myKey, rivalKey, allTeams, maxRows, gap) {
   var fd = _skRotoFlipData(league, myKey, rivalKey, allTeams);
   if (!fd.gain.length && !fd.risk.length) return '';
@@ -125070,28 +125100,42 @@ function _skBuildRotoFlips(league, myKey, rivalKey, allTeams, maxRows, gap) {
 
   var html = '';
   if (fd.gain.length) {
-    var shownG = fd.gain.slice(0, cap);
-    var shownWorth = 0;
-    shownG.forEach(function (c) { shownWorth += c.worth; });
-    shownWorth = p1(shownWorth);
+    // ROTOPATH - every category needed, not the first three.
+    var path = _skRotoFlipPath(fd, gap);
+    var shownG = path.rows.length ? path.rows : fd.gain.slice(0, cap);
     html += '<div class="sk-catch-flips">' +
-      '<div class="sk-catch-flips-hd">CLOSEST FLIPS \u00b7 need \u00b7 worth</div>' +
-      rowsOf(shownG, 'sk-catch-flip-worth');
-    // Does what is on screen actually do the job? The worths are in the same
-    // unit as the gap, so this is a subtraction the reader should not have to
-    // do in their head.
-    if (gap > 0) {
-      var left = p1(gap - shownWorth);
-      html += '<div class="sk-catch-flip-sum">' +
-        (left <= 0
-          ? ('these ' + shownG.length + ' are worth <b>' + shownWorth + '</b> \u2014 enough to clear it')
-          : ('these ' + shownG.length + ' are worth <b>' + shownWorth + '</b> \u2014 ' +
-             left + ' short of the gap')) +
-        (fd.gain.length > shownG.length
-          ? ('<span class="sk-catch-flip-more">' + fd.gain.length + ' contested in all \u00b7 ' +
-             fd.gainTotal + ' pts</span>')
-          : '') +
+      '<div class="sk-catch-flips-hd">' +
+        (gap > 0 ? 'TO PASS THEM' : 'CLOSEST FLIPS') + ' \u00b7 need \u00b7 worth</div>';
+    shownG.forEach(function (c) {
+      html += '<div class="sk-catch-flip' + (c.clears ? ' clears' : '') + '">' +
+        '<span class="sk-catch-flip-cat">' + skEscape(String(c.label)) +
+          (c.clears ? '<em class="sk-flip-tick">CLEARS</em>' : '') + '</span>' +
+        '<span class="sk-catch-flip-need">+' + fmtNeed(c.need) + '</span>' +
+        '<span class="sk-catch-flip-worth">' + p1(c.worth) + ' pts' +
+          (c.cum != null && shownG.length > 1
+            ? '<small class="sk-flip-cum">' + c.cum + '</small>' : '') +
+        '</span>' +
       '</div>';
+    });
+    if (gap > 0) {
+      if (path.enough) {
+        html += '<div class="sk-catch-flip-sum">' +
+          'take these <b>' + path.rows.length + '</b> and the ' + p1(gap) +
+          '-point gap is gone' +
+          ((path.fewest && path.fewest < path.rows.length)
+            ? ('<span class="sk-catch-flip-more">or <b>' + path.fewest +
+               '</b> of them if you go after the biggest instead of the nearest</span>')
+            : '') +
+        '</div>';
+      } else {
+        html += '<div class="sk-catch-flip-sum">' +
+          'every category they lead, all ' + fd.gain.length + ' of them, is worth <b>' +
+          fd.gainTotal + '</b> \u2014 still ' + p1(gap - fd.gainTotal) +
+          ' short of the gap' +
+          '<span class="sk-catch-flip-more">the rest has to come from the teams ' +
+            'between you dropping points</span>' +
+        '</div>';
+      }
     }
     html += '</div>';
   }
