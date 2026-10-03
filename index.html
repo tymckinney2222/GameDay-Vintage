@@ -122690,6 +122690,8 @@ function skBuildRotoCategoryTable(league, leagueData, allTeams) {
   if (!order.length) { for (var sid in meRow.pts) if (meRow.pts.hasOwnProperty(sid)) order.push(sid); }
 
   function num(v) { var n = parseFloat(v); return isNaN(n) ? null : n; }
+  // ROTOFMT - shared with the Pressure tab and the flips.
+  var fmtRaw = _skRotoFmtRawFor(meta);
 
   var rows = '', shown = 0;
   for (var oi = 0; oi < order.length; oi++) {
@@ -122755,14 +122757,15 @@ function skBuildRotoCategoryTable(league, leagueData, allTeams) {
         // a stale totals snapshot, or a category whose direction we have the
         // wrong way round. A question mark says that; a dash would have said
         // "you lead this", which is the error this whole fix is about.
-        gapTxt = (d > 0) ? String(Math.round(d * 1000) / 1000) : '?';
+        // A gap in a time category is a duration too: 13 seconds reads 0:13.
+        gapTxt = (d > 0) ? fmtRaw(d, id) : '?';
       }
     }
     if (levelN > 0) gapTxt += '<small class="sk-rc-tie">T' + levelN + '</small>';
     shown++;
     rows += '<div class="sk-rc-row">' +
       '<span class="sk-rc-cat">' + skEscape(m2.abbr || m2.displayName || ('#' + id)) + '</span>' +
-      '<span class="sk-rc-raw">' + (myRaw == null ? '\u2014' : myRaw) + '</span>' +
+      '<span class="sk-rc-raw">' + (myRaw == null ? '\u2014' : fmtRaw(myRaw, id)) + '</span>' +
       '<span class="sk-rc-pts">' + (myPts == null ? '\u2014' : myPts) + '</span>' +
       '<span class="sk-rc-up">' + (above ? skEscape(above.name) : '\u2014') + '</span>' +
       '<span class="sk-rc-gap">' + gapTxt + '</span>' +
@@ -124357,25 +124360,9 @@ function _skRotoCatStates(league, data, metaOverride) {
   if (!order.length) { for (var sid in meT.pts) if (meT.pts.hasOwnProperty(sid)) order.push(sid); }
 
   function num(v) { var n = parseFloat(v); return isNaN(n) ? null : n; }
-  function fmtRaw(v, id) {
-    // ROTOFMT — a provider that knows how to write its own stats gets to.
-    // ESPN's ice time is SECONDS, and printed raw it reads 1198 where every
-    // other surface in the app says 19:57.
-    if (id != null && meta && typeof meta.fmt === 'function') {
-      try {
-        var _p = meta.fmt(id, v);
-        if (_p != null && _p !== '') return String(_p);
-      } catch (eF) {}
-    }
-    var a = Math.abs(v);
-    // ROTOYOU — a whole number of faceoffs is "6", not "6.0". Only the three
-    // columns in raw stat units use this, so they stay consistent with each
-    // other; rates keep their decimals.
-    if (v === Math.round(v)) return String(v);
-    if (a >= 10) return String(Math.round(v));
-    if (a >= 1) return v.toFixed(1);
-    return String(Math.round(v * 1000) / 1000);
-  }
+  // ROTOFMT — shared, so the Pressure tab, the Category Board and the flips
+  // cannot each decide what a second looks like.
+  var fmtRaw = _skRotoFmtRawFor(meta);
 
   var sj2;   // ROTOWORTH
   var groups = { CONTESTED: [], CLIMBABLE: [], EXPOSED: [], LOCKED: [] };
@@ -124962,6 +124949,27 @@ function _skCatchLiveHtml(league, allTeams, myKey, rivalKey, maxRows, lvIn) {
 // ESPCATCH - a league's category metadata, from the league itself when it
 // brought its own. Yahoo's lives in leagueSettingsCache; ESPN derives its
 // equivalent per render and hands it over on the league object.
+// ROTOFMT - how this league writes a raw stat value. A provider that knows
+// its own formats supplies one (ESPN: ice time in seconds, a save percentage
+// with no leading zero); otherwise a sensible numeric default.
+function _skRotoFmtRawFor(meta) {
+  return function (v, id) {
+    if (v == null || isNaN(v)) return '\u2014';
+    if (id != null && meta && typeof meta.fmt === 'function') {
+      try {
+        var _p = meta.fmt(id, v);
+        if (_p != null && _p !== '') return String(_p);
+      } catch (eF) {}
+    }
+    var a = Math.abs(v);
+    // A whole number of faceoffs is "6", not "6.0"; rates keep their decimals.
+    if (v === Math.round(v)) return String(v);
+    if (a >= 10) return String(Math.round(v));
+    if (a >= 1) return v.toFixed(1);
+    return String(Math.round(v * 1000) / 1000);
+  };
+}
+
 function _skRotoMetaFor(league) {
   if (!league) return null;
   if (league._meta) return league._meta;
@@ -125027,6 +125035,7 @@ function _skRotoFlipData(league, myKey, rivalKey, allTeams) {
     if (!(need > 0)) continue;
     var worth = Math.abs(thPts - myPts) + 1;
     var row = {
+      id: id,                               // ROTOFMT - a need in seconds has to be written as one
       label: m2.abbr || m2.displayName || ('#' + id),
       need: need,
       closeness: (spread > 0) ? (need / spread) : 1,
@@ -125065,7 +125074,7 @@ function _skRotoFlipPath(fd, gap) {
   for (i = 0; i < fd.gain.length; i++) {
     var r = fd.gain[i];
     acc += r.worth;
-    res.rows.push({ label: r.label, need: r.need, worth: r.worth,
+    res.rows.push({ id: r.id, label: r.label, need: r.need, worth: r.worth,
                     cum: Math.round(acc * 10) / 10,
                     clears: (acc >= gap && !res.enough) });
     if (acc >= gap) { res.enough = true; break; }
@@ -125092,14 +125101,11 @@ function _skBuildRotoFlips(league, myKey, rivalKey, allTeams, maxRows, gap) {
   var fd = _skRotoFlipData(league, myKey, rivalKey, allTeams);
   if (!fd.gain.length && !fd.risk.length) return '';
 
-  // Categories span whole numbers (REB) and ratios (FG%) - pick the precision
-  // from the magnitude rather than forcing one format on both.
-  function fmtNeed(v) {
-    var a = Math.abs(v);
-    if (a >= 10) return String(Math.round(v));
-    if (a >= 1) return v.toFixed(1);
-    return String(Math.round(v * 1000) / 1000);
-  }
+  // ROTOFMT - the same writer the Pressure tab and the board use. ESPN's ice
+  // time is seconds: "+14" here meant fourteen seconds and read as fourteen
+  // minutes.
+  var _fmtRaw = _skRotoFmtRawFor(_skRotoMetaFor(league));
+  function fmtNeed(v, id) { return _fmtRaw(v, id); }
   function p1(v) { return Math.round(v * 10) / 10; }
   var cap = (typeof maxRows === 'number' && maxRows > 0) ? maxRows : 3;
 
@@ -125108,7 +125114,7 @@ function _skBuildRotoFlips(league, myKey, rivalKey, allTeams, maxRows, gap) {
     list.forEach(function (c) {
       h += '<div class="sk-catch-flip">' +
         '<span class="sk-catch-flip-cat">' + skEscape(String(c.label)) + '</span>' +
-        '<span class="sk-catch-flip-need">+' + fmtNeed(c.need) + '</span>' +
+        '<span class="sk-catch-flip-need">+' + fmtNeed(c.need, c.id) + '</span>' +
         '<span class="' + worthCls + '">' + p1(c.worth) + ' pts</span>' +
       '</div>';
     });
@@ -125127,7 +125133,7 @@ function _skBuildRotoFlips(league, myKey, rivalKey, allTeams, maxRows, gap) {
       html += '<div class="sk-catch-flip' + (c.clears ? ' clears' : '') + '">' +
         '<span class="sk-catch-flip-cat">' + skEscape(String(c.label)) +
           (c.clears ? '<em class="sk-flip-tick">CLEARS</em>' : '') + '</span>' +
-        '<span class="sk-catch-flip-need">+' + fmtNeed(c.need) + '</span>' +
+        '<span class="sk-catch-flip-need">+' + fmtNeed(c.need, c.id) + '</span>' +
         '<span class="sk-catch-flip-worth">' + p1(c.worth) + ' pts' +
           (c.cum != null && shownG.length > 1
             ? '<small class="sk-flip-cum">' + c.cum + '</small>' : '') +
@@ -125352,7 +125358,14 @@ function skBuildCatchTheLeaders(rows, myKey, league, allTeams) {
   // baseline snapshot exists yet (store is fresh, or week just turned),
   // wtd stays null and rows show a "building" note instead of a number.
   // Pure localStorage read — no fetch.
-  var lkey = league && league.league_key;
+  // ESPCATCH - everything keyed off lkey below reads the snapshot store that
+  // the Yahoo "Snap Points & Roto" control writes. An ESPN league has nothing
+  // in it and never will, so the panel was telling the reader to go and tap a
+  // button that would not help them. Dropping the key drops the snapshot line,
+  // the THIS WEEK row, the daily table and the weekly history with it - the
+  // parts of this panel that do not depend on snapshots are unaffected.
+  var lkey = (league && String(league.provider || '') === 'espn')
+    ? '' : (league && league.league_key);
   var wtdByKey = {};        // team key -> week-to-date PF (number) or undefined
   var wtdBaseDate = null;   // the snapshot date used as this week's zero
   var wtdReady = false;
