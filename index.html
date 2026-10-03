@@ -23971,6 +23971,16 @@
   }
   .sk-catch-flip-need { color: var(--sk-text-1); font-weight: 700; }
   .sk-catch-flip-worth { color: var(--sk-gold); font-size: 10px; min-width: 46px; text-align: right; }
+  /* ROTOFLIP2 - what the listed flips add up to, and the defensive half. */
+  .sk-catch-flip-cost { color: #f87171; font-size: 10px; min-width: 46px; text-align: right; }
+  .sk-catch-flips.risk { border-color: rgba(248,113,113,0.22); }
+  .sk-catch-flip-sum {
+    margin-top: 5px; padding-top: 5px; border-top: 1px solid rgba(255,255,255,0.07);
+    font-family: var(--sk-font-mono); font-size: 9.5px; line-height: 1.45;
+    color: var(--sk-text-3);
+  }
+  .sk-catch-flip-sum b { color: var(--sk-text-1); }
+  .sk-catch-flip-more { display: block; color: var(--sk-text-4); font-size: 8.5px; margin-top: 1px; }
 
   .sk-standings-logo {
     width: 18px; height: 18px;
@@ -124736,21 +124746,36 @@ function skBuildPacePerWeekTable(rows, myKey, league) {
 // aren't the same distance — so closeness is the need as a share of the
 // league's own spread in that category. Reads catPoints / catStats off the
 // standings payload, same as the Category Board; no extra request.
-function _skBuildRotoFlips(league, myKey, rivalKey, allTeams, maxRows) {
-  if (!league || !allTeams || !myKey || !rivalKey) return '';
+// == BOTH DIRECTIONS == ROTOFLIP2 ==
+//
+// The card only ever asked what you can take off a rival. The same arithmetic
+// run the other way says what they are closest to taking off YOU, which for a
+// team 7 points back matters just as much: the gap moves either way, and a
+// category you lead by a hair is the cheapest thing on the board for them.
+//
+// Returns the raw ledger so the card, the metric and the prose all read from
+// one computation and cannot drift apart.
+//   gain  - categories they lead that you are nearest to turning over
+//   risk  - categories you lead that they are nearest to turning over
+//   need  - raw stat still required, in the direction that wins the category
+//   worth - roto points the flip actually swings: (leader - chaser) + 1,
+//           because the passer takes the place and the passed drops one
+function _skRotoFlipData(league, myKey, rivalKey, allTeams) {
+  var out = { gain: [], risk: [], gainTotal: 0, riskTotal: 0 };
+  if (!league || !allTeams || !myKey || !rivalKey) return out;
   var teams = [];
   for (var k in allTeams) {
     if (!allTeams.hasOwnProperty(k)) continue;
     var t = allTeams[k];
     if (t && t.catPoints) teams.push({ key: k, pts: t.catPoints, raw: t.catStats || {} });
   }
-  if (teams.length < 2) return '';
+  if (teams.length < 2) return out;
   var meT = null, rivalT = null;
   for (var ti = 0; ti < teams.length; ti++) {
     if (teams[ti].key === myKey) meT = teams[ti];
     if (teams[ti].key === rivalKey) rivalT = teams[ti];
   }
-  if (!meT || !rivalT) return '';
+  if (!meT || !rivalT) return out;
 
   var meta = (typeof leagueSettingsCache !== 'undefined' && leagueSettingsCache[league.league_key])
     ? leagueSettingsCache[league.league_key] : null;
@@ -124760,20 +124785,20 @@ function _skBuildRotoFlips(league, myKey, rivalKey, allTeams, maxRows) {
 
   function num(v) { var n = parseFloat(v); return isNaN(n) ? null : n; }
 
-  var cands = [];
   for (var oi = 0; oi < order.length; oi++) {
     var id = String(order[oi]);
     var m2 = statsMeta[id] || {};
-    // Display-only stats carry no rank points — nothing to flip.
+    // Display-only stats carry no rank points - nothing to flip.
     if (m2.isOnlyDisplayStat || m2.enabled === false) continue;
     var myPts = num(meT.pts[id]), thPts = num(rivalT.pts[id]);
     if (myPts == null || thPts == null) continue;
-    if (thPts <= myPts) continue;                  // already level or past them here
+    if (myPts === thPts) continue;                  // level: nothing to take either way
     var myRaw = num(meT.raw[id]), thRaw = num(rivalT.raw[id]);
     if (myRaw == null || thRaw == null) continue;
     var higherWins = (m2.sortOrder == null) ? true : (m2.sortOrder !== 0);
-    var need = higherWins ? (thRaw - myRaw) : (myRaw - thRaw);
-    if (!(need > 0)) continue;
+
+    // The league's own spread in this category, so 40 rebounds and .004 of
+    // FG% can be compared as distances.
     var lo = null, hi = null;
     for (var si = 0; si < teams.length; si++) {
       var v = num(teams[si].raw[id]);
@@ -124782,19 +124807,59 @@ function _skBuildRotoFlips(league, myKey, rivalKey, allTeams, maxRows) {
       if (hi == null || v > hi) hi = v;
     }
     var spread = (lo != null && hi != null) ? (hi - lo) : 0;
-    cands.push({
+
+    var chasing = (thPts > myPts);                  // they lead it
+    var need = chasing
+      ? (higherWins ? (thRaw - myRaw) : (myRaw - thRaw))
+      : (higherWins ? (myRaw - thRaw) : (thRaw - myRaw));
+    if (!(need > 0)) continue;
+    var worth = Math.abs(thPts - myPts) + 1;
+    var row = {
       label: m2.abbr || m2.displayName || ('#' + id),
       need: need,
       closeness: (spread > 0) ? (need / spread) : 1,
-      worth: (thPts - myPts) + 1
-    });
+      worth: worth
+    };
+    if (chasing) { out.gain.push(row); out.gainTotal += worth; }
+    else         { out.risk.push(row); out.riskTotal += worth; }
   }
-  if (!cands.length) return '';
-  cands.sort(function(a, b) { return a.closeness - b.closeness; });
-  var cap = (typeof maxRows === 'number' && maxRows > 0) ? maxRows : 3;
-  if (cands.length > cap) cands = cands.slice(0, cap);
+  out.gain.sort(function (a, b) { return a.closeness - b.closeness; });
+  out.risk.sort(function (a, b) { return a.closeness - b.closeness; });
+  out.gainTotal = Math.round(out.gainTotal * 10) / 10;
+  out.riskTotal = Math.round(out.riskTotal * 10) / 10;
+  return out;
+}
 
-  // Categories span whole numbers (REB) and ratios (FG%) — pick the precision
+// How many categories actually have to change hands to erase the gap.
+//
+// The card used to answer this with Math.ceil(gap) - one rank point per pass -
+// and then print a sentence underneath explaining that a pass is worth more
+// than one point. Both could not be true. A 7.5 gap read as "about 8 passes"
+// when two of the three flips already on screen covered it.
+//
+// Taking the biggest swings first gives the fewest categories that can do it.
+// enough:false means the gap cannot be closed on this rival's categories at
+// all - every one of them turned over still leaves you short, and the rest has
+// to come from the teams between you.
+function _skRotoFlipsToClear(fd, gap) {
+  var res = { n: null, enough: false, total: (fd && fd.gainTotal) || 0 };
+  if (!fd || !fd.gain.length || !(gap > 0)) return res;
+  var byWorth = fd.gain.slice().sort(function (a, b) { return b.worth - a.worth; });
+  var acc = 0;
+  for (var i = 0; i < byWorth.length; i++) {
+    acc += byWorth[i].worth;
+    if (acc >= gap) { res.n = i + 1; res.enough = true; return res; }
+  }
+  res.n = byWorth.length;
+  return res;
+}
+
+// \u2500\u2500 Closest flips \u2500\u2500 ROTOFLIP \u2500\u2500
+function _skBuildRotoFlips(league, myKey, rivalKey, allTeams, maxRows, gap) {
+  var fd = _skRotoFlipData(league, myKey, rivalKey, allTeams);
+  if (!fd.gain.length && !fd.risk.length) return '';
+
+  // Categories span whole numbers (REB) and ratios (FG%) - pick the precision
   // from the magnitude rather than forcing one format on both.
   function fmtNeed(v) {
     var a = Math.abs(v);
@@ -124802,19 +124867,62 @@ function _skBuildRotoFlips(league, myKey, rivalKey, allTeams, maxRows) {
     if (a >= 1) return v.toFixed(1);
     return String(Math.round(v * 1000) / 1000);
   }
-  var rowsHtml = '';
-  cands.forEach(function(c) {
-    rowsHtml += '<div class="sk-catch-flip">' +
-      '<span class="sk-catch-flip-cat">' + skEscape(String(c.label)) + '</span>' +
-      '<span class="sk-catch-flip-need">+' + fmtNeed(c.need) + '</span>' +
-      '<span class="sk-catch-flip-worth">' + (Math.round(c.worth * 10) / 10) + ' pts</span>' +
+  function p1(v) { return Math.round(v * 10) / 10; }
+  var cap = (typeof maxRows === 'number' && maxRows > 0) ? maxRows : 3;
+
+  function rowsOf(list, worthCls) {
+    var h = '';
+    list.forEach(function (c) {
+      h += '<div class="sk-catch-flip">' +
+        '<span class="sk-catch-flip-cat">' + skEscape(String(c.label)) + '</span>' +
+        '<span class="sk-catch-flip-need">+' + fmtNeed(c.need) + '</span>' +
+        '<span class="' + worthCls + '">' + p1(c.worth) + ' pts</span>' +
+      '</div>';
+    });
+    return h;
+  }
+
+  var html = '';
+  if (fd.gain.length) {
+    var shownG = fd.gain.slice(0, cap);
+    var shownWorth = 0;
+    shownG.forEach(function (c) { shownWorth += c.worth; });
+    shownWorth = p1(shownWorth);
+    html += '<div class="sk-catch-flips">' +
+      '<div class="sk-catch-flips-hd">CLOSEST FLIPS \u00b7 need \u00b7 worth</div>' +
+      rowsOf(shownG, 'sk-catch-flip-worth');
+    // Does what is on screen actually do the job? The worths are in the same
+    // unit as the gap, so this is a subtraction the reader should not have to
+    // do in their head.
+    if (gap > 0) {
+      var left = p1(gap - shownWorth);
+      html += '<div class="sk-catch-flip-sum">' +
+        (left <= 0
+          ? ('these ' + shownG.length + ' are worth <b>' + shownWorth + '</b> \u2014 enough to clear it')
+          : ('these ' + shownG.length + ' are worth <b>' + shownWorth + '</b> \u2014 ' +
+             left + ' short of the gap')) +
+        (fd.gain.length > shownG.length
+          ? ('<span class="sk-catch-flip-more">' + fd.gain.length + ' contested in all \u00b7 ' +
+             fd.gainTotal + ' pts</span>')
+          : '') +
+      '</div>';
+    }
+    html += '</div>';
+  }
+
+  // The half the card never showed: what they are nearest to taking back.
+  if (fd.risk.length) {
+    var shownR = fd.risk.slice(0, Math.min(cap, 3));
+    html += '<div class="sk-catch-flips risk">' +
+      '<div class="sk-catch-flips-hd">AT RISK \u00b7 they need \u00b7 costs you</div>' +
+      rowsOf(shownR, 'sk-catch-flip-cost') +
+      '<div class="sk-catch-flip-sum">you lead ' + fd.risk.length +
+        ' they could still take \u00b7 <b>' + fd.riskTotal + '</b> pts of exposure</div>' +
     '</div>';
-  });
-  return '<div class="sk-catch-flips">' +
-    '<div class="sk-catch-flips-hd">CLOSEST FLIPS \u00b7 need \u00b7 worth</div>' +
-    rowsHtml +
-  '</div>';
+  }
+  return html;
 }
+
 
 function skBuildCatchTheLeaders(rows, myKey, league, allTeams) {
   if (!rows || !rows.length) return '';
@@ -125161,7 +125269,7 @@ function skBuildCatchTheLeaders(rows, myKey, league, allTeams) {
     // rather than leaving you guessing whether it was ever built.
     if (lkey) {
       try {
-        var _clearTbl = skBuildDailyDeltaTable(lkey, valid, me, weeksLeft, league);
+        var _clearTbl = skBuildDailyDeltaTable(lkey, valid, me, weeksLeft, league, allTeams);
         if (_clearTbl) html += _clearTbl;
         var _clearHist = skBuildWeeklyTotalsTable(lkey, valid, me, league);
         if (_clearHist) html += _clearHist;
@@ -125195,6 +125303,16 @@ function skBuildCatchTheLeaders(rows, myKey, league, allTeams) {
     else                          tier = 'steep';
     var cls = (tier === 'live') ? 'good' : (tier === 'push' ? 'mid' : 'hard');
 
+    // ROTOFLIP2 - one ledger per rival, read by the metric, the flips panel
+    // and the prose, so the three cannot tell different stories.
+    var _fd = null, _clear = null;
+    if (_isRoto) {
+      try {
+        _fd = _skRotoFlipData(league, me.key, t.key, allTeams);
+        _clear = _skRotoFlipsToClear(_fd, gap);
+      } catch (eFd) { _fd = null; _clear = null; }
+    }
+
     html += '<div class="sk-catch-row ' + (_isRoto ? 'mid' : cls) + '">';   // ROTOCATCH
     html += '<div class="sk-catch-row-top">'
           +   '<span class="sk-catch-team">' + skEscape(t.name || t.key) + '</span>'
@@ -125206,11 +125324,26 @@ function skBuildCatchTheLeaders(rows, myKey, league, allTeams) {
     // actually is: how many points behind, and how many single-category passes
     // that represents — one rank point IS one place in one category.
     if (_isRoto) {
+      // ROTOFLIP2 - CATEGORY PLACES was Math.ceil(gap): one rank point per
+      // pass. The sentence directly beneath it said, correctly, that a pass
+      // is worth more than one point, because you take their place AND they
+      // drop to yours. Both could not be true, and the number was the wrong
+      // one - a 7.5 gap read as "about 8 passes" when two of the three flips
+      // already on screen covered it.
+      //
+      // FLIPS TO CLEAR counts real worths, biggest first: the fewest
+      // categories that have to change hands. A dash means they cannot all
+      // cover the gap, which is itself the answer.
+      var _flipTxt = '\u2014', _flipCls = 'neg';
+      if (_clear && _clear.n != null) {
+        if (_clear.enough) { _flipTxt = String(_clear.n); _flipCls = ''; }
+        else { _flipTxt = _clear.n + '+'; _flipCls = 'neg'; }
+      }
       html += '<div class="sk-catch-metrics">'
             +   '<div class="sk-catch-metric"><span class="sk-catch-mlbl">ROTO PTS BEHIND</span>'
             +     '<span class="sk-catch-mval">' + f1(gap) + '</span></div>'
-            +   '<div class="sk-catch-metric"><span class="sk-catch-mlbl">CATEGORY PLACES</span>'
-            +     '<span class="sk-catch-mval neg">' + Math.ceil(gap) + '</span></div>'
+            +   '<div class="sk-catch-metric"><span class="sk-catch-mlbl">FLIPS TO CLEAR</span>'
+            +     '<span class="sk-catch-mval ' + _flipCls + '">' + _flipTxt + '</span></div>'
             + '</div>';
     } else if (_isFb) {
       // NFLCATCH — the firm number stays; the backward-looking /wk average is
@@ -125239,7 +125372,7 @@ function skBuildCatchTheLeaders(rows, myKey, league, allTeams) {
     // each one is actually worth against the gap.
     if (_isRoto) {
       var _flipHtml = '';
-      try { _flipHtml = _skBuildRotoFlips(league, me.key, t.key, allTeams, 3) || ''; } catch (e) {}
+      try { _flipHtml = _skBuildRotoFlips(league, me.key, t.key, allTeams, 3, gap) || ''; } catch (e) {}
       html += _flipHtml;
     }
 
@@ -125290,11 +125423,22 @@ function skBuildCatchTheLeaders(rows, myKey, league, allTeams) {
       // flip is worth: taking a category off them moves me into their place
       // and drops them one, so the gap closes by more than the single point
       // the number suggests.
-      var _places = Math.ceil(gap);
-      verdict = 'You trail by <b>' + f1(gap) + '</b> roto points \u2014 about ' + _places
-              + ' single-category ' + (_places === 1 ? 'pass' : 'passes') + '. '
-              + 'Each one you take off them counts double against the gap: you move up to their '
-              + 'place and they drop to yours.';
+      // ROTOFLIP2 - say the number the ledger actually produced, and say what
+      // happens when the categories cannot cover it.
+      if (_clear && _clear.n != null && _clear.enough) {
+        verdict = 'You trail by <b>' + f1(gap) + '</b> roto points, which <b>' + _clear.n
+                + '</b> category ' + (_clear.n === 1 ? 'flip' : 'flips') + ' would erase. '
+                + 'A flip counts twice over: you take their place and they drop to yours, '
+                + 'so the ones worth most are rarely the ones you are closest to.';
+      } else if (_clear && _clear.n != null) {
+        verdict = 'You trail by <b>' + f1(gap) + '</b> roto points. Turning over every one of the <b>'
+                + _clear.n + '</b> categories they lead is worth ' + _clear.total
+                + ' \u2014 short of the gap on its own, so the rest has to come from the '
+                + 'teams between you dropping points.';
+      } else {
+        verdict = 'You trail by <b>' + f1(gap) + '</b> roto points. No category totals are in yet, '
+                + 'so there is nothing to say about which ones are worth chasing.';
+      }
     } else if (_isFb) {
       // NFLCATCH — early on there isn't enough season to judge a per-week ask,
       // so lead with the gap in scoring weeks and say plainly that the /wk
@@ -125441,8 +125585,10 @@ function skBuildCatchTheLeaders(rows, myKey, league, allTeams) {
     ? ('<div class="sk-catch-note">Roto points are category RANK points, not accumulated ' +
        'score \u2014 one point is one place in one category, and passing somebody takes it ' +
        'from them. There is no per-week pace here because the gap closes by moving up ' +
-       'categories, not by out-scoring. CATEGORY PLACES is how many single-category passes ' +
-       'the gap is worth.</div>')
+       'categories, not by out-scoring. FLIPS TO CLEAR is how many categories have to change ' +
+       'hands to erase the gap \u2014 a flip is worth (their rank points in it minus yours) + 1, ' +
+       'because you take their place and they drop to yours. AT RISK is the same sum running the ' +
+       'other way: what they are nearest to taking back off you.</div>')
     : '';
   if (_isFb) html += '<div class="sk-catch-note">NEED is what it takes from here \u2014 '
         + 'the gap spread across the weeks left. WEEKS BACK is the same gap measured in '
@@ -125464,7 +125610,7 @@ function skBuildCatchTheLeaders(rows, myKey, league, allTeams) {
   // ── This-week daily breakdown (Mon–Sun margins vs every team) ───────
   if (lkey) {
     try {
-      var dailyHtml = skBuildDailyDeltaTable(lkey, valid, me, weeksLeft, league);
+      var dailyHtml = skBuildDailyDeltaTable(lkey, valid, me, weeksLeft, league, allTeams);
       if (dailyHtml) html += dailyHtml;
     } catch (e) { /* fail-open */ }
   }
@@ -125656,7 +125802,7 @@ function _skBuildNflWeeklyDeltaTable(leagueKey, snaps, valid, me, weeksLeft, lea
   return html;
 }
 
-function skBuildDailyDeltaTable(leagueKey, valid, me, weeksLeft, league) {
+function skBuildDailyDeltaTable(leagueKey, valid, me, weeksLeft, league, allTeams) {
   var snaps = listPtsSnapshots(leagueKey) || [];
 
   // ── NFL SEASON-POINTS: weekly grid (Week 1–17) instead of Mon–Sun days ──
@@ -125692,7 +125838,19 @@ function skBuildDailyDeltaTable(leagueKey, valid, me, weeksLeft, league) {
     if (me.pf == null || teamRow.pf == null) return null;
     var gap = teamRow.pf - me.pf;
     if (gap <= 0) return null; // already ahead of them
-    if (_isRotoT) return Math.ceil(gap);
+    // ROTOFLIP2 - this column carried the same one-point-per-pass model the
+    // rows above used to: ceil(gap). A flip is worth (their rank points minus
+    // mine) + 1 in the category it happens in, so counting the real worths
+    // gives a number several times smaller - and it is the number the cards
+    // directly above this table now print.
+    if (_isRotoT) {
+      try {
+        var _fd = _skRotoFlipData(league, me.key, teamRow.key, allTeams);
+        var _c = _skRotoFlipsToClear(_fd, gap);
+        if (_c && _c.n != null) return _c.enough ? _c.n : (_c.n + '+');
+      } catch (e) {}
+      return null;   // no category totals yet - a dash beats a wrong count
+    }
     if (weeksLeft == null || weeksLeft <= 0) return null;
     return gap / weeksLeft;
   }
@@ -125822,7 +125980,7 @@ function skBuildDailyDeltaTable(leagueKey, valid, me, weeksLeft, league) {
     html += '<th class="' + (isToday ? 'today' : '') + '">' + dayLabels[idx] + '</th>';
   });
   html += '<th class="tot">TOT</th>';
-  html += '<th class="need">' + (_isRotoT ? 'PLACES' : 'NEED') + '</th>';
+  html += '<th class="need">' + (_isRotoT ? 'FLIPS' : 'NEED') + '</th>';
   html += '</tr></thead><tbody>';
 
   // Reference row: MY daily score (no color — it's the baseline).
@@ -125861,6 +126019,7 @@ function skBuildDailyDeltaTable(leagueKey, valid, me, weeksLeft, league) {
     var need = neededFor(r);
     var needTxt = (need == null) ? '\u2014'
                 : (_isRotoT ? String(need) : ('+' + need.toFixed(0)));
+    // ROTOFLIP2 - the header says FLIPS now, so match the rows above.
 
     html += '<tr class="' + mineCls + '"><td class="team">' + skEscape(short(r.name || r.key)) + '</td>'
           + cellsHtml
@@ -125875,7 +126034,8 @@ function skBuildDailyDeltaTable(leagueKey, valid, me, weeksLeft, league) {
             ? ('Each cell is the rank points you took off that team that day \u2014 '
                + 'green you climbed, red you slid. Category totals moving doesn\u2019t mean you '
                + 'passed anybody; this does. TOT is your week-to-date swing vs that team. '
-               + 'PLACES is how many single-category passes the gap is worth. ')
+               + 'FLIPS is how many categories have to change hands to erase the gap \u2014 '
+               + 'counting what each one is really worth, not one point apiece. ')
             : ('Each cell is your points that day minus theirs \u2014 '
                + 'green you gained, red you lost. TOT is your week-to-date margin vs that team. '
                + 'NEED is the weekly margin to catch them (gap \u00f7 weeks left). '))
