@@ -43373,6 +43373,9 @@ function listPtsSnapshots(leagueKey) {
     if (typeof ESP_PTS_SNAP_PREFIX === 'string') {
       prefixes.push(ESP_PTS_SNAP_PREFIX + leagueKey + '_');
     }
+    if (typeof EXT_PTS_SNAP_PREFIX === 'string') {
+      prefixes.push(EXT_PTS_SNAP_PREFIX + leagueKey + '_');   // FXCATCH
+    }
   } catch (ePfx) {}
   var out = [];
   try {
@@ -125658,7 +125661,12 @@ function skBuildCatchTheLeaders(rows, myKey, league, allTeams) {
   // either provider; what changes is only which control the status line names,
   // since ESPN's capture is automatic and Yahoo's is a button.
   var lkey = league && league.league_key;
-  var _snapAuto = (String((league && league.provider) || '') === 'espn');
+  // FXCATCH - every external provider captures on render now; only Yahoo's
+  // store is filled by a button the reader has to find.
+  var _snapAuto = (function () {
+    var _p = String((league && league.provider) || '');
+    return (_p === 'espn' || _p === 'fantrax' || _p === 'sleeper');
+  })();
   var wtdByKey = {};        // team key -> week-to-date PF (number) or undefined
   var wtdBaseDate = null;   // the snapshot date used as this week's zero
   var wtdReady = false;
@@ -165825,20 +165833,41 @@ function _espRotoAdapt(row, valsOverride) {
 // per-week pace math against each team's total.
 function _espCatchLeague(row, isRoto) {
   var sport = String(row.sport || '').toLowerCase();
-  var yr = Number(row.season) || (new Date()).getFullYear();
-  // ESPCATCH - the season window table keys off the year a season STARTS,
-  // which is Yahoo's convention. ESPN numbers a season that crosses the new
-  // year by the year it ENDS: the league on screen reads "NHL 2027" in
-  // October 2026. Handing 2027 to a table expecting a start year put the
-  // whole season in the future and the panel read "80 weeks left".
-  try {
-    var w = (typeof _SK_SEASON_WINDOWS !== 'undefined') ? _SK_SEASON_WINDOWS[sport] : null;
-    if (w && w.spans) yr = yr - 1;
-  } catch (e) {}
+  var prov = String(row.provider || 'espn').toLowerCase();
+  var w = null;
+  try { w = (typeof _SK_SEASON_WINDOWS !== 'undefined') ? _SK_SEASON_WINDOWS[sport] : null; }
+  catch (e) { w = null; }
+
+  // The season window table keys off the year a season STARTS, which is
+  // Yahoo's convention. ESPN numbers a season that crosses the new year by
+  // the year it ENDS - "NHL 2027" in October 2026 - so its figure is shifted
+  // back one. Handing 2027 to a table expecting a start year put the whole
+  // season in the future and the panel read "80 weeks left".
+  //
+  // FXCATCH - a provider that sends no season at all is the other trap: the
+  // calendar year is the START year for half of a spanning season and the END
+  // year for the other half, so in April it would have named a season that
+  // finished. Today's date against the window decides it.
+  var hasYr = (row.season != null && !isNaN(Number(row.season)));
+  var yr;
+  if (hasYr) {
+    yr = Number(row.season);
+    if (prov === 'espn' && w && w.spans) yr = yr - 1;
+  } else {
+    var now = new Date();
+    yr = now.getFullYear();
+    if (w && w.spans) {
+      var mo = String(w.start || '-01-01').slice(1, 3);
+      var dy = String(w.start || '-01-01').slice(4, 6);
+      var startThisYear = new Date(yr + '-' + mo + '-' + dy + 'T00:00:00').getTime();
+      // Before this season's opener, the season under way began last year.
+      if (!isNaN(startThisYear) && now.getTime() < startThisYear) yr = yr - 1;
+    }
+  }
   return {
     league_key: String(row.key || ''),
     name: row.name || '',
-    provider: 'espn',
+    provider: prov,
     scoring_type: isRoto ? 'roto' : 'point',
     season: yr,
     sport: sport,
@@ -165853,6 +165882,11 @@ function _espCatchPanelHtml(row) {
   if (typeof skBuildCatchTheLeaders !== 'function') return '';
 
   var isRoto = (fk === 'roto');
+  // FXCATCH - the category ledger comes from _espRotoAdapt, which reads
+  // ESPN's own payload. No other provider has been shown to publish per-team
+  // category totals yet, so roto stays ESPN-only rather than rendering a
+  // board built on nothing.
+  if (isRoto && String(row.provider || '') !== 'espn') return '';
   var league = _espCatchLeague(row, isRoto);
   var allTeams = {}, myKey = '', rows = [], k;
 
@@ -165884,11 +165918,12 @@ function _espCatchPanelHtml(row) {
       var t = list[i];
       if (!t || t.teamId == null) continue;
       var id = String(t.teamId);
-      var pts = parseFloat(t.points);
+      // FXCATCH - Fantrax prints the season total as points; ESPN uses pf.
+      var pts = (t.points != null) ? parseFloat(t.points) : parseFloat(t.pf);
       allTeams[id] = { name: t.teamName || id };
       if (mine[id]) myKey = id;
       rows.push({ key: id, name: t.teamName || id,
-                  pf: isNaN(pts) ? null : pts, isMine: !!mine[id] });
+                  pf: (pts == null || isNaN(pts)) ? null : pts, isMine: !!mine[id] });
     }
   }
   if (!myKey || rows.length < 2) return '';
@@ -166178,6 +166213,57 @@ function _espSeasonStatsHtml(row, mode) {
 // keeping both means a consumer can pick a consistent basis rather than
 // discovering mid-analysis that the series mixes the two.
 var ESP_PTS_SNAP_PREFIX = 'esp_pts_snap_v1_';
+// FXCATCH - Fantrax and Sleeper bank theirs here. A separate prefix because
+// ESPN's records carry fields these do not; league keys never collide across
+// providers, so one read over all three prefixes is unambiguous.
+var EXT_PTS_SNAP_PREFIX = 'ext_pts_snap_v1_';
+var _extSnapTried = {};
+
+function _extPtsSnapKey(leagueKey, date) {
+  return EXT_PTS_SNAP_PREFIX + leagueKey + '_' + date;
+}
+
+// The same { date, pfByTeam } every other provider banks, from the standings
+// the league already published. Nothing is recomputed from player lines: the
+// season total a provider prints is the one its own race is run on.
+function _extWritePtsSnapshot(row, date) {
+  if (!row || !row.key) return null;
+  var rows = row.standingsAll || [];
+  if (!rows.length) return null;
+  var pfByTeam = {}, captured = 0, i;
+  for (i = 0; i < rows.length; i++) {
+    var r = rows[i];
+    if (!r || r.teamId == null) continue;
+    // Fantrax prints the season total as points; pf is the fallback for a
+    // provider that fills the other field.
+    var v = (r.points != null) ? parseFloat(r.points) : parseFloat(r.pf);
+    if (v == null || isNaN(v)) continue;
+    pfByTeam[String(r.teamId)] = v;
+    captured++;
+  }
+  // One team's total says nothing about a race. Same floor the others use.
+  if (captured < 2) return null;
+  var d = date || _todayDateString();
+  var snap = { ts: Date.now(), leagueKey: row.key, date: d, pfByTeam: pfByTeam };
+  try { localStorage.setItem(_extPtsSnapKey(row.key, d), JSON.stringify(snap)); }
+  catch (e) { return null; }
+  return snap;
+}
+
+// Automatic, on render, like ESPN's - a history that depends on remembering
+// to tap something has gaps exactly on the days worth remembering.
+function _extMaybeSnapshot(row) {
+  if (!row || !row.key) return;
+  if (row.provider === 'espn' || row.provider === 'yahoo') return;
+  var fk = '';
+  try { fk = (typeof extFormatKey === 'function') ? extFormatKey(row) : ''; } catch (e) {}
+  if (fk !== 'point') return;
+  var d = _todayDateString();
+  var memo = row.key + '_' + d;
+  if (_extSnapTried[memo]) return;
+  _extSnapTried[memo] = 1;
+  try { _extWritePtsSnapshot(row, d); } catch (e2) {}
+}
 
 function _espPtsSnapKey(leagueKey, date) {
   return ESP_PTS_SNAP_PREFIX + leagueKey + '_' + date;
@@ -177549,6 +177635,14 @@ function extOpenLeague(key) {
     }
   } else {
     standingsHtml = '<div style="color:rgba(255,255,255,0.4);font-size:12px;">No standings available yet.</div>';
+  }
+
+  // FXCATCH — the same race panel ESPN and Yahoo leagues get, for a provider
+  // that publishes a season total per team. It reads only the standings the
+  // league already sent; nothing is rebuilt from individual player lines.
+  if (row.provider !== 'espn' && typeof _espCatchPanelHtml === 'function') {
+    try { _extMaybeSnapshot(row); } catch (eS) {}
+    try { standingsHtml += _espCatchPanelHtml(row) || ''; } catch (eC) {}
   }
 
   // MATCHUP pane — live scores (current period, zeros pre-season)
