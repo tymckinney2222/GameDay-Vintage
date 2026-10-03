@@ -21540,6 +21540,62 @@
      ═══════════════════════════════════════════════════════════════ */
 
   /* Banner — sits above the league list on Monday */
+  /* DRAFTAHEAD - the pending-drafts list above the league cards. */
+  .sk-da-box {
+    background: linear-gradient(135deg, rgba(74, 222, 128, 0.10), rgba(74, 222, 128, 0.03));
+    border: 1px solid rgba(74, 222, 128, 0.28);
+    border-radius: 14px;
+    margin: 0 0 14px 0;
+    overflow: hidden;
+  }
+  .sk-da-head {
+    display: flex; align-items: center; gap: 8px;
+    padding: 11px 14px 9px;
+    font-family: var(--sk-font-mono);
+    font-size: 10px; font-weight: 700; letter-spacing: 0.14em;
+    color: #4ade80;
+    border-bottom: 1px solid rgba(74, 222, 128, 0.16);
+  }
+  .sk-da-icon { font-size: 12px; letter-spacing: 0; }
+  .sk-da-ct { margin-left: auto; color: var(--sk-text-3); letter-spacing: 0.06em; }
+  .sk-da-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 14px;
+    border-top: 1px solid rgba(255, 255, 255, 0.05);
+  }
+  .sk-da-row:first-of-type { border-top: none; }
+  .sk-da-stripe {
+    flex-shrink: 0; width: 3px; height: 26px; border-radius: 2px;
+  }
+  .sk-da-main { flex: 1; min-width: 0; }
+  .sk-da-name {
+    font-family: var(--sk-font-sans);
+    font-size: 13px; font-weight: 600; color: var(--sk-text);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .sk-da-when {
+    font-family: var(--sk-font-mono);
+    font-size: 11px; color: var(--sk-text-2); margin-top: 2px;
+  }
+  .sk-da-when.muted { color: var(--sk-text-3); font-style: italic; }
+  .sk-da-right { flex-shrink: 0; text-align: right; }
+  .sk-da-tag {
+    font-family: var(--sk-font-mono);
+    font-size: 9px; font-weight: 700; letter-spacing: 0.08em;
+    color: var(--sk-text-3);
+  }
+  .sk-da-rel {
+    display: block; margin-top: 2px;
+    font-family: var(--sk-font-mono);
+    font-size: 11px; font-weight: 700; color: var(--sk-text);
+  }
+  .sk-da-live {
+    display: inline-block; margin-top: 3px;
+    padding: 1px 5px; border-radius: 3px;
+    font-family: var(--sk-font-mono);
+    font-size: 9px; font-weight: 800; letter-spacing: 0.06em;
+    color: #052e16; background: #4ade80;
+  }
   .sk-briefing-banner {
     display: flex;
     align-items: stretch;
@@ -29648,6 +29704,11 @@
     <button class="sk-account-item" onclick="skProbeEspnCats(); skCloseAccountMenu();">
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l3 8 4-16 3 8h4"/></svg>
       <span>Probe ESPN category matchup</span>
+    </button>
+    <!-- DRAFTAHEAD — does Yahoo publish a draft time, and under what key? -->
+    <button class="sk-account-item" onclick="skProbeYahooDraft(); skCloseAccountMenu();">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M3 10h18M8 2v4M16 2v4"/><path d="M9 15l2 2 4-4"/></svg>
+      <span>Probe Yahoo draft fields</span>
     </button>
     <!-- SEASONLABELS — what does ESPN's season line actually contain? -->
     <button class="sk-account-item" onclick="skProbeSeasonLabels(); skCloseAccountMenu();">
@@ -87884,6 +87945,11 @@ async function fysilentInit() {
           // single fantasy point can exist.
           start_date: lg.start_date || null,
           end_date: lg.end_date || null,
+          // DRAFTAHEAD - 'predraft' | 'drafting' | 'postdraft', straight off
+          // the league object this loop already has in hand. It was being
+          // dropped, so nothing in the app could tell a league that still
+          // needs drafting from one that drafted in August.
+          draft_status: lg.draft_status || '',
         });
       }
     }
@@ -89822,6 +89888,11 @@ function skRenderTodayCards() {
   document.getElementById('sk-mode-ct-today').textContent = '·' + totalVisible;
 
   var listEl = document.getElementById('skLeagueList');
+  // DRAFTAHEAD - above the briefing banner, above the cards, and ahead of the
+  // early returns below so a sport filter cannot hide a pending draft.
+  if (typeof skRenderDraftBanner === 'function') {
+    try { skRenderDraftBanner(); } catch (eDa) {}
+  }
   var extHtml = (typeof skExtTodayCardsHtml === 'function') ? skExtTodayCardsHtml() : '';
   if (!leagues.length) {
     var extAll = (typeof extSyncedLeaguesAll === 'function') ? extSyncedLeaguesAll().length : 0;
@@ -113869,6 +113940,310 @@ function _skFormatBriefingDateRange(range) {
 
 // Render or remove the briefing banner at the top of the league list.
 // Idempotent — safe to call from skRenderTodayCards on every paint.
+// == WHEN DO I DRAFT? == DRAFTAHEAD ==
+//
+// One list above the league cards: every league whose draft has not happened
+// yet, soonest first. A league that has drafted leaves the list entirely, so
+// mid-season the whole section is absent rather than a stack of rows saying
+// "already drafted" - which is the half of this that actually matters, since
+// the answer is usually "none" and a section that says nothing should say it
+// by not being there.
+//
+// What each provider will actually tell us, which is not the same thing:
+//
+//   YAHOO    draft_status on the league object. The app was already
+//            receiving it and discarding it, so the pending/done half is
+//            free. The TIME lives in /league/{key}/settings, fetched only
+//            for leagues already known to be pre-draft.
+//   ESPN     settings.draftSettings.date (epoch ms), already in memory from
+//            the mSettings the registry load requests - no new call at all.
+//            draftDetail.drafted is the authoritative done flag where it is
+//            present; a date in the past stands in where it is not.
+//   SLEEPER  status ('pre_draft' | 'drafting'). The time is on the draft
+//            itself: one /draft/{draft_id} call per pre-draft league.
+//   FANTRAX  draftStatus, and nothing else. Probe-confirmed earlier: fxea's
+//            draftSettings holds draftType and no date. So a Fantrax row can
+//            say a draft is pending but never when.
+//
+// A league with a pending draft and no published time still belongs here -
+// it is precisely the one worth going to look up. It sorts last and says so,
+// rather than being hidden for want of a timestamp.
+var _skDraftY = {};       // yahoo league_key -> { time, type, status } RESOLVED
+var _skDraftYPend = {};   // league_key -> 1 while its settings call is open
+var _skDraftS = {};       // sleeper league key -> { time } RESOLVED
+var _skDraftSPend = {};
+
+// Pull the draft fields out of a /league/{key}/settings payload. Same
+// both-locations defensiveness as _skReadGuillotineFlag: Yahoo puts some
+// fields on the league metadata and some on the settings object, and which
+// one holds a given field varies by field and by sport.
+function _skDraftFromSettings(res) {
+  var out = { time: null, type: '', status: '' };
+  function take(o) {
+    if (!o || typeof o !== 'object') return;
+    // draft_time is seconds since the epoch, and arrives as a string.
+    if (out.time == null && o.draft_time != null && o.draft_time !== '') {
+      var n = parseInt(o.draft_time, 10);
+      if (!isNaN(n) && n > 0) out.time = n * 1000;
+    }
+    if (!out.type && typeof o.draft_type === 'string') out.type = o.draft_type;
+    if (!out.status && typeof o.draft_status === 'string') out.status = o.draft_status;
+  }
+  function walk(x) {
+    if (!x || typeof x !== 'object') return;
+    if (Object.prototype.toString.call(x) === '[object Array]') {
+      for (var i = 0; i < x.length; i++) take(x[i]);
+    } else take(x);
+  }
+  try {
+    var lc = res && res.fantasy_content && res.fantasy_content.league;
+    if (!lc) return out;
+    walk(lc[0]);
+    var sw = lc[1] && lc[1].settings;
+    walk((sw && sw[0]) ? sw[0] : sw);
+  } catch (e) {}
+  return out;
+}
+
+// An unknown status counts as DONE, not pending. This section exists to flag
+// the few leagues that still need drafting; filling it with every league whose
+// status we could not read would defeat the one thing it is for.
+function _skDraftPendingY(l) {
+  var st = String((l && l.draft_status) || '').toLowerCase();
+  return (st === 'predraft' || st === 'pre_draft' || st === 'drafting');
+}
+
+function _skDraftRows() {
+  var rows = [], i;
+
+  // ---- Yahoo ----
+  var yl = (typeof skSyncedLeagues === 'function') ? skSyncedLeagues() : [];
+  for (i = 0; i < yl.length; i++) {
+    var l = yl[i];
+    if (!_skDraftPendingY(l)) continue;
+    var k = l.league_key;
+    var d = _skDraftY[k] || null;
+    rows.push({
+      key: k,
+      name: l.name || 'Unnamed league',
+      sport: String(l.sport || '').toUpperCase(),
+      prov: 'Yahoo',
+      accent: '#7B16FF',
+      time: d ? d.time : null,
+      live: String(l.draft_status || '').toLowerCase() === 'drafting',
+      pending: !d && !!_skDraftYPend[k]
+    });
+  }
+
+  // ---- the external providers ----
+  var el = (typeof extSyncedLeaguesAll === 'function') ? extSyncedLeaguesAll() : [];
+  for (i = 0; i < el.length; i++) {
+    var r = el[i];
+    var st = String(r.status || '').toLowerCase();
+    var t = null, live = false, pend = false;
+
+    if (r.provider === 'espn') {
+      var dd = (r.raw && r.raw.draftDetail) || null;
+      if (dd && dd.drafted === true) continue;
+      var dset = (r.raw && r.raw.settings && r.raw.settings.draftSettings) || null;
+      var dt = dset && dset.date;
+      if (dd && dd.inProgress === true) live = true;
+      // No draftDetail to lean on: a date already past is a draft that
+      // happened, and no date at all says nothing worth printing.
+      if (!dd) {
+        if (!(dt > 0)) continue;
+        if (dt < Date.now()) continue;
+      }
+      if (dt > 0) t = dt;
+
+    } else if (r.provider === 'sleeper') {
+      if (st !== 'pre_draft' && st !== 'drafting') continue;
+      live = (st === 'drafting');
+      var sd = _skDraftS[r.key] || null;
+      t = sd ? sd.time : null;
+      pend = !sd && !!_skDraftSPend[r.key];
+
+    } else {
+      // Fantrax and anything else: the status is the whole of what we get.
+      if (st !== 'pre_draft' && st !== 'predraft' && st !== 'drafting') continue;
+      live = (st === 'drafting');
+    }
+
+    rows.push({
+      key: r.key,
+      name: r.name || 'Unnamed league',
+      sport: String(r.sport || '').toUpperCase(),
+      prov: (typeof extProvLabel === 'function') ? extProvLabel(r.provider) : String(r.provider || ''),
+      accent: (typeof extProvAccent === 'function') ? extProvAccent(r.provider) : '#8a8a8a',
+      time: t, live: live, pending: pend
+    });
+  }
+
+  // Soonest first. A draft under way outranks everything; a draft with no
+  // published time sorts to the bottom, which is where "go find out" belongs.
+  rows.sort(function (a, b) {
+    if (a.live !== b.live) return a.live ? -1 : 1;
+    if ((a.time == null) !== (b.time == null)) return (a.time == null) ? 1 : -1;
+    if (a.time != null && b.time != null && a.time !== b.time) return a.time - b.time;
+    return String(a.name).localeCompare(String(b.name));
+  });
+  return rows;
+}
+
+// "Sun Oct 5 - 7:00 PM" and "in 2 days", kept separate so the row can dim
+// the relative half.
+function _skDraftWhen(ms) {
+  var out = { when: '', rel: '' };
+  var d = new Date(ms);
+  if (isNaN(d.getTime())) return out;
+  var dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  var monNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  var now = new Date();
+  // Calendar days apart, not hours apart: a draft at 9pm tonight and one at
+  // 1am tomorrow are four hours away from each other and should not both
+  // read "today".
+  var t0 = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  var d0 = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  var dayDiff = Math.round((d0 - t0) / 86400000);
+
+  var datePart;
+  if (dayDiff === 0) datePart = 'Today';
+  else if (dayDiff === 1) datePart = 'Tomorrow';
+  else {
+    datePart = dayNames[d.getDay()] + ' ' + monNames[d.getMonth()] + ' ' + d.getDate();
+    if (d.getFullYear() !== now.getFullYear()) datePart += ', ' + d.getFullYear();
+  }
+
+  var clock = '';
+  try { clock = d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }); }
+  catch (e) { clock = ''; }
+  // A date field with no time set comes through as midnight. Printing
+  // "12:00 AM" would read as a real 00:00 draft, so the date stands alone.
+  if (d.getHours() === 0 && d.getMinutes() === 0) clock = '';
+  out.when = datePart + (clock ? ' \u00b7 ' + clock : '');
+
+  var mins = Math.round((ms - now.getTime()) / 60000);
+  if (mins <= 0) out.rel = 'now';
+  else if (mins < 60) out.rel = 'in ' + mins + 'm';
+  else if (mins < 36 * 60) out.rel = 'in ' + Math.round(mins / 60) + 'h';
+  else out.rel = 'in ' + dayDiff + ' days';
+  return out;
+}
+
+// Redraw after one league's time lands. Each resolution calls this once, and
+// a redraw starts no fetch it has not already started, so this terminates.
+function _skDraftTouch() {
+  try {
+    if (document.getElementById('skDraftAhead')) skRenderDraftBanner();
+  } catch (e) {}
+}
+
+// Resolve the times we do not have yet. Scoped hard: only leagues already
+// known to be pre-draft, once each per session. In mid-season that is zero
+// calls, which is the whole point of reading the free status flag first.
+function _skDraftEnrich() {
+  var yl = (typeof skSyncedLeagues === 'function') ? skSyncedLeagues() : [];
+  for (var i = 0; i < yl.length; i++) {
+    (function (l) {
+      if (!_skDraftPendingY(l)) return;
+      var k = l.league_key;
+      if (!k || _skDraftY[k] || _skDraftYPend[k]) return;
+      if (typeof fyApi !== 'function') return;
+      _skDraftYPend[k] = 1;
+      fyApi('/league/' + k + '/settings').then(function (res) {
+        _skDraftYPend[k] = 0;
+        // No answer is not an answer. Leaving the slot empty makes the next
+        // render retry rather than locking in "time not published" for the
+        // session over a rate-limited moment.
+        if (!res || res.error) return;
+        _skDraftY[k] = _skDraftFromSettings(res);
+        _skDraftTouch();
+      })['catch'](function () { _skDraftYPend[k] = 0; });
+    })(yl[i]);
+  }
+
+  var el = (typeof extSyncedLeaguesAll === 'function') ? extSyncedLeaguesAll() : [];
+  for (var j = 0; j < el.length; j++) {
+    (function (r) {
+      if (!r || r.provider !== 'sleeper') return;
+      var st = String(r.status || '').toLowerCase();
+      if (st !== 'pre_draft' && st !== 'drafting') return;
+      var did = r.raw && r.raw.draft_id;
+      if (!did) return;
+      if (_skDraftS[r.key] || _skDraftSPend[r.key]) return;
+      if (typeof slFetchJson !== 'function' || typeof SLEEPER_BASE === 'undefined') return;
+      _skDraftSPend[r.key] = 1;
+      slFetchJson(SLEEPER_BASE + '/draft/' + did).then(function (dj) {
+        _skDraftSPend[r.key] = 0;
+        if (!dj) return;
+        var t = dj.start_time;
+        _skDraftS[r.key] = { time: (t > 0) ? t : null };
+        _skDraftTouch();
+      })['catch'](function () { _skDraftSPend[r.key] = 0; });
+    })(el[j]);
+  }
+}
+
+// The section itself. A sibling inserted ABOVE the league list, like the
+// Monday briefing banner, so replacing the list's innerHTML never wipes it.
+// Deliberately NOT filtered by the sport or platform pills: "when do I
+// draft" is a question about all of them at once, and a draft hidden behind
+// a filter is a draft missed.
+function skRenderDraftBanner() {
+  var listEl = document.getElementById('skLeagueList');
+  if (!listEl || !listEl.parentNode) return;
+  var existing = document.getElementById('skDraftAhead');
+  if (existing) existing.remove();
+
+  var rows = [];
+  try { rows = _skDraftRows(); } catch (e) { return; }
+  // Everything has drafted. No header, no empty state, no section.
+  if (!rows.length) return;
+
+  var h = '', i;
+  for (i = 0; i < rows.length; i++) {
+    var r = rows[i];
+    var w = (r.time != null) ? _skDraftWhen(r.time) : null;
+
+    var whenTxt, rightTxt;
+    if (w) { whenTxt = w.when; rightTxt = w.rel; }
+    else if (r.pending) { whenTxt = 'checking\u2026'; rightTxt = ''; }
+    else { whenTxt = 'time not published'; rightTxt = ''; }
+
+    var right = r.live
+      ? '<span class="sk-da-live">DRAFTING NOW</span>'
+      : (rightTxt ? '<span class="sk-da-rel">' + skEscape(rightTxt) + '</span>' : '');
+
+    h += '<div class="sk-da-row">' +
+      '<span class="sk-da-stripe" style="background:' + skEscape(r.accent) + '"></span>' +
+      '<div class="sk-da-main">' +
+        '<div class="sk-da-name">' + skEscape(r.name) + '</div>' +
+        '<div class="sk-da-when' + (w ? '' : ' muted') + '">' + skEscape(whenTxt) + '</div>' +
+      '</div>' +
+      '<div class="sk-da-right">' +
+        '<div class="sk-da-tag">' + skEscape(r.sport) +
+          ((r.sport && r.prov) ? ' \u00b7 ' : '') + skEscape(r.prov) + '</div>' +
+        right +
+      '</div>' +
+    '</div>';
+  }
+
+  var box = document.createElement('div');
+  box.id = 'skDraftAhead';
+  box.className = 'sk-da-box';
+  box.innerHTML =
+    '<div class="sk-da-head">' +
+      '<span class="sk-da-icon">\ud83d\udccb</span>' +
+      '<span>DRAFTS AHEAD</span>' +
+      '<span class="sk-da-ct">\u00b7' + rows.length + '</span>' +
+    '</div>' + h;
+  listEl.parentNode.insertBefore(box, listEl);
+
+  // Fill in whatever times are still missing; each one redraws when it lands.
+  try { _skDraftEnrich(); } catch (e2) {}
+}
+
 function skRenderBriefingBanner() {
   var listEl = document.getElementById('skLeagueList');
   if (!listEl || !listEl.parentNode) return;
@@ -121348,6 +121723,93 @@ function skProbeEspnCats() {
   }).catch(function (e) {
     say('  refetch failed: ' + (e && e.message ? e.message : e));
   }).then(finish, finish);
+}
+
+// DRAFTAHEAD - does Yahoo publish a draft TIME, and under which key?
+//
+// draft_status is confirmed: it is on the league object the list call already
+// returns. The time is the open question, and the feature reads draft_time off
+// /league/{key}/settings. This dumps every draft-shaped field off both halves
+// of that payload, verbatim, so the answer comes from a response rather than
+// from a second guess.
+//
+// The status line is free for every league. Settings is a call each, so it is
+// fetched for every pre-draft league (the ones that matter) plus the first few
+// others for comparison.
+function skProbeYahooDraft() {
+  var all = (typeof fyLeagues !== 'undefined' && fyLeagues) ? fyLeagues : [];
+  if (!all.length) { _skGpProbeShow('No Yahoo leagues loaded.'); return; }
+
+  // Each league owns a slot, so the async answers land in list order rather
+  // than in the order they happen to come back.
+  var buf = [], fetchFor = [], i;
+  for (i = 0; i < all.length; i++) {
+    var l = all[i];
+    var st = String(l.draft_status || '');
+    var head = (l.name || '?') + '  [' + String(l.sport || '?').toUpperCase() +
+               ' ' + (l.season || '?') + ']';
+    buf.push([head, '  draft_status: ' + (st ? st : '(empty \u2014 not captured on this build?)')]);
+    var pend = (st.toLowerCase() === 'predraft' || st.toLowerCase() === 'drafting');
+    if (pend || fetchFor.length < 3) fetchFor.push(i);
+  }
+
+  function show() {
+    var out = ['\u2500\u2500 YAHOO DRAFT FIELDS \u00b7 ' + all.length +
+               ' leagues \u00b7 ' + fetchFor.length + ' settings calls \u2500\u2500'];
+    for (var q = 0; q < buf.length; q++) { out.push(''); out = out.concat(buf[q]); }
+    _skGpProbeShow(out.join('\n'));
+  }
+
+  if (typeof fyApi !== 'function' || !fetchFor.length) { show(); return; }
+
+  var pending = fetchFor.length;
+  function done() { if (!--pending) show(); }
+
+  for (i = 0; i < fetchFor.length; i++) {
+    (function (idx) {
+      var lg = all[idx], slot = buf[idx];
+      fyApi('/league/' + lg.league_key + '/settings').then(function (res) {
+        if (!res || res.error) {
+          slot.push('  settings: ' + ((res && res.error) || 'no payload'));
+          done(); return;
+        }
+        var lc = res.fantasy_content && res.fantasy_content.league;
+        if (!lc) { slot.push('  settings: unexpected shape'); done(); return; }
+        function dump(label, o) {
+          if (!o || typeof o !== 'object') return;
+          var hits = [], k;
+          for (k in o) {
+            if (!o.hasOwnProperty(k)) continue;
+            if (!/draft/i.test(k)) continue;
+            var v = o[k];
+            hits.push(k + '=' + ((v && typeof v === 'object')
+              ? JSON.stringify(v).slice(0, 90) : String(v)));
+          }
+          if (hits.length) slot.push('  ' + label + ': ' + hits.join('   '));
+        }
+        function walk(label, x) {
+          if (!x || typeof x !== 'object') return;
+          if (Object.prototype.toString.call(x) === '[object Array]') {
+            for (var w = 0; w < x.length; w++) dump(label + '[' + w + ']', x[w]);
+          } else dump(label, x);
+        }
+        var before = slot.length;
+        walk('meta', lc[0]);
+        var sw = lc[1] && lc[1].settings;
+        walk('settings', (sw && sw[0]) ? sw[0] : sw);
+        if (slot.length === before) slot.push('  (no field with "draft" in its name)');
+        // And what the feature's own reader made of it.
+        var got = _skDraftFromSettings(res);
+        slot.push('  -> parsed time=' +
+          (got.time != null ? new Date(got.time).toString().slice(0, 24) : 'null') +
+          '  type=' + (got.type || '-') + '  status=' + (got.status || '-'));
+        done();
+      })['catch'](function (e) {
+        slot.push('  settings threw: ' + (e && e.message));
+        done();
+      });
+    })(fetchFor[i]);
+  }
 }
 
 function skProbeSeasonLabels() {
@@ -157824,6 +158286,11 @@ async function loadFyLeagues() {
           // single fantasy point can exist.
           start_date: lg.start_date || null,
           end_date: lg.end_date || null,
+          // DRAFTAHEAD - 'predraft' | 'drafting' | 'postdraft', straight off
+          // the league object this loop already has in hand. It was being
+          // dropped, so nothing in the app could tell a league that still
+          // needs drafting from one that drafted in August.
+          draft_status: lg.draft_status || '',
         });
       }
     }
