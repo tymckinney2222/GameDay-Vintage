@@ -122684,8 +122684,7 @@ function skBuildRotoCategoryTable(league, leagueData, allTeams) {
   for (var i = 0; i < teams.length; i++) if (teams[i].key === myKey) meRow = teams[i];
   if (!meRow) return '';
 
-  var meta = (typeof leagueSettingsCache !== 'undefined' && leagueSettingsCache[league.league_key])
-    ? leagueSettingsCache[league.league_key] : null;
+  var meta = _skRotoMetaFor(league);
   var statsMeta = (meta && meta.stats) || {};
   var order = (meta && meta.statOrder) || [];
   if (!order.length) { for (var sid in meRow.pts) if (meRow.pts.hasOwnProperty(sid)) order.push(sid); }
@@ -124814,6 +124813,11 @@ function skBuildPacePerWeekTable(rows, myKey, league) {
 // and hands it down.
 function _skRotoLiveDelta(league, allTeams, myKey, rivalKey, lvIn) {
   if (!league || league.scoring_type !== 'roto' || !allTeams || !myKey || !rivalKey) return null;
+  // ESPCATCH - today's ladder is derived from a Yahoo endpoint. The guard
+  // lives here, in the function that would make the call, rather than only in
+  // the caller that normally derives it: without one handed down, the
+  // per-rival fallback below would have asked Yahoo about an ESPN key.
+  if (String(league.provider || '') === 'espn') return null;
   var lv = lvIn || null;
   if (!lv) {
     try {
@@ -124955,6 +124959,20 @@ function _skCatchLiveHtml(league, allTeams, myKey, rivalKey, maxRows, lvIn) {
 //   need  - raw stat still required, in the direction that wins the category
 //   worth - roto points the flip actually swings: (leader - chaser) + 1,
 //           because the passer takes the place and the passed drops one
+// ESPCATCH - a league's category metadata, from the league itself when it
+// brought its own. Yahoo's lives in leagueSettingsCache; ESPN derives its
+// equivalent per render and hands it over on the league object.
+function _skRotoMetaFor(league) {
+  if (!league) return null;
+  if (league._meta) return league._meta;
+  try {
+    if (typeof leagueSettingsCache !== 'undefined' && leagueSettingsCache[league.league_key]) {
+      return leagueSettingsCache[league.league_key];
+    }
+  } catch (e) {}
+  return null;
+}
+
 function _skRotoFlipData(league, myKey, rivalKey, allTeams) {
   var out = { gain: [], risk: [], gainTotal: 0, riskTotal: 0 };
   if (!league || !allTeams || !myKey || !rivalKey) return out;
@@ -124972,8 +124990,7 @@ function _skRotoFlipData(league, myKey, rivalKey, allTeams) {
   }
   if (!meT || !rivalT) return out;
 
-  var meta = (typeof leagueSettingsCache !== 'undefined' && leagueSettingsCache[league.league_key])
-    ? leagueSettingsCache[league.league_key] : null;
+  var meta = _skRotoMetaFor(league);
   var statsMeta = (meta && meta.stats) || {};
   var order = (meta && meta.statOrder) || [];
   if (!order.length) { for (var sid in meT.pts) if (meT.pts.hasOwnProperty(sid)) order.push(sid); }
@@ -125518,7 +125535,10 @@ function skBuildCatchTheLeaders(rows, myKey, league, allTeams) {
   // ROTOLIVEDELTA - one live ladder for the whole panel. Null until today's
   // numbers arrive; _skRotoLiveView asks for them and repaints us when they do.
   var _lvOnce = null;
-  if (_isRoto) {
+  // ESPCATCH - today's live ladder comes from a Yahoo endpoint; an ESPN
+  // league has no business asking for it. The panel simply renders without
+  // the TODAY block there.
+  if (_isRoto && String(league.provider || '') !== 'espn') {
     try {
       _lvOnce = _skRotoLiveView(league, { allTeams: allTeams, team: { team_key: me.key } });
     } catch (eLv) { _lvOnce = null; }
@@ -165420,6 +165440,102 @@ function _espRotoAdapt(row, valsOverride) {
   };
 }
 
+// == CATCH THE LEADERS, FOR ESPN == ESPCATCH ==
+//
+// The panel is sport- and provider-agnostic already: it wants teams with
+// category totals and rank points, a row per team with a season total, and
+// the league's stat metadata. Yahoo keeps those in three different places;
+// ESPN derives all of them in _espRotoAdapt. So this is an adapter, not a
+// second implementation - the race math, the flip path, the exposure and the
+// prose are the same code Yahoo leagues run.
+//
+// Season-points leagues take the simpler road: no categories, just the
+// per-week pace math against each team's total.
+function _espCatchLeague(row, isRoto) {
+  var sport = String(row.sport || '').toLowerCase();
+  var yr = Number(row.season) || (new Date()).getFullYear();
+  // ESPCATCH - the season window table keys off the year a season STARTS,
+  // which is Yahoo's convention. ESPN numbers a season that crosses the new
+  // year by the year it ENDS: the league on screen reads "NHL 2027" in
+  // October 2026. Handing 2027 to a table expecting a start year put the
+  // whole season in the future and the panel read "80 weeks left".
+  try {
+    var w = (typeof _SK_SEASON_WINDOWS !== 'undefined') ? _SK_SEASON_WINDOWS[sport] : null;
+    if (w && w.spans) yr = yr - 1;
+  } catch (e) {}
+  return {
+    league_key: String(row.key || ''),
+    name: row.name || '',
+    provider: 'espn',
+    scoring_type: isRoto ? 'roto' : 'point',
+    season: yr,
+    sport: sport,
+    settings: {}
+  };
+}
+
+function _espCatchPanelHtml(row) {
+  var fk = '';
+  try { fk = (typeof extFormatKey === 'function') ? extFormatKey(row) : ''; } catch (e) { fk = ''; }
+  if (fk !== 'roto' && fk !== 'point') return '';
+  if (typeof skBuildCatchTheLeaders !== 'function') return '';
+
+  var isRoto = (fk === 'roto');
+  var league = _espCatchLeague(row, isRoto);
+  var allTeams = {}, myKey = '', rows = [], k;
+
+  if (isRoto) {
+    var a = null;
+    try { a = _espRotoAdapt(row); } catch (e) { a = null; }
+    if (!a || !a.allTeams) return '';
+    allTeams = a.allTeams;
+    myKey = a.myKey || '';
+    // The categories ESPN derived, handed to the shared code on the league
+    // itself rather than written into Yahoo's settings cache.
+    league._meta = a.meta || null;
+    for (k in allTeams) {
+      if (!allTeams.hasOwnProperty(k)) continue;
+      var cp = allTeams[k].catPoints || {}, tot = 0, sid, any = false;
+      for (sid in cp) {
+        if (!cp.hasOwnProperty(sid)) continue;
+        var v = parseFloat(cp[sid]);
+        if (!isNaN(v)) { tot += v; any = true; }
+      }
+      rows.push({ key: k, name: allTeams[k].name || k,
+                  pf: any ? tot : null, isMine: (k === myKey) });
+    }
+  } else {
+    var list = (row && row.standingsAll) || [];
+    if (!list.length) return '';
+    var mine = row.myTeamIds || {};
+    for (var i = 0; i < list.length; i++) {
+      var t = list[i];
+      if (!t || t.teamId == null) continue;
+      var id = String(t.teamId);
+      var pts = parseFloat(t.points);
+      allTeams[id] = { name: t.teamName || id };
+      if (mine[id]) myKey = id;
+      rows.push({ key: id, name: t.teamName || id,
+                  pf: isNaN(pts) ? null : pts, isMine: !!mine[id] });
+    }
+  }
+  if (!myKey || rows.length < 2) return '';
+
+  var html = '';
+  try { html = skBuildCatchTheLeaders(rows, myKey, league, allTeams) || ''; }
+  catch (e) { return ''; }
+  if (!html) return '';
+
+  // Roto also gets the category board, which is where the per-category
+  // standing it all rests on actually lives.
+  var board = '';
+  if (isRoto && typeof skBuildRotoCategoryTable === 'function') {
+    try { board = skBuildRotoCategoryTable(league, { team: { team_key: myKey } }, allTeams) || ''; }
+    catch (e2) { board = ''; }
+  }
+  return '<div class="esp-catch-wrap" style="margin-top:14px">' + board + html + '</div>';
+}
+
 // On-screen reconciliation readout. This exists because the derivation above
 // can be confidently wrong, and a mismatch is invisible in the numbers
 // themselves — the only tell is that the per-category points stop adding up
@@ -170131,9 +170247,20 @@ function _espStandingsPaneHtml(row) {
       'the payload, so GB is still measured from the overall leader and will ' +
       'disagree with the ranks. Worth telling me if you see this.</div>';
   }
-  h += '</div>';
+  // ESPCATCH — the same race panel Yahoo leagues get, under the standings
+  // on this pane only. The Pace tab is untouched: it answers a different
+  // question and people navigate to it on purpose.
+  try { h += _espCatchPanelHtml(row); } catch (eC) {}
+
   // SKBUMP — rank movement chart for ESPN season-points and roto leagues.
+  // ESPBUMPDUP - inside [data-espstand], not after it. espRepaintStandPane
+  // swaps that element's outerHTML, so anything outside it survives the swap:
+  // the chart used to be orphaned on every tab change and a fresh one added
+  // beside it, which is how one became two became three. Being inside also
+  // confines it to this pane - the Season, Daily, Pressure and Pace panes
+  // return before this point and never had a chart of their own.
   try { h += skBumpHtmlEsp(row); } catch (eB) {}
+  h += '</div>';
   return h;
 }
 
