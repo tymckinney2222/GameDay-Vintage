@@ -43342,12 +43342,23 @@ function readPtsSnapshot(leagueKey, date) {
 
 // Every points snapshot for a league, sorted by date ascending.
 function listPtsSnapshots(leagueKey) {
-  var prefix = PTS_SNAP_PREFIX + leagueKey + '_';
+  // ESPSNAP2 - both providers' stores. ESPN's record carries the same
+  // { date, pfByTeam } the Yahoo one does, plus extras nothing here reads.
+  var prefixes = [PTS_SNAP_PREFIX + leagueKey + '_'];
+  try {
+    if (typeof ESP_PTS_SNAP_PREFIX === 'string') {
+      prefixes.push(ESP_PTS_SNAP_PREFIX + leagueKey + '_');
+    }
+  } catch (ePfx) {}
   var out = [];
   try {
     for (var i = 0; i < localStorage.length; i++) {
       var k = localStorage.key(i);
-      if (!k || k.indexOf(prefix) !== 0) continue;
+      var hit = false;
+      for (var pi = 0; pi < prefixes.length; pi++) {
+        if (k && k.indexOf(prefixes[pi]) === 0) { hit = true; break; }
+      }
+      if (!hit) continue;
       try {
         var v = localStorage.getItem(k);
         if (v) out.push(JSON.parse(v));
@@ -125358,14 +125369,12 @@ function skBuildCatchTheLeaders(rows, myKey, league, allTeams) {
   // baseline snapshot exists yet (store is fresh, or week just turned),
   // wtd stays null and rows show a "building" note instead of a number.
   // Pure localStorage read — no fetch.
-  // ESPCATCH - everything keyed off lkey below reads the snapshot store that
-  // the Yahoo "Snap Points & Roto" control writes. An ESPN league has nothing
-  // in it and never will, so the panel was telling the reader to go and tap a
-  // button that would not help them. Dropping the key drops the snapshot line,
-  // the THIS WEEK row, the daily table and the weekly history with it - the
-  // parts of this panel that do not depend on snapshots are unaffected.
-  var lkey = (league && String(league.provider || '') === 'espn')
-    ? '' : (league && league.league_key);
+  // ESPSNAP2 - ESPN banks its own snapshots, on render, for season points and
+  // roto alike, and listPtsSnapshots reads both stores. So the key stands for
+  // either provider; what changes is only which control the status line names,
+  // since ESPN's capture is automatic and Yahoo's is a button.
+  var lkey = league && league.league_key;
+  var _snapAuto = (String((league && league.provider) || '') === 'espn');
   var wtdByKey = {};        // team key -> week-to-date PF (number) or undefined
   var wtdBaseDate = null;   // the snapshot date used as this week's zero
   var wtdReady = false;
@@ -125489,7 +125498,9 @@ function skBuildCatchTheLeaders(rows, myKey, league, allTeams) {
     var _snapMsg2;
     if (snapCount === 0) {
       // ROTOSNAP2 — name the control that actually feeds this panel.
-      _snapMsg2 = 'No snapshots yet \u2014 tap "Snap Points & Roto" in the account menu each morning to start tracking.';
+      _snapMsg2 = _snapAuto
+        ? 'No snapshots yet \u2014 they are captured automatically each time this league loads, so the first week-over-week numbers arrive tomorrow.'
+        : 'No snapshots yet \u2014 tap "Snap Points & Roto" in the account menu each morning to start tracking.';
     } else if (wtdReady && !wtdPartial) {
       _snapMsg2 = snapCount + ' snapshot' + (snapCount === 1 ? '' : 's')
                 + ' \u00b7 this week tracked from ' + (wtdBaseDate || '');
@@ -125846,7 +125857,8 @@ function skBuildCatchTheLeaders(rows, myKey, league, allTeams) {
     } else if (lkey) {
       var _bMsg = (snapCount > 0)
         ? 'building \u2014 needs one more daily snap to show numbers'
-        : 'building \u2014 snap daily to track actuals';
+        : (_snapAuto ? 'building \u2014 captured automatically, numbers from tomorrow'
+                     : 'building \u2014 snap daily to track actuals');
       html += '<div class="sk-catch-week building">'
             +   '<span class="sk-catch-week-lbl">THIS WEEK</span>'
             +   '<span class="sk-catch-week-vs">' + _bMsg + '</span>'
@@ -165831,11 +165843,45 @@ function _espPtsSnapKey(leagueKey, date) {
 function espWritePtsSnapshot(row, date) {
   window._espLastPtsSnapReason = '';
   if (!row || !row.key) { window._espLastPtsSnapReason = 'no league'; return null; }
-  if (typeof espIsSeasonPts !== 'function' || !espIsSeasonPts(row)) {
+  // ESPSNAP2 - a roto league has a season total too: the rank points it holds
+  // right now, which is exactly the figure the standings and the race panel
+  // read. Banking it daily is what turns those into week-over-week movement,
+  // and it is the same arithmetic a season-points league already gets.
+  var _fk = '';
+  try { _fk = (typeof extFormatKey === 'function') ? extFormatKey(row) : ''; } catch (eFk) {}
+  var _isRotoSnap = (_fk === 'roto');
+  if (!_isRotoSnap &&
+      (typeof espIsSeasonPts !== 'function' || !espIsSeasonPts(row))) {
     window._espLastPtsSnapReason = 'not a season-points league'; return null;
   }
   var rows = row.standingsAll || [];
   if (!rows.length) { window._espLastPtsSnapReason = 'no standings'; return null; }
+
+  // Roto totals are derived, not published, so they come from the same
+  // adapter the standings and the race panel read - one derivation, so a
+  // banked total can never disagree with the one on screen.
+  var _rotoTot = null;
+  if (_isRotoSnap) {
+    try {
+      var _ra = _espRotoAdapt(row);
+      if (_ra && _ra.allTeams) {
+        _rotoTot = {};
+        for (var _rk in _ra.allTeams) {
+          if (!_ra.allTeams.hasOwnProperty(_rk)) continue;
+          var _cp = _ra.allTeams[_rk].catPoints || {}, _sum = 0, _sid, _got = false;
+          for (_sid in _cp) {
+            if (!_cp.hasOwnProperty(_sid)) continue;
+            var _cv = parseFloat(_cp[_sid]);
+            if (!isNaN(_cv)) { _sum += _cv; _got = true; }
+          }
+          if (_got) _rotoTot[String(_rk)] = _sum;
+        }
+      }
+    } catch (eRa) { _rotoTot = null; }
+    if (!_rotoTot) {
+      window._espLastPtsSnapReason = 'no roto totals yet'; return null;
+    }
+  }
 
   var live = (typeof espLiveStandings === 'function') ? espLiveStandings(row).live : {};
   var pfByTeam = {}, liveByTeam = {}, captured = 0, i;
@@ -165854,10 +165900,14 @@ function espWritePtsSnapshot(row, date) {
   }
   for (i = 0; i < rows.length; i++) {
     var r = rows[i];
-    if (r.pf == null || isNaN(Number(r.pf))) continue;
-    pfByTeam[String(r.teamId)] = Number(r.pf);
-    var lv = live[String(r.teamId)];
-    if (lv != null && !isNaN(Number(lv))) liveByTeam[String(r.teamId)] = Number(lv);
+    var _tid = String(r.teamId);
+    var _val = _isRotoSnap ? _rotoTot[_tid] : Number(r.pf);
+    if (_val == null || isNaN(_val)) continue;
+    pfByTeam[_tid] = _val;
+    if (!_isRotoSnap) {
+      var lv = live[_tid];
+      if (lv != null && !isNaN(Number(lv))) liveByTeam[_tid] = Number(lv);
+    }
     captured++;
   }
   // One team's total says nothing about a race. Same floor Yahoo uses.
@@ -165956,7 +166006,14 @@ var _espSnapTried = {};
 function espMaybeSnapshot(row) {
   try { _skRankHistRecordEsp(row); } catch (eRH) {}   // SKBUMP — daily rank history (roto too)
   if (!row || !row.key) return;
-  if (typeof espIsSeasonPts !== 'function' || !espIsSeasonPts(row)) return;
+  // ESPSNAP2 - roto banks its derived rank-point total on the same hook, so
+  // the capture stays automatic for both: nobody has to remember to tap
+  // anything, and a history that depends on remembering has gaps exactly on
+  // the days worth remembering.
+  var _fkS = '';
+  try { _fkS = (typeof extFormatKey === 'function') ? extFormatKey(row) : ''; } catch (e0) {}
+  if (_fkS !== 'roto' &&
+      (typeof espIsSeasonPts !== 'function' || !espIsSeasonPts(row))) return;
   var d = _todayDateString();
   var hasRosters = !!(row.rosters && row.rosters.byTeam);
   var memo = row.key + '_' + d + '_' + (hasRosters ? 'r' : 'n');
