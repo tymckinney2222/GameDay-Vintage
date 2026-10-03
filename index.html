@@ -126357,7 +126357,62 @@ function skBuildDailyDeltaTable(leagueKey, valid, me, weeksLeft, league, allTeam
 // snap[D+1] - snap[D] (a morning snap holds the prior night's finals). We roll
 // those daily numbers up into Mon–Sun weeks; the current week accumulates the
 // days snapped so far, and a fresh row begins each Monday.
-function _skBuildMlbWeeklyTotalsFromDays(leagueKey, snaps, valid, me) {
+// == WEEKS THE SEASON WAS ACTUALLY ON == SEASONWK ==
+//
+// Snapshots start the day a league is first synced, which can be weeks before
+// a puck drops. Every one of those weeks totals zero for every team, and nine
+// rows of zeros above the only week that happened buries it. The history
+// should begin where the season does.
+//
+// The week CONTAINING the opener is kept, not the first full week after it:
+// the NHL opened on a Tuesday, and the week of the 28th is where that game
+// belongs. Weeks past the season's end go the same way.
+//
+// Returns a filter over week-Monday strings. Without a season window - a
+// league whose dates are not known yet - it keeps everything, because
+// hiding rows on a guess is worse than showing a few empty ones.
+function _skSeasonWeekFilter(league) {
+  // _skSeasonWindow falls back to the BASEBALL calendar for a sport it does
+  // not have, which is fine for a pace estimate and wrong here: it would hide
+  // real rows against the wrong season. Filter only when this league's dates
+  // are known outright, or its sport is one the table actually covers.
+  var known = false;
+  try {
+    var lk = league && league.league_key;
+    var ld = (typeof _skLeagueDates !== 'undefined' && lk) ? _skLeagueDates[lk] : null;
+    if (ld && ld.start && ld.end) known = true;
+    else {
+      var sp = String((league && league.sport) || '').toLowerCase();
+      if (typeof _SK_SEASON_WINDOWS !== 'undefined' && _SK_SEASON_WINDOWS[sp]) known = true;
+    }
+  } catch (eK) { known = false; }
+  if (!known) return function () { return true; };
+
+  var win = null;
+  try { win = (typeof _skSeasonWindow === 'function') ? _skSeasonWindow(league) : null; }
+  catch (e) { win = null; }
+  if (!win || !win.startMs) return function () { return true; };
+  function ymdL(d) {
+    return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') +
+      '-' + String(d.getDate()).padStart(2, '0');
+  }
+  function monOf(dateStr) {
+    var d = new Date(dateStr + 'T12:00:00');
+    var dow = d.getDay();
+    var toMon = (dow === 0) ? -6 : (1 - dow);
+    return ymdL(new Date(d.getFullYear(), d.getMonth(), d.getDate() + toMon));
+  }
+  var firstMon = monOf(ymdL(new Date(win.startMs)));
+  var lastMon = win.endMs ? monOf(ymdL(new Date(win.endMs))) : null;
+  return function (mondayStr) {
+    if (!mondayStr) return false;
+    if (mondayStr < firstMon) return false;
+    if (lastMon && mondayStr > lastMon) return false;
+    return true;
+  };
+}
+
+function _skBuildMlbWeeklyTotalsFromDays(leagueKey, snaps, valid, me, league) {
   // Fast date helpers.
   function ymd(d) {
     return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') +
@@ -126404,7 +126459,11 @@ function _skBuildMlbWeeklyTotalsFromDays(leagueKey, snaps, valid, me) {
     });
   });
 
-  var weeks = Object.keys(weekTotals).filter(function(w){ return weekHasData[w]; }).sort();
+  // SEASONWK - weeks before the opener are rows of zeros for everybody.
+  var _inSeason = _skSeasonWeekFilter(league);
+  var weeks = Object.keys(weekTotals).filter(function(w){
+    return weekHasData[w] && _inSeason(w);
+  }).sort();
   if (!weeks.length) return '';
 
   var thisMon = mondayOf(_todayDateString());
@@ -126462,7 +126521,7 @@ function skBuildWeeklyTotalsTable(leagueKey, valid, me, league) {
   // keeps its own weekly-bucket logic below (it scores by week, not by day).
   var _isNflW = (typeof _skIsNflLeague === 'function') && _skIsNflLeague(league);
   if (!_isNflW) {
-    return _skBuildMlbWeeklyTotalsFromDays(leagueKey, snaps, valid, me);
+    return _skBuildMlbWeeklyTotalsFromDays(leagueKey, snaps, valid, me, league);
   }
 
   function _mondayOf(dateStr) {
@@ -126485,6 +126544,10 @@ function skBuildWeeklyTotalsTable(leagueKey, valid, me, league) {
     endByWeek[mon] = s;
   });
   weekOrder.sort();
+  // SEASONWK - same rule for the football path: a week the season was not on
+  // is a row of zeros.
+  var _inSeasonW = _skSeasonWeekFilter(league);
+  weekOrder = weekOrder.filter(function (w) { return _inSeasonW(w); });
   if (weekOrder.length < 2) return ''; // can't diff a single week yet
 
   // Decide which teams to show as columns: me + the rivals immediately
