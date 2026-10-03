@@ -1210,6 +1210,24 @@
   .nbp-line { font-family: 'Share Tech Mono', monospace; font-size: 10.5px; color: rgba(255,255,255,0.55);
               margin-top: 2px; line-height: 1.45; }   /* wraps — the full line is the point */
 
+  /* HTWATCH - sort pills and the watch dot on the AHL leader boards. */
+  .ht-lead-pills { display: flex; gap: 6px; flex-wrap: wrap; padding: 2px 16px 8px; }
+  .ht-lead-pill {
+    padding: 3px 10px; border-radius: 999px; cursor: pointer;
+    font-family: var(--sk-font-mono, monospace); font-size: 9px; font-weight: 700;
+    letter-spacing: 0.08em; border: 1px solid rgba(255,255,255,0.14);
+    background: none; color: rgba(255,255,255,0.5);
+  }
+  .ht-lead-pill.on {
+    border-color: rgba(125,211,252,0.55); background: rgba(125,211,252,0.12);
+    color: #7dd3fc;
+  }
+  .ht-lead-dots { margin-left: 6px; font-size: 9px; letter-spacing: 1px; }
+  .ht-lead-note {
+    font-size: 9px; line-height: 1.5; color: rgba(255,255,255,0.3);
+    padding: 6px 16px 0;
+  }
+
   /* ── Power Play Time ── PPTIME ── */
   .ppt { padding: 0 0 6px; }
   .ppt-hd { display: flex; align-items: center; gap: 8px; padding: 12px 16px 8px; }
@@ -61931,38 +61949,152 @@ function _htLeaders(league) {
   });
   return _htLeadersCache[league];
 }
+// == LEADERS, BY THE STAT YOU CARE ABOUT == HTWATCH ==
+//
+// The feed sends one scoring list and one goaltending list, each carrying
+// every column. Points order answers "who is having the best season"; it does
+// not answer "who is scoring goals", and a winger with 20 goals and 8 assists
+// can sit below a defenceman with 4 and 30. Both lists are already in hand, so
+// the other orders cost nothing but a sort.
+//
+// GAA and SV% are rates, so they need a floor - a goalie with one relief
+// appearance and a 0.00 average is not leading anything. The floor is set
+// against the busiest goalie rather than a fixed number, so it means the same
+// thing in October as in March.
+var _htLeadSort = { sk: 'points', go: 'wins' };
+
+function htSetLeadSort(which, key) {
+  if (which !== 'sk' && which !== 'go') return;
+  _htLeadSort[which] = key;
+  var lg = window._htLeadLeague;
+  if (lg) _htRenderLeaders(lg);
+}
+
+function _htLeadNum(v) { var n = parseFloat(v); return isNaN(n) ? null : n; }
+
+// Rows the rate columns are allowed to rank, and the floor that decided it.
+function _htLeadQualified(rows) {
+  var most = 0, i, gp;
+  for (i = 0; i < rows.length; i++) {
+    gp = _htLeadNum(rows[i].games_played);
+    if (gp != null && gp > most) most = gp;
+  }
+  var floor = Math.max(1, Math.round(most * 0.25));
+  return { floor: floor, rows: rows.filter(function (r) {
+    var g = _htLeadNum(r.games_played);
+    return g != null && g >= floor;
+  }) };
+}
+
+function _htLeadSorted(rows, isG) {
+  var key = isG ? _htLeadSort.go : _htLeadSort.sk;
+  var list = rows.slice(), floor = null;
+  var lowerWins = (key === 'goals_against_average');
+  var isRate = lowerWins || (key === 'save_percentage');
+  if (isRate) {
+    var q = _htLeadQualified(list);
+    list = q.rows; floor = q.floor;
+  }
+  list.sort(function (a, b) {
+    var av = _htLeadNum(a[key]), bv = _htLeadNum(b[key]);
+    if (av == null && bv == null) return 0;
+    if (av == null) return 1;
+    if (bv == null) return -1;
+    if (av === bv) {
+      // A tie on the headline stat goes to the player who did it in fewer
+      // games, which is the one worth looking at.
+      var ag = _htLeadNum(a.games_played), bg = _htLeadNum(b.games_played);
+      if (ag != null && bg != null && ag !== bg) return ag - bg;
+      return 0;
+    }
+    return lowerWins ? (av - bv) : (bv - av);
+  });
+  return { rows: list, floor: floor, key: key };
+}
+
+// The watch signal. An AHL name that already appears on a roster in one of
+// your leagues is a name the fantasy world has decided matters - usually
+// because he has been up before, or is up right now. That is the difference
+// between a career AHL scorer and somebody to put a claim in on.
+function _htLeadOwnDots(name) {
+  var out = '';
+  try {
+    if (typeof extOwnDots === 'function') out += extOwnDots(name, null, 'NHL') || '';
+    if (typeof yahooOwnDot === 'function') out += yahooOwnDot(name, 'NHL') || '';
+  } catch (e) {}
+  return out;
+}
+
+function _htLeadPills(which, cur, opts) {
+  var h = '<div class="ht-lead-pills">';
+  for (var i = 0; i < opts.length; i++) {
+    var on = (opts[i].k === cur);
+    h += '<button class="ht-lead-pill' + (on ? ' on' : '') +
+      '" onclick="htSetLeadSort(\'' + which + '\',\'' + opts[i].k + '\')">' +
+      opts[i].lbl + '</button>';
+  }
+  return h + '</div>';
+}
+
 function _htLeaderTable(rows, isG, league) {
   if (!rows || !rows.length) return '';
+  var sorted = _htLeadSorted(rows, isG);
+  var list = sorted.rows;
+  if (!list.length) return '';
   var labels = isG ? ['#', 'PLAYER', 'TEAM', 'GP', 'W', 'GAA', 'SV%', 'SO']
                    : ['#', 'PLAYER', 'TEAM', 'GP', 'G', 'A', 'P'];
+  var pills = isG
+    ? _htLeadPills('go', _htLeadSort.go, [
+        { k: 'wins', lbl: 'WINS' },
+        { k: 'goals_against_average', lbl: 'GAA' },
+        { k: 'save_percentage', lbl: 'SV%' },
+        { k: 'shutouts', lbl: 'SO' }])
+    : _htLeadPills('sk', _htLeadSort.sk, [
+        { k: 'points', lbl: 'POINTS' },
+        { k: 'goals', lbl: 'GOALS' },
+        { k: 'assists', lbl: 'ASSISTS' }]);
+
   var html = '<div class="gym-bx-section"><div class="gym-bx-title"><span>' +
-    (isG ? 'GOALTENDING' : 'SCORING') + '</span></div>' +
+    (isG ? 'GOALTENDING' : 'SCORING') + '</span></div>' + pills +
     '<div class="gym-bx-wrap"><table class="gym-bx-table"><thead><tr>';
   for (var L = 0; L < labels.length; L++) html += '<th>' + labels[L] + '</th>';
   html += '</tr></thead><tbody>';
-  for (var i = 0; i < rows.length; i++) {
-    var r = rows[i] || {};
+  for (var i = 0; i < list.length; i++) {
+    var r = list[i] || {};
     var cells = isG
       ? [r.games_played, r.wins,
          (r.goals_against_average != null ? r.goals_against_average : '-'),
          (function () { var v = parseFloat(r.save_percentage); return isNaN(v) ? '-' : v.toFixed(3).replace(/^0/, ''); })(),
          r.shutouts]
       : [r.games_played, r.goals, r.assists, r.points];
+    var dots = _htLeadOwnDots(r.name || r.shortname || '');
     html += '<tr style="cursor:pointer" onclick="_htOpenPlayer(\'ht' + skEscapeMaybe(r.player_id) + '\',\'' +
         league + '\',\'' + _jsStr(r.team_code || '') + '\',\'#7dd3fc\')">' +
       '<td style="color:rgba(255,255,255,0.3)">' + (i + 1) + '</td>' +
-      '<td style="white-space:nowrap">' + skEscapeMaybe(r.name || r.shortname || '?') + '</td>' +
+      '<td style="white-space:nowrap">' + skEscapeMaybe(r.name || r.shortname || '?') +
+        (dots ? '<span class="ht-lead-dots">' + dots + '</span>' : '') + '</td>' +
       '<td style="color:rgba(255,255,255,0.45)">' + skEscapeMaybe(r.team_code || '') + '</td>';
     for (var c = 0; c < cells.length; c++) {
       html += '<td>' + (cells[c] != null && cells[c] !== '' ? skEscapeMaybe(cells[c]) : '-') + '</td>';
     }
     html += '</tr>';
   }
-  return html + '</tbody></table></div></div>';
+  html += '</tbody></table></div>';
+  if (sorted.floor != null) {
+    html += '<div class="ht-lead-note">' + (isG ? 'GAA and SV%' : 'Rates') +
+      ' rank only goalies with at least ' + sorted.floor + ' game' +
+      (sorted.floor === 1 ? '' : 's') +
+      ' \u2014 a quarter of what the busiest has played, so the bar means the ' +
+      'same in October as in March.</div>';
+  }
+  return html + '</div>';
 }
+
 function _htRenderLeaders(league) {
+
   var body = document.getElementById('stBody');
   if (!body) return;
+  window._htLeadLeague = league;   // HTWATCH - the sort pills repaint this
   body.innerHTML = '<div class="pm-loading">Loading leaders…</div>';
   _htLeaders(league).then(function (d) {
     var note = d.season
@@ -61972,7 +62104,11 @@ function _htRenderLeaders(league) {
       : '';
     var tables = _htLeaderTable(d.skaters, false, league) + _htLeaderTable(d.goalies, true, league);
     body.innerHTML = tables
-      ? (note + tables + '<div class="pm-t8" style="color:rgba(255,255,255,0.2);letter-spacing:0.5px;padding:12px 20px">' +
+      ? (note + tables +
+         '<div class="ht-lead-note" style="padding:2px 20px 0">A dot beside a name '
+         + 'means somebody in one of your leagues already rosters him \u2014 which is '
+         + 'usually the tell that he has been up before, or is up now.</div>' +
+         '<div class="pm-t8" style="color:rgba(255,255,255,0.2);letter-spacing:0.5px;padding:12px 20px">' +
          league + ' · HOCKEYTECH</div>')
       : '<div class="pm-loading" style="padding:30px;text-align:center">No leaders published yet.</div>';
     body.scrollTop = 0;
