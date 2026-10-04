@@ -164226,6 +164226,10 @@ var ESP_STAT_NAME_FHL = {
   // Skating
   13: 'G', 14: 'A', 15: '+/-', 16: 'PTS', 17: 'PIM',
   23: 'FOW', 24: 'FOL', 25: 'SHFT', 26: 'TOI', 27: 'ATOI',
+  // ATOIDEN2 - ESPN ships no label for 34. The name describes the role the
+  // probe established (it is exactly what ATOI divides by), not a word ESPN
+  // gave us, and it is here so the figure never renders as a bare "#34".
+  34: 'SKGP',
   29: 'SOG', 30: 'GP', 31: 'BLK', 32: 'HIT',
   35: 'STG', 36: 'STA', 37: 'STP', 38: 'PPP', 39: 'SHP'
 };
@@ -164430,7 +164434,12 @@ function espStatFmt(id, v, game) {
     return espNoLeadZero(game, id) ? r.replace(/^0/, '') : r;
   }
   // Outs back to innings in baseball notation: 145 outs is 48.1, not 48.3.
-  if (String(id) === '34') return Math.floor(n / 3) + '.' + (n % 3);
+  // ATOIDEN2 - BASEBALL's 34. Hockey's 34 is the ATOI denominator, and this
+  // line had no sport gate, so a skater-games count of 33 would have printed
+  // as "11.0" innings. The ids collide across sports; the formatting cannot.
+  if (String(id) === '34' && espFlagGame(game) === 'flb') {
+    return Math.floor(n / 3) + '.' + (n % 3);
+  }
   // Everything else here is a COUNT, and counts are whole numbers. A
   // fractional value means either an unidentified rate or something
   // unexpected — and rounding it to one decimal hides both. That is how two
@@ -166668,11 +166677,32 @@ var ESP_RATE_COMPONENTS = [0, 1, 8, 34, 37, 39, 45, 48];
 var ESP_RATE_RECIPE_BY_GAME = {
   flb: ESP_RATE_RECIPE,
   fhl: {
-    // ATOI = total ice time over games played. Verified against ESPN's own
-    // team row: 1024 + 226 + 955 + 236 = 2441s over 4 skaters = 10:10.
-    // viaRate: ESPN's baseline carries TOI but not GP, so the stored
-    // denominator is recovered as TOI / ATOI. ESPGPDERIVE
-    27: { num: [26], den: [30], mode: 'ratio', viaRate: true },
+    // == ATOIDEN2 ==
+    //
+    // ATOI is total skater ice time over stat 34, NOT over GP (30).
+    //
+    // GP counts every player's games, goalies included, while TOI is skater
+    // ice time only - so dividing by it understated ATOI by between 35 and
+    // 190 seconds a team. That is what the live derivation's gate kept
+    // catching, and correctly: it refused to carry a rate it could not
+    // reproduce on settled data.
+    //
+    // Probe-confirmed rather than reasoned: across 40 team-rows in four
+    // leagues, TOI / #34 reproduced ESPN's published ATOI to within five
+    // nanoseconds, every row. Two of those leagues publish no GP at all and
+    // still carry #34, which settles which field is the real one.
+    //
+    // #34 is unnamed in ESPN's hockey vocabulary. Its behaviour is "the count
+    // ESPN divides skater ice time by", and GP minus it varies from 1 to 6 in
+    // the way a team's goalie appearances would - but that is an inference and
+    // the recipe does not rest on it. The exact quotient does.
+    //
+    // viaRate is gone with it. That machinery existed to recover a missing
+    // denominator from the published rate, which is self-validating: a recipe
+    // that derives its divisor from the answer can never disagree with the
+    // answer, so the gate would have learned nothing. The real field needs no
+    // such trick.
+    27: { num: [26], den: [34], mode: 'ratio' },
     // Saves over shots against — a count over a count, no units involved.
     11: { num: [6],  den: [3],  mode: 'ratio' }
   },
@@ -166685,7 +166715,10 @@ var ESP_RATE_RECIPE_BY_GAME = {
 
 var ESP_RATE_COMPONENTS_BY_GAME = {
   flb: ESP_RATE_COMPONENTS,
-  fhl: [26, 30, 6, 3, 4, 8],   // TOI, GP, SV, SA, + GA and goalie TOI for GAA
+  // ATOIDEN2 - 34 joins because ATOI is built on it. A league almost never
+  // SCORES it, so without this line it is trimmed out of every window and the
+  // live denominator can never grow past its season value.
+  fhl: [26, 30, 34, 6, 3, 4, 8],   // TOI, GP, ATOI denom, SV, SA, GA, goalie TOI
   fba: [13, 14, 15, 16, 17, 18]
 };
 
@@ -171676,13 +171709,52 @@ function _espRotoLiveStats(row) {
         if (!_ex) _ex = { pub: pub, mine: mine, dry: dry };
       } else ok++;
     }
-    if (ok >= 2 && !bad) { rebuilt.push(label); continue; }
+    // ATOIDEN2 - the season rebuild passing is necessary, not sufficient. A
+    // rate is only LIVE if today moved its denominator too: if the numerator
+    // grew and the divisor did not, the quotient is today's minutes spread
+    // over yesterday's games, which climbs for no reason. That is the shape
+    // the old GP recipe would have produced had it ever passed the gate, and
+    // it is cheap to refuse rather than discover later.
+    var denStuck = false;
+    var _R0 = (typeof _espRecipesFor === 'function') ? _espRecipesFor(game) : null;
+    var rc0 = _R0 && _R0[id];
+    if (ok >= 2 && !bad && rc0 && rc0.den && rc0.den.length) {
+      var numMoved = false, denMoved = false, t3;
+      for (t3 = 0; t3 < teamsRaw.length; t3++) {
+        var tk3 = String(teamsRaw[t3].id);
+        var se3 = seasonOnly[tk3] || {}, lv3 = vals[tk3] || {};
+        var ci3;
+        for (ci3 = 0; ci3 < rc0.num.length; ci3++) {
+          if (Number(lv3[rc0.num[ci3]]) !== Number(se3[rc0.num[ci3]])) numMoved = true;
+        }
+        for (ci3 = 0; ci3 < rc0.den.length; ci3++) {
+          if (Number(lv3[rc0.den[ci3]]) !== Number(se3[rc0.den[ci3]])) denMoved = true;
+        }
+      }
+      denStuck = (numMoved && !denMoved);
+    }
+    if (ok >= 2 && !bad && !denStuck) { rebuilt.push(label); continue; }
     // ESPROTOLIVE3 - name the actual obstacle. A rate held back is the
     // difference between a live total and one that still matches the
     // provider's, so "why" has to be on screen, not inferred.
     var why;
     var R = (typeof _espRecipesFor === 'function') ? _espRecipesFor(game) : null;
     var rc = R && R[id];
+    if (denStuck) {
+      var dnm = [], dz;
+      for (dz = 0; dz < rc.den.length; dz++) {
+        dnm.push((typeof espStatLabel === 'function')
+          ? (espStatLabel(game, rc.den[dz]) || ('#' + rc.den[dz])) : ('#' + rc.den[dz]));
+      }
+      held.push(label + ' (today moved the top of it but not ' + dnm.join(' or ') +
+                ', so the rate would drift)');
+      for (t2 = 0; t2 < teamsRaw.length; t2++) {
+        var tkS = String(teamsRaw[t2].id);
+        var svS = (seasonOnly[tkS] || {})[id];
+        if (svS == null) { delete vals[tkS][id]; } else { vals[tkS][id] = svS; }
+      }
+      continue;
+    }
     if (!rc) {
       why = 'no recipe for it';
     } else {
