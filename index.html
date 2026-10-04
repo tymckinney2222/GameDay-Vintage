@@ -171545,6 +171545,11 @@ function _espRotoLiveStats(row) {
     if (!espIsRate(game, id)) continue;
     var label = (typeof espStatLabel === 'function') ? (espStatLabel(game, id) || ('#' + id)) : ('#' + id);
     var ok = 0, bad = 0, t2;
+    // ESPHELDWHY - keep the first disagreement, with its parts. "The rebuild
+    // disagreed" is true and unactionable; the two numbers and the components
+    // behind them are what says whether the recipe is wrong, the denominator
+    // means something else, or ESPN is averaging where we are summing.
+    var _ex = null;
     for (t2 = 0; t2 < teamsRaw.length; t2++) {
       var tk = String(teamsRaw[t2].id);
       var pub = parseFloat((seasonOnly[tk] || {})[id]);
@@ -171557,8 +171562,10 @@ function _espRotoLiveStats(row) {
       }
       var mine = _espApplyRates(dry, game)[id];
       if (mine == null || !isFinite(mine)) { bad++; continue; }
-      if (Math.abs(mine - pub) > Math.max(0.0015, Math.abs(pub) * 0.005)) bad++;
-      else ok++;
+      if (Math.abs(mine - pub) > Math.max(0.0015, Math.abs(pub) * 0.005)) {
+        bad++;
+        if (!_ex) _ex = { pub: pub, mine: mine, dry: dry };
+      } else ok++;
     }
     if (ok >= 2 && !bad) { rebuilt.push(label); continue; }
     // ESPROTOLIVE3 - name the actual obstacle. A rate held back is the
@@ -171581,6 +171588,26 @@ function _espRotoLiveStats(row) {
       why = miss.length
         ? ('ESPN\u2019s team totals carry no ' + miss.join(' or '))
         : (ok ? 'rebuild disagreed with ESPN on some teams' : 'rebuild disagreed with ESPN');
+      // ESPHELDWHY - a worked example, in the league's own formatting.
+      if (!miss.length && _ex) {
+        function _fq(v, sid) {
+          try { return espStatFmt(sid, v, game); } catch (eQ) { return String(v); }
+        }
+        var partTxt = [], pw;
+        for (pw = 0; pw < rc.num.length; pw++) {
+          partTxt.push(((typeof espStatLabel === 'function')
+            ? (espStatLabel(game, rc.num[pw]) || ('#' + rc.num[pw])) : ('#' + rc.num[pw])) +
+            ' ' + (_ex.dry[rc.num[pw]] == null ? '\u2014' : _ex.dry[rc.num[pw]]));
+        }
+        var denTxt = [];
+        for (pw = 0; pw < rc.den.length; pw++) {
+          denTxt.push(((typeof espStatLabel === 'function')
+            ? (espStatLabel(game, rc.den[pw]) || ('#' + rc.den[pw])) : ('#' + rc.den[pw])) +
+            ' ' + (_ex.dry[rc.den[pw]] == null ? '\u2014' : _ex.dry[rc.den[pw]]));
+        }
+        why += ': ESPN ' + _fq(_ex.pub, id) + ', rebuilt ' + _fq(_ex.mine, id) +
+               ' from ' + partTxt.join(' + ') + ' \u00f7 ' + denTxt.join(' + ');
+      }
     }
     held.push(label + ' (' + why + ')');
     // Put the season value back, verbatim, for every team.
@@ -171634,12 +171661,31 @@ function _espRotoLiveView(row) {
   }
   var n = 0, q;
   for (q in sT) { if (sT.hasOwnProperty(q)) n++; }
+  // == ESPSEASONCAT ==
+  //
+  // The Yahoo view returns seasonCat - the per-category ladder BEFORE today -
+  // and _skRotoCrossings needs it to say who passed whom. This one returned
+  // only the totals, so on an ESPN league every crossing test compared a live
+  // ladder against nothing and found nobody. The names were silently absent
+  // rather than wrong, which is why it read as a missing feature.
+  //
+  // order and statsMeta come along for the same reason: the ledger reads them
+  // off the view, and a view that carries one half of what a consumer needs
+  // is a view that works on one provider.
+  var seasonCat = {}, _sk2;
+  for (_sk2 in base.allTeams) {
+    if (!base.allTeams.hasOwnProperty(_sk2)) continue;
+    seasonCat[_sk2] = base.allTeams[_sk2].catPoints || {};
+  }
   return {
     data: { allTeams: live.allTeams, team: { team_key: base.myKey } },
     meta: live.meta,
     day: (typeof _todayDateString === 'function') ? _todayDateString() : '',
     rates: ls.held, rebuilt: ls.rebuilt, touched: ls.todayAny,
     cats: ls.cats, src: 'ESPN',
+    seasonCat: seasonCat,
+    order: (live.meta && live.meta.statOrder) || [],
+    statsMeta: (live.meta && live.meta.stats) || {},
     moved: moved, me: moved[base.myKey] || null, myKey: base.myKey, teams: n
   };
 }
