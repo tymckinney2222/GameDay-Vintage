@@ -24127,6 +24127,15 @@
   .sk-dm-cat { font-weight: 700; color: var(--sk-text); }
   .sk-dm-from { color: var(--sk-text-4); }
   .sk-dm-to { color: var(--sk-text-2); font-weight: 700; }
+  /* ROTOCROSS - who moved past whom, under the row it explains. */
+  .sk-dm-whorow {
+    display: block; padding: 0 11px 5px;
+    font-family: var(--sk-font-mono, monospace); font-size: 9.5px; line-height: 1.45;
+  }
+  .sk-dm-who { display: block; }
+  .sk-dm-who.up { color: rgba(74,222,128,0.75); }
+  .sk-dm-who.dn { color: rgba(248,113,113,0.75); }
+  .sk-dm-who.lv { color: var(--sk-text-3); }
   .sk-dm-foot {
     padding: 6px 11px 7px; font-size: 9px; color: var(--sk-text-4);
     border-top: 1px solid rgba(255,255,255,0.04);
@@ -125819,8 +125828,13 @@ function _rpFlattenStates(res) {
   return out;
 }
 
-function _rpDayMoveRows(seasonRes, liveRes) {
+function _rpDayMoveRows(seasonRes, liveRes, lv) {
   var S = _rpFlattenStates(seasonRes), L = _rpFlattenStates(liveRes);
+  // ROTOCROSS - the league-wide ladder, so each row can say WHO moved. The
+  // states function only ever knows about my own row.
+  var _sc = (lv && lv.seasonCat) || null;
+  var _at = (lv && lv.data && lv.data.allTeams) || null;
+  var _me = (lv && lv.myKey) || '';
   var rows = [], unmoved = 0, net = 0, id;
   for (id in L) {
     if (!L.hasOwnProperty(id) || !S[id]) continue;
@@ -125832,10 +125846,16 @@ function _rpDayMoveRows(seasonRes, liveRes) {
     var moved = (dPts !== 0) || (a.rank !== b.rank) || (!!a.tied !== !!b.tied);
     if (!moved) { unmoved++; continue; }
     net += dPts;
+    var X = null;
+    if (_sc && _at && _me) {
+      try { X = _skRotoCrossings(_sc, _at, _me, id); } catch (eX) { X = null; }
+    }
     rows.push({ id: id, label: b.label,
                 rankFrom: a.rank, tiedFrom: a.tied, ptsFrom: a.pts,
                 rankTo: b.rank, tiedTo: b.tied, ptsTo: b.pts,
-                dPts: dPts });
+                dPts: dPts,
+                passed: (X && X.passed) || [], passedBy: (X && X.passedBy) || [],
+                level: (X && X.level) || [] });
   }
   // Biggest swing first, either direction, so the row that explains the day
   // is the first one read.
@@ -126022,7 +126042,7 @@ function _skBuildRotoPressureHTML(league, data, metaOverride, liveOpt) {
       var _sRes = _skRotoCatStates(league, data, metaOverride);
       var _lRes = _skRotoCatStates(league, _lvDm.data,
                                    (_lvDm.meta ? _lvDm.meta : metaOverride));
-      var dm = _rpDayMoveRows(_sRes, _lRes);
+      var dm = _rpDayMoveRows(_sRes, _lRes, _lvDm);
       if (dm.rows.length) {
         var dmNetCls = dm.net > 0 ? 'pos' : (dm.net < 0 ? 'neg' : '');
         var dmBody = '';
@@ -126036,13 +126056,33 @@ function _skBuildRotoPressureHTML(league, data, metaOverride, liveOpt) {
             '<span class="sk-dm-to">' + (dr.tiedTo ? 'T' : '') + ordinal(dr.rankTo) + '</span>' +
             '<span class="sk-dm-d">' + _rpArrow(dr.ptsFrom, dr.ptsTo, true) + '</span>' +
           '</div>';
+          // ROTOCROSS - the names are the answer to "why did that number
+          // move", so they get their own line rather than a column that
+          // would truncate them.
+          var dmWho = [];
+          if (dr.passed.length) {
+            dmWho.push('<span class="sk-dm-who up">passed ' +
+              skEscape(dr.passed.join(', ')) + '</span>');
+          }
+          if (dr.level.length) {
+            dmWho.push('<span class="sk-dm-who lv">now level with ' +
+              skEscape(dr.level.join(', ')) + '</span>');
+          }
+          if (dr.passedBy.length) {
+            dmWho.push('<span class="sk-dm-who dn">passed by ' +
+              skEscape(dr.passedBy.join(', ')) + '</span>');
+          }
+          if (dmWho.length) dmBody += '<div class="sk-dm-whorow">' + dmWho.join('') + '</div>';
         }
         dayMove = '<div class="sk-dm">' +
           '<div class="sk-dm-hd"><span>DAY MOVE</span>' +
             '<span class="sk-dm-net ' + dmNetCls + '">' +
               (dm.net > 0 ? '+' : '') + f1(dm.net) + ' pts</span></div>' +
           '<div class="sk-dm-sub">your rank when the day started, and now \u00b7 ' +
-            'both pills in one table</div>' +
+            'both pills in one table<br>PTS is PLACES gained, not a rate \u2014 ' +
+            'in a ' + (_lvDm.teams || '20') + '-team league last place is 1 point and ' +
+            'first is ' + (_lvDm.teams || 20) + ', and a tie splits the two places ' +
+            'it covers</div>' +
           dmBody +
           (dm.unmoved ? ('<div class="sk-dm-foot">' + dm.unmoved +
                          ' categor' + (dm.unmoved === 1 ? 'y' : 'ies') +
@@ -126267,6 +126307,42 @@ function _skRotoLiveDelta(league, allTeams, myKey, rivalKey, lvIn) {
 // Comparing POINTS rather than raw stats is deliberate: in roto the points
 // ARE the rank, so "they passed me" is exactly "their category points went
 // from below mine to above mine". No separate ranking pass to disagree with.
+// == WHO CROSSED ME == ROTOCROSS ==
+//
+// In a category, your rank points ARE your place, so "they passed me" is
+// exactly "their category points went from below mine to above mine". No
+// separate ranking pass that could disagree with the board.
+//
+// The ledger first shipped with two cases, passed and was-passed, and that
+// missed the one that happens most: DRAWING LEVEL. Going from sole 16th to a
+// tie for 15th in a 20-team league is worth exactly half a point, and under
+// two-case logic nobody is named at all - the team you are now tied with was
+// below you and is still not above you. A half-point move with no explanation
+// beside it is the thing that made the number look like a per-save rate.
+//
+// -> { passed, passedBy, level } of team names, for one category.
+function _skRotoCrossings(sc, at, me, id) {
+  // Names for display, keys alongside them so a count of distinct teams
+  // cannot be thrown by two managers choosing the same team name.
+  var out = { passed: [], passedBy: [], level: [],
+              passedK: [], passedByK: [], levelK: [] };
+  if (!sc || !at || !sc[me] || !at[me]) return out;
+  var was = (sc[me] || {})[id];
+  var now = ((at[me] && at[me].catPoints) || {})[id];
+  if (was == null || now == null) return out;
+  for (var k in at) {
+    if (!at.hasOwnProperty(k) || k === me) continue;
+    var tw = (sc[k] || {})[id];
+    var tn = ((at[k] && at[k].catPoints) || {})[id];
+    if (tw == null || tn == null) continue;
+    var nm = at[k].name || k;
+    if (tw !== was && tn === now) { out.level.push(nm); out.levelK.push(k); }
+    else if (tw < was && tn > now) { out.passedBy.push(nm); out.passedByK.push(k); }
+    else if (tw > was && tn < now) { out.passed.push(nm); out.passedK.push(k); }
+  }
+  return out;
+}
+
 function _skRotoMyLedger(lv) {
   if (!lv || !lv.myKey || !lv.order || !lv.seasonCat) return null;
   var me = lv.myKey;
@@ -126288,19 +126364,16 @@ function _skRotoMyLedger(lv) {
     var d = Math.round((now - was) * 10) / 10;
     if (!d) { flat++; continue; }
 
-    var passedMe = [], iPassed = [];
-    for (k in at) {
-      if (!at.hasOwnProperty(k) || k === me) continue;
-      var tw = (sc[k] || {})[id], tn = liveCat(k)[id];
-      if (tw == null || tn == null) continue;
-      // Below me then, above me now - and the other way round.
-      if (tw < was && tn > now) { passedMe.push(at[k].name || k); onMe[k] = 1; }
-      else if (tw > was && tn < now) { iPassed.push(at[k].name || k); byMe[k] = 1; }
-    }
+    // ROTOCROSS - one rule, shared with the Pressure tab's DAY MOVE table.
+    var X = _skRotoCrossings(sc, at, me, id);
+    var passedMe = X.passedBy, iPassed = X.passed, drewLevel = X.level;
+    var _ci;
+    for (_ci = 0; _ci < X.passedByK.length; _ci++) onMe[X.passedByK[_ci]] = 1;
+    for (_ci = 0; _ci < X.passedK.length; _ci++) byMe[X.passedK[_ci]] = 1;
     rows.push({ id: id, label: (typeof _skRotoCatLabel === 'function' ? _skRotoCatLabel(m) : '') ||
                   m.abbr || m.displayName || ('#' + id),
                 was: was, now: now, delta: d,
-                passedMe: passedMe, iPassed: iPassed });
+                passedMe: passedMe, iPassed: iPassed, drewLevel: drewLevel });
     if (d > 0) up += d; else down += d;
   }
 
@@ -126365,6 +126438,11 @@ function _skRotoLedgerHtml(lv) {
     if (r.iPassed.length) {
       h += '<div class="sk-rl-who up">you passed: ' +
            skEscape(r.iPassed.join(', ')) + '</div>';
+    }
+    // ROTOCROSS - the half-point case, which is most of them.
+    if (r.drewLevel && r.drewLevel.length) {
+      h += '<div class="sk-rl-who">now level with: ' +
+           skEscape(r.drewLevel.join(', ')) + '</div>';
     }
   }
   h += '</div>';
