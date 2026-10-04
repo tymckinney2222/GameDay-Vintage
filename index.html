@@ -24092,6 +24092,45 @@
   .sk-rp-row.hd .sk-rp-cat, .sk-rp-row.hd .sk-rp-up, .sk-rp-row.hd .sk-rp-dn,
   .sk-rp-row.hd .sk-rp-you { color: var(--sk-text-4); font-weight: 700; }
   .sk-rp-empty { padding: 4px 14px 14px; font-size: 11px; color: var(--sk-text-4); }
+  /* ROTODAYMOVE - start-of-day rank beside live rank, one table. */
+  .sk-dm {
+    margin: 0 12px 10px; padding: 9px 0 2px; border-radius: 8px;
+    background: rgba(255,255,255,0.025);
+    border: 1px solid rgba(255,255,255,0.07);
+  }
+  .sk-dm-hd {
+    display: flex; align-items: baseline; justify-content: space-between;
+    padding: 0 11px 1px;
+    font-family: var(--sk-font-mono, monospace);
+    font-size: 9.5px; font-weight: 700; letter-spacing: 0.12em;
+    color: var(--sk-text-2);
+  }
+  .sk-dm-net { font-size: 11px; font-weight: 800; color: var(--sk-text-3); }
+  .sk-dm-net.pos { color: var(--sk-green); }
+  .sk-dm-net.neg { color: var(--sk-red); }
+  .sk-dm-sub {
+    padding: 0 11px 7px; font-size: 9px; line-height: 1.4;
+    color: var(--sk-text-4);
+  }
+  .sk-dm-row {
+    display: grid; grid-template-columns: 1fr 52px 52px 62px;
+    align-items: baseline; gap: 4px; padding: 4px 11px;
+    font-family: var(--sk-font-mono, monospace); font-size: 11.5px;
+    border-top: 1px solid rgba(255,255,255,0.04);
+  }
+  .sk-dm-row.hd {
+    border-top: none; font-size: 8.5px; letter-spacing: 0.1em;
+    color: var(--sk-text-4);
+  }
+  .sk-dm-row.hd span:not(:first-child),
+  .sk-dm-from, .sk-dm-to, .sk-dm-d { text-align: right; }
+  .sk-dm-cat { font-weight: 700; color: var(--sk-text); }
+  .sk-dm-from { color: var(--sk-text-4); }
+  .sk-dm-to { color: var(--sk-text-2); font-weight: 700; }
+  .sk-dm-foot {
+    padding: 6px 11px 7px; font-size: 9px; color: var(--sk-text-4);
+    border-top: 1px solid rgba(255,255,255,0.04);
+  }
   .sk-rp-note {
     padding: 10px 14px 12px; font-size: 10px; line-height: 1.45;
     color: var(--sk-text-4); border-top: 1px solid rgba(255,255,255,0.05);
@@ -125713,6 +125752,60 @@ function _skRotoCatStates(league, data, metaOverride) {
   return { groups: groups, byStat: byStat, gain: gainTotal, risk: riskTotal, scored: scored };
 }
 
+// == BOTH COLUMNS AT ONCE == ROTODAYMOVE ==
+//
+// The LIVE and SEASON pills show the same table against two different
+// ladders, so comparing them means holding one in your head while you tap to
+// the other. The comparison is the thing worth seeing, so here it is as one
+// table: where each category stood when the day started, where it stands now,
+// and what that cost or earned in rank points.
+//
+// Both ladders come from _skRotoCatStates, the same function each pill
+// already renders, run twice - once on the settled standings and once on the
+// live ones. Nothing is derived a second way, so this table cannot disagree
+// with either pill.
+//
+// Only the categories that MOVED are listed. Sixteen rows of "no change"
+// would bury the four that matter, and the count of the rest is enough.
+function _rpFlattenStates(res) {
+  var out = {}, g, i;
+  if (!res || !res.groups) return out;
+  for (g in res.groups) {
+    if (!res.groups.hasOwnProperty(g)) continue;
+    var list = res.groups[g] || [];
+    for (i = 0; i < list.length; i++) out[String(list[i].id)] = list[i];
+  }
+  return out;
+}
+
+function _rpDayMoveRows(seasonRes, liveRes) {
+  var S = _rpFlattenStates(seasonRes), L = _rpFlattenStates(liveRes);
+  var rows = [], unmoved = 0, net = 0, id;
+  for (id in L) {
+    if (!L.hasOwnProperty(id) || !S[id]) continue;
+    var a = S[id], b = L[id];
+    var dPts = Math.round((b.pts - a.pts) * 10) / 10;
+    // A rank can change while the points do not (a tie forming or breaking
+    // among teams below you), and the points can change while the rank holds.
+    // Either one is a move worth showing.
+    var moved = (dPts !== 0) || (a.rank !== b.rank) || (!!a.tied !== !!b.tied);
+    if (!moved) { unmoved++; continue; }
+    net += dPts;
+    rows.push({ id: id, label: b.label,
+                rankFrom: a.rank, tiedFrom: a.tied, ptsFrom: a.pts,
+                rankTo: b.rank, tiedTo: b.tied, ptsTo: b.pts,
+                dPts: dPts });
+  }
+  // Biggest swing first, either direction, so the row that explains the day
+  // is the first one read.
+  rows.sort(function (x, y) {
+    var d = Math.abs(y.dPts) - Math.abs(x.dPts);
+    if (d) return d;
+    return x.rankTo - y.rankTo;
+  });
+  return { rows: rows, unmoved: unmoved, net: Math.round(net * 10) / 10 };
+}
+
 function _skBuildRotoPressureHTML(league, data, metaOverride, liveOpt) {
   if (!league || league.scoring_type !== 'roto') return '';
   function shell(msg) {
@@ -125873,12 +125966,57 @@ function _skBuildRotoPressureHTML(league, data, metaOverride, liveOpt) {
     }
   }
 
+  // ---- ROTODAYMOVE ----
+  // Shown in BOTH modes, because the whole point is not having to switch.
+  // The live ladder is resolved here even on SEASON, which costs the same
+  // day-fetch the LIVE pill would have made and which is cached per day.
+  var dayMove = '';
+  try {
+    var _lvDm = _lv;
+    if (!_lvDm) {
+      if (liveOpt) _lvDm = liveOpt.view || null;
+      else { try { _lvDm = _skRotoLiveView(league, data, metaOverride); } catch (eD1) {} }
+    }
+    if (_lvDm && _lvDm.data) {
+      var _sRes = _skRotoCatStates(league, data, metaOverride);
+      var _lRes = _skRotoCatStates(league, _lvDm.data,
+                                   (_lvDm.meta ? _lvDm.meta : metaOverride));
+      var dm = _rpDayMoveRows(_sRes, _lRes);
+      if (dm.rows.length) {
+        var dmNetCls = dm.net > 0 ? 'pos' : (dm.net < 0 ? 'neg' : '');
+        var dmBody = '';
+        dmBody += '<div class="sk-dm-row hd"><span>CAT</span><span>START</span>' +
+                  '<span>NOW</span><span>PTS</span></div>';
+        for (var dmi = 0; dmi < dm.rows.length; dmi++) {
+          var dr = dm.rows[dmi];
+          dmBody += '<div class="sk-dm-row">' +
+            '<span class="sk-dm-cat">' + skEscape(String(dr.label)) + '</span>' +
+            '<span class="sk-dm-from">' + (dr.tiedFrom ? 'T' : '') + ordinal(dr.rankFrom) + '</span>' +
+            '<span class="sk-dm-to">' + (dr.tiedTo ? 'T' : '') + ordinal(dr.rankTo) + '</span>' +
+            '<span class="sk-dm-d">' + _rpArrow(dr.ptsFrom, dr.ptsTo, true) + '</span>' +
+          '</div>';
+        }
+        dayMove = '<div class="sk-dm">' +
+          '<div class="sk-dm-hd"><span>DAY MOVE</span>' +
+            '<span class="sk-dm-net ' + dmNetCls + '">' +
+              (dm.net > 0 ? '+' : '') + f1(dm.net) + ' pts</span></div>' +
+          '<div class="sk-dm-sub">your rank when the day started, and now \u00b7 ' +
+            'both pills in one table</div>' +
+          dmBody +
+          (dm.unmoved ? ('<div class="sk-dm-foot">' + dm.unmoved +
+                         ' categor' + (dm.unmoved === 1 ? 'y' : 'ies') +
+                         ' unchanged</div>') : '') +
+        '</div>';
+      }
+    }
+  } catch (eDm) { dayMove = ''; }
+
   return '<div class="sk-rp" id="skRotoPressCard">' +
     '<div class="sk-rp-head">' +
       '<div class="sk-rp-title">CATEGORY PRESSURE</div>' +
       '<div class="sk-rp-sub">where your rank points can actually move</div>' +
     '</div>' +
-    _rpToggle() + liveBar +
+    _rpToggle() + liveBar + dayMove +
     '<div class="sk-rp-tot">' +
       '<div class="sk-rp-tot-cell"><span class="sk-rp-tot-lbl">WITHIN REACH</span>' +
         '<span class="sk-rp-tot-val pos">' + f1(gainTotal) + '</span></div>' +
