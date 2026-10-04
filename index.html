@@ -118695,7 +118695,37 @@ function skBuildStandingsTable(league, leagueData, allTeams) {
     _skIsNflLeague(league);
   if (_isFbSeasonPts) hasSeasonTodayFp = false;
 
-  var hasProjection = hasWeekRecords || hasSeasonTodayFp;
+  // == IF TODAY ENDED NOW, IN ROTO == ROTOPROJ ==
+  //
+  // Roto rides the season-points path through this builder (ROTOSP), and the
+  // season-points projection adds today's FANTASY POINTS to a team's PF. In
+  // roto that is meaningless twice over: the standings column is rank points,
+  // and fantasy points are not the currency. So that route is shut off here
+  // and the real one takes its place.
+  //
+  // The real one already exists. _skRotoLiveView re-ranks the whole league on
+  // season + today and reports, per team, ptsFrom (the settled ladder) and
+  // ptsTo (the live one). The difference between them IS "if today ended now"
+  // - and because both sides come from one derivation, the delta is today's
+  // movement rather than a disagreement between two sources.
+  //
+  // That delta is applied to Yahoo's PUBLISHED total rather than replacing it.
+  // The published figure is what the league's own standings page shows, and
+  // swapping it for a derived one in a view labelled "Actual" would be a
+  // quiet substitution. Adding a derived MOVEMENT to it is the honest shape:
+  // their number, plus what today has done since.
+  var _rotoProj = null;
+  if (scoringType === 'roto') {
+    hasSeasonTodayFp = false;
+    try {
+      if (typeof _skRotoLiveView === 'function') {
+        var _rv = _skRotoLiveView(league, { allTeams: allTeams, team: { team_key: myKey } });
+        if (_rv && _rv.moved && _rv.touched) _rotoProj = _rv;
+      }
+    } catch (eRp) { _rotoProj = null; }
+  }
+
+  var hasProjection = hasWeekRecords || hasSeasonTodayFp || !!_rotoProj;
   if (!hasProjection) view = 'actual';
 
   // Snapshot allTeams as an array; the renderer (skRenderStandingsRows)
@@ -118739,6 +118769,20 @@ function skBuildStandingsTable(league, leagueData, allTeams) {
       if (todayFp != null && !isNaN(todayFp)) {
         seasonFpDelta = todayFp;
         pfNow = basePf + todayFp;
+      }
+    }
+    // ROTOPROJ - rank points moved by today, from the live ladder.
+    if (view === 'projected' && _rotoProj && _rotoProj.moved[k]) {
+      var _mv = _rotoProj.moved[k];
+      if (_mv.ptsFrom != null && _mv.ptsTo != null) {
+        var _rd = Math.round((_mv.ptsTo - _mv.ptsFrom) * 10) / 10;
+        seasonFpDelta = _rd;
+        // Yahoo publishes no points_for on a roto row in some leagues. Where
+        // it is missing, the derived live total stands on its own rather than
+        // leaving the column empty in the one view built to fill it.
+        pfNow = (basePf != null)
+          ? Math.round((basePf + _rd) * 10) / 10
+          : Math.round(_mv.ptsTo * 10) / 10;
       }
     }
     return {
@@ -118832,8 +118876,10 @@ function skBuildStandingsTable(league, leagueData, allTeams) {
     sortedForRank.forEach(function(r, i) {
       r.rank = i + 1;
     });
-  } else if (view === 'projected' && hasSeasonTodayFp && _isLeagueView) {
+  } else if (view === 'projected' && (hasSeasonTodayFp || _rotoProj) && _isLeagueView) {
     // Season-points: check if any pf delta is non-zero before resorting.
+    // ROTOPROJ rides the same check - its delta lands in the same field, so a
+    // day where nothing moved leaves the order exactly as Actual has it.
     var anyPfChanged = false;
     for (var pri = 0; pri < rows.length; pri++) {
       if (rows[pri].seasonFpDelta && rows[pri].seasonFpDelta !== 0) {
@@ -119011,7 +119057,17 @@ function skBuildStandingsTable(league, leagueData, allTeams) {
       '<button class="sk-toggle-btn' + (view === 'projected' ? ' active' : '') +
         '" onclick="skSetStandingsView(\'' + league.league_key + '\', \'projected\')">If ' + (isSeasonPts ? 'today ended' : 'week ended') + ' now</button>' +
     '</div>';
-  } else if (_isFbSeasonPts) {
+  }
+  if (hasProjection && _rotoProj && view === 'projected') {
+    // ROTOPROJ - what the number is, in one line, where the number is.
+    toggleHTML += '<div class="sk-standings-livenote">Rank points, re-ranked on ' +
+      'season + today \u2014 every category re-sorted with today\u2019s games ' +
+      'folded in, so passing somebody takes their point' +
+      (_rotoProj.rates && _rotoProj.rates.length
+        ? (' \u00b7 held at season: ' + skEscape(_rotoProj.rates.join(', ')))
+        : '') + '.</div>';
+  }
+  if (_isFbSeasonPts) {
     // NFLSPPF — no toggle, but say why rather than leaving a silent gap.
     toggleHTML += '<div class="sk-standings-livenote">PF is live \u2014 football ' +
       'scores by the week and Yahoo counts the week in progress as it ' +
