@@ -24140,6 +24140,69 @@
     padding: 6px 11px 7px; font-size: 9px; color: var(--sk-text-4);
     border-top: 1px solid rgba(255,255,255,0.04);
   }
+  /* ROTOMATH - the arithmetic, shown. */
+  .sk-rm {
+    margin: 0 12px 10px; border-radius: 8px;
+    background: rgba(255,255,255,0.025);
+    border: 1px solid rgba(255,255,255,0.07);
+  }
+  .sk-rm-sum {
+    padding: 10px 11px; cursor: pointer; list-style: none;
+    font-family: var(--sk-font-mono, monospace);
+    font-size: 9.5px; font-weight: 700; letter-spacing: 0.1em;
+    color: var(--sk-text-2);
+  }
+  .sk-rm-sum::-webkit-details-marker { display: none; }
+  .sk-rm-sum::after { content: ' \25be'; color: var(--sk-text-4); }
+  .sk-rm[open] > .sk-rm-sum::after { content: ' \25b4'; }
+  .sk-rm-rule {
+    padding: 0 11px 9px; font-size: 10.5px; line-height: 1.55;
+    color: var(--sk-text-3);
+  }
+  .sk-rm-rule b { color: var(--sk-text-2); }
+  .sk-rm-row {
+    display: grid; grid-template-columns: 1fr 58px 76px 44px;
+    align-items: baseline; gap: 4px; padding: 5px 11px;
+    font-family: var(--sk-font-mono, monospace); font-size: 11.5px;
+    border-top: 1px solid rgba(255,255,255,0.04);
+  }
+  .sk-rm-row.hd {
+    border-top: none; font-size: 8.5px; letter-spacing: 0.1em;
+    color: var(--sk-text-4);
+  }
+  .sk-rm-row span:not(:first-child) { text-align: right; }
+  .sk-rm-cat { display: block; }
+  .sk-rm-cat > summary { cursor: pointer; list-style: none; }
+  .sk-rm-cat > summary::-webkit-details-marker { display: none; }
+  .sk-rm-cat-l { font-weight: 700; color: var(--sk-text); }
+  .sk-rm-low {
+    margin-left: 5px; font-size: 8px; font-style: normal;
+    letter-spacing: 0.06em; color: var(--sk-text-4);
+  }
+  .sk-rm-val { color: var(--sk-text-2); }
+  .sk-rm-place { color: var(--sk-text-3); font-size: 10.5px; }
+  .sk-rm-pts { font-weight: 800; color: var(--sk-gold); }
+  .sk-rm-row.tot {
+    border-top: 1px solid rgba(255,255,255,0.14);
+    font-weight: 800; color: var(--sk-text-2);
+  }
+  .sk-rm-row.tot span:nth-child(3) { font-weight: 400; color: var(--sk-text-4); font-size: 9.5px; }
+  .sk-rm-row.tot span:last-child { color: var(--sk-gold); }
+  .sk-rm-lad { padding: 2px 0 6px; background: rgba(0,0,0,0.18); }
+  .sk-rm-lrow {
+    display: grid; grid-template-columns: 54px 1fr 58px 42px;
+    align-items: baseline; gap: 4px; padding: 3px 11px;
+    font-family: var(--sk-font-mono, monospace); font-size: 10.5px;
+    color: var(--sk-text-3);
+  }
+  .sk-rm-lrow.me {
+    background: rgba(245,213,71,0.10); color: var(--sk-text);
+    box-shadow: inset 3px 0 0 var(--sk-gold);
+  }
+  .sk-rm-lname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sk-rm-lval, .sk-rm-lpts { text-align: right; }
+  .sk-rm-lpts { font-weight: 700; }
+  .sk-rm-lrow.me .sk-rm-lpts { color: var(--sk-gold); }
   .sk-rp-note {
     padding: 10px 14px 12px; font-size: 10px; line-height: 1.45;
     color: var(--sk-text-4); border-top: 1px solid rgba(255,255,255,0.05);
@@ -125867,6 +125930,103 @@ function _rpDayMoveRows(seasonRes, liveRes, lv) {
   return { rows: rows, unmoved: unmoved, net: Math.round(net * 10) / 10 };
 }
 
+// == SHOW THE ARITHMETIC == ROTOMATH ==
+//
+// Every other surface here reports a roto number. None of them shows where it
+// came from, and the rule is not guessable from one row: in an N-team league
+// last place in a category pays 1 and first pays N, and a tie splits the
+// places it covers between the teams in it. Seeing "5.5" with no ladder
+// beside it is how a half point starts looking like a per-save rate.
+//
+// So: one row per category - your value, your place, what that place pays -
+// and a TOTAL that visibly equals your roto points. Then any category opens
+// into the full league ladder for it, every team's value in order, with the
+// places and the split shown.
+//
+// The points are NOT recomputed here. _skRotoDeriveCatPoints is the single
+// definition and this calls it, so the table cannot teach you arithmetic the
+// board does not actually use. Only the PLACE labels are worked out here,
+// from the same counting the derivation does.
+function _skRotoLadderFor(activeData, order, statsMeta, catId) {
+  var at = (activeData && activeData.allTeams) || {};
+  var teams = [], k;
+  for (k in at) {
+    if (!at.hasOwnProperty(k)) continue;
+    // BOTH, deliberately: the groups above build their team list from
+    // catPoints and the derivation needs catStats. Requiring only one would
+    // let this table rank a different number of teams than the board does,
+    // and then its arithmetic would be right about the wrong league.
+    if (!at[k] || !at[k].catStats || !at[k].catPoints) continue;
+    teams.push({ key: k, name: at[k].name || k, raw: at[k].catStats });
+  }
+  if (teams.length < 2) return null;
+
+  var id = String(catId);
+  var m = statsMeta[id] || {};
+  if (m.isOnlyDisplayStat || m.enabled === false) return null;
+  var lowerWins = (m.sortOrder === 0);
+
+  // The points, from the app's one derivation - never a second copy.
+  var pts = _skRotoDeriveCatPoints(teams, [id], statsMeta);
+
+  var rows = [], i;
+  for (i = 0; i < teams.length; i++) {
+    var v = parseFloat(teams[i].raw[id]);
+    rows.push({ key: teams[i].key, name: teams[i].name,
+                val: isNaN(v) ? null : v,
+                pts: (pts[teams[i].key] || {})[id] });
+  }
+  // Best first. A team with no value at all is last, which is what the
+  // derivation does with it too (ROTONULLRANK).
+  rows.sort(function (a, b) {
+    if ((a.val == null) !== (b.val == null)) return (a.val == null) ? 1 : -1;
+    if (a.val == null) return String(a.name).localeCompare(String(b.name));
+    if (a.val !== b.val) return lowerWins ? (a.val - b.val) : (b.val - a.val);
+    return String(a.name).localeCompare(String(b.name));
+  });
+
+  // Places, counting ties the way the points do: everyone level shares the
+  // block of places they jointly occupy.
+  var n = rows.length;
+  for (i = 0; i < n; ) {
+    var j = i;
+    while (j + 1 < n && rows[j + 1].val === rows[i].val) j++;
+    var from = i + 1, to = j + 1;
+    for (var q = i; q <= j; q++) {
+      rows[q].place = from;
+      rows[q].span = (to > from) ? (to - from + 1) : 1;
+      rows[q].placeTxt = (to > from) ? ('T' + from + '\u2013' + to) : String(from);
+    }
+    i = j + 1;
+  }
+  return { rows: rows, teams: n, lowerWins: lowerWins,
+           label: (typeof _skRotoCatLabel === 'function' ? _skRotoCatLabel(m) : '') ||
+                  m.abbr || m.displayName || ('#' + id) };
+}
+
+// One line per category plus the total, which is the point: the column has to
+// add up to the number on the card.
+function _skRotoMathSummary(activeData, order, statsMeta, myKey) {
+  var out = [], total = 0, any = false, i;
+  for (i = 0; i < order.length; i++) {
+    var id = String(order[i]);
+    var L = _skRotoLadderFor(activeData, order, statsMeta, id);
+    if (!L) continue;
+    var mine = null;
+    for (var j = 0; j < L.rows.length; j++) {
+      if (L.rows[j].key === myKey) { mine = L.rows[j]; break; }
+    }
+    if (!mine) continue;
+    any = true;
+    if (mine.pts != null) total += mine.pts;
+    out.push({ id: id, label: L.label, ladder: L,
+               val: mine.val, placeTxt: mine.placeTxt, span: mine.span,
+               pts: mine.pts, teams: L.teams, lowerWins: L.lowerWins });
+  }
+  if (!any) return null;
+  return { rows: out, total: Math.round(total * 10) / 10 };
+}
+
 function _skBuildRotoPressureHTML(league, data, metaOverride, liveOpt) {
   if (!league || league.scoring_type !== 'roto') return '';
   function shell(msg) {
@@ -126092,12 +126252,76 @@ function _skBuildRotoPressureHTML(league, data, metaOverride, liveOpt) {
     }
   } catch (eDm) { dayMove = ''; }
 
+  // ---- ROTOMATH ----
+  // Built from the SAME ladder the groups above are built from, so the table
+  // showing the arithmetic and the table using it cannot disagree.
+  var mathHtml = '';
+  try {
+    var _mData = _lv ? _lv.data : data;
+    var _mMeta = (_lv && _lv.meta) ? _lv.meta : metaOverride;
+    var _mFull = _mMeta ||
+      ((typeof leagueSettingsCache !== 'undefined' && league.league_key &&
+        leagueSettingsCache[league.league_key]) ? leagueSettingsCache[league.league_key] : null);
+    var _mStats = (_mFull && _mFull.stats) || {};
+    var _mOrder = (_mFull && _mFull.statOrder) || [];
+    var _mMine = (_mData && _mData.team && _mData.team.team_key) || '';
+    if (!_mOrder.length && _mData && _mData.allTeams && _mMine &&
+        _mData.allTeams[_mMine] && _mData.allTeams[_mMine].catStats) {
+      for (var _mk in _mData.allTeams[_mMine].catStats) {
+        if (_mData.allTeams[_mMine].catStats.hasOwnProperty(_mk)) _mOrder.push(_mk);
+      }
+    }
+    var MS = (_mOrder.length && _mMine)
+      ? _skRotoMathSummary(_mData, _mOrder, _mStats, _mMine) : null;
+    if (MS && MS.rows.length) {
+      var _mFmt = _skRotoFmtRawFor(_mFull);
+      var nTeams = MS.rows[0].teams;
+      var mb = '';
+      mb += '<div class="sk-rm-rule">In a <b>' + nTeams + '-team</b> league, last place in a ' +
+            'category pays <b>1</b> point and first pays <b>' + nTeams + '</b>. Teams that are ' +
+            'level split the places they cover \u2014 two tied for 15th take 15th and 16th, ' +
+            'so each gets ' + f1(((nTeams - 15 + 1) + (nTeams - 16 + 1)) / 2) +
+            '. Tap a category to see the whole ladder.</div>';
+      mb += '<div class="sk-rm-row hd"><span>CAT</span><span>YOU</span>' +
+            '<span>PLACE</span><span>PTS</span></div>';
+      for (var mi = 0; mi < MS.rows.length; mi++) {
+        var mr = MS.rows[mi];
+        mb += '<details class="sk-rm-cat">';
+        mb += '<summary class="sk-rm-row">' +
+          '<span class="sk-rm-cat-l">' + skEscape(String(mr.label)) +
+            (mr.lowerWins ? '<i class="sk-rm-low">low wins</i>' : '') + '</span>' +
+          '<span class="sk-rm-val">' + skEscape(_mFmt(mr.val, mr.id)) + '</span>' +
+          '<span class="sk-rm-place">' + skEscape(String(mr.placeTxt)) +
+            ' of ' + mr.teams + '</span>' +
+          '<span class="sk-rm-pts">' + (mr.pts == null ? '\u2014' : f1(mr.pts)) + '</span>' +
+        '</summary>';
+        // The whole ladder for this category, in order, mine marked.
+        mb += '<div class="sk-rm-lad">';
+        for (var lj = 0; lj < mr.ladder.rows.length; lj++) {
+          var lr = mr.ladder.rows[lj];
+          mb += '<div class="sk-rm-lrow' + (lr.key === _mMine ? ' me' : '') + '">' +
+            '<span class="sk-rm-lplace">' + skEscape(String(lr.placeTxt)) + '</span>' +
+            '<span class="sk-rm-lname">' + skEscape(String(lr.name)) + '</span>' +
+            '<span class="sk-rm-lval">' + skEscape(_mFmt(lr.val, mr.id)) + '</span>' +
+            '<span class="sk-rm-lpts">' + (lr.pts == null ? '\u2014' : f1(lr.pts)) + '</span>' +
+          '</div>';
+        }
+        mb += '</div></details>';
+      }
+      mb += '<div class="sk-rm-row tot"><span>TOTAL</span><span></span>' +
+            '<span>your roto points</span><span>' + f1(MS.total) + '</span></div>';
+      mathHtml = '<details class="sk-rm">' +
+        '<summary class="sk-rm-sum">SHOW THE MATH \u00b7 how ' + f1(MS.total) +
+        ' is arrived at</summary>' + mb + '</details>';
+    }
+  } catch (eRm) { mathHtml = ''; }
+
   return '<div class="sk-rp" id="skRotoPressCard">' +
     '<div class="sk-rp-head">' +
       '<div class="sk-rp-title">CATEGORY PRESSURE</div>' +
       '<div class="sk-rp-sub">where your rank points can actually move</div>' +
     '</div>' +
-    _rpToggle() + liveBar + dayMove +
+    _rpToggle() + liveBar + dayMove + mathHtml +
     '<div class="sk-rp-tot">' +
       '<div class="sk-rp-tot-cell"><span class="sk-rp-tot-lbl">WITHIN REACH</span>' +
         '<span class="sk-rp-tot-val pos">' + f1(gainTotal) + '</span></div>' +
