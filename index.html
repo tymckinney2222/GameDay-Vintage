@@ -23923,6 +23923,55 @@
 
   /* Daily-delta table (this week, Mon–Sun margins vs every team) */
   .sk-catch-daily { border-top: 1px solid var(--sk-border); }
+  /* ROTOLEDGER - my own total, category by category. */
+  .sk-rl {
+    margin: 10px 0 0; border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 10px; background: rgba(255,255,255,0.015);
+  }
+  .sk-rl-sum {
+    padding: 11px 14px; cursor: pointer; list-style: none;
+    font-family: var(--sk-font-mono);
+    font-size: 10.5px; font-weight: 700; letter-spacing: 0.12em;
+    color: var(--sk-text-2);
+  }
+  .sk-rl-sum::-webkit-details-marker { display: none; }
+  .sk-rl-sum::after { content: ' \25be'; color: var(--sk-text-4); }
+  .sk-rl[open] .sk-rl-sum::after { content: ' \25b4'; }
+  .sk-rl-sum b.up { color: var(--sk-green); }
+  .sk-rl-sum b.dn { color: var(--sk-red); }
+  .sk-rl-sum b.flat { color: var(--sk-text-3); }
+  .sk-rl-why {
+    padding: 0 14px 10px; font-size: 11px; line-height: 1.5;
+    color: var(--sk-text-3);
+  }
+  .sk-rl-why em { color: var(--sk-text-2); font-style: normal; font-weight: 700; }
+  .sk-rl-tbl { padding: 0 14px 4px; font-family: var(--sk-font-mono); }
+  .sk-rl-hd, .sk-rl-row {
+    display: grid; grid-template-columns: 1fr 44px 44px 52px;
+    align-items: baseline; gap: 4px; padding: 4px 0;
+  }
+  .sk-rl-hd {
+    font-size: 8.5px; letter-spacing: 0.1em; color: var(--sk-text-4);
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+  }
+  .sk-rl-row { border-bottom: 1px solid rgba(255,255,255,0.03); font-size: 12px; }
+  .sk-rl-cat { font-weight: 700; color: var(--sk-text); }
+  .sk-rl-was, .sk-rl-now { text-align: right; color: var(--sk-text-3); font-size: 11px; }
+  .sk-rl-d { text-align: right; font-weight: 800; }
+  .sk-rl-d.up { color: var(--sk-green); }
+  .sk-rl-d.dn { color: var(--sk-red); }
+  .sk-rl-who {
+    padding: 1px 0 5px 2px; font-size: 10px; line-height: 1.4;
+    color: var(--sk-text-3);
+  }
+  .sk-rl-who.dn { color: rgba(248,113,113,0.75); }
+  .sk-rl-who.up { color: rgba(74,222,128,0.75); }
+  .sk-rl-foot {
+    padding: 8px 14px 12px; font-size: 10.5px; line-height: 1.5;
+    color: var(--sk-text-3); border-top: 1px solid rgba(255,255,255,0.05);
+  }
+  .sk-rl-foot b.up { color: var(--sk-green); }
+  .sk-rl-foot b.dn { color: var(--sk-red); }
   .sk-catch-daily-sum {
     padding: 11px 14px; cursor: pointer; list-style: none;
     font-size: 10.5px; font-weight: 700; letter-spacing: 0.12em;
@@ -126019,6 +126068,143 @@ function _skRotoLiveDelta(league, allTeams, myKey, rivalKey, lvIn) {
 // down for the league card, and the later definition silently wins. Renders nothing at all
 // when nothing has moved - an empty "TODAY" panel on a quiet afternoon is
 // worse than no panel, because it reads as a broken one.
+// == WHERE MY POINTS WENT == ROTOLEDGER ==
+//
+// The rival cards answer a PAIRWISE question: what happened to the gap
+// between you and one team ahead. That number can be green on every card
+// while your own total falls, for two reasons that the cards cannot show:
+//
+//   1. A gap closes if THEY drop, not only if you climb. "+18 on them" is
+//      compatible with you losing 4 points and them losing 22.
+//   2. The cards only look UP the table. Roto points are rank points against
+//      the whole league, so a team BEHIND you passing you in a category takes
+//      a point off you - and no card above is watching that direction.
+//
+// So this is the other question, asked once: your own total, category by
+// category, baseline to now, and the names of whoever crossed you. It
+// reconciles exactly to the headline change, because both come from the same
+// per-category ladder _skRotoLiveView already built.
+//
+// Comparing POINTS rather than raw stats is deliberate: in roto the points
+// ARE the rank, so "they passed me" is exactly "their category points went
+// from below mine to above mine". No separate ranking pass to disagree with.
+function _skRotoMyLedger(lv) {
+  if (!lv || !lv.myKey || !lv.order || !lv.seasonCat) return null;
+  var me = lv.myKey;
+  var at = (lv.data && lv.data.allTeams) || {};
+  var sc = lv.seasonCat;
+  if (!sc[me] || !at[me]) return null;
+
+  function liveCat(k) { return (at[k] && at[k].catPoints) || {}; }
+  var mySeason = sc[me], myLive = liveCat(me);
+  var rows = [], up = 0, down = 0, flat = 0, i, k;
+  var byMe = {}, onMe = {};
+
+  for (i = 0; i < lv.order.length; i++) {
+    var id = String(lv.order[i]);
+    var m = (lv.statsMeta || {})[id] || {};
+    if (m.isOnlyDisplayStat || m.enabled === false) continue;
+    var was = mySeason[id], now = myLive[id];
+    if (was == null || now == null) continue;
+    var d = Math.round((now - was) * 10) / 10;
+    if (!d) { flat++; continue; }
+
+    var passedMe = [], iPassed = [];
+    for (k in at) {
+      if (!at.hasOwnProperty(k) || k === me) continue;
+      var tw = (sc[k] || {})[id], tn = liveCat(k)[id];
+      if (tw == null || tn == null) continue;
+      // Below me then, above me now - and the other way round.
+      if (tw < was && tn > now) { passedMe.push(at[k].name || k); onMe[k] = 1; }
+      else if (tw > was && tn < now) { iPassed.push(at[k].name || k); byMe[k] = 1; }
+    }
+    rows.push({ id: id, label: (typeof _skRotoCatLabel === 'function' ? _skRotoCatLabel(m) : '') ||
+                  m.abbr || m.displayName || ('#' + id),
+                was: was, now: now, delta: d,
+                passedMe: passedMe, iPassed: iPassed });
+    if (d > 0) up += d; else down += d;
+  }
+
+  // Soonest-to-explain first: the biggest losses, then the biggest gains.
+  rows.sort(function (a, b) { return a.delta - b.delta; });
+  var nOn = 0, nBy = 0;
+  for (k in onMe) { if (onMe.hasOwnProperty(k)) nOn++; }
+  for (k in byMe) { if (byMe.hasOwnProperty(k)) nBy++; }
+
+  var mv = lv.me || null;
+  return {
+    rows: rows, gained: Math.round(up * 10) / 10, lostPts: Math.round(down * 10) / 10,
+    net: Math.round((up + down) * 10) / 10, flat: flat,
+    teamsPastMe: nOn, teamsIPassed: nBy,
+    was: mv ? mv.ptsFrom : null, now: mv ? mv.ptsTo : null,
+    rankFrom: mv ? mv.rankFrom : null, rankTo: mv ? mv.rankTo : null
+  };
+}
+
+function _skRotoLedgerHtml(lv) {
+  var L = null;
+  try { L = _skRotoMyLedger(lv); } catch (e) { return ''; }
+  if (!L || !L.rows.length) return '';
+
+  function sgn(v) {
+    var r = (Math.round(v * 10) / 10).toFixed(1);
+    return (v > 0 ? '+' : '') + r;
+  }
+  function one(v) { return (Math.round(v * 10) / 10).toFixed(1); }
+  var netCls = L.net > 0 ? 'up' : (L.net < 0 ? 'dn' : 'flat');
+
+  var h = '';
+  h += '<details class="sk-rl">';
+  h += '<summary class="sk-rl-sum">MY POINTS TODAY' +
+       (L.was != null ? (' \u00b7 ' + one(L.was) + ' \u2192 ' + one(L.now)) : '') +
+       ' <b class="' + netCls + '">' + sgn(L.net) + '</b></summary>';
+
+  h += '<div class="sk-rl-why">The cards above measure the gap to one rival, ' +
+       'and a gap closes when they drop as readily as when you climb. This is ' +
+       'your own total against the whole league \u2014 including the teams ' +
+       '<em>behind</em> you, who take a point off you every time they pass you ' +
+       'in a category.</div>';
+
+  h += '<div class="sk-rl-tbl">';
+  h += '<div class="sk-rl-hd"><span>CAT</span><span>WAS</span><span>NOW</span>' +
+       '<span>\u0394</span></div>';
+  for (var i = 0; i < L.rows.length; i++) {
+    var r = L.rows[i];
+    var cls = r.delta > 0 ? 'up' : 'dn';
+    h += '<div class="sk-rl-row ' + cls + '">' +
+      '<span class="sk-rl-cat">' + skEscape(String(r.label)) + '</span>' +
+      '<span class="sk-rl-was">' + one(r.was) + '</span>' +
+      '<span class="sk-rl-now">' + one(r.now) + '</span>' +
+      '<span class="sk-rl-d ' + cls + '">' + sgn(r.delta) + '</span>' +
+      '</div>';
+    // The names are the whole explanation, so they get their own line rather
+    // than being squeezed into a column that would truncate them.
+    if (r.passedMe.length) {
+      h += '<div class="sk-rl-who dn">passed you: ' +
+           skEscape(r.passedMe.join(', ')) + '</div>';
+    }
+    if (r.iPassed.length) {
+      h += '<div class="sk-rl-who up">you passed: ' +
+           skEscape(r.iPassed.join(', ')) + '</div>';
+    }
+  }
+  h += '</div>';
+
+  var bits = [];
+  if (L.teamsPastMe) bits.push('<b class="dn">' + L.teamsPastMe + '</b> team' +
+    (L.teamsPastMe === 1 ? '' : 's') + ' passed you');
+  if (L.teamsIPassed) bits.push('<b class="up">' + L.teamsIPassed + '</b> you passed');
+  if (L.flat) bits.push(L.flat + ' categor' + (L.flat === 1 ? 'y' : 'ies') + ' unmoved');
+  h += '<div class="sk-rl-foot">' + bits.join(' \u00b7 ') +
+       (L.rankFrom != null && L.rankTo != null && L.rankFrom !== L.rankTo
+         ? ('<br>overall ' + (typeof skOrdinal === 'function' ? skOrdinal(L.rankFrom) : L.rankFrom) +
+            ' \u2192 ' + (typeof skOrdinal === 'function' ? skOrdinal(L.rankTo) : L.rankTo))
+         : '') +
+       '</div>';
+  h += '</details>';
+  return h;
+}
+
 function _skCatchLiveHtml(league, allTeams, myKey, rivalKey, maxRows, lvIn) {
   var dl = null;
   try { dl = _skRotoLiveDelta(league, allTeams, myKey, rivalKey, lvIn); } catch (e) { return ''; }
@@ -127025,6 +127211,13 @@ function skBuildCatchTheLeaders(rows, myKey, league, allTeams) {
         + (wtdPartial ? ' THIS WEEK* is partial \u2014 measured from your first snapshot this week, '
                       + 'so it misses anything scored before that. Full weeks track Monday-to-Monday.' : '')
         + '</div>';
+
+  // ROTOLEDGER - the other question: not the gap to one rival, but what
+  // happened to MY total. Sits directly under the note that explains how roto
+  // points work, because it is the worked example of it.
+  if (_isRoto && _lvOnce) {
+    try { html += _skRotoLedgerHtml(_lvOnce) || ''; } catch (eRl) {}
+  }
 
   // ── This-week daily breakdown (Mon–Sun margins vs every team) ───────
   if (lkey) {
