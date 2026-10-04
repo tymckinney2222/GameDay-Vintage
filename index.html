@@ -43266,6 +43266,20 @@ async function _skStadiumRefresh() {
     }
     // 4) Refresh the score cards underneath too (count markers / scores).
     if (typeof renderCards === 'function') { try { renderCards(); } catch (e) {} }
+    // 5) FHUBSTALE - the per-player FP lines have just been rebuilt from fresh
+    //    stats. The TEAM score above them is a different number from a
+    //    different call, and nothing here was refreshing it, so a tap moved
+    //    the players and left the total alone. Mark it stale; if the hub is
+    //    open, redraw it now so the re-ask happens while you are looking at
+    //    it rather than the next time you open it.
+    try { if (typeof _fhubMarkScoresStale === 'function') _fhubMarkScoresStale(); } catch (eH) {}
+    try {
+      var _fhubM = document.getElementById('fhubAllModal');
+      if (_fhubM && _fhubM.classList.contains('open') &&
+          typeof openFantasyHubAll === 'function') {
+        openFantasyHubAll();
+      }
+    } catch (eH2) {}
   } catch (e) {
     try { console.warn('[stadium-refresh] failed', e); } catch (e2) {}
   } finally {
@@ -79471,11 +79485,32 @@ function _fhubAllBadge(g) {
 // they have all landed rather than a flicker per arrival.
 var _fhubWarmed = {};
 
-function _fhubWarmOne(g) {
+// == THE SCORE GOES STALE TOO == FHUBSTALE ==
+//
+// Warming is once-per-session and skips any league whose score is already
+// answerable. That is right for filling in a blank, and wrong after an
+// explicit refresh: the player lines under the score get rebuilt from fresh
+// stats while the score above them keeps whatever it had when the league was
+// last hydrated. Tapping FP refresh and watching a player move while the team
+// total sat still is exactly that.
+//
+// So a refresh marks the scores stale, and the next draw re-asks for the
+// leagues it is about to show - the handful with players in THIS game, not
+// every league synced. The flag is consumed when that pass builds its list,
+// so the redraw it triggers finds nothing to do and stops rather than looping.
+var _fhubScoresStale = false;
+
+function _fhubMarkScoresStale() {
+  _fhubScoresStale = true;
+  _fhubWarmed = {};
+}
+
+function _fhubWarmOne(g, force) {
   var fmt = _fhubFmtOf(g);
   if (fmt !== 'head' && fmt !== 'headone' && fmt !== 'headpoint') return null;
-  // Already answerable - nothing to fetch.
-  try { if (_fhubMatchupFor(g)) return null; } catch (e0) {}
+  // Already answerable - nothing to fetch, unless we have been told the
+  // number itself is out of date.
+  if (!force) { try { if (_fhubMatchupFor(g)) return null; } catch (e0) {} }
   var lg = g.lg;
   try {
     if (lg && lg.provider === 'espn' && typeof espRefreshLive === 'function') {
@@ -79487,7 +79522,7 @@ function _fhubWarmOne(g) {
         catch (e1) { res(null); }
       });
     }
-    if (!lg && typeof skHydrateLeague === 'function' &&
+    if ((!lg || lg.provider === 'yahoo') && typeof skHydrateLeague === 'function' &&
         typeof fyLeagues !== 'undefined' && fyLeagues) {
       var want = String(g.key || '');
       for (var i = 0; i < fyLeagues.length; i++) {
@@ -79503,14 +79538,20 @@ function _fhubWarmOne(g) {
 // true when something was actually fetched, so the caller knows a repaint is
 // coming. done() runs once, after every job settles.
 function _fhubWarmMatchups(groups, done) {
+  // FHUBSTALE - consumed here, before any async work, so the repaint this
+  // pass schedules does not force a second one.
+  var force = _fhubScoresStale;
+  _fhubScoresStale = false;
+
   var todo = [], i;
   for (i = 0; i < (groups || []).length; i++) {
     var g = groups[i];
     var k = String(g && g.key || '');
-    if (!k || _fhubWarmed[k]) continue;
+    if (!k) continue;
+    if (!force && _fhubWarmed[k]) continue;
     var fmt = _fhubFmtOf(g);
     if (fmt !== 'head' && fmt !== 'headone' && fmt !== 'headpoint') continue;
-    try { if (_fhubMatchupFor(g)) continue; } catch (e) {}
+    if (!force) { try { if (_fhubMatchupFor(g)) continue; } catch (e) {} }
     _fhubWarmed[k] = 1;
     todo.push(g);
   }
@@ -79518,11 +79559,11 @@ function _fhubWarmMatchups(groups, done) {
   function settle() { try { done(); } catch (e3) {} }
   var run = (typeof _espnMapLimited === 'function')
     ? _espnMapLimited(todo, 3, function (g2) {
-        var p = _fhubWarmOne(g2);
+        var p = _fhubWarmOne(g2, force);
         return p ? p['catch'](function () { return null; }) : Promise.resolve(null);
       })
     : Promise.all(todo.map(function (g2) {
-        var p = _fhubWarmOne(g2);
+        var p = _fhubWarmOne(g2, force);
         return p ? p['catch'](function () { return null; }) : Promise.resolve(null);
       }));
   Promise.resolve(run).then(settle, settle);
