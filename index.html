@@ -3024,12 +3024,46 @@
   /* Bottom Navigation Bar */
   .bottom-nav {
     position: fixed; bottom: 0; left: 0; right: 0; z-index: 8500;
-    display: flex; align-items: stretch; justify-content: space-around;
+    /* NIGHTSTRIP - a column now, so the strip can sit above the buttons
+       inside the same fixed bar. .bnav-row below carries exactly what this
+       rule used to say about laying the buttons out, so the buttons
+       themselves are unchanged. */
+    display: flex; flex-direction: column;
     background: var(--nav-bg);
     border-top: 1px solid rgba(255,255,255,0.06);
     padding: 6px 0 env(safe-area-inset-bottom, 6px);
     -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px);
   }
+  .bnav-row { display: flex; align-items: stretch; justify-content: space-around; }
+  /* NIGHTSTRIP */
+  .sk-night-strip {
+    display: none; align-items: center; gap: 8px;
+    margin: -2px 10px 5px; padding: 5px 10px; border-radius: 8px;
+    background: rgba(245,197,24,0.08); border: 1px solid rgba(245,197,24,0.22);
+    cursor: pointer; overflow: hidden;
+  }
+  .sk-night-strip:active { background: rgba(245,197,24,0.16); }
+  .sk-night-label {
+    font-family: 'Barlow Condensed', sans-serif; font-weight: 800; font-size: 10px;
+    letter-spacing: 0.14em; color: var(--sk-gold, #f5c518); flex-shrink: 0;
+  }
+  .sk-night-fp {
+    font-family: 'Share Tech Mono', monospace; font-size: 13px; font-weight: 700;
+    color: rgba(255,255,255,0.75); flex-shrink: 0;
+  }
+  .sk-night-fp.up { color: #fbbf24; }
+  .sk-night-fp.dn { color: #f87171; }
+  .sk-night-meta {
+    flex: 1; min-width: 0; text-align: right;
+    font-family: 'Share Tech Mono', monospace; font-size: 9.5px;
+    color: rgba(255,255,255,0.45);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .sk-night-go { flex-shrink: 0; color: rgba(255,255,255,0.3); font-size: 14px; line-height: 1; }
+  .vintage-mode .sk-night-strip {
+    background: rgba(196,149,32,0.1); border-color: rgba(196,149,32,0.3);
+  }
+  .vintage-mode .sk-night-label { color: #c49520; }
   .bnav-item {
     flex: 1; display: flex; flex-direction: column; align-items: center;
     gap: 2px; padding: 6px 4px; border: none; background: none;
@@ -3053,6 +3087,11 @@
   .bnav-badge:empty, .bnav-badge[data-count="0"] { display: none; }
   /* Add bottom padding to main content so it doesn't hide behind nav */
   .cards-grid { padding-bottom: 70px !important; }
+  /* NIGHTSTRIP - the strip makes the fixed bar taller, so the one screen
+     that scrolls BEHIND it needs the extra clearance. Keyed on a body class
+     set only while the strip is showing, so a day with nothing on it is
+     byte-for-byte the old layout. */
+  body.sk-night-on .cards-grid { padding-bottom: 100px !important; }
   /* ═══════════ VINTAGE MODE — Full App Skin ═══════════ */
   /* ── Yahoo Fantasy Overlay ── */
   .fy-overlay {
@@ -30705,6 +30744,13 @@
 </div>
 
 <nav class="bottom-nav" id="bottomNav">
+  <!-- NIGHTSTRIP - inside the nav, not floating above it. The nav is
+       position:fixed with its own safe-area padding, and anything parked at a
+       hand-computed offset from it drifts the moment that padding changes. -->
+  <div class="sk-night-strip" id="skNightStrip" style="display:none"
+       onclick="if(typeof openAllInHub==='function')openAllInHub()"
+       role="button" tabindex="0"></div>
+  <div class="bnav-row">
   <button class="bnav-item" onclick="openStandings()">
     <span class="bnav-icon">📊</span>
     <span class="bnav-label">Standings</span>
@@ -30734,6 +30780,7 @@
     <span class="bnav-icon">☰</span>
     <span class="bnav-label">Leagues</span>
   </button>
+  </div>
 </nav>
 
 <script>
@@ -43439,6 +43486,10 @@ async function _skStadiumRefresh() {
         _allInRender();
       }
     } catch (eH3) {}
+    // NIGHTSTRIP - the strip is reading the same caches that just changed, and
+    // its own TTL would otherwise hold the pre-refresh figure for 25 seconds
+    // after a tap that said it refreshed.
+    try { if (typeof _skNightRender === 'function') _skNightRender(true); } catch (eH4) {}
   } catch (e) {
     try { console.warn('[stadium-refresh] failed', e); } catch (e2) {}
   } finally {
@@ -80548,6 +80599,128 @@ function _allInByGameHtml(players, sport) {
   return html;
 }
 
+// ══════════════════════════════════════════════════════════════════
+// YOUR NIGHT, FROM ANYWHERE — NIGHTSTRIP
+//
+// One line docked above the bottom nav: what your whole slate has scored so
+// far, how much of it is live, and how much is still to come. Tap it and the
+// All-In hub opens on the detail.
+//
+// The point is that you can be reading the Avs box score and still see your
+// night tick. That is the difference between a sports app you check and a
+// fantasy app you check, and one app.
+//
+// It reuses _allInScan and the hub's row builders rather than counting
+// anything of its own, so the number here and the number in the hub cannot
+// disagree - they are the same arithmetic over the same rows.
+//
+// TWO things make it affordable:
+//   - the provider indexes are built ONCE for the whole pass, not once per
+//     sport. _allInCollect builds its own, which is right for the single
+//     sport on screen and wrong for a strip that walks all of them.
+//   - the result is memoised for 25 seconds. The strip repaints on a timer,
+//     not on scroll, so it never lands in the middle of a gesture.
+// ══════════════════════════════════════════════════════════════════
+var _skNightCache = null;
+var _skNightTimer = null;
+var _SK_NIGHT_TTL = 25000;
+
+function _skNightScan(force) {
+  if (!force && _skNightCache && (Date.now() - _skNightCache.ts) < _SK_NIGHT_TTL) {
+    return _skNightCache;
+  }
+  var out = { ts: Date.now(), total: null, live: 0, pre: 0, post: 0, players: 0 };
+  try {
+    // The slate in memory follows the scores screen's date while the fantasy
+    // caches are keyed to today, so off-today it reports nothing rather than
+    // a figure made of two different days. Same rule the hub states.
+    if (typeof isToday === 'function' && !isToday()) { _skNightCache = out; return out; }
+    if (typeof _allInScan !== 'function') { _skNightCache = out; return out; }
+    var scan = _allInScan();
+    var espIdx = (typeof _espFhubIndex === 'function') ? _espFhubIndex() : null;
+    var extIdx = (typeof _extFhubIndex === 'function') ? _extFhubIndex() : null;
+    var i, j, k;
+    for (i = 0; i < scan.length; i++) {
+      var sc = scan[i];
+      if (!sc.hits || !sc.hits.length) continue;
+      for (j = 0; j < sc.hits.length; j++) {
+        var h = sc.hits[j];
+        var rows = [];
+        try { rows = _fhubRowsForAthlete({ name: h.name }, espIdx, extIdx, sc.sport) || []; }
+        catch (eR) { rows = []; }
+        if (!rows.length) continue;
+        var anyActive = false;
+        for (k = 0; k < rows.length; k++) {
+          var fr = rows[k] || {};
+          var benched = (typeof _fhubRowBenched === 'function') &&
+                        _fhubRowBenched(fr) === true;
+          // Started SOMEWHERE is what makes him part of tonight. Tested
+          // separately from the points, because a player active only in
+          // category leagues scores nothing here and is still at stake.
+          if (!benched) anyActive = true;
+          // Active points only, and never a category row - the same two
+          // exclusions the hub card headline makes.
+          if (benched || fr.fp == null || fr.isCats) continue;
+          out.total = (out.total == null ? 0 : out.total) + Number(fr.fp);
+        }
+        // Benched in every league you hold him in. The hub still shows him -
+        // what you left on the bench is worth seeing - but "4 LIVE" has to
+        // mean four of yours are out there earning, or the count overstates
+        // what is actually at stake and disagrees with the total beside it.
+        if (!anyActive) continue;
+        out.players++;
+        var gst = (h.gm && h.gm.g && h.gm.g.state) || 'pre';
+        if (gst === 'in') out.live++;
+        else if (gst === 'post') out.post++;
+        else out.pre++;
+      }
+    }
+    if (out.total != null) out.total = Math.round(out.total * 10) / 10;
+  } catch (e) {}
+  _skNightCache = out;
+  return out;
+}
+
+function _skNightRender(force) {
+  var el = document.getElementById('skNightStrip');
+  if (!el) return;
+  var n = _skNightScan(force);
+  if (!n || !n.players) {
+    // Nothing of yours plays today. An empty strip is a permanent reminder
+    // that there is nothing to remind you of, so it leaves instead - and
+    // takes its clearance with it.
+    el.style.display = 'none';
+    el.innerHTML = '';
+    try { document.body.classList.remove('sk-night-on'); } catch (e) {}
+    return;
+  }
+  var bits = [];
+  if (n.live) bits.push(n.live + ' LIVE');
+  if (n.pre) bits.push(n.pre + ' TO COME');
+  if (!n.live && !n.pre) bits.push('ALL DONE');
+  var tot = '';
+  if (n.total != null) {
+    tot = '<b class="sk-night-fp' + (n.total > 0 ? ' up' : (n.total < 0 ? ' dn' : '')) + '">' +
+      (n.total > 0 ? '+' : '') + n.total.toFixed(1) + '</b>';
+  }
+  el.innerHTML =
+    '<span class="sk-night-label">YOUR NIGHT</span>' + tot +
+    '<span class="sk-night-meta">' + bits.join(' \u00b7 ') + '</span>' +
+    '<span class="sk-night-go">\u203a</span>';
+  el.style.display = 'flex';
+  try { document.body.classList.add('sk-night-on'); } catch (e2) {}
+}
+
+function _skNightStart() {
+  try { _skNightRender(true); } catch (e) {}
+  if (_skNightTimer) clearInterval(_skNightTimer);
+  // Half a minute. The underlying caches do not refill faster than that on
+  // their own, so a tighter loop would redraw the same number.
+  _skNightTimer = setInterval(function () {
+    try { _skNightRender(); } catch (e2) {}
+  }, 30000);
+}
+
 function _allInPillsHtml(scan) {
   if (!scan.length) return '';
   var h = '<div class="myp-chips">', i;
@@ -89206,6 +89379,9 @@ function skApplyConnectionState() {
     // Official football week windows (NFL + CFB) — powers date-derived
     // snapshot week tagging. Cached 7 days; tiny fetch.
     if (typeof _skLoadGameWeeks === 'function') setTimeout(_skLoadGameWeeks, 2500);
+    // NIGHTSTRIP - after the rosters and the slate have had a moment to land.
+    // Starting it earlier just draws an empty strip and hides it again.
+    if (typeof _skNightStart === 'function') setTimeout(_skNightStart, 4000);
   } else {
     if (chrome) chrome.classList.add('hidden');
     if (signinView) signinView.classList.remove('hidden');
