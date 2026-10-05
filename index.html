@@ -6848,6 +6848,12 @@
     background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.12);
     color: #fff; font-size: 16px; cursor: pointer; line-height: 1;
   }
+  /* ALLINREF - its own class, not .fw-yahoo-refresh, so the stadium
+     refresh cannot clear the spin while the slate half is still running. */
+  .crs-fhub-close.allin-spin {
+    opacity: 0.7; pointer-events: none;
+    animation: fwYahooSpin 0.8s linear infinite;
+  }
   .crs-fhub-sub {
     padding: 0 18px 12px; flex-shrink: 0;
     font-family: 'Barlow Condensed', sans-serif; font-size: 11px;
@@ -29133,7 +29139,11 @@
 <div class="crs-fhub-modal" id="allInModal">
   <div class="crs-fhub-head">
     <div class="crs-fhub-title" id="allInTitle" style="color:#f5c518">ALL-IN FANTASY</div>
-    <button class="crs-fhub-close" onclick="closeAllInHub()">✕</button>
+    <div style="display:flex;align-items:center;gap:8px;flex-shrink:0">
+      <button class="crs-fhub-close" id="allInRefresh" onclick="refreshAllInHub()"
+              title="Pull fresh rosters, points and scores">⟳</button>
+      <button class="crs-fhub-close" onclick="closeAllInHub()">✕</button>
+    </div>
   </div>
   <div class="crs-fhub-sub" id="allInSub"></div>
   <div id="allInPills" style="padding:0 14px;flex-shrink:0"></div>
@@ -43397,6 +43407,16 @@ async function _skStadiumRefresh() {
         openFantasyHubAll();
       }
     } catch (eH2) {}
+    // ALLINREF - same for the All-In hub. It can be open over a stadium whose
+    // own FP button was tapped, and leaving it showing pre-refresh numbers
+    // beside freshly refreshed ones is the FHUBSTALE problem again.
+    try {
+      var _aiM = document.getElementById('allInModal');
+      if (_aiM && _aiM.classList.contains('open') && typeof _allInRender === 'function') {
+        if (typeof _allInStamp !== 'undefined') _allInStamp = Date.now();
+        _allInRender();
+      }
+    } catch (eH3) {}
   } catch (e) {
     try { console.warn('[stadium-refresh] failed', e); } catch (e2) {}
   } finally {
@@ -80252,6 +80272,90 @@ function _allInCollect(hits, sport) {
   return out;
 }
 
+// ── REFRESH ── ALLINREF ──
+//
+// One tap, everything behind this screen - which is TWO unrelated things,
+// and that is the whole reason this function exists rather than a call to
+// the stadium button:
+//
+//   the FANTASY side (rosters, today's FP, the ESPN / Sleeper / Fantrax
+//   enrichers, the Fantrax live cache) is exactly what the stadium FP button
+//   already pulls, so it calls that rather than growing a second copy that
+//   can drift away from it;
+//
+//   the SLATE is the scoreboard's own data and NOTHING in that refresh
+//   touches it. Without this half, a game that went live while the hub was
+//   open would still read "5:30 PM MDT" after a tap that said it refreshed -
+//   and the points would have moved, which is the worst of both.
+//
+// Only the buckets this hub holds leagues in are refetched. fetchAll walks
+// every league the app knows, most of which have nothing of mine in them.
+var _allInBusy = false;
+var _allInStamp = 0;
+
+function _allInTimeTxt(ms) {
+  if (!ms) return '';
+  try {
+    var d = new Date(ms), h = d.getHours(), m = d.getMinutes();
+    var ap = (h >= 12) ? 'PM' : 'AM';
+    h = h % 12; if (h === 0) h = 12;
+    return h + ':' + (m < 10 ? '0' : '') + m + ' ' + ap;
+  } catch (e) { return ''; }
+}
+
+function refreshAllInHub() {
+  if (_allInBusy) return;
+  if (!document.getElementById('allInModal')) return;
+  _allInBusy = true;
+  var btn = document.getElementById('allInRefresh');
+  if (btn) btn.classList.add('allin-spin');
+
+  var jobs = [];
+  // ── the slate ──
+  try {
+    var scan = _allInScan(), i, seen = {};
+    for (i = 0; i < scan.length; i++) {
+      var bk = _ALLIN_BUCKET[scan[i].sport];
+      if (!bk || seen[bk]) continue;
+      seen[bk] = 1;
+      jobs.push((function (b2) {
+        // Started HERE, synchronously, rather than inside a .then: deferring
+        // the call by a microtask bought nothing and left the requests
+        // queued behind whatever else was pending.
+        var pr = null;
+        try { pr = (typeof fetchLeague === 'function') ? fetchLeague(b2) : null; }
+        catch (e2) { pr = null; }
+        return Promise.resolve(pr)
+          .then(function (g) { if (g) allGames[b2] = g; })
+          .catch(function () { return null; });
+      })(bk));
+    }
+  } catch (eJ) {}
+
+  // ── the fantasy side ──
+  // Its own re-entry guard means a refresh already running elsewhere simply
+  // returns, rather than doubling every request.
+  try {
+    if (typeof _skStadiumRefresh === 'function') {
+      jobs.push(Promise.resolve(_skStadiumRefresh()).catch(function () { return null; }));
+    }
+  } catch (eF) {}
+
+  Promise.all(jobs).catch(function () { return null; }).then(function () {
+    _allInBusy = false;
+    // This button owns its own spin class deliberately. _skStadiumRefresh
+    // clears .spinning off every button it found when it STARTED, so sharing
+    // that class would stop the spin while the slate half was still in
+    // flight - a stopped spinner meaning "still working".
+    var b3 = document.getElementById('allInRefresh');
+    if (b3) b3.classList.remove('allin-spin');
+    _allInStamp = Date.now();
+    try { if (typeof renderCards === 'function') renderCards(); } catch (eC) {}
+    var m2 = document.getElementById('allInModal');
+    if (m2 && m2.classList.contains('open')) _allInRender();
+  });
+}
+
 function _allInPillsHtml(scan) {
   if (!scan.length) return '';
   var h = '<div class="myp-chips">', i;
@@ -80277,6 +80381,11 @@ function closeAllInHub() {
 function openAllInHub() {
   var m = document.getElementById('allInModal');
   if (!m) return;
+  // ALLINREF - the caches were last filled whenever they were filled, and
+  // the honest thing to stamp on an open is the moment it was read. A tap on
+  // refresh moves it, which is how you can tell the tap did anything on an
+  // afternoon where every line still reads 0.0.
+  if (!_allInStamp) _allInStamp = Date.now();
   _allInRender();
   m.classList.add('open');
 }
@@ -80286,7 +80395,11 @@ function _allInRender() {
   var sub = document.getElementById('allInSub');
   var pills = document.getElementById('allInPills');
   if (!body) return;
-  if (sub) sub.textContent = '';
+  // ALLINREF - set BEFORE the branches below, so an empty state carries it
+  // too. Tapping refresh on a quiet night has to look different from tapping
+  // nothing at all.
+  var _stamp = _allInStamp ? ('UPDATED ' + _allInTimeTxt(_allInStamp)) : '';
+  if (sub) sub.textContent = _stamp;
   if (pills) pills.innerHTML = '';
 
   // The slate in memory follows the SCORES SCREEN's date, while every
@@ -80341,7 +80454,8 @@ function _allInRender() {
   // the one thing their terms name. Identity is carried by colour. FHUBALL2
   if (sub) {
     sub.textContent = players.length + ' PLAYER' + (players.length === 1 ? '' : 'S') +
-      ' \u00b7 ' + cur.games + ' GAME' + (cur.games === 1 ? '' : 'S');
+      ' \u00b7 ' + cur.games + ' GAME' + (cur.games === 1 ? '' : 'S') +
+      (_stamp ? (' \u00b7 ' + _stamp) : '');
   }
   body.innerHTML = _fhubAllPlayersHtml(players);
 }
