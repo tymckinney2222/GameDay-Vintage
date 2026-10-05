@@ -6966,7 +6966,12 @@
     letter-spacing: 0.08em; color: rgba(255,255,255,0.45);
   }
   .fxh-lgsub {
+    /* ALLIN - wraps because the All-In card adds the game to this line
+       ("C . EDM . @ COL . 2nd 8:14 . 4 leagues"), which can outrun a phone
+       with a long status on it. A short stadium-hub meta never reaches the
+       edge, so nothing there moves. */
     display: flex; align-items: baseline; gap: 8px; margin: 1px 0 7px;
+    flex-wrap: wrap;
     font-family: var(--sk-font-mono, monospace); font-size: 9px;
     color: rgba(255,255,255,0.35);
   }
@@ -29121,6 +29126,20 @@
   <div class="crs-fhub-body" id="fhubAllBody"></div>
 </div>
 
+<!-- ALL-IN FANTASY HUB ── ALLIN ──
+     Reached from Tools, not from a stadium. Same card markup as the merged
+     hub (_fhubAllPlayersHtml draws both), so the two can never drift apart
+     in look or in arithmetic. Same mark-free rule applies. -->
+<div class="crs-fhub-modal" id="allInModal">
+  <div class="crs-fhub-head">
+    <div class="crs-fhub-title" id="allInTitle" style="color:#f5c518">ALL-IN FANTASY</div>
+    <button class="crs-fhub-close" onclick="closeAllInHub()">✕</button>
+  </div>
+  <div class="crs-fhub-sub" id="allInSub"></div>
+  <div id="allInPills" style="padding:0 14px;flex-shrink:0"></div>
+  <div class="crs-fhub-body" id="allInBody"></div>
+</div>
+
 <!-- ESPN fantasy hub. Separate from the Yahoo hub by design. ESPNFHUB3 -->
 <div class="crs-fhub-modal" id="espFhubModal">
   <div class="crs-fhub-head">
@@ -37526,6 +37545,12 @@ function renderLeagueDrawerBody() {
   html += '<div class="ld-tool-item" onclick="openFantasyMatchups(); closeLeagueDrawer();">' +
     '<div class="ld-tool-icon">\ud83c\udd9a</div>' +
     '<div class="ld-tool-name">Fantasy</div>' +
+  '</div>';
+  // ALLIN - under Fantasy, because it is the same question asked across
+  // every game at once.
+  html += '<div class="ld-tool-item" onclick="openAllInHub(); closeLeagueDrawer();">' +
+    '<div class="ld-tool-icon">\ud83d\udd2d</div>' +
+    '<div class="ld-tool-name">All-In Fantasy</div>' +
   '</div>';
   html += '<div class="ld-tool-item" onclick="openStadiumTour(); closeLeagueDrawer();">' +
     '<div class="ld-tool-icon">\ud83c\udfdf\ufe0f</div>' +
@@ -79837,6 +79862,10 @@ function _fhubAllPlayersHtml(players) {
     var meta = [];
     if (pl.pos) meta.push(slEsc(pl.pos));
     if (pl.teamAbbr) meta.push(slEsc(pl.teamAbbr));
+    // ALLIN - which game he is in. Only the All-In hub sets this; inside a
+    // stadium the answer is the stadium, so the field is absent and this
+    // line adds nothing there.
+    if (pl.gameLine) meta.push(slEsc(pl.gameLine));
     meta.push(rows.length + ' league' + (rows.length === 1 ? '' : 's'));
 
     html += '<div class="crs-fhub-card" style="--fhub-accent:' + (pl.accent || '#9aa4b2') + '">' +
@@ -80036,6 +80065,287 @@ function _fhubEnsureNames(done) {
 }
 
 // One button per stadium now, where there were three.
+// ══════════════════════════════════════════════════════════════════════
+// ALL-IN FANTASY HUB ── ALLIN ──
+//
+// Every fantasy player with a game today, once, with the leagues he is in
+// and what he has done in each underneath him. The per-game hubs answer
+// "who in THIS game is mine"; this answers "what is my whole day doing",
+// without opening ten stadiums to find out.
+//
+// It is a RE-POINTING of the merged hub, not a second one. _fhubCollectAll
+// starts from the athletes in the open stadium's box score; this starts from
+// my own rosters and the day's slate. Everything after that first step is
+// the same code: _fhubRowsForAthlete builds the Yahoo + ESPN + Sleeper /
+// Fantrax rows, and _fhubAllPlayersHtml draws them. The stadium hubs are
+// untouched and still reachable exactly where they were.
+//
+// Nothing here fetches. The player list is _skSearchAllRosters (the index
+// the player search and the My Players pill already build), the slate is
+// allGames (already on screen), and every stat line comes from the fantasy
+// caches the leagues were synced into - not from a box score.
+//
+// ── WHAT THIS CANNOT SHOW, AND WHY ──
+// Fantrax publishes no per-player fantasy points, so its rows are SCORED
+// from a box line by _fxStadiumStatMap - which reads the open stadium. There
+// is no open stadium here, so a Fantrax league still lists under the player
+// but carries no computed number. That is a real gap, left visible rather
+// than filled with a zero.
+// ══════════════════════════════════════════════════════════════════════
+
+// Fantasy sport token -> the allGames bucket holding that sport's slate.
+var _ALLIN_BUCKET = { nhl: 'NHL', nba: 'NBA', mlb: 'MLB', nfl: 'NFL', cfb: 'NCAAFB' };
+var _allInSport = '';
+
+function _allInCanon(a) {
+  return (typeof _skCanonTeamAbbr === 'function')
+    ? _skCanonTeamAbbr(a) : String(a || '').toUpperCase();
+}
+
+// The day's games for one sport, indexed by canonical team abbr.
+//
+// Matched WITHIN sport and through _skCanonTeamAbbr only - the same join the
+// Live Now slide-out uses. fyNormalizeAbbr is deliberately not applied: its
+// map is sport-blind (it sends WSH to WAS, right for the Wizards and wrong
+// for the Capitals, and ARI to UTA, right for the Coyotes and wrong for the
+// Diamondbacks), so running it here would break the sports it does not mean.
+function _allInSlate(sport) {
+  var out = { byAbbr: {}, games: 0 };
+  var bucket = _ALLIN_BUCKET[String(sport || '').toLowerCase()];
+  if (!bucket) return out;
+  var games = (typeof allGames !== 'undefined' && allGames[bucket]) || [];
+  for (var i = 0; i < games.length; i++) {
+    var g = games[i];
+    if (!g) continue;
+    out.games++;
+    if (g.home && g.home.abbr) out.byAbbr[_allInCanon(g.home.abbr)] = { g: g, side: 'home' };
+    if (g.away && g.away.abbr) out.byAbbr[_allInCanon(g.away.abbr)] = { g: g, side: 'away' };
+  }
+  return out;
+}
+
+// ONE walk of every synced league, grouped by sport, deduped by player.
+//
+// The dedup is the whole point of this hub: a player held in six leagues is
+// ONE entry carrying six rows, not six entries. Keyed on the folded name
+// within a sport, which is the only identity Yahoo offers - the same bargain
+// the stadium hubs already make, and the reason the sport scope is not
+// optional. FHUBCFB
+function _allInScan() {
+  var mine = [];
+  try {
+    mine = (typeof _skSearchAllRosters === 'function') ? (_skSearchAllRosters() || []) : [];
+  } catch (eS) { mine = []; }
+  var bySport = {}, order = [], i;
+  for (i = 0; i < mine.length; i++) {
+    var m = mine[i];
+    if (!m || !m.name) continue;
+    var sp = String(m.sport || '').toLowerCase();
+    if (!sp || !_ALLIN_BUCKET[sp]) continue;
+    if (!bySport[sp]) { bySport[sp] = { sport: sp, byKey: {}, order: [] }; order.push(sp); }
+    var grp = bySport[sp];
+    var k = (typeof _pmNameKey === 'function')
+      ? _pmNameKey(m.name) : String(m.name).toLowerCase();
+    if (!k) continue;
+    if (!grp.byKey[k]) {
+      grp.byKey[k] = { key: k, name: m.name, teamAbbr: m.teamAbbr || '', pos: m.displayPos || '' };
+      grp.order.push(k);
+    } else {
+      // Providers publish different amounts about the same player. Take the
+      // first non-empty of each rather than whichever league was walked
+      // first - a Fantrax row carrying no pro team would otherwise strand a
+      // player a Yahoo row could have placed on the slate.
+      if (!grp.byKey[k].teamAbbr && m.teamAbbr) grp.byKey[k].teamAbbr = m.teamAbbr;
+      if (!grp.byKey[k].pos && m.displayPos) grp.byKey[k].pos = m.displayPos;
+    }
+  }
+  var out = [], j;
+  for (i = 0; i < order.length; i++) {
+    var g2 = bySport[order[i]];
+    var slate = _allInSlate(g2.sport);
+    var players = [], hits = [];
+    for (j = 0; j < g2.order.length; j++) {
+      var pl = g2.byKey[g2.order[j]];
+      players.push(pl);
+      var hit = pl.teamAbbr ? slate.byAbbr[_allInCanon(pl.teamAbbr)] : null;
+      if (hit) { pl.gm = hit; hits.push(pl); }
+    }
+    out.push({ sport: g2.sport, label: _ALLIN_BUCKET[g2.sport],
+               players: players, hits: hits, games: slate.games });
+  }
+  // Most to watch first, then the sports with nothing on.
+  out.sort(function (a, b) {
+    if (b.hits.length !== a.hits.length) return b.hits.length - a.hits.length;
+    return a.label < b.label ? -1 : (a.label > b.label ? 1 : 0);
+  });
+  return out;
+}
+
+function _allInStatus(g) {
+  if (!g) return '';
+  if (g.state === 'post') return 'Final';
+  if (g.statusDetail) return String(g.statusDetail);
+  return (g.state === 'in') ? 'Live' : 'Scheduled';
+}
+
+function _allInAccent(team) {
+  try {
+    if (typeof stTheme === 'function' && team && team.abbr) {
+      var t = stTheme(team.abbr, team.fullName || team.name || '');
+      if (t && t.accent) return t.accent;
+    }
+  } catch (e) {}
+  return '#9aa4b2';
+}
+
+// Build the card data for one sport's matched players, in the shape
+// _fhubAllPlayersHtml already draws.
+function _allInCollect(hits, sport) {
+  var out = [], i, j;
+  if (!hits || !hits.length) return out;
+  // Built ONCE for the whole pass, not per player. Each index walks every
+  // synced league's roster, and at the league count this app reaches that is
+  // the five-figure loop _extDotIndex warns about. FHUBALL
+  var espIdx = (typeof _espFhubIndex === 'function') ? _espFhubIndex() : null;
+  var extIdx = (typeof _extFhubIndex === 'function') ? _extFhubIndex() : null;
+  for (i = 0; i < hits.length; i++) {
+    var h = hits[i];
+    var rows = [];
+    try { rows = _fhubRowsForAthlete({ name: h.name }, espIdx, extIdx, sport) || []; }
+    catch (eR) { rows = []; }
+    if (!rows.length) continue;
+    // ACTIVE points only, because that is the figure the card headlines. The
+    // stadium hub sorts on a total that includes bench rows, which is fine
+    // against ten players and wrong against a few hundred: the list would be
+    // ordered by a number nowhere on screen.
+    var act = null, lineup = null, injury = '';
+    for (j = 0; j < rows.length; j++) {
+      var fr = rows[j] || {};
+      if (!lineup && fr.lineup) lineup = fr.lineup;
+      if (!injury && fr.injury) injury = fr.injury;
+      if (fr.fp == null || fr.isCats) continue;
+      if (typeof _fhubRowBenched === 'function' && _fhubRowBenched(fr) === true) continue;
+      act = (act == null ? 0 : act) + Number(fr.fp);
+    }
+    var g = (h.gm && h.gm.g) || null, side = (h.gm && h.gm.side) || 'home';
+    var mine = (g && g[side]) || {};
+    var opp = (g && g[side === 'home' ? 'away' : 'home']) || {};
+    out.push({
+      key: h.key, name: h.name, pos: h.pos, teamAbbr: h.teamAbbr,
+      teamLogo: mine.logo || '',
+      accent: _allInAccent(mine),
+      // ALLIN - which game he is in. The stadium hubs never set this because
+      // the answer there is the stadium you are standing in.
+      gameLine: (side === 'home' ? 'vs ' : '@ ') + (opp.abbr || '?') +
+        ' \u00b7 ' + _allInStatus(g),
+      rows: rows,
+      total: (act == null) ? null : Math.round(act * 100) / 100,
+      lineup: lineup, injury: injury
+    });
+  }
+  out.sort(function (x, y) {
+    if (x.total != null && y.total != null) return y.total - x.total;
+    if (x.total != null) return -1;
+    if (y.total != null) return 1;
+    return String(x.name || '').localeCompare(String(y.name || ''));
+  });
+  return out;
+}
+
+function _allInPillsHtml(scan) {
+  if (!scan.length) return '';
+  var h = '<div class="myp-chips">', i;
+  for (i = 0; i < scan.length; i++) {
+    var sc = scan[i];
+    h += '<button class="myp-chip' + (sc.sport === _allInSport ? ' on' : '') +
+      '" onclick="setAllInSport(\'' + sc.sport + '\')">' + sc.label +
+      (sc.hits.length ? (' \u00b7 ' + sc.hits.length) : '') + '</button>';
+  }
+  return h + '</div>';
+}
+
+function setAllInSport(sport) {
+  _allInSport = String(sport || '').toLowerCase();
+  _allInRender();
+}
+
+function closeAllInHub() {
+  var m = document.getElementById('allInModal');
+  if (m) m.classList.remove('open');
+}
+
+function openAllInHub() {
+  var m = document.getElementById('allInModal');
+  if (!m) return;
+  _allInRender();
+  m.classList.add('open');
+}
+
+function _allInRender() {
+  var body = document.getElementById('allInBody');
+  var sub = document.getElementById('allInSub');
+  var pills = document.getElementById('allInPills');
+  if (!body) return;
+  if (sub) sub.textContent = '';
+  if (pills) pills.innerHTML = '';
+
+  // The slate in memory follows the SCORES SCREEN's date, while every
+  // fantasy cache here is keyed to today. Drawing both together would set
+  // today's points against another day's games, so it says so instead.
+  if (typeof isToday === 'function' && !isToday()) {
+    body.innerHTML = '<div class="crs-fhub-empty">The scores screen is parked on ' +
+      'another date, so the slate in memory is not today\u2019s \u2014 and the ' +
+      'fantasy numbers are. Tap TODAY on the scores screen, then reopen this.</div>';
+    return;
+  }
+
+  var scan = _allInScan();
+  if (!scan.length) {
+    body.innerHTML = '<div class="crs-fhub-empty">No synced leagues yet.</div>';
+    return;
+  }
+  // Default to the sport with the most to watch, which _allInScan already
+  // sorted to the front. A pill the user picked wins until it goes empty.
+  var cur = null, i;
+  for (i = 0; i < scan.length; i++) if (scan[i].sport === _allInSport) cur = scan[i];
+  if (!cur) { cur = scan[0]; _allInSport = cur.sport; }
+  if (pills) pills.innerHTML = _allInPillsHtml(scan);
+
+  if (!cur.games) {
+    body.innerHTML = '<div class="crs-fhub-empty">No ' + cur.label +
+      ' games today.</div>';
+    return;
+  }
+  if (!cur.hits.length) {
+    // Games ARE on and none of my players matched one. With a full roster
+    // that is far more likely to be an abbreviation the slate spells
+    // differently than a day where nobody I own plays, so it says both
+    // rather than the comfortable one.
+    body.innerHTML = '<div class="crs-fhub-empty">None of your ' + cur.label +
+      ' players is in today\u2019s ' + cur.games + ' game' +
+      (cur.games === 1 ? '' : 's') +
+      (cur.players.length
+        ? ' \u2014 or their teams are spelled differently on the slate than on your rosters.'
+        : '.') + '</div>';
+    return;
+  }
+
+  var players = _allInCollect(cur.hits, cur.sport);
+  if (!players.length) {
+    body.innerHTML = '<div class="crs-fhub-empty">Your ' + cur.label +
+      ' players are in today\u2019s games, but no league has published a line ' +
+      'for them yet.</div>';
+    return;
+  }
+  // NO PROVIDER NAMES IN HERE - a Yahoo word mark beside another brand's is
+  // the one thing their terms name. Identity is carried by colour. FHUBALL2
+  if (sub) {
+    sub.textContent = players.length + ' PLAYER' + (players.length === 1 ? '' : 'S') +
+      ' \u00b7 ' + cur.games + ' GAME' + (cur.games === 1 ? '' : 'S');
+  }
+  body.innerHTML = _fhubAllPlayersHtml(players);
+}
+
 function _fhubAllUpdateBtn(btnId, countId, _retried) {
   try {
     var btn = document.getElementById(btnId);
