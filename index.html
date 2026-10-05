@@ -18057,6 +18057,22 @@
   .sk-wr-l   { color: var(--sk-red); }
   .sk-wr-t   { color: var(--sk-gold); }
   .sk-wr-sep { color: var(--sk-text-4); font-weight: 300; font-size: 42px; }
+  /* WIREMOVE - the movement line on a row, and its summary in the headline.
+     Fallbacks because the sk- custom properties are declared on .sk-overlay,
+     not :root: outside that scope the var resolves to nothing and the colour
+     silently inherits, which is the same trap --sk-text-1 fell into. */
+  .sk-wr-move {
+    color: var(--sk-text-3, rgba(245,245,240,0.42));
+    /* Wraps rather than clipping. The sibling score lines are short enough to
+       stay on one line; this one carries three facts and a date. */
+    white-space: normal;
+  }
+  .sk-wr-move.up { color: var(--sk-green, #4ade80); }
+  .sk-wr-move.dn { color: var(--sk-red, #f87171); }
+  .sk-wr-movesum { margin-top: 6px; font-size: 11px; }
+  .sk-wr-movesum b { font-weight: 800; }
+  .sk-wr-movesum b.sk-wr-w { color: var(--sk-green, #4ade80); }
+  .sk-wr-movesum b.sk-wr-l { color: var(--sk-red, #f87171); }
   .sk-wr-dash { color: var(--sk-text-4); }
   .sk-wr-sub {
     font-size: 13.5px; color: var(--sk-text-2); line-height: 1.4;
@@ -97357,6 +97373,19 @@ function _skBuildWireDigestHTML(agg, synced) {
     }
   }
 
+  // WIREMOVE - the record above counts matchups, and a season-points or roto
+  // league has none, so none of them reached that number. This is their line.
+  var _ms = (typeof _skWireMoveSummary === 'function') ? _skWireMoveSummary(synced) : null;
+  if (_ms) {
+    var _mb = [];
+    if (_ms.up) _mb.push('<b class="sk-wr-w">up in ' + _ms.up + '</b>');
+    if (_ms.down) _mb.push('<b class="sk-wr-l">down in ' + _ms.down + '</b>');
+    if (_ms.held) _mb.push('held in ' + _ms.held);
+    inner += '<div class="sk-wr-sub sk-wr-movesum">' + _mb.join(' \u00b7 ') +
+      ' \u00b7 across ' + _ms.n + ' league' + (_ms.n === 1 ? '' : 's') +
+      ' with no opponent</div>';
+  }
+
   return '<div class="sk-wr-digest">' + inner + '</div>';
 }
 
@@ -97432,6 +97461,109 @@ function _skBuildWireLeagueBoardHTML(synced) {
   '</div>';
 }
 
+// ══════════════════════════════════════════════════════════════════
+// WIREMOVE — a result for the leagues that have no opponent.
+//
+// The whole Wire is built around a matchup: a W/L/T pill, a score line,
+// "you won 3 and lost 1". A season-points league has none of that, so its
+// row said SOLO - true, and the single least useful word on the screen -
+// and a roto league fell past every branch to a bare dash. On a portfolio
+// built mostly of those two formats, the morning digest was reporting on
+// the minority of it.
+//
+// But those leagues DID have a result yesterday: you moved, or you didn't.
+// And the app has been recording exactly that all along - SKBUMP writes
+// sk_rank_hist_v1_<leagueKey> on every sync, every season-points and roto
+// league, rank AND season total, kept 200 days, for the bump chart under
+// the standings. Nothing here fetches; it reads a store that was already
+// being filled and asks it a question nobody had asked.
+//
+// It compares the last two days ON RECORD, not "yesterday" - the history
+// is written when you open the app, so skipping a day leaves a gap. The
+// line says which day it is measuring from rather than calling a
+// three-day move an overnight one.
+// ══════════════════════════════════════════════════════════════════
+
+function _skRankMoveFor(leagueKey, myId) {
+  if (!leagueKey || myId == null) return null;
+  var o = null;
+  try {
+    o = JSON.parse(localStorage.getItem(SK_RANKHIST_PREFIX + leagueKey) || 'null');
+  } catch (e) { return null; }
+  if (!o || !o.d) return null;
+  var id = String(myId);
+  var dates = Object.keys(o.d).sort(), i;
+  // The last two days that BOTH carry me. A day recorded before this team
+  // existed, or one a sync only half-filled, is skipped rather than read as
+  // a move from nowhere.
+  var have = [];
+  for (i = dates.length - 1; i >= 0 && have.length < 2; i--) {
+    var dd = o.d[dates[i]];
+    if (dd && dd[id] != null) have.push(dates[i]);
+  }
+  if (have.length < 2) {
+    return (have.length === 1) ? { only: have[0], rankTo: Number(o.d[have[0]][id]) } : null;
+  }
+  var to = have[0], from = have[1];
+  var pf = (o.p && o.p[from] && o.p[from][id] != null) ? Number(o.p[from][id]) : null;
+  var pt = (o.p && o.p[to] && o.p[to][id] != null) ? Number(o.p[to][id]) : null;
+  return {
+    from: from, to: to,
+    rankFrom: Number(o.d[from][id]), rankTo: Number(o.d[to][id]),
+    ptsFrom: pf, ptsTo: pt,
+    ptsDelta: (pf != null && pt != null) ? Math.round((pt - pf) * 10) / 10 : null
+  };
+}
+
+// The Wire walks Yahoo leagues, so this resolves a Yahoo team key. ESPN's
+// season-points and roto leagues record into the same store under their own
+// keys and can be read the same way when a surface needs them.
+function _skWireMoveForLeague(league) {
+  if (!league) return null;
+  var st = String(league.scoring_type || '');
+  if (st !== 'point' && st !== 'roto') return null;
+  var ld = (typeof skLeagueData === 'object' && skLeagueData)
+    ? skLeagueData[league.league_key] : null;
+  var myId = ld && ld.team && ld.team.team_key;
+  if (!myId) return null;
+  try { return _skRankMoveFor(league.league_key, myId); } catch (e) { return null; }
+}
+
+// "yesterday" only when it IS yesterday. A gap gets its date.
+function _skWireSinceLabel(dateStr) {
+  if (!dateStr) return '';
+  try {
+    if (typeof skYesterdayDateString === 'function' &&
+        dateStr === skYesterdayDateString()) return 'since yesterday';
+    if (typeof _todayDateString === 'function' && dateStr === _todayDateString()) {
+      return 'earlier today';
+    }
+    var d = new Date(dateStr + 'T12:00:00');
+    var dn = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    var mn = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug',
+              'Sep', 'Oct', 'Nov', 'Dec'];
+    return 'since ' + dn[d.getDay()] + ' ' + mn[d.getMonth()] + ' ' + d.getDate();
+  } catch (e) { return ''; }
+}
+
+function _skWireOrdinal(n) {
+  return (typeof skOrdinal === 'function') ? skOrdinal(n) : String(n);
+}
+
+// Up in 3, down in 1, held in 2 - across every league the W/L line ignores.
+function _skWireMoveSummary(synced) {
+  var up = 0, down = 0, held = 0, n = 0, i;
+  for (i = 0; i < (synced || []).length; i++) {
+    var mv = _skWireMoveForLeague(synced[i]);
+    if (!mv || mv.rankFrom == null || mv.rankTo == null) continue;
+    n++;
+    if (mv.rankTo < mv.rankFrom) up++;
+    else if (mv.rankTo > mv.rankFrom) down++;
+    else held++;
+  }
+  return n ? { up: up, down: down, held: held, n: n } : null;
+}
+
 function _skBuildWireLeagueRowHTML(league, entry) {
   var leagueData = skLeagueData[league.league_key] || {};
   var team = leagueData.team;
@@ -97483,7 +97615,22 @@ function _skBuildWireLeagueRowHTML(league, entry) {
   if (entry.result === 'W') { pillCls = 'win'; pillTxt = 'W'; }
   else if (entry.result === 'L') { pillCls = 'loss'; pillTxt = 'L'; }
   else if (entry.result === 'T') { pillCls = 'tie'; pillTxt = 'T'; }
-  else if (st === 'point') { pillCls = 'no'; pillTxt = 'SOLO'; }
+  // WIREMOVE - where you moved, in place of the word SOLO. Roto joins it:
+  // it had no branch at all and showed a bare dash.
+  var _mv = null;
+  if (st === 'point' || st === 'roto') {
+    _mv = _skWireMoveForLeague(league);
+    if (_mv && _mv.rankFrom != null) {
+      var _d = _mv.rankFrom - _mv.rankTo;        // positive = climbed
+      if (_d > 0) { pillCls = 'win'; pillTxt = '\u25b2' + _d; }
+      else if (_d < 0) { pillCls = 'loss'; pillTxt = '\u25bc' + (-_d); }
+      else { pillCls = 'no'; pillTxt = 'HELD'; }
+    } else if (_mv && _mv.only) {
+      // One day on record is not a movement, and a zero here would read as
+      // one. Say what it actually is.
+      pillCls = 'no'; pillTxt = _skWireOrdinal(_mv.rankTo);
+    } else if (st === 'point') { pillCls = 'no'; pillTxt = 'SOLO'; }
+  }
   // An unfinished football week has no result to report, so the pill says
   // where the week IS: LIVE while clubs are on the field, W/L/T once the
   // week is settled, LEAD/TRAIL in between, week number before kickoff.
@@ -97573,6 +97720,31 @@ function _skBuildWireLeagueRowHTML(league, entry) {
     noteHtml = '<div class="sk-wr-row-score">' + skEscape(catStr2) + '</div>';
   } else if (st === 'point' && entry.myFp != null) {
     noteHtml = '<div class="sk-wr-row-score">' + entry.myFp.toFixed(1) + ' FP today</div>';
+  }
+
+  // WIREMOVE - the move itself, under whatever else the row says. Added
+  // rather than replacing, because "28.5 FP today" and "11th to 9th" are
+  // different facts and a season-points morning wants both.
+  if (_mv && _mv.rankFrom != null) {
+    var _mvD = _mv.rankFrom - _mv.rankTo;
+    var _bits = [_skWireOrdinal(_mv.rankFrom) + ' \u2192 ' + _skWireOrdinal(_mv.rankTo)];
+    if (_mv.ptsDelta != null && _mv.ptsDelta !== 0) {
+      _bits.push((_mv.ptsDelta > 0 ? '+' : '') + _mv.ptsDelta.toFixed(1) + ' pts');
+    }
+    // Only when it is NOT yesterday. The row clips to one line, and spending
+    // those characters restating the default is what pushed the real figures
+    // off the end of it. A gap is the surprise, so a gap keeps its label.
+    var _yd = (typeof skYesterdayDateString === 'function') ? skYesterdayDateString() : '';
+    if (_mv.from !== _yd) {
+      var _since = _skWireSinceLabel(_mv.from);
+      if (_since) _bits.push(_since);
+    }
+    noteHtml += '<div class="sk-wr-row-score sk-wr-move' +
+      (_mvD > 0 ? ' up' : (_mvD < 0 ? ' dn' : '')) + '">' +
+      skEscape(_bits.join(' \u00b7 ')) + '</div>';
+  } else if (_mv && _mv.only) {
+    noteHtml += '<div class="sk-wr-row-score sk-wr-move">' +
+      skEscape(_skWireOrdinal(_mv.rankTo) + ' \u00b7 tracking from today') + '</div>';
   }
 
   var mvpNote = '';
