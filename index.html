@@ -3035,6 +3035,24 @@
     -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px);
   }
   .bnav-row { display: flex; align-items: stretch; justify-content: space-around; }
+  /* PSPARK - ten days of form, scaled to the player's own best. */
+  .sk-spark {
+    display: inline-flex; align-items: flex-end; gap: 1.5px; height: 14px;
+    margin-left: 2px; flex-shrink: 0;
+  }
+  .sk-spark i {
+    width: 3px; border-radius: 1px; display: block;
+    background: rgba(245,197,24,0.30);
+  }
+  .sk-spark i.best { background: var(--sk-gold, #f5c518); }
+  .sk-spark i.today { background: #fff; }
+  /* Scored nothing, versus nothing recorded. Different facts, different marks. */
+  .sk-spark i.zero { height: 2px; background: rgba(255,255,255,0.14); }
+  .sk-spark i.miss { height: 2px; background: rgba(255,255,255,0.05); }
+  .sk-spark-avg {
+    font-family: var(--sk-font-mono, monospace); font-size: 8.5px;
+    color: var(--sk-text-4, rgba(245,245,240,0.28)); flex-shrink: 0;
+  }
   /* NIGHTSTRIP */
   .sk-night-strip {
     display: none; align-items: center; gap: 8px;
@@ -42532,6 +42550,11 @@ async function fetchTeamFpForDate(teamKey, date) {
       if (_hasData && typeof _skGpWriteTally === 'function') {
         try { _skGpWriteTally(teamKey, date, byKey, isImmutable); } catch (e3) {}
       }
+      // PSPARK - the same parsed map, kept as one number per player per day in
+      // a store the FP cache's eviction cannot reach.
+      if (_hasData && typeof _skSparkWrite === 'function') {
+        try { _skSparkWrite(teamKey, date, byKey); } catch (e4) {}
+      }
       if (isImmutable && _hasData) {
         // STORAGE — quota-aware: makes room and retries rather than failing
         // silently and leaving this date permanently uncached.
@@ -79952,6 +79975,30 @@ function _fhubAllPlayersHtml(players) {
         ' on the bench</span>';
     }
 
+    // PSPARK - his last ten days, from the league with the most on record.
+    // Built here rather than in the collector because it is a rendering
+    // concern: the collector's job is what he is worth tonight.
+    var sparkHtml = '';
+    try {
+      if (typeof _skSparkBestLeague === 'function') {
+        var _lks = [], _li;
+        for (_li = 0; _li < rows.length; _li++) {
+          if (rows[_li] && rows[_li].leagueKey) _lks.push(rows[_li].leagueKey);
+        }
+        var _bl = _skSparkBestLeague(pl.name, _lks);
+        if (_bl) {
+          var _ser = _skSparkSeries(pl.name, _bl, 10);
+          var _bn = '';
+          for (_li = 0; _li < rows.length; _li++) {
+            if (rows[_li] && rows[_li].leagueKey === _bl) {
+              _bn = rows[_li].teamName || rows[_li].leagueName || ''; break;
+            }
+          }
+          sparkHtml = _skSparkHtml(_ser, _bn);
+        }
+      }
+    } catch (eSp) { sparkHtml = ''; }
+
     var meta = [];
     if (pl.pos) meta.push(slEsc(pl.pos));
     if (pl.teamAbbr) meta.push(slEsc(pl.teamAbbr));
@@ -79971,7 +80018,7 @@ function _fhubAllPlayersHtml(players) {
           slEsc(pl.injury) + '</span>' : '') +
         headTag +
       '</div>' +
-      '<div class="fxh-lgsub">' + meta.join(' · ') +
+      '<div class="fxh-lgsub">' + meta.join(' · ') + sparkHtml +
         (benTag ? '<span class="fxh-lgcount">' + benTag + '</span>' : '') +
       '</div>' + lines +
     '</div>';
@@ -80597,6 +80644,192 @@ function _allInByGameHtml(players, sport) {
     '</div>';
   }
   return html;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// FORM SPARKLINES — PSPARK
+//
+// Ten days of a player's fantasy points as a row of bars, so "is he actually
+// cold or did I just notice him" is answered without opening anything.
+//
+// ── WHY THIS NEEDS ITS OWN STORE ──
+// It was going to be free off GPTALLY. It is not: that store keeps a
+// per-POSITION appearance count ({C:2, D:4}), not per-player points. And the
+// per-player FP cache is capped at FP_LS_MAX (140) entries across every team
+// and date, oldest evicted first, with the Vs-the-League grid deleting other
+// teams' entries as it goes - about six days at this league count. There is
+// no ten-day per-player history to read.
+//
+// So this keeps its own, in the shape GPTALLY proved: tiny, in its own
+// namespace, untouched by either eviction. ONE key per DAY holding every
+// player's figure for that day, rather than one key per player - a full sync
+// then costs one write per team instead of twenty-five.
+//
+// ── WHY THE KEY CARRIES THE LEAGUE ──
+// A player does not have "a" fantasy point total. He has one per league, and
+// they differ: the same night is 12.5 in one scoring system and 9.0 in
+// another. A series that took whichever league answered first would be
+// shaped by which league synced, not by how he played. So the series is per
+// (player, league), and the card draws the league with the most days on
+// record - stable across repaints, and the one with the most to say.
+//
+// ── WHAT IT CANNOT DO ──
+// Football is skipped outright. Yahoo scopes football stats by WEEK, so
+// fetchTeamFpForDate returns the same week-to-date total every day of that
+// week; recording it daily would draw a staircase that says nothing. A
+// weekly football sparkline is a different chart.
+//
+// And it starts EMPTY. Nothing retroactive exists to backfill from, so the
+// bars fill in from the day this ships.
+// ══════════════════════════════════════════════════════════════════
+var SK_PSPARK_PREFIX = 'sk_pspark_v1_';
+var SK_PSPARK_DAYS = 14;        // kept; the card draws 10
+var _skSparkMem = null;
+
+function _skSparkKey(name, leagueKey) {
+  var nk = (typeof _pmNameKey === 'function') ? _pmNameKey(name)
+         : String(name || '').toLowerCase();
+  if (!nk || !leagueKey) return '';
+  return nk + '|' + leagueKey;
+}
+
+// The last N calendar dates, newest last.
+function _skSparkDates(n) {
+  var out = [], d = new Date(), i;
+  for (i = n - 1; i >= 0; i--) {
+    var x = new Date(d.getTime());
+    x.setDate(x.getDate() - i);
+    out.push(x.getFullYear() + '-' + String(x.getMonth() + 1).padStart(2, '0') +
+             '-' + String(x.getDate()).padStart(2, '0'));
+  }
+  return out;
+}
+
+// Merge one team's day into that day's bucket. Called where _skGpWriteTally
+// is, off the same parsed map, so it costs no request of its own.
+function _skSparkWrite(teamKey, date, fpMap) {
+  if (!teamKey || !date || !fpMap) return;
+  var parts = String(teamKey).split('.t.');
+  var leagueKey = parts[0];
+  if (!leagueKey) return;
+  // Football is week-scoped; see the note above.
+  try {
+    var lg = (typeof fyLeagues !== 'undefined' && fyLeagues)
+      ? fyLeagues.filter(function (l) { return l.league_key === leagueKey; })[0] : null;
+    if (lg && typeof _skIsNflLeague === 'function' && _skIsNflLeague(lg)) return;
+  } catch (e) {}
+  var k = SK_PSPARK_PREFIX + date, bucket = null;
+  try { bucket = JSON.parse(localStorage.getItem(k) || 'null'); } catch (e2) {}
+  if (!bucket || typeof bucket !== 'object') bucket = {};
+  var wrote = false, pk;
+  for (pk in fpMap) {
+    if (!fpMap.hasOwnProperty(pk)) continue;
+    var e3 = fpMap[pk];
+    if (!e3 || !e3.name || typeof e3.fp !== 'number' || isNaN(e3.fp)) continue;
+    var sk = _skSparkKey(e3.name, leagueKey);
+    if (!sk) continue;
+    bucket[sk] = Math.round(e3.fp * 10) / 10;
+    wrote = true;
+  }
+  if (!wrote) return;
+  try { localStorage.setItem(k, JSON.stringify(bucket)); } catch (e4) { return; }
+  _skSparkMem = null;
+  _skSparkPrune();
+}
+
+// Anything older than the window. Cheap, and it runs on a write rather than
+// on a timer so a phone that never opens the app never pays for it.
+function _skSparkPrune() {
+  try {
+    var keep = {}, ds = _skSparkDates(SK_PSPARK_DAYS), i;
+    for (i = 0; i < ds.length; i++) keep[SK_PSPARK_PREFIX + ds[i]] = 1;
+    var drop = [];
+    for (i = 0; i < localStorage.length; i++) {
+      var k = localStorage.key(i);
+      if (k && k.indexOf(SK_PSPARK_PREFIX) === 0 && !keep[k]) drop.push(k);
+    }
+    for (i = 0; i < drop.length; i++) { try { localStorage.removeItem(drop[i]); } catch (e) {} }
+  } catch (e2) {}
+}
+
+// Every bucket in the window, parsed ONCE. A card with fifty players would
+// otherwise re-parse fourteen JSON blobs per player.
+function _skSparkLoad() {
+  if (_skSparkMem && (Date.now() - _skSparkMem.ts) < 60000) return _skSparkMem;
+  var days = [], ds = _skSparkDates(SK_PSPARK_DAYS), i;
+  for (i = 0; i < ds.length; i++) {
+    var o = null;
+    try { o = JSON.parse(localStorage.getItem(SK_PSPARK_PREFIX + ds[i]) || 'null'); } catch (e) {}
+    days.push({ d: ds[i], m: (o && typeof o === 'object') ? o : null });
+  }
+  _skSparkMem = { ts: Date.now(), days: days };
+  return _skSparkMem;
+}
+
+// Which of this player's leagues has the most days on record. Ties go to the
+// lower league key so the same series is drawn on every repaint.
+function _skSparkBestLeague(name, leagueKeys) {
+  if (!leagueKeys || !leagueKeys.length) return '';
+  var mem = _skSparkLoad(), best = '', bestN = -1, i, j;
+  for (i = 0; i < leagueKeys.length; i++) {
+    var lk = leagueKeys[i];
+    var sk = _skSparkKey(name, lk);
+    if (!sk) continue;
+    var n = 0;
+    for (j = 0; j < mem.days.length; j++) {
+      if (mem.days[j].m && mem.days[j].m[sk] != null) n++;
+    }
+    if (n > bestN || (n === bestN && best && String(lk) < String(best))) { bestN = n; best = lk; }
+  }
+  return bestN > 0 ? best : '';
+}
+
+// days newest-last, each { d, fp } with fp null where nothing was recorded.
+function _skSparkSeries(name, leagueKey, n) {
+  var sk = _skSparkKey(name, leagueKey);
+  if (!sk) return [];
+  var mem = _skSparkLoad(), out = [], i;
+  var start = Math.max(0, mem.days.length - (n || 10));
+  for (i = start; i < mem.days.length; i++) {
+    var m = mem.days[i].m;
+    out.push({ d: mem.days[i].d, fp: (m && m[sk] != null) ? Number(m[sk]) : null });
+  }
+  return out;
+}
+
+// The bars. Scaled to the player's OWN best in the window, so no unit has to
+// be stated for the shape to mean something - which is the whole question
+// ("is he cold"), and it is asked of him, not of the league.
+//
+// A day with nothing recorded and a day he scored nothing are drawn
+// differently on purpose. A cold streak and an idle streak look identical on
+// a chart that flattens both, and they call for opposite decisions.
+function _skSparkHtml(series, leagueName) {
+  if (!series || series.length < 3) return '';
+  var max = 0, sum = 0, played = 0, i;
+  for (i = 0; i < series.length; i++) {
+    var v = series[i].fp;
+    if (v == null) continue;
+    played++;
+    sum += v;
+    if (v > max) max = v;
+  }
+  // Under three days on record there is no shape yet, only noise.
+  if (played < 3) return '';
+  var bars = '';
+  for (i = 0; i < series.length; i++) {
+    var f = series[i].fp;
+    var last = (i === series.length - 1);
+    if (f == null) { bars += '<i class="miss" title="' + skEscape(series[i].d) + ' \u00b7 no data"></i>'; continue; }
+    if (f <= 0) { bars += '<i class="zero" title="' + skEscape(series[i].d) + ' \u00b7 ' + f + '"></i>'; continue; }
+    var h = (max > 0) ? Math.max(2, Math.round(2 + 12 * (f / max))) : 2;
+    bars += '<i class="' + (last ? 'today' : (f === max ? 'best' : '')) + '" style="height:' + h +
+      'px" title="' + skEscape(series[i].d) + ' \u00b7 ' + f + '"></i>';
+  }
+  var avg = played ? (Math.round((sum / played) * 10) / 10) : 0;
+  return '<span class="sk-spark" title="' + skEscape((leagueName || '') + ' \u00b7 last ' +
+      series.length + ' days') + '">' + bars + '</span>' +
+    '<span class="sk-spark-avg">' + avg.toFixed(1) + '/g</span>';
 }
 
 // ══════════════════════════════════════════════════════════════════
