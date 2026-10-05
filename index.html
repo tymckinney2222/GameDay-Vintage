@@ -6848,6 +6848,12 @@
     background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.12);
     color: #fff; font-size: 16px; cursor: pointer; line-height: 1;
   }
+  /* ALLINTABS - a game group is a card you can tap into. */
+  .crs-fhub-card.allin-gm { cursor: pointer; }
+  .crs-fhub-card.allin-gm:active { background: rgba(255,255,255,0.06); }
+  .fxh-lgcount.allin-go {
+    color: var(--sk-gold, #f5c518); opacity: 0.75; letter-spacing: 0.06em;
+  }
   /* ALLINREF - its own class, not .fw-yahoo-refresh, so the stadium
      refresh cannot clear the spin while the slate half is still running. */
   .crs-fhub-close.allin-spin {
@@ -79971,6 +79977,12 @@ function _fhubAllTeamRosterHtml(g, col) {
   return out;
 }
 
+// ALLINTABS - what this renderer is counting OVER. It was written for a
+// stadium, where "in this game" is the literal truth; the All-In hub draws
+// the same cards across the whole night. Set and restored around that one
+// render, which is synchronous, so nothing else can observe it mid-flight.
+var _fhubTeamScope = 'in this game';
+
 // ── BY TEAM ── what this game is worth to each team ── FHUBPLAYER ──
 function _fhubAllTeamsHtml(players) {
   // _extFhubByLeague is _fhubGroupRows plus the sport, the format and the
@@ -80030,7 +80042,7 @@ function _fhubAllTeamsHtml(players) {
         tot +
       '</div>' +
       '<div class="fxh-lgsub">' + slEsc(lgName) +
-        '<span class="fxh-lgcount">' + g.activeN + ' in this game' +
+        '<span class="fxh-lgcount">' + g.activeN + ' ' + _fhubTeamScope +
           (g.benchN ? (' · ' + g.benchN + ' benched') : '') + '</span>' +
       '</div>' + _fhubMatchupHtml(g) + catStrip +
       // FHUBTEAMROSTER — the players behind the total, under it.
@@ -80038,8 +80050,9 @@ function _fhubAllTeamsHtml(players) {
     '</div>';
   }
   if (!html) {
-    return '<div class="crs-fhub-empty">No players from this game are on ' +
-      'any of your rosters.</div>';
+    return '<div class="crs-fhub-empty">No players ' +
+      (_fhubTeamScope === 'in this game' ? 'from this game' : 'playing today') +
+      ' are on any of your rosters.</div>';
   }
   if (grand != null) {
     grand = Math.round(grand * 10) / 10;
@@ -80260,7 +80273,10 @@ function _allInCollect(hits, sport) {
         ' \u00b7 ' + _allInStatus(g),
       rows: rows,
       total: (act == null) ? null : Math.round(act * 100) / 100,
-      lineup: lineup, injury: injury
+      lineup: lineup, injury: injury,
+      // ALLINTABS - the game itself rides along so BY GAME can group on it
+      // without a second join. Harmless to every other reader of this array.
+      gm: h.gm || null
     });
   }
   out.sort(function (x, y) {
@@ -80354,6 +80370,166 @@ function refreshAllInHub() {
     var m2 = document.getElementById('allInModal');
     if (m2 && m2.classList.contains('open')) _allInRender();
   });
+}
+
+// ── THE THREE VIEWS ── ALLINTABS ──
+//
+// Same array of players, asked three different questions:
+//
+//   PLAYERS  who is mine, and where do I hold him  (the original)
+//   BY GAME  which game tonight is worth the most to me - and it opens that
+//            game's stadium, so this hub becomes the front door to the
+//            per-game hubs rather than a thing running alongside them
+//   BY TEAM  what is each of my fantasy teams doing across EVERY game, which
+//            otherwise takes opening ten stadiums to find out
+//
+// Its own state. _fhubAllTab belongs to the stadium hub, and sharing it would
+// mean a tab chosen in one silently moved the other.
+var _allInTab = 'PLAYERS';
+
+function setAllInTab(which) {
+  var w = String(which || '').toUpperCase();
+  _allInTab = (w === 'GAMES' || w === 'TEAMS') ? w : 'PLAYERS';
+  _allInRender();
+}
+
+function _allInTabsHtml() {
+  var opts = [['PLAYERS', 'PLAYERS'], ['GAMES', 'BY GAME'], ['TEAMS', 'BY TEAM']];
+  var h = '<div class="fhub-filt" style="margin:8px 0 10px">', i;
+  for (i = 0; i < opts.length; i++) {
+    h += '<button class="fhub-filt-chip' + (_allInTab === opts[i][0] ? ' on' : '') +
+      '" onclick="setAllInTab(\'' + opts[i][0] + '\')">' + opts[i][1] + '</button>';
+  }
+  return h + '</div>';
+}
+
+// The stadium for one game. The game is looked up by id at TAP time rather
+// than stashed in the markup: the slate is refetched by the refresh button,
+// and a held object would open a stadium on a game state that no longer
+// exists. Nothing closes until an opener has actually been found, so a sport
+// with no stadium leaves you where you were instead of on a blank screen.
+function _allInOpenGame(sport, gameId) {
+  var sp = String(sport || '').toLowerCase();
+  var bucket = _ALLIN_BUCKET[sp];
+  if (!bucket) return;
+  var games = (typeof allGames !== 'undefined' && allGames[bucket]) || [];
+  var g = null, i;
+  for (i = 0; i < games.length; i++) {
+    if (games[i] && String(games[i].id) === String(gameId)) { g = games[i]; break; }
+  }
+  if (!g) return;
+  var fn = null;
+  if (sp === 'nhl' && typeof openRink === 'function') fn = openRink;
+  else if (sp === 'nba' && typeof openGym === 'function') fn = openGym;
+  else if ((sp === 'nfl' || sp === 'cfb') && typeof openField === 'function') fn = openField;
+  else if (sp === 'mlb' && typeof openFenway === 'function') fn = openFenway;
+  if (!fn) return;
+  closeAllInHub();
+  try { fn(g); } catch (e) {}
+}
+
+function _allInStadiumWord(sport) {
+  var sp = String(sport || '').toLowerCase();
+  if (sp === 'nhl') return 'RINK';
+  if (sp === 'nba') return 'COURT';
+  if (sp === 'mlb') return 'BALLPARK';
+  return 'FIELD';
+}
+
+// One compact player line inside a game group. Deliberately NOT the league
+// line used elsewhere: here the label is the player and the number is his
+// whole night, because the leagues are what the PLAYERS tab is for.
+function _allInGamePlayerLine(pl) {
+  var nm = pl.name || '?';
+  if (nm.length > 22) nm = nm.slice(0, 21) + '\u2026';
+  var n = (pl.rows || []).length;
+  var right = '';
+  if (pl.total != null) {
+    var c = pl.total > 0 ? '#fbbf24' : (pl.total < 0 ? '#f87171' : 'rgba(255,255,255,0.35)');
+    right = '<span class="crs-fhub-fp" style="color:' + c + '">' +
+      (pl.total > 0 ? '+' : '') + pl.total.toFixed(1) + ' FP</span>';
+  }
+  return '<div class="crs-fhub-row">' +
+    (pl.teamLogo
+      ? '<img class="crs-fhub-row-logo" src="' + slEsc(pl.teamLogo) +
+        '" alt="" onerror="this.style.display=\'none\'">'
+      : '<span class="crs-fhub-row-logo-ph"></span>') +
+    '<span class="fxh-pname">' + slEsc(nm) +
+      '<span style="opacity:0.45"> \u00b7 ' + n + ' lg</span></span>' +
+    '<span class="crs-fhub-cats"></span>' + right +
+  '</div>';
+}
+
+// ── BY GAME ── which game is worth the most to me ── ALLINTABS ──
+function _allInByGameHtml(players, sport) {
+  var byId = {}, order = [], i;
+  for (i = 0; i < players.length; i++) {
+    var pl = players[i];
+    var g = pl.gm && pl.gm.g;
+    if (!g || g.id == null) continue;
+    var k = String(g.id);
+    if (!byId[k]) { byId[k] = { g: g, players: [], total: null }; order.push(k); }
+    byId[k].players.push(pl);
+    if (pl.total != null) byId[k].total = (byId[k].total == null ? 0 : byId[k].total) + pl.total;
+  }
+  if (!order.length) return '<div class="crs-fhub-empty">Nothing to group yet.</div>';
+  var groups = [];
+  for (i = 0; i < order.length; i++) {
+    var gr = byId[order[i]];
+    if (gr.total != null) gr.total = Math.round(gr.total * 100) / 100;
+    groups.push(gr);
+  }
+  // Worth the most first. Before anything has started every total is null and
+  // this falls through to the player count, which is the only ranking that
+  // means anything at 1pm - and the one that still answers "where am I most
+  // exposed tonight".
+  groups.sort(function (a, b) {
+    var av = (a.total == null) ? -1e9 : a.total;
+    var bv = (b.total == null) ? -1e9 : b.total;
+    if (av !== bv) return bv - av;
+    if (b.players.length !== a.players.length) return b.players.length - a.players.length;
+    return String(a.g.id).localeCompare(String(b.g.id));
+  });
+
+  var html = '', j;
+  for (i = 0; i < groups.length; i++) {
+    var G = groups[i], g2 = G.g;
+    var away = (g2.away && g2.away.abbr) || '?';
+    var home = (g2.home && g2.home.abbr) || '?';
+    var score = '';
+    if (g2.state !== 'pre' && g2.away && g2.home &&
+        g2.away.score != null && g2.home.score != null) {
+      score = ' ' + g2.away.score + '\u2013' + g2.home.score;
+    }
+    var tot = '';
+    if (G.total != null) {
+      var tc = G.total > 0 ? '#fbbf24' : (G.total < 0 ? '#f87171' : 'rgba(255,255,255,0.4)');
+      tot = '<span class="crs-fhub-card-total" style="color:' + tc + '">' +
+        (G.total > 0 ? '+' : '') + G.total.toFixed(1) + ' FP</span>';
+    }
+    G.players.sort(function (a, b) {
+      var av = (a.total == null) ? -1e9 : a.total;
+      var bv = (b.total == null) ? -1e9 : b.total;
+      if (av !== bv) return bv - av;
+      return String(a.name || '').localeCompare(String(b.name || ''));
+    });
+    var lines = '';
+    for (j = 0; j < G.players.length; j++) lines += _allInGamePlayerLine(G.players[j]);
+
+    html += '<div class="crs-fhub-card allin-gm" style="--fhub-accent:' +
+        _allInAccent(g2.home || {}) + '" onclick="_allInOpenGame(\'' +
+        slEsc(String(sport)) + '\',\'' + slEsc(String(g2.id)) + '\')">' +
+      '<div class="crs-fhub-card-top">' +
+        '<span class="crs-fhub-card-name">' + slEsc(away) + ' @ ' + slEsc(home) +
+          slEsc(score) + '</span>' + tot +
+      '</div>' +
+      '<div class="fxh-lgsub">' + slEsc(_allInStatus(g2)) + ' \u00b7 ' +
+        G.players.length + ' player' + (G.players.length === 1 ? '' : 's') +
+        '<span class="fxh-lgcount allin-go">OPEN ' + _allInStadiumWord(sport) +
+        ' \u2192</span></div>' + lines +
+    '</div>';
+  }
+  return html;
 }
 
 function _allInPillsHtml(scan) {
@@ -80457,7 +80633,32 @@ function _allInRender() {
       ' \u00b7 ' + cur.games + ' GAME' + (cur.games === 1 ? '' : 'S') +
       (_stamp ? (' \u00b7 ' + _stamp) : '');
   }
-  body.innerHTML = _fhubAllPlayersHtml(players);
+  // ALLINTABS - the tabs live beside the sport pills rather than scrolling
+  // with the body, because switching view is a thing you do constantly and a
+  // control you have to scroll back up to find is a control you stop using.
+  if (pills) pills.innerHTML += _allInTabsHtml();
+
+  if (_allInTab === 'GAMES') {
+    body.innerHTML = _allInByGameHtml(players, cur.sport);
+  } else if (_allInTab === 'TEAMS') {
+    _fhubTeamScope = 'tonight';
+    try { body.innerHTML = _fhubAllTeamsHtml(players); }
+    finally { _fhubTeamScope = 'in this game'; }
+    // FHUBWARM - a team's own matchup is a separate fetch, and the groups
+    // this hub draws are mostly leagues no stadium happened to warm. Once per
+    // league per session; the redraw is guarded on the hub still being open
+    // AND still on this tab, so a tab change mid-flight is not undone.
+    try {
+      if (typeof _fhubWarmMatchups === 'function') {
+        _fhubWarmMatchups(window._fhubLastGroups || [], function () {
+          var m3 = document.getElementById('allInModal');
+          if (m3 && m3.classList.contains('open') && _allInTab === 'TEAMS') _allInRender();
+        });
+      }
+    } catch (eW) {}
+  } else {
+    body.innerHTML = _fhubAllPlayersHtml(players);
+  }
 }
 
 function _fhubAllUpdateBtn(btnId, countId, _retried) {
