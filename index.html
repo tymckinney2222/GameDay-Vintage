@@ -97564,6 +97564,104 @@ function _skWireMoveSummary(synced) {
   return n ? { up: up, down: down, held: held, n: n } : null;
 }
 
+// ══════════════════════════════════════════════════════════════════
+// WIREMOVE2 — the roto league never reached the movement code.
+//
+// The Wire's scanner has branches for headpoint, point, head and headone,
+// and roto falls past all four into
+//     entry.error = 'Scoring type not supported: ' + scoringType
+// which the row builder catches at its second guard and returns a "No data"
+// stub from - long before the movement code further down ever runs.
+//
+// Meanwhile the headline summary reads the rank history DIRECTLY, so it
+// counted that league perfectly happily. That is how the digest came to say
+// "across 3 leagues" while the board showed two of them and a card reading
+// No data: two readers of the same fact, one of which could not get past a
+// guard the other never met.
+//
+// So the pill and the line move out into functions, and every branch that
+// draws a row - loading, errored, or normal - asks the same ones. The error
+// is left in place on the entry, because it is TRUE: the matchup scan really
+// does have nothing for a roto league, and it is what keeps that league out
+// of the "N of M leagues counted" record it cannot contribute to.
+// ══════════════════════════════════════════════════════════════════
+
+function _skWireMovePill(mv) {
+  if (!mv) return null;
+  if (mv.rankFrom != null) {
+    var d = mv.rankFrom - mv.rankTo;
+    if (d > 0) return { cls: 'win', txt: '\u25b2' + d };
+    if (d < 0) return { cls: 'loss', txt: '\u25bc' + (-d) };
+    return { cls: 'no', txt: 'HELD' };
+  }
+  if (mv.only) return { cls: 'no', txt: _skWireOrdinal(mv.rankTo) };
+  return null;
+}
+
+function _skWireMoveLineHTML(mv, isRoto) {
+  if (!mv) return '';
+  if (mv.rankFrom == null) {
+    if (!mv.only) return '';
+    return '<div class="sk-wr-row-score sk-wr-move">' +
+      skEscape(_skWireOrdinal(mv.rankTo) + ' \u00b7 tracking from today') + '</div>';
+  }
+  var d = mv.rankFrom - mv.rankTo;
+  var bits = [_skWireOrdinal(mv.rankFrom) + ' \u2192 ' + _skWireOrdinal(mv.rankTo)];
+  if (mv.ptsDelta != null && mv.ptsDelta !== 0) {
+    // Named, because they are not the same unit. A season-points league's
+    // number is fantasy points scored; a roto league's is RANK points, which
+    // move by passing somebody rather than by scoring.
+    bits.push((mv.ptsDelta > 0 ? '+' : '') + mv.ptsDelta.toFixed(1) +
+              (isRoto ? ' roto pts' : ' pts'));
+  }
+  // Only when it is NOT yesterday. The row clips to one line, and spending
+  // those characters restating the default is what pushed the real figures
+  // off the end of it. A gap is the surprise, so a gap keeps its label.
+  var yd = (typeof skYesterdayDateString === 'function') ? skYesterdayDateString() : '';
+  if (mv.from !== yd) {
+    var since = _skWireSinceLabel(mv.from);
+    if (since) bits.push(since);
+  }
+  return '<div class="sk-wr-row-score sk-wr-move' +
+    (d > 0 ? ' up' : (d < 0 ? ' dn' : '')) + '">' +
+    skEscape(bits.join(' \u00b7 ')) + '</div>';
+}
+
+// The shell both stub branches share, so an errored or still-loading league
+// that HAS movement reads as a real row rather than a placeholder.
+function _skWireStubRowHTML(league, teamName, leagueName, logoUrl, fmtPill, mv, fallbackTxt, fallbackCls) {
+  var pill = _skWireMovePill(mv);
+  var isRoto = String(league && league.scoring_type || '') === 'roto';
+  var moveHtml = pill ? _skWireMoveLineHTML(mv, isRoto) : '';
+  var pillHtml = pill
+    ? ('<div class="sk-wr-row-pill ' + pill.cls + '">' + pill.txt + '</div>')
+    : ('<div class="sk-wr-row-pill ' + fallbackCls + '">' + fallbackTxt + '</div>');
+  var tap = pill
+    ? (' onclick="skOpenWireDetail(\'' + skEscape(league.league_key) + '\')" role="button" tabindex="0"')
+    : '';
+  // The dimmed 'loading' class belongs to the still-fetching case only. An
+  // errored row never carried it before this builder merged the two branches,
+  // and quietly dimming it would be a change nobody asked for.
+  return '<div class="sk-wr-row' +
+    ((!pill && fallbackCls === 'loading') ? ' loading' : '') + '"' + tap + '>' +
+    '<div class="sk-wr-row-logo-wrap">' +
+      (logoUrl ? '<img class="sk-wr-row-logo" src="' + skEscape(logoUrl) + '" alt="" onerror="this.style.display=\'none\'">'
+               : '<div class="sk-wr-row-logo-ph"></div>') +
+    '</div>' +
+    '<div class="sk-wr-row-main">' +
+      '<div class="sk-wr-row-team">' + skEscape(teamName) + '</div>' +
+      (pill
+        ? ('<div class="sk-wr-row-meta">' + skEscape(leagueName) +
+           ' <span class="sk-wr-fmt-pill">' + skEscape(fmtPill) + '</span></div>')
+        : ('<div class="sk-wr-row-league">' + skEscape(leagueName) + '</div>')) +
+      moveHtml +
+    '</div>' +
+    '<div class="sk-wr-row-right">' + pillHtml +
+      (pill ? '<div class="sk-wr-row-chevron">\u203a</div>' : '') +
+    '</div>' +
+  '</div>';
+}
+
 function _skBuildWireLeagueRowHTML(league, entry) {
   var leagueData = skLeagueData[league.league_key] || {};
   var team = leagueData.team;
@@ -97578,34 +97676,20 @@ function _skBuildWireLeagueRowHTML(league, entry) {
               : st === 'point'     ? 'SEASON'
               : (st || '\u2014').toUpperCase();
 
+  // WIREMOVE2 - read BEFORE the guards, not after them. This is the whole
+  // bug: a roto league stops at the error guard below, and the movement code
+  // used to live past it.
+  var _mv0 = (typeof _skWireMoveForLeague === 'function')
+    ? _skWireMoveForLeague(league) : null;
+
   if (!entry) {
-    return '<div class="sk-wr-row loading">' +
-      '<div class="sk-wr-row-logo-wrap">' +
-        (logoUrl ? '<img class="sk-wr-row-logo" src="' + skEscape(logoUrl) + '" alt="">' : '<div class="sk-wr-row-logo-ph"></div>') +
-      '</div>' +
-      '<div class="sk-wr-row-main">' +
-        '<div class="sk-wr-row-team">' + skEscape(teamName) + '</div>' +
-        '<div class="sk-wr-row-league">' + skEscape(leagueName) + '</div>' +
-      '</div>' +
-      '<div class="sk-wr-row-right">' +
-        '<div class="sk-wr-row-pill loading">Loading\u2026</div>' +
-      '</div>' +
-    '</div>';
+    return _skWireStubRowHTML(league, teamName, leagueName, logoUrl, fmtPill,
+                              _mv0, 'Loading\u2026', 'loading');
   }
 
   if (entry.error) {
-    return '<div class="sk-wr-row">' +
-      '<div class="sk-wr-row-logo-wrap">' +
-        (logoUrl ? '<img class="sk-wr-row-logo" src="' + skEscape(logoUrl) + '" alt="">' : '<div class="sk-wr-row-logo-ph"></div>') +
-      '</div>' +
-      '<div class="sk-wr-row-main">' +
-        '<div class="sk-wr-row-team">' + skEscape(teamName) + '</div>' +
-        '<div class="sk-wr-row-league">' + skEscape(leagueName) + '</div>' +
-      '</div>' +
-      '<div class="sk-wr-row-right">' +
-        '<div class="sk-wr-row-pill no">No data</div>' +
-      '</div>' +
-    '</div>';
+    return _skWireStubRowHTML(league, teamName, leagueName, logoUrl, fmtPill,
+                              _mv0, 'No data', 'no');
   }
 
   // ── WIRENFL ── Derived fresh every render, never cached. See _skWireNflLive.
@@ -97617,20 +97701,14 @@ function _skBuildWireLeagueRowHTML(league, entry) {
   else if (entry.result === 'T') { pillCls = 'tie'; pillTxt = 'T'; }
   // WIREMOVE - where you moved, in place of the word SOLO. Roto joins it:
   // it had no branch at all and showed a bare dash.
-  var _mv = null;
-  if (st === 'point' || st === 'roto') {
-    _mv = _skWireMoveForLeague(league);
-    if (_mv && _mv.rankFrom != null) {
-      var _d = _mv.rankFrom - _mv.rankTo;        // positive = climbed
-      if (_d > 0) { pillCls = 'win'; pillTxt = '\u25b2' + _d; }
-      else if (_d < 0) { pillCls = 'loss'; pillTxt = '\u25bc' + (-_d); }
-      else { pillCls = 'no'; pillTxt = 'HELD'; }
-    } else if (_mv && _mv.only) {
-      // One day on record is not a movement, and a zero here would read as
-      // one. Say what it actually is.
-      pillCls = 'no'; pillTxt = _skWireOrdinal(_mv.rankTo);
-    } else if (st === 'point') { pillCls = 'no'; pillTxt = 'SOLO'; }
-  }
+  var _mv = (st === 'point' || st === 'roto') ? _mv0 : null;
+  var _mvp = _mv ? _skWireMovePill(_mv) : null;
+  if (_mvp) { pillCls = _mvp.cls; pillTxt = _mvp.txt; }
+  // Outside the movement check, deliberately. Nesting it cost the SOLO
+  // fallback on a season-points league with NO history at all - the case
+  // where _mv is null and the old nested branch was never entered. The
+  // previous build's test caught it; this is what it was guarding.
+  else if (st === 'point') { pillCls = 'no'; pillTxt = 'SOLO'; }
   // An unfinished football week has no result to report, so the pill says
   // where the week IS: LIVE while clubs are on the field, W/L/T once the
   // week is settled, LEAD/TRAIL in between, week number before kickoff.
@@ -97725,27 +97803,7 @@ function _skBuildWireLeagueRowHTML(league, entry) {
   // WIREMOVE - the move itself, under whatever else the row says. Added
   // rather than replacing, because "28.5 FP today" and "11th to 9th" are
   // different facts and a season-points morning wants both.
-  if (_mv && _mv.rankFrom != null) {
-    var _mvD = _mv.rankFrom - _mv.rankTo;
-    var _bits = [_skWireOrdinal(_mv.rankFrom) + ' \u2192 ' + _skWireOrdinal(_mv.rankTo)];
-    if (_mv.ptsDelta != null && _mv.ptsDelta !== 0) {
-      _bits.push((_mv.ptsDelta > 0 ? '+' : '') + _mv.ptsDelta.toFixed(1) + ' pts');
-    }
-    // Only when it is NOT yesterday. The row clips to one line, and spending
-    // those characters restating the default is what pushed the real figures
-    // off the end of it. A gap is the surprise, so a gap keeps its label.
-    var _yd = (typeof skYesterdayDateString === 'function') ? skYesterdayDateString() : '';
-    if (_mv.from !== _yd) {
-      var _since = _skWireSinceLabel(_mv.from);
-      if (_since) _bits.push(_since);
-    }
-    noteHtml += '<div class="sk-wr-row-score sk-wr-move' +
-      (_mvD > 0 ? ' up' : (_mvD < 0 ? ' dn' : '')) + '">' +
-      skEscape(_bits.join(' \u00b7 ')) + '</div>';
-  } else if (_mv && _mv.only) {
-    noteHtml += '<div class="sk-wr-row-score sk-wr-move">' +
-      skEscape(_skWireOrdinal(_mv.rankTo) + ' \u00b7 tracking from today') + '</div>';
-  }
+  noteHtml += _skWireMoveLineHTML(_mv, st === 'roto');
 
   var mvpNote = '';
   if (entry.mvp && entry.mvp.fp != null) {
@@ -99515,6 +99573,17 @@ function _skRankHistRecordYahoo() {
         var r = parseInt(all[k] && all[k].rank, 10);
         if (r > 0) ranks[k] = r;
         var pv = all[k] && all[k].points_for;
+        // WIREMOVE2 - Yahoo publishes NO points_for on a roto standings row,
+        // so the points half of this history was empty for every roto league
+        // and anything reading it showed a rank move with no number beside
+        // it. The roto total is the sum of the per-category rank points Yahoo
+        // DOES publish - the same arithmetic the standings page does, its own
+        // figures added up rather than a derivation that could disagree with
+        // them. The bump chart's points layer (SKBUMP2) gains this too.
+        if (pv == null && st === 'roto' && typeof _skYahooRotoPts === 'function') {
+          var _rpv = _skYahooRotoPts(all[k]);
+          if (_rpv != null) pv = _rpv;
+        }
         if (pv != null && !isNaN(Number(pv))) pts[k] = Number(pv);
       }
       _skRankHistRecord(lg.league_key, ranks, pts);
