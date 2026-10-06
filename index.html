@@ -1381,6 +1381,17 @@
   .sk-gpb-cov.low { color: #f87171; }
   .sk-gpb-cov.mid { color: #fbbf24; }
   .sk-gpb-cov.ok  { color: rgba(255,255,255,0.45); }
+  /* GPBUDGET - the press-or-hold verdict, and a budget with room in it. */
+  .sk-gpb-bud-call {
+    font-family: var(--sk-font-mono, monospace); font-size: 10px;
+    line-height: 1.6; color: rgba(255,255,255,0.5);
+    margin: 0 0 7px; padding: 0 6px;
+  }
+  .sk-gpb-bud-call b { font-weight: 700; letter-spacing: 0.08em; }
+  .sk-gpb-bud-call b.hold { color: #f87171; }
+  .sk-gpb-bud-call b.press { color: #4ade80; }
+  .sk-gpb-bud-call .sep { color: rgba(255,255,255,0.16); margin: 0 7px; }
+  .sk-gpb-mine-n.room { color: #4ade80; }
   /* ── ESPKO ── Knockout survival board. */
   .sk-ko-head {
     font-family: var(--sk-font-mono, monospace); font-size: 9px;
@@ -121443,6 +121454,9 @@ function _skRenderGpBoard(league, host) {
     '<div class="sk-gpb">' + head + body + '</div>' +
     _skGpPaceBoard(league, rows, maxByPos, positions) +
     _skGpMinePanel(league, rows, maxByPos, positions, myKey, _win) +
+    // GPBUDGET - MY SLOTS says where this team stands; this says what to do
+    // about it this week, which is the question a manager acts on.
+    _skGpBudgetPanel(league, rows, maxByPos, positions, myKey, _win) +
     '<div class="sk-gpb-note">Coverage grows on its own now: every day this ' +
       'league is opened is written down and kept, where before it was held ' +
       'only until midnight.</div>';
@@ -121572,6 +121586,207 @@ function _skGpMinePanel(league, rows, maxByPos, positions, myKey, win) {
       ? ('<button class="sk-gpb-fill" onclick="skGpCatchUp(\'' + lk + '\')">FILL IN ' +
          gaps.length + ' DAY' + (gaps.length === 1 ? '' : 'S') + '</button>')
       : '') +
+  '</div>';
+  return h;
+}
+
+// == WEEKLY BUDGET PER POSITION == GPBUDGET ==
+//
+// The ask, in his words: "I ultimately need to know what my budget is, per
+// position. We did this calculation for IP in baseball and calculated what my
+// weekly budget was so that I knew whether or not I could press or if I
+// needed to hold back."
+//
+// That baseball calculation is _skBuildCapPlan: remaining innings over weeks
+// left, against the pace actually being run. Same arithmetic here, once per
+// slot instead of once per team.
+//
+// The one piece that CANNOT be copied across is the headroom. Cap Watch knows
+// exactly how many innings have been thrown because Yahoo publishes
+// max_innings_pitched and stat 50. Here usage is counted off cached lineups
+// and is a LOWER BOUND - which is exactly what the note under MY SLOTS
+// already admits about its LEFT column: "it reads HIGH by whatever the
+// coverage above is missing."
+//
+// A budget that reads high is the one kind of wrong this cannot afford. It
+// says press when the honest answer is hold, which is the precise mistake the
+// feature exists to prevent. So the headroom is corrected the same way FINISH
+// is corrected - games per COUNTED day carried across the days that have
+// actually elapsed - rather than taken from the raw running total:
+//
+//   estUsed = rate x elapsedDays          what the counted days imply
+//   budget  = (max - estUsed) / weeksLeft games per week to land on the cap
+//   pace    = rate x 7                    games per week being run now
+//
+// and that makes this block agree with the column above it by construction.
+// budget > pace exactly when rate x seasonDays < max, and rate x seasonDays
+// is FINISH. The two readings can never contradict each other, which is why
+// elapsedDays is taken as seasonDays - daysLeft rather than counted
+// separately: a second count of the same thing would eventually disagree with
+// the first by a day and the panel would start arguing with itself.
+function _skGpWeekBudget(used, max, rate, seasonDays, daysLeft) {
+  if (rate == null || max == null || !(max > 0)) return null;
+  if (seasonDays == null || daysLeft == null) return null;
+  var weeksLeft = daysLeft / 7;
+  // Under half a week there is no plan left to make, and dividing by it turns
+  // two spare games into a budget of thirty.
+  if (!(weeksLeft >= 0.5)) return null;
+  var elapsed = Math.max(0, seasonDays - daysLeft);
+  var estUsed = rate * elapsed;
+  var estLeft = max - estUsed;
+  var pace = rate * 7;
+  // Past the cap on this estimate, the budget is zero, not negative. There is
+  // no such thing as owing the cap games back.
+  var budget = (estLeft > 0) ? (estLeft / weeksLeft) : 0;
+  var delta = budget - pace;
+  // A quarter of a game a week is noise, not a decision.
+  var call = (delta >= 0.25) ? 'press' : ((delta <= -0.25) ? 'hold' : 'even');
+  return {
+    weeksLeft: weeksLeft, estUsed: estUsed, estLeft: estLeft,
+    rawLeft: Math.max(0, max - used), pace: pace, budget: budget,
+    delta: delta, call: call, frozen: (estLeft <= 0)
+  };
+}
+
+// GPBUDGET - games charged to each position since Monday, which is what a
+// weekly budget is actually spent against. Read off the same tally the board
+// is built from, so it carries the same floor: today is still accruing, and a
+// day nobody cached counts nothing.
+function _skGpWeekSoFar(league, teamKey) {
+  if (typeof _weekDaysForDate !== 'function' || !teamKey) return null;
+  var today = _todayDateString();
+  var wk = _weekDaysForDate(today) || [];
+  var byPos = {}, days = 0, elapsed = 0, i, pos;
+  for (i = 0; i < wk.length; i++) {
+    if (wk[i] > today) break;            // the rest of the week hasn't happened
+    elapsed++;
+    var day = _skGpReadTally(teamKey, wk[i]);
+    if (!day) continue;
+    days++;
+    for (pos in day) {
+      if (day.hasOwnProperty(pos)) byPos[pos] = (byPos[pos] || 0) + day[pos];
+    }
+  }
+  return { byPos: byPos, days: days, elapsed: elapsed, start: wk[0] || '' };
+}
+
+// One decimal, always shown, because "7" and "7.0" in the same column read as
+// different kinds of number.
+function _skGpB1(n) {
+  if (n == null || isNaN(n)) return '\u2014';
+  return (Math.round(n * 10) / 10).toFixed(1);
+}
+
+function _skGpBudgetPanel(league, rows, maxByPos, positions, myKey, win) {
+  var mine = null, i;
+  for (i = 0; i < rows.length; i++) if (rows[i].isMine) mine = rows[i];
+  if (!mine) return '';
+  var pr = _skGpProjectSlots(league, mine.usage, maxByPos, positions);
+  if (!pr.rows.length) return '';
+
+  // GPBUDGET - the same two-counted-day bar the projection holds itself to.
+  // One counted day is a schedule, not a rate, and a budget built on it would
+  // be a number with no evidence behind it at all. Says so instead.
+  //
+  // Each branch below writes its own markup rather than sharing an opening
+  // fragment, so the open and close tags balance inside every string literal
+  // and a tag audit over the file still means something.
+  if (!pr.projects) {
+    return '<div class="sk-gpb-mine">' +
+      '<div class="sk-gpb-mine-h">WEEKLY BUDGET</div>' +
+      '<div class="sk-gpb-mine-note">A rate needs two counted days. Fill in a ' +
+      'couple above and the budget appears with them.</div></div>';
+  }
+  if (!(pr.daysLeft / 7 >= 0.5)) {
+    return '<div class="sk-gpb-mine">' +
+      '<div class="sk-gpb-mine-h">WEEKLY BUDGET</div>' +
+      '<div class="sk-gpb-mine-note">Less than a week of season left ' +
+      '\u2014 there is no budget left to pace, only games left to use.' +
+      '</div></div>';
+  }
+
+  var lk = league.league_key;
+  var days = pr.days;
+  var wk = null;
+  try { wk = _skGpWeekSoFar(league, myKey); } catch (e) {}
+
+  var list = [], holds = [], presses = [], anyFrozen = false, anySpent = false;
+  for (i = 0; i < pr.rows.length; i++) {
+    var r = pr.rows[i];
+    // Unrounded deliberately. pr.rows[i].rate is rounded to two places for
+    // display, and this one gets multiplied by a whole season.
+    var rate = days > 0 ? (r.used / days) : null;
+    var b = _skGpWeekBudget(r.used, r.max, rate, pr.seasonDays, pr.daysLeft);
+    if (!b) continue;
+    var lbl = _skGpPosLabel(lk, r.pos);
+    if (b.call === 'hold') holds.push(lbl);
+    else if (b.call === 'press') presses.push(lbl);
+    if (b.frozen) anyFrozen = true;
+    var thisWk = wk ? (wk.byPos[r.pos] || 0) : null;
+    // Already past this week's allowance, whatever day it is. On a Tuesday
+    // that is worth knowing precisely BECAUSE it is only Tuesday.
+    var spent = (thisWk != null && thisWk > b.budget);
+    if (spent) anySpent = true;
+    list.push({ pos: r.pos, label: lbl, b: b, wk: thisWk, spent: spent });
+  }
+  if (!list.length) return '';
+
+  var wl = list[0].b.weeksLeft;
+  var h = '<div class="sk-gpb-mine">' +
+    '<div class="sk-gpb-mine-h">WEEKLY BUDGET \u00b7 ' + _skGpB1(wl) +
+      ' weeks left</div>';
+
+  // The whole question answered before the table: where to push, where to
+  // sit on your hands.
+  if (holds.length || presses.length) {
+    h += '<div class="sk-gpb-bud-call">' +
+      (holds.length
+        ? ('<b class="hold">HOLD</b> ' + skEscape(holds.join(' \u00b7 '))) : '') +
+      ((holds.length && presses.length) ? '<span class="sep">|</span>' : '') +
+      (presses.length
+        ? ('<b class="press">PRESS</b> ' + skEscape(presses.join(' \u00b7 '))) : '') +
+      '</div>';
+  } else {
+    h += '<div class="sk-gpb-bud-call"><b>ON BUDGET</b> in every slot</div>';
+  }
+
+  h += '<div class="sk-gpb-mine-row head">' +
+      '<span class="sk-gpb-mine-pos"></span>' +
+      '<span class="sk-gpb-mine-n">THIS WK</span>' +
+      '<span class="sk-gpb-mine-n">NOW / WK</span>' +
+      '<span class="sk-gpb-mine-n">BUDGET</span>' +
+    '</div>';
+
+  for (i = 0; i < list.length; i++) {
+    var it = list[i], bb = it.b;
+    h += '<div class="sk-gpb-mine-row">' +
+      '<span class="sk-gpb-mine-pos">' + skEscape(it.label) + '</span>' +
+      '<span class="sk-gpb-mine-n' + (it.spent ? ' over' : '') + '">' +
+        (it.wk == null ? '\u2014' : it.wk) + '</span>' +
+      '<span class="sk-gpb-mine-n' + (bb.call === 'hold' ? ' over' : '') + '">' +
+        _skGpB1(bb.pace) + '</span>' +
+      '<span class="sk-gpb-mine-n' +
+        (bb.frozen ? ' over' : (bb.call === 'press' ? ' room' : '')) + '">' +
+        _skGpB1(bb.budget) + '</span>' +
+    '</div>';
+  }
+
+  h += '<div class="sk-gpb-mine-note">BUDGET is games per week from here on to ' +
+    'land exactly on the cap. NOW / WK is what this slot has actually been ' +
+    'charged per week so far \u2014 red there means the pace is over budget, so ' +
+    'hold back; green on the budget means there is room to press. THIS WK is ' +
+    'games already charged since Monday' +
+    ((wk && wk.elapsed) ? (', ' + wk.elapsed + ' day' +
+      (wk.elapsed === 1 ? '' : 's') + ' in') : '') +
+    (anySpent ? ', and red means this week\u2019s allowance is already gone in ' +
+      'that slot' : '') + '. ' +
+    (anyFrozen ? 'A budget of 0.0 is a slot this estimate has already pushed ' +
+      'past its cap \u2014 it scores nothing more. ' : '') +
+    'Headroom is corrected for the days nobody counted \u2014 games per counted ' +
+    'day carried across the ' + Math.max(0, pr.seasonDays - pr.daysLeft) +
+    ' days elapsed \u2014 so these figures agree with FINISH above instead of ' +
+    'reading high the way LEFT does. The count itself is still a floor, so a ' +
+    'budget is generous by whatever the coverage is missing.</div>' +
   '</div>';
   return h;
 }
