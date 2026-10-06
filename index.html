@@ -6905,6 +6905,11 @@
     background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.12);
     color: #fff; font-size: 16px; cursor: pointer; line-height: 1;
   }
+  /* ESPABBR - who this hub could not place, and why. */
+  .sk-allin-skip {
+    margin: 0 0 8px; font-family: var(--sk-font-mono, monospace);
+    font-size: 9px; line-height: 1.5; color: var(--sk-text-4, rgba(245,245,240,0.28));
+  }
   /* ALLINTABS - a game group is a card you can tap into. */
   .crs-fhub-card.allin-gm { cursor: pointer; }
   .crs-fhub-card.allin-gm:active { background: rgba(255,255,255,0.06); }
@@ -80323,7 +80328,8 @@ function _allInScan() {
       ? _pmNameKey(m.name) : String(m.name).toLowerCase();
     if (!k) continue;
     if (!grp.byKey[k]) {
-      grp.byKey[k] = { key: k, name: m.name, teamAbbr: m.teamAbbr || '', pos: m.displayPos || '' };
+      grp.byKey[k] = { key: k, name: m.name, teamAbbr: m.teamAbbr || '',
+                       pos: m.displayPos || '', espnId: m.espnId || '' };
       grp.order.push(k);
     } else {
       // Providers publish different amounts about the same player. Take the
@@ -80332,21 +80338,28 @@ function _allInScan() {
       // player a Yahoo row could have placed on the slate.
       if (!grp.byKey[k].teamAbbr && m.teamAbbr) grp.byKey[k].teamAbbr = m.teamAbbr;
       if (!grp.byKey[k].pos && m.displayPos) grp.byKey[k].pos = m.displayPos;
+      if (!grp.byKey[k].espnId && m.espnId) grp.byKey[k].espnId = m.espnId;   // ESPABBR
     }
   }
   var out = [], j;
   for (i = 0; i < order.length; i++) {
     var g2 = bySport[order[i]];
     var slate = _allInSlate(g2.sport);
-    var players = [], hits = [];
+    var players = [], hits = [], noClub = 0, noMatch = 0;
     for (j = 0; j < g2.order.length; j++) {
       var pl = g2.byKey[g2.order[j]];
       players.push(pl);
-      var hit = pl.teamAbbr ? slate.byAbbr[_allInCanon(pl.teamAbbr)] : null;
+      if (!pl.teamAbbr) { noClub++; continue; }
+      var hit = slate.byAbbr[_allInCanon(pl.teamAbbr)];
       if (hit) { pl.gm = hit; hits.push(pl); }
+      else noMatch++;
     }
+    // ESPABBR - counted, not swallowed. A player with no club on file and a
+    // player whose club is spelled differently on the slate are both dropped
+    // silently otherwise, and that is exactly how the ESPN gap went unseen.
     out.push({ sport: g2.sport, label: _ALLIN_BUCKET[g2.sport],
-               players: players, hits: hits, games: slate.games });
+               players: players, hits: hits, games: slate.games,
+               noClub: noClub, noMatch: noMatch });
   }
   // Most to watch first, then the sports with nothing on.
   out.sort(function (a, b) {
@@ -80386,8 +80399,12 @@ function _allInCollect(hits, sport) {
   for (i = 0; i < hits.length; i++) {
     var h = hits[i];
     var rows = [];
-    try { rows = _fhubRowsForAthlete({ name: h.name }, espIdx, extIdx, sport) || []; }
-    catch (eR) { rows = []; }
+    // ESPABBR - with the id, _espFhubRowsFor and _extFhubRowsFor take their
+    // EXACT join instead of falling back to the folded name.
+    try {
+      rows = _fhubRowsForAthlete({ name: h.name, espnId: h.espnId || null },
+                                 espIdx, extIdx, sport) || [];
+    } catch (eR) { rows = []; }
     if (!rows.length) continue;
     // ACTIVE points only, because that is the figure the card headlines. The
     // stadium hub sorts on a total that includes bench rows, which is fine
@@ -80909,8 +80926,10 @@ function _skNightScan(force) {
       for (j = 0; j < sc.hits.length; j++) {
         var h = sc.hits[j];
         var rows = [];
-        try { rows = _fhubRowsForAthlete({ name: h.name }, espIdx, extIdx, sc.sport) || []; }
-        catch (eR) { rows = []; }
+        try {
+          rows = _fhubRowsForAthlete({ name: h.name, espnId: h.espnId || null },
+                                     espIdx, extIdx, sc.sport) || [];
+        } catch (eR) { rows = []; }
         if (!rows.length) continue;
         var anyActive = false;
         for (k = 0; k < rows.length; k++) {
@@ -81084,6 +81103,17 @@ function _allInRender() {
     sub.textContent = players.length + ' PLAYER' + (players.length === 1 ? '' : 'S') +
       ' \u00b7 ' + cur.games + ' GAME' + (cur.games === 1 ? '' : 'S') +
       (_stamp ? (' \u00b7 ' + _stamp) : '');
+  }
+  // ESPABBR - a player this hub could not place is a player it does not show,
+  // and silence about it is how the ESPN gap survived. Said out loud, with
+  // the two reasons kept apart because they have different fixes.
+  var _skipped = (cur.noClub || 0) + (cur.noMatch || 0);
+  if (_skipped > 0 && pills) {
+    var _sb = [];
+    if (cur.noClub) _sb.push(cur.noClub + ' with no club on file');
+    if (cur.noMatch) _sb.push(cur.noMatch + ' whose club is not on tonight\u2019s slate');
+    pills.innerHTML += '<div class="sk-allin-skip">' + _skipped +
+      ' not shown \u00b7 ' + _sb.join(' \u00b7 ') + '</div>';
   }
   // ALLINTABS - the tabs live beside the sport pills rather than scrolling
   // with the body, because switching view is a thing you do constantly and a
@@ -141882,10 +141912,19 @@ function _skSearchAllRosters() {
             ? _fxItemStatusLabel(itm).toUpperCase() : 'BN';
         }
         out.push({
-          name: nm, teamAbbr: res.team || '', displayPos: res.pos || '',
+          // ESPABBR - res.team first, then ESPN's numeric club id resolved.
+          name: nm, teamAbbr: res.team || _extProAbbr(row, itm) || '',
+          displayPos: res.pos || '',
           sport: String(row.sport || '').toLowerCase(), provider: row.provider || 'ext',
           leagueKey: row.key, leagueName: row.name || '(unnamed league)',
           teamName: team.teamName || '', teamLogo: lgLogo, slot: slot, scoringType: '',
+          // ESPABBR - the ESPN athlete id, which ESPN's own roster carries as
+          // playerId and Sleeper's name resolver copies in as espnId. It is
+          // what _espFhubRowsFor and _extFhubRowsFor join on EXACTLY, where a
+          // name is only a fallback - and it is the only thing that can give
+          // a Fantrax row a figure.
+          espnId: (String(row.provider) === 'espn')
+            ? (itm.playerId || '') : (itm.espnId || ''),
           active: _xpSpotIsActive(itm, itm.slot || itm.position || '')   // XPACTIVE
         });
       }
@@ -141893,6 +141932,47 @@ function _skSearchAllRosters() {
   } catch (eX) {}
 
   return out;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// ESPN PLAYERS HAD NO CLUB — ESPABBR
+//
+// An ESPN roster item names the real-life club with a NUMERIC proTeamId and
+// never an abbreviation (ESPPROTEAM says so at the point it is built).
+// _extRosterItemName reads it.team / it.teamShort / it.proTeam, none of
+// which ESPN sets, so every ESPN row in the cross-platform roster index came
+// back with teamAbbr: ''.
+//
+// Sleeper and Fantrax were fine - Sleeper's name resolver writes items[i]
+// .team, and Fantrax's player dictionary carries one - so this was invisible
+// anywhere the abbreviation was only decoration.
+//
+// The All-In hub joins my players to the night's slate BY CLUB. A player with
+// no club matches no game, so every player held ONLY in ESPN leagues was
+// dropped from that hub entirely - not shown without points, not shown at
+// all. The per-game hubs never noticed because they start from the box score
+// and ask the indexes "is he mine", which is id- and name-keyed and needs no
+// club at all.
+//
+// espProTeamMap already fetches ESPN's own id->abbrev list and caches it per
+// sport and season. This reads that cache, and starts the fetch when it is
+// cold so the next render has it. Nothing new is requested on its account.
+function _extProAbbr(row, itm) {
+  var t = itm && (itm.team || itm.teamShort || itm.proTeam);
+  if (t) return String(t);
+  var tid = itm && itm.teamId;
+  if (tid == null || String(row && row.provider) !== 'espn') return '';
+  try {
+    var game = (typeof _espGameCode === 'function') ? _espGameCode(row) : '';
+    var season = row.season;
+    if (!game || !season) return '';
+    var map = (typeof _espProTeams !== 'undefined') ? _espProTeams[game + ':' + season] : null;
+    if (map) return String(map[String(tid)] || '');
+    // Cold. Kick it off - it self-dedupes on _espProTeamsBusy - and answer
+    // with nothing this pass rather than guessing an abbreviation.
+    if (typeof espProTeamMap === 'function') espProTeamMap(game, season);
+  } catch (e) {}
+  return '';
 }
 
 // One tap from a result to that league, whichever platform it's on. Yahoo
