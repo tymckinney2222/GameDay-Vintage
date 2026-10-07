@@ -78589,7 +78589,10 @@ function _extFhubRowsFor(at, idx, sport) {
       // Fantrax publishes no per-player FP; score this game's box line with
       // the league's own settings. The hub already knows the ESPN athlete
       // id, so no name matching is needed here. FXENGINE
-      var sm = _fxStadiumStatMap(at.espnId);
+      // FXALLIN - at.gameId is set by the hubs that know which game the
+      // player is in (All-In, the night strip). A stadium caller leaves it
+      // undefined and gets the open box, as before.
+      var sm = _fxStadiumStatMap(at.espnId, at.gameId);
       if (sm) {
         var res = _fxScoreStatMap(sport, row.scoring, sm.statMap, sm.pos, sm.ctx);   // FXGOALIE
         if (res) { fp = Math.round(res.fp * 100) / 100; calc = true; calcTitle = _fxScoreTitle(res); }
@@ -80357,6 +80360,89 @@ function _fhubEnsureNames(done) {
 // than filled with a zero.
 // ══════════════════════════════════════════════════════════════════════
 
+// == WARMING THE BOXES == FXALLIN ==
+//
+// A Fantrax row needs the box line for the game its player is in. In a
+// stadium that box is already loaded; here there are nine of them and none.
+//
+// So the games tonight that hold my players get their summaries pulled once
+// and cached in the same window._gameSummaries every other reader uses - at
+// most one request per game on the slate, fewer in practice because the
+// rinks already opened are in there, and ZERO for anyone who holds no
+// Fantrax league with a scoring system, which the gate checks first.
+//
+// A finished game's box never changes again, so it is fetched once ever.
+// A live one is re-fetched only on an explicit refresh.
+var _fxWarmBusy = {};
+
+function _fxAnyScoredLeague() {
+  var list = [];
+  try {
+    if (typeof extSyncedLeagues === 'function') list = extSyncedLeagues() || [];
+  } catch (e) {}
+  for (var i = 0; i < list.length; i++) {
+    if (list[i] && String(list[i].provider) === 'fantrax' && list[i].scoring) return true;
+  }
+  return false;
+}
+
+// The distinct games my matched players are in. hits already carry the game
+// the slate join found, so this invents no matching of its own.
+function _fxWarmGamesFor(hits) {
+  var out = [], seen = {}, i;
+  for (i = 0; i < (hits || []).length; i++) {
+    var g = hits[i] && hits[i].gm && hits[i].gm.g;
+    if (!g || g.id == null) continue;
+    var k = String(g.id);
+    if (seen[k]) continue;
+    seen[k] = 1;
+    out.push(g);
+  }
+  return out;
+}
+
+// done(gotSomething) - true only when a box that was not there before is now,
+// which is the only case worth repainting for.
+function _fxWarmBoxes(hits, force, done) {
+  function fin(v) { if (typeof done === 'function') done(v); }
+  if (!_fxAnyScoredLeague()) { fin(false); return; }
+  try { window._gameSummaries = window._gameSummaries || {}; } catch (eG) { fin(false); return; }
+  var games = _fxWarmGamesFor(hits), jobs = [], i;
+  for (i = 0; i < games.length; i++) {
+    var g = games[i], k = String(g.id);
+    if (_fxWarmBusy[k]) continue;
+    if (window._gameSummaries[k]) {
+      // Already here. Only an explicit refresh of a game still being played
+      // is worth asking again for.
+      if (!force || g.state === 'post' || g.state === 'pre') continue;
+    }
+    var cfg = (typeof LEAGUES !== 'undefined') ? LEAGUES[g.league] : null;
+    // A minor-league game comes from HockeyTech, not ESPN, and has no
+    // summary at this address. Skipped rather than requested and failed.
+    if (!cfg || cfg.hockeyTech) continue;
+    jobs.push({ g: g, k: k, cfg: cfg });
+  }
+  if (!jobs.length) { fin(false); return; }
+  var left = jobs.length, got = false;
+  for (i = 0; i < jobs.length; i++) {
+    (function (job) {
+      _fxWarmBusy[job.k] = 1;
+      function step() {
+        delete _fxWarmBusy[job.k];
+        left--;
+        if (left <= 0) fin(got);
+      }
+      fetch('https://site.api.espn.com/apis/site/v2/sports/' + job.cfg.sport +
+            '/' + job.cfg.slug + '/summary?event=' + job.g.id)
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) {
+          if (d) { window._gameSummaries[job.k] = d; got = true; }
+        })['catch'](function () { return null; })
+        .then(step, step);
+    })(jobs[i]);
+  }
+}
+
 // Fantasy sport token -> the allGames bucket holding that sport's slate.
 var _ALLIN_BUCKET = { nhl: 'NHL', nba: 'NBA', mlb: 'MLB', nfl: 'NFL', cfb: 'NCAAFB' };
 var _allInSport = '';
@@ -80486,7 +80572,10 @@ function _allInCollect(hits, sport) {
     // ESPABBR - with the id, _espFhubRowsFor and _extFhubRowsFor take their
     // EXACT join instead of falling back to the folded name.
     try {
-      rows = _fhubRowsForAthlete({ name: h.name, espnId: h.espnId || null },
+      // FXALLIN - and the game he is in, which is what lets a Fantrax row
+      // be scored off the right box.
+      rows = _fhubRowsForAthlete({ name: h.name, espnId: h.espnId || null,
+                                   gameId: (h.gm && h.gm.g && h.gm.g.id) || null },
                                  espIdx, extIdx, sport) || [];
     } catch (eR) { rows = []; }
     if (!rows.length) continue;
@@ -80588,6 +80677,18 @@ function refreshAllInHub() {
           .then(function (g) { if (g) allGames[b2] = g; })
           .catch(function () { return null; });
       })(bk));
+    }
+    // FXALLIN - the box scores the Fantrax scorer reads. A live game's box
+    // moves while it is being played, so an explicit refresh re-pulls the
+    // ones that have not finished. Built off the scan already in hand rather
+    // than a second walk of every roster.
+    var _fxh = [], _fq;
+    for (_fq = 0; _fq < scan.length; _fq++) _fxh = _fxh.concat(scan[_fq].hits || []);
+    if (_fxh.length) {
+      jobs.push(new Promise(function (res) {
+        try { _fxWarmBoxes(_fxh, true, function () { res(null); }); }
+        catch (e4) { res(null); }
+      }));
     }
   } catch (eJ) {}
 
@@ -81071,7 +81172,8 @@ function _skNightScan(force) {
         var h = sc.hits[j];
         var rows = [];
         try {
-          rows = _fhubRowsForAthlete({ name: h.name, espnId: h.espnId || null },
+          rows = _fhubRowsForAthlete({ name: h.name, espnId: h.espnId || null,
+                                       gameId: (h.gm && h.gm.g && h.gm.g.id) || null },
                                      espIdx, extIdx, sc.sport) || [];
         } catch (eR) { rows = []; }
         if (!rows.length) continue;
@@ -81233,6 +81335,19 @@ function _allInRender() {
         : '.') + '</div>';
     return;
   }
+
+  // FXALLIN - a Fantrax row is scored from a box line and this hub has no
+  // open stadium to read one from, so the boxes for tonight's games are
+  // warmed once and the hub repaints when they land. Gated inside on holding
+  // a scored Fantrax league at all, so everyone else pays nothing, and it
+  // cannot loop: the second pass finds every game cached and reports false.
+  try {
+    _fxWarmBoxes(cur.hits, false, function (got) {
+      if (!got) return;
+      var m3 = document.getElementById('allInModal');
+      if (m3 && m3.classList.contains('open')) _allInRender();
+    });
+  } catch (eW) {}
 
   var players = _allInCollect(cur.hits, cur.sport);
   if (!players.length) {
@@ -123939,13 +124054,44 @@ function _fxCatStatLine(sport, scoring, statMap, pos, ctx) {
 }
 
 // Stat map for an ESPN athlete id from whichever stadium box is open.
-function _fxStadiumStatMap(espnId) {
+// == A BOX FOR A NAMED GAME == FXALLIN ==
+//
+// This read three globals and nothing else: gymData, rinkData, fieldData -
+// the box score of the stadium currently open. Which is exactly right inside
+// a stadium, and the reason Fantrax carried no points anywhere else: Fantrax
+// publishes no per-player figure, so its rows are SCORED from a box line, and
+// away from a stadium there was no line to score.
+//
+// Worse than absent, it was arbitrary. closeRink() never clears rinkData, so
+// the last game opened stayed in memory and its players alone kept computing
+// - "some Fantrax players have points and most don't", with the subset being
+// whichever game had been looked at.
+//
+// The data was never missing. window._gameSummaries caches every box score
+// this app loads, keyed by game id, written by the rink, the box-score modal
+// and fetchStarredPlayerGames. This reads it.
+//
+// gameId NAMES the game, and when one is named nothing else is consulted. A
+// cache spanning several dates can hold the same athlete twice, and falling
+// back to whatever stadium happens to be open would score him off another
+// night's box - the specific wrong answer this parameter exists to prevent.
+// No id (every stadium caller) behaves exactly as before.
+function _fxStadiumStatMap(espnId, gameId) {
   var id = String(espnId || '');
   if (!id) return null;
   var boxes = [];
+  if (gameId != null && String(gameId) !== '') {
+    var _cached = null;
+    try {
+      _cached = window._gameSummaries && window._gameSummaries[String(gameId)];
+    } catch (e0) {}
+    if (!_cached) return null;
+    boxes.push({ d: _cached });
+  } else {
   try { if (typeof gymData !== 'undefined' && gymData) boxes.push({ d: gymData }); } catch (e) {}
   try { if (typeof rinkData !== 'undefined' && rinkData) boxes.push({ d: rinkData }); } catch (e2) {}
   try { if (typeof fieldData !== 'undefined' && fieldData) boxes.push({ d: fieldData }); } catch (e3) {}
+  }
   for (var b = 0; b < boxes.length; b++) {
     var teams = ((boxes[b].d || {}).boxscore || {}).players || [];
     for (var t = 0; t < teams.length; t++) {
