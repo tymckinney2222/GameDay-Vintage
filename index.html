@@ -37888,7 +37888,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = '2026-10-07 FMTSEL';
+var SK_BUILD = '2026-10-07 ROTOCATS';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -50267,8 +50267,29 @@ function _buildSkipperFpRows(playerName, includeEmpty, sportFilter) {
       // Cats (H2H) leagues pass nothing and render exactly as before.
       var _rpStates = (st === 'roto' && typeof _skRotoStatesForLeague === 'function')
         ? _skRotoStatesForLeague(r.leagueKey) : null;
+      // == ROTOCATS == every scored category, for a roto league ==
+      //
+      // Six was the right cap for a head-to-head line, where the question is
+      // "what did he do tonight" and the biggest few answer it. A roto league
+      // asks a different question - which of MY categories did he move - and
+      // that one is only answered by the categories themselves. Sixteen of
+      // them capped at six is a line that silently omits most of the scoring
+      // system, which is exactly what it looked like from the outside:
+      // roto players being ignored.
+      //
+      // Uncapped, in the league's own order, rate categories included.
+      var _isRoto = (st === 'roto');
+      var _rotoOrd = null;
+      if (_isRoto) {
+        try {
+          var _rs = (typeof leagueSettingsCache === 'object' && leagueSettingsCache)
+            ? leagueSettingsCache[r.leagueKey] : null;
+          _rotoOrd = (_rs && _rs.statOrder && _rs.statOrder.length) ? _rs.statOrder : null;
+        } catch (eRo) { _rotoOrd = null; }
+      }
       var catHtml = (hasStats && typeof _skBuildCatStatLine === 'function')
-        ? _skBuildCatStatLine(stats, statsMeta, 6, _rpStates)
+        ? _skBuildCatStatLine(stats, statsMeta, _isRoto ? 0 : 6, _rpStates,
+            _isRoto ? { order: _rotoOrd, rates: true } : null)
         : '';
       // Drop empty cats rows on stadium cards, but keep them in hub mode so a
       // rostered player still appears (with no stat line yet).
@@ -78034,6 +78055,12 @@ function _espFhubStatHtml(row, it) {
   var sp = String(row.sport || '').toLowerCase();
   if (sp === 'nfl') game = 'ffl'; else if (sp === 'nba') game = 'fba'; else if (sp === 'nhl') game = 'fhl';
   var order = espScoredIds(row), bits = [], i;
+  // ROTOCATS - espScoredIds is already the league's scored categories in its
+  // own order, so this line only ever needed its cap lifting for roto.
+  var _esRoto = false;
+  try {
+    _esRoto = (typeof extFormatKey === 'function') && extFormatKey(row) === 'roto';
+  } catch (eR2) { _esRoto = false; }
   for (i = 0; i < order.length; i++) {
     var id = order[i];
     if (w.stats[id] == null) continue;
@@ -78050,7 +78077,7 @@ function _espFhubStatHtml(row, it) {
     if (!Number(w.stats[id]) && bits.length >= 4) continue;   // keep it short
     bits.push('<b>' + slEsc(String(espStatFmt(id, w.stats[id], _espGameCode(row)))) + '</b> ' + slEsc(lbl));
   }
-  return bits.slice(0, 6).join(' \u00b7 ');
+  return (_esRoto ? bits : bits.slice(0, 6)).join(' \u00b7 ');
 }
 
 // The row logo for an ESPN league. A logo the owner uploaded here wins,
@@ -78088,6 +78115,12 @@ function _espFhubRowsFor(at, idx, sport) {
   for (var r = 0; r < refs.length; r++) {
     var row = refs[r].row, it = refs[r].item;
     var cats = espIsCats(row);
+    // ROTOCATS - roto is neither cats nor points to extFormatKey, and the
+    // difference decides whether this row carries a points figure at all.
+    var _espRoto = false;
+    try {
+      _espRoto = (typeof extFormatKey === 'function') && extFormatKey(row) === 'roto';
+    } catch (eFk) { _espRoto = false; }
     var w = it.windows && it.windows.today;
     rows.push({
       provider: 'espn',
@@ -78106,7 +78139,25 @@ function _espFhubRowsFor(at, idx, sport) {
       teamLogo: _espFhubLogo(row),
       catHtml: _espFhubStatHtml(row, it),
       game: (typeof _espGameCode === 'function') ? _espGameCode(row) : 'flb',   // ESPFFLWIN
-      fp: (!cats && w && w.total != null) ? Math.round(Number(w.total) * 10) / 10 : null,
+      // == ROTOCATS == no invented points in a format that has none ==
+      //
+      // ESPROTO added noFp to stop the hub's "0.0 FP" fallback appearing on a
+      // roto row, and gated it on fp == null. ESPN does not send null: it
+      // sends a total of 0 for a player who has not scored, so fp was 0, the
+      // guard never fired, and every ESPN roto player read "0.0 FP" - a
+      // fantasy points figure in a format that does not have fantasy points.
+      //
+      // Fixed where the number is taken rather than where it is drawn: a roto
+      // league has no per-player points, so none is carried. noFp then fires
+      // as it was always meant to.
+      fp: (!cats && !_espRoto && w && w.total != null)
+        ? Math.round(Number(w.total) * 10) / 10 : null,
+      // And SAY so. noFp is what the hub's FP column reads; this builder
+      // never set it, which is why the guard in the other row builder - the
+      // one that names espn and roto in the same breath - could never have
+      // covered an ESPN row. It covers Sleeper and Fantrax. These rows come
+      // from here.
+      noFp: _espRoto,
       isCats: cats,
       slot: it.slot || '',
       lineup: {
@@ -108032,19 +108083,57 @@ function _skFpStatLine(stats, selectedPos, leagueKey, statsMeta) {
     '</span>';
 }
 
-function _skBuildCatStatLine(statsMap, statsMeta, cap, states) {
+// == A ROTO LINE IS THE LEAGUE'S CATEGORIES == ROTOCATS ==
+//
+// opts is the fifth argument and every existing caller leaves it out, which
+// is deliberate: without it this builder is byte-identical to what it was.
+// Ten callers share it and none of them should shift.
+//
+//   opts.order  the league's own stat order. A line sorted by raw value puts
+//               5 SOG ahead of 1 G and reorders itself player by player, so
+//               the same category never lands in the same place twice. In a
+//               roto league the categories ARE the scoring system, and
+//               reading them down a team means they have to hold still.
+//   opts.rates  keep the rate categories. They are excluded normally, and
+//               correctly - a line of totals should not carry an average.
+//               In roto a rate IS one of the scored categories, and a
+//               goalie's save percentage tonight is the whole of what he
+//               did, so leaving it out left his row looking empty.
+function _skBuildCatStatLine(statsMap, statsMeta, cap, states, opts) {
   if (!statsMap || !statsMeta) return '';
+  var _rates = !!(opts && opts.rates);
+  var _ord = (opts && opts.order && opts.order.length) ? opts.order : null;
+  var _ordAt = {}, _oi;
+  if (_ord) { for (_oi = 0; _oi < _ord.length; _oi++) _ordAt[String(_ord[_oi])] = _oi; }
   var entries = [];
   Object.keys(statsMap).forEach(function(sid) {
     var v = statsMap[sid];
     if (v == null || v === 0) return;
     var meta = statsMeta[sid];
-    if (!_skIsCountingCatStat(meta)) return;
+    var _isRate = false;
+    if (!_skIsCountingCatStat(meta)) {
+      // ROTOCATS - a rate only gets in when the caller asked for rates AND
+      // the league actually scores it. A display-only stat stays out either
+      // way; it is not a category, it is decoration on Yahoo's page.
+      if (!_rates || !meta || !meta.enabled || meta.isOnlyDisplayStat) return;
+      _isRate = true;
+    }
     var abbr = (meta.abbr || meta.displayName || meta.name || sid).toUpperCase();
-    entries.push({ sid: String(sid), abbr: abbr, val: v, sortOrder: parseInt(sid, 10) });
+    entries.push({ sid: String(sid), abbr: abbr, val: v, meta: meta,
+                   isRate: _isRate, sortOrder: parseInt(sid, 10) });
   });
-  // Sort by raw value descending — biggest stat output first.
-  entries.sort(function(a, b) { return b.val - a.val; });
+  if (_ord) {
+    // ROTOCATS - the league's order. A category it does not list falls to the
+    // end rather than being dropped: it is still something he did.
+    entries.sort(function (a, b) {
+      var ai = (_ordAt[a.sid] == null) ? 9999 : _ordAt[a.sid];
+      var bi = (_ordAt[b.sid] == null) ? 9999 : _ordAt[b.sid];
+      return (ai - bi) || (a.sortOrder - b.sortOrder);
+    });
+  } else {
+    // Sort by raw value descending — biggest stat output first.
+    entries.sort(function(a, b) { return b.val - a.val; });
+  }
   if (cap && entries.length > cap) entries = entries.slice(0, cap);
   if (!entries.length) return '';
   return entries.map(function(e) {
@@ -108068,8 +108157,12 @@ function _skBuildCatStatLine(statsMap, statsMeta, cap, states) {
     var abbrHtml = stCls
       ? ('<span class="stat-abbr' + stCls + '">' + skEscape(e.abbr) + '</span>')
       : skEscape(e.abbr);
+    // ROTOCATS - a rate needs a rate's formatting. _skFmtCountingVal rounds
+    // to one decimal, which turns a .915 save percentage into "0.9".
+    var numTxt = (e.isRate && typeof _skWirePLFmt === 'function')
+      ? _skWirePLFmt(e.val, e.meta) : _skFmtCountingVal(e.val);
     return '<span class="stat-num' + (catCls ? ' ' + catCls : '') + stCls + '">' +
-      _skFmtCountingVal(e.val) + '</span>' + abbrHtml;
+      skEscape(String(numTxt)) + '</span>' + abbrHtml;
   }).join('<span class="sep">·</span>');
 }
 
