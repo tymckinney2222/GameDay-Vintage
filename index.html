@@ -3060,6 +3060,9 @@
   /* Scored nothing, versus nothing recorded. Different facts, different marks. */
   .sk-spark i.zero { height: 2px; background: rgba(255,255,255,0.14); }
   .sk-spark i.miss { height: 2px; background: rgba(255,255,255,0.05); }
+  /* PSPARKG - and a night his club was not playing, which is neither. Cooler
+     than the other two so three near-identical 2px marks stay tellable. */
+  .sk-spark i.ng { height: 2px; background: rgba(125,170,255,0.22); }
   .sk-spark-avg {
     font-family: var(--sk-font-mono, monospace); font-size: 8.5px;
     color: var(--sk-text-4, rgba(245,245,240,0.28)); flex-shrink: 0;
@@ -80854,7 +80857,19 @@ function _skSparkWrite(teamKey, date, fpMap) {
     if (!e3 || !e3.name || typeof e3.fp !== 'number' || isNaN(e3.fp)) continue;
     var sk = _skSparkKey(e3.name, leagueKey);
     if (!sk) continue;
-    bucket[sk] = Math.round(e3.fp * 10) / 10;
+    // == A NIGHT OFF IS NOT A COLD NIGHT == PSPARKG ==
+    //
+    // Yahoo reports 0.00 for a rostered player whose club had no game, and
+    // this used to bank that 0 as a figure like any other. It then sat in the
+    // denominator of the per-game average, so a player with one game in three
+    // days read at a third of his real rate - and the label said "/g", which
+    // it was not.
+    //
+    // Now a day he did not play is stored as the sentinel '-'. It is a
+    // STRING, so nothing that reads a number is confused by it, and days
+    // banked under the old rule keep reading as the numbers they are. No
+    // migration, nothing lost, and a mixed record for the next fortnight.
+    bucket[sk] = _skPlayedThatDay(e3) ? (Math.round(e3.fp * 10) / 10) : '-';
     wrote = true;
   }
   if (!wrote) return;
@@ -80894,6 +80909,18 @@ function _skSparkLoad() {
 
 // Which of this player's leagues has the most days on record. Ties go to the
 // lower league key so the same series is drawn on every repaint.
+// PSPARKG - a stored day is one of three things now, and this is the only
+// place that knows how to tell them apart:
+//   a number   he played, and this is what he scored (0 included)
+//   '-'        he was on the roster and his club had no game
+//   absent     nothing was recorded that day at all
+function _skSparkCell(v) {
+  if (v == null) return { fp: null, ng: false };          // never synced
+  if (v === '-') return { fp: null, ng: true };           // no game
+  var n = Number(v);
+  return isNaN(n) ? { fp: null, ng: false } : { fp: n, ng: false };
+}
+
 function _skSparkBestLeague(name, leagueKeys) {
   if (!leagueKeys || !leagueKeys.length) return '';
   var mem = _skSparkLoad(), best = '', bestN = -1, i, j;
@@ -80903,22 +80930,43 @@ function _skSparkBestLeague(name, leagueKeys) {
     if (!sk) continue;
     var n = 0;
     for (j = 0; j < mem.days.length; j++) {
-      if (mem.days[j].m && mem.days[j].m[sk] != null) n++;
+      // PSPARKG - days he PLAYED, so the league picked is the one with the
+      // most to say rather than the one that happened to sync most often.
+      if (mem.days[j].m && _skSparkCell(mem.days[j].m[sk]).fp != null) n++;
     }
     if (n > bestN || (n === bestN && best && String(lk) < String(best))) { bestN = n; best = lk; }
   }
   return bestN > 0 ? best : '';
 }
 
-// days newest-last, each { d, fp } with fp null where nothing was recorded.
-function _skSparkSeries(name, leagueKey, n) {
+// days newest-last, each { d, fp, ng }: fp null where he did not play or
+// nothing was recorded, ng true for the first of those two.
+//
+// == THE WINDOW ENDS WHERE THE VIEW DOES == PSPARKG ==
+//
+// This used to end at today, always, because it had no way to be told
+// otherwise. On The Wire's sheet - which is explicitly about YESTERDAY -
+// that put today's half-finished figure in the average and drew it as the
+// final bar beside a row showing yesterday's score. The number on the row
+// and the bar next to it were about different days.
+//
+// endDate fixes the right-hand edge. Left out, it is today, which is what
+// every live view wants. Outside the fortnight the store keeps, it falls
+// back to today rather than returning an empty strip.
+function _skSparkSeries(name, leagueKey, n, endDate) {
   var sk = _skSparkKey(name, leagueKey);
   if (!sk) return [];
   var mem = _skSparkLoad(), out = [], i;
-  var start = Math.max(0, mem.days.length - (n || 10));
-  for (i = start; i < mem.days.length; i++) {
-    var m = mem.days[i].m;
-    out.push({ d: mem.days[i].d, fp: (m && m[sk] != null) ? Number(m[sk]) : null });
+  var last = mem.days.length - 1;
+  if (endDate) {
+    for (i = 0; i < mem.days.length; i++) {
+      if (mem.days[i].d === endDate) { last = i; break; }
+    }
+  }
+  var start = Math.max(0, (last + 1) - (n || 10));
+  for (i = start; i <= last; i++) {
+    var c = _skSparkCell(mem.days[i].m ? mem.days[i].m[sk] : null);
+    out.push({ d: mem.days[i].d, fp: c.fp, ng: c.ng });
   }
   return out;
 }
@@ -80934,9 +80982,13 @@ function _skSparkSeries(name, leagueKey, n) {
 // identical numbers side by side read as a mistake.
 function _skSparkHtml(series, leagueName, hideAvg) {
   if (!series || series.length < 3) return '';
-  var max = 0, sum = 0, played = 0, i;
+  // PSPARKG - the denominator is days he PLAYED. A night his club was not
+  // on the schedule is not a fact about him and never belonged in a
+  // per-game average; it is drawn, and it is not divided by.
+  var max = 0, sum = 0, played = 0, ngN = 0, i;
   for (i = 0; i < series.length; i++) {
     var v = series[i].fp;
+    if (series[i].ng) ngN++;
     if (v == null) continue;
     played++;
     sum += v;
@@ -80947,7 +80999,14 @@ function _skSparkHtml(series, leagueName, hideAvg) {
   var bars = '';
   for (i = 0; i < series.length; i++) {
     var f = series[i].fp;
+    // PSPARKG - the last bar is the day this VIEW is about, which is today
+    // on a live card and the sheet's own date on The Wire.
     var last = (i === series.length - 1);
+    if (series[i].ng) {
+      bars += '<i class="ng" title="' + skEscape(series[i].d) +
+        ' \u00b7 no game"></i>';
+      continue;
+    }
     if (f == null) { bars += '<i class="miss" title="' + skEscape(series[i].d) + ' \u00b7 no data"></i>'; continue; }
     if (f <= 0) { bars += '<i class="zero" title="' + skEscape(series[i].d) + ' \u00b7 ' + f + '"></i>'; continue; }
     var h = (max > 0) ? Math.max(2, Math.round(2 + 12 * (f / max))) : 2;
@@ -80955,8 +81014,12 @@ function _skSparkHtml(series, leagueName, hideAvg) {
       'px" title="' + skEscape(series[i].d) + ' \u00b7 ' + f + '"></i>';
   }
   var avg = played ? (Math.round((sum / played) * 10) / 10) : 0;
-  return '<span class="sk-spark" title="' + skEscape((leagueName || '') + ' \u00b7 last ' +
-      series.length + ' days') + '">' + bars + '</span>' +
+  // PSPARKG - the tooltip says what the divisor actually was, because "/g"
+  // is a claim and this is the evidence for it.
+  var cap = (leagueName || '') + ' \u00b7 ' + series.length + ' days to ' +
+    series[series.length - 1].d + ' \u00b7 ' + played + ' played' +
+    (ngN ? (' \u00b7 ' + ngN + ' no game') : '');
+  return '<span class="sk-spark" title="' + skEscape(cap) + '">' + bars + '</span>' +
     (hideAvg ? '' : ('<span class="sk-spark-avg">' + avg.toFixed(1) + '/g</span>'));
 }
 
@@ -103641,6 +103704,7 @@ function skBuildWireDetailPoints(entry) {
   // WIREMOD - the league these rows belong to, for the form bars.
   var _wmLk = entry.leagueKey || '';
   var _wmLn = (entry.league && entry.league.name) || '';
+  var _wmDt = entry.dateStr || '';          // PSPARKG - the day this sheet is about
 
   // My starters: rank by FP desc, take top 5 (or all if fewer)
   var myStartersSorted = (entry.starters || [])
@@ -103658,7 +103722,7 @@ function skBuildWireDetailPoints(entry) {
             '<span class="meta">' + (entry.myFp != null ? entry.myFp.toFixed(1) + ' total' : '') + '</span>' +
             '</div>';
     myTop.forEach(function(p, i) {
-      html += _skPlayerRow(p, i + 1, i === 0 ? 'gold' : '', _wmLk, _wmLn);
+      html += _skPlayerRow(p, i + 1, i === 0 ? 'gold' : '', _wmLk, _wmLn, _wmDt);
     });
   }
 
@@ -103678,7 +103742,7 @@ function skBuildWireDetailPoints(entry) {
       oppTop.forEach(function(p, i) {
         // WIREMOD - the same league key, which is why these draw nothing:
         // an opponent's player has no form banked in a league I am not in.
-        html += _skPlayerRow(p, i + 1, '', _wmLk, _wmLn);
+        html += _skPlayerRow(p, i + 1, '', _wmLk, _wmLn, _wmDt);
       });
     }
   }
@@ -103718,7 +103782,7 @@ function skBuildWireDetailPoints(entry) {
               '<span class="meta">vs lowest starter ' + lowestStarterFp.toFixed(1) + ' fp</span>' +
               '</div>';
       burns.forEach(function(p, i) {
-        html += _skPlayerRow(p, i + 1, 'burn', _wmLk, _wmLn);
+        html += _skPlayerRow(p, i + 1, 'burn', _wmLk, _wmLn, _wmDt);
       });
     }
   }
@@ -103726,7 +103790,7 @@ function skBuildWireDetailPoints(entry) {
   return html;
 }
 
-function _skPlayerRow(p, rank, extraCls, leagueKey, leagueName) {
+function _skPlayerRow(p, rank, extraCls, leagueKey, leagueName, endDate) {
   var cls = 'sk-wire-player-row' + (extraCls ? ' ' + extraCls : '');
   var fpStr = (p.fp != null) ? p.fp.toFixed(1) : '\u2014';
   var meta = [];
@@ -103752,7 +103816,11 @@ function _skPlayerRow(p, rank, extraCls, leagueKey, leagueName) {
   if (leagueKey && typeof _skSparkSeries === 'function' &&
       typeof _skSparkHtml === 'function' && p.name) {
     try {
-      spark = _skSparkHtml(_skSparkSeries(p.name, leagueKey, 14), leagueName || '', false);
+      // PSPARKG - ending on the sheet's own date. This sheet is about one
+      // day, and the last bar is now that day rather than today's
+      // half-finished figure sitting beside yesterday's score.
+      spark = _skSparkHtml(_skSparkSeries(p.name, leagueKey, 14, endDate),
+                           leagueName || '', false);
     } catch (eSp) { spark = ''; }
   }
 
@@ -121218,6 +121286,34 @@ function _skGpReadCachedMap(teamKey, date) {
 // One date -> { position: 1 } for every active slot that actually produced a
 // stat line. A player parked in an active slot on his team's off day has no
 // stats and does NOT burn a game, which is how Yahoo counts it too.
+// == DID HE PLAY THAT DAY == PSPARKG ==
+//
+// Lifted out of _skGpCountDate unchanged so the form sparklines can ask the
+// same question the games-cap board asks, and get the same answer. Two
+// definitions of "played" in one app is how two screens come to disagree
+// about the same night.
+//
+// The rule, and its limit, are _skGpCountDate's own (GPPLAYED): Yahoo returns
+// a full line of ZEROS for a rostered player whose club did not play, so an
+// idle day and a scoreless day look identical unless something is nonzero. A
+// real appearance almost always leaves a mark - a shot, a hit, a block, time
+// on ice - so this is better than the alternative and still a LOWER BOUND: a
+// player who dressed and produced nothing at all reads as not having played.
+// In a league that scores only goals and assists that happens often enough to
+// matter, and every caller has to say so rather than imply otherwise.
+function _skPlayedThatDay(e) {
+  if (!e) return false;
+  if (typeof e.fp === 'number' && e.fp !== 0) return true;
+  if (e.stats && typeof e.stats === 'object') {
+    for (var sk in e.stats) {
+      if (!e.stats.hasOwnProperty(sk)) continue;
+      var sv = e.stats[sk];
+      if (typeof sv === 'number' && sv !== 0) return true;
+    }
+  }
+  return false;
+}
+
 function _skGpCountDate(fpMap) {
   var out = {};
   if (!fpMap) return out;
@@ -121239,16 +121335,8 @@ function _skGpCountDate(fpMap) {
     // Better, not exact. Someone who appeared and produced a pure zero line
     // still reads as not played, so this is a LOWER BOUND — which is why the
     // board calls itself an estimate.
-    var played = false;
-    if (typeof e.fp === 'number' && e.fp !== 0) played = true;
-    if (!played && e.stats && typeof e.stats === 'object') {
-      for (var sk in e.stats) {
-        if (!e.stats.hasOwnProperty(sk)) continue;
-        var sv = e.stats[sk];
-        if (typeof sv === 'number' && sv !== 0) { played = true; break; }
-      }
-    }
-    if (!played) continue;
+    // PSPARKG - the same test, now named, so the sparklines share it.
+    if (!_skPlayedThatDay(e)) continue;
     var pos = String(e.selectedPos || '').toUpperCase();
     if (!pos) continue;
     out[pos] = (out[pos] || 0) + 1;
