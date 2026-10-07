@@ -21621,6 +21621,15 @@
     accent-color: var(--sk-gold);
     cursor: pointer;
   }
+  /* FHUBFMTSEL - isolate one scoring format on the BY TEAM tab. */
+  .fhub-fmtsel { margin: 0 0 9px; }
+  .fhub-fmtsel select {
+    width: 100%;
+    background: var(--sk-bg-elev); border: 1px solid var(--sk-border);
+    border-radius: 8px; padding: 7px 10px;
+    color: var(--sk-text); font-family: var(--sk-font-mono);
+    font-size: 11px; letter-spacing: 0.06em;
+  }
   .sk-pulse-set-select {
     flex-shrink: 0;
     background: var(--sk-bg-elev);
@@ -37874,7 +37883,12 @@ function toggleDrawerTools() {
 // looking — a change that IS in the file appears simply not to have worked.
 // Shown at the foot of the drawer so the running build can be read off the
 // screen and compared with what was shipped. Bump on every deploy. SKBUILD
-var SK_BUILD = '2026-09-06 NFLTREND';
+//
+// It sat at 2026-09-06 through every build since, which made it worse than
+// useless: a device running a month-old copy and a device running today's
+// one both read NFLTREND, so the marker agreed with whatever was on screen.
+// The one job it has is to disagree.
+var SK_BUILD = '2026-10-07 FMTSEL';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -80227,6 +80241,31 @@ function _fhubAllTeamRosterHtml(g, col) {
 // render, which is synchronous, so nothing else can observe it mid-flight.
 var _fhubTeamScope = 'in this game';
 
+// == ISOLATE ONE FORMAT == FHUBFMTSEL ==
+//
+// Twenty-two teams on one tab with four scoring systems between them, and the
+// question is nearly always about one of them. The sort already puts the
+// formats in blocks, but a block is not an isolation: the roto and season
+// teams still sit between you and the bottom of the list.
+//
+// Filtered on the BADGE rather than the raw format key, so the dropdown
+// offers exactly what the cards show. head and headone both badge as H2H CATS
+// and are ONE choice here, because they are one thing to the person reading.
+//
+// null means "no control at all", which is how the stadium hub keeps its old
+// behaviour untouched - it draws one game's leagues and has nothing to
+// isolate. The All-In hub sets a string around its own render, the same
+// borrowing _fhubTeamScope already does.
+var _fhubFmtFilter = null;
+
+function _fhubFmtBadgeOf(g) {
+  var b = '';
+  try { b = _fhubAllBadge(g) || ''; } catch (e) {}
+  // A league whose format did not resolve still has to be reachable, or it
+  // becomes a bucket that can be seen in ALL and never on its own.
+  return b || 'OTHER';
+}
+
 // ── BY TEAM ── what this game is worth to each team ── FHUBPLAYER ──
 function _fhubAllTeamsHtml(players) {
   // _extFhubByLeague is _fhubGroupRows plus the sport, the format and the
@@ -80244,8 +80283,57 @@ function _fhubAllTeamsHtml(players) {
     if (b.total != null) return 1;
     return String(a.teamName || '').localeCompare(String(b.teamName || ''));
   });
+  // FHUBFMTSEL - counted over EVERY group, BEFORE any filtering, so the
+  // dropdown keeps offering the formats you are not currently looking at
+  // along with how many teams each one has.
+  var fmtSel = '', fmtOn = (typeof _fhubFmtFilter === 'string') ? _fhubFmtFilter : '';
+  if (_fhubFmtFilter !== null) {
+    var fcount = {}, frank = {}, forder = [], fi, fb, fr2;
+    for (fi = 0; fi < groups.length; fi++) {
+      fb = _fhubFmtBadgeOf(groups[fi]);
+      fr2 = _fhubFmtRank(groups[fi]);
+      if (fcount[fb] == null) { fcount[fb] = 0; frank[fb] = fr2; forder.push(fb); }
+      fcount[fb]++;
+      if (fr2 < frank[fb]) frank[fb] = fr2;
+    }
+    // Offered in the order the cards are already in, so the dropdown and the
+    // list below it read the same way down.
+    forder.sort(function (a, b) { return (frank[a] - frank[b]) || (a < b ? -1 : 1); });
+    // One format present is nothing to isolate, and a control that cannot
+    // change anything is worse than no control.
+    if (forder.length > 1) {
+      var fo = '<option value=""' + (fmtOn ? '' : ' selected') + '>ALL FORMATS \u00b7 ' +
+        groups.length + '</option>';
+      for (fi = 0; fi < forder.length; fi++) {
+        fo += '<option value="' + slEsc(forder[fi]) + '"' +
+          (fmtOn === forder[fi] ? ' selected' : '') + '>' +
+          slEsc(forder[fi]) + ' \u00b7 ' + fcount[forder[fi]] + '</option>';
+      }
+      // Held from another sport and not present here: offered anyway, at
+      // zero, so the box shows the filter that is ACTUALLY applied rather
+      // than falling back to displaying ALL over an empty list.
+      if (fmtOn && fcount[fmtOn] == null) {
+        fo += '<option value="' + slEsc(fmtOn) + '" selected>' +
+          slEsc(fmtOn) + ' \u00b7 0</option>';
+      }
+      fmtSel = '<div class="fhub-fmtsel">' +
+        '<select onchange="setAllInFmt(this.value)" aria-label="Scoring format">' +
+        fo + '</select></div>';
+    } else {
+      fmtOn = '';                       // nothing to isolate, so isolate nothing
+    }
+    if (fmtOn) {
+      var kept = [];
+      for (fi = 0; fi < groups.length; fi++) {
+        if (_fhubFmtBadgeOf(groups[fi]) === fmtOn) kept.push(groups[fi]);
+      }
+      groups = kept;
+    }
+  }
+
   // FHUBWARM - the groups this hub is about to draw, so the opener can fetch
-  // the matchups none of them have yet.
+  // the matchups none of them have yet. FHUBFMTSEL - the FILTERED set, so a
+  // format you are not looking at costs no requests until you look at it.
   try { window._fhubLastGroups = groups; } catch (eG) {}
 
   var html = '', grand = null, i, c;
@@ -80294,7 +80382,15 @@ function _fhubAllTeamsHtml(players) {
     '</div>';
   }
   if (!html) {
-    return '<div class="crs-fhub-empty">No players ' +
+    // FHUBFMTSEL - the dropdown rides along, or picking a format with nothing
+    // in it tonight leaves a blank panel and no way back to the others.
+    if (fmtOn) {
+      return fmtSel + '<div class="crs-fhub-empty">No ' + slEsc(fmtOn) +
+        ' teams have players ' +
+        (_fhubTeamScope === 'in this game' ? 'in this game' : 'playing today') +
+        '.</div>';
+    }
+    return fmtSel + '<div class="crs-fhub-empty">No players ' +
       (_fhubTeamScope === 'in this game' ? 'from this game' : 'playing today') +
       ' are on any of your rosters.</div>';
   }
@@ -80305,13 +80401,16 @@ function _fhubAllTeamsHtml(players) {
     html += '<div style="display:flex;align-items:baseline;gap:8px;padding:10px 4px 2px;' +
       'border-top:1px solid rgba(255,255,255,0.08);margin-top:6px;">' +
       '<span style="flex:1;font-family:var(--sk-font-mono,monospace);font-size:9.5px;' +
-        'letter-spacing:0.12em;color:rgba(255,255,255,0.45);">ALL ' + groups.length +
+        // FHUBFMTSEL - "ALL 13 TEAMS" is a lie once a format is isolated, so
+        // the footer names what it is actually totalling.
+        'letter-spacing:0.12em;color:rgba(255,255,255,0.45);">' +
+        (fmtOn ? (slEsc(fmtOn) + ' \u00b7 ') : 'ALL ') + groups.length +
         ' TEAM' + (groups.length === 1 ? '' : 'S') + '</span>' +
       '<span style="font-family:var(--sk-font-mono,monospace);font-size:13px;font-weight:800;' +
         'color:var(--sk-gold,#f5c518);">' + (grand > 0 ? '+' : '') + grand.toFixed(1) + ' FP</span>' +
     '</div>';
   }
-  return html;
+  return fmtSel + html;
 }
 
 
@@ -80745,6 +80844,15 @@ function setAllInTab(which) {
   var w = String(which || '').toUpperCase();
   _allInTab = (w === 'GAMES' || w === 'TEAMS') ? w : 'PLAYERS';
   _allInRender();
+}
+
+// FHUBFMTSEL - '' is every format. Kept for the session rather than stored,
+// the same as the tab: it is a way of looking at tonight, not a setting.
+var _allInFmt = '';
+
+function setAllInFmt(v) {
+  _allInFmt = String(v || '');
+  if (typeof _allInRender === 'function') _allInRender();
 }
 
 function _allInTabsHtml() {
@@ -81393,8 +81501,9 @@ function _allInRender() {
     body.innerHTML = _allInByGameHtml(players, cur.sport);
   } else if (_allInTab === 'TEAMS') {
     _fhubTeamScope = 'tonight';
+    _fhubFmtFilter = _allInFmt;                       // FHUBFMTSEL
     try { body.innerHTML = _fhubAllTeamsHtml(players); }
-    finally { _fhubTeamScope = 'in this game'; }
+    finally { _fhubTeamScope = 'in this game'; _fhubFmtFilter = null; }
     // FHUBWARM - a team's own matchup is a separate fetch, and the groups
     // this hub draws are mostly leagues no stadium happened to warm. Once per
     // league per session; the redraw is guarded on the hub still being open
