@@ -30409,6 +30409,11 @@
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M3 10h18M8 2v4M16 2v4"/><path d="M9 15l2 2 4-4"/></svg>
       <span>Probe Yahoo draft fields</span>
     </button>
+    <!-- FPCOVER — which window did Yahoo stamp today's stat nodes for? -->
+    <button class="sk-account-item" onclick="skProbeYahooCoverage(); skCloseAccountMenu();">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M3 10h18M8 2v4M16 2v4"/><path d="M12 13v5M9.5 15.5h5"/></svg>
+      <span>Probe Yahoo stat coverage (today)</span>
+    </button>
     <!-- SEASONLABELS — what does ESPN's season line actually contain? -->
     <button class="sk-account-item" onclick="skProbeSeasonLabels(); skCloseAccountMenu();">
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18M7 15l4-4 3 3 5-6"/></svg>
@@ -38138,7 +38143,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = '2026-10-08 ALLINCANON';
+var SK_BUILD = '2026-10-08 FPCOVER';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -42912,7 +42917,9 @@ async function fetchTeamFpForDate(teamKey, date) {
       if (!_seg) return null;
       var url = '/team/' + teamKey + _seg;
       var data = await fyApi(url);
-      var byKey = _parseTeamFpResponse(data);
+      // FPCOVER - the window comes off the segment just built, so the
+      // gate always matches the request.
+      var byKey = _parseTeamFpResponse(data, _fpWantFromSeg(_seg));
       // Stamp today+yesterday entries so we can TTL-bust them on the
       // next read. Immutable (2+ days old) entries don't need stamping.
       if (!isImmutable) {
@@ -42998,7 +43005,8 @@ async function fetchTeamFpForWeek(teamKey, week, currentWeek) {
     try {
       var url = '/team/' + teamKey + '/roster;week=' + week + '/players/stats;type=week;week=' + week;
       var data = await fyApi(url);
-      var byKey = _parseTeamFpResponse(data);
+      // FPCOVER - football is weekly; a season node is just as wrong here.
+      var byKey = _parseTeamFpResponse(data, { type: 'week', value: String(week) });
       if (!isPastWeek) {
         try { Object.defineProperty(byKey, '_ts', { value: Date.now(), enumerable: false, writable: true }); }
         catch (e) { byKey._ts = Date.now(); }
@@ -43025,8 +43033,64 @@ async function fetchTeamFpForWeek(teamKey, week, currentWeek) {
 // endpoint. Returns { player_key: { fp, selectedPos } } — one entry
 // per rostered player. selectedPos comes from selected_position.position
 // nested somewhere inside the player array; we search defensively.
-function _parseTeamFpResponse(data) {
+// == A DAY'S STAT LINE HAS TO COME FROM THAT DAY == FPCOVER ==
+//
+// Yahoo returns a player as an ARRAY whose later entries are bags: one
+// carries selected_position, one carries player_points, one carries
+// player_stats. This parser walked every bag, merged every
+// player_stats.stats it found into a single map, and took
+// player_points.total from whichever bag held one last. Nothing anywhere
+// in it looked at coverage_type.
+//
+// Yahoo stamps each stat node with the WINDOW it describes - date, week,
+// season - and this file already knows that perfectly well:
+// _skProbeCoverages enumerates the stamps a response carries,
+// _fppProbeRawStatNodes prints them node by node because "Yahoo may serve
+// [stats] under player_projected_stats rather than player_stats", and
+// fetchTeamFpSeason asks for type=season and parses it with THIS SAME
+// FUNCTION. So a season-stamped node arriving inside a dated request is
+// not a hypothetical; it is the shape the rest of the file is built
+// around, and the one thing the daily parser could not see.
+//
+// Merged, it lands a stat from some other night on tonight's line. That
+// is a hub crediting a goal while the live box score, and the scoreboard,
+// both read zero - the same number, from the same player, in two places,
+// because two different windows were added together.
+//
+// The gate is deliberately narrow. A bag is refused ONLY when Yahoo
+// states a coverage and it is not the one that was asked for. A bag with
+// no coverage_type, and every caller that names no window at all
+// (fetchTeamFpSeason, the opponent-roster reads), behaves exactly as
+// before - silence is not a mismatch, and this must not blank a line
+// that works today.
+function _fpWantFromSeg(seg) {
+  // Read the window back off the URL that was actually sent, so the gate
+  // cannot drift from the request the way a second copy of the rule would.
+  var s = String(seg || '');
+  var m = /;type=date;date=([0-9][0-9-]*)/.exec(s);
+  if (m) return { type: 'date', value: m[1] };
+  m = /;type=week;week=([0-9]+)/.exec(s);
+  if (m) return { type: 'week', value: m[1] };
+  return null;
+}
+
+function _fpBagCoverageOk(node, want) {
+  if (!want || !want.type) return true;          // caller named no window
+  if (!node || typeof node !== 'object') return true;
+  var ct = node.coverage_type;
+  if (ct == null || ct === '') return true;      // Yahoo named no window
+  ct = String(ct).toLowerCase();
+  if (ct !== String(want.type).toLowerCase()) return false;
+  if (want.value == null || want.value === '') return true;
+  // node.date / node.week - the value for the coverage it just declared.
+  var got = node[ct];
+  if (got == null || got === '') return true;
+  return String(got) === String(want.value);
+}
+
+function _parseTeamFpResponse(data, want) {
   var out = {};
+  var _refused = 0;   // FPCOVER - bags from another window, for the probe
   if (!data || !data.fantasy_content) return out;
   try {
     var team = data.fantasy_content.team;
@@ -43101,8 +43165,12 @@ function _parseTeamFpResponse(data) {
           var bag = p[j];
           if (!bag || typeof bag !== 'object') continue;
           if (bag.player_points && bag.player_points.total != null) {
-            var n = parseFloat(bag.player_points.total);
-            if (!isNaN(n)) fp = n;
+            // FPCOVER - a season total is not today's total.
+            if (!_fpBagCoverageOk(bag.player_points, want)) { _refused++; }
+            else {
+              var n = parseFloat(bag.player_points.total);
+              if (!isNaN(n)) fp = n;
+            }
           }
           // Today's lineup confirmation. Yahoo posts this near first pitch:
           // starting_status.is_starting = "1" (in lineup) / "0" (not), and a
@@ -43142,17 +43210,22 @@ function _parseTeamFpResponse(data) {
               selectedPos = sp.position;
             }
           }
-          // Parse raw stats for inline display — use _yahooArr to handle
+          // Parse raw stats for inline display - use _yahooArr to handle
           // both true arrays AND Yahoo's numeric-key-object format
           if (bag.player_stats && bag.player_stats.stats) {
-            var ss = _yahooArr(bag.player_stats.stats);
-            ss.forEach(function(item) {
-              var st = item && item.stat;
-              if (st && st.stat_id != null) {
-                var sv = parseFloat(st.value);
-                if (!isNaN(sv)) stats[String(st.stat_id)] = sv;
-              }
-            });
+            // FPCOVER - merging a season node into a dated map is how a
+            // goal from another night reaches tonight's stat line.
+            if (!_fpBagCoverageOk(bag.player_stats, want)) { _refused++; }
+            else {
+              var ss = _yahooArr(bag.player_stats.stats);
+              ss.forEach(function(item) {
+                var st = item && item.stat;
+                if (st && st.stat_id != null) {
+                  var sv = parseFloat(st.value);
+                  if (!isNaN(sv)) stats[String(st.stat_id)] = sv;
+                }
+              });
+            }
           }
         }
         out[key] = { fp: fp, selectedPos: selectedPos, name: name, teamAbbr: teamAbbr, stats: stats,
@@ -43162,6 +43235,14 @@ function _parseTeamFpResponse(data) {
     }
   } catch (e) {
     console.warn('[fp] parse error', e);
+  }
+  // FPCOVER - non-enumerable, like _ts: every reader of this map walks its
+  // keys as player keys, and a counter among them would read as a player.
+  if (_refused) {
+    try {
+      Object.defineProperty(out, '_coverageRefused',
+        { value: _refused, enumerable: false, writable: true });
+    } catch (e4) {}
   }
   return out;
 }
@@ -127675,6 +127756,181 @@ function skProbeEspnPeriods() {
       }
     })['catch'](function (e3) {
       say('  fetch failed: ' + ((e3 && e3.message) ? e3.message : String(e3)));
+    }).then(step, step);
+  }
+  step();
+}
+
+// == WHICH WINDOW DID YAHOO ACTUALLY SEND == FPCOVER ==
+//
+// Re-fetches the very roster the hub reads, for today, and prints every
+// stats node Yahoo attached to each player together with the window it is
+// stamped for. One player carrying a node that is not today is the whole
+// of "the hub shows a goal the box score does not", and this names him.
+//
+// For hockey it also puts ESPN's live box line beside Yahoo's goal count,
+// because that is the comparison being made by eye anyway.
+function _fpCovNodes(p) {
+  var out = [], i, k;
+  for (i = 1; i < p.length; i++) {
+    var seg = p[i];
+    if (!seg || typeof seg !== 'object') continue;
+    for (k in seg) {
+      if (!seg.hasOwnProperty(k)) continue;
+      if (k.indexOf('stats') === -1 && k.indexOf('points') === -1) continue;
+      var node = seg[k] || {};
+      if (typeof node !== 'object') continue;
+      var ct = (node.coverage_type != null) ? String(node.coverage_type) : '';
+      var cv = (ct && node[ct] != null) ? String(node[ct]) : '';
+      out.push({ key: k, cov: ct, val: cv, node: node });
+    }
+  }
+  return out;
+}
+
+function _fpCovStatStr(node, ids) {
+  var arr = [];
+  try { arr = _yahooArr(node.stats); } catch (e) { arr = []; }
+  var m = {}, i;
+  for (i = 0; i < arr.length; i++) {
+    var st = arr[i] && arr[i].stat;
+    if (st && st.stat_id != null) m[String(st.stat_id)] = String(st.value);
+  }
+  var bits = [];
+  for (i = 0; i < ids.length; i++) {
+    if (m[ids[i]] != null) bits.push('id' + ids[i] + '=' + m[ids[i]]);
+  }
+  return { n: arr.length, show: bits.join(' '), map: m };
+}
+
+function _fpCovReport(data, job, say) {
+  var players = null;
+  try {
+    var team = data && data.fantasy_content && data.fantasy_content.team;
+    var rc = team && team[1] && team[1].roster;
+    if (rc && rc['0'] && rc['0'].players) players = rc['0'].players;
+    else if (rc && rc.players) players = rc.players;
+    else if (team && team[1]) players = team[1].players;
+  } catch (e) {}
+  if (!players || !players.count) { say('  no players in the response.'); return; }
+  var today = _todayDateString();
+  var n = 0, withStats = 0, flagged = 0, shapes = {}, i;
+  var lines = [];
+  for (i = 0; i < players.count; i++) {
+    var p = players[i] && players[i].player;
+    if (!p) continue;
+    n++;
+    var meta = Array.isArray(p[0]) ? p[0] : [];
+    var nm = '', j;
+    for (j = 0; j < meta.length; j++) {
+      if (meta[j] && meta[j].name && meta[j].name.full) { nm = meta[j].name.full; break; }
+    }
+    var nodes = _fpCovNodes(p);
+    var statNodes = [], bad = false, bits = [];
+    for (j = 0; j < nodes.length; j++) {
+      var nd = nodes[j];
+      var tag = nd.key + (nd.cov ? ('[' + nd.cov + (nd.val ? (' ' + nd.val) : '') + ']') : '[no stamp]');
+      var off = !!(nd.cov && !(nd.cov === 'date' && nd.val === today) &&
+                   !(nd.cov === 'week'));
+      if (nd.key.indexOf('stats') !== -1) {
+        statNodes.push(nd);
+        var sv = _fpCovStatStr(nd.node, ['1', '2', '3', '14']);
+        bits.push(tag + ' ' + sv.n + ' stats' + (sv.show ? (' ' + sv.show) : '') +
+                  (off ? '  <-- NOT TODAY' : ''));
+      } else {
+        bits.push(tag + ' total=' +
+                  ((nd.node && nd.node.total != null) ? nd.node.total : '?') +
+                  (off ? '  <-- NOT TODAY' : ''));
+      }
+      if (off) bad = true;
+    }
+    if (statNodes.length) withStats++;
+    var shape = String(statNodes.length) + ' stat node(s)';
+    shapes[shape] = (shapes[shape] || 0) + 1;
+    // Only the interesting ones get a line: more than one stats node, a
+    // node stamped for another window, or a goal on the board.
+    var goal = 0;
+    if (statNodes.length) {
+      var s0 = _fpCovStatStr(statNodes[0].node, []);
+      goal = parseFloat(s0.map['1'] || '0') || 0;
+    }
+    if (bad || statNodes.length > 1 || goal > 0) {
+      if (bad || statNodes.length > 1) flagged++;
+      lines.push('  ' + (nm || '?'));
+      for (j = 0; j < bits.length; j++) lines.push('      ' + bits[j]);
+      if (job.sport === 'nhl' && typeof _ftxLiveFor === 'function') {
+        var lv = null;
+        try { lv = _ftxLiveFor('NHL', nm); } catch (e2) { lv = null; }
+        if (lv && lv.statMap) {
+          var sm = lv.statMap;
+          lines.push('      ESPN box now: G=' + (sm['G'] != null ? sm['G'] : '-') +
+                     ' A=' + (sm['A'] != null ? sm['A'] : '-') +
+                     ' S=' + (sm['S'] != null ? sm['S'] : '-') +
+                     ' TOI=' + (sm['TOI'] != null ? sm['TOI'] : '-'));
+        } else {
+          lines.push('      ESPN box now: no live line cached for him');
+        }
+      }
+    }
+  }
+  say('  ' + n + ' players, ' + withStats + ' carrying a stats node');
+  var k2, sh = [];
+  for (k2 in shapes) { if (shapes.hasOwnProperty(k2)) sh.push(shapes[k2] + ' x ' + k2); }
+  say('  shapes: ' + sh.join(', '));
+  if (!lines.length) {
+    say('  every node is stamped for today. Nothing to answer for here.');
+  } else {
+    say('  ' + (flagged ? (flagged + ' player(s) carry a node that is NOT today:')
+                        : 'detail:'));
+    for (i = 0; i < lines.length && i < 60; i++) say(lines[i]);
+    if (lines.length > 60) say('  ... ' + (lines.length - 60) + ' more lines');
+  }
+  say('  (NHL ids: 1=G 2=A 3=P 14=SOG)');
+}
+
+function skProbeYahooCoverage() {
+  if (typeof fyFullRosters === 'undefined' || !fyFullRosters || !fyFullRosters.length) {
+    _skGpProbeShow('No Yahoo rosters are loaded.');
+    return;
+  }
+  if (typeof fyApi !== 'function' || typeof _skRosterStatsPath !== 'function') {
+    _skGpProbeShow('The Yahoo fetch helpers are not loaded in this build.');
+    return;
+  }
+  var today = _todayDateString();
+  var seen = {}, jobs = [], i, r;
+  for (i = 0; i < fyFullRosters.length; i++) {
+    r = fyFullRosters[i];
+    if (!r || !r.myTeamKey || seen[r.myTeamKey]) continue;
+    seen[r.myTeamKey] = 1;
+    jobs.push({ tk: r.myTeamKey, name: r.leagueName || r.leagueKey || r.myTeamKey,
+                sport: String(r.sport || '').toLowerCase() });
+  }
+  // Hockey first - the stat ids printed below are the hockey ones, and
+  // hockey is where the question was asked.
+  jobs.sort(function (a, b) {
+    return (a.sport === 'nhl' ? 0 : 1) - (b.sport === 'nhl' ? 0 : 1);
+  });
+  if (jobs.length > 5) jobs = jobs.slice(0, 5);
+  var lines = ['-- YAHOO STAT COVERAGE - ' + today + ' - ' +
+               jobs.length + ' team(s) --'];
+  function say(t) { lines.push(t); }
+  _skGpProbeShow('Fetching rosters...');
+  var at = 0;
+  function step() {
+    if (at >= jobs.length) { _skGpProbeShow(lines.join('\n')); return; }
+    var job = jobs[at++];
+    var seg = null;
+    try { seg = _skRosterStatsPath(job.tk, today); } catch (e) { seg = null; }
+    say('');
+    say('-- ' + job.name + '  (' + (job.sport || '?').toUpperCase() + ') --');
+    if (!seg) { say('  no stats path for this league today.'); step(); return; }
+    say('  asked for ' + seg);
+    fyApi('/team/' + job.tk + seg).then(function (data) {
+      try { _fpCovReport(data, job, say); }
+      catch (e3) { say('  report failed: ' + ((e3 && e3.message) ? e3.message : String(e3))); }
+    }, function (e2) {
+      say('  fetch failed: ' + ((e2 && e2.message) ? e2.message : String(e2)));
     }).then(step, step);
   }
   step();
