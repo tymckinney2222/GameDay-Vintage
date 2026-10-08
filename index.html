@@ -38138,7 +38138,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = '2026-10-08 NBALDR';
+var SK_BUILD = '2026-10-08 ALLINCANON';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -57366,14 +57366,10 @@ var _MYP2_FETCH = {
 var _myp2WkCache = {};
 var _myp2WkBusy = {};
 
-function _myp2Canon(sport, abbr) {
-  var a = String(abbr || '').toUpperCase();
-  if (!a) return '';
-  if (sport === 'nhl' && typeof nhsNhlCanon === 'function') return nhsNhlCanon(a);
-  if (sport === 'nba' && typeof nspNbaCanon === 'function') return nspNbaCanon(a);
-  if (typeof _skCanonTeamAbbr === 'function') return _skCanonTeamAbbr(a);
-  return a;
-}
+// ALLINCANON - the week grid got this right first and the hub did not, so
+// there were two implementations of one idea and only one of them was
+// correct. Now there is one, and this is the thin alias.
+function _myp2Canon(sport, abbr) { return _allInCanon(abbr, sport); }
 
 function _myp2Week7(sport, offset) {
   if ((sport === 'nhl' || sport === 'nba') && typeof skGamesPerWeek === 'function') {
@@ -81798,9 +81794,41 @@ function _fxWarmBoxes(hits, force, done, always) {
 var _ALLIN_BUCKET = { nhl: 'NHL', nba: 'NBA', mlb: 'MLB', nfl: 'NFL', cfb: 'NCAAFB' };
 var _allInSport = '';
 
-function _allInCanon(a) {
-  return (typeof _skCanonTeamAbbr === 'function')
-    ? _skCanonTeamAbbr(a) : String(a || '').toUpperCase();
+// == TBL IS NOT TB == ALLINCANON ==
+//
+// This hub joins my players to tonight's games BY CLUB ABBREVIATION, and it
+// was doing it through _skCanonTeamAbbr, whose whole map is
+//
+//     CHW/CWS  OAK/ATH  AZ/ARI  WAS/WSH  SD/SDP  SF/SFG  TB/TBR  KC/KCR
+//
+// - which is to say, baseball. It knows TB and TBR and has never heard of
+// TBL. Fantrax writes Tampa Bay as TBL, ESPN's scoreboard writes TB, and
+// _skCanonTeamAbbr changes neither, so the two never met: Anthony Cirelli,
+// active and playing, was not in the hub at all. Not benched, not scoreless
+// - ABSENT. He then showed up on MOVES as an idle starter to be replaced,
+// which is the same miss wearing a different hat, and the recommendation
+// was exactly backwards.
+//
+// The same hole swallows LAK, SJS, NJD and CLB. It hid for as long as it
+// did because BOTH sides of the join ran through the same broken function,
+// so any club the provider happens to spell ESPN's way matched fine - and
+// Yahoo, Sleeper and ESPN mostly do. Fantrax mostly does not, which is why
+// this has read all day like "a Fantrax problem".
+//
+// The fix is not a bigger sport-blind map; the comment under _allInSlate is
+// right that those break the sports they don't mean (WSH is Washington's
+// hockey club and also, elsewhere, the Wizards). It is to use the map that
+// belongs to the sport being joined - which already exists, per sport, and
+// is already what the My Players week grid joins through.
+function _allInCanon(a, sport) {
+  var u = String(a || '').toUpperCase();
+  if (!u) return '';
+  var sp = String(sport || '').toLowerCase();
+  if (sp === 'nhl' && typeof nhsNhlCanon === 'function') return nhsNhlCanon(u);
+  if (sp === 'nba' && typeof nspNbaCanon === 'function') return nspNbaCanon(u);
+  // Baseball and football keep the map they have always used, which is the
+  // one written for them.
+  return (typeof _skCanonTeamAbbr === 'function') ? _skCanonTeamAbbr(u) : u;
 }
 
 // The day's games for one sport, indexed by canonical team abbr.
@@ -81811,7 +81839,7 @@ function _allInCanon(a) {
 // for the Capitals, and ARI to UTA, right for the Coyotes and wrong for the
 // Diamondbacks), so running it here would break the sports it does not mean.
 function _allInSlate(sport) {
-  var out = { byAbbr: {}, games: 0 };
+  var out = { byAbbr: {}, games: 0, raw: [] };
   var bucket = _ALLIN_BUCKET[String(sport || '').toLowerCase()];
   if (!bucket) return out;
   var games = (typeof allGames !== 'undefined' && allGames[bucket]) || [];
@@ -81819,8 +81847,17 @@ function _allInSlate(sport) {
     var g = games[i];
     if (!g) continue;
     out.games++;
-    if (g.home && g.home.abbr) out.byAbbr[_allInCanon(g.home.abbr)] = { g: g, side: 'home' };
-    if (g.away && g.away.abbr) out.byAbbr[_allInCanon(g.away.abbr)] = { g: g, side: 'away' };
+    // ALLINCANON - the SAME canon on both sides, which is the only thing
+    // that makes a join mean anything. out.raw keeps the unconverted
+    // spellings so an unmatched player can be reported against them.
+    if (g.home && g.home.abbr) {
+      out.byAbbr[_allInCanon(g.home.abbr, sport)] = { g: g, side: 'home' };
+      out.raw.push(String(g.home.abbr).toUpperCase());
+    }
+    if (g.away && g.away.abbr) {
+      out.byAbbr[_allInCanon(g.away.abbr, sport)] = { g: g, side: 'away' };
+      out.raw.push(String(g.away.abbr).toUpperCase());
+    }
   }
   return out;
 }
@@ -81866,21 +81903,29 @@ function _allInScan() {
   for (i = 0; i < order.length; i++) {
     var g2 = bySport[order[i]];
     var slate = _allInSlate(g2.sport);
-    var players = [], hits = [], noClub = 0, noMatch = 0;
+    var players = [], hits = [], noClub = 0, noMatch = 0, missAb = [];
     for (j = 0; j < g2.order.length; j++) {
       var pl = g2.byKey[g2.order[j]];
       players.push(pl);
       if (!pl.teamAbbr) { noClub++; continue; }
-      var hit = slate.byAbbr[_allInCanon(pl.teamAbbr)];
+      var hit = slate.byAbbr[_allInCanon(pl.teamAbbr, g2.sport)];
       if (hit) { pl.gm = hit; hits.push(pl); }
-      else noMatch++;
+      else {
+        noMatch++;
+        // ALLINCANON - WHICH club, not just how many. A count cannot tell a
+        // quiet night apart from a spelling this app has never seen, and
+        // that is exactly the difference TBL hid behind for a week.
+        var ab = String(pl.teamAbbr || '').toUpperCase();
+        if (ab && missAb.indexOf(ab) < 0) missAb.push(ab);
+      }
     }
     // ESPABBR - counted, not swallowed. A player with no club on file and a
     // player whose club is spelled differently on the slate are both dropped
     // silently otherwise, and that is exactly how the ESPN gap went unseen.
+    missAb.sort();
     out.push({ sport: g2.sport, label: _ALLIN_BUCKET[g2.sport],
                players: players, hits: hits, games: slate.games,
-               noClub: noClub, noMatch: noMatch });
+               noClub: noClub, noMatch: noMatch, missAb: missAb });
   }
   // Most to watch first, then the sports with nothing on.
   out.sort(function (a, b) {
@@ -82342,7 +82387,7 @@ function _mvScan(sport) {
   for (i = 0; i < idx.length; i++) {
     var p = idx[i];
     if (p.sport !== sport || !p.leagues.length) continue;
-    var hit = p.teamAbbr ? slate.byAbbr[_allInCanon(p.teamAbbr)] : null;
+    var hit = p.teamAbbr ? slate.byAbbr[_allInCanon(p.teamAbbr, sport)] : null;
     var g = hit && hit.g;
     var rec0 = { p: p, g: g || null, start: _mvStartOf(g) };
     for (L = 0; L < p.leagues.length; L++) {
@@ -83584,7 +83629,16 @@ function _allInRender() {
   if (_skipped > 0 && pills) {
     var _sb = [];
     if (cur.noClub) _sb.push(cur.noClub + ' with no club on file');
-    if (cur.noMatch) _sb.push(cur.noMatch + ' whose club is not on tonight\u2019s slate');
+    if (cur.noMatch) {
+      // ALLINCANON - the abbreviations themselves, because the day this
+      // count is wrong again it will be a spelling, and a bare number
+      // cannot say so.
+      _sb.push(cur.noMatch + ' whose club is not on tonight\u2019s slate' +
+        ((cur.missAb && cur.missAb.length)
+          ? (' (' + cur.missAb.slice(0, 10).join(' ') +
+             (cur.missAb.length > 10 ? ' +' + (cur.missAb.length - 10) : '') + ')')
+          : ''));
+    }
     pills.innerHTML += '<div class="sk-allin-skip">' + _skipped +
       ' not shown \u00b7 ' + _sb.join(' \u00b7 ') + '</div>';
   }
