@@ -29142,11 +29142,33 @@
   .mv-out { margin-left:auto; flex:0 0 auto; font-family:'Barlow Condensed',sans-serif;
     font-size:10px; letter-spacing:0.4px; color:rgba(255,255,255,0.45); }
   .mv-slot { color:#f5c518; font-weight:700; }
+  .mv-kind { font-family:'Barlow Condensed',sans-serif; font-weight:800; font-size:8.5px;
+    letter-spacing:0.9px; padding:1px 5px; border-radius:4px; flex:0 0 auto; }
+  .mv-kind.idle { background:rgba(245,197,24,0.16); color:#f5c518; }
+  .mv-kind.form { background:rgba(52,211,153,0.16); color:#34d399; }
+  .mv-gain { color:#34d399; font-weight:700; }
   .mv-note { font-size:10.5px; line-height:1.6; color:rgba(255,255,255,0.4);
     padding:10px 2px 0; }
   .mv-clear { padding:34px 18px; text-align:center; font-size:12.5px; line-height:1.7;
     color:rgba(255,255,255,0.45); }
   .mv-clear b { color:#34d399; }
+
+  /* ── THE NIGHT CARD ── NIGHTCARD ── */
+  .nc-ov { position:fixed; inset:0; z-index:12060; background:rgba(0,0,0,0.86);
+    display:none; flex-direction:column; align-items:center; justify-content:center;
+    padding:18px; gap:14px; }
+  .nc-ov.open { display:flex; }
+  .nc-img { max-width:100%; max-height:70vh; border-radius:14px;
+    border:1px solid rgba(255,255,255,0.12); display:block; }
+  .nc-row { display:flex; gap:10px; flex-wrap:wrap; justify-content:center; }
+  .nc-btn { padding:11px 20px; border-radius:999px; cursor:pointer;
+    font-family:'Barlow Condensed',sans-serif; font-weight:800; font-size:12px;
+    letter-spacing:1.1px; border:1px solid rgba(255,255,255,0.18);
+    background:rgba(255,255,255,0.06); color:#e2e8f0; }
+  .nc-btn.go { border-color:rgba(245,197,24,0.5); background:rgba(245,197,24,0.14);
+    color:#f5c518; }
+  .nc-msg { font-size:11px; color:rgba(255,255,255,0.45); text-align:center;
+    max-width:420px; line-height:1.6; }
 
   /* -- end ALLINMOVES -- */
 
@@ -29556,12 +29578,26 @@
     <div style="display:flex;align-items:center;gap:8px;flex-shrink:0">
       <button class="crs-fhub-close" id="allInRefresh" onclick="refreshAllInHub()"
               title="Pull fresh rosters, points and scores">⟳</button>
+      <!-- NIGHTCARD -->
+      <button class="crs-fhub-close" id="allInCard" onclick="ncOpen()"
+              title="Tonight as a card you can share">◎</button>
       <button class="crs-fhub-close" onclick="closeAllInHub()">✕</button>
     </div>
   </div>
   <div class="crs-fhub-sub" id="allInSub"></div>
   <div id="allInPills" style="padding:0 14px;flex-shrink:0"></div>
   <div class="crs-fhub-body" id="allInBody"></div>
+</div>
+
+<!-- NIGHTCARD -->
+<div class="nc-ov" id="ncOv" onclick="ncClose(event)">
+  <img class="nc-img" id="ncImg" alt="Your night" />
+  <div class="nc-row">
+    <button class="nc-btn go" id="ncShareBtn" onclick="event.stopPropagation();ncShare()">SHARE</button>
+    <button class="nc-btn" onclick="event.stopPropagation();ncSave()">SAVE</button>
+    <button class="nc-btn" onclick="event.stopPropagation();ncClose()">CLOSE</button>
+  </div>
+  <div class="nc-msg" id="ncMsg"></div>
 </div>
 
 <!-- ESPN fantasy hub. Separate from the Yahoo hub by design. ESPNFHUB3 -->
@@ -38102,7 +38138,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = '2026-10-08 MOVES';
+var SK_BUILD = '2026-10-08 NIGHTCARD';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -82008,6 +82044,108 @@ var _MV_FLEX = {
          'W/R': ['RB', 'WR'], 'W/T': ['WR', 'TE'], OP: ['QB', 'RB', 'WR', 'TE'] }
 };
 
+// == A PLAYER YOU CANNOT MOVE IS NOT A MOVE == MVSTASH ==
+//
+// _skSlotIsReserve answers "is this spot out of the lineup", which lumps a
+// healthy bench together with injured reserve - right for scoring, wrong
+// here. A man on IR, IR+, IL, NA, DL or the taxi squad cannot be started
+// tonight at all, so offering him is noise that pushes the real moves down
+// the screen. This is the narrower question: is he unavailable, as opposed
+// to merely benched.
+//
+// Fantrax is the one to watch: its RESERVE status is an ordinary bench and
+// stays eligible, while INJURED_RESERVE arrives here as "IR" and does not.
+function _mvIsStashed(slot) {
+  var s = String(slot || '').trim().toUpperCase();
+  if (!s) return false;
+  if (s.indexOf('IL') === 0 || s.indexOf('IR') === 0) return true;   // IL+, IL10, IR+
+  if (s.indexOf('INJURED') === 0) return true;
+  switch (s) {
+    case 'NA': case 'DL': case 'TAXI': case 'MINORS': case 'MIN': case 'SUS':
+      return true;
+  }
+  return false;
+}
+
+// == FORM, AND ONLY WHERE IT IS REAL == MVFORM ==
+//
+// The second kind of move: both men play tonight, and the one on your bench
+// is the better bet. That needs a fantasy points PER GAME figure, and the
+// honest truth is that only two of the four providers have one.
+//
+//   YAHOO   the sparkline store - the same ten-day average already printed
+//           as "/g" on an All-In card. Three played days minimum, which is
+//           the floor the sparkline itself uses before it will draw a shape.
+//   ESPN    windows[].avg, which is ESPN's OWN appliedAverage and is already
+//           rendered as "/g" in the roster pane. Thirty days for preference,
+//           then fifteen, seven, season - the first that actually carries
+//           one.
+//   SLEEPER a week-to-date total, which is not a rate.
+//   FANTRAX no published points at all.
+//
+// So those two leagues get form rows and the other two do not, and the row
+// names the window it used. Inventing a number for the sake of a uniform
+// screen would be the worst of the options: it is the comparison itself
+// that would be wrong, and nothing on screen would show it.
+var _MV_UP_DELTA = 1.0;     // and it has to be worth doing
+var _MV_UP_RATIO = 1.25;
+
+function _mvSparkAvg(name, leagueKey) {
+  if (typeof _skSparkSeries !== 'function') return null;
+  var s = [];
+  try { s = _skSparkSeries(name, leagueKey, 10, null) || []; } catch (e) { return null; }
+  var sum = 0, played = 0, i;
+  for (i = 0; i < s.length; i++) {
+    if (s[i].fp == null) continue;
+    played++; sum += s[i].fp;
+  }
+  if (played < 3) return null;
+  return { v: Math.round((sum / played) * 10) / 10, basis: played + 'd' };
+}
+
+var _MV_ESP_WINS = [['d30', '30d'], ['d15', '15d'], ['d7', '7d'], ['season', 'season']];
+
+function _mvEspIdx() {
+  var out = {}, rows = (typeof extLeagues !== 'undefined' && extLeagues) ? extLeagues : [];
+  var i, k, j, w;
+  for (i = 0; i < rows.length; i++) {
+    var row = rows[i];
+    if (!row || row.provider !== 'espn' || !row.rosters || !row.rosters.byTeam) continue;
+    for (k in row.rosters.byTeam) {
+      if (!row.rosters.byTeam.hasOwnProperty(k)) continue;
+      var items = (row.rosters.byTeam[k] || {}).items || [];
+      for (j = 0; j < items.length; j++) {
+        var it = items[j];
+        if (!it || !it.name || !it.windows) continue;
+        var pick = null;
+        for (w = 0; w < _MV_ESP_WINS.length; w++) {
+          var win = it.windows[_MV_ESP_WINS[w][0]];
+          if (win && win.avg != null && !isNaN(Number(win.avg))) {
+            pick = { v: Math.round(Number(win.avg) * 10) / 10, basis: _MV_ESP_WINS[w][1] };
+            break;
+          }
+        }
+        if (!pick) continue;
+        var nk = (typeof _pmNameKey === 'function') ? _pmNameKey(it.name)
+               : String(it.name).toLowerCase();
+        if (nk) out[row.key + '|' + nk] = pick;
+      }
+    }
+  }
+  return out;
+}
+
+function _mvForm(p, lg, espIdx) {
+  if (!p || !lg) return null;
+  if (lg.provider === 'yahoo') return _mvSparkAvg(p.name, lg.key);
+  if (lg.provider === 'espn') {
+    var nk = (typeof _pmNameKey === 'function') ? _pmNameKey(p.name)
+           : String(p.name || '').toLowerCase();
+    return (nk && espIdx[lg.key + '|' + nk]) || null;
+  }
+  return null;
+}
+
 function _mvPosList(pos) {
   var out = [], t = String(pos || '').toUpperCase().split(/[,\/]/), i;
   for (i = 0; i < t.length; i++) {
@@ -82040,12 +82178,14 @@ function _mvStartOf(g) {
 
 // Every swap available right now, grouped by the player to START.
 function _mvScan(sport) {
-  var out = { cards: [], leagues: 0, late: 0, blocked: 0, idleN: 0 };
+  var out = { cards: [], leagues: 0, late: 0, blocked: 0, idleN: 0,
+              stashed: 0, noForm: 0 };
   var idx = [];
   try { idx = (typeof _myp2Index === 'function') ? _myp2Index() : []; } catch (e) { return out; }
   if (!idx.length) return out;
   var slate = (typeof _allInSlate === 'function') ? _allInSlate(sport) : { byAbbr: {} };
   var now = Date.now();
+  var espIdx = _mvEspIdx();          // MVFORM - built once, not per league
 
   var byLg = {}, order = [], i, L;
   for (i = 0; i < idx.length; i++) {
@@ -82061,8 +82201,12 @@ function _mvScan(sport) {
                          provider: lg.provider, act: [], bench: [] };
         order.push(lg.key);
       }
-      var rec = { p: rec0.p, g: rec0.g, start: rec0.start, slot: lg.slot };
-      if (lg.active) byLg[lg.key].act.push(rec); else byLg[lg.key].bench.push(rec);
+      var rec = { p: rec0.p, g: rec0.g, start: rec0.start, slot: lg.slot,
+                  lg: lg };
+      if (lg.active) { byLg[lg.key].act.push(rec); continue; }
+      // MVSTASH - injured reserve and the like never reach the bench list.
+      if (_mvIsStashed(lg.slot)) { out.stashed++; continue; }
+      byLg[lg.key].bench.push(rec);
     }
   }
   out.leagues = order.length;
@@ -82074,7 +82218,6 @@ function _mvScan(sport) {
     // so he is movable all night and contributes no deadline of his own.
     var idle = [];
     for (L = 0; L < Lg.act.length; L++) if (!Lg.act[L].g) idle.push(Lg.act[L]);
-    if (!idle.length) continue;
     out.idleN += idle.length;
     // Bench players who ARE playing, soonest first: the tightest deadline
     // is the one worth pairing while there is still a free slot to take.
@@ -82086,7 +82229,8 @@ function _mvScan(sport) {
     }
     if (!cand.length) continue;
     cand.sort(function (a, c) { return a.start - c.start; });
-    var used = {};
+    var used = {}, tookBench = {};
+    if (idle.length) {
     for (L = 0; L < cand.length; L++) {
       var bp = cand[L];
       var lockAt = bp.start - _MV_LOCK_MIN * 60000;
@@ -82100,10 +82244,13 @@ function _mvScan(sport) {
       }
       if (took < 0) { if (fits) out.blocked++; continue; }
       used[took] = 1;
-      swaps.push({ inP: bp.p, start: bp.start, lockAt: lockAt, g: bp.g,
+      tookBench[L] = 1;
+      swaps.push({ kind: 'idle', inP: bp.p, start: bp.start, lockAt: lockAt, g: bp.g,
                    lgName: Lg.name, lgTeam: Lg.team, provider: Lg.provider,
                    outP: idle[took].p, slot: idle[took].slot });
     }
+    }
+    _mvUpgrades(Lg, cand, tookBench, sport, now, espIdx, swaps, out);
   }
 
   // One card per player to start; the leagues ride underneath it.
@@ -82123,6 +82270,58 @@ function _mvScan(sport) {
     return c.spots.length - a.spots.length;
   });
   return out;
+}
+
+// == THE SECOND KIND OF MOVE == MVFORM ==
+//
+// Both men play, and the bench one has been the better player. Everything
+// the idle case did not have to decide now matters: by how much, measured
+// over what, and against whose deadline.
+//
+//   BY HOW MUCH  a tenth of a point is noise. It has to clear BOTH an
+//                absolute floor and a proportional one, so a 0.5 edge on a
+//                two-point-a-night fourth-liner does not qualify and
+//                neither does a 1.0 edge on a twenty-point goalie.
+//   OVER WHAT    whichever window the provider could supply, printed on the
+//                row. A comparison is only honest inside one league, where
+//                both numbers come from the same scoring system and the
+//                same source - which is exactly how this is scoped.
+//   WHOSE CLOCK  the earlier of the two games. Both are playing, so both
+//                lock, and the swap dies with the first of them.
+//
+// A starter with no form figure is left alone. "He might be worse" is not a
+// reason to bench somebody.
+function _mvUpgrades(Lg, cand, tookBench, sport, now, espIdx, swaps, out) {
+  var usedAct = {}, L, a;
+  for (L = 0; L < cand.length; L++) {
+    if (tookBench[L]) continue;                    // already moved in somewhere
+    var bp = cand[L];
+    var bf = _mvForm(bp.p, bp.lg, espIdx);
+    if (!bf) { out.noForm++; continue; }
+    var best = -1, bestGain = 0, bestAf = null, bestLock = 0;
+    for (a = 0; a < Lg.act.length; a++) {
+      if (usedAct[a]) continue;
+      var ap = Lg.act[a];
+      if (!ap.g || ap.start == null) continue;     // the idle case, handled above
+      if (!_mvCanFill(bp.p.pos, ap.slot, sport)) continue;
+      var af = _mvForm(ap.p, ap.lg, espIdx);
+      if (!af) continue;
+      if (!(bf.v >= af.v + _MV_UP_DELTA)) continue;
+      if (!(af.v <= 0 ? true : bf.v >= af.v * _MV_UP_RATIO)) continue;
+      // Both play, so both lock; the swap dies with whichever starts first.
+      var lockAt = Math.min(bp.start, ap.start) - _MV_LOCK_MIN * 60000;
+      if (now >= lockAt) continue;
+      var gain = bf.v - af.v;
+      if (gain <= bestGain) continue;
+      best = a; bestGain = gain; bestAf = af; bestLock = lockAt;
+    }
+    if (best < 0) continue;
+    usedAct[best] = 1;
+    swaps.push({ kind: 'form', inP: bp.p, start: bp.start, lockAt: bestLock, g: bp.g,
+                 lgName: Lg.name, lgTeam: Lg.team, provider: Lg.provider,
+                 outP: Lg.act[best].p, slot: Lg.act[best].slot,
+                 inAvg: bf.v, outAvg: bestAf.v, basis: bf.basis });
+  }
 }
 
 // Memoised for ten seconds: the tab strip asks for the count and the body
@@ -82152,7 +82351,8 @@ function _mvHtml(sport) {
     else if (!sc.idleN) why = 'Every active spot you have is filled by somebody with a game.';
     else if (sc.late) why = sc.late + ' swap' + (sc.late === 1 ? ' has' : 's have') +
       ' already locked tonight. Nothing else is open.';
-    else why = 'Nobody on your benches is playing into an idle slot.';
+    else why = 'Nobody on your benches is playing into an idle slot, and ' +
+      'nobody there is out-scoring the man ahead of him.';
     return '<div class="mv-clear"><b>Nothing to move.</b><br>' + _myp2Esc(why) +
       (sc.blocked ? ('<br><br>' + sc.blocked + ' bench player' +
         (sc.blocked === 1 ? '' : 's') + " can't fill the slot that's free.") : '') +
@@ -82185,13 +82385,20 @@ function _mvHtml(sport) {
     for (j = 0; j < c.spots.length; j++) {
       var s = c.spots[j];
       var col = (typeof _MYP2_PROV === 'object' && _MYP2_PROV[s.provider]) || '#9aa4b2';
+      var tail = (s.kind === 'form')
+        ? ('<span class="mv-slot">' + _myp2Esc(s.slot || '?') + '</span> holds ' +
+           _myp2Esc(s.outP.name) + ' \u00b7 ' + s.outAvg + ' \u2192 ' +
+           '<span class="mv-gain">' + s.inAvg + '/g</span> (' +
+           _myp2Esc(s.basis) + ')')
+        : ('<span class="mv-slot">' + _myp2Esc(s.slot || '?') + '</span> holds ' +
+           _myp2Esc(s.outP.name) + ' (' + _myp2Esc(s.outP.teamAbbr || '\u2014') +
+           ', idle)');
       h += '<div class="mv-spot">' +
         '<span class="mv-dot" style="background:' + col + '"></span>' +
-        '<span class="mv-lg">' + _myp2Esc(s.lgName) +
-          (s.lgTeam ? ('  \u00b7  ' + _myp2Esc(s.lgTeam)) : '') + '</span>' +
-        '<span class="mv-out"><span class="mv-slot">' + _myp2Esc(s.slot || '?') +
-          '</span> holds ' + _myp2Esc(s.outP.name) + ' (' +
-          _myp2Esc(s.outP.teamAbbr || '\u2014') + ', idle)</span>' +
+        '<span class="mv-kind ' + (s.kind === 'form' ? 'form">FORM' : 'idle">IDLE') +
+          '</span>' +
+        '<span class="mv-lg">' + _myp2Esc(s.lgName) + '</span>' +
+        '<span class="mv-out">' + tail + '</span>' +
         '</div>';
     }
     h += '</div>';
@@ -82208,6 +82415,14 @@ function _mvHtml(sport) {
     (sc.blocked ? ('<br><br>' + sc.blocked + ' more bench player' +
       (sc.blocked === 1 ? ' plays' : 's play') + ' tonight but can\u2019t fill the ' +
       'slot that\u2019s free.') : '') +
+    '<br><br><b>IDLE</b> is an active spot held by somebody with no game \u2014 he ' +
+    'never locks, so the clock is entirely the man going in. <b>FORM</b> is ' +
+    'both men playing and the one on your bench scoring more per game in ' +
+    'that league, over the window named on the row; there, the swap dies ' +
+    'with whichever game starts first. Form rows only appear for Yahoo and ' +
+    'ESPN, which are the two that publish a per-game figure.' +
+    '<br><br>Players on IR, IL, NA or the taxi squad are left out \u2014 you ' +
+    'can\u2019t start them tonight whatever the numbers say.' +
     '<br><br>Skipper can\u2019t set a lineup \u2014 these are for you to go and make.</div>';
   return h;
 }
@@ -82224,6 +82439,236 @@ function _mvTick() {
     var b = document.getElementById('allInBody');
     if (b) b.innerHTML = _mvHtml(_allInSport);
   }, 30000);
+}
+
+
+// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+// THE NIGHT CARD - NIGHTCARD
+//
+// One tap turns tonight into something you can drop in a league chat: the
+// whole-portfolio total, how many of yours played, and who carried it.
+// Nothing here is new data - it is the same scan the All-In hub draws from,
+// rendered to a canvas instead of to the DOM, because a screenshot of a
+// scrolling hub is not a thing anybody wants to look at.
+//
+// Drawn at 1080x1350, which is the portrait shape every chat app crops to
+// least badly, and shared as a FILE rather than a link - the page is a
+// private PWA and a URL to it would be no use to anyone.
+//
+// navigator.share with files is the good path and Android Chrome has it.
+// Everything else gets a download, which is what the SAVE button does
+// anyway, so there is no dead end.
+var _ncBlob = null;
+var _NC_W = 1080, _NC_H = 1350;
+
+// Tonight, across every sport and every league. Reuses the hub's own scan
+// and collector so the number on the card is the number on the screen - a
+// second implementation would eventually disagree with the first, and the
+// card is the one nobody would check.
+function _ncData() {
+  var d = { total: 0, players: 0, games: 0, leagues: 0, top: [], when: '' };
+  var scan = [];
+  try { scan = (typeof _allInScan === 'function') ? _allInScan() : []; } catch (e) { return d; }
+  var seenGame = {}, seenLg = {}, all = [], i, j, k;
+  for (i = 0; i < scan.length; i++) {
+    var sc = scan[i];
+    if (!sc.hits || !sc.hits.length) continue;
+    var coll = [];
+    try { coll = _allInCollect(sc.hits, sc.sport) || []; } catch (e2) { coll = []; }
+    for (j = 0; j < coll.length; j++) {
+      var pl = coll[j];
+      if (pl.total == null) continue;
+      d.total += pl.total;
+      d.players++;
+      all.push(pl);
+      var gid = pl.gm && pl.gm.g && pl.gm.g.id;
+      if (gid != null) seenGame[String(gid)] = 1;
+      for (k = 0; k < (pl.rows || []).length; k++) {
+        var lk = pl.rows[k].lgKey;
+        if (lk) seenLg[lk] = 1;
+      }
+    }
+  }
+  for (k in seenGame) { if (seenGame.hasOwnProperty(k)) d.games++; }
+  for (k in seenLg) { if (seenLg.hasOwnProperty(k)) d.leagues++; }
+  d.total = Math.round(d.total * 10) / 10;
+  all.sort(function (a, b) { return b.total - a.total; });
+  d.top = all.slice(0, 5);
+  try {
+    var dt = new Date();
+    var M = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
+    var W = ['SUNDAY', 'MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY'];
+    d.when = W[dt.getDay()] + '  \u00b7  ' + M[dt.getMonth()] + ' ' + dt.getDate();
+  } catch (e3) { d.when = ''; }
+  return d;
+}
+
+function _ncFont(weight, size, fam) {
+  return weight + ' ' + size + 'px "' + (fam || 'Barlow Condensed') + '", sans-serif';
+}
+
+function _ncDraw(d) {
+  var c = document.createElement('canvas');
+  c.width = _NC_W; c.height = _NC_H;
+  var x = c.getContext('2d');
+  if (!x) return null;
+
+  var g = x.createLinearGradient(0, 0, 0, _NC_H);
+  g.addColorStop(0, '#0b1020');
+  g.addColorStop(0.55, '#121a2c');
+  g.addColorStop(1, '#090c15');
+  x.fillStyle = g; x.fillRect(0, 0, _NC_W, _NC_H);
+
+  // A warm bloom behind the number, so the eye lands there first.
+  var rg = x.createRadialGradient(_NC_W / 2, 470, 20, _NC_W / 2, 470, 620);
+  rg.addColorStop(0, 'rgba(245,197,24,0.16)');
+  rg.addColorStop(1, 'rgba(245,197,24,0)');
+  x.fillStyle = rg; x.fillRect(0, 0, _NC_W, 1000);
+
+  x.textAlign = 'left';
+  x.fillStyle = '#f5c518';
+  x.font = _ncFont(800, 34);
+  x.fillText('SKIPPER', 72, 104);
+  x.textAlign = 'right';
+  x.fillStyle = 'rgba(255,255,255,0.45)';
+  x.font = _ncFont(700, 30);
+  x.fillText(d.when, _NC_W - 72, 104);
+
+  x.textAlign = 'center';
+  x.fillStyle = 'rgba(255,255,255,0.5)';
+  x.font = _ncFont(800, 40);
+  x.fillText('YOUR NIGHT', _NC_W / 2, 330);
+
+  x.fillStyle = '#ffffff';
+  x.font = _ncFont(800, 250);
+  x.fillText(d.total.toFixed(1), _NC_W / 2, 530);
+
+  x.fillStyle = 'rgba(255,255,255,0.55)';
+  x.font = _ncFont(700, 34);
+  x.fillText(d.players + ' PLAYER' + (d.players === 1 ? '' : 'S') +
+             '   \u00b7   ' + d.games + ' GAME' + (d.games === 1 ? '' : 'S') +
+             '   \u00b7   ' + d.leagues + ' LEAGUE' + (d.leagues === 1 ? '' : 'S'),
+             _NC_W / 2, 600);
+
+  x.strokeStyle = 'rgba(255,255,255,0.10)';
+  x.lineWidth = 2;
+  x.beginPath(); x.moveTo(72, 672); x.lineTo(_NC_W - 72, 672); x.stroke();
+
+  x.textAlign = 'left';
+  x.fillStyle = 'rgba(255,255,255,0.4)';
+  x.font = _ncFont(800, 28);
+  x.fillText('WHO CARRIED IT', 72, 736);
+
+  var y = 822, i;
+  for (i = 0; i < d.top.length; i++) {
+    var p = d.top[i];
+    x.textAlign = 'left';
+    x.fillStyle = 'rgba(255,255,255,0.22)';
+    x.font = _ncFont(800, 46);
+    x.fillText(String(i + 1), 72, y);
+    x.fillStyle = '#ffffff';
+    x.font = _ncFont(700, 46, 'Outfit');
+    x.fillText(String(p.name || ''), 148, y);
+    x.fillStyle = 'rgba(255,255,255,0.38)';
+    x.font = _ncFont(700, 26);
+    x.fillText(String(p.teamAbbr || '') + (p.pos ? ('  \u00b7  ' + p.pos) : ''), 148, y + 32);
+    x.textAlign = 'right';
+    x.fillStyle = (p.total > 0) ? '#34d399' : 'rgba(255,255,255,0.4)';
+    x.font = _ncFont(800, 52);
+    x.fillText((p.total > 0 ? '+' : '') + p.total.toFixed(1), _NC_W - 72, y + 8);
+    y += 104;
+  }
+
+  x.textAlign = 'center';
+  x.fillStyle = 'rgba(255,255,255,0.26)';
+  x.font = _ncFont(700, 26);
+  x.fillText('EVERY LEAGUE, ONE NUMBER', _NC_W / 2, _NC_H - 70);
+  return c;
+}
+
+function _ncMsg(t) {
+  var el = document.getElementById('ncMsg');
+  if (el) el.textContent = t || '';
+}
+
+function ncOpen() {
+  var ov = document.getElementById('ncOv');
+  var img = document.getElementById('ncImg');
+  if (!ov || !img) return;
+  var d = _ncData();
+  if (!d.players) {
+    _ncMsg('');
+    if (typeof skToast === 'function') {
+      skToast('Nothing has been scored tonight yet.');
+    }
+    return;
+  }
+  function paint() {
+    var c = _ncDraw(d);
+    if (!c) return;
+    try { img.src = c.toDataURL('image/png'); } catch (e) {}
+    _ncBlob = null;
+    if (c.toBlob) {
+      try { c.toBlob(function (b) { _ncBlob = b; }, 'image/png'); } catch (e2) {}
+    }
+    ov.classList.add('open');
+    _ncMsg('Shared as a picture, so it works anywhere \u2014 this page is private ' +
+           'and a link to it would be no use to anybody.');
+  }
+  // The card is drawn in the app's own typefaces, and a canvas will happily
+  // fall back to a system font if they have not finished loading. Waiting
+  // costs a frame and saves a card that looks like a different app.
+  if (document.fonts && document.fonts.ready && document.fonts.ready.then) {
+    document.fonts.ready.then(paint, paint);
+  } else {
+    paint();
+  }
+}
+
+function ncClose(ev) {
+  if (ev && ev.target && ev.target.id !== 'ncOv') return;
+  var ov = document.getElementById('ncOv');
+  if (ov) ov.classList.remove('open');
+}
+
+function _ncFile() {
+  if (!_ncBlob) return null;
+  try { return new File([_ncBlob], 'skipper-night.png', { type: 'image/png' }); }
+  catch (e) { return null; }
+}
+
+function ncShare() {
+  var f = _ncFile();
+  // canShare is asked BEFORE share, because a browser that has share but
+  // cannot take files throws on the call rather than declining it.
+  if (f && navigator.share && navigator.canShare && navigator.canShare({ files: [f] })) {
+    try {
+      navigator.share({ files: [f], title: 'Your night' })['catch'](function () {});
+      return true;
+    } catch (e) {}
+  }
+  _ncMsg('This browser won\u2019t hand a picture to the share sheet \u2014 saved ' +
+         'it instead, so you can send it yourself.');
+  return ncSave();
+}
+
+function ncSave() {
+  var url = '';
+  try {
+    if (_ncBlob) url = URL.createObjectURL(_ncBlob);
+    else {
+      var img = document.getElementById('ncImg');
+      url = (img && img.src) || '';
+    }
+  } catch (e) { url = ''; }
+  if (!url) return false;
+  try {
+    var a = document.createElement('a');
+    a.href = url; a.download = 'skipper-night.png';
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    if (_ncBlob) setTimeout(function () { try { URL.revokeObjectURL(url); } catch (e2) {} }, 2000);
+    return true;
+  } catch (e3) { return false; }
 }
 
 function _allInTabsHtml() {
