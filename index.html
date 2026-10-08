@@ -30207,6 +30207,11 @@
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/><path d="M5 5l14 14"/></svg>
       <span>Probe ESPN ATOI denominator</span>
     </button>
+    <!-- ESPFHLIDS2 - what are the hockey stat ids ESPN never labels? -->
+    <button class="sk-account-item" onclick="skProbeEspnHockeyIds(); skCloseAccountMenu();">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h6M4 12h6M4 17h6"/><path d="M14 7h6M14 12h6M14 17h6"/><circle cx="12" cy="12" r="10"/></svg>
+      <span>Probe ESPN hockey stat ids</span>
+    </button>
     <!-- DRAFTAHEAD — does Yahoo publish a draft time, and under what key? -->
     <button class="sk-account-item" onclick="skProbeYahooDraft(); skCloseAccountMenu();">
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M3 10h18M8 2v4M16 2v4"/><path d="M9 15l2 2 4-4"/></svg>
@@ -37941,7 +37946,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = '2026-10-08 FXHUBSRC';
+var SK_BUILD = '2026-10-08 FHLIDS';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -125377,6 +125382,338 @@ function skProbeEspnAtoi() {
   say('recipe needs a subtraction, which no recipe does yet.');
   say('Neither, but whole numbers throughout: the count is real but unpublished,');
   say('so the season denominator has to be recovered as TOI/ATOI.');
+  _skGpProbeShow(lines.join('\n'));
+}
+
+// == WHAT ARE ESPN'S UNNAMED HOCKEY STAT IDS == ESPFHLIDS2 ==
+//
+// ESP_STAT_NAME_FHL names 0-17, 23-27, 29-32 and 34-39. The ids in the gaps
+// - 18 to 22, and 28 and 33 - have no label, so a league that SCORES one of
+// them renders it as a bare "#19" in every stat line. That is deliberate
+// (ESPFFLNAMES: visible and nameable beats silently dropped) and it is the
+// point at which somebody has to name them.
+//
+// Naming them by eye is the one thing not to do. Every rate and direction
+// flag outside baseball is keyed by NAME - ESP_RATE_BY_NAME,
+// ESP_LOWER_BY_NAME, ESP_CAT_GROUPS - so a wrong label does not merely print
+// the wrong three letters. It can attach the wrong flag to a real category
+// and reverse how a roto race reads, which is the failure ESPSPORTFLAG
+// already documents and which nothing on screen would show. ATOIDEN2 settled
+// #34 from evidence; this settles the rest the same way.
+//
+// The evidence is arithmetic over ESPN's own season totals, across every
+// player on every roster of every synced hockey league. Hockey's
+// special-teams categories are not independent of each other:
+//
+//   power-play goals + power-play assists == power-play points   (#38, PPP)
+//   short-handed goals + short-handed assists == short-handed points (#39)
+//   a power-play goal is a goal, so it can never exceed G; likewise assists
+//
+// So this does NOT go looking for the ids it expects. For every unnamed id
+// it reports which NAMED ids bound it from above, which named id it equals,
+// and which PAIRS sum to it exactly - searched over every id, not over a
+// shortlist. An identity holding across two hundred players with no
+// counterexample is an identification. One holding across four is a
+// coincidence, so the sample count is printed beside every claim and the
+// reader can tell them apart.
+function _fhlProbeSamples() {
+  var rows = (typeof extLeagues !== 'undefined' && extLeagues) ? extLeagues : [];
+  var out = { samples: [], leagues: [], ids: {} };
+  var seenPlayer = {};
+  for (var i = 0; i < rows.length; i++) {
+    var row = rows[i];
+    if (!row || row.provider !== 'espn') continue;
+    if (String(row.sport || '').toLowerCase() !== 'nhl') continue;
+    var raw = row.raw || {};
+    var teams = raw.teams || [];
+    if (!teams.length) continue;
+    var season = (raw.seasonId != null) ? raw.seasonId : row.season;
+    var before = out.samples.length;
+    for (var t = 0; t < teams.length; t++) {
+      var ents = ((teams[t] || {}).roster || {}).entries || [];
+      for (var k = 0; k < ents.length; k++) {
+        var pl = (((ents[k] || {}).playerPoolEntry) || {}).player || {};
+        var pid = String(pl.id || (ents[k] || {}).playerId || '');
+        // A player held in three leagues is ONE observation, not three.
+        // Counting him once per league would inflate every sample count and
+        // make a coincidence look like a law.
+        if (!pid || seenPlayer[pid]) continue;
+        // Season totals: statSourceId 0 (real, not projected), split 0.
+        var e = (typeof espStatEntry === 'function')
+          ? espStatEntry(pl, 0, 0, season, null) : null;
+        var st = e && e.stats;
+        if (!st) continue;
+        var m = {}, any = false, id, v;
+        for (id in st) {
+          if (!st.hasOwnProperty(id)) continue;
+          v = Number(st[id]);
+          if (isNaN(v) || !isFinite(v)) continue;
+          m[String(id)] = v;
+          out.ids[String(id)] = (out.ids[String(id)] || 0) + 1;
+          any = true;
+        }
+        if (!any) continue;
+        seenPlayer[pid] = 1;
+        var nmP = pl.fullName ||
+          ((pl.firstName || '') + ' ' + (pl.lastName || '')).replace(/^ | $/g, '') ||
+          ('#' + pid);
+        out.samples.push({ name: nmP, stats: m });
+      }
+    }
+    out.leagues.push({ name: row.name || row.key, season: season,
+                       teams: teams.length, added: out.samples.length - before });
+  }
+  return out;
+}
+
+function skProbeEspnHockeyIds() {
+  var lines = [];
+  function say(t) { lines.push(t); }
+
+  var D = _fhlProbeSamples();
+  if (!D.samples.length) {
+    _skGpProbeShow('No synced ESPN hockey league with rosters in memory.\n\n' +
+      'Open an ESPN NHL league once so its teams load, then run this again.');
+    return;
+  }
+
+  function named(id) {
+    return !!((typeof espStatName === 'function') && espStatName('fhl', id));
+  }
+  function nm(id) {
+    var s = (typeof espStatName === 'function') ? espStatName('fhl', id) : '';
+    return s ? s : ('#' + id);
+  }
+  // An unnamed id is already written as "#19"; appending "(#19)" to it
+  // reads as two different things.
+  function tag(id) { return named(id) ? (nm(id) + ' (#' + id + ')') : ('#' + id); }
+
+  var ids = [], q;
+  for (q in D.ids) { if (D.ids.hasOwnProperty(q)) ids.push(q); }
+  ids.sort(function (a, b) { return Number(a) - Number(b); });
+  var unnamed = [], s, m;
+  for (q = 0; q < ids.length; q++) { if (!named(ids[q])) unnamed.push(ids[q]); }
+
+  var MIN_N = 20;          // below this a relation is not evidence
+  var MIN_NZ = 3;          // and an all-zero column agrees with everything
+
+  say('\u2500\u2500 WHAT WAS READ \u2500\u2500');
+  for (q = 0; q < D.leagues.length; q++) {
+    say('  ' + D.leagues[q].name + '  season ' + D.leagues[q].season +
+        '  \u00b7 ' + D.leagues[q].teams + ' teams \u00b7 ' +
+        D.leagues[q].added + ' players not already counted');
+  }
+  say('  ' + D.samples.length + ' distinct players with a season stat line');
+  say('  ids present: ' + ids.length + '  \u00b7  of those UNNAMED: ' +
+      (unnamed.length ? unnamed.join(', ') : 'none'));
+  if (!unnamed.length) {
+    say('');
+    say('Every id these leagues publish already has a label. Nothing to identify.');
+    _skGpProbeShow(lines.join('\n'));
+    return;
+  }
+
+  // -- shape of each unnamed column --
+  function shapeOf(U) {
+    var n = 0, nz = 0, mn = null, mx = null, frac = 0;
+    for (s = 0; s < D.samples.length; s++) {
+      m = D.samples[s].stats;
+      if (m[U] == null) continue;
+      var v = m[U];
+      n++;
+      if (v !== 0) nz++;
+      if (mn == null || v < mn) mn = v;
+      if (mx == null || v > mx) mx = v;
+      if (Math.abs(v - Math.round(v)) > 1e-9) frac++;
+    }
+    return { n: n, nz: nz, mn: mn, mx: mx, frac: frac };
+  }
+
+  // -- U is never greater than N --
+  function boundedBy(U) {
+    var out = [], a;
+    for (a = 0; a < ids.length; a++) {
+      var N = ids[a];
+      if (N === U || !named(N)) continue;
+      var both = 0, ok = true, nzU = 0;
+      for (s = 0; s < D.samples.length; s++) {
+        m = D.samples[s].stats;
+        if (m[U] == null || m[N] == null) continue;
+        both++;
+        if (m[U] > m[N] + 1e-9) { ok = false; break; }
+        if (m[U] !== 0) nzU++;
+      }
+      if (ok && both >= MIN_N && nzU >= MIN_NZ) out.push(tag(N) + ' on ' + both);
+    }
+    return out;
+  }
+
+  // -- U is the same number as N, everywhere --
+  function equalTo(U) {
+    var out = [], a;
+    for (a = 0; a < ids.length; a++) {
+      var N = ids[a];
+      if (N === U) continue;
+      var both = 0, ok = true, nzU = 0;
+      for (s = 0; s < D.samples.length; s++) {
+        m = D.samples[s].stats;
+        if (m[U] == null || m[N] == null) continue;
+        both++;
+        if (Math.abs(m[U] - m[N]) > 1e-9) { ok = false; break; }
+        if (m[U] !== 0) nzU++;
+      }
+      if (ok && both >= MIN_N && nzU >= MIN_NZ) out.push(tag(N) + ' on ' + both);
+    }
+    return out;
+  }
+
+  // -- U + V == W, searched over every V and every W --
+  // Both addends must be non-zero somewhere in the tested set. Without that,
+  // a column of zeros satisfies U + V == W for every U that already equals
+  // W, and the output fills with restatements of the equality above.
+  function sumsWith(U) {
+    var out = [], w, v;
+    for (w = 0; w < ids.length; w++) {
+      var W = ids[w];
+      if (W === U) continue;
+      for (v = 0; v < ids.length; v++) {
+        var V = ids[v];
+        if (V === U || V === W) continue;
+        var n = 0, ok = true, nzU = 0, nzV = 0;
+        for (s = 0; s < D.samples.length; s++) {
+          m = D.samples[s].stats;
+          if (m[U] == null || m[V] == null || m[W] == null) continue;
+          n++;
+          if (Math.abs((m[U] + m[V]) - m[W]) > 1e-9) { ok = false; break; }
+          if (m[U] !== 0) nzU++;
+          if (m[V] !== 0) nzV++;
+        }
+        if (ok && n >= MIN_N && nzU >= MIN_NZ && nzV >= MIN_NZ) {
+          out.push({ v: V, w: W, n: n,
+                     txt: tag(U) + ' + ' + tag(V) + ' == ' + tag(W) + '  on ' + n });
+        }
+      }
+    }
+    return out;
+  }
+
+  var found = {};
+  say('');
+  say('\u2500\u2500 EACH UNNAMED ID \u2500\u2500');
+  for (q = 0; q < unnamed.length; q++) {
+    var U = unnamed[q], sh = shapeOf(U);
+    say('');
+    say('  #' + U + '  \u00b7 present on ' + sh.n + ', non-zero on ' + sh.nz +
+        '  \u00b7 range ' + sh.mn + ' to ' + sh.mx +
+        (sh.frac ? ('  \u00b7 FRACTIONAL on ' + sh.frac + ' (a rate, not a count)')
+                 : '  \u00b7 whole numbers throughout'));
+    if (!sh.nz) {
+      say('    every value is zero, so nothing here can identify it.');
+      continue;
+    }
+    var eq = equalTo(U);
+    say('    equals      : ' + (eq.length ? eq.join(', ') : 'nothing'));
+    var bb = boundedBy(U);
+    say('    never above : ' + (bb.length ? bb.join(', ') : 'nothing that holds'));
+    var sw = sumsWith(U);
+    if (!sw.length) { say('    sums        : no pair holds on every player'); }
+    else {
+      for (var z = 0; z < sw.length && z < 6; z++) say('    sums        : ' + sw[z].txt);
+      if (sw.length > 6) say('    sums        : +' + (sw.length - 6) + ' more');
+    }
+    found[U] = { shape: sh, eq: eq, bounded: bb, sums: sw };
+  }
+
+  // -- the reading --
+  // Written against the NAMES of the aggregates rather than their ids, so
+  // this still says something true if ESPN ever renumbers.
+  function aggId(label) {
+    for (var a = 0; a < ids.length; a++) if (nm(ids[a]) === label) return ids[a];
+    return null;
+  }
+  function boundedByName(U, label) {
+    var b = (found[U] && found[U].bounded) || [];
+    for (var a = 0; a < b.length; a++) if (b[a].indexOf(label + ' (#') === 0) return true;
+    return false;
+  }
+  function readPair(aggLabel, goalName, assistName) {
+    var W = aggId(aggLabel);
+    if (W == null) { say('  ' + aggLabel + ': not scored by these leagues, nothing to split.'); return; }
+    var pairs = [], a, seenPair = {};
+    for (a = 0; a < unnamed.length; a++) {
+      var sw = (found[unnamed[a]] && found[unnamed[a]].sums) || [];
+      for (var b = 0; b < sw.length; b++) {
+        if (sw[b].w !== W) continue;
+        // U + V and V + U are one finding. Reported twice it reads like two
+        // pieces of evidence for the same claim.
+        var lo = Math.min(Number(unnamed[a]), Number(sw[b].v));
+        var hi = Math.max(Number(unnamed[a]), Number(sw[b].v));
+        var pk = lo + ':' + hi;
+        if (seenPair[pk]) continue;
+        seenPair[pk] = 1;
+        pairs.push({ u: unnamed[a], v: sw[b].v, n: sw[b].n });
+      }
+    }
+    if (!pairs.length) {
+      say('  ' + aggLabel + ' (#' + W + '): no pair of ids sums to it on every player,');
+      say('    so its two components are not both in this data.');
+      return;
+    }
+    for (a = 0; a < pairs.length; a++) {
+      var P = pairs[a];
+      var uG = boundedByName(P.u, 'G'), uA = boundedByName(P.u, 'A');
+      var vG = boundedByName(P.v, 'G'), vA = boundedByName(P.v, 'A');
+      var verdict;
+      if (uG && !uA && vA && !vG) verdict = tag(P.u) + ' is ' + goalName + ', ' + tag(P.v) + ' is ' + assistName;
+      else if (uA && !uG && vG && !vA) verdict = tag(P.u) + ' is ' + assistName + ', ' + tag(P.v) + ' is ' + goalName;
+      else verdict = 'both are components of ' + aggLabel +
+        ', but G and A do not separate them here \u2014 see the bounds above';
+      say('  ' + aggLabel + ' (#' + W + ') == #' + P.u + ' + #' + P.v +
+          ' on ' + P.n + ' players');
+      say('    \u2192 ' + verdict);
+    }
+  }
+
+  say('');
+  say('\u2500\u2500 THE READING \u2500\u2500');
+  readPair('PPP', 'power-play goals (PPG)', 'power-play assists (PPA)');
+  readPair('SHP', 'short-handed goals (SHG)', 'short-handed assists (SHA)');
+  say('');
+  say('  Anything left over that is never above G, is in no sum, and runs');
+  say('  small is a goal SUBSET - game-winning goals are the usual one.');
+  for (q = 0; q < unnamed.length; q++) {
+    var L = unnamed[q];
+    if (!found[L] || !found[L].shape.nz) continue;
+    if (found[L].sums.length) continue;
+    if (!boundedByName(L, 'G')) continue;
+    say('    #' + L + ' fits that description (max ' + found[L].shape.mx + ')');
+  }
+
+  // -- the raw rows, so the verdict can be checked rather than believed --
+  say('');
+  say('\u2500\u2500 THE BIGGEST LINES, UNABRIDGED \u2500\u2500');
+  say('  Check these against the real box score. If the reading above is');
+  say('  right it survives that; if it is not, this is where it shows.');
+  var ranked = D.samples.slice(0);
+  ranked.sort(function (x, y) {
+    var sx = 0, sy = 0, a;
+    for (a = 0; a < unnamed.length; a++) {
+      sx += Number(x.stats[unnamed[a]] || 0);
+      sy += Number(y.stats[unnamed[a]] || 0);
+    }
+    return sy - sx;
+  });
+  for (q = 0; q < ranked.length && q < 10; q++) {
+    var bits = [], a2;
+    for (a2 = 0; a2 < ids.length; a2++) {
+      var val = ranked[q].stats[ids[a2]];
+      if (val == null || val === 0) continue;
+      bits.push(nm(ids[a2]) + ' ' + (Math.round(val * 1000) / 1000));
+    }
+    say('  ' + ranked[q].name);
+    say('    ' + (bits.join('  ') || '(empty)'));
+  }
+
   _skGpProbeShow(lines.join('\n'));
 }
 
