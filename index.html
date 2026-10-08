@@ -37941,7 +37941,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = '2026-10-08 LDRTAB';
+var SK_BUILD = '2026-10-08 FXHUBSRC';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -78713,14 +78713,17 @@ function _extFhubRowsFor(at, idx, sport) {
       // Sleeper only — its items really do carry playerId. FTXFHUBID
       var v = row._slPP[String(it.playerId || it.id || '')];
       if (v != null) fp = Math.round(Number(v) * 10) / 10;
-    } else if (row.provider === 'fantrax' && row.scoring && typeof _fxStadiumStatMap === 'function') {
+    } else if (row.provider === 'fantrax' && row.scoring && typeof _fxHubStatLine === 'function') {
       // Fantrax publishes no per-player FP; score this game's box line with
       // the league's own settings. The hub already knows the ESPN athlete
       // id, so no name matching is needed here. FXENGINE
       // FXALLIN - at.gameId is set by the hubs that know which game the
       // player is in (All-In, the night strip). A stadium caller leaves it
       // undefined and gets the open box, as before.
-      var sm = _fxStadiumStatMap(at.espnId, at.gameId);
+      // FXHUBSRC - the name-keyed live cache first, the id-keyed box second.
+      // Reading the id-keyed box FIRST meant a Fantrax-only player, who has
+      // no ESPN athlete id at all, never got a line.
+      var sm = _fxHubStatLine(sport, at, it);
       if (sm) {
         var res = _fxScoreStatMap(sport, row.scoring, sm.statMap, sm.pos, sm.ctx);   // FXGOALIE
         if (res) { fp = Math.round(res.fp * 100) / 100; calc = true; calcTitle = _fxScoreTitle(res); }
@@ -81081,6 +81084,17 @@ function refreshAllInHub() {
   // stay failed for the session, and the hub would keep quietly omitting
   // those leagues. An explicit refresh is exactly when to try again.
   _allInNamesAsked = false;
+  // FXHUBSRC - and the live box cache, which a tap on refresh is exactly the
+  // moment to re-pull: _ftxFetchLive holds it for a minute of its own accord,
+  // so clearing it is what makes the tap mean anything mid-game.
+  try {
+    _allInLiveAsked = {};
+    if (typeof _ftxLiveCache !== 'undefined' && _ftxLiveCache) {
+      for (var _lk in _ftxLiveCache) {
+        if (_ftxLiveCache.hasOwnProperty(_lk)) delete _ftxLiveCache[_lk];
+      }
+    }
+  } catch (eLv) {}
   var btn = document.getElementById('allInRefresh');
   if (btn) btn.classList.add('allin-spin');
 
@@ -81703,6 +81717,9 @@ function _skNightStart() {
   // not a per-tick fetch.
   try {
     _allInEnsureNames(function () { try { _skNightRender(true); } catch (e0) {} });
+    // FXHUBSRC - and the box lines, for the same reason: the strip totals
+    // Fantrax rows and they are scored from this cache.
+    _allInEnsureLive(function () { try { _skNightRender(true); } catch (e1) {} });
   } catch (eS) {}
   try { _skNightRender(true); } catch (e) {}
   if (_skNightTimer) clearInterval(_skNightTimer);
@@ -81731,6 +81748,52 @@ function _skNightStart() {
 // failure. This hub never did. Same call, same once-per-session guard, and a
 // repaint when something actually arrives.
 var _allInNamesAsked = false;
+
+// == AND THE BOX LINES WERE ONLY THERE IF THE LEAGUE HAD BEEN OPENED ==
+// == FXHUBSRC ==
+//
+// Same shape as the dictionary above, one layer down. FXHUBSRC makes
+// _ftxLiveCache the source a Fantrax row is scored from, and the only thing
+// that ever filled it was a Fantrax roster pane rendering. So the hub would
+// have kept needing the league opened first - for the numbers now instead of
+// for the names.
+//
+// Gated on actually holding a scored Fantrax league, per sport, once per
+// session, so everybody else pays nothing. _ftxFetchLive dedupes its own
+// requests and caches for a minute; the flag here exists for the case it
+// answers with nothing - no games on - where there is no cache to stop a
+// repaint asking again.
+var _allInLiveAsked = {};
+
+function _allInEnsureLive(onLanded) {
+  if (typeof _ftxFetchLive !== 'function' ||
+      typeof FTX_LIVE_CFG === 'undefined') return;
+  var list = [];
+  try {
+    if (typeof extSyncedLeagues === 'function') list = extSyncedLeagues() || [];
+  } catch (e) { list = []; }
+  var want = {}, i, sp;
+  for (i = 0; i < list.length; i++) {
+    if (!list[i] || String(list[i].provider) !== 'fantrax' || !list[i].scoring) continue;
+    sp = String(list[i].sport || '').toUpperCase();
+    if (!sp || !FTX_LIVE_CFG[sp] || _allInLiveAsked[sp]) continue;
+    want[sp] = 1;
+  }
+  for (sp in want) {
+    if (!want.hasOwnProperty(sp)) continue;
+    _allInLiveAsked[sp] = 1;
+    (function (S) {
+      var p = null;
+      try { p = _ftxFetchLive(S); } catch (e2) { p = null; }
+      if (!p || typeof p.then !== 'function') return;
+      p.then(function (res) {
+        // Only a cache that actually arrived is worth a repaint.
+        if (!res || !res.byName) return;
+        if (typeof onLanded === 'function') onLanded();
+      }, function () { return null; });
+    })(sp);
+  }
+}
 
 function _allInEnsureNames(onLanded) {
   if (_allInNamesAsked || typeof _fhubEnsureNames !== 'function') return;
@@ -81801,6 +81864,16 @@ function _allInRender() {
       'fantasy numbers are. Tap TODAY on the scores screen, then reopen this.</div>';
     return;
   }
+
+  // FXHUBSRC - the box lines every Fantrax row is scored from. Asked here
+  // so the hub works without the Fantrax pane having been opened, the same
+  // reason the dictionary below is asked here.
+  try {
+    _allInEnsureLive(function () {
+      var mL = document.getElementById('allInModal');
+      if (mL && mL.classList.contains('open')) _allInRender();
+    });
+  } catch (eL) {}
 
   // ALLINNAMES - before the scan, because the scan is what cannot see them.
   _allInEnsureNames(function () {
@@ -124668,6 +124741,63 @@ function _fxStadiumStatMap(espnId, gameId) {
     }
   }
   return null;
+}
+
+// == WHERE A FANTRAX BOX LINE COMES FROM == FXHUBSRC ==
+//
+// Two caches hold the same box scores and they are reached differently:
+//
+//   _ftxLiveCache  every started game on the slate, indexed by PLAYER NAME
+//   _gameSummaries every box this app has loaded, indexed by GAME ID, and
+//                  read by _fxStadiumStatMap through an ESPN ATHLETE ID
+//
+// The hubs only ever used the second one, and no Fantrax roster item carries
+// an ESPN athlete id - nothing fills one in. _skSearchAllRosters sets espnId
+// from ESPN's own playerId or from Sleeper's dictionary, so a Fantrax player
+// got an id ONLY when some other league of mine happened to hold him too.
+//
+// That is the whole of "some Fantrax players score and some don't". It is
+// not about the lineup, the slot, the league or the game: a player held in
+// an ESPN or Sleeper league as well picked up an id and scored, and a player
+// held only in Fantrax leagues had no id, so _fxStadiumStatMap returned on
+// its first line and the row rendered blank. The same player could be ACTIVE
+// in one Fantrax team and RESERVE in another and be blank in both, which is
+// exactly what the roster modals disagreeing with the hub looked like.
+//
+// The roster pane never had the problem because it reads _ftxLiveCache by
+// name - which is why opening the league made the numbers appear, and why
+// the pane and the hub printed two different figures for the same player:
+// two caches, captured at two different moments.
+//
+// So the name-keyed cache is the SOURCE here, as FXPROBESRC already says it
+// is, and the id-keyed box is the FALLBACK - it still answers for a player
+// the live cache missed by name but whose id is known.
+//
+// PINNED TO THE NAMED GAME. The live cache is refilled from ESPN's undated
+// scoreboard and holds whatever slate ESPN is serving, so it is consulted
+// only when the caller named a game and the cached line agrees it came from
+// that game. A caller that names no game (every stadium caller) skips this
+// source entirely and behaves exactly as before.
+function _fxHubStatLine(sport, at, item) {
+  if (!at) return null;
+  var gid = (at.gameId == null) ? '' : String(at.gameId);
+  if (gid && typeof _ftxLiveFor === 'function') {
+    var SPORT = String(sport || '').toUpperCase();
+    // at.name is the hub's deduped display name; the roster item's own name
+    // is tried too, because the two can differ when several providers hold
+    // the same player and the first one walked set the label.
+    var tries = [at.name, (item && item.name) || ''];
+    for (var t = 0; t < tries.length; t++) {
+      if (!tries[t]) continue;
+      var lv = null;
+      try { lv = _ftxLiveFor(SPORT, tries[t]); } catch (e) { lv = null; }
+      if (!lv || !lv.statMap) continue;
+      if (String(lv.gid || '') !== gid) continue;
+      return { statMap: lv.statMap, pos: lv.pos || '', ctx: lv.ctx || null };
+    }
+  }
+  if (typeof _fxStadiumStatMap !== 'function') return null;
+  try { return _fxStadiumStatMap(at.espnId, at.gameId); } catch (e2) { return null; }
 }
 
 // Compact "how this number was built" for a tooltip. FXENGINE
@@ -181632,6 +181762,14 @@ function _ftxParseBox(j, SPORT, g) {
               for (var _v = 0; _v < labels.length && _v < vals.length; _v++) _sm[String(labels[_v] || '')] = vals[_v];
               out[keys[kk]] = { line: bits.join('\u0001'), live: (g.state === 'in'),
                                 day: g.day || '',   // FTXSLATE
+                                // FXHUBSRC - which game this line is from.
+                                // The cache spans a whole slate and is
+                                // refilled from ESPN's undated scoreboard,
+                                // so a consumer working to a NAMED game has
+                                // to be able to check that it is the same
+                                // one. Nothing else in here could tell
+                                // tonight's line from last night's.
+                                gid: String(g.id == null ? '' : g.id),
 
                                 detail: g.detail || '', statMap: _sm,
                                 pos: (who.position && who.position.abbreviation) || '',
