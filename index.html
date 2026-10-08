@@ -37946,7 +37946,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = '2026-10-08 FHLIDS';
+var SK_BUILD = '2026-10-08 PPA';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -125416,66 +125416,192 @@ function skProbeEspnAtoi() {
 // counterexample is an identification. One holding across four is a
 // coincidence, so the sample count is printed beside every claim and the
 // reader can tell them apart.
-function _fhlProbeSamples() {
+// == IT WAS LOOKING WHERE THE ROSTERS AREN'T == ESPFHLIDS3 ==
+//
+// The first cut of this walked row.raw.teams[].roster.entries. row.raw is
+// the mTeam+mSettings payload and has no rosters in it at all - ESPNLAZY
+// says so where it is fetched: adding mRoster to that call took it from
+// 32KB to 1.5MB, so rosters are a separate lazy fetch. skProbeEspnAtoi reads
+// row.raw too and is right to, because it wants team totals; this wants
+// players, and there were none to find. The probe answered "no league with
+// rosters in memory" for a league whose rosters were in memory, in a
+// different place.
+//
+// Two sources now, and they are complementary rather than redundant:
+//
+//   MEMORY  row.rosters.byTeam[].items[].windows - already parsed, instant,
+//           and FILTERED to the ids each league scores (espSliceIds). Enough
+//           to test any identity whose every term one of your leagues
+//           happens to score, and nothing beyond that.
+//   FETCH   the mRoster view, read for its UNFILTERED player stat entries.
+//           This is what can identify a component NO league of yours scores,
+//           which is the whole difficulty: #18 cannot be checked against
+//           #19 + #18 == PPP if no league asked ESPN for #18.
+//
+// And every step now reports its count. "Didn't load" has to be impossible
+// to get back as an answer: whatever this finds or fails to find, the funnel
+// says which step produced nothing.
+function _fhlNumMap(st) {
+  var m = {}, n = 0, id, v;
+  for (id in st) {
+    if (!st.hasOwnProperty(id)) continue;
+    v = Number(st[id]);
+    if (isNaN(v) || !isFinite(v)) continue;
+    m[String(id)] = v;
+    n++;
+  }
+  return { map: m, n: n };
+}
+
+// One row per player per window, merged across leagues. A player held in
+// three leagues is ONE observation of a season - counting him three times
+// would inflate every sample count and make a coincidence look like a law -
+// but the three leagues score different categories, so the UNION of their id
+// sets is strictly more than any one of them had.
+function _fhlProbeAdd(D, key, name, map) {
+  var cur = D.byKey[key], id;
+  if (!cur) {
+    cur = { name: name, stats: {} };
+    D.byKey[key] = cur;
+    D.samples.push(cur);
+  }
+  for (id in map) {
+    if (!map.hasOwnProperty(id)) continue;
+    if (cur.stats[id] == null) cur.stats[id] = map[id];
+  }
+}
+
+function _fhlProbeIndex(D) {
+  var s, id;
+  D.ids = {};
+  for (s = 0; s < D.samples.length; s++) {
+    for (id in D.samples[s].stats) {
+      if (!D.samples[s].stats.hasOwnProperty(id)) continue;
+      D.ids[id] = (D.ids[id] || 0) + 1;
+    }
+  }
+}
+
+// season and prev only. The rolling windows are slices of season, so they
+// restate the same facts under new names and would pad every count.
+var _FHL_PROBE_WINDOWS = ['season', 'prev'];
+
+function _fhlProbeFromMemory(D) {
   var rows = (typeof extLeagues !== 'undefined' && extLeagues) ? extLeagues : [];
-  var out = { samples: [], leagues: [], ids: {} };
-  var seenPlayer = {};
-  for (var i = 0; i < rows.length; i++) {
+  var i, k, j, w;
+  for (i = 0; i < rows.length; i++) {
     var row = rows[i];
     if (!row || row.provider !== 'espn') continue;
     if (String(row.sport || '').toLowerCase() !== 'nhl') continue;
-    var raw = row.raw || {};
-    var teams = raw.teams || [];
-    if (!teams.length) continue;
-    var season = (raw.seasonId != null) ? raw.seasonId : row.season;
-    var before = out.samples.length;
-    for (var t = 0; t < teams.length; t++) {
-      var ents = ((teams[t] || {}).roster || {}).entries || [];
-      for (var k = 0; k < ents.length; k++) {
-        var pl = (((ents[k] || {}).playerPoolEntry) || {}).player || {};
-        var pid = String(pl.id || (ents[k] || {}).playerId || '');
-        // A player held in three leagues is ONE observation, not three.
-        // Counting him once per league would inflate every sample count and
-        // make a coincidence look like a law.
-        if (!pid || seenPlayer[pid]) continue;
-        // Season totals: statSourceId 0 (real, not projected), split 0.
-        var e = (typeof espStatEntry === 'function')
-          ? espStatEntry(pl, 0, 0, season, null) : null;
-        var st = e && e.stats;
-        if (!st) continue;
-        var m = {}, any = false, id, v;
-        for (id in st) {
-          if (!st.hasOwnProperty(id)) continue;
-          v = Number(st[id]);
-          if (isNaN(v) || !isFinite(v)) continue;
-          m[String(id)] = v;
-          out.ids[String(id)] = (out.ids[String(id)] || 0) + 1;
-          any = true;
+    var L = { name: row.name || row.key, season: row.season || '?',
+              teams: 0, players: 0, rows: 0, row: row };
+    D.leagues.push(L);
+    if (!row.rosters || !row.rosters.byTeam) { L.note = 'no rosters loaded yet'; continue; }
+    for (k in row.rosters.byTeam) {
+      if (!row.rosters.byTeam.hasOwnProperty(k)) continue;
+      L.teams++;
+      var items = (row.rosters.byTeam[k] || {}).items || [];
+      for (j = 0; j < items.length; j++) {
+        var it = items[j] || {};
+        L.players++;
+        if (!it.windows) continue;
+        for (w = 0; w < _FHL_PROBE_WINDOWS.length; w++) {
+          var wk = _FHL_PROBE_WINDOWS[w];
+          var win = it.windows[wk];
+          if (!win || !win.stats) continue;
+          var nmp = _fhlNumMap(win.stats);
+          if (!nmp.n) continue;
+          var pid = String(it.playerId || it.name || '');
+          if (!pid) continue;
+          _fhlProbeAdd(D, pid + '|' + wk,
+                       (it.name || pid) + ' [' + wk + ']', nmp.map);
+          L.rows++;
         }
-        if (!any) continue;
-        seenPlayer[pid] = 1;
-        var nmP = pl.fullName ||
-          ((pl.firstName || '') + ' ' + (pl.lastName || '')).replace(/^ | $/g, '') ||
-          ('#' + pid);
-        out.samples.push({ name: nmP, stats: m });
       }
     }
-    out.leagues.push({ name: row.name || row.key, season: season,
-                       teams: teams.length, added: out.samples.length - before });
+    if (!L.rows && L.players) L.note = 'rosters loaded but no stat windows on them yet';
   }
-  return out;
+}
+
+// The unfiltered read. Serial, and capped, because mRoster measured 1.5MB a
+// league where it is fetched for real.
+function _fhlProbeFetch(D, done) {
+  var jobs = [], i;
+  for (i = 0; i < D.leagues.length && jobs.length < 2; i++) {
+    var row = D.leagues[i].row;
+    var sv = null;
+    try {
+      sv = (typeof espFindSaved === 'function')
+        ? espFindSaved(String(row.key || '').slice(4)) : null;
+    } catch (e) { sv = null; }
+    if (sv) jobs.push({ L: D.leagues[i], sv: sv });
+  }
+  if (!jobs.length || typeof espFetchLeague !== 'function' ||
+      typeof espCurrentSeason !== 'function') { done(); return; }
+
+  var at = 0;
+  function step() {
+    if (at >= jobs.length) { done(); return; }
+    var job = jobs[at++];
+    espCurrentSeason(job.sv.game).then(function (season) {
+      return espFetchLeague(job.sv.game, job.sv.id, season, '?view=mRoster');
+    }).then(function (jr) {
+      var teams = (jr && jr.teams) || [], t, e2;
+      var season = (jr && jr.seasonId != null) ? Number(jr.seasonId) : null;
+      job.L.fetched = 0;
+      for (t = 0; t < teams.length; t++) {
+        var ents = ((teams[t] || {}).roster || {}).entries || [];
+        for (e2 = 0; e2 < ents.length; e2++) {
+          var pl = (((ents[e2] || {}).playerPoolEntry) || {}).player || {};
+          var pid = String(pl.id || (ents[e2] || {}).playerId || '');
+          if (!pid) continue;
+          var nmP = pl.fullName ||
+            ((pl.firstName || '') + ' ' + (pl.lastName || '')).replace(/^ | $/g, '') ||
+            ('player ' + pid);
+          var pairs = [['season', season], ['prev', (season == null) ? null : season - 1]];
+          for (var w2 = 0; w2 < pairs.length; w2++) {
+            if (pairs[w2][1] == null) continue;
+            var en = (typeof espStatEntry === 'function')
+              ? espStatEntry(pl, 0, 0, pairs[w2][1], null) : null;
+            if (!en || !en.stats) continue;
+            var nmp = _fhlNumMap(en.stats);
+            if (!nmp.n) continue;
+            _fhlProbeAdd(D, pid + '|' + pairs[w2][0],
+                         nmP + ' [' + pairs[w2][0] + ']', nmp.map);
+            job.L.fetched++;
+          }
+        }
+      }
+      if (!job.L.fetched) job.L.fetchNote = 'the roster view carried no player stat entries';
+    })['catch'](function (err) {
+      job.L.fetchNote = 'roster fetch failed: ' +
+        ((err && err.message) ? err.message : String(err));
+    }).then(step, step);
+  }
+  step();
 }
 
 function skProbeEspnHockeyIds() {
-  var lines = [];
-  function say(t) { lines.push(t); }
-
-  var D = _fhlProbeSamples();
-  if (!D.samples.length) {
-    _skGpProbeShow('No synced ESPN hockey league with rosters in memory.\n\n' +
-      'Open an ESPN NHL league once so its teams load, then run this again.');
+  var D = { samples: [], byKey: {}, leagues: [], ids: {} };
+  _fhlProbeFromMemory(D);
+  if (!D.leagues.length) {
+    _skGpProbeShow('No ESPN hockey league is synced.\n\n' +
+      'This reads ESPN NHL leagues only - Fantrax, Sleeper and Yahoo publish ' +
+      'their own category names and need no identifying.');
     return;
   }
+  _fhlProbeIndex(D);
+  _skGpProbeShow('Read ' + D.samples.length + ' stat lines from memory.\n' +
+                 'Fetching the full ones from ESPN\u2026');
+  _fhlProbeFetch(D, function () {
+    _fhlProbeIndex(D);
+    _fhlProbeRender(D);
+  });
+}
+
+function _fhlProbeRender(D) {
+  var lines = [];
+  function say(t) { lines.push(t); }
 
   function named(id) {
     return !!((typeof espStatName === 'function') && espStatName('fhl', id));
@@ -125499,11 +125625,23 @@ function skProbeEspnHockeyIds() {
 
   say('\u2500\u2500 WHAT WAS READ \u2500\u2500');
   for (q = 0; q < D.leagues.length; q++) {
-    say('  ' + D.leagues[q].name + '  season ' + D.leagues[q].season +
-        '  \u00b7 ' + D.leagues[q].teams + ' teams \u00b7 ' +
-        D.leagues[q].added + ' players not already counted');
+    var L = D.leagues[q];
+    say('  ' + L.name + '  season ' + L.season);
+    say('    in memory : ' + L.teams + ' teams \u00b7 ' + L.players +
+        ' roster spots \u00b7 ' + L.rows + ' stat lines' +
+        (L.note ? ('  \u2014 ' + L.note) : ''));
+    say('    fetched   : ' + ((L.fetched == null) ? 'not fetched' : (L.fetched + ' stat lines')) +
+        (L.fetchNote ? ('  \u2014 ' + L.fetchNote) : ''));
   }
-  say('  ' + D.samples.length + ' distinct players with a season stat line');
+  if (!D.samples.length) {
+    say('');
+    say('Nothing to work from. Open an ESPN hockey league once so its rosters');
+    say('load, then run this again \u2014 the per-league lines above say which');
+    say('step came back empty.');
+    _skGpProbeShow(lines.join('\n'));
+    return;
+  }
+  say('  ' + D.samples.length + ' stat lines, one per player per season');
   say('  ids present: ' + ids.length + '  \u00b7  of those UNNAMED: ' +
       (unnamed.length ? unnamed.join(', ') : 'none'));
   if (!unnamed.length) {
@@ -125636,7 +125774,7 @@ function skProbeEspnHockeyIds() {
     for (var a = 0; a < b.length; a++) if (b[a].indexOf(label + ' (#') === 0) return true;
     return false;
   }
-  function readPair(aggLabel, goalName, assistName) {
+  function readPair(aggLabel, goalAbbr, goalName, assistAbbr, assistName) {
     var W = aggId(aggLabel);
     if (W == null) { say('  ' + aggLabel + ': not scored by these leagues, nothing to split.'); return; }
     var pairs = [], a, seenPair = {};
@@ -125659,16 +125797,43 @@ function skProbeEspnHockeyIds() {
       say('    so its two components are not both in this data.');
       return;
     }
+    // ESPFHLIDS3 - which half is which. A partner that ALREADY has a name
+    // answers it outright: the pair sums to the whole, so if one of them is
+    // PPA the other is the goals half, and no bound is needed. Only when
+    // BOTH are unnamed does this fall back to G and A as the separator.
+    // Before PPA was named this branch did not exist, so the moment one half
+    // got a label the other stopped being identifiable - the opposite of
+    // what learning a name should do.
+    function sideOf(id) {
+      if (named(id)) {
+        var n2 = nm(id);
+        if (n2 === goalAbbr) return 'g';
+        if (n2 === assistAbbr) return 'a';
+        return '';
+      }
+      var g2 = boundedByName(id, 'G'), a2 = boundedByName(id, 'A');
+      if (g2 && !a2) return 'g';
+      if (a2 && !g2) return 'a';
+      return '';
+    }
     for (a = 0; a < pairs.length; a++) {
       var P = pairs[a];
-      var uG = boundedByName(P.u, 'G'), uA = boundedByName(P.u, 'A');
-      var vG = boundedByName(P.v, 'G'), vA = boundedByName(P.v, 'A');
+      var su = sideOf(P.u), sv = sideOf(P.v);
+      // Two halves of one total: knowing either one fixes the other.
+      if (!su && sv) su = (sv === 'g') ? 'a' : 'g';
+      if (!sv && su) sv = (su === 'g') ? 'a' : 'g';
       var verdict;
-      if (uG && !uA && vA && !vG) verdict = tag(P.u) + ' is ' + goalName + ', ' + tag(P.v) + ' is ' + assistName;
-      else if (uA && !uG && vG && !vA) verdict = tag(P.u) + ' is ' + assistName + ', ' + tag(P.v) + ' is ' + goalName;
-      else verdict = 'both are components of ' + aggLabel +
-        ', but G and A do not separate them here \u2014 see the bounds above';
-      say('  ' + aggLabel + ' (#' + W + ') == #' + P.u + ' + #' + P.v +
+      if (su && sv && su !== sv) {
+        var bits2 = [];
+        if (!named(P.u)) bits2.push(tag(P.u) + ' is ' + ((su === 'g') ? goalName : assistName));
+        if (!named(P.v)) bits2.push(tag(P.v) + ' is ' + ((sv === 'g') ? goalName : assistName));
+        verdict = bits2.length ? bits2.join(', ')
+                               : 'both halves are already named';
+      } else {
+        verdict = 'both are components of ' + aggLabel +
+          ', but G and A do not separate them here \u2014 see the bounds above';
+      }
+      say('  ' + aggLabel + ' (#' + W + ') == ' + tag(P.u) + ' + ' + tag(P.v) +
           ' on ' + P.n + ' players');
       say('    \u2192 ' + verdict);
     }
@@ -125676,8 +125841,8 @@ function skProbeEspnHockeyIds() {
 
   say('');
   say('\u2500\u2500 THE READING \u2500\u2500');
-  readPair('PPP', 'power-play goals (PPG)', 'power-play assists (PPA)');
-  readPair('SHP', 'short-handed goals (SHG)', 'short-handed assists (SHA)');
+  readPair('PPP', 'PPG', 'power-play goals (PPG)', 'PPA', 'power-play assists (PPA)');
+  readPair('SHP', 'SHG', 'short-handed goals (SHG)', 'SHA', 'short-handed assists (SHA)');
   say('');
   say('  Anything left over that is never above G, is in no sum, and runs');
   say('  small is a goal SUBSET - game-winning goals are the usual one.');
@@ -167791,6 +167956,31 @@ var ESP_STAT_NAME_FHL = {
   8: 'TOI', 9: 'OTL', 10: 'GAA', 11: 'SV%', 12: 'W%',
   // Skating
   13: 'G', 14: 'A', 15: '+/-', 16: 'PTS', 17: 'PIM',
+  // ESPFHLIDS3 - power-play assists. ESPN ships no label for it, and an
+  // unlabelled id renders as a bare "#19" in every stat line that scores it.
+  //
+  // Named on two independent confirmations, not on the shape of the gap:
+  //
+  //   1. A skater carrying "1 #19" on a night he also carried "1 PPP" and
+  //      "1 A", beside a team-mate in the SAME league with 2 A, no PPP and
+  //      no #19 at all. An even-strength assist produces no #19; a
+  //      power-play one produces both.
+  //   2. The box score for that game, checked away from this app: the
+  //      assist was on the power play.
+  //
+  // It cannot be plain assists - 14 is already A, and the two render side by
+  // side on the same row. The structural argument agrees (38 and 39 are the
+  // PPP and SHP TOTALS, so their components have to live in the 18-22 gap)
+  // but structure alone would not have been enough to name it: outside
+  // baseball every rate and direction flag is keyed by NAME, so a wrong
+  // label can attach a wrong flag to a real category and reverse how a roto
+  // race reads, with nothing on screen to show it. ESPSPORTFLAG.
+  //
+  // PPA is a COUNT, so it is deliberately absent from ESP_RATE_BY_NAME and
+  // ESP_NOLEAD_BY_NAME, and higher is better, so it is absent from
+  // ESP_LOWER_BY_NAME. 18, 20, 21 and 22 stay unnamed until the hockey id
+  // probe settles them the same way.
+  19: 'PPA',
   23: 'FOW', 24: 'FOL', 25: 'SHFT', 26: 'TOI', 27: 'ATOI',
   // ATOIDEN2 - ESPN ships no label for 34. The name describes the role the
   // probe established (it is exactly what ATOI divides by), not a word ESPN
@@ -167876,7 +168066,13 @@ var ESP_STAT_NO_LEAD_ZERO = { 2: 1, 9: 1, 17: 1, 18: 1, 71: 1 };
 var ESP_CAT_GROUPS = {
   // Hockey splits the way the app splits it.
   fhl: [
-    { key: 's', label: 'SKATING',     names: ['G', 'A', '+/-', 'PIM', 'PPP', 'ATOI', 'SOG'] },
+    // ESPFHLIDS3 - PPA joins on a different footing from the rest of this
+    // list. The others were read off a League Info screen; this one is the
+    // group a power-play assist obviously belongs to. The name is evidence
+    // (see ESP_STAT_NAME_FHL); only the heading it sits under is inference,
+    // and the worst a wrong heading can do is print the wrong word above a
+    // row - no flag, no direction, no arithmetic reads this.
+    { key: 's', label: 'SKATING',     names: ['G', 'A', '+/-', 'PIM', 'PPP', 'PPA', 'ATOI', 'SOG'] },
     { key: 'g', label: 'GOALTENDING', names: ['W', 'GAA', 'SV%'] }
   ],
   // Basketball's League Info lists all eight under one SCORING heading with
