@@ -38138,7 +38138,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = '2026-10-08 NIGHTCARD';
+var SK_BUILD = '2026-10-08 NBALDR';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -81383,16 +81383,47 @@ function _fhubEnsureNames(done) {
 // label -> display name. NHL first, deliberately: these are the labels the
 // ESPN box actually uses, which is why they read as abbreviations rather
 // than as the fantasy names for the same things.
+// == HOW A CATEGORY ADDS UP == LDRMODE ==
+//
+// Hockey could get away with one rule - sum it - because every category on
+// the board is a count. Basketball cannot, and the three ways it differs
+// are each a way to be quietly wrong:
+//
+//   avg   Points, assists, rebounds and turnovers are worth more per player
+//         than in total: twelve men for 221 points says less than 18.4 a
+//         man. The DENOMINATOR is players who logged minutes, not players
+//         on the slate. A man who played and scored nothing drags the
+//         average, correctly; a man who never left the bench is not a zero,
+//         he is an absence, and dividing by him understates everybody.
+//   pct   A percentage is NOT the average of percentages. Four shooters at
+//         50, 100, 0 and 33 are not a 45.8% team - you pool the makes, pool
+//         the attempts and divide once. ESPN hands these over as "8-15",
+//         which is exactly the pair needed, so the pooled figure is the
+//         easy one to get right and the averaged one is the easy one to get
+//         wrong.
+//   made  The made half of a made-attempted pair, summed. Threes are a
+//         count that happens to arrive inside a ratio.
+//
+// A def is [key, display, mode, sourceLabel]. For sum and avg the key IS
+// the box label; for pct and made the key is ours and the fourth field
+// names the box column to read.
 var _LDR_CATS = {
-  nhl: [['G', 'GOALS'], ['A', 'ASSISTS'], ['P', 'POINTS'], ['+/-', 'PLUS/MINUS'],
-        ['S', 'SHOTS'], ['HT', 'HITS'], ['BS', 'BLOCKS'], ['PIM', 'PIM'],
-        ['FW', 'FACEOFFS WON'], ['TK', 'TAKEAWAYS'], ['GV', 'GIVEAWAYS'],
-        ['SV', 'SAVES'], ['GA', 'GOALS AGAINST']]
+  nhl: [['G', 'GOALS', 'sum'], ['A', 'ASSISTS', 'sum'], ['P', 'POINTS', 'sum'],
+        ['+/-', 'PLUS/MINUS', 'sum'], ['S', 'SHOTS', 'sum'], ['HT', 'HITS', 'sum'],
+        ['BS', 'BLOCKS', 'sum'], ['PIM', 'PIM', 'sum'], ['FW', 'FACEOFFS WON', 'sum'],
+        ['TK', 'TAKEAWAYS', 'sum'], ['GV', 'GIVEAWAYS', 'sum'], ['SV', 'SAVES', 'sum'],
+        ['GA', 'GOALS AGAINST', 'sum']],
+  nba: [['PTS', 'POINTS', 'avg'], ['AST', 'ASSISTS', 'avg'],
+        ['REB', 'REBOUNDS', 'avg'], ['3PM', '3-POINTERS', 'made', '3PT'],
+        ['FG%', 'FG%', 'pct', 'FG'], ['FT%', 'FT%', 'pct', 'FT'],
+        ['3P%', '3PT%', 'pct', '3PT'], ['TO', 'TURNOVERS', 'avg'],
+        ['+/-', 'PLUS/MINUS', 'sum']]
 };
 
 // Labels that exist in the box and are deliberately NOT offered, so the
 // skip note can tell them apart from ones nobody has thought about yet.
-var _LDR_RATES = { 'SV%': 1, 'TOI': 1, 'GAA': 1, 'FO%': 1, 'W%': 1, 'MIN': 1 };
+var _LDR_RATES = { 'SV%': 1, 'TOI': 1, 'GAA': 1, 'FO%': 1, 'W%': 1, 'MIN': 1,
+                   'PF': 1, 'OREB': 1, 'DREB': 1, 'STL': 1, 'BLK': 1 };
 
 // One player's real line for tonight, out of the game he is actually in.
 //
@@ -81446,6 +81477,33 @@ function _ldrNum(v) {
   return isNaN(n) ? null : n;
 }
 
+// "8-15" -> { m: 8, a: 15 }. ESPN writes every shooting line this way, and
+// it is the only form that lets a percentage be pooled rather than averaged.
+function _ldrPair(v) {
+  if (v == null) return null;
+  var s = String(v).trim();
+  var m = /^(\d+)\s*-\s*(\d+)$/.exec(s);
+  if (!m) return null;
+  return { m: parseInt(m[1], 10), a: parseInt(m[2], 10) };
+}
+
+// == WHO COUNTS IN THE DENOMINATOR == LDRMODE ==
+//
+// A basketball average divided by everyone on the slate would be wrong by
+// however many of them were inactive, and wrong in the direction that makes
+// your night look worse than it was. So the denominator is players who
+// actually logged minutes. Hockey keeps its old behaviour - a line at all
+// counts - because nothing on that board is an average.
+function _ldrPlayed(m, sp) {
+  if (sp !== 'nba') return true;
+  var mn = m && m['MIN'];
+  if (mn == null) return false;
+  var s = String(mn).trim();
+  if (!s || s === '--') return false;
+  var n = parseFloat(s.split(':')[0]);
+  return !isNaN(n) && n > 0;
+}
+
 // hits are the hub's own deduped players, already matched to a game.
 function _ldrScan(hits, sport) {
   var sp = String(sport || '').toLowerCase();
@@ -81453,10 +81511,15 @@ function _ldrScan(hits, sport) {
   var out = { sport: sp, cats: [], players: 0, noLine: 0, unknown: [],
               supported: !!defs.length };
   if (!defs.length || !hits || !hits.length) return out;
-  var byLabel = {}, d;
+  var byLabel = {}, d, consumed = {};
   for (d = 0; d < defs.length; d++) {
-    byLabel[defs[d][0]] = { label: defs[d][0], name: defs[d][1], total: 0, rows: [] };
+    var df = defs[d];
+    byLabel[df[0]] = { label: df[0], name: df[1], mode: df[2] || 'sum',
+                       src: df[3] || df[0], total: 0, made: 0, att: 0,
+                       played: 0, rows: [] };
+    consumed[df[3] || df[0]] = 1;
   }
+  out.played = 0;
   var unk = {}, i, k;
   for (i = 0; i < hits.length; i++) {
     var h = hits[i];
@@ -81465,20 +81528,56 @@ function _ldrScan(hits, sport) {
     try { line = _ldrBoxLine(gid, h.espnId, h.name); } catch (eL) { line = null; }
     if (!line) { out.noLine++; continue; }
     out.players++;
-    for (k in line.statMap) {
-      if (!line.statMap.hasOwnProperty(k)) continue;
-      var n = _ldrNum(line.statMap[k]);
-      if (n == null) {
-        // Not a number at all. Only worth naming if it is not already a
-        // known rate - those are set aside on purpose.
-        if (!_LDR_RATES[k] && !byLabel[k]) unk[k] = 1;
+    var didPlay = _ldrPlayed(line.statMap, sp);
+    if (didPlay) out.played++;
+
+    // The declared categories, in their own terms.
+    for (d = 0; d < defs.length; d++) {
+      var c = byLabel[defs[d][0]];
+      var raw = line.statMap[c.src];
+      if (raw == null) continue;
+      if (c.mode === 'pct' || c.mode === 'made') {
+        var pr = _ldrPair(raw);
+        if (!pr) continue;
+        if (c.mode === 'pct') {
+          if (!didPlay) continue;
+          c.made += pr.m; c.att += pr.a;
+          if (pr.a > 0) {
+            c.rows.push({ name: h.name, club: h.teamAbbr || '',
+                          pos: h.pos || line.pos || '',
+                          val: pr.a ? (pr.m / pr.a) * 100 : 0, m: pr.m, a: pr.a });
+          }
+        } else {
+          if (pr.m === 0) continue;
+          c.total += pr.m;
+          c.rows.push({ name: h.name, club: h.teamAbbr || '',
+                        pos: h.pos || line.pos || '', val: pr.m });
+        }
         continue;
       }
-      if (!byLabel[k]) { if (!_LDR_RATES[k]) unk[k] = 1; continue; }
-      if (n === 0) continue;                 // nothing to rank
-      byLabel[k].total = Math.round((byLabel[k].total + n) * 10) / 10;
-      byLabel[k].rows.push({ name: h.name, club: h.teamAbbr || '',
-                             pos: h.pos || line.pos || '', val: n });
+      var n = _ldrNum(raw);
+      if (n == null) continue;
+      if (c.mode === 'avg') {
+        // A man who played and did nothing belongs in the denominator; the
+        // one who never got off the bench does not.
+        if (!didPlay) continue;
+        c.played++;
+        c.total = Math.round((c.total + n) * 10) / 10;
+        if (n === 0) continue;               // counted, not listed
+      } else {
+        if (n === 0) continue;               // nothing to rank
+        c.total = Math.round((c.total + n) * 10) / 10;
+      }
+      c.rows.push({ name: h.name, club: h.teamAbbr || '',
+                    pos: h.pos || line.pos || '', val: n });
+    }
+
+    // Anything the box carries that no category claimed, so a column worth
+    // a pill is named rather than silently dropped.
+    for (k in line.statMap) {
+      if (!line.statMap.hasOwnProperty(k)) continue;
+      if (consumed[k] || _LDR_RATES[k]) continue;
+      unk[k] = 1;
     }
   }
   for (k in unk) { if (unk.hasOwnProperty(k)) out.unknown.push(k); }
@@ -81486,23 +81585,65 @@ function _ldrScan(hits, sport) {
   // Keep the declared order - the pills are a fixed row, and a row that
   // reorders itself every refresh cannot be learned.
   for (d = 0; d < defs.length; d++) {
-    var c = byLabel[defs[d][0]];
-    c.rows.sort(function (a, b) {
+    var c2 = byLabel[defs[d][0]];
+    c2.rows.sort(function (a, b) {
       return (b.val - a.val) || String(a.name).localeCompare(String(b.name));
     });
-    out.cats.push(c);
+    // Is there anything to show, and what is the one number? The two
+    // questions differ by mode, and conflating them is how a board ends up
+    // with a pill reading 0 for a category nobody has touched.
+    //   sum/made  somebody has to have done it
+    //   avg       somebody has to have PLAYED; everyone scoring zero is a
+    //             real answer and 0.0 is the honest way to print it
+    //   pct       somebody has to have SHOT; 0 of 7 is a real answer too
+    if (c2.mode === 'pct') {
+      c2.live = c2.att > 0;
+      c2.value = c2.live ? Math.round((c2.made / c2.att) * 1000) / 10 : null;
+    } else if (c2.mode === 'avg') {
+      c2.live = c2.played > 0;
+      c2.value = c2.live ? Math.round((c2.total / c2.played) * 10) / 10 : null;
+    } else {
+      c2.live = c2.rows.length > 0;
+      c2.value = c2.live ? (Math.round(c2.total * 10) / 10) : null;
+    }
+    out.cats.push(c2);
   }
   return out;
+}
+
+// What goes on the pill, in this category's own units.
+function _ldrVal(c) {
+  if (c.value == null) return '\u2014';
+  if (c.mode === 'pct') return c.value.toFixed(1) + '%';
+  if (c.mode === 'avg') return c.value.toFixed(1);
+  return String(Math.round(c.value * 10) / 10);
+}
+
+// The line under the pills, which has to show the WORKING - an average is
+// only trustworthy if its denominator is on screen, and a pooled percentage
+// is only checkable if the makes and attempts are.
+function _ldrHeadline(c) {
+  if (c.mode === 'pct') {
+    return (c.value == null ? '\u2014' : (c.value.toFixed(1) + '%')) +
+      ' \u00b7 ' + c.made + ' of ' + c.att;
+  }
+  if (c.mode === 'avg') {
+    return (c.value == null ? '\u2014' : (c.value.toFixed(1) + ' per player')) +
+      ' \u00b7 ' + (Math.round(c.total * 10) / 10) + ' from ' + c.played + ' who played';
+  }
+  return (Math.round(c.total * 10) / 10) + ' from ' + c.rows.length +
+    ' player' + (c.rows.length === 1 ? '' : 's');
 }
 
 function _ldrHtml(hits, sport) {
   var sc = _ldrScan(hits, sport);
   if (!sc.supported) {
-    return '<div class="crs-fhub-empty">Nightly Leaders is hockey only so far. ' +
-      'The categories are per sport and the others have not been chosen yet.</div>';
+    return '<div class="crs-fhub-empty">Nightly Leaders covers hockey and ' +
+      'basketball so far. The categories are per sport and the others have ' +
+      'not been chosen yet.</div>';
   }
   var live = [], i;
-  for (i = 0; i < sc.cats.length; i++) if (sc.cats[i].rows.length) live.push(sc.cats[i]);
+  for (i = 0; i < sc.cats.length; i++) if (sc.cats[i].live) live.push(sc.cats[i]);
   if (!live.length) {
     return '<div class="crs-fhub-empty">' +
       (sc.players
@@ -81523,22 +81664,24 @@ function _ldrHtml(hits, sport) {
     h += '<button class="sk-ldr-pill' + (c === cur ? ' on' : '') +
       '" onclick="setAllInCat(\'' + slEsc(c.label) + '\')">' +
       '<span class="sk-ldr-pl">' + slEsc(c.name) + '</span>' +
-      '<b>' + (Math.round(c.total * 10) / 10) + '</b></button>';
+      '<b>' + _ldrVal(c) + '</b></button>';
   }
   h += '</div>';
 
   h += '<div class="sk-ldr-hd"><span>' + slEsc(cur.name) + '</span>' +
-    '<span class="sk-ldr-tot">' + (Math.round(cur.total * 10) / 10) +
-    ' from ' + cur.rows.length + ' player' + (cur.rows.length === 1 ? '' : 's') +
-    '</span></div>';
+    '<span class="sk-ldr-tot">' + _ldrHeadline(cur) + '</span></div>';
   for (i = 0; i < cur.rows.length; i++) {
     var r = cur.rows[i];
+    var rv = (cur.mode === 'pct')
+      ? ((Math.round(r.val * 10) / 10) + '%')
+      : String(Math.round(r.val * 10) / 10);
     h += '<div class="sk-ldr-row">' +
       '<span class="sk-ldr-rk">' + (i + 1) + '</span>' +
       '<span class="sk-ldr-nm">' + slEsc(r.name) +
         (r.club ? ('<i>' + slEsc(String(r.club).toUpperCase()) +
-          (r.pos ? (' \u00b7 ' + slEsc(r.pos)) : '') + '</i>') : '') + '</span>' +
-      '<span class="sk-ldr-v">' + (Math.round(r.val * 10) / 10) + '</span>' +
+          (r.pos ? (' \u00b7 ' + slEsc(r.pos)) : '') + '</i>') : '') +
+        (cur.mode === 'pct' ? ('<i>' + r.m + ' of ' + r.a + '</i>') : '') + '</span>' +
+      '<span class="sk-ldr-v">' + rv + '</span>' +
     '</div>';
   }
 
@@ -81548,10 +81691,18 @@ function _ldrHtml(hits, sport) {
     notes.push('not ranked: ' + sc.unknown.slice(0, 8).join(', ') +
       ' \u2014 tell me which of these are worth a pill');
   }
-  h += '<div class="sk-ldr-note">Totals are across every player you roster who ' +
-    'is in tonight\u2019s games, counted ONCE however many leagues you hold him ' +
-    'in \u2014 these are his real numbers, not fantasy points. Rates are left ' +
-    'out on purpose: save percentages do not add up to anything.' +
+  h += '<div class="sk-ldr-note">Every player you roster who is in tonight\u2019s ' +
+    'games, counted ONCE however many leagues you hold him in \u2014 these are ' +
+    'his real numbers, not fantasy points.' +
+    (sc.sport === 'nba'
+      ? ' Points, assists, rebounds and turnovers are shown PER PLAYER, over ' +
+        'the ' + sc.played + ' who logged minutes \u2014 a man who never came off ' +
+        'the bench is an absence, not a zero. The percentages pool every make ' +
+        'and every attempt and divide once; an average of percentages would ' +
+        'be a different number and the wrong one. Threes and plus/minus are ' +
+        'totals.'
+      : ' Rates are left out on purpose: save percentages do not add up to ' +
+        'anything.') +
     (notes.length ? (' ' + notes.join('. ') + '.') : '') + '</div>';
   return h;
 }
