@@ -38070,7 +38070,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = '2026-10-08 MYPFPZ';
+var SK_BUILD = '2026-10-08 MYPFPAUTO';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -57690,6 +57690,39 @@ function _myp2PortfolioHtml(list) {
 var _mypFpKey = '';
 var _mypFpBusy = false;
 
+// == IT LOADS ITSELF NOW == MYPFPAUTO ==
+//
+// The first cut made you tap LOAD on every player, and the reason I gave
+// for it - "up to sixty-three day-calls" - was arithmetic done on the wrong
+// unit. teamFpCache is keyed by TEAM and DATE, not by player. Loading
+// Monday for a league loads it for EVERY player in that league, so the
+// cost is paid once per league-day for the whole session and the second
+// player you open in that league is free. Across a browsing session the
+// marginal cost collapses; charging a tap for it was protecting against a
+// bill that does not arrive.
+//
+// It is also well inside what this app already does on its own: the weekly
+// chart fires all seven days of TWO teams in parallel the moment you open
+// a league. Three at a time here is more polite than that, not less.
+//
+// -- WHY SOME DAYS WERE THERE AND SOME WERE NOT --
+// TODAY is pre-fetched for every team by the daily roster load, which is
+// why today's column had a state in every league. A PAST day only existed
+// if something had fetched that team on that date - which the weekly chart
+// does, for one league at a time. So the leagues whose week you had opened
+// looked complete and the ones you had not looked empty, in the same card.
+// Nothing was broken; nothing had asked.
+//
+// -- ASKED ONCE --
+// A day that comes back without this player in it is a fact (he was not on
+// the roster), and the cell reads as a night off. A day that comes back
+// EMPTY, or not at all, leaves the cell cold - and without a record of
+// having asked, the auto-load would fire again on the next repaint, and
+// the repaint is what the fetch triggers. Hence _mypFpTried: one ask per
+// team-day per session, and a retry only when you ask for it.
+var _mypFpTried = {};
+var _mypFpRun = 0;
+
 var _MYPFP_DOW = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN'];
 
 // Yahoo POINTS leagues holding this player: headpoint is H2H points, point
@@ -57753,7 +57786,7 @@ function _mypFpDates() {
 // request answers for every league sharing a team key - which is none of
 // them, but the dedupe costs nothing and the day a league splits teams it
 // will matter.
-function _mypFpMissing(lgs, d) {
+function _mypFpMissing(lgs, d, includeTried) {
   var out = [], seen = {}, i, j;
   for (i = 0; i < lgs.length; i++) {
     for (j = 0; j < d.days.length; j++) {
@@ -57761,8 +57794,9 @@ function _mypFpMissing(lgs, d) {
       if (_mypFpCell(lgs[i], d.days[j], d.today).state !== 'cold') continue;
       var k = lgs[i].myTeamKey + '|' + d.days[j];
       if (seen[k]) continue;
+      if (!includeTried && _mypFpTried[k]) continue;   // MYPFPAUTO
       seen[k] = 1;
-      out.push({ teamKey: lgs[i].myTeamKey, date: d.days[j] });
+      out.push({ teamKey: lgs[i].myTeamKey, date: d.days[j], ck: k });
     }
   }
   return out;
@@ -57772,8 +57806,11 @@ function mypFpOpen(key) {
   _mypFpKey = String(key || '');
   var ov = document.getElementById('mypFpOv');
   if (!ov) return;
+  // Drawn from the cache FIRST so the card is on screen immediately with
+  // whatever is already known, then the gaps fill in behind it.
   _mypFpRender();
   ov.classList.add('open');
+  try { mypFpLoad(false); } catch (e) {}
 }
 
 function mypFpClose(ev) {
@@ -57783,28 +57820,40 @@ function mypFpClose(ev) {
   _mypFpKey = '';
 }
 
-function mypFpLoad() {
+function mypFpLoad(retry) {
   if (_mypFpBusy || typeof fetchTeamFpForDate !== 'function') return;
   var p = _mypFpPlayer();
   if (!p) return;
   var d = _mypFpDates();
-  var jobs = _mypFpMissing(_mypFpLeagues(p), d);
+  var jobs = _mypFpMissing(_mypFpLeagues(p), d, !!retry);
   if (!jobs.length) return;
+  // Marked BEFORE the request, not after. A failure has to count as an ask
+  // or the next repaint tries again, and the repaint is what the fetch
+  // causes - that is a loop, not a retry.
+  for (var m = 0; m < jobs.length; m++) _mypFpTried[jobs[m].ck] = 1;
+  var run = ++_mypFpRun;
+  var openedFor = _mypFpKey;
   _mypFpBusy = true;
   _mypFpRender();
   var at = 0;
   function lane() {
-    if (at >= jobs.length) return Promise.resolve();
+    if (at >= jobs.length || run !== _mypFpRun) return Promise.resolve();
     var job = jobs[at++];
     return Promise.resolve(fetchTeamFpForDate(job.teamKey, job.date))
       ['catch'](function () { return null; })
-      .then(function () { _mypFpRender(); return lane(); });
+      .then(function () {
+        // A lane from a card you have already closed must not redraw the
+        // one you are looking at now. The cache it filled still counts.
+        if (run === _mypFpRun && _mypFpKey === openedFor) _mypFpRender();
+        return lane();
+      });
   }
-  // Three at a time. The same ceiling the weekly schedule fetch uses, and
-  // for the same reason: a phone's connection pool is not deep.
+  // Three at a time. The weekly chart fires all seven days of two teams at
+  // once, so this is the conservative end of what the app already does.
   var lanes = [];
   for (var L = 0; L < 3; L++) lanes.push(lane());
   Promise.all(lanes)['catch'](function () { return null; }).then(function () {
+    if (run !== _mypFpRun) return;
     _mypFpBusy = false;
     _mypFpRender();
   });
@@ -57887,21 +57936,31 @@ function _mypFpRender() {
       '</div>';
   }
 
-  var missing = _mypFpMissing(lgs, d).length;
-  if (missing) {
-    h += '<button class="mypfp-load" onclick="mypFpLoad()"' +
-      (_mypFpBusy ? ' disabled' : '') + '>' +
-      (_mypFpBusy ? 'LOADING\u2026' : ('LOAD THE WEEK \u00b7 ' + missing + ' DAY' +
-        (missing === 1 ? '' : 'S'))) + '</button>';
-    h += '<div class="mypfp-note">' + loaded + ' of ' + slots +
-      ' day-slots are already here. Finished days are kept on this phone and ' +
-      'never asked for twice; today and yesterday are re-read because a live ' +
-      'game can still move them.</div>';
-  } else {
+  // MYPFPAUTO - three states, and the difference matters. Still fetching;
+  // asked and did not arrive, which is worth a retry; or nothing missing.
+  var cold = _mypFpMissing(lgs, d, true).length;
+  if (_mypFpBusy) {
+    h += '<div class="mypfp-note">Filling in ' + (slots - loaded) + ' day' +
+      ((slots - loaded) === 1 ? '' : 's') + '\u2026</div>';
+  } else if (cold) {
+    h += '<button class="mypfp-load" onclick="mypFpLoad(true)">TRY ' + cold +
+      ' DAY' + (cold === 1 ? '' : 'S') + ' AGAIN</button>';
+    h += '<div class="mypfp-note">' + cold + ' day' + (cold === 1 ? '' : 's') +
+      ' didn\u2019t come back. The rest of the card is still right.</div>';
+  }
+  // How to READ the card does not depend on whether every day arrived, so
+  // this is not gated on cold. Hiding it behind a complete load was exactly
+  // backwards: the moment part of the card is missing is the moment the
+  // reader most needs to know what the marks mean.
+  if (!_mypFpBusy) {
     h += '<div class="mypfp-note">The number on the right is that league\u2019s ' +
-      'week to date. \u2014 is a night his club did not play. The totals are not ' +
-      'summed across leagues: each one scores on its own settings, so adding ' +
-      'them would produce a number that means nothing.</div>';
+      'week to date. \u2014 is a night his club did not play, \u00b7 a day not ' +
+      'loaded. The totals are not summed across leagues: each one scores on ' +
+      'its own settings, so adding them would produce a number that means ' +
+      'nothing.<br><br>Days are stored per TEAM, so one loaded here is loaded ' +
+      'for every player in that league \u2014 the next card from one of these ' +
+      'leagues costs nothing. Finished days stay on this phone; today and ' +
+      'yesterday are re-read because a live game can still move them.</div>';
   }
   card.innerHTML = h;
 }
