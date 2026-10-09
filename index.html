@@ -29096,6 +29096,7 @@
   .mypfp-fmt { font-family:'Barlow Condensed',sans-serif; font-weight:700; font-size:9px;
     letter-spacing:0.8px; padding:1px 6px; border-radius:4px; flex:0 0 auto;
     background:rgba(167,139,250,0.16); color:#c4b5fd; }
+  .mypfp-fmt.esp { background:rgba(245,197,24,0.14); color:#f5c518; }
   .mypfp-wk { margin-left:auto; font-family:'Barlow Condensed',sans-serif; font-weight:800;
     font-size:15px; color:#f5c518; flex:0 0 auto; }
   .mypfp-grid { display:grid; grid-template-columns:repeat(7,1fr); gap:3px; }
@@ -38143,7 +38144,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = '2026-10-08 FPCOVER';
+var SK_BUILD = '2026-10-08 ESPDAY';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -57873,6 +57874,51 @@ var _MYPFP_DOW = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN'];
 // Yahoo POINTS leagues holding this player: headpoint is H2H points, point
 // is season-long total points. Cats, 1-cat and roto are deliberately out -
 // they have no fantasy point to show per day, which is the whole card.
+// == ESPN JOINS THE WEEK CARD == ESPDAY ==
+//
+// The probe settled what ESPN will and will not give, and the two answers
+// are different:
+//
+//   TODAY     ESPN publishes its OWN per-player fantasy total for the
+//             current scoring period, and the sync has already parsed it
+//             into item.windows.today.total. Three hockey points leagues
+//             came back carrying 0.5, 0.2 and 0.5 with a per-stat
+//             breakdown behind each. That number costs nothing: it is in
+//             memory before this card opens.
+//   ANY OTHER DAY
+//             The roster payload carries ONE scoring period - the current
+//             one. Every window in espWindows is pinned to it with
+//             useCurrentPeriod. A past day is not missing from a cache,
+//             it is not in the response, and the only way to it is one
+//             refetch per league per day at ?scoringPeriodId=N.
+//
+// I am not guessing at N. Period 10 on an October Thursday in hockey and
+// period 188 in baseball do not come from the same arithmetic, and a
+// mis-derived period would file Monday's points under Tuesday - silently,
+// and in the one place on this card where a wrong number looks exactly
+// like a right one. So ESPN fills today and says so, and the backfill
+// waits for a measurement rather than a guess.
+//
+// Right now that costs almost nothing anyway: the NBA leagues are on
+// scoring period 1. Today IS their whole week.
+//
+// -- A BLANK IS NOT A NIGHT OFF --
+// When windows.today is null the payload cannot say whether he had no
+// game or whether the sync simply predates his. Tonight's slate can, and
+// ALLINCANON made that join sport-aware, so TBL finds TB here too: club
+// on the slate and no line yet reads as waiting, club not on the slate
+// reads as a night off. They are not the same thing and they must not
+// share a mark.
+function _mypFpEspOnSlate(lg, abbr) {
+  if (!abbr || typeof _allInSlate !== 'function' || typeof _allInCanon !== 'function') {
+    return null;
+  }
+  var slate = null;
+  try { slate = _allInSlate(lg.sport); } catch (e) { return null; }
+  if (!slate || !slate.games) return null;
+  return !!slate.byAbbr[_allInCanon(abbr, lg.sport)];
+}
+
 function _mypFpLeagues(p) {
   var out = [];
   if (!p) return out;
@@ -57893,10 +57939,42 @@ function _mypFpLeagues(p) {
     if (st !== 'headpoint' && st !== 'point') continue;
     if (seen[r.leagueKey]) continue;
     seen[r.leagueKey] = 1;
-    out.push({ leagueKey: r.leagueKey, leagueName: r.leagueName || '(unnamed league)',
+    out.push({ src: 'yahoo', sport: sp, teamAbbr: p.teamAbbr || '',
+               leagueKey: r.leagueKey, leagueName: r.leagueName || '(unnamed league)',
                teamName: (typeof _skMyTeamName === 'function') ? _skMyTeamName(r.leagueKey) : '',
                myTeamKey: r.myTeamKey, playerKey: r.playerKey,
                fmt: (st === 'point') ? 'SEASON' : 'H2H PTS' });
+  }
+
+  // ESPDAY - the same question asked of ESPN. Points formats only, for the
+  // same reason Yahoo's are: a categories or roto league scores no fantasy
+  // point to break down by day, which is the whole card.
+  var eIdx = null;
+  try { eIdx = (typeof _espFhubIndex === 'function') ? _espFhubIndex() : null; }
+  catch (e1) { eIdx = null; }
+  if (eIdx && eIdx.n) {
+    var en = (typeof _skNormalizeName === 'function') ? _skNormalizeName(p.name || '')
+           : String(p.name || '').toLowerCase();
+    var refs = (en && eIdx.byName[en]) ? eIdx.byName[en] : [];
+    var psp = String(p.sport || '').toLowerCase();
+    for (var q = 0; q < refs.length; q++) {
+      var erow = refs[q] && refs[q].row;
+      if (!erow || !erow.key) continue;
+      var esp = String(erow.sport || '').toLowerCase();
+      // FHUBSPORT - a name is not an identity across two sports.
+      if (esp !== psp) continue;
+      if (esp === 'nfl' || esp === 'cfb') continue;         // WKTRENDFB
+      var fk = '';
+      try { fk = (typeof extFormatKey === 'function') ? extFormatKey(erow) : ''; }
+      catch (e2) { fk = ''; }
+      if (fk !== 'headpoint' && fk !== 'point') continue;
+      if (seen['esp:' + erow.key]) continue;
+      seen['esp:' + erow.key] = 1;
+      out.push({ src: 'espn', sport: esp, teamAbbr: p.teamAbbr || '',
+                 leagueKey: erow.key, leagueName: erow.name || '(unnamed league)',
+                 teamName: refs[q].teamName || '', item: refs[q].item,
+                 fmt: (fk === 'point') ? 'SEASON' : 'H2H PTS' });
+    }
   }
   out.sort(function (a, b) { return (a.leagueName || '').localeCompare(b.leagueName || ''); });
   return out;
@@ -57907,6 +57985,17 @@ function _mypFpLeagues(p) {
 // same as a day nobody has loaded. PSPARKG draws the same distinction.
 function _mypFpCell(lg, date, today) {
   if (date > today) return { state: 'future' };
+  // ESPDAY - ESPN answers for today and for nothing else, and the two
+  // ways it can answer blank are not the same answer.
+  if (lg.src === 'espn') {
+    if (date !== today) return { state: 'napast' };
+    var ew = (lg.item && lg.item.windows) ? lg.item.windows.today : null;
+    if (ew && ew.total != null && !isNaN(Number(ew.total))) {
+      return { state: 'fp', fp: Math.round(Number(ew.total) * 10) / 10 };
+    }
+    return (_mypFpEspOnSlate(lg, lg.teamAbbr) === true)
+      ? { state: 'wait' } : { state: 'off' };
+  }
   var map = null;
   try {
     map = (typeof teamFpCache !== 'undefined')
@@ -57934,6 +58023,11 @@ function _mypFpDates() {
 function _mypFpMissing(lgs, d, includeTried) {
   var out = [], seen = {}, i, j;
   for (i = 0; i < lgs.length; i++) {
+    // ESPDAY - there is nothing to fetch for an ESPN row. Its states are
+    // never 'cold', so this guard changes no behaviour today; it is here
+    // so a future state rename cannot turn this card into a fetch loop
+    // against an endpoint that has no answer for it.
+    if (lgs[i].src === 'espn') continue;
     for (j = 0; j < d.days.length; j++) {
       if (d.days[j] > d.today) continue;
       if (_mypFpCell(lgs[i], d.days[j], d.today).state !== 'cold') continue;
@@ -58036,8 +58130,8 @@ function _mypFpRender() {
 
   var lgs = _mypFpLeagues(p);
   if (!lgs.length) {
-    h += '<div class="mypfp-note">No Yahoo points league of yours holds him.<br><br>' +
-      'This card only covers Yahoo H2H points and season points leagues. ' +
+    h += '<div class="mypfp-note">No points league of yours holds him.<br><br>' +
+      'This card covers Yahoo and ESPN H2H points and season points leagues. ' +
       'Category and roto leagues score no fantasy points to break down by day, ' +
       'Sleeper publishes only a week-to-date figure, and Fantrax publishes no ' +
       'points at all. Football is week-scoped everywhere.</div>';
@@ -58051,7 +58145,12 @@ function _mypFpRender() {
     for (j = 0; j < d.days.length; j++) {
       var c = _mypFpCell(lgs[i], d.days[j], d.today);
       var cls = 'mypfp-c', val = '\u00b7', vcls = 'mypfp-dv off';
-      if (c.state === 'future') { cls += ' future'; val = '\u00b7'; }
+      // ESPDAY - a day ESPN does not publish, and a day it has not
+      // published YET, are both dim: neither is a number and neither is a
+      // night off. They do not count toward the load counters either,
+      // which are about days that can be fetched.
+      if (c.state === 'future' || c.state === 'napast') { cls += ' future'; val = '\u00b7'; }
+      else if (c.state === 'wait') { cls += ' future'; val = '\u00b7'; vcls = 'mypfp-dv cold'; }
       else {
         slots++;
         if (c.state === 'cold') { val = '\u00b7'; }
@@ -58075,6 +58174,8 @@ function _mypFpRender() {
       '<div class="mypfp-lgtop">' +
         '<span class="mypfp-lgn">' + _myp2Esc(lgs[i].leagueName) + '</span>' +
         '<span class="mypfp-fmt">' + lgs[i].fmt + '</span>' +
+        (lgs[i].src === 'espn'
+          ? '<span class="mypfp-fmt esp">ESPN \u00b7 TODAY</span>' : '') +
         '<span class="mypfp-wk">' + (nDay ? (Math.round(wk * 10) / 10) : '\u2014') + '</span>' +
       '</div>' +
       '<div class="mypfp-grid">' + cells + '</div>' +
@@ -58097,6 +58198,15 @@ function _mypFpRender() {
   // this is not gated on cold. Hiding it behind a complete load was exactly
   // backwards: the moment part of the card is missing is the moment the
   // reader most needs to know what the marks mean.
+  // ESPDAY - say it once, and only when there is an ESPN row to explain.
+  var _anyEsp = false;
+  for (i = 0; i < lgs.length; i++) if (lgs[i].src === 'espn') _anyEsp = true;
+  if (!_mypFpBusy && _anyEsp) {
+    h += '<div class="mypfp-note">A row marked ESPN \u00b7 TODAY carries ESPN\u2019s ' +
+      'own fantasy total for today, which is the only day its roster payload ' +
+      'holds \u2014 the earlier days are dim because ESPN did not send them, not ' +
+      'because nobody asked. Unmarked rows are Yahoo and cover the week.</div>';
+  }
   if (!_mypFpBusy) {
     h += '<div class="mypfp-note">The number on the right is that league\u2019s ' +
       'week to date. \u2014 is a night his club did not play, \u00b7 a day not ' +
@@ -81491,7 +81601,8 @@ var _LDR_CATS = {
         ['TK', 'TAKEAWAYS', 'sum'], ['GV', 'GIVEAWAYS', 'sum'], ['SV', 'SAVES', 'sum'],
         ['GA', 'GOALS AGAINST', 'sum']],
   nba: [['PTS', 'POINTS', 'avg'], ['AST', 'ASSISTS', 'avg'],
-        ['REB', 'REBOUNDS', 'avg'], ['3PM', '3-POINTERS', 'made', '3PT'],
+        ['REB', 'REBOUNDS', 'avg'], ['BLK', 'BLOCKS', 'avg'],
+        ['3PM', '3-POINTERS', 'made', '3PT'],
         ['FG%', 'FG%', 'pct', 'FG'], ['FT%', 'FT%', 'pct', 'FT'],
         ['3P%', '3PT%', 'pct', '3PT'], ['TO', 'TURNOVERS', 'avg'],
         ['+/-', 'PLUS/MINUS', 'sum']]
@@ -81499,8 +81610,11 @@ var _LDR_CATS = {
 
 // Labels that exist in the box and are deliberately NOT offered, so the
 // skip note can tell them apart from ones nobody has thought about yet.
+// LDRBLK - BLK came off this list the moment basketball started offering
+// it. A label can be withheld or offered, not both, and leaving it here
+// would mean the skip note stays silent on the day it is dropped again.
 var _LDR_RATES = { 'SV%': 1, 'TOI': 1, 'GAA': 1, 'FO%': 1, 'W%': 1, 'MIN': 1,
-                   'PF': 1, 'OREB': 1, 'DREB': 1, 'STL': 1, 'BLK': 1 };
+                   'PF': 1, 'OREB': 1, 'DREB': 1, 'STL': 1 };
 
 // One player's real line for tonight, out of the game he is actually in.
 //
