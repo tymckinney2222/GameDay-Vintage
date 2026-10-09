@@ -30410,6 +30410,11 @@
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M3 10h18M8 2v4M16 2v4"/><path d="M9 15l2 2 4-4"/></svg>
       <span>Probe Yahoo draft fields</span>
     </button>
+    <!-- ESPWEEK — can a past scoring period be fetched, and is it the right day? -->
+    <button class="sk-account-item" onclick="skProbeEspnBackfill(); skCloseAccountMenu();">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M3 10h18M8 2v4M16 2v4"/><path d="M7 14h3M14 14h3"/></svg>
+      <span>Probe ESPN day backfill</span>
+    </button>
     <!-- FPCOVER — which window did Yahoo stamp today's stat nodes for? -->
     <button class="sk-account-item" onclick="skProbeYahooCoverage(); skCloseAccountMenu();">
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M3 10h18M8 2v4M16 2v4"/><path d="M12 13v5M9.5 15.5h5"/></svg>
@@ -38144,7 +38149,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = '2026-10-08 ESPDAY';
+var SK_BUILD = '2026-10-09 ESPWEEK';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -57909,6 +57914,116 @@ var _MYPFP_DOW = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN'];
 // on the slate and no line yet reads as waiting, club not on the slate
 // reads as a night off. They are not the same thing and they must not
 // share a mark.
+// == A WEEK OF ESPN DAYS == ESPWEEK ==
+//
+// Your screenshot settled the open question: ESPN's own app lists the
+// matchup week day by day - Mon Oct 5 through Sun Oct 11 with Today in the
+// Thursday slot - so the data exists and is addressable. What it is
+// addressed BY is the scoring period, and hockey's current one is 10 on
+// Thursday Oct 8. Seven consecutive day tabs over a week whose Thursday is
+// period 10 means period 7 is Monday: ONE PERIOD PER CALENDAR DAY, counted
+// from an anchor. Baseball agrees - period 188 on Oct 8 puts period 1 in
+// early April, which is where a season starts.
+//
+// So the period for a date is today's period plus the difference in days.
+// The anchor is read off the synced payload rather than computed, so the
+// only extrapolation is the day count, and today itself never goes through
+// it - today's number still comes free from windows.today.
+//
+// -- IT REFUSES TO GUESS TWICE --
+// Two checks stop a day's points landing under the wrong date, which is
+// the only way this feature can be worse than not having it:
+//
+//   1. The response has to AGREE. ESPN echoes the scoring period it
+//      served; a payload that came back for a different one is discarded,
+//      not filed.
+//   2. The entry has to agree too. Only statSourceId 0, split 5, and the
+//      period asked for is read. A season total also carries a period
+//      field, and filed as a day it would read as the best night of
+//      anyone's career.
+//
+// And if ESPN simply serves nothing for a past period, the day stays dim.
+// The failure mode is the card looking exactly as it did before, never a
+// number under the wrong heading. skProbeEspnBackfill prints the derived
+// date beside each period so the mapping can be checked by eye against the
+// day tabs in that screenshot.
+//
+// One request per LEAGUE per day, and the whole league's rosters come back
+// inside it - so it is paid once and every player in that league is then
+// free, the same economics MYPFPAUTO found on the Yahoo side.
+var _espDayCache = {};      // leagueKey|period -> { period, byPid, n, players }
+var _espDayTried = {};      // leagueKey|period -> 1, one ask per session
+var _espDayInflight = {};
+
+function _espDayDiff(a, b) {
+  try {
+    var da = new Date(String(a) + 'T12:00:00').getTime();
+    var db = new Date(String(b) + 'T12:00:00').getTime();
+    if (isNaN(da) || isNaN(db)) return null;
+    return Math.round((da - db) / 86400000);
+  } catch (e) { return null; }
+}
+
+function _espDayPeriodFor(lg, date, today) {
+  if (!lg || !lg.row) return null;
+  var cur = (typeof _espScoringPeriod === 'function') ? _espScoringPeriod(lg.row) : null;
+  if (cur == null) return null;
+  var dd = _espDayDiff(date, today);
+  if (dd == null) return null;
+  var n = cur + dd;
+  return (n > 0) ? n : null;
+}
+
+function _espDayParse(j, period) {
+  if (!j) return null;
+  var want = Number(period);
+  var served = (j.scoringPeriodId != null) ? Number(j.scoringPeriodId) : null;
+  if (served != null && served !== want) return null;      // check 1
+  var out = { period: want, byPid: {}, n: 0, players: 0 };
+  var teams = j.teams || [], t, k;
+  for (t = 0; t < teams.length; t++) {
+    var ents = ((teams[t] || {}).roster || {}).entries || [];
+    for (k = 0; k < ents.length; k++) {
+      var pl = (((ents[k] || {}).playerPoolEntry) || {}).player || {};
+      if (pl.id == null) continue;
+      out.players++;
+      var e = (typeof espStatEntry === 'function')
+        ? espStatEntry(pl, ESP_SRC_ACTUAL, ESP_SPLIT_DAY, null, want) : null;   // check 2
+      if (!e) continue;
+      var tot = (typeof espAppliedTotal === 'function') ? espAppliedTotal(e) : null;
+      if (tot == null) continue;
+      out.byPid[String(pl.id)] = tot;
+      out.n++;
+    }
+  }
+  return out;
+}
+
+function _espDayFetch(lg, period) {
+  var ck = lg.leagueKey + '|' + period;
+  if (_espDayCache[ck]) return Promise.resolve(_espDayCache[ck]);
+  if (_espDayInflight[ck]) return _espDayInflight[ck];
+  var sv = null;
+  try {
+    sv = (typeof espFindSaved === 'function')
+      ? espFindSaved(String(lg.leagueKey || '').slice(4)) : null;
+  } catch (e) { sv = null; }
+  if (!sv || typeof espCurrentSeason !== 'function' || typeof espFetchLeague !== 'function') {
+    return Promise.resolve(null);
+  }
+  var pr = espCurrentSeason(sv.game).then(function (season) {
+    return espFetchLeague(sv.game, sv.id, season,
+      '?view=mRoster&scoringPeriodId=' + period);
+  }).then(function (j) {
+    var got = _espDayParse(j, period);
+    if (got) _espDayCache[ck] = got;
+    delete _espDayInflight[ck];
+    return got;
+  }, function () { delete _espDayInflight[ck]; return null; });
+  _espDayInflight[ck] = pr;
+  return pr;
+}
+
 function _mypFpEspOnSlate(lg, abbr) {
   if (!abbr || typeof _allInSlate !== 'function' || typeof _allInCanon !== 'function') {
     return null;
@@ -57973,6 +58088,7 @@ function _mypFpLeagues(p) {
       out.push({ src: 'espn', sport: esp, teamAbbr: p.teamAbbr || '',
                  leagueKey: erow.key, leagueName: erow.name || '(unnamed league)',
                  teamName: refs[q].teamName || '', item: refs[q].item,
+                 row: erow,                                    // ESPWEEK - the anchor
                  fmt: (fk === 'point') ? 'SEASON' : 'H2H PTS' });
     }
   }
@@ -57988,13 +58104,28 @@ function _mypFpCell(lg, date, today) {
   // ESPDAY - ESPN answers for today and for nothing else, and the two
   // ways it can answer blank are not the same answer.
   if (lg.src === 'espn') {
-    if (date !== today) return { state: 'napast' };
-    var ew = (lg.item && lg.item.windows) ? lg.item.windows.today : null;
-    if (ew && ew.total != null && !isNaN(Number(ew.total))) {
-      return { state: 'fp', fp: Math.round(Number(ew.total) * 10) / 10 };
+    if (date === today) {
+      var ew = (lg.item && lg.item.windows) ? lg.item.windows.today : null;
+      if (ew && ew.total != null && !isNaN(Number(ew.total))) {
+        return { state: 'fp', fp: Math.round(Number(ew.total) * 10) / 10 };
+      }
+      return (_mypFpEspOnSlate(lg, lg.teamAbbr) === true)
+        ? { state: 'wait' } : { state: 'off' };
     }
-    return (_mypFpEspOnSlate(lg, lg.teamAbbr) === true)
-      ? { state: 'wait' } : { state: 'off' };
+    // ESPWEEK - a past day, addressed by its scoring period.
+    var per = _espDayPeriodFor(lg, date, today);
+    if (per == null) return { state: 'napast' };
+    var eck = lg.leagueKey + '|' + per;
+    var day = _espDayCache[eck];
+    if (!day) return _espDayTried[eck] ? { state: 'napast' } : { state: 'cold' };
+    // ESPN served the day and there was nothing in it for anybody. That is
+    // not every player having a night off - it is the day being empty, and
+    // the two must not share a mark.
+    if (!day.n) return { state: 'napast' };
+    var epid = String((lg.item && lg.item.playerId) || '');
+    var ev = epid ? day.byPid[epid] : null;
+    if (ev == null) return { state: 'off' };
+    return { state: 'fp', fp: ev };
   }
   var map = null;
   try {
@@ -58023,19 +58154,28 @@ function _mypFpDates() {
 function _mypFpMissing(lgs, d, includeTried) {
   var out = [], seen = {}, i, j;
   for (i = 0; i < lgs.length; i++) {
-    // ESPDAY - there is nothing to fetch for an ESPN row. Its states are
-    // never 'cold', so this guard changes no behaviour today; it is here
-    // so a future state rename cannot turn this card into a fetch loop
-    // against an endpoint that has no answer for it.
-    if (lgs[i].src === 'espn') continue;
     for (j = 0; j < d.days.length; j++) {
       if (d.days[j] > d.today) continue;
       if (_mypFpCell(lgs[i], d.days[j], d.today).state !== 'cold') continue;
+      // ESPWEEK - two providers, two addresses for the same idea: Yahoo
+      // wants a team and a date, ESPN wants a league and a period. Deduped
+      // separately because one ESPN request answers for a whole league.
+      if (lgs[i].src === 'espn') {
+        var per = _espDayPeriodFor(lgs[i], d.days[j], d.today);
+        if (per == null) continue;
+        var emk = lgs[i].leagueKey + '|' + per;
+        if (seen['e|' + emk]) continue;
+        if (!includeTried && _espDayTried[emk]) continue;
+        seen['e|' + emk] = 1;
+        out.push({ src: 'espn', lg: lgs[i], period: per, ck: emk, mark: emk });
+        continue;
+      }
       var k = lgs[i].myTeamKey + '|' + d.days[j];
       if (seen[k]) continue;
       if (!includeTried && _mypFpTried[k]) continue;   // MYPFPAUTO
       seen[k] = 1;
-      out.push({ teamKey: lgs[i].myTeamKey, date: d.days[j], ck: k });
+      out.push({ src: 'yahoo', teamKey: lgs[i].myTeamKey, date: d.days[j],
+                 ck: k, mark: k });
     }
   }
   return out;
@@ -58069,7 +58209,10 @@ function mypFpLoad(retry) {
   // Marked BEFORE the request, not after. A failure has to count as an ask
   // or the next repaint tries again, and the repaint is what the fetch
   // causes - that is a loop, not a retry.
-  for (var m = 0; m < jobs.length; m++) _mypFpTried[jobs[m].ck] = 1;
+  for (var m = 0; m < jobs.length; m++) {
+    if (jobs[m].src === 'espn') _espDayTried[jobs[m].mark] = 1;   // ESPWEEK
+    else _mypFpTried[jobs[m].mark] = 1;
+  }
   var run = ++_mypFpRun;
   var openedFor = _mypFpKey;
   _mypFpBusy = true;
@@ -58078,7 +58221,10 @@ function mypFpLoad(retry) {
   function lane() {
     if (at >= jobs.length || run !== _mypFpRun) return Promise.resolve();
     var job = jobs[at++];
-    return Promise.resolve(fetchTeamFpForDate(job.teamKey, job.date))
+    var pr = (job.src === 'espn')
+      ? _espDayFetch(job.lg, job.period)                          // ESPWEEK
+      : Promise.resolve(fetchTeamFpForDate(job.teamKey, job.date));
+    return Promise.resolve(pr)
       ['catch'](function () { return null; })
       .then(function () {
         // A lane from a card you have already closed must not redraw the
@@ -58175,7 +58321,7 @@ function _mypFpRender() {
         '<span class="mypfp-lgn">' + _myp2Esc(lgs[i].leagueName) + '</span>' +
         '<span class="mypfp-fmt">' + lgs[i].fmt + '</span>' +
         (lgs[i].src === 'espn'
-          ? '<span class="mypfp-fmt esp">ESPN \u00b7 TODAY</span>' : '') +
+          ? '<span class="mypfp-fmt esp">ESPN</span>' : '') +
         '<span class="mypfp-wk">' + (nDay ? (Math.round(wk * 10) / 10) : '\u2014') + '</span>' +
       '</div>' +
       '<div class="mypfp-grid">' + cells + '</div>' +
@@ -58202,10 +58348,11 @@ function _mypFpRender() {
   var _anyEsp = false;
   for (i = 0; i < lgs.length; i++) if (lgs[i].src === 'espn') _anyEsp = true;
   if (!_mypFpBusy && _anyEsp) {
-    h += '<div class="mypfp-note">A row marked ESPN \u00b7 TODAY carries ESPN\u2019s ' +
-      'own fantasy total for today, which is the only day its roster payload ' +
-      'holds \u2014 the earlier days are dim because ESPN did not send them, not ' +
-      'because nobody asked. Unmarked rows are Yahoo and cover the week.</div>';
+    h += '<div class="mypfp-note">A row marked ESPN carries ESPN\u2019s own ' +
+      'fantasy total. Today comes free with the roster it already synced; ' +
+      'each earlier day is one request for the whole league, which this card ' +
+      'makes for you and then keeps. A day ESPN serves nothing for stays dim ' +
+      'rather than reading as a night off. Unmarked rows are Yahoo.</div>';
   }
   if (!_mypFpBusy) {
     h += '<div class="mypfp-note">The number on the right is that league\u2019s ' +
@@ -128000,6 +128147,127 @@ function _fpCovReport(data, job, say) {
     if (lines.length > 60) say('  ... ' + (lines.length - 60) + ' more lines');
   }
   say('  (NHL ids: 1=G 2=A 3=P 14=SOG)');
+}
+
+// == CAN A PAST DAY BE FETCHED, AND IS IT THE RIGHT DAY == ESPWEEK ==
+//
+// Two questions in one tap. It asks each ESPN league for today's scoring
+// period and the two before it, and prints the DATE this app derives for
+// each one next to how many players came back with a daily line. Check a
+// derived date against the day tabs in ESPN's own app and the mapping is
+// either confirmed or dead on the spot - which is the whole reason the
+// sample player's three numbers are printed on one line.
+function skProbeEspnBackfill() {
+  var rows = (typeof extLeagues !== 'undefined' && extLeagues) ? extLeagues : [];
+  var want = [], i;
+  for (i = 0; i < rows.length; i++) {
+    var r = rows[i];
+    if (!r || r.provider !== 'espn') continue;
+    var sp = String(r.sport || '').toLowerCase();
+    if (sp === 'nfl' || sp === 'cfb') continue;         // week-scoped, not daily
+    var cur = (typeof _espScoringPeriod === 'function') ? _espScoringPeriod(r) : null;
+    // A league on period 1 has no yesterday to ask about, and asking is
+    // what wasted the last run of the periods probe.
+    if (cur == null || cur < 2) continue;
+    want.push({ row: r, cur: cur });
+    if (want.length >= 2) break;
+  }
+  if (!want.length) {
+    _skGpProbeShow('No ESPN league is past its first scoring period, so there ' +
+                   'is no earlier day to ask for yet.');
+    return;
+  }
+  if (typeof espFindSaved !== 'function' || typeof espFetchLeague !== 'function' ||
+      typeof espCurrentSeason !== 'function') {
+    _skGpProbeShow('The ESPN fetch helpers are not loaded in this build.');
+    return;
+  }
+  var today = _todayDateString();
+  function dateFor(cur, per) {
+    try {
+      var d = new Date(today + 'T12:00:00');
+      d.setDate(d.getDate() + (per - cur));
+      var W = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+      var M = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug',
+               'Sep', 'Oct', 'Nov', 'Dec'];
+      return W[d.getDay()] + ' ' + M[d.getMonth()] + ' ' + d.getDate();
+    } catch (e) { return '?'; }
+  }
+  var lines = ['-- ESPN DAY BACKFILL - today is ' + today + ' --'];
+  function say(t) { lines.push(t); }
+  _skGpProbeShow('Asking for three days\u2026');
+
+  var at = 0;
+  function step() {
+    if (at >= want.length) { _skGpProbeShow(lines.join('\n')); return; }
+    var job = want[at++];
+    var row = job.row, cur = job.cur;
+    var sv = null;
+    try { sv = espFindSaved(String(row.key || '').slice(4)); } catch (e) { sv = null; }
+    say('');
+    say('-- ' + (row.name || row.key) + '  (' +
+        String(row.sport || '?').toUpperCase() + ') --');
+    say('  current scoring period ' + cur + ' = ' + dateFor(cur, cur) +
+        ', which should be today');
+    if (!sv) { say('  not in the saved league list; cannot refetch.'); step(); return; }
+    var pers = [cur, cur - 1, cur - 2], got = {};
+    var sample = null, pi = 0;
+    function one() {
+      if (pi >= pers.length) {
+        // One player, three days, side by side. This is the line to hold up
+        // against ESPN's own day tabs.
+        if (sample) {
+          var bits = [], z;
+          for (z = 0; z < pers.length; z++) {
+            var dd = got[pers[z]];
+            var v = (dd && dd.byPid[sample.id] != null) ? dd.byPid[sample.id] : null;
+            bits.push('p' + pers[z] + '=' + (v == null ? '-' : v));
+          }
+          say('  sample: ' + sample.name + '   ' + bits.join('  '));
+        }
+        var any = false, z2;
+        for (z2 = 1; z2 < pers.length; z2++) if (got[pers[z2]] && got[pers[z2]].n) any = true;
+        say(any
+          ? '  -> PAST DAYS ARE THERE. The week card can fill itself in.'
+          : '  -> nothing came back for an earlier period. Either no games on ' +
+            'those dates, or this league does not serve a past day.');
+        step();
+        return;
+      }
+      var per = pers[pi++];
+      espCurrentSeason(sv.game).then(function (season) {
+        return espFetchLeague(sv.game, sv.id, season,
+          '?view=mRoster&scoringPeriodId=' + per);
+      }).then(function (j) {
+        var served = (j && j.scoringPeriodId != null) ? Number(j.scoringPeriodId) : null;
+        var parsed = _espDayParse(j, per);
+        got[per] = parsed;
+        say('  period ' + per + ' (' + dateFor(cur, per) + ')  served=' +
+            (served == null ? '?' : served) +
+            (served != null && served !== per ? '  <-- MISMATCH, DISCARDED' : '') +
+            '  ' + (parsed ? (parsed.n + ' of ' + parsed.players +
+                              ' players with a daily line') : 'discarded'));
+        if (!sample && parsed && parsed.n) {
+          var teams = (j && j.teams) || [], t, k;
+          for (t = 0; t < teams.length && !sample; t++) {
+            var ents = ((teams[t] || {}).roster || {}).entries || [];
+            for (k = 0; k < ents.length; k++) {
+              var pl = (((ents[k] || {}).playerPoolEntry) || {}).player || {};
+              if (pl.id != null && parsed.byPid[String(pl.id)] != null) {
+                sample = { id: String(pl.id), name: pl.fullName || ('#' + pl.id) };
+                break;
+              }
+            }
+          }
+        }
+      }, function (e2) {
+        say('  period ' + per + ' (' + dateFor(cur, per) + ')  fetch failed: ' +
+            ((e2 && e2.message) ? e2.message : String(e2)));
+      }).then(one, one);
+    }
+    one();
+  }
+  step();
 }
 
 function skProbeYahooCoverage() {
