@@ -637,7 +637,73 @@
   }
   .ed-btn[disabled] { opacity: 0.35; }
   .ed-scroll { flex: 1 1 auto; overflow-y: auto; -webkit-overflow-scrolling: touch;
+    /* EDTURN - a leaf hinged at an edge sweeps past it. Without this the
+       sweep is a horizontal scrollbar instead of a page turning. */
+    overflow-x: hidden;
     padding: 12px 10px calc(28px + env(safe-area-inset-bottom, 0px)); }
+
+  /* ── EDTURN ── the leaf ── */
+  #edPaper { position: relative; }
+  /* The vanishing point sits ON the hinge. With it in the middle of the
+     screen - the obvious default - a page hinged at the left edge races
+     off past the vanishing point and is edge-on by a third of the way
+     through, so two thirds of the turn happens off-screen. */
+  .ed-turning { perspective: 2400px; }
+  .ed-turning.hinge-l { perspective-origin: 0% 30%; }
+  .ed-turning.hinge-r { perspective-origin: 100% 30%; }
+  .ed-leaf {
+    position: absolute; left: 0; top: 0; width: 100%;
+    transform-style: preserve-3d; pointer-events: none; z-index: 6;
+    will-change: transform;
+  }
+  .ed-leaf.fwd  { transform-origin: left center; }
+  .ed-leaf.back { transform-origin: right center; }
+  .ed-leaf.go   { transition: transform 520ms cubic-bezier(0.36, 0.05, 0.28, 1); }
+  /* Not 180. Measured: hinged at the left edge of a phone, the leaf is
+     409px wide at 20 degrees, 303 at 50, 86 at 80, and entirely off the
+     left of the screen by 110. Everything past that is duration spent on
+     something nobody can see. */
+  .ed-leaf.fwd.go  { transform: rotateY(-115deg); }
+  .ed-leaf.back.go { transform: rotateY(115deg); }
+  .ed-leaf-f, .ed-leaf-b {
+    position: absolute; left: 0; top: 0; width: 100%; height: 100%;
+    overflow: hidden;
+    backface-visibility: hidden; -webkit-backface-visibility: hidden;
+  }
+  /* The reverse of the sheet: paper, and the shadow of the type on the
+     other side of it. A blank white rectangle is what gives a CSS flip
+     away as a CSS flip. */
+  .ed-leaf-b {
+    transform: rotateY(180deg); background: #e9e0cc;
+    box-shadow: inset 0 0 40px rgba(90, 74, 48, 0.16);
+  }
+  /* The crease. It deepens across the turn, which is the whole difference
+     between a page turning and a rectangle rotating. */
+  .ed-leaf-f::after, .ed-leaf-b::after {
+    content: ''; position: absolute; left: 0; top: 0; right: 0; bottom: 0;
+    opacity: 0; transition: opacity 520ms linear; pointer-events: none;
+  }
+  .ed-leaf.fwd .ed-leaf-f::after {
+    background: linear-gradient(to right,
+      rgba(40, 28, 10, 0.34) 0%, rgba(40, 28, 10, 0.06) 38%,
+      rgba(40, 28, 10, 0) 70%);
+  }
+  .ed-leaf.back .ed-leaf-f::after {
+    background: linear-gradient(to left,
+      rgba(40, 28, 10, 0.34) 0%, rgba(40, 28, 10, 0.06) 38%,
+      rgba(40, 28, 10, 0) 70%);
+  }
+  .ed-leaf.go .ed-leaf-f::after { opacity: 1; }
+  /* And the page underneath is in the turning page's shade until it clears. */
+  .ed-shade {
+    position: absolute; left: 0; top: 0; width: 100%; z-index: 5;
+    background: rgba(40, 28, 10, 0.20); opacity: 1;
+    transition: opacity 520ms linear; pointer-events: none;
+  }
+  .ed-shade.go { opacity: 0; }
+  @media (prefers-reduced-motion: reduce) {
+    .ed-leaf.go, .ed-shade, .ed-leaf-f::after { transition: none; }
+  }
 
   .ed-paper {
     --ed-base: 13px;
@@ -38723,7 +38789,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = '2026-10-10 EDFAN2';
+var SK_BUILD = '2026-10-10 EDFDAY';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -41057,7 +41123,7 @@ function _edFrontPage(d, ed) {
   // EDFANTASY - a pointer to the desk, with the only number that matters
   // on it. Silent on a day nothing of yours played.
   var fz = null;
-  try { fz = _edFantasyData(); } catch (eF) { fz = null; }
+  try { fz = _edFantasyData(_edIsoOf(d)); } catch (eF) { fz = null; }
   if (fz && fz.players) {
     h += '<div class="ed-teaser" onclick="edPage(2)" role="button" tabindex="0">' +
       '<span class="ed-teaser-k">From the Fantasy Desk</span>' +
@@ -41085,7 +41151,13 @@ function _edRender() {
   else if (_ED_PAGE === 2) inner = _edFantasyPage(d);
   else if (_ED_PAGE === 3) inner = _edGroundsPage(d, ed);
   else inner = _edFrontPage(d, ed);
-  host.innerHTML = '<div class="ed-paper" id="edSheet">' + inner + '</div>';
+  var wrap = document.getElementById('edSheetWrap');
+  if (!wrap) {
+    wrap = document.createElement('div');
+    wrap.id = 'edSheetWrap';
+    host.appendChild(wrap);
+  }
+  wrap.innerHTML = '<div class="ed-paper" id="edSheet">' + inner + '</div>';
 
   // Type, after the DOM exists and can be measured.
   _edFit(document.getElementById('edMast'), 20, 46, 1);
@@ -41184,12 +41256,18 @@ function edClose() {
 // edition leaves you on the day you were reading.
 function edStep(delta) {
   if (delta > 0 && typeof isToday === 'function' && isToday()) return;
+  // EDTURN - a different day is a different sheet, so it turns too.
+  // Forward in time turns forward. changeDate refetches, and whatever it
+  // brings back lands on the sheet under the leaf, which is exactly where
+  // a reader cannot see it arrive.
+  var t = _ED_TURNING ? null : _edTurnTake(delta > 0 ? 'fwd' : 'back');
   if (typeof changeDate === 'function') {
     try { changeDate(delta); } catch (e) {}
   }
   var sc = document.getElementById('edScroll');
   if (sc) sc.scrollTop = 0;
   _edRender();
+  _edTurnRun(t);
 }
 
 // Whenever the board redraws, so does the paper - that is how a date
@@ -41537,9 +41615,44 @@ function _edBoxPage(d) {
 var _ED_FDSPORT = { nhl: 'Hockey', nba: 'Basketball', mlb: 'Baseball',
                     nfl: 'Football', cfb: 'College Football' };
 
-function _edFantasyData() {
+// The day's bucket out of the player-spark store, or null. One read, not
+// one per player: at forty leagues this is called a few hundred times.
+function _edSparkDay(iso) {
+  if (!iso || typeof SK_PSPARK_PREFIX === 'undefined') return null;
+  try {
+    var o = JSON.parse(localStorage.getItem(SK_PSPARK_PREFIX + iso) || 'null');
+    return (o && typeof o === 'object') ? o : null;
+  } catch (e) { return null; }
+}
+
+// PSPARKG's three answers, kept distinct: a number he scored, 'ng' for a
+// night his club did not play, null for nothing recorded.
+function _edSparkFp(bucket, name, leagueKey) {
+  if (!bucket || typeof _skSparkKey !== 'function') return null;
+  var sk = _skSparkKey(name, leagueKey);
+  if (!sk) return null;
+  var cell = (typeof _skSparkCell === 'function')
+    ? _skSparkCell(bucket[sk]) : { fp: null, ng: false };
+  return cell;
+}
+
+function _edIsoOf(d) {
+  try {
+    return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') +
+      '-' + String(d.getDate()).padStart(2, '0');
+  } catch (e) { return ''; }
+}
+
+var _ED_WEEKSPORT = { nfl: 1, cfb: 1 };
+
+function _edFantasyData(iso) {
   var out = { total: 0, players: 0, leagues: [], sports: [], top: [],
-              nLg: 0, nCold: 0, nCat: 0 };
+              nLg: 0, nCold: 0, nCat: 0, nWeek: 0, past: false, date: '' };
+  var today = (typeof _todayDateString === 'function') ? _todayDateString() : '';
+  var past = !!(iso && today && iso < today);
+  out.past = past;
+  out.date = iso || today;
+  var spark = past ? _edSparkDay(iso) : null;
   var scan = [];
   try { scan = (typeof _allInScan === 'function') ? _allInScan() : []; }
   catch (e) { return out; }
@@ -41549,12 +41662,15 @@ function _edFantasyData() {
     if (!sc.hits || !sc.hits.length) continue;
     var coll = [];
     try { coll = _allInCollect(sc.hits, sc.sport) || []; } catch (e2) { coll = []; }
+    var spk = String(sc.sport || '').toLowerCase();
+    var isWeek = !!_ED_WEEKSPORT[spk];
     for (j = 0; j < coll.length; j++) {
       var pl = coll[j];
-      if (pl.total == null) continue;
-      out.total += pl.total;
-      out.players++;
-      all.push(pl);
+      // On today's card the headline is _allInCollect's own active total.
+      // On a past one there is no such figure to inherit, so it is built
+      // from the rows that could be scored for that date.
+      if (!past && pl.total == null) continue;
+      var pTot = null;
       for (k = 0; k < (pl.rows || []).length; k++) {
         var r = pl.rows[k] || {};
         var key = r.lgKey || r.leagueKey;
@@ -41564,14 +41680,29 @@ function _edFantasyData() {
           e3 = byLg[key] = { key: key, name: r.leagueName || String(key),
                              team: '', prov: r.provider || '',
                              sport: String(sc.sport || ''),
-                             pts: 0, n: 0, nPts: 0, nCats: 0 };
+                             pts: 0, n: 0, nPts: 0, nCats: 0, week: 0 };
         }
         // FHUBTEAM - whichever builder answered first. All three carry it.
         if (!e3.team && r.teamName) e3.team = r.teamName;
         e3.n++;
         if (r.isCats) { e3.nCats++; continue; }
-        var fp = Number(r.fp);
-        if (r.fp == null || isNaN(fp)) continue;
+        var fp = null, benchOk = true;
+        if (!past) {
+          var fnum = Number(r.fp);
+          if (r.fp != null && !isNaN(fnum)) fp = fnum;
+        } else if (isWeek) {
+          // EDFDAY - football is scored by week on both Yahoo and ESPN, so
+          // the live figure IS the right figure for any day inside that
+          // week. It is marked, because it is the week's and not the day's.
+          var wnum = Number(r.fp);
+          if (r.fp != null && !isNaN(wnum)) { fp = wnum; e3.week = 1; }
+        } else if (r.provider === 'yahoo') {
+          // The only per-day bank on the device. It holds every rostered
+          // man who played, so the lineup cannot be honoured for that day.
+          var cell = _edSparkFp(spark, pl.name, key);
+          if (cell && cell.fp != null) { fp = cell.fp; benchOk = false; }
+        }
+        if (fp == null) continue;
         // A figure was FILED, which is what separates a nought from a
         // dash - counted before the bench is taken out, so a league whose
         // men tonight are all on the bench reads 0 rather than "nothing
@@ -41580,9 +41711,20 @@ function _edFantasyData() {
         // EDFAN2 - but only the SAME men the headline counts. _allInCollect
         // totals active rows only; summing the bench here is what made the
         // league lines overshoot the figure at the top of the page.
-        if (typeof _fhubRowBenched === 'function' &&
+        if (benchOk && typeof _fhubRowBenched === 'function' &&
             _fhubRowBenched(r) === true) continue;
         e3.pts += fp;
+        if (past) pTot = (pTot == null ? 0 : pTot) + fp;
+      }
+      if (!past) {
+        out.total += pl.total;
+        out.players++;
+        all.push(pl);
+      } else if (pTot != null) {
+        out.total += pTot;
+        out.players++;
+        all.push({ name: pl.name, teamAbbr: pl.teamAbbr, total: pTot,
+                   rows: pl.rows });
       }
     }
   }
@@ -41592,9 +41734,10 @@ function _edFantasyData() {
     var L = byLg[k];
     L.pts = Math.round(L.pts * 10) / 10;
     // EDFAN2 - three states, not two. A figure of nought is a figure.
-    L.state = L.nPts ? 'pts' : (L.nCats ? 'cat' : 'cold');
+    L.state = L.nPts ? (L.week ? 'week' : 'pts') : (L.nCats ? 'cat' : 'cold');
     if (L.state === 'cat') out.nCat++;
     if (L.state === 'cold') out.nCold++;
+    if (L.state === 'week') out.nWeek++;
     out.leagues.push(L);
     var sp = L.sport || '?';
     if (!bySp[sp]) {
@@ -41603,12 +41746,17 @@ function _edFantasyData() {
       spOrder.push(sp);
     }
     bySp[sp].leagues.push(L);
-    if (L.state === 'pts') { bySp[sp].pts += L.pts; bySp[sp].nPts++; }
+    if (L.state === 'pts' || L.state === 'week') {
+      bySp[sp].pts += L.pts; bySp[sp].nPts++;
+    }
   }
   function byPts(a, b) {
     // A league with a figure outranks one without, whatever the figure.
-    var ra = (a.state === 'pts') ? 0 : (a.state === 'cat' ? 1 : 2);
-    var rb = (b.state === 'pts') ? 0 : (b.state === 'cat' ? 1 : 2);
+    function rk(x) {
+      return (x.state === 'pts' || x.state === 'week') ? 0
+        : (x.state === 'cat' ? 1 : 2);
+    }
+    var ra = rk(a), rb = rk(b);
     return (ra - rb) || (b.pts - a.pts) ||
       String(a.name).localeCompare(String(b.name));
   }
@@ -41631,10 +41779,13 @@ function _edFantasyData() {
 var _ED_PROVNAME = { yahoo: 'Yahoo', espn: 'ESPN', sleeper: 'Sleeper', fantrax: 'Fantrax' };
 
 function _edFantasyPage(d) {
-  var f = _edFantasyData();
+  var f = _edFantasyData(_edIsoOf(d));
+  var past2 = !!f.past;
   var h = _edFolio(d, 2) +
     '<div class="ed-pagehead">The Fantasy Desk</div>' +
-    '<div class="ed-pagesub">Your clubs, across every platform you keep</div>';
+    '<div class="ed-pagesub">' + (f.past
+      ? 'Your clubs, as the day was banked'
+      : 'Your clubs, across every platform you keep') + '</div>';
   if (!f.players) {
     return h + '<div class="ed-empty">No rostered player of yours has taken the ' +
       'field today.</div>';
@@ -41657,8 +41808,10 @@ function _edFantasyPage(d) {
     for (var i = 0; i < S.leagues.length; i++) {
       var L = S.leagues[i];
       var cell = (L.state === 'pts') ? String(L.pts)
-        : ((L.state === 'cat') ? 'cat.' : '\u2014');
-      h += '<tr' + (L.state === 'pts' ? '' : ' class="ed-fd-q"') + '><td>' +
+        : ((L.state === 'week') ? (L.pts + ' wk')
+        : ((L.state === 'cat') ? 'cat.' : '\u2014'));
+      h += '<tr' + ((L.state === 'pts' || L.state === 'week')
+        ? '' : ' class="ed-fd-q"') + '><td>' +
         _edEsc(L.name) +
         (L.team ? (' <span class="ed-fd-tm">(' + _edEsc(L.team) + ')</span>') : '') +
         '</td>' +
@@ -41687,17 +41840,32 @@ function _edFantasyPage(d) {
       (where.length ? ('<div class="ed-ag-lead">' + _edEsc(where.join('; ')) + '</div>') : '');
   }
   h += '</div></div>';
-  var note = 'Totals are the sum of every team that holds the player, so a ' +
-    'man on two of your rosters counts on both, and only men in the lineup ' +
-    'are counted. A nought is a nought: it means they played and scored ' +
-    'nothing.';
+  var note = past2
+    ? ('Totals are the sum of every team that holds the player, so a man on ' +
+       'two of your rosters counts on both. A past edition is read out of ' +
+       'the day bank this app keeps for Yahoo, which records what each man ' +
+       'scored but not how your lineup stood that day, so every rostered ' +
+       'man who played is counted.')
+    : ('Totals are the sum of every team that holds the player, so a man on ' +
+       'two of your rosters counts on both, and only men in the lineup are ' +
+       'counted. A nought is a nought: it means they played and scored ' +
+       'nothing.');
+  if (f.nWeek) {
+    note += ' ' + f.nWeek + ' football league' +
+      (f.nWeek === 1 ? ' marked wk is scored by week, not by day, so that figure is'
+                     : 's marked wk are scored by week, not by day, so those figures are') +
+      ' the whole week to date.';
+  }
   if (f.nCat) {
     note += ' ' + f.nCat + ' league' + (f.nCat === 1 ? ' is' : 's are') +
       ' marked cat., scored on categories rather than points.';
   }
   if (f.nCold) {
     note += ' ' + f.nCold + ' league' + (f.nCold === 1 ? ' filed' : 's filed') +
-      ' no figure at all; open the league once to sync it.';
+      ' no figure' + (past2
+        ? ' for this date: only Yahoo is banked day by day, and only for ' +
+          'the past fortnight.'
+        : ' at all; open the league once to sync it.');
   }
   h += '<div class="ed-box-note">' + _edEsc(note) + '</div>';
   return h;
@@ -41718,11 +41886,90 @@ function _edGroundsPage(d, ed) {
   return h;
 }
 
+var _ED_TURNING = 0;
+var _ED_TURN_MS = 520;
+
+function _edReduced() {
+  try {
+    return !!(window.matchMedia &&
+      window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  } catch (e) { return false; }
+}
+
+// Everything the turn needs about the page being left, taken BEFORE the
+// render that replaces it.
+function _edTurnTake(dir) {
+  if (_edReduced()) return null;
+  var host = document.getElementById('edPaper');
+  var sheet = document.getElementById('edSheet');
+  var sc = document.getElementById('edScroll');
+  if (!host || !sheet || !sc) return null;
+  var r = sheet.getBoundingClientRect();
+  // Only what the reader can see of it. See the note above the CSS.
+  var h = Math.round(Math.min(r.height, sc.clientHeight || r.height));
+  if (h < 40) return null;
+  var leaf = document.createElement('div');
+  leaf.className = 'ed-leaf ' + dir;
+  leaf.style.height = h + 'px';
+  var f = document.createElement('div');
+  f.className = 'ed-leaf-f';
+  // The snapshot is scrolled to wherever the reader was, so the leaf shows
+  // the part of the page they were actually looking at.
+  var inner = document.createElement('div');
+  inner.style.marginTop = (-Math.round(Math.max(0, sc.scrollTop))) + 'px';
+  inner.innerHTML = sheet.outerHTML;
+  f.appendChild(inner);
+  var bk = document.createElement('div');
+  bk.className = 'ed-leaf-b';
+  leaf.appendChild(f);
+  leaf.appendChild(bk);
+  var shade = document.createElement('div');
+  shade.className = 'ed-shade';
+  // The leaf is cropped to the window; its shadow is not. Cropping both
+  // left a bright band under the turning page where the shade stopped.
+  shade.style.height = (h + 80) + 'px';
+  return { host: host, leaf: leaf, shade: shade,
+           hinge: (dir === 'fwd') ? 'hinge-l' : 'hinge-r' };
+}
+
+function _edTurnRun(t) {
+  if (!t) return;
+  _ED_TURNING = 1;
+  t.host.classList.add('ed-turning');
+  t.host.classList.add(t.hinge);
+  t.host.appendChild(t.shade);
+  t.host.appendChild(t.leaf);
+  // Two frames, not one: the first commits the starting transform, the
+  // second starts the transition. With one, Chrome on Android coalesces
+  // them and the page arrives already turned.
+  requestAnimationFrame(function () {
+    requestAnimationFrame(function () {
+      t.leaf.classList.add('go');
+      t.shade.classList.add('go');
+    });
+  });
+  setTimeout(function () {
+    try { t.host.removeChild(t.leaf); } catch (e) {}
+    try { t.host.removeChild(t.shade); } catch (e2) {}
+    t.host.classList.remove('ed-turning');
+    t.host.classList.remove(t.hinge);
+    _ED_TURNING = 0;
+  }, _ED_TURN_MS + 60);
+}
+
 function edPage(n) {
-  _ED_PAGE = Math.max(0, Math.min(_ED_PAGES.length - 1, n | 0));
+  var to = Math.max(0, Math.min(_ED_PAGES.length - 1, n | 0));
+  // A tap on the section already open is not a turn.
+  if (to === _ED_PAGE && !_ED_TURNING) return;
+  // A tap landing DURING a turn still has to change the page - it just
+  // does not get a turn of its own, or the first leaf is stranded over a
+  // page it was never a picture of.
+  var t = _ED_TURNING ? null : _edTurnTake(to > _ED_PAGE ? 'fwd' : 'back');
+  _ED_PAGE = to;
   var sc = document.getElementById('edScroll');
   if (sc) sc.scrollTop = 0;
   _edRender();
+  _edTurnRun(t);
 }
 
 function _edTabs() {
