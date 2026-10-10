@@ -1010,8 +1010,17 @@
     font-family: Georgia, serif; font-style: italic; font-size: 11.5px;
     color: var(--ed-ink-soft); margin-top: 3px;
   }
-  .ed-fd-t { margin-top: 10px; font-size: 9.5px; }
-  .ed-fd-t td:first-child { max-width: 0; }
+  .ed-fd-t { margin-top: 7px; font-size: 9.5px; }
+  /* EDFAN2 - the club's name rides with the league's, so the cell wraps
+     rather than truncating. The identifying half is at the END. */
+  .ed-fd-t td:first-child { max-width: none; white-space: normal;
+    overflow: visible; text-overflow: clip; padding-right: 6px;
+    line-height: 1.25; }
+  .ed-fd-t thead th { padding-top: 2px; }
+  .ed-fd-tm { font-family: Georgia, serif; font-style: italic;
+    color: var(--ed-ink-soft); }
+  .ed-fd-t tr.ed-fd-q td { color: var(--ed-ink-soft); }
+  .ed-fd-t tr + tr td { padding-top: 1px; }
   .ed-fd-p { font-family: 'Barlow Condensed', sans-serif; letter-spacing: 0.06em;
     color: var(--ed-ink-soft); }
   .ed-setting {
@@ -38714,7 +38723,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = '2026-10-10 EDRICH';
+var SK_BUILD = '2026-10-10 EDFAN2';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var isActive = activeLeague === key;
@@ -41525,8 +41534,12 @@ function _edBoxPage(d) {
 // Yahoo's rows carry leagueKey, the ext providers' carry lgKey - so both
 // are read. A league counted under two different keys would appear
 // twice with half its points in each.
+var _ED_FDSPORT = { nhl: 'Hockey', nba: 'Basketball', mlb: 'Baseball',
+                    nfl: 'Football', cfb: 'College Football' };
+
 function _edFantasyData() {
-  var out = { total: 0, players: 0, leagues: [], top: [], nLg: 0 };
+  var out = { total: 0, players: 0, leagues: [], sports: [], top: [],
+              nLg: 0, nCold: 0, nCat: 0 };
   var scan = [];
   try { scan = (typeof _allInScan === 'function') ? _allInScan() : []; }
   catch (e) { return out; }
@@ -41549,22 +41562,64 @@ function _edFantasyData() {
         var e3 = byLg[key];
         if (!e3) {
           e3 = byLg[key] = { key: key, name: r.leagueName || String(key),
-                             prov: r.provider || '', pts: 0, n: 0, best: null };
+                             team: '', prov: r.provider || '',
+                             sport: String(sc.sport || ''),
+                             pts: 0, n: 0, nPts: 0, nCats: 0 };
         }
+        // FHUBTEAM - whichever builder answered first. All three carry it.
+        if (!e3.team && r.teamName) e3.team = r.teamName;
         e3.n++;
+        if (r.isCats) { e3.nCats++; continue; }
         var fp = Number(r.fp);
         if (r.fp == null || isNaN(fp)) continue;
+        // A figure was FILED, which is what separates a nought from a
+        // dash - counted before the bench is taken out, so a league whose
+        // men tonight are all on the bench reads 0 rather than "nothing
+        // filed". It scored nothing; that is not the same as unknown.
+        e3.nPts++;
+        // EDFAN2 - but only the SAME men the headline counts. _allInCollect
+        // totals active rows only; summing the bench here is what made the
+        // league lines overshoot the figure at the top of the page.
+        if (typeof _fhubRowBenched === 'function' &&
+            _fhubRowBenched(r) === true) continue;
         e3.pts += fp;
-        if (!e3.best || fp > e3.best.fp) e3.best = { name: pl.name, fp: fp };
       }
     }
   }
+  var bySp = {}, spOrder = [];
   for (k in byLg) {
     if (!byLg.hasOwnProperty(k)) continue;
-    byLg[k].pts = Math.round(byLg[k].pts * 10) / 10;
-    out.leagues.push(byLg[k]);
+    var L = byLg[k];
+    L.pts = Math.round(L.pts * 10) / 10;
+    // EDFAN2 - three states, not two. A figure of nought is a figure.
+    L.state = L.nPts ? 'pts' : (L.nCats ? 'cat' : 'cold');
+    if (L.state === 'cat') out.nCat++;
+    if (L.state === 'cold') out.nCold++;
+    out.leagues.push(L);
+    var sp = L.sport || '?';
+    if (!bySp[sp]) {
+      bySp[sp] = { sport: sp, name: _ED_FDSPORT[sp] || String(sp).toUpperCase(),
+                   leagues: [], pts: 0, nPts: 0 };
+      spOrder.push(sp);
+    }
+    bySp[sp].leagues.push(L);
+    if (L.state === 'pts') { bySp[sp].pts += L.pts; bySp[sp].nPts++; }
   }
-  out.leagues.sort(function (a, b) { return (b.pts - a.pts) ||
+  function byPts(a, b) {
+    // A league with a figure outranks one without, whatever the figure.
+    var ra = (a.state === 'pts') ? 0 : (a.state === 'cat' ? 1 : 2);
+    var rb = (b.state === 'pts') ? 0 : (b.state === 'cat' ? 1 : 2);
+    return (ra - rb) || (b.pts - a.pts) ||
+      String(a.name).localeCompare(String(b.name));
+  }
+  out.leagues.sort(byPts);
+  for (i = 0; i < spOrder.length; i++) {
+    var S = bySp[spOrder[i]];
+    S.pts = Math.round(S.pts * 10) / 10;
+    S.leagues.sort(byPts);
+    out.sports.push(S);
+  }
+  out.sports.sort(function (a, b) { return (b.pts - a.pts) ||
     String(a.name).localeCompare(String(b.name)); });
   out.nLg = out.leagues.length;
   out.total = Math.round(out.total * 10) / 10;
@@ -41590,15 +41645,27 @@ function _edFantasyPage(d) {
        (f.players === 1 ? '' : 's') + ' across ' + f.nLg + ' league' +
        (f.nLg === 1 ? '' : 's') + '</div></div>';
 
-  if (f.leagues.length) {
-    h += '<table class="ed-bt ed-fd-t"><caption>By League</caption><thead><tr>' +
-      '<th>League</th><th>Platform</th><th>Plyrs</th><th>Pts</th></tr></thead><tbody>';
-    for (var i = 0; i < f.leagues.length; i++) {
-      var L = f.leagues[i];
-      h += '<tr><td>' + _edEsc(L.name) + '</td>' +
-        '<td class="ed-fd-p">' + _edEsc(_ED_PROVNAME[L.prov] || L.prov || '-') + '</td>' +
+  for (var s = 0; s < f.sports.length; s++) {
+    var S = f.sports[s];
+    // EDFAN2 - a rule between one sport and the next, the way the box
+    // scores page separates them, carrying what the sport came to.
+    h += '<div class="ed-sportrule">' + _edEsc(S.name) +
+      '<span class="ed-ag-n">' + (S.nPts ? S.pts : '\u2014') + '</span></div>' +
+      '<table class="ed-bt ed-fd-t"><thead><tr>' +
+      '<th>League</th><th>Platform</th><th>Plyrs</th><th>Pts</th>' +
+      '</tr></thead><tbody>';
+    for (var i = 0; i < S.leagues.length; i++) {
+      var L = S.leagues[i];
+      var cell = (L.state === 'pts') ? String(L.pts)
+        : ((L.state === 'cat') ? 'cat.' : '\u2014');
+      h += '<tr' + (L.state === 'pts' ? '' : ' class="ed-fd-q"') + '><td>' +
+        _edEsc(L.name) +
+        (L.team ? (' <span class="ed-fd-tm">(' + _edEsc(L.team) + ')</span>') : '') +
+        '</td>' +
+        '<td class="ed-fd-p">' + _edEsc(_ED_PROVNAME[L.prov] || L.prov || '-') +
+        '</td>' +
         '<td>' + L.n + '</td>' +
-        '<td>' + (L.pts ? L.pts : '-') + '</td></tr>';
+        '<td>' + cell + '</td></tr>';
     }
     h += '</tbody></table>';
   }
@@ -41620,9 +41687,19 @@ function _edFantasyPage(d) {
       (where.length ? ('<div class="ed-ag-lead">' + _edEsc(where.join('; ')) + '</div>') : '');
   }
   h += '</div></div>';
-  h += '<div class="ed-box-note">Totals are the sum of every team that holds ' +
-       'the player, so a man on two of your rosters counts on both. Category ' +
-       'leagues score no points and contribute none.</div>';
+  var note = 'Totals are the sum of every team that holds the player, so a ' +
+    'man on two of your rosters counts on both, and only men in the lineup ' +
+    'are counted. A nought is a nought: it means they played and scored ' +
+    'nothing.';
+  if (f.nCat) {
+    note += ' ' + f.nCat + ' league' + (f.nCat === 1 ? ' is' : 's are') +
+      ' marked cat., scored on categories rather than points.';
+  }
+  if (f.nCold) {
+    note += ' ' + f.nCold + ' league' + (f.nCold === 1 ? ' filed' : 's filed') +
+      ' no figure at all; open the league once to sync it.';
+  }
+  h += '<div class="ed-box-note">' + _edEsc(note) + '</div>';
   return h;
 }
 
