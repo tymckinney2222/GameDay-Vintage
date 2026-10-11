@@ -36244,7 +36244,27 @@ function vibrant(hex, minLightness = 0.48) {
   const rh = Math.round(rr*255).toString(16).padStart(2,'0');
   const gh = Math.round(gg*255).toString(16).padStart(2,'0');
   const bh = Math.round(bb*255).toString(16).padStart(2,'0');
-  return `#${rh}${gh}${bh}`;
+  var _v = `#${rh}${gh}${bh}`;
+
+  // ---- VIBCONTRAST ----
+  // The lightness boost above is this function's whole reason for existing --
+  // "boost lightness for dark colors" -- and it measures the wrong thing.
+  // HSL lightness says nothing about how bright a colour LOOKS: blue carries
+  // about seven percent of perceived luminance against green's seventy-two,
+  // so a navy lifted to lightness 0.48 still only reaches about 2.6:1 on a
+  // dark arena and stays unreadable. Every warm colour cleared the same bar
+  // honestly, which is why this only ever showed on the blues.
+  //
+  // One fix here covers the lot. The tale of the tape was patched on its own
+  // earlier tonight and that was treating a symptom: the scoring summary,
+  // the three stars, the skater panels and everything else that takes an
+  // accent were all still dark, because they all come through this function.
+  //
+  // The floor is a little below the one used for small figures, so fills and
+  // rules are not forced as pale as text -- the tape still lifts its own
+  // numerals the rest of the way.
+  if (typeof _stAccentFloor === 'function') _v = _stAccentFloor(_v);
+  return _v;
 }
 
 // The poll ranking ESPN hangs on a scoreboard competitor. ── ESPRANK ──
@@ -66762,8 +66782,14 @@ function renderFieldStadium() {
   }
 
   var divStyle = '1px solid rgba(255,255,255,0.07)';
+  // vibrant already applies the floor; the fallbacks do not, so both go
+  // through it. ACCFLOOR
   var homeAccent = vibrant(game.home.color) || ac;
   var awayAccent = vibrant(game.away.color) || theme.alt;
+  if (typeof _stAccentFloor === 'function') {
+    homeAccent = _stAccentFloor(homeAccent);
+    awayAccent = _stAccentFloor(awayAccent);
+  }
   _stashScoreColors(game.id, awayAccent, homeAccent);
 
   var isLive = game.state === 'in';
@@ -69654,12 +69680,26 @@ function renderRinkStadium() {
       var r1=parseInt(ha.slice(0,2),16),g1=parseInt(ha.slice(2,4),16),b1=parseInt(ha.slice(4,6),16);
       var r2=parseInt(pa.slice(0,2),16),g2=parseInt(pa.slice(2,4),16),b2=parseInt(pa.slice(4,6),16);
       if (Math.sqrt((r1-r2)*(r1-r2)+(g1-g2)*(g1-g2)+(b1-b2)*(b1-b2)) < 100 && awayTheme && awayTheme.alt) {
-        return awayTheme.alt;
+        // ACCFLOOR -- only if the alt is a colour that can be made to read.
+        var _altOk = true;
+        if (typeof _stHsl === 'function') {
+          var _ac = _stHsl(awayTheme.alt);
+          _altOk = !!(_ac && _ac.chroma >= 0.04);
+        }
+        if (_altOk) return awayTheme.alt;
       }
     }
     return primary;
   })();
+  // ACCFLOOR -- the arena theme hands out a fixed hex per club and several
+  // of those are navies that measure under 3:1 on this background. Every
+  // panel below takes these two colours, so the floor is applied once here
+  // rather than at twenty call sites.
   var homeAccent = theme.accent;
+  if (typeof _stAccentFloor === 'function') {
+    awayAccent = _stAccentFloor(awayAccent);
+    homeAccent = _stAccentFloor(homeAccent);
+  }
   _stashScoreColors(game.id, awayAccent, homeAccent);
   // Readable variants for score/boxscore TEXT on the near-black background —
   // lighten a too-dark team accent while preserving hue. Used only for the big
@@ -72168,6 +72208,10 @@ function renderGymStadium() {
     return primary;
   })();
   var homeAccent = theme.accent;
+  if (typeof _stAccentFloor === 'function') {   // ACCFLOOR
+    awayThemeColor = _stAccentFloor(awayThemeColor);
+    homeAccent = _stAccentFloor(homeAccent);
+  }
   _stashScoreColors(game.id, awayThemeColor, homeAccent);
   // Readable variants for score/boxscore TEXT on the near-black background.
   // A near-black team accent (e.g. Nets navy) is unreadable at any font size;
@@ -83108,6 +83152,38 @@ function _stHex(h, sat, l) {
   }
   return '#' + hx(rr) + hx(gg) + hx(bb);
 }
+
+// ---- the contrast floor, as one routine -- ACCFLOOR -------------------
+// vibrant() applies this to the colours it derives, but the stadiums prefer
+// a HARD-CODED arena-theme accent and only fall back to vibrant, so the
+// themed teams never went through it. That is why the scoring summary was
+// still dark after vibrant was fixed: Nashville's panel accent never came
+// from vibrant at all.
+//
+// Hue and saturation are held, lightness is walked up until the colour
+// clears the floor on a dark arena. A colour that already clears it is
+// returned untouched, so a bright accent is never bleached.
+function _stLift(hex, want) {
+  if (!hex) return hex;
+  if (typeof _luminance !== 'function' || typeof _stHsl !== 'function' ||
+      typeof _stHex !== 'function') return hex;
+  var bg = 0.02, c = _stHsl(hex);
+  // No chroma: there is no hue to preserve and lifting only yields grey, so
+  // the callers that know what to do about that are left to do it.
+  if (!c || c.chroma < 0.04) return hex;
+  var out = hex, l = c.l, sat = Math.max(c.s, 0.55), guard = 0;
+  while (guard < 40 && l < 0.92 &&
+         ((_luminance(out) + 0.05) / (bg + 0.05)) < want) {
+    l += 0.02; guard++;
+    out = _stHex(c.h, sat, l);
+  }
+  return out;
+}
+
+// The floor for an accent used as panel furniture: text, rules and fills
+// alike. Small figures get lifted further by _stTextAccent where they are
+// drawn; this is the baseline nothing in a stadium should fall below.
+function _stAccentFloor(hex) { return _stLift(hex, 3.4); }
 
 function _stTextAccent(hex) {
   if (!hex) return '#ffffff';
