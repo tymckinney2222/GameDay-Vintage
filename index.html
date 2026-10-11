@@ -36157,6 +36157,96 @@ function _usableAccent(hex) {
   return lum > 0.04 && lum < 0.95;
 }
 
+// ---- the colour a club is actually wearing on screen -- LOGOCOL ------
+// The last turn's reading of this was wrong. ESPN's volleyball scoreboard
+// does carry team colours -- Dayton came through red and Saint Louis blue
+// on the same screen where UNLV and Grand Canyon did not. The league is not
+// uncoloured; those two clubs are. A club whose feed colour is missing, or
+// is the near-black or near-white that _usableAccent refuses, falls to one
+// shared slate, and any two such clubs in the same match come out identical.
+//
+// The right colour was on the page the whole time: the logo. UNLV's mark is
+// red and Grand Canyon's is purple, drawn an inch from the digits that were
+// both blue. So the logo is read for it.
+//
+// This is a canvas read of an image from another origin, which only works
+// if that origin allows it. If it does not, the read throws, the club keeps
+// the slate, and nothing else changes -- so it costs nothing to try.
+var _lcAsked = {};
+
+// The dominant colour of a mark, which is not its average. Averaging a logo
+// gives mud: a red wordmark on white averages to pink. Pixels are binned by
+// hue and the heaviest bin wins, so a mark that is mostly white with a red
+// device still reads as red.
+function _lcDominant(img) {
+  var N = 40;
+  var cv = document.createElement('canvas');
+  cv.width = N; cv.height = N;
+  var ctx = cv.getContext('2d', { willReadFrequently: true });
+  if (!ctx) return null;
+  ctx.drawImage(img, 0, 0, N, N);
+  var px = ctx.getImageData(0, 0, N, N).data;   // throws if the canvas tainted
+  var bins = {}, i, r, g, b, a, mx, mn, chroma, h, key, w, best = null, bw = 0;
+  for (i = 0; i < px.length; i += 4) {
+    a = px[i + 3];
+    if (a < 150) continue;
+    r = px[i]; g = px[i + 1]; b = px[i + 2];
+    mx = Math.max(r, g, b); mn = Math.min(r, g, b);
+    chroma = mx - mn;
+    // White, black and the greys in between say nothing about identity.
+    if (chroma < 34) continue;
+    if (mx < 28) continue;
+    h = 0;
+    if (mx === r) h = ((g - b) / chroma) % 6;
+    else if (mx === g) h = (b - r) / chroma + 2;
+    else h = (r - g) / chroma + 4;
+    h *= 60; if (h < 0) h += 360;
+    key = String(Math.floor(h / 24));          // 15 bins of 24 degrees
+    if (!bins[key]) bins[key] = { n: 0, w: 0, r: 0, g: 0, b: 0 };
+    // Weight by how colourful the pixel is, so a near-grey on the edge of
+    // the threshold does not out-vote the solid middle of the mark.
+    w = chroma / 255;
+    bins[key].n++; bins[key].w += w;
+    bins[key].r += r * w; bins[key].g += g * w; bins[key].b += b * w;
+  }
+  for (key in bins) {
+    if (!Object.prototype.hasOwnProperty.call(bins, key)) continue;
+    if (bins[key].w > bw) { bw = bins[key].w; best = bins[key]; }
+  }
+  // A handful of stray pixels is noise, not a colour.
+  if (!best || best.n < 12) return null;
+  function hx(v) {
+    v = Math.max(0, Math.min(255, Math.round(v / best.w)));
+    return (v < 16 ? '0' : '') + v.toString(16);
+  }
+  var out = '#' + hx(best.r) + hx(best.g) + hx(best.b);
+  return _usableAccent(out) ? out : null;
+}
+
+function _lcAsk(league, abbr, url) {
+  if (!league || !abbr || !url) return;
+  var k = league + '|' + String(abbr).toUpperCase();
+  if (_lcAsked[k]) return;
+  _lcAsked[k] = 1;
+  var img = new Image();
+  img.crossOrigin = 'anonymous';
+  img.onload = function () {
+    var hex = null;
+    try { hex = _lcDominant(img); } catch (e) { hex = null; }
+    if (!hex) return;
+    var all = _tcAll();
+    // at:0 so _tcFetch still treats the league as unfetched -- a few logos
+    // read here must not stand in for the whole team list.
+    if (!all[league]) all[league] = { at: 0, t: {} };
+    if (!all[league].t) all[league].t = {};
+    all[league].t[String(abbr).toUpperCase()] = hex;
+    try { localStorage.setItem(_TC_KEY, JSON.stringify(all)); } catch (e2) {}
+    _tcRepaint(league);
+  };
+  img.onerror = function () {};
+  img.src = url;
+}
+
 // ---- a team's colour when its own scoreboard does not carry one -------
 // VBCOLOR. getTeamColor's last resort is a single slate, #4a5568, handed to
 // EVERY team the feed leaves uncoloured. Women's college volleyball is the
@@ -36196,7 +36286,7 @@ function _tcFetch(league) {
   if (have && have.at && (Date.now() - have.at) < _TC_TTL) { _tcAsked[league] = 1; return; }
   _tcAsked[league] = 1;
   var url = 'https://site.api.espn.com/apis/site/v2/sports/' + cfg.sport + '/' +
-    cfg.slug + '/teams?limit=900';
+    cfg.slug + '/teams?limit=200';
   fetch(url).then(function (r) { return r.ok ? r.json() : null; }).then(function (d) {
     var rows = (d && d.sports && d.sports[0] && d.sports[0].leagues &&
       d.sports[0].leagues[0] && d.sports[0].leagues[0].teams) || [];
@@ -36271,11 +36361,17 @@ function getTeamColor(team, league) {
   if (_usableAccent(team && team.color)) return '#' + String(team.color).replace('#', '');
   // Primary unusable - try ESPN's alternate before giving up on the team.
   if (_usableAccent(team && team.alternateColor)) return '#' + String(team.alternateColor).replace('#', '');
-  // VBCOLOR -- before the one-size-fits-all slate, ask the league's own team
-  // list, and set that list loading if this is the first time we have needed
-  // it. The slate stands only for this render; _tcRepaint corrects it.
+  // VBCOLOR / LOGOCOL -- before the one-size-fits-all slate, ask what has
+  // already been worked out for this club, and if nothing has, set both
+  // sources going: its own logo, and the league's team list. The slate
+  // stands only for this render; _tcRepaint corrects it.
   var _tcHit = (typeof _tcGet === 'function') ? _tcGet(league, _ab) : null;
   if (_tcHit) return _tcHit;
+  if (typeof _lcAsk === 'function') {
+    var _lgo = (team && (team.logo ||
+      (team.logos && team.logos[0] && team.logos[0].href))) || '';
+    if (_lgo) _lcAsk(league, _ab, _lgo);
+  }
   if (typeof _tcFetch === 'function') _tcFetch(league);
   return '#4a5568';
 }
@@ -65967,6 +66063,121 @@ function _f3Pin(p, col) {
 }
 
 // ---- the whole graphic ------------------------------------------------
+// ---- the scoreboard over the end of the field -- SBOARD ---------------
+// A high school board of the kind every small-college and Friday-night
+// ground has: a marquee cap, the two sides with the clock boxed between
+// them, the down-and-distance row under it, and timeouts in the corners.
+// It carries the same numbers the panels below the field do -- nothing on
+// it is invented, and a figure the feed does not publish shows as dashes
+// rather than a plausible-looking zero.
+var _SB_X = 70, _SB_W = 60, _SB_Y = 29, _SB_H = 29;
+
+function _sbTxt(x, y, t, size, fill, weight, space) {
+  return '<text x="' + _f3n(x) + '" y="' + _f3n(y) + '" text-anchor="middle"' +
+    ' font-family="Barlow Condensed,sans-serif" font-size="' + size + '"' +
+    ' font-weight="' + (weight || 800) + '" fill="' + fill + '"' +
+    (space ? ' letter-spacing="' + space + '"' : '') + '>' + _tpEsc(t) + '</text>';
+}
+
+function _sbTol(x, y, n, dir) {
+  // dir: +1 draws rightward from x, -1 leftward.
+  var s = '', i, cx;
+  for (i = 0; i < 3; i++) {
+    cx = x + dir * (1.2 + i * 2.6);
+    s += '<circle cx="' + _f3n(cx) + '" cy="' + _f3n(y) + '" r="0.9" fill="' +
+      ((n != null && i < n) ? '#ffb02e' : 'none') + '" stroke="#6b82c0"' +
+      ' stroke-width="0.32"/>';
+  }
+  return s;
+}
+
+function _f3Scoreboard(o) {
+  var X = _SB_X, W = _SB_W, Y = _SB_Y, H = _SB_H;
+  var AMBER = '#ffb02e', LABEL = '#93a9e0', CAPTXT = '#e8eeff';
+  var live = !!o.isLive, over = !!o.isFinal;
+  if (!live && !over) return '';
+
+  // A figure the feed does not publish shows as dashes. Nothing on this
+  // board is inferred -- a plausible-looking 0 under DOWN would be a lie,
+  // and the TOL dots went through exactly that argument once already.
+  function num(v) {
+    return (v == null || v === '' || (typeof v === 'number' && isNaN(v))) ?
+      '--' : String(v);
+  }
+
+  var capH = 5.2, bodyY = Y + capH, rowTop = bodyY + 0.6;
+  var lowTop = Y + 17.8, tolY = Y + H - 1.2;
+  var s = '<g>';
+
+  // two legs, dropping away behind the field
+  s += '<rect x="' + _f3n(X + 13) + '" y="' + _f3n(Y + H - 1) + '" width="1.6"' +
+    ' height="14" fill="#1b2434"/>';
+  s += '<rect x="' + _f3n(X + W - 14.6) + '" y="' + _f3n(Y + H - 1) + '" width="1.6"' +
+    ' height="14" fill="#1b2434"/>';
+
+  // marquee cap, then the body
+  s += '<rect x="' + _f3n(X - 1.5) + '" y="' + _f3n(Y) + '" width="' + _f3n(W + 3) +
+    '" height="' + _f3n(capH + 0.6) + '" rx="0.8" fill="#0b1a44" stroke="#39559e"' +
+    ' stroke-width="0.4"/>';
+  s += '<rect x="' + _f3n(X) + '" y="' + _f3n(bodyY) + '" width="' + W +
+    '" height="' + _f3n(H - capH) + '" rx="0.8" fill="#102457" stroke="#39559e"' +
+    ' stroke-width="0.5"/>';
+  s += _sbTxt(X + W / 2, Y + 3.9, String(o.boardName || 'STADIUM').toUpperCase(),
+    3.9, CAPTXT, 800, '0.28');
+
+  // ---- the two sides, with the clock boxed between them ----------------
+  var aCx = X + 11.5, hCx = X + W - 11.5;
+  s += _sbTxt(aCx, rowTop + 2.8, String(o.awayAbbr || 'AWAY').toUpperCase(), 3,
+    LABEL, 800, '0.16');
+  s += _sbTxt(hCx, rowTop + 2.8, String(o.homeAbbr || 'HOME').toUpperCase(), 3,
+    LABEL, 800, '0.16');
+  s += _sbTxt(aCx, rowTop + 10.4, num(o.awayScore), 8, AMBER, 800, '0.06');
+  s += _sbTxt(hCx, rowTop + 10.4, num(o.homeScore), 8, AMBER, 800, '0.06');
+
+  // the clock, in its own lit box the way these boards do it
+  var cw = 20, cx0 = X + W / 2 - cw / 2, cy0 = rowTop + 1.6;
+  s += '<rect x="' + _f3n(cx0) + '" y="' + _f3n(cy0) + '" width="' + cw +
+    '" height="9.2" rx="0.6" fill="#0a1a44" stroke="#3ddc84" stroke-width="0.45"/>';
+  s += _sbTxt(X + W / 2, cy0 + 6.8, over ? 'FINAL' : (o.clock || '--:--'),
+    over ? 5 : 6.2, over ? '#ff7070' : AMBER, 800, '0.08');
+
+  // possession: a lamp arrow beside the side with the ball, as on the board
+  // in the photograph
+  if (live && (o.possTeam === 'away' || o.possTeam === 'home')) {
+    var aw = (o.possTeam === 'away');
+    var tip = aw ? (cx0 - 1.2) : (cx0 + cw + 1.2);
+    var back = aw ? (cx0 - 4.2) : (cx0 + cw + 4.2);
+    s += '<polygon points="' + _f3n(tip) + ',' + _f3n(cy0 + 4.6) + ' ' +
+      _f3n(back) + ',' + _f3n(cy0 + 3) + ' ' + _f3n(back) + ',' +
+      _f3n(cy0 + 6.2) + '" fill="#ffd27a"/>';
+  }
+
+  // ---- down, distance, spot, quarter -----------------------------------
+  s += '<line x1="' + _f3n(X + 1) + '" y1="' + _f3n(lowTop - 1) + '" x2="' +
+    _f3n(X + W - 1) + '" y2="' + _f3n(lowTop - 1) +
+    '" stroke="#2b4a8e" stroke-width="0.35"/>';
+  var qtr = o.period ? (o.period > 4 ? 'OT' : String(o.period)) : null;
+  var cells = [['DOWN', num(o.down || null)], ['TO GO', num(o.distance || null)],
+    ['BALL ON', num(o.ballOn)], ['QTR', num(qtr)]];
+  var cw4 = (W - 2) / 4, ci, ccx;
+  for (ci = 0; ci < cells.length; ci++) {
+    ccx = X + 1 + cw4 * (ci + 0.5);
+    s += _sbTxt(ccx, lowTop + 2.4, cells[ci][0], 2.4, LABEL, 700, '0.24');
+    s += _sbTxt(ccx, lowTop + 7.8, cells[ci][1], 5.6, AMBER, 800, '0.04');
+  }
+
+  // ---- timeouts, in the corners, as every one of these boards has them --
+  s += '<line x1="' + _f3n(X + 1) + '" y1="' + _f3n(tolY - 3.4) + '" x2="' +
+    _f3n(X + W - 1) + '" y2="' + _f3n(tolY - 3.4) +
+    '" stroke="#2b4a8e" stroke-width="0.35"/>';
+  s += _sbTxt(X + 5, tolY, 'T.O.L.', 2.2, LABEL, 700, '0.14');
+  s += _sbTol(X + 9.4, tolY - 0.7, o.awayTol, 1);
+  s += _sbTxt(X + W - 5, tolY, 'T.O.L.', 2.2, LABEL, 700, '0.14');
+  s += _sbTol(X + W - 9.4, tolY - 0.7, o.homeTol, -1);
+
+  return s + '</g>';
+}
+
 // ---- night game -- FLOODS --------------------------------------------
 // Four standards behind the far sideline and the pools they lay on the
 // grass. It comes in two pieces because the two halves sit on opposite
@@ -65999,7 +66210,7 @@ function _f3LightDefs() {
     '</linearGradient>' +
     '<linearGradient id="f3sky" x1="0" y1="0" x2="0" y2="1">' +
     '<stop offset="0" stop-color="#05080f" stop-opacity="0"/>' +
-    '<stop offset="0.35" stop-color="#0a1322" stop-opacity="0.85"/>' +
+    '<stop offset="0.62" stop-color="#0a1322" stop-opacity="0.85"/>' +
     '<stop offset="1" stop-color="#0a1322" stop-opacity="0.85"/>' +
     '</linearGradient>' +
     '</defs>';
@@ -66010,7 +66221,7 @@ function _f3LightDefs() {
 // below the far sideline so the turf covers it and the tower reads as
 // standing behind the bowl rather than on it.
 function _f3Tower(bx, baseY) {
-  var POLE = 13, BW = 13, BH = 3.8;
+  var POLE = 18, BW = 13, BH = 3.8;
   var ty = baseY - POLE;
   var s = '<g>';
   s += '<ellipse cx="' + _f3n(bx) + '" cy="' + _f3n(ty + BH / 2) +
@@ -66051,15 +66262,18 @@ function _f3LightTowers() {
   // Out past the far sideline on both sides. Real standards sit outside the
   // bowl, and a row that stops short of the end zones reads as a row of
   // screens hung over midfield rather than as a lit stadium.
+  //
+  // SBOARD -- and pushed away from the centre, because the scoreboard now
+  // stands between the inner pair. The four are placed by hand rather than
+  // evenly: evenly spaced, the inner two sat behind the board.
   var x0 = fl[0] - 28, x1 = fr[0] + 28, span = x1 - x0;
+  var AT = [0.05, 0.26, 0.74, 0.95];
   var s = _f3LightDefs();
   // Full height, not just down to the far sideline. Stopping it there left a
   // tonal step running off both sides of the frame where the backdrop ended
   // and the page began; the turf hides the middle of it either way.
-  s += '<rect x="0" y="54" width="200" height="46" fill="url(#f3sky)"/>';
-  for (var i = 0; i < _F3_TOWERS; i++) {
-    s += _f3Tower(x0 + span * ((i + 0.5) / _F3_TOWERS), baseY);
-  }
+  s += '<rect x="0" y="26" width="200" height="74" fill="url(#f3sky)"/>';
+  for (var i = 0; i < AT.length; i++) s += _f3Tower(x0 + span * AT[i], baseY);
   return s;
 }
 
@@ -66089,15 +66303,18 @@ function _fwField3D(o) {
   var isCollege = (lg.indexOf('NCAA') === 0 || lg === 'CFB');
   var hashOff = isCollege ? 20 : 23.58;
 
-  // The drawing lives between y=46 (far sideline) and y=97 (under the slab),
-  // and the tallest arc -- a kickoff -- tops out near y=50. A 0..112 box was
-  // therefore two fifths empty sky, which shrank the field on the page for
-  // nothing. The viewBox crops to what is used.
-  var s = '<svg viewBox="0 54 200 46" style="width:100%;height:auto;display:block"' +
+  // The drawing lives between y=70 (far sideline) and y=95 (under the slab).
+  // The box used to crop at y=54, just above the tallest arc, because
+  // everything above that was empty sky. SBOARD put a scoreboard and four
+  // light standards up there, so the top opens to y=26 to hold them. The
+  // field itself does not move or change size: the element is simply taller.
+  var s = '<svg viewBox="0 26 200 74" style="width:100%;height:auto;display:block"' +
     ' preserveAspectRatio="xMidYMid meet">';
 
   // FLOODS -- first of all, because everything else stands in front of them.
   s += _f3LightTowers();
+  // SBOARD -- between the inner pair of standards.
+  s += _f3Scoreboard(o);
 
   // The slab edge under the near sideline, which is what sells the depth.
   var nl = _f3Proj(0, _F3_WID), nr = _f3Proj(_F3_LEN, _F3_WID);
@@ -67209,7 +67426,18 @@ function renderFieldStadium() {
       down: down, distance: distance, league: game.league, isLive: isLive,
       playStart: _f3i.playStart, playEnd: _f3i.playEnd, playKind: _f3i.playKind,
       playColor: _f3i.playColor, returnEnd: _f3i.returnEnd,
-      returnColor: _f3i.returnColor
+      returnColor: _f3i.returnColor,
+      // SBOARD -- the board overhead. BALL ON is the yard-line MARKER, which
+      // counts in from whichever end zone is nearer and so never passes 50,
+      // not the 0-100 absolute spot the graphic is drawn from.
+      isFinal: isFinal,
+      awayScore: (game.state !== 'pre') ? game.away.score : null,
+      homeScore: (game.state !== 'pre') ? game.home.score : null,
+      clock: clock, period: period,
+      ballOn: (ballAbs == null || isNaN(ballAbs)) ? null :
+        Math.round(ballAbs > 50 ? (100 - ballAbs) : ballAbs),
+      awayTol: awayTimeouts, homeTol: homeTimeouts,
+      boardName: (theme.nickname || theme.name || game.venue || '')
     });
     html += '</div>';
   }
@@ -136458,6 +136686,11 @@ function skProbeTeamColors() {
   say('');
   flush();
 
+  // LOGOCOL -- the first run of this probe came back "Failed to fetch" on
+  // every league, including two the app reads happily elsewhere. That is a
+  // network-level refusal, not a missing field, so the probe now runs a
+  // control request first to tell "this endpoint is blocked" apart from
+  // "this endpoint has no colours", and tries the logo route as well.
   var leagues = ['NCAAWVB', 'NCAAMB', 'NCAAFB'];
   var open = (typeof courtGame !== 'undefined' && courtGame && courtGame.league) ?
     String(courtGame.league) : null;
@@ -136503,7 +136736,62 @@ function skProbeTeamColors() {
     });
   }
 
-  var chain = Promise.resolve();
+  // Control: the scoreboard, which the app reads all day. If this fails too
+  // then nothing is reaching ESPN and the teams result means nothing.
+  function control() {
+    var u = 'https://site.api.espn.com/apis/site/v2/sports/volleyball/' +
+      'womens-college-volleyball/scoreboard';
+    return fetch(u).then(function (r) {
+      say('== control: the scoreboard endpoint ==');
+      say('  HTTP ' + r.status + ' -- requests ARE reaching ESPN.');
+      say('');
+    })['catch'](function (e) {
+      say('== control: the scoreboard endpoint ==');
+      say('  failed too: ' + (e && e.message ? e.message : e));
+      say('  -> nothing is reaching ESPN from here; ignore the rest.');
+      say('');
+    });
+  }
+
+  // Can a logo be read pixel by pixel? That is the other way to get a
+  // club's colour, and it needs the image host to allow a canvas read.
+  function logoTest() {
+    var url = '';
+    try {
+      var g = (typeof courtGame !== 'undefined' && courtGame) || null;
+      if (g && g.away && g.away.logo) url = g.away.logo;
+      if (!url && typeof allGames === 'object') {
+        var ks = Object.keys(allGames || {});
+        for (var i = 0; i < ks.length && !url; i++) {
+          var arr = allGames[ks[i]] || [];
+          for (var j = 0; j < arr.length && !url; j++) {
+            if (arr[j] && arr[j].home && arr[j].home.logo) url = arr[j].home.logo;
+          }
+        }
+      }
+    } catch (e) {}
+    say('== reading the colour straight off a logo ==');
+    if (!url) { say('  no logo to try -- open a game first.'); say(''); return Promise.resolve(); }
+    say('  ' + url.slice(0, 78));
+    return new Promise(function (res) {
+      var img = new Image();
+      img.crossOrigin = 'anonymous';
+      var done = false;
+      function finish(msg) { if (done) return; done = true; say('  ' + msg); say(''); res(); }
+      setTimeout(function () { finish('timed out waiting for the image.'); }, 6000);
+      img.onerror = function () { finish('the image would not load with a cross-origin request.'); };
+      img.onload = function () {
+        var hex = null, err = '';
+        try { hex = _lcDominant(img); } catch (e) { err = (e && e.message) || String(e); }
+        if (err) finish('the canvas is tainted -- the host does not allow a pixel read. (' + err + ')');
+        else if (!hex) finish('read fine, but the mark had no colour in it worth using.');
+        else finish('READ IT: ' + hex + '  -> the logo route works.');
+      };
+      img.src = url;
+    });
+  }
+
+  var chain = control().then(flush).then(logoTest).then(flush);
   leagues.forEach(function (lg) {
     chain = chain.then(function () { return one(lg); }).then(flush);
   });
