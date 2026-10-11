@@ -41862,11 +41862,21 @@ function _fbParse(j, lg) {
         if (!c) continue;
         var k = _fbKeyOf(ath[a]);
         if (!k) continue;
+        // FBFIX -- the folded name rides along with the figures. _fbKeyOf
+        // prefers the ESPN id, and an id is only any use if the other side
+        // of the join has one too; the name is the key both sides always
+        // have. Carried as a field rather than a second map so it cannot
+        // drift away from the counters it belongs to.
+        var _nm = (ath[a].athlete || {}).displayName ||
+                  (ath[a].athlete || {}).shortName || '';
+        var _nk = _nm ? ('n' + ((typeof _pmNameKey === 'function')
+          ? _pmNameKey(_nm) : String(_nm).toLowerCase())) : '';
         // A footballer files under passing AND rushing AND receiving, so
         // the groups merge rather than replace one another.
         if (!out[k]) out[k] = {};
         var p;
         for (p in c) { if (c.hasOwnProperty(p)) out[k][p] = c[p]; }
+        if (_nk) out[k]._nk = _nk;   // FBFIX
       }
     }
   }
@@ -41900,21 +41910,23 @@ function _fbScan(gid, lg, now, emit) {
     var mbase = gid + '|' + k + '|';
     if (lg === 'NHL') {
       var dg = (c.g || 0) - (prev.g || 0);
-      if (dg > 0) out.push({ k: k, what: (dg > 1 ? dg + ' goals' : 'Goal'), big: true });
+      if (dg > 0) out.push({ k: k, nk: c._nk, what: (dg > 1 ? dg + ' goals' : 'Goal'), big: true });
       var da = (c.a || 0) - (prev.a || 0);
-      if (da > 0) out.push({ k: k, what: (da > 1 ? da + ' assists' : 'Assist'), big: false });
+      if (da > 0) out.push({ k: k, nk: c._nk, what: (da > 1 ? da + ' assists' : 'Assist'), big: false });
     } else if (lg === 'NFL') {
       var tds = [['tdPass', 'Passing touchdown'], ['tdRush', 'Rushing touchdown'],
                  ['tdRec', 'Receiving touchdown']], z;
       for (z = 0; z < tds.length; z++) {
         var d = (c[tds[z][0]] || 0) - (prev[tds[z][0]] || 0);
         if (d > 0) {
-          out.push({ k: k, what: (d > 1 ? d + ' ' + tds[z][1].toLowerCase() + 's'
-                                        : tds[z][1]), big: true });
+          out.push({ k: k, nk: c._nk,
+                     what: (d > 1 ? d + ' ' + tds[z][1].toLowerCase() + 's'
+                                  : tds[z][1]), big: true });
         }
       }
       var df = (c.fg || 0) - (prev.fg || 0);
-      if (df > 0) out.push({ k: k, what: (df > 1 ? df + ' field goals' : 'Field goal'),
+      if (df > 0) out.push({ k: k, nk: c._nk,
+                             what: (df > 1 ? df + ' field goals' : 'Field goal'),
                              big: false });
     } else if (lg === 'NBA') {
       var st;
@@ -41927,14 +41939,15 @@ function _fbScan(gid, lg, now, emit) {
           // Only the highest step crossed. A poll that catches a man going
           // from eight points to twenty-one should say twenty, not fire
           // ten and twenty one after the other.
-          out.push({ k: k, what: tier + ' ' + _FB_MILEWORD[st], big: (tier >= 30) });
+          out.push({ k: k, nk: c._nk, what: tier + ' ' + _FB_MILEWORD[st],
+                     big: (tier >= 30) });
         }
       }
       var nd = _fbDbl(c), hadD = _fbMile[mbase + 'dbl'] || 0;
       if (nd > hadD) {
         mk[mbase + 'dbl'] = nd;
-        if (nd === 2) out.push({ k: k, what: 'Double-double', big: true });
-        else if (nd >= 3) out.push({ k: k, what: 'Triple-double', big: true });
+        if (nd === 2) out.push({ k: k, nk: c._nk, what: 'Double-double', big: true });
+        else if (nd >= 3) out.push({ k: k, nk: c._nk, what: 'Triple-double', big: true });
       }
     }
   }
@@ -42160,8 +42173,14 @@ function _fbTick(force) {
           if (G.game && G.game.state === 'post') _fbDone[G.id] = 1;
           var z;
           for (z = 0; z < evs.length; z++) {
-            var man = G.men[evs[z].k];
-            if (!man) continue;    // not one of yours
+            // FBFIX -- id first, then the folded name. This is the join
+            // that was silently failing: _fbKeyOf returns 'i<espnId>' for
+            // every ESPN box score, and the watch list only ever held
+            // 'n<name>' keys because the roster collector never passed an
+            // espnId through. Every event looked like somebody else's
+            // player and was dropped, so the feature has never once fired.
+            var man = G.men[evs[z].k] || (evs[z].nk ? G.men[evs[z].nk] : null);
+            if (!man) continue;    // genuinely not one of yours
             _fbPush({ who: man.name, pos: man.pos || man.team || '',
                       what: evs[z].what, big: !!evs[z].big,
                       game: _fbGameLine(G.game), at: _fbClock() });
@@ -87710,6 +87729,9 @@ function _allInCollect(hits, sport) {
     var opp = (g && g[side === 'home' ? 'away' : 'home']) || {};
     out.push({
       key: h.key, name: h.name, pos: h.pos, teamAbbr: h.teamAbbr,
+      // FBFIX -- the hit has carried an ESPN id all along and this dropped
+      // it on the floor, which is half of why the player alerts never fired.
+      espnId: h.espnId || null,
       teamLogo: mine.logo || '',
       accent: _allInAccent(mine),
       // ALLIN - which game he is in. The stadium hubs never set this because
