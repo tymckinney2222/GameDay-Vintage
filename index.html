@@ -51868,6 +51868,157 @@ function renderMLBMatchup(data, game) {
 // Everything below reuses _vbSets(), so the set-completion and decider-cap
 // rules live in exactly one place and the modal ladder and this page can
 // never disagree about who won a set. VBLADDER
+// ---------------------------------------------------------------
+// POLLRATE -- how often the panels actually ask ESPN.
+//
+// All five stadium panels opened with the same four lines: pull once,
+// then setInterval at a fixed cadence for as long as the panel is open.
+// Three things were wrong with that, and each one cost real requests:
+//
+//   1. the guard was (state === 'in' || state === 'pre'), so a game
+//      tipping in three hours was polled at the LIVE rate to learn
+//      nothing. Pre-game now backs off to _POLL_PRE_MS.
+//   2. nothing stopped when a game went final. syncScoreboardGame
+//      flips game.state to 'post', but no clearInterval ever fired on
+//      that transition -- leave the gym open through the buzzer and it
+//      polled a finished game every five seconds until the tab died.
+//      Now one last pull lands the closing box score and the timer stops.
+//   3. nothing stopped when the page was hidden. Lock the phone with the
+//      gym open and it kept going. Every poller now suspends on
+//      visibilitychange and catches up on the way back.
+//
+// The cadence is a GATE rather than the timer period: the interval keeps
+// running at the live rate and each tick decides whether enough time has
+// passed to be worth a request. A timer firing is free; the fetch is not.
+// Holding the period fixed buys two things. Every existing clearInterval
+// call scattered through the close, box-score and mode-switch paths keeps
+// working untouched -- there are thirteen of them and none needed to
+// change. And a pre-game that tips while the panel is open speeds up on
+// the very next tick, instead of waiting out a stale sixty-second timer.
+// ---------------------------------------------------------------
+var _POLL_PRE_MS = 60000;   // a game that has not started yet
+var _POLL = {};             // key -> entry, below
+
+// The freshest state anyone knows for a game.
+//
+// Only three of the five panels update game.state themselves -- field,
+// rink and gym, by way of syncScoreboardGame. Court and Fenway never
+// have, so on their own they could never tell that a match had ended.
+// Rather than teach two more payload shapes (Fenway alone reads MLB's
+// statsapi, MiLB and ESPN college) this reads the scoreboard sweep,
+// which already refreshes every league once a minute and carries the
+// state of every game on the card.
+//
+// 'post' is believed from either source; 'in' is believed from either
+// and beats a 'pre' from the other, because the sweep can be a minute
+// stale and under-polling a live game is the one mistake worth avoiding.
+function _pollState(g) {
+  if (!g) return '';
+  var sw = '', arr, i;
+  try {
+    arr = (typeof allGames === 'object' && allGames) ? allGames[g.league] : null;
+    if (arr && arr.length) {
+      for (i = 0; i < arr.length; i++) {
+        if (arr[i] && String(arr[i].id) === String(g.id)) { sw = arr[i].state || ''; break; }
+      }
+    }
+  } catch (e) {}
+  if (g.state === 'post' || sw === 'post') return 'post';
+  if (g.state === 'in' || sw === 'in') return 'in';
+  return g.state || sw || '';
+}
+
+function _pollArm(key) {
+  var e = _POLL[key];
+  if (!e || e.id) return;
+  e.id = setInterval(function () { _pollTick(key); }, e.ms);
+  if (e.set) e.set(e.id);
+}
+
+function _pollStop(key) {
+  var e = _POLL[key];
+  if (!e) return;
+  if (e.id) clearInterval(e.id);
+  if (e.set) e.set(null);
+  delete _POLL[key];
+}
+
+function _pollTick(key) {
+  var e = _POLL[key];
+  if (!e) return;
+  var g = e.game ? e.game() : null;
+  if (e.game && !g) return;          // the panel is open on nothing
+  var st = g ? _pollState(g) : '';
+  if (st === 'post') {
+    // One last pull, so the closing box score and final line land, and
+    // then stop for good: a finished game never changes again.
+    if (!e.done) { e.done = true; e.last = Date.now(); e.fetch(g); }
+    _pollStop(key);
+    return;
+  }
+  var want = (st === 'pre') ? _POLL_PRE_MS : e.ms;
+  var now = Date.now();
+  // Slack, because eleven ticks of five seconds do not sum to exactly
+  // sixty: without it the gate would skip a beat and run at 65s.
+  if (now - e.last < want - Math.min(e.ms / 2, 1500)) return;
+  e.last = now;
+  e.fetch(g);
+}
+
+// ms      the live cadence, and the timer period
+// getGame reads the panel's current game, or null if nothing is open
+// ovId    the overlay element, so a panel closed while the page was
+//         hidden can be recognised on the way back
+// setFn   writes the timer handle back to the panel's own variable, so
+//         that every clearInterval(xInterval) already in the file still
+//         kills whatever timer is actually running
+function _pollStart(key, ms, getGame, fetchFn, ovId, setFn) {
+  _pollStop(key);
+  _POLL[key] = {
+    ms: ms, game: getGame || null, fetch: fetchFn, ov: ovId || null,
+    set: setFn || null, last: Date.now(), done: false, id: null
+  };
+  _pollArm(key);
+  return _POLL[key] ? _POLL[key].id : null;
+}
+
+function _pollSuspend() {
+  var k, e;
+  for (k in _POLL) {
+    if (!_POLL.hasOwnProperty(k)) continue;
+    e = _POLL[k];
+    if (e.id) { clearInterval(e.id); e.id = null; if (e.set) e.set(null); }
+  }
+}
+
+function _pollResume() {
+  var keys = [], k, e, ov, i;
+  for (k in _POLL) { if (_POLL.hasOwnProperty(k)) keys.push(k); }
+  for (i = 0; i < keys.length; i++) {
+    e = _POLL[keys[i]];
+    if (!e || e.id) continue;
+    // A panel closed while we were away leaves its entry behind: the
+    // close paths clear the timer directly and know nothing about this
+    // registry. An overlay that is no longer open is the honest signal,
+    // and a null game backs it up for the panels that clear one.
+    if (e.ov) {
+      ov = document.getElementById(e.ov);
+      if (!ov || !ov.classList.contains('open') || (e.game && !e.game())) {
+        _pollStop(keys[i]);
+        continue;
+      }
+    }
+    _pollTick(keys[i]);     // catch up -- but only if it is actually due
+    _pollArm(keys[i]);
+  }
+}
+
+try {
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) _pollSuspend(); else _pollResume();
+  });
+} catch (ePV) {}
+
 var courtGame = null;
 var courtData = null;
 var courtInterval = null;
@@ -51899,8 +52050,10 @@ function openCourt(game) {
     '<div class="pm-loading" style="padding:40px;color:rgba(255,255,255,0.3)">Loading scoreboard\u2026</div>';
   fetchCourtData(game);
   clearInterval(courtInterval);
+  _pollStop('court');   // POLLRATE
   if (game.state === 'in' || game.state === 'pre') {
-    courtInterval = setInterval(function () { if (courtGame) fetchCourtData(courtGame); }, 15000);
+    courtInterval = _pollStart('court', 15000, function () { return courtGame; },
+      fetchCourtData, 'courtOverlay', function (id) { courtInterval = id; });   // POLLRATE
   }
 }
 
@@ -52895,6 +53048,188 @@ function _vbWinProb(v) {
 //
 // side: { team, acc, logo, pts, pipsOn, pipsOf, rec, rank }
 // ---------------------------------------------------------------
+// A surname out of whatever form the feed sent -- ONFLOOR.
+// "Victor Wembanyama" and "V. Wembanyama" both come back Wembanyama, and
+// the particle in front of a name like "de Larrea" comes with it rather
+// than being left behind on the bench.
+var _C3_PARTICLE = { de: 1, del: 1, della: 1, di: 1, da: 1, van: 1, von: 1,
+  der: 1, la: 1, le: 1, st: 1, mc: 1, dos: 1, das: 1 };
+
+var _C3_SUFFIX = { jr: 1, sr: 1, ii: 1, iii: 1, iv: 1, v: 1 };
+
+function _c3Last(name) {
+  var parts = String(name || '').replace(/\s+/g, ' ').trim().split(' ');
+  if (parts.length < 2) return parts[0] || '';
+  // A suffix is not a surname. Taking the last token turned Jabari
+  // Smith Jr. into "Jr." on the board.
+  var tail = '';
+  var key = parts[parts.length - 1].toLowerCase().replace(/\./g, '');
+  if (_C3_SUFFIX[key] && parts.length > 2) {
+    tail = ' ' + parts.pop();
+  }
+  var last = parts[parts.length - 1];
+  var prev = parts[parts.length - 2] || '';
+  var pkey = prev.toLowerCase().replace(/\./g, '');
+  // A one-letter initial is never a particle: "V. Wembanyama" keeps only
+  // the surname, while "S. de Larrea" keeps the particle with it.
+  if (pkey.length > 1 && _C3_PARTICLE[pkey]) return prev + ' ' + last + tail;
+  return last + tail;
+}
+
+function _c3Int(v) {
+  var n = parseInt(String(v == null ? '' : v).replace(/[^0-9-]/g, ''), 10);
+  return isNaN(n) ? 0 : n;
+}
+
+// Minutes as a number, from either "28" or "28:14".
+function _c3Min(v) {
+  var t = String(v == null ? '' : v);
+  var m = /^(\d+):(\d\d)/.exec(t);
+  if (m) return Number(m[1]) + Number(m[2]) / 60;
+  return _c3Int(t);
+}
+
+// The five a side the board should name -- ONFLOOR.
+//
+// Three answers, in order of how much they are worth. The exact five on
+// the floor only exists while a game is live AND the substitution replay
+// held together, which _gymOnCourtMap already decides and will not
+// guess at. Failing that the starting five, which is a fact the box
+// score states. Failing THAT -- a feed with no starter flags, which
+// preseason does -- the five who have played most, which is a different
+// claim and is labelled as one rather than passed off as the floor.
+function _c3OnFloor(data, game, isLive) {
+  var blocks = (data && data.boxscore && data.boxscore.players) || [];
+  if (blocks.length < 2 || !game) return null;
+  var map = { byTeam: {}, ok: {} };
+  try {
+    if (typeof _gymOnCourtMap === 'function') {
+      map = _gymOnCourtMap(data, game, !!isLive) || map;
+    }
+  } catch (eM) {}
+
+  var out = { away: null, home: null, mode: 0 };
+  var worst = 0, bi, gi, ai, li;
+  for (bi = 0; bi < blocks.length; bi++) {
+    var blk = blocks[bi] || {};
+    var tid = (blk.team && blk.team.id);
+    if (tid == null) continue;
+    var isHome = String(tid) === String(game.home.id);
+    var list = [], groups = blk.statistics || [];
+    for (gi = 0; gi < groups.length; gi++) {
+      var labels = (groups[gi] && groups[gi].labels) || [];
+      var aths = (groups[gi] && groups[gi].athletes) || [];
+      for (ai = 0; ai < aths.length; ai++) {
+        var a = aths[ai] || {}, ath = a.athlete || {};
+        if (!ath.id) continue;
+        var sm = {}, st = a.stats || [];
+        for (li = 0; li < labels.length; li++) sm[labels[li]] = st[li];
+        list.push({
+          id: String(ath.id),
+          name: _c3Last(ath.displayName || ath.shortName || ''),
+          min: _c3Min(sm.MIN), pts: _c3Int(sm.PTS), reb: _c3Int(sm.REB),
+          ast: _c3Int(sm.AST), starter: !!a.starter
+        });
+      }
+    }
+    if (!list.length) continue;
+
+    var pick = null, mode = 2;
+    var cur = map.byTeam && map.byTeam[tid] && map.byTeam[tid].current;
+    if (map.ok && map.ok[tid] && cur) {
+      var five = [];
+      for (ai = 0; ai < list.length; ai++) if (cur[list[ai].id]) five.push(list[ai]);
+      if (five.length === 5) { pick = five; mode = 0; }
+    }
+    if (!pick) {
+      var starters = [];
+      for (ai = 0; ai < list.length; ai++) if (list[ai].starter) starters.push(list[ai]);
+      if (starters.length === 5) { pick = starters; mode = 1; }
+    }
+    if (!pick) {
+      pick = list.slice().sort(function (p, q) { return q.min - p.min; }).slice(0, 5);
+      mode = 2;
+    }
+    if (mode > worst) worst = mode;
+    if (isHome) out.home = pick; else out.away = pick;
+  }
+  out.mode = worst;
+  if (!out.away || !out.home || out.away.length < 5 || out.home.length < 5) return null;
+  return out;
+}
+
+// A very light wash of a club's colour -- BCTINT.
+//
+// The obvious version is the one to avoid: the team colour at low opacity
+// over the cream. Clubs do not share a lightness. Texas burnt orange at
+// twelve per cent is a clear peach, a silver at twelve per cent is
+// nothing at all, and a gold goes cream on cream -- so the same rule
+// would give one panel a strong tint, one none, and one an invisible
+// smudge. Worse, the tint would then vary the contrast under the ink
+// club by club, and this panel's whole premise is dark text on near
+// white.
+//
+// So only the HUE is taken from the club. Saturation is capped and
+// lightness is fixed, which means every tint is the same strength and
+// every panel measures the same against the text on it.
+var _BC_TINT_L = 0.885;     // every tint lands here
+var _BC_TINT_S = 0.52;      // and no louder than this
+
+function _bcHsl(hex) {
+  var h = String(hex || '').replace('#', '');
+  if (h.length === 3) h = h.charAt(0) + h.charAt(0) + h.charAt(1) + h.charAt(1) +
+    h.charAt(2) + h.charAt(2);
+  if (!/^[0-9a-f]{6}$/i.test(h)) return null;
+  var r = parseInt(h.slice(0, 2), 16) / 255;
+  var g = parseInt(h.slice(2, 4), 16) / 255;
+  var b = parseInt(h.slice(4, 6), 16) / 255;
+  var mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn;
+  var L = (mx + mn) / 2, S = 0, H = 0;
+  if (d) {
+    S = L > 0.5 ? d / (2 - mx - mn) : d / (mx + mn);
+    if (mx === r) H = ((g - b) / d) + (g < b ? 6 : 0);
+    else if (mx === g) H = ((b - r) / d) + 2;
+    else H = ((r - g) / d) + 4;
+    H *= 60;
+  }
+  return { h: H, s: S, l: L };
+}
+
+function _bcHslHex(H, S, L) {
+  function hue(p, q, t) {
+    if (t < 0) t += 1;
+    if (t > 1) t -= 1;
+    if (t < 1 / 6) return p + (q - p) * 6 * t;
+    if (t < 1 / 2) return q;
+    if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
+    return p;
+  }
+  var r, g, b;
+  if (!S) { r = g = b = L; }
+  else {
+    var q = L < 0.5 ? L * (1 + S) : L + S - L * S;
+    var p = 2 * L - q;
+    r = hue(p, q, H / 360 + 1 / 3);
+    g = hue(p, q, H / 360);
+    b = hue(p, q, H / 360 - 1 / 3);
+  }
+  function two(v) {
+    var n = Math.round(Math.max(0, Math.min(1, v)) * 255).toString(16);
+    return n.length < 2 ? '0' + n : n;
+  }
+  return '#' + two(r) + two(g) + two(b);
+}
+
+function _bcTint(hex) {
+  var c = _bcHsl(hex);
+  if (!c) return null;
+  // A club whose colour is a grey has no hue to lend. It still gets a
+  // wash, a cool one, so its half is told apart from the warm cream --
+  // which is the whole job -- rather than left looking unpainted.
+  if (c.s < 0.1) return _bcHslHex(215, 0.1, _BC_TINT_L);
+  return _bcHslHex(c.h, Math.min(c.s, _BC_TINT_S), _BC_TINT_L);
+}
+
 function _bcBuildBar(o) {
   o = o || {};
   var esc = (typeof o.esc === 'function') ? o.esc
@@ -52912,8 +53247,14 @@ function _bcBuildBar(o) {
   function seg(sd, right) {
     var team = sd.team || {};
     var bg = _vbBcHex(team.color, sd.acc);
+    // BCTINT -- the wash is taken from the accent rather than the club's
+    // raw colour, because the accent has already been through the clash
+    // test. Two clubs that both run out in red arrive here as two
+    // different hues, so their halves of the bar do too.
+    var tint = _bcTint(sd.acc);
     return '<div class="vbbc-team' + (right ? ' r' : '') +
-      '" style="border-top-color:' + sd.acc + '">' +
+      '" style="border-top-color:' + sd.acc +
+      (tint ? ';background:' + tint : '') + '">' +
       chip(sd.logo, bg, team.abbr) +
       '<span class="vbbc-id">' +
         '<span class="vbbc-name">' +
@@ -68270,8 +68611,10 @@ function openField(game) {
   fetchFieldData(game);
   // Start live refresh for in-progress games
   clearInterval(fieldInterval);
+  _pollStop('field');   // POLLRATE
   if (game.state === 'in' || game.state === 'pre') {
-    fieldInterval = setInterval(function() { if (fieldGame) fetchFieldData(fieldGame); }, 15000);
+    fieldInterval = _pollStart('field', 15000, function () { return fieldGame; },
+      fetchFieldData, 'fieldOverlay', function (id) { fieldInterval = id; });   // POLLRATE
   }
 }
 
@@ -69826,8 +70169,10 @@ function openRink(game) {
   document.getElementById('rinkBody').innerHTML = '<div class="pm-loading" style="padding:40px;color:rgba(255,255,255,0.3)">Loading scoreboard...</div>';
   fetchRinkData(game);
   clearInterval(rinkInterval);
+  _pollStop('rink');   // POLLRATE
   if (game.state === 'in' || game.state === 'pre') {
-    rinkInterval = setInterval(function() { if (rinkGame) fetchRinkData(rinkGame); }, 5000);
+    rinkInterval = _pollStart('rink', 5000, function () { return rinkGame; },
+      fetchRinkData, 'rinkOverlay', function (id) { rinkInterval = id; });   // POLLRATE
   }
 }
 
@@ -72589,8 +72934,10 @@ function openGym(game) {
   document.getElementById('gymBody').innerHTML = '<div class="pm-loading" style="padding:40px;color:rgba(255,255,255,0.3)">Loading scoreboard...</div>';
   fetchGymData(game);
   clearInterval(gymInterval);
+  _pollStop('gym');   // POLLRATE
   if (game.state === 'in' || game.state === 'pre') {
-    gymInterval = setInterval(function() { if (gymGame) fetchGymData(gymGame); }, 5000);
+    gymInterval = _pollStart('gym', 5000, function () { return gymGame; },
+      fetchGymData, 'gymOverlay', function (id) { gymInterval = id; });   // POLLRATE
   }
 }
 
@@ -76003,20 +76350,39 @@ function gymToggleZones() {
 // ---------------------------------------------------------------
 var _C3_LEN = 94, _C3_WID = 50;
 var _C3_CX = 100;        // screen centre line
-var _C3_SX = 1.96;       // screen units per foot at the near sideline
+var _C3_SX = 2;          // screen units per foot at the near sideline
 var _C3_SHRINK = 0.13;   // how much the far sideline narrows
-var _C3_NEAR_Y = 88;     // screen y of the near sideline
+// The near sideline, which moves DOWN as the court gets deeper so the
+// far one stays where it was -- five units clear of the board hanging
+// above it.
+var _C3_NEAR_Y = 101;
 // How flat the camera is. The football field wanted the width squashed to
 // about a third of the length because a sideline camera sits low. A court
 // is watched from higher up and from closer in -- measured off the shot
 // ESPN draws, the width comes out at roughly 47% of the length -- so this
 // is proportionally larger than the field's.
-var _C3_DEPTH = 40;
+// BIGCOURT -- raised from forty. At forty the floor took a third of a
+// panel whose board took a half, and read as a letterbox under it. The
+// width could not help: at ninety-four feet across a two hundred unit
+// box it was already using all there was. Depth was the axis with room.
+//
+// This also moves the camera up, and the measurement it was set from is
+// not precise enough to argue with: the 0.467 width-to-length ratio came
+// off my own pixel estimates on a screenshot. 0.52 is within that, and
+// three candidates rendered side by side settled it -- at sixty the arcs
+// start closing into circles and the floor reads as a plan rather than a
+// camera.
+var _C3_DEPTH = 52;
+
+// Where the box ends, below the apron -- which is further down than it
+// was, now that the floor runs five feet past each touchline and has
+// chairs standing on it.
+var _C3_BOTTOM = 114;
 // Screen units per foot of HEIGHT. Standing things are drawn far shorter
 // than their true scale on purpose: a ten foot rim at the floor's own scale
 // would be eighteen units tall against forty units of court depth and would
 // read as a goalpost. Broadcast court graphics shrink the baskets too.
-var _C3_UP = 0.95;
+var _C3_UP = 1.08;
 
 function _c3n(v) { return Math.round(v * 100) / 100; }
 
@@ -76433,15 +76799,33 @@ function _c3QLabel(n) {
 // Unlike the backboards, the board's near face genuinely does face this
 // camera -- a centre hung board is built square to the sidelines, and
 // the sideline is where we are standing. So it is drawn square on with
-// no apology, with a sliver of its end panel to give it depth.
+// no apology, with the top of the box showing because the camera for
+// this whole drawing sits above the floor.
 // ---------------------------------------------------------------
-var _C3_RAF_Y = 7;      // the truss the board hangs from
-var _C3_BX = 86;        // the board, wide
-var _C3_BY0 = 14;       // and from here down
-// Thirty, not twenty-eight: at twenty-eight the clock and the period
-// under it shared the same three units of band and ran into each other
-// whenever a game was actually live -- which is the state that matters.
-var _C3_BH = 30;
+var _C3_BX = 124;        // the board, wide
+var _C3_BY1 = 39;        // its underside, clear of the widened floor
+var _C3_BTOP = 28.6;     // the halo, the face and the clock band
+// Derived, not guessed: five rows of 3.9 starting 14.3 below the panel
+// top, plus the descender on the last of them. Picking this number by
+// eye is what put Irving and Sheppard through the bottom edge.
+var _C3_ROW_Y0 = 14.3, _C3_ROW_H = 3.9;
+var _C3_ROSTER_H = _C3_ROW_Y0 + _C3_ROW_H * 4 + 2.8 + 1.5;
+var _C3_HANG = 7;        // cable between the truss and the board
+
+function _c3BoardTop(hasRoster) {
+  return _C3_BY1 - _C3_BTOP - (hasRoster ? _C3_ROSTER_H : 0);
+}
+
+// Text with an anchor of its own -- the scoreboard helper this borrows
+// from only ever centres, and a roster needs its names ranged left and
+// its figures ranged right.
+function _c3Txt(x, y, t, size, fill, weight, anchor, space) {
+  return '<text x="' + _c3n(x) + '" y="' + _c3n(y) + '" text-anchor="' +
+    (anchor || 'middle') + '" font-family="Barlow Condensed,sans-serif"' +
+    ' font-size="' + size + '" font-weight="' + (weight || 800) + '" fill="' +
+    fill + '"' + (space ? ' letter-spacing="' + space + '"' : '') + '>' +
+    _tpEsc(t) + '</text>';
+}
 
 // Lattice between two rails: the bracing is what reads as a truss rather
 // than a bar.
@@ -76452,30 +76836,31 @@ var _C3_BH = 30;
 // the span happened to end, so the roof came out subtly different at the
 // two ends of an arena that is otherwise a mirror of itself.
 function _c3Truss(x0, x1, y, h, col, op) {
-  var s = '<line x1="' + x0 + '" y1="' + y + '" x2="' + x1 + '" y2="' + y +
+  var s = '<line x1="' + x0 + '" y1="' + _c3n(y) + '" x2="' + x1 + '" y2="' + _c3n(y) +
     '" stroke="' + col + '" stroke-width="0.7" stroke-opacity="' + op + '"/>';
-  s += '<line x1="' + x0 + '" y1="' + (y + h) + '" x2="' + x1 + '" y2="' + (y + h) +
-    '" stroke="' + col + '" stroke-width="0.7" stroke-opacity="' + op + '"/>';
+  s += '<line x1="' + x0 + '" y1="' + _c3n(y + h) + '" x2="' + x1 + '" y2="' +
+    _c3n(y + h) + '" stroke="' + col + '" stroke-width="0.7" stroke-opacity="' +
+    op + '"/>';
   var bays = Math.max(2, Math.round((x1 - x0) / 9));
   var w = (x1 - x0) / bays, i, a, bx;
   for (i = 0; i < bays; i++) {
     a = x0 + i * w; bx = a + w;
-    s += '<line x1="' + _c3n(a) + '" y1="' + y + '" x2="' + _c3n(bx) + '" y2="' +
-      (y + h) + '" stroke="' + col + '" stroke-width="0.32" stroke-opacity="' +
+    s += '<line x1="' + _c3n(a) + '" y1="' + _c3n(y) + '" x2="' + _c3n(bx) + '" y2="' +
+      _c3n(y + h) + '" stroke="' + col + '" stroke-width="0.32" stroke-opacity="' +
       _c3n(op * 0.75) + '"/>';
-    s += '<line x1="' + _c3n(a) + '" y1="' + (y + h) + '" x2="' + _c3n(bx) + '" y2="' +
-      y + '" stroke="' + col + '" stroke-width="0.32" stroke-opacity="' +
-      _c3n(op * 0.75) + '"/>';
+    s += '<line x1="' + _c3n(a) + '" y1="' + _c3n(y + h) + '" x2="' + _c3n(bx) +
+      '" y2="' + _c3n(y) + '" stroke="' + col + '" stroke-width="0.32"' +
+      ' stroke-opacity="' + _c3n(op * 0.75) + '"/>';
     if (i) {
-      s += '<line x1="' + _c3n(a) + '" y1="' + y + '" x2="' + _c3n(a) + '" y2="' +
-        (y + h) + '" stroke="' + col + '" stroke-width="0.3" stroke-opacity="' +
-        _c3n(op * 0.6) + '"/>';
+      s += '<line x1="' + _c3n(a) + '" y1="' + _c3n(y) + '" x2="' + _c3n(a) +
+        '" y2="' + _c3n(y + h) + '" stroke="' + col + '" stroke-width="0.3"' +
+        ' stroke-opacity="' + _c3n(op * 0.6) + '"/>';
     }
   }
   return s;
 }
 
-// A house light on the rig, and the pool it throws on the floor far below.
+// A house light on the rig, and the bloom around it.
 function _c3Lamp(x, y, uid) {
   return '<rect x="' + _c3n(x - 1.3) + '" y="' + _c3n(y) + '" width="2.6"' +
     ' height="1.6" rx="0.4" fill="#2a3040"/>' +
@@ -76485,28 +76870,84 @@ function _c3Lamp(x, y, uid) {
     ' fill="url(#lamp' + uid + ')"/>';
 }
 
-function _c3Rafters(uid) {
+function _c3Rafters(uid, boardTop) {
   var s = '';
+  var main = boardTop - _C3_HANG - 3.6;      // the rail the board hangs from
   // the dark above, so the rig has something to hang in
-  s += '<rect x="0" y="-4" width="200" height="16" fill="url(#roof' + uid + ')"/>';
+  s += '<rect x="0" y="' + _c3n(main - 10) + '" width="200" height="16" fill="url(#roof' +
+    uid + ')"/>';
   var col = '#3b4557';
   // Three rows, each wider and brighter than the one behind it, which is
   // the same thing the floor's near sideline does and reads as depth for
   // the same reason.
-  s += _c3Truss(26, 174, -1.6, 2.1, '#242b38', 0.6);
-  s += _c3Truss(14, 186, 2.2, 2.6, '#2e3645', 0.8);
-  s += _c3Truss(4, 196, _C3_RAF_Y, 3.6, col, 0.95);
-  // catwalk hangers between the rows
+  s += _c3Truss(26, 174, main - 8.6, 2.1, '#242b38', 0.6);
+  s += _c3Truss(14, 186, main - 4.8, 2.6, '#2e3645', 0.8);
+  s += _c3Truss(4, 196, main, 3.6, col, 0.95);
   var hx;
   for (hx = 22; hx <= 178; hx += 26) {
-    s += '<line x1="' + hx + '" y1="0.5" x2="' + hx + '" y2="' + _C3_RAF_Y +
-      '" stroke="' + col + '" stroke-width="0.4" stroke-opacity="0.75"/>';
+    s += '<line x1="' + hx + '" y1="' + _c3n(main - 6.5) + '" x2="' + hx + '" y2="' +
+      _c3n(main) + '" stroke="' + col + '" stroke-width="0.4" stroke-opacity="0.75"/>';
   }
-  // the lights, skipping the middle where the board hangs
-  var lx;
-  for (lx = 13; lx <= 187; lx += 14.5) {
-    if (lx > 60 && lx < 140) continue;
-    s += _c3Lamp(lx, _C3_RAF_Y + 3.6, uid);
+  // The lights, in what the board leaves of the rig. Striding evenly
+  // across the whole span and dropping whatever the board covers was
+  // fine on a narrow board and left two lamps a side on a wide one, so
+  // the run is fitted to the gap instead of cropped out of a pattern.
+  var edge = 100 - _C3_BX / 2 - 4;      // where the board's shadow starts
+  // Fence posts, not fence panels: a twenty unit run at seven units of
+  // spacing holds FOUR lamps, not two. The floor of the division gave
+  // the gaps and forgot the ends.
+  var n = Math.max(2, Math.round((edge - 9) / 7) + 1);
+  var gap = (edge - 9) / Math.max(1, n - 1), li2, lx;
+  for (li2 = 0; li2 < n; li2++) {
+    lx = 9 + li2 * gap;
+    s += _c3Lamp(lx, main + 3.6, uid);
+    s += _c3Lamp(200 - lx, main + 3.6, uid);
+  }
+  return s;
+}
+
+// The five on the floor, with what each has done -- JUMBO/ONFLOOR.
+//
+// The names are last names only and the figures are points, rebounds and
+// assists, which is the line an arena board carries and about all that
+// fits across half a board at this size.
+function _c3Roster(o, x0, x1, ry, rh) {
+  var side = o.roster;
+  if (!side) return '';
+  var s = '<rect x="' + _c3n(x0 + 1.2) + '" y="' + _c3n(ry) + '" width="' +
+    _c3n(x1 - x0 - 2.4) + '" height="' + _c3n(rh) + '" rx="0.6" fill="#0b121c"/>';
+  var label = ['ON THE FLOOR', 'STARTERS', 'MOST MINUTES'][side.mode] || 'ON THE FLOOR';
+  s += _c3Txt(100, ry + 3.9, label, 3, 'rgba(255,255,255,0.46)', 800,
+    'middle', '0.24');
+  // the divider between the two halves
+  s += '<line x1="100" y1="' + _c3n(ry + 5.4) + '" x2="100" y2="' +
+    _c3n(ry + rh - 1.4) + '" stroke="#223049" stroke-width="0.35"/>';
+
+  var halves = [
+    { list: side.away, col: o.awayColor || '#888', lo: x0 + 1.2, hi: 99 },
+    { list: side.home, col: o.homeColor || '#888', lo: 101, hi: x1 - 1.2 }
+  ];
+  var hi, ri;
+  for (hi = 0; hi < halves.length; hi++) {
+    var H = halves[hi];
+    var nameX = H.lo + 2.6;
+    var astX = H.hi - 2.6, rebX = astX - 8.4, ptsX = rebX - 8.4;
+    // the column heads
+    var hy = ry + 9.2;
+    s += _c3Txt(ptsX, hy, 'PTS', 2.5, 'rgba(255,255,255,0.3)', 800, 'end', '0.1');
+    s += _c3Txt(rebX, hy, 'REB', 2.5, 'rgba(255,255,255,0.3)', 800, 'end', '0.1');
+    s += _c3Txt(astX, hy, 'AST', 2.5, 'rgba(255,255,255,0.3)', 800, 'end', '0.1');
+    s += '<line x1="' + _c3n(H.lo + 2) + '" y1="' + _c3n(hy + 1.1) + '" x2="' +
+      _c3n(H.hi - 2) + '" y2="' + _c3n(hy + 1.1) + '" stroke="#223049"' +
+      ' stroke-width="0.3"/>';
+    for (ri = 0; ri < H.list.length && ri < 5; ri++) {
+      var pl = H.list[ri];
+      var y = ry + _C3_ROW_Y0 + ri * _C3_ROW_H;
+      s += _c3Txt(nameX, y, pl.name, 3.5, H.col, 800, 'start', '0.02');
+      s += _c3Txt(ptsX, y, String(pl.pts), 3.5, '#eef2f8', 800, 'end');
+      s += _c3Txt(rebX, y, String(pl.reb), 3.5, 'rgba(238,242,248,0.72)', 700, 'end');
+      s += _c3Txt(astX, y, String(pl.ast), 3.5, 'rgba(238,242,248,0.72)', 700, 'end');
+    }
   }
   return s;
 }
@@ -76524,87 +76965,91 @@ function _c3Rafters(uid) {
 function _c3Jumbo(o, uid) {
   var s = '';
   var x0 = 100 - _C3_BX / 2, x1 = 100 + _C3_BX / 2;
-  var y0 = _C3_BY0, y1 = _C3_BY0 + _C3_BH;
+  var hasR = !!o.roster;
+  var y0 = _c3BoardTop(hasR), y1 = _C3_BY1;
+  var BH = y1 - y0;
   var away = o.awayColor || '#888', home = o.homeColor || '#888';
+  var main = y0 - _C3_HANG - 3.6;
 
   // the cables, before the box so they run behind it
-  var ci, cables = [x0 + 9, x0 + 26, x1 - 26, x1 - 9];
+  var ci, cables = [x0 + 12, x0 + 34, x1 - 34, x1 - 12];
   for (ci = 0; ci < cables.length; ci++) {
-    s += '<line x1="' + _c3n(cables[ci]) + '" y1="' + (_C3_RAF_Y + 3.4) +
-      '" x2="' + _c3n(cables[ci]) + '" y2="' + (y0 - 1.6) +
+    s += '<line x1="' + _c3n(cables[ci]) + '" y1="' + _c3n(main + 3.6) +
+      '" x2="' + _c3n(cables[ci]) + '" y2="' + _c3n(y0 - 1.6) +
       '" stroke="#39445a" stroke-width="0.55"/>';
   }
 
   // The TOP of the box, not a side panel. The camera for this whole
   // drawing sits above the floor and on the centre line, so it looks
   // down on the board and sees no end of it at all -- an end sliver,
-  // which the first pass drew, would put the viewer off to one side.
-  s += '<polygon points="' + (x0 + 3.4) + ',' + (y0 - 2.6) + ' ' +
-    (x1 - 3.4) + ',' + (y0 - 2.6) + ' ' + x1 + ',' + y0 + ' ' + x0 + ',' + y0 +
-    '" fill="#20283a"/>';
-  // the frame it hangs in
-  s += '<rect x="' + (x0 + 2.2) + '" y="' + (y0 - 3.6) + '" width="' + (_C3_BX - 4.4) +
-    '" height="1.3" rx="0.5" fill="#2b3346"/>';
+  // which an earlier pass drew, would put the viewer off to one side.
+  s += '<polygon points="' + _c3n(x0 + 3.4) + ',' + _c3n(y0 - 2.6) + ' ' +
+    _c3n(x1 - 3.4) + ',' + _c3n(y0 - 2.6) + ' ' + _c3n(x1) + ',' + _c3n(y0) + ' ' +
+    _c3n(x0) + ',' + _c3n(y0) + '" fill="#20283a"/>';
+  s += '<rect x="' + _c3n(x0 + 2.2) + '" y="' + _c3n(y0 - 3.6) + '" width="' +
+    _c3n(_C3_BX - 4.4) + '" height="1.3" rx="0.5" fill="#2b3346"/>';
 
   // the spill, before the box so the box sits inside its own light
-  s += '<ellipse cx="100" cy="' + _c3n(y0 + _C3_BH / 2) + '" rx="' +
-    (_C3_BX * 0.72) + '" ry="' + (_C3_BH * 0.82) + '" fill="url(#glow' + uid + ')"/>';
+  s += '<ellipse cx="100" cy="' + _c3n(y0 + BH / 2) + '" rx="' +
+    _c3n(_C3_BX * 0.68) + '" ry="' + _c3n(BH * 0.78) + '" fill="url(#glow' +
+    uid + ')"/>';
 
   // the box
-  s += '<rect x="' + x0 + '" y="' + y0 + '" width="' + _C3_BX + '" height="' + _C3_BH +
-    '" rx="1.6" fill="#080c14" stroke="#333d52" stroke-width="0.7"/>';
+  s += '<rect x="' + _c3n(x0) + '" y="' + _c3n(y0) + '" width="' + _c3n(_C3_BX) +
+    '" height="' + _c3n(BH) + '" rx="1.6" fill="#080c14" stroke="#333d52"' +
+    ' stroke-width="0.7"/>';
 
   // the halo across the top, where an arena puts its name
-  s += '<rect x="' + (x0 + 1.2) + '" y="' + (y0 + 1.1) + '" width="' + (_C3_BX - 2.4) +
-    '" height="4.2" rx="0.6" fill="#121a26"/>';
+  s += '<rect x="' + _c3n(x0 + 1.2) + '" y="' + _c3n(y0 + 1.1) + '" width="' +
+    _c3n(_C3_BX - 2.4) + '" height="4.2" rx="0.6" fill="#121a26"/>';
   if (o.boardName) {
     s += _sbTxt(100, y0 + 4.4, String(o.boardName).toUpperCase(), 3,
       'rgba(255,255,255,0.5)', 800, '0.24');
   }
 
   // ---- the face ------------------------------------------------------
-  var fy = y0 + 6.1, fh = 13.6;
-  s += '<rect x="' + (x0 + 1.2) + '" y="' + _c3n(fy) + '" width="' + (_C3_BX - 2.4) +
-    '" height="' + fh + '" rx="0.6" fill="#05080e"/>';
-  // a team colour wash behind each half, the way a board tints its panels
-  s += '<rect x="' + (x0 + 1.2) + '" y="' + _c3n(fy) + '" width="' + (_C3_BX / 2 - 1.2) +
-    '" height="' + fh + '" fill="' + away + '" fill-opacity="0.18"/>';
-  s += '<rect x="100" y="' + _c3n(fy) + '" width="' + (_C3_BX / 2 - 1.2) +
+  var fy = y0 + 6.1, fh = 14;
+  s += '<rect x="' + _c3n(x0 + 1.2) + '" y="' + _c3n(fy) + '" width="' +
+    _c3n(_C3_BX - 2.4) + '" height="' + fh + '" rx="0.6" fill="#05080e"/>';
+  s += '<rect x="' + _c3n(x0 + 1.2) + '" y="' + _c3n(fy) + '" width="' +
+    _c3n(_C3_BX / 2 - 1.2) + '" height="' + fh + '" fill="' + away +
+    '" fill-opacity="0.18"/>';
+  s += '<rect x="100" y="' + _c3n(fy) + '" width="' + _c3n(_C3_BX / 2 - 1.2) +
     '" height="' + fh + '" fill="' + home + '" fill-opacity="0.18"/>';
-  s += '<line x1="100" y1="' + _c3n(fy + 1.4) + '" x2="100" y2="' + _c3n(fy + fh - 1.4) +
-    '" stroke="#2c3545" stroke-width="0.4"/>';
+  s += '<line x1="100" y1="' + _c3n(fy + 1.4) + '" x2="100" y2="' +
+    _c3n(fy + fh - 1.4) + '" stroke="#2c3545" stroke-width="0.4"/>';
 
   // crests at the outer ends
-  var lg = 10.2, ly = fy + (fh - lg) / 2;
+  var lg = 10.6, ly = fy + (fh - lg) / 2;
   if (o.awayLogo) {
-    s += '<image href="' + o.awayLogo + '" x="' + _c3n(x0 + 3.2) + '" y="' + _c3n(ly) +
+    s += '<image href="' + o.awayLogo + '" x="' + _c3n(x0 + 4) + '" y="' + _c3n(ly) +
       '" width="' + lg + '" height="' + lg + '" preserveAspectRatio="xMidYMid meet"/>';
   } else {
-    s += _sbTxt(x0 + 8.3, fy + fh / 2 + 1.7, String(o.awayAbbr || ''), 5,
+    s += _sbTxt(x0 + 9.3, fy + fh / 2 + 1.8, String(o.awayAbbr || ''), 5.4,
       away, 900, '0.04');
   }
   if (o.homeLogo) {
-    s += '<image href="' + o.homeLogo + '" x="' + _c3n(x1 - 3.2 - lg) + '" y="' + _c3n(ly) +
+    s += '<image href="' + o.homeLogo + '" x="' + _c3n(x1 - 4 - lg) + '" y="' + _c3n(ly) +
       '" width="' + lg + '" height="' + lg + '" preserveAspectRatio="xMidYMid meet"/>';
   } else {
-    s += _sbTxt(x1 - 8.3, fy + fh / 2 + 1.7, String(o.homeAbbr || ''), 5,
+    s += _sbTxt(x1 - 9.3, fy + fh / 2 + 1.8, String(o.homeAbbr || ''), 5.4,
       home, 900, '0.04');
   }
 
   // the figures
-  s += _sbTxt(85, fy + fh / 2 + 4.6, (o.awayPts == null ? '-' : String(o.awayPts)),
-    12.4, away, 900, '-0.01');
-  s += _sbTxt(115, fy + fh / 2 + 4.6, (o.homePts == null ? '-' : String(o.homePts)),
-    12.4, home, 900, '-0.01');
+  s += _sbTxt(81, fy + fh / 2 + 4.8, (o.awayPts == null ? '-' : String(o.awayPts)),
+    13, away, 900, '-0.01');
+  s += _sbTxt(119, fy + fh / 2 + 4.8, (o.homePts == null ? '-' : String(o.homePts)),
+    13, home, 900, '-0.01');
 
   // ---- the band under it ---------------------------------------------
-  var by = y0 + 20.6, bh = _C3_BH - 21.8;
-  s += '<rect x="' + (x0 + 1.2) + '" y="' + _c3n(by) + '" width="' + (_C3_BX - 2.4) +
-    '" height="' + _c3n(bh) + '" rx="0.6" fill="#121a26"/>';
+  var by = y0 + 20.8, bh = 7.6;
+  s += '<rect x="' + _c3n(x0 + 1.2) + '" y="' + _c3n(by) + '" width="' +
+    _c3n(_C3_BX - 2.4) + '" height="' + _c3n(bh) + '" rx="0.6" fill="#121a26"/>';
   if (o.clock) {
     s += _sbTxt(100, by + 4.2, String(o.clock), 5, '#f1b434', 900, '0.02');
     if (o.label) {
-      s += _sbTxt(100, by + 7.6, String(o.label).toUpperCase(), 2.7,
+      s += _sbTxt(100, by + 7.2, String(o.label).toUpperCase(), 2.7,
         'rgba(255,255,255,0.45)', 800, '0.2');
     }
   } else if (o.label) {
@@ -76612,16 +77057,156 @@ function _c3Jumbo(o, uid) {
       'rgba(255,255,255,0.62)', 800, '0.22');
   }
   if (o.awayLine) {
-    s += _sbTxt(x0 + 15, by + bh / 2 + 1.1, String(o.awayLine), 3.2, away, 800, '0.05');
+    s += _sbTxt(x0 + 20, by + bh / 2 + 1.1, String(o.awayLine), 3.2, away, 800, '0.05');
   }
   if (o.homeLine) {
-    s += _sbTxt(x1 - 15, by + bh / 2 + 1.1, String(o.homeLine), 3.2, home, 800, '0.05');
+    s += _sbTxt(x1 - 20, by + bh / 2 + 1.1, String(o.homeLine), 3.2, home, 800, '0.05');
   }
 
-  // the scanline, over everything on the face, which is what makes it a
-  // screen rather than a painted sign
-  s += '<rect x="' + (x0 + 1.2) + '" y="' + _c3n(fy) + '" width="' + (_C3_BX - 2.4) +
-    '" height="' + _c3n(by + bh - fy) + '" fill="url(#scan' + uid + ')"/>';
+  // ---- the five a side, when the payload knows them -------------------
+  if (hasR) s += _c3Roster(o, x0, x1, y0 + _C3_BTOP + 0.5, _C3_ROSTER_H - 1.5);
+
+  // the scanline, over everything the board lights, which is what makes
+  // it a screen rather than a painted sign
+  s += '<rect x="' + _c3n(x0 + 1.2) + '" y="' + _c3n(fy) + '" width="' +
+    _c3n(_C3_BX - 2.4) + '" height="' + _c3n(y1 - 1.4 - fy) +
+    '" fill="url(#scan' + uid + ')"/>';
+  return s;
+}
+// ---------------------------------------------------------------
+// COURTSIDE and the BOWL -- ARENA --
+// The building around the floor: seating behind the far sideline, a row
+// of courtside chairs down each touchline, and the scorer's table at
+// mid court where it has always been.
+//
+// All of it stands on floor that did not exist until now. The slab used
+// to stop dead on the painted lines, which no floor does -- there are
+// several feet of maple outside them, and that strip is where every one
+// of these things lives.
+// ---------------------------------------------------------------
+var _C3_OUT_W = 5;      // feet of floor outside each sideline
+var _C3_OUT_L = 2;      // and off each baseline
+
+// A courtside chair. Seen from behind on the near touchline and from the
+// front on the far one, which at this size is the difference between a
+// dark back and a lit seat -- so that is all that is drawn.
+function _c3Chair(cx, cy, near) {
+  var p = _c3Proj(cx, cy), k = _c3K(cy);
+  var w = 2.2 * _C3_SX * k / 2;
+  var h = 3 * _C3_UP * k;
+  var seatH = 1.1 * _C3_UP * k;
+  var s = '';
+  // the shadow it casts on the maple
+  s += '<ellipse cx="' + _c3n(p[0]) + '" cy="' + _c3n(p[1]) + '" rx="' + _c3n(w * 1.1) +
+    '" ry="' + _c3n(0.9 * _C3_DEPTH / _C3_WID) + '" fill="#2a1a0c" fill-opacity="0.3"/>';
+  // The back narrower than the seat and standing clear above it. At four
+  // units wide no detail survives, so the SILHOUETTE is the whole thing
+  // -- and a back the same width as the seat is a lump, not a chair.
+  s += '<rect x="' + _c3n(p[0] - w) + '" y="' + _c3n(p[1] - seatH) + '" width="' +
+    _c3n(w * 2) + '" height="' + _c3n(seatH) + '" rx="' + _c3n(w * 0.28) +
+    '" fill="' + (near ? '#14181f' : '#1b212b') + '"/>';
+  s += '<rect x="' + _c3n(p[0] - w * 0.7) + '" y="' + _c3n(p[1] - h) + '" width="' +
+    _c3n(w * 1.4) + '" height="' + _c3n(h - seatH * 0.55) + '" rx="' + _c3n(w * 0.3) +
+    '" fill="' + (near ? '#1c222c' : '#28313f') + '"/>';
+  return s;
+}
+
+// The two rows of them. Positions are stepped out from the HALFWAY LINE
+// rather than counted up from a baseline, so the row is symmetric about
+// the centre of the floor the way the court it sits beside is -- a loop
+// from one end lands its last chair wherever the span happens to run
+// out and leaves one side of the arena a seat short.
+function _c3Chairs() {
+  var s = '', i, cx;
+  var mid = _C3_LEN / 2, step = 4.4;
+  var nearY = _C3_WID + 2.9, farY = -2.9;
+  for (i = 0; i < 11; i++) {
+    cx = mid + step * (i + 0.5);
+    // the scorer's table takes the middle of the near touchline
+    if (i > 0) {
+      s += _c3Chair(cx, nearY, true);
+      s += _c3Chair(_C3_LEN - cx, nearY, true);
+    }
+    s += _c3Chair(cx, farY, false);
+    s += _c3Chair(_C3_LEN - cx, farY, false);
+  }
+  return s;
+}
+
+// The scorer's table, mid court on the near touchline, with the home
+// club's name across the front of it.
+function _c3Scorers(name, accent) {
+  var x0 = _C3_LEN / 2 - 11, x1 = _C3_LEN / 2 + 11;
+  var yF = _C3_WID + 1.6, yB = _C3_WID + 4.6;   // the court side and the back
+  var k = _c3K(yF);
+  var h = 4.2 * _C3_UP * k;
+  var a = _c3Proj(x0, yB), b = _c3Proj(x1, yB);
+  var c = _c3Proj(x1, yF), d = _c3Proj(x0, yF);
+  var s = '';
+  // the top, lying on the floor
+  s += '<polygon points="' + _c3n(a[0]) + ',' + _c3n(a[1] - h) + ' ' +
+    _c3n(b[0]) + ',' + _c3n(b[1] - h) + ' ' + _c3n(c[0]) + ',' + _c3n(c[1] - h) + ' ' +
+    _c3n(d[0]) + ',' + _c3n(d[1] - h) + '" fill="#2b3340"/>';
+  // the face the camera is looking at
+  s += '<polygon points="' + _c3n(d[0]) + ',' + _c3n(d[1] - h) + ' ' +
+    _c3n(c[0]) + ',' + _c3n(c[1] - h) + ' ' + _c3n(c[0]) + ',' + _c3n(c[1]) + ' ' +
+    _c3n(d[0]) + ',' + _c3n(d[1]) + '" fill="#10151d"/>';
+  s += '<line x1="' + _c3n(d[0]) + '" y1="' + _c3n(d[1] - h) + '" x2="' + _c3n(c[0]) +
+    '" y2="' + _c3n(c[1] - h) + '" stroke="' + accent + '" stroke-width="0.5"' +
+    ' stroke-opacity="0.8"/>';
+  if (name) {
+    s += _c3Txt((d[0] + c[0]) / 2, _c3n((d[1] + c[1]) / 2 - h * 0.28),
+      String(name).toUpperCase(), 3.4, accent, 800, 'middle', '0.2');
+  }
+  return s;
+}
+
+// The bowl behind the far touchline. Rows of seats with people in them,
+// a rail along the front and the vomitories punched through -- drawn
+// before anything else on the floor, because everything else is in
+// front of it.
+function _c3Bowl(uid, homeColor) {
+  var botY = _c3Proj(0, -_C3_OUT_W)[1];
+  var topY = botY - 16;
+  var s = '';
+  // the dark of the upper deck above it
+  s += '<rect x="0" y="' + _c3n(topY - 7) + '" width="200" height="' + _c3n(7.4) +
+    '" fill="#070a10"/>';
+  // the deck, narrowing a little as it rises away
+  s += '<polygon points="6,' + _c3n(topY) + ' 194,' + _c3n(topY) + ' 200,' +
+    _c3n(botY) + ' 0,' + _c3n(botY) + '" fill="#0d1119"/>';
+
+  // the crowd, five rows of it. Deterministic, so the arena does not
+  // reseat itself on every repaint.
+  var seed = 20240101;
+  function rnd() { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; }
+  var tint = ['#2b3444', '#39404e', '#4a4038', '#2f3a4d', homeColor || '#3a4252'];
+  var r, i2, rowY, inset, n, x, rr;
+  for (r = 0; r < 5; r++) {
+    rowY = topY + 2.2 + r * 2.9;
+    inset = 6 - r * 1.2;
+    s += '<rect x="' + _c3n(inset) + '" y="' + _c3n(rowY + 1.5) + '" width="' +
+      _c3n(200 - inset * 2) + '" height="1.8" fill="#070a0f" fill-opacity="0.55"/>';
+    n = 30 + r * 4;
+    for (i2 = 0; i2 < n; i2++) {
+      x = inset + 2 + ((200 - inset * 2 - 4) * (i2 + 0.5)) / n + (rnd() - 0.5) * 1.4;
+      rr = 0.62 + r * 0.07;
+      s += '<circle cx="' + _c3n(x) + '" cy="' + _c3n(rowY) + '" r="' + _c3n(rr) +
+        '" fill="' + tint[Math.floor(rnd() * tint.length)] + '" fill-opacity="' +
+        _c3n(0.55 + r * 0.07) + '"/>';
+    }
+  }
+  // the vomitories, punched through every row
+  var v, vx;
+  for (v = 0; v < 4; v++) {
+    vx = 26 + v * 49.4;
+    s += '<polygon points="' + _c3n(vx - 2.4) + ',' + _c3n(topY) + ' ' +
+      _c3n(vx + 2.4) + ',' + _c3n(topY) + ' ' + _c3n(vx + 3.4) + ',' + _c3n(botY) +
+      ' ' + _c3n(vx - 3.4) + ',' + _c3n(botY) + '" fill="#090d14"/>';
+  }
+  // and the rail the front row leans on
+  s += '<line x1="0" y1="' + _c3n(botY - 1.2) + '" x2="200" y2="' + _c3n(botY - 1.2) +
+    '" stroke="#39445a" stroke-width="0.5" stroke-opacity="0.75"/>';
   return s;
 }
 
@@ -76636,9 +77221,13 @@ function _gymFloor3D(o) {
   // dark-coloured home team painted its lines into the floor.
   var ink = '#4a3520';
   // The floor and its apron occupy y 48..92. Everything above that is
-  // the arena -- JUMBO -- so the box opens to the ceiling at y = -4.
-  // The court does not move or change size; the panel is simply taller.
-  var s = '<svg viewBox="0 -4 200 100" style="width:100%;height:auto;display:block"' +
+  // the arena -- JUMBO -- and how far above depends on whether the board
+  // is carrying a roster, so the box is measured from the board rather
+  // than fixed. The court does not move or change size whatever happens
+  // up there; the panel is simply taller.
+  var _top = _c3BoardTop(!!o.roster) - _C3_HANG - 3.6 - 11;
+  var s = '<svg viewBox="0 ' + _c3n(_top) + ' 200 ' + _c3n(_C3_BOTTOM - _top) +
+    '" style="width:100%;height:auto;display:block"' +
     ' preserveAspectRatio="xMidYMid meet">';
 
   s += '<defs>' +
@@ -76674,37 +77263,43 @@ function _gymFloor3D(o) {
 
   // JUMBO -- the roof, first of all, because the floor is drawn in front
   // of it and the board hangs between the two.
-  s += _c3Rafters(uid);
+  s += _c3Bowl(uid, o.homeColor || '#3a4252');
+  s += _c3Rafters(uid, _c3BoardTop(!!o.roster));
   s += _c3Jumbo(o, uid);
 
-  // The apron under the near sideline. Three and a half units of dark
-  // edge is the whole reason the floor reads as a raised deck rather
-  // than a drawing of a rectangle.
-  var nl = _c3Proj(0, _C3_WID), nr = _c3Proj(_C3_LEN, _C3_WID);
-  s += '<polygon points="' + _c3Pt(0, _C3_WID) + ' ' + _c3Pt(_C3_LEN, _C3_WID) + ' ' +
+  // The SLAB, which runs past the painted lines the way a real floor
+  // does. Everything courtside stands on the strip between the two.
+  var SL0 = -_C3_OUT_L, SL1 = _C3_LEN + _C3_OUT_L;
+  var SW0 = -_C3_OUT_W, SW1 = _C3_WID + _C3_OUT_W;
+
+  // The apron under the near edge. Three and a half units of dark is the
+  // whole reason the floor reads as a raised deck rather than a drawing
+  // of a rectangle.
+  var nl = _c3Proj(SL0, SW1), nr = _c3Proj(SL1, SW1);
+  s += '<polygon points="' + _c3Pt(SL0, SW1) + ' ' + _c3Pt(SL1, SW1) + ' ' +
     _c3n(nr[0]) + ',' + _c3n(nr[1] + 3.6) + ' ' + _c3n(nl[0]) + ',' + _c3n(nl[1] + 3.6) +
     '" fill="#3b2715"/>';
 
   // the ends of the slab, a sliver of each in view from the centre line
   var ef, ea, eb;
   for (ef = 0; ef < 2; ef++) {
-    ea = _c3Proj(ef ? _C3_LEN : 0, _C3_WID);
-    eb = _c3Proj(ef ? _C3_LEN : 0, 0);
+    ea = _c3Proj(ef ? SL1 : SL0, SW1);
+    eb = _c3Proj(ef ? SL1 : SL0, SW0);
     s += '<polygon points="' + _c3n(ea[0]) + ',' + _c3n(ea[1]) + ' ' +
       _c3n(eb[0]) + ',' + _c3n(eb[1]) + ' ' + _c3n(eb[0]) + ',' + _c3n(eb[1] + 3.1) +
       ' ' + _c3n(ea[0]) + ',' + _c3n(ea[1] + 3.6) + '" fill="#32200f"/>';
   }
 
   // the maple
-  s += '<polygon points="' + _c3Pt(0, _C3_WID) + ' ' + _c3Pt(_C3_LEN, _C3_WID) + ' ' +
-    _c3Pt(_C3_LEN, 0) + ' ' + _c3Pt(0, 0) + '" fill="url(#w' + uid + ')"/>';
+  s += '<polygon points="' + _c3Pt(SL0, SW1) + ' ' + _c3Pt(SL1, SW1) + ' ' +
+    _c3Pt(SL1, SW0) + ' ' + _c3Pt(SL0, SW0) + '" fill="url(#w' + uid + ')"/>';
 
   // Planks run the LENGTH of a floor, so a plank seam is a line of constant
   // width -- and in this projection those are the lines that converge,
   // which is free perspective.
   var pk;
-  for (pk = 4; pk < _C3_WID; pk += 4) {
-    var pa = _c3Proj(0, pk), pb = _c3Proj(_C3_LEN, pk);
+  for (pk = SW0 + 2; pk < SW1; pk += 4) {
+    var pa = _c3Proj(SL0, pk), pb = _c3Proj(SL1, pk);
     s += '<line x1="' + _c3n(pa[0]) + '" y1="' + _c3n(pa[1]) + '" x2="' + _c3n(pb[0]) +
       '" y2="' + _c3n(pb[1]) + '" stroke="#b58b53" stroke-width="0.18" stroke-opacity="0.38"/>';
   }
@@ -76748,7 +77343,8 @@ function _gymFloor3D(o) {
       home, 0.72);
   }
 
-  // the boundary, over the top of everything painted inside it
+  // the boundary, over the top of everything painted inside it -- and it
+  // is the painted LINE, which the wood now runs past on every side
   s += '<polygon points="' + _c3Pt(0, _C3_WID) + ' ' + _c3Pt(_C3_LEN, _C3_WID) + ' ' +
     _c3Pt(_C3_LEN, 0) + ' ' + _c3Pt(0, 0) + '" fill="none" stroke="' + ink +
     '" stroke-width="0.62" stroke-opacity="0.7"/>';
@@ -76780,6 +77376,11 @@ function _gymFloor3D(o) {
     }
   }
   s += dmk;
+
+  // ARENA -- the chairs and the table stand on the floor, so they come
+  // after everything painted on it.
+  s += _c3Chairs();
+  s += _c3Scorers(o.homeName || o.homeAbbr || '', home);
 
   // The baskets last of all: they stand in front of everything, including
   // a shot taken from under them.
@@ -76835,6 +77436,14 @@ function _gymFloorPanel(data, game, awayAccent, homeAccent, divStyle, venue) {
   board.aLine = a30 ? (a3m + '-' + a30 + ' 3P') : '';
   board.hLine = h30 ? (h3m + '-' + h30 + ' 3P') : '';
 
+  // ONFLOOR -- who is out there. Only on a game that has tipped: a
+  // pregame box score has no minutes to rank and no five to name.
+  var roster = null;
+  if (game.state !== 'pre') {
+    try { roster = _c3OnFloor(data, game, game.state === 'in'); }
+    catch (eR) { roster = null; }
+  }
+
   var aLogo = (typeof vLogo === 'function'
     ? (vLogo(game.away.abbr, game.league, game.away.logo) || game.away.logo || '')
     : (game.away.logo || ''));
@@ -76848,6 +77457,7 @@ function _gymFloorPanel(data, game, awayAccent, homeAccent, divStyle, venue) {
       league: game.league, uid: game.id,
       awayColor: awayAccent, homeColor: homeAccent,
       awayAbbr: game.away.abbr, homeAbbr: game.home.abbr,
+      homeName: game.home.name || game.home.displayName || game.home.abbr,
       homeLogo: hLogo,
       awayLogo: aLogo,
       shots: shots,
@@ -76855,7 +77465,8 @@ function _gymFloorPanel(data, game, awayAccent, homeAccent, divStyle, venue) {
       boardName: venue || '',
       awayPts: board.a, homePts: board.h,
       clock: board.clock, label: board.label,
-      awayLine: board.aLine, homeLine: board.hLine
+      awayLine: board.aLine, homeLine: board.hLine,
+      roster: roster
     });
   } catch (eF) {
     try { console.error('Floor:', eF); } catch (e2) {}
@@ -79142,8 +79753,10 @@ function openFenway(game) {
   document.getElementById('fwBody').innerHTML = _skelRows(6);
   fetchFenwayData(game);
   clearInterval(fenwayInterval);
+  _pollStop('fenway');   // POLLRATE
   if (game.state === 'in' || game.state === 'pre') {
-    fenwayInterval = setInterval(function() { if (fenwayGame) fetchFenwayData(fenwayGame); }, 15000);
+    fenwayInterval = _pollStart('fenway', 15000, function () { return fenwayGame; },
+      fetchFenwayData, 'fwOverlay', function (id) { fenwayInterval = id; });   // POLLRATE
   }
 }
 
@@ -99562,7 +100175,8 @@ function sortTeamStat(sortKey, colIdx) {
 // Init
 document.title = "GAMEDAY VINTAGE - LOADED";
 fetchAll();
-setInterval(() => { if (isToday()) fetchAll(); }, 60000);
+_pollStart('sweep', 60000, null,
+  function () { if (isToday()) fetchAll(); }, null, null);   // POLLRATE
 try { _fbStart(); } catch (eFBS) {}
 try { _sfApplyAll(); } catch (eSF) {}
 /* ═══════════════════════════════════════════
