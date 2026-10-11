@@ -31510,6 +31510,11 @@
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M4 12h16M4 17h10"/><circle cx="19" cy="17" r="2.5"/></svg>
       <span>Probe merged fantasy hub (open a game first)</span>
     </button>
+    <!-- VBCOLOR — does the teams endpoint carry colours for this league? -->
+    <button class="sk-account-item" onclick="skProbeTeamColors(); skCloseAccountMenu();">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 3v18M3 12h18"/></svg>
+      <span>Probe team colours</span>
+    </button>
     <!-- VBPROBE — is there point-by-point for volleyball? -->
     <button class="sk-account-item" onclick="skProbeVolleyballPlays(); skCloseAccountMenu();">
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M4 9c5 0 9 2 11 7M20 9c-5 0-9 2-11 7M12 3c2 4 2 8 0 12"/></svg>
@@ -36152,6 +36157,103 @@ function _usableAccent(hex) {
   return lum > 0.04 && lum < 0.95;
 }
 
+// ---- a team's colour when its own scoreboard does not carry one -------
+// VBCOLOR. getTeamColor's last resort is a single slate, #4a5568, handed to
+// EVERY team the feed leaves uncoloured. Women's college volleyball is the
+// whole league: ESPN's scoreboard for it publishes no team colours at all,
+// so UNLV's red and Grand Canyon's purple both arrived as that slate, and
+// vibrant() lifted both to the same blue. Two different schools, one colour,
+// on every panel in the match.
+//
+// The colours do exist -- the per-sport TEAMS endpoint carries them, and the
+// app already calls that endpoint elsewhere for ids and logos. So it is
+// fetched once per league, kept for a month (a school changes its colours
+// about never), and consulted before the slate.
+var _TC_KEY = 'gd_teamcolors_v1';
+var _TC_TTL = 30 * 24 * 3600 * 1000;
+var _TC_SLATE = '#4a5568';
+var _tcMem = null, _tcAsked = {};
+
+function _tcAll() {
+  if (_tcMem) return _tcMem;
+  try { _tcMem = JSON.parse(localStorage.getItem(_TC_KEY) || '{}') || {}; }
+  catch (e) { _tcMem = {}; }
+  return _tcMem;
+}
+
+function _tcGet(league, abbr) {
+  if (!league || !abbr) return null;
+  var lg = _tcAll()[league];
+  if (!lg || !lg.t) return null;
+  return lg.t[String(abbr).toUpperCase()] || null;
+}
+
+function _tcFetch(league) {
+  if (!league || _tcAsked[league]) return;
+  var cfg = (typeof LEAGUES !== 'undefined') && LEAGUES[league];
+  if (!cfg || !cfg.sport || !cfg.slug) return;
+  var have = _tcAll()[league];
+  if (have && have.at && (Date.now() - have.at) < _TC_TTL) { _tcAsked[league] = 1; return; }
+  _tcAsked[league] = 1;
+  var url = 'https://site.api.espn.com/apis/site/v2/sports/' + cfg.sport + '/' +
+    cfg.slug + '/teams?limit=900';
+  fetch(url).then(function (r) { return r.ok ? r.json() : null; }).then(function (d) {
+    var rows = (d && d.sports && d.sports[0] && d.sports[0].leagues &&
+      d.sports[0].leagues[0] && d.sports[0].leagues[0].teams) || [];
+    var map = {}, n = 0, i, t, ab, col;
+    for (i = 0; i < rows.length; i++) {
+      t = rows[i].team || rows[i];
+      ab = (t && t.abbreviation) ? String(t.abbreviation).toUpperCase() : '';
+      if (!ab) continue;
+      col = _usableAccent(t.color) ? t.color :
+        (_usableAccent(t.alternateColor) ? t.alternateColor : '');
+      if (!col) continue;
+      map[ab] = '#' + String(col).replace('#', '');
+      n++;
+    }
+    // Nothing usable came back: leave the cache alone so the next session
+    // tries again rather than remembering an empty answer for a month.
+    if (!n) return;
+    _tcAll()[league] = { at: Date.now(), t: map };
+    try { localStorage.setItem(_TC_KEY, JSON.stringify(_tcAll())); } catch (e) {}
+    _tcRepaint(league);
+  })['catch'](function () {});
+}
+
+// Games are parsed once and the colour is baked into the game object, so a
+// cache that lands after the parse has to go back and correct what is
+// already in hand. Only the teams still wearing the slate are touched, so a
+// club whose own feed DID carry a colour keeps it.
+function _tcRepaint(league) {
+  var touched = 0;
+  function fix(g) {
+    if (!g || !g.league || (league && g.league !== league)) return;
+    var sides = ['away', 'home'], si, sd, c;
+    for (si = 0; si < sides.length; si++) {
+      sd = g[sides[si]];
+      if (!sd || !sd.abbr) continue;
+      if (String(sd.color || '').toLowerCase() !== _TC_SLATE) continue;
+      c = _tcGet(g.league, sd.abbr);
+      if (c) { sd.color = c; touched++; }
+    }
+  }
+  try {
+    if (typeof allGames === 'object' && allGames) {
+      Object.keys(allGames).forEach(function (lg) {
+        var arr = allGames[lg] || [];
+        for (var i = 0; i < arr.length; i++) fix(arr[i]);
+      });
+    }
+  } catch (e) {}
+  try { if (typeof courtGame !== 'undefined' && courtGame) fix(courtGame); } catch (e) {}
+  if (!touched) return;
+  try { if (typeof renderCards === 'function') renderCards(); } catch (e) {}
+  try {
+    if (typeof courtGame !== 'undefined' && courtGame &&
+        typeof renderCourt === 'function') renderCourt();
+  } catch (e) {}
+}
+
 function getTeamColor(team, league) {
   // For NFL teams, prefer the curated identity color over ESPN's feed hex.
   // Gated by league so shared abbrs (SF, MIN, LAC…) don't cross-contaminate
@@ -36169,6 +36271,12 @@ function getTeamColor(team, league) {
   if (_usableAccent(team && team.color)) return '#' + String(team.color).replace('#', '');
   // Primary unusable - try ESPN's alternate before giving up on the team.
   if (_usableAccent(team && team.alternateColor)) return '#' + String(team.alternateColor).replace('#', '');
+  // VBCOLOR -- before the one-size-fits-all slate, ask the league's own team
+  // list, and set that list loading if this is the first time we have needed
+  // it. The slate stands only for this render; _tcRepaint corrects it.
+  var _tcHit = (typeof _tcGet === 'function') ? _tcGet(league, _ab) : null;
+  if (_tcHit) return _tcHit;
+  if (typeof _tcFetch === 'function') _tcFetch(league);
   return '#4a5568';
 }
 
@@ -36209,6 +36317,12 @@ function tLogo(logo, teamId, league, style) {
 }
 
 function vibrant(hex, minLightness = 0.48) {
+  // VBCOLOR -- a guard, not a feature. Anything that is not a readable hex
+  // comes back as a plain neutral so the caller paints SOMETHING legible.
+  var _vin = String(hex == null ? '' : hex).replace('#', '');
+  if (_vin.length === 3) _vin = _vin[0]+_vin[0]+_vin[1]+_vin[1]+_vin[2]+_vin[2];
+  if (!/^[0-9a-fA-F]{6}$/.test(_vin)) return '#8b93a1';
+  hex = _vin;
   const c = hex.replace('#', '');
   let r = parseInt(c.substr(0, 2), 16) / 255;
   let g = parseInt(c.substr(2, 2), 16) / 255;
@@ -40485,6 +40599,7 @@ function buildInningStrip(game, accentHex) {
 // (P1–P3); extras beyond regulation collapse into OT.
 // True when two hex colors are close enough to be hard to tell apart.
 function _clashClose(a, b) {
+  if (typeof _acClash === 'function') return _acClash(a, b);   // HUECLASH
   if (typeof _colorDistance !== 'function') return false;
   return _colorDistance(a, b) < 100;
 }
@@ -65852,6 +65967,116 @@ function _f3Pin(p, col) {
 }
 
 // ---- the whole graphic ------------------------------------------------
+// ---- night game -- FLOODS --------------------------------------------
+// Four standards behind the far sideline and the pools they lay on the
+// grass. It comes in two pieces because the two halves sit on opposite
+// sides of the turf: the towers are drawn before it so the field covers
+// their feet and they read as standing behind the bowl, the pools after it
+// so they read as light falling ON the grass rather than paint in it.
+// Four standards, placed in SCREEN space rather than at field positions.
+// Light towers stand outside the bowl, so pinning them to yard lines put
+// them all inside the width of the far sideline -- which at this camera is
+// barely half the frame -- and they came out huddled in the middle like a
+// row of televisions. They straddle the frame instead.
+var _F3_TOWERS = 4;
+
+function _f3LightDefs() {
+  return '<defs>' +
+    '<radialGradient id="f3glow">' +
+    '<stop offset="0" stop-color="#fffdf2" stop-opacity="0.60"/>' +
+    '<stop offset="0.35" stop-color="#ffeaa7" stop-opacity="0.16"/>' +
+    '<stop offset="1" stop-color="#ffe08a" stop-opacity="0"/>' +
+    '</radialGradient>' +
+    '<radialGradient id="f3pool">' +
+    '<stop offset="0" stop-color="#fff6d8" stop-opacity="0.22"/>' +
+    '<stop offset="0.55" stop-color="#fff2cc" stop-opacity="0.10"/>' +
+    '<stop offset="1" stop-color="#ffeec0" stop-opacity="0"/>' +
+    '</radialGradient>' +
+    '<linearGradient id="f3beam" x1="0" y1="0" x2="0" y2="1">' +
+    '<stop offset="0" stop-color="#fff3cf" stop-opacity="0.10"/>' +
+    '<stop offset="0.55" stop-color="#fff3cf" stop-opacity="0.035"/>' +
+    '<stop offset="1" stop-color="#fff3cf" stop-opacity="0"/>' +
+    '</linearGradient>' +
+    '<linearGradient id="f3sky" x1="0" y1="0" x2="0" y2="1">' +
+    '<stop offset="0" stop-color="#05080f" stop-opacity="0"/>' +
+    '<stop offset="0.35" stop-color="#0a1322" stop-opacity="0.85"/>' +
+    '<stop offset="1" stop-color="#0a1322" stop-opacity="0.85"/>' +
+    '</linearGradient>' +
+    '</defs>';
+}
+
+// One standard: a truss up from behind the far sideline, a bank of lamps on
+// top, the halo around it and the shaft of light it drops. The foot runs
+// below the far sideline so the turf covers it and the tower reads as
+// standing behind the bowl rather than on it.
+function _f3Tower(bx, baseY) {
+  var POLE = 13, BW = 13, BH = 3.8;
+  var ty = baseY - POLE;
+  var s = '<g>';
+  s += '<ellipse cx="' + _f3n(bx) + '" cy="' + _f3n(ty + BH / 2) +
+    '" rx="13" ry="9" fill="url(#f3glow)"/>';
+  // the shaft, aimed down the field toward the near sideline
+  s += '<polygon points="' + _f3n(bx - BW / 2) + ',' + _f3n(ty + BH) + ' ' +
+    _f3n(bx + BW / 2) + ',' + _f3n(ty + BH) + ' ' +
+    _f3n(bx + 24) + ',' + _f3n(baseY + 22) + ' ' +
+    _f3n(bx - 24) + ',' + _f3n(baseY + 22) +
+    '" fill="url(#f3beam)"/>';
+  s += '<line x1="' + _f3n(bx) + '" y1="' + _f3n(baseY + 4) + '" x2="' + _f3n(bx) +
+    '" y2="' + _f3n(ty + BH) + '" stroke="#4b5c78" stroke-width="1.1"/>';
+  // two stays, which is what stops it reading as a lollipop
+  s += '<line x1="' + _f3n(bx - 3.2) + '" y1="' + _f3n(baseY + 4) + '" x2="' +
+    _f3n(bx) + '" y2="' + _f3n(ty + BH) +
+    '" stroke="#3b4a63" stroke-width="0.45" opacity="0.85"/>';
+  s += '<line x1="' + _f3n(bx + 3.2) + '" y1="' + _f3n(baseY + 4) + '" x2="' +
+    _f3n(bx) + '" y2="' + _f3n(ty + BH) +
+    '" stroke="#3b4a63" stroke-width="0.45" opacity="0.85"/>';
+  s += '<rect x="' + _f3n(bx - BW / 2) + '" y="' + _f3n(ty) + '" width="' + BW +
+    '" height="' + BH + '" rx="0.7" fill="#161f2e" stroke="#3a4961"' +
+    ' stroke-width="0.3"/>';
+  var cols = 5, rows = 2, ci, ri, lx, ly;
+  for (ri = 0; ri < rows; ri++) {
+    for (ci = 0; ci < cols; ci++) {
+      lx = bx - BW / 2 + (BW / cols) * (ci + 0.5);
+      ly = ty + (BH / rows) * (ri + 0.5);
+      s += '<circle cx="' + _f3n(lx) + '" cy="' + _f3n(ly) + '" r="0.72"' +
+        ' fill="#fffbe6"/>';
+    }
+  }
+  return s + '</g>';
+}
+
+function _f3LightTowers() {
+  var fl = _f3Proj(0, 0), fr = _f3Proj(_F3_LEN, 0);
+  var baseY = fl[1];
+  // Out past the far sideline on both sides. Real standards sit outside the
+  // bowl, and a row that stops short of the end zones reads as a row of
+  // screens hung over midfield rather than as a lit stadium.
+  var x0 = fl[0] - 28, x1 = fr[0] + 28, span = x1 - x0;
+  var s = _f3LightDefs();
+  // Full height, not just down to the far sideline. Stopping it there left a
+  // tonal step running off both sides of the frame where the backdrop ended
+  // and the page began; the turf hides the middle of it either way.
+  s += '<rect x="0" y="54" width="200" height="46" fill="url(#f3sky)"/>';
+  for (var i = 0; i < _F3_TOWERS; i++) {
+    s += _f3Tower(x0 + span * ((i + 0.5) / _F3_TOWERS), baseY);
+  }
+  return s;
+}
+
+// What the banks throw. Each pool is centred out in the field rather than
+// under its own tower -- a light aimed from behind the far side lands
+// across the middle -- and they overlap into one lit surface instead of
+// four spots, which is what a stadium actually looks like.
+function _f3LightPools() {
+  var s = '', i, p;
+  for (i = 0; i < 4; i++) {
+    p = _f3Proj(10 + i * 33, _F3_WID * 0.5);
+    s += '<ellipse cx="' + _f3n(p[0]) + '" cy="' + _f3n(p[1]) +
+      '" rx="38" ry="15" fill="url(#f3pool)"/>';
+  }
+  return s;
+}
+
 function _fwField3D(o) {
   o = o || {};
   var awayAbbr = o.awayAbbr || 'AWAY', homeAbbr = o.homeAbbr || 'HOME';
@@ -65871,6 +66096,9 @@ function _fwField3D(o) {
   var s = '<svg viewBox="0 54 200 46" style="width:100%;height:auto;display:block"' +
     ' preserveAspectRatio="xMidYMid meet">';
 
+  // FLOODS -- first of all, because everything else stands in front of them.
+  s += _f3LightTowers();
+
   // The slab edge under the near sideline, which is what sells the depth.
   var nl = _f3Proj(0, _F3_WID), nr = _f3Proj(_F3_LEN, _F3_WID);
   s += '<polygon points="' + _f3Pt(0, _F3_WID) + ' ' + _f3Pt(_F3_LEN, _F3_WID) + ' ' +
@@ -65886,6 +66114,10 @@ function _fwField3D(o) {
     }
   }
 
+  // FLOODS -- the light lands here, over the turf and under everything that
+  // is painted on it.
+  s += _f3LightPools();
+
   // End zones in team colour, with the abbreviation painted on the grass.
   s += '<polygon points="' + _f3Quad(0, EZ) + '" fill="' + awayCol + '" opacity="0.62"/>';
   s += '<polygon points="' + _f3Quad(_F3_LEN - EZ, _F3_LEN) + '" fill="' + homeCol +
@@ -65897,19 +66129,25 @@ function _fwField3D(o) {
   // Home crest at the 50, under the paint.
   if (o.homeLogo) {
     var mid = _f3Proj(60, _F3_WID / 2);
-    // Painted into the turf rather than laid on top of it. Plain opacity only
-    // made the crest PALER against a dark field, which is the opposite of
-    // what paint does, so the colour channels are knocked down as well. The
-    // alpha has to stay low with them: a first pass at 0.62 turned a solid
-    // crest into a black puck, which is worse than the pale ghost it
-    // replaced. Dark and faint, so the shape reads without competing.
+    // CREST -- bigger, and lying in the turf rather than pasted flat on it.
+    // The earlier version was drawn straight in screen space, so it kept its
+    // square aspect while everything around it was foreshortened; at this
+    // size that would read as a sticker. It now takes the same squash the
+    // yard numbers take, which is what puts it ON the ground.
+    //
+    // The colour knock-down is mostly gone. It was there to stop the crest
+    // competing with the paint, but the floodlights now light the middle of
+    // the field, and a midfield logo under lights is the brightest thing on
+    // it. A little is kept so it still looks like paint and not a decal.
+    var _ck = 1 - _F3_SHRINK * 0.5;
     s += '<defs><filter id="f3turf" x="-10%" y="-10%" width="120%" height="120%">' +
       '<feColorMatrix type="matrix" values="' +
-      '0.45 0 0 0 0  0 0.45 0 0 0  0 0 0.45 0 0  0 0 0 0.30 0"/>' +
+      '0.92 0 0 0 0  0 0.92 0 0 0  0 0 0.92 0 0  0 0 0 0.78 0"/>' +
       '</filter></defs>';
-    s += '<image href="' + o.homeLogo + '" x="' + _f3n(mid[0] - 11) + '" y="' +
-      _f3n(mid[1] - 6) + '" width="22" height="12" filter="url(#f3turf)"' +
-      ' preserveAspectRatio="xMidYMid meet"/>';
+    s += '<g transform="translate(' + _f3n(mid[0]) + ',' + _f3n(mid[1]) +
+      ') scale(' + _f3n(_ck) + ',' + _f3n(_ck * 0.52) + ')">' +
+      '<image href="' + o.homeLogo + '" x="-19" y="-19" width="38" height="38"' +
+      ' filter="url(#f3turf)" preserveAspectRatio="xMidYMid meet"/></g>';
   }
 
   // Every five yards a line; every ten a heavier one. Goal lines heaviest.
@@ -69675,21 +69913,9 @@ function renderRinkStadium() {
   var awayTheme = nhlArenaTheme(game.away.abbr);
   var awayAccent = (function() {
     var primary = (awayTheme && awayTheme.accent) || vibrant(game.away.color) || '#fff';
-    var ha = theme.accent.replace('#',''), pa = primary.replace('#','');
-    if (ha.length === 6 && pa.length === 6) {
-      var r1=parseInt(ha.slice(0,2),16),g1=parseInt(ha.slice(2,4),16),b1=parseInt(ha.slice(4,6),16);
-      var r2=parseInt(pa.slice(0,2),16),g2=parseInt(pa.slice(2,4),16),b2=parseInt(pa.slice(4,6),16);
-      if (Math.sqrt((r1-r2)*(r1-r2)+(g1-g2)*(g1-g2)+(b1-b2)*(b1-b2)) < 100 && awayTheme && awayTheme.alt) {
-        // ACCFLOOR -- only if the alt is a colour that can be made to read.
-        var _altOk = true;
-        if (typeof _stHsl === 'function') {
-          var _ac = _stHsl(awayTheme.alt);
-          _altOk = !!(_ac && _ac.chroma >= 0.04);
-        }
-        if (_altOk) return awayTheme.alt;
-      }
-    }
-    return primary;
+    // HUECLASH -- one shared judgement of what counts as a clash, and one
+    // shared rule for what to do about it.
+    return _acPickAway(theme.accent, primary, awayTheme && awayTheme.alt);
   })();
   // ACCFLOOR -- the arena theme hands out a fixed hex per club and several
   // of those are navies that measure under 3:1 on this background. Every
@@ -71012,16 +71238,8 @@ function renderRinkBoxScore(data, game) {
   var ac = (_awayTheme && _awayTheme.accent) || vibrant(game.away.color) || '#fff';
   // Clash guard: if the away accent is too close to the home accent, use the
   // away team's alternate color (same logic the scoreboard uses).
-  (function() {
-    var ha = String(hc).replace('#',''), pa = String(ac).replace('#','');
-    if (ha.length === 6 && pa.length === 6) {
-      var r1=parseInt(ha.slice(0,2),16),g1=parseInt(ha.slice(2,4),16),b1=parseInt(ha.slice(4,6),16);
-      var r2=parseInt(pa.slice(0,2),16),g2=parseInt(pa.slice(2,4),16),b2=parseInt(pa.slice(4,6),16);
-      if (Math.sqrt((r1-r2)*(r1-r2)+(g1-g2)*(g1-g2)+(b1-b2)*(b1-b2)) < 100 && _awayTheme && _awayTheme.alt) {
-        ac = _awayTheme.alt;
-      }
-    }
-  })();
+  // HUECLASH -- the same rule the scoreboard uses, so the box score agrees.
+  ac = _acPickAway(hc, ac, _awayTheme && _awayTheme.alt);
 
   var sides = [
     { box: boxPlayers.find(function(t) { return t.team?.id === game.away.id; }) || boxPlayers[0], label: game.away.abbr, logo: game.away.logo, color: ac, side: 'away' },
@@ -71589,7 +71807,7 @@ var NBA_ARENA_THEMES = {
     bgImage:"repeating-linear-gradient(135deg,rgba(254,197,36,0.07) 0px,rgba(254,197,36,0.07) 1px,transparent 1px,transparent 22px)" },
   DET:{ name:'Little Caesars Arena',     nickname:'THE LITTLE CAESAR',     city:'Detroit, MI',    est:2017, bg:'#0a0008', accent:'#c8102e', alt:'#1d42ba', divider:'dashed',
     bgImage:"repeating-linear-gradient(90deg,rgba(200,16,46,0.07) 0px,rgba(200,16,46,0.07) 1px,transparent 1px,transparent 22px)" },
-  GSW:{ name:'Chase Center',             nickname:'CHASE CENTER',          city:'San Francisco, CA',est:2019, bg:'#040d1c', accent:'#1d428a', alt:'#ffc72c', divider:'wave',
+  GSW:{ name:'Chase Center',             nickname:'CHASE CENTER',          city:'San Francisco, CA',est:2019, bg:'#040d1c', accent:'#ffc72c', alt:'#1d428a', divider:'wave',
     bgImage:"radial-gradient(ellipse 100% 30% at 50% 110%,rgba(255,199,44,0.13) 0%,transparent 60%)" },
   HOU:{ name:'Toyota Center',            nickname:'THE TOYOTA CENTER',     city:'Houston, TX',    est:2003, bg:'#0e0008', accent:'#ce1141', alt:'#c4ced4', divider:'dashed',
     bgImage:"repeating-linear-gradient(135deg,rgba(206,17,65,0.07) 0px,rgba(206,17,65,0.07) 1px,transparent 1px,transparent 22px)" },
@@ -72190,22 +72408,11 @@ function renderGymStadium() {
   var awayThemeColor = (function() {
     var t = nbaArenaTheme(game.away.abbr, game.league);
     var primary = (t && t.accent) || vibrant(game.away.color) || '#fff';
-    // Clash detection
-    var ha = theme.accent.replace('#','');
-    var pa = primary.replace('#','');
-    if (ha.length === 6 && pa.length === 6) {
-      var r1=parseInt(ha.slice(0,2),16),g1=parseInt(ha.slice(2,4),16),b1=parseInt(ha.slice(4,6),16);
-      var r2=parseInt(pa.slice(0,2),16),g2=parseInt(pa.slice(2,4),16),b2=parseInt(pa.slice(4,6),16);
-      var dist = Math.sqrt((r1-r2)*(r1-r2)+(g1-g2)*(g1-g2)+(b1-b2)*(b1-b2));
-      if (dist < 100 && t && t.alt) {
-        var ah = t.alt.replace('#','');
-        if (ah.length === 6) {
-          var rv=parseInt(ah.slice(0,2),16)/255,gv=parseInt(ah.slice(2,4),16)/255,bv=parseInt(ah.slice(4,6),16)/255;
-          if (0.2126*rv+0.7152*gv+0.0722*bv >= 0.08) return t.alt;
-        }
-      }
-    }
-    return primary;
+    // HUECLASH -- this was the reported case: Sacramento's purple measured 65
+    // RGB units from Golden State's navy, the old test called that a clash,
+    // and the purple was replaced by the grey-blue alternate. Both sides then
+    // painted blue. Hue separation says 52 degrees, which is two colours.
+    return _acPickAway(theme.accent, primary, t && t.alt);
   })();
   var homeAccent = theme.accent;
   if (typeof _stAccentFloor === 'function') {   // ACCFLOOR
@@ -75942,16 +76149,8 @@ function renderGymBoxScore(data, game, isV) {
   var _gAwayTheme = (typeof nbaArenaTheme === 'function' && nbaArenaTheme(game.away.abbr, game.league)) || null;
   var hc = (_gHomeTheme && _gHomeTheme.accent) || vibrant(game.home.color) || '#fff';
   var ac = (_gAwayTheme && _gAwayTheme.accent) || vibrant(game.away.color) || '#fff';
-  (function() {
-    var ha = String(hc).replace('#',''), pa = String(ac).replace('#','');
-    if (ha.length === 6 && pa.length === 6) {
-      var r1=parseInt(ha.slice(0,2),16),g1=parseInt(ha.slice(2,4),16),b1=parseInt(ha.slice(4,6),16);
-      var r2=parseInt(pa.slice(0,2),16),g2=parseInt(pa.slice(2,4),16),b2=parseInt(pa.slice(4,6),16);
-      if (Math.sqrt((r1-r2)*(r1-r2)+(g1-g2)*(g1-g2)+(b1-b2)*(b1-b2)) < 100 && _gAwayTheme && _gAwayTheme.alt) {
-        ac = _gAwayTheme.alt;
-      }
-    }
-  })();
+  // HUECLASH -- same rule as the scoreboard above.
+  ac = _acPickAway(hc, ac, _gAwayTheme && _gAwayTheme.alt);
   
   var sides = [
     { box: boxPlayers.find(function(t) { return t.team?.id === game.away.id; }) || boxPlayers[0], label: game.away.abbr, logo: game.away.logo, color: ac, side: 'away' },
@@ -82995,6 +83194,85 @@ function stTheme(abbr, teamName) {
 // accent — UNLESS it's too similar to the opposing (home) team's
 // accent, in which case alt is used to differentiate. Home team always
 // gets their accent unchanged.
+// ---- do two team colours read as the same colour? -- HUECLASH ----------
+// The old test was the euclidean distance between the two colours in RGB,
+// under 100 units meaning "too close". RGB distance is not a measure of
+// how alike two colours LOOK, because it mixes up hue and brightness:
+//
+//   Golden State navy #1d428a and Sacramento purple #5a2d81 are 65 units
+//   apart, so the test fired and threw Sacramento's purple away for its
+//   grey-blue alternate -- which really IS the same colour as the navy.
+//   The check meant to keep the two sides distinct is what made them match.
+//
+//   The reverse happens too: a navy and a sky blue of the same hue are far
+//   apart in RGB and sail through, even though both read as "the blue team".
+//
+// What actually separates two accents on the page is the angle between
+// their hues and the gap in how bright they are. Both are measured on the
+// colours as they will be PAINTED -- after the contrast floor -- because
+// that is what the eye gets, not the club's registered hex.
+function _acHueGap(a, b) {
+  if (typeof _stHsl !== 'function') return 180;
+  var ca = _stHsl(a), cb = _stHsl(b);
+  if (!ca || !cb) return 180;
+  var d = Math.abs(ca.h - cb.h);
+  return (d > 180) ? (360 - d) : d;
+}
+
+// Calibrated against every matchup in the four leagues the stadiums cover.
+// The pairs that genuinely read as one colour -- two navies, two golds, a
+// wine and a red, an orange and a gold -- all sit inside 25 degrees. The
+// pairs that do NOT, and were being broken up for nothing, sit outside it:
+// a red and an orange are 28 apart, a navy and a purple 52. Degrees of hue
+// are not evenly spaced perceptually, so this is a measured number rather
+// than a round one.
+var _AC_HUE_MIN = 25;    // degrees of hue that count as different colours
+var _AC_LUM_MIN = 1.9;   // or this much difference in brightness alone
+var _AC_GREY = 0.12;     // chroma below this reads as a neutral, not a hue
+
+function _acClash(a, b) {
+  if (!a || !b) return false;
+  if (typeof _stHsl !== 'function' || typeof _luminance !== 'function') {
+    // No colour maths available: fall back to the old behaviour rather than
+    // claiming two colours are fine when nothing has looked at them.
+    return (typeof _colorDistance === 'function') ? _colorDistance(a, b) < 100 : false;
+  }
+  var A = (typeof _stAccentFloor === 'function') ? _stAccentFloor(a) : a;
+  var B = (typeof _stAccentFloor === 'function') ? _stAccentFloor(b) : b;
+  var ca = _stHsl(A), cb = _stHsl(B);
+  if (!ca || !cb) return false;
+  var la = _luminance(A), lb = _luminance(B);
+  var lum = (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
+  var greyA = ca.chroma < _AC_GREY, greyB = cb.chroma < _AC_GREY;
+  // A neutral beside a coloured accent never reads as the same team, however
+  // close the two happen to sit in RGB -- Brooklyn's grey next to the Lakers'
+  // purple was being swapped out for white on exactly that mistake.
+  if (greyA !== greyB) return false;
+  // Two neutrals have no hue to tell them apart, so brightness has to.
+  if (greyA && greyB) return lum < 1.6;
+  return _acHueGap(A, B) < _AC_HUE_MIN && lum < _AC_LUM_MIN;
+}
+
+// The away side's display colour. Its own primary unless that really does
+// read as the home accent; then its alternate, but only when the alternate
+// is a colour that can be made readable AND is itself distinct. A club whose
+// alternate is black has no second option, and a near-match is still better
+// than text nobody can see, so the primary stays.
+function _acPickAway(homeAccent, primary, alt) {
+  if (!primary) return primary;
+  if (!homeAccent || !_acClash(homeAccent, primary)) return primary;
+  if (!alt) return primary;
+  if (typeof _stHsl === 'function') {
+    var c = _stHsl(alt);
+    if (!c) return primary;
+    // No chroma and dark: lifting it yields grey, so there is nothing to use.
+    if (c.chroma < 0.04 && typeof _luminance === 'function' &&
+        ((_luminance(alt) + 0.05) / 0.07) < 3.0) return primary;
+  }
+  if (_acClash(homeAccent, alt)) return primary;
+  return alt;
+}
+
 function _colorDistance(h1, h2) {
   h1 = h1.replace('#',''); h2 = h2.replace('#','');
   if (h1.length !== 6 || h2.length !== 6) return 999;
@@ -83238,10 +83516,10 @@ function _teamColorFor(abbr, isAway, opposingAccent, teamName) {  var t = stThem
   if (!isAway) return primary;
   // Away team: switch off the primary when it clashes with the home accent so
   // the two teams never read as the same color (e.g. CIN red vs ATL red).
-  if (opposingAccent && _colorDistance(primary, opposingAccent) < 100) {
+  if (opposingAccent && _acClash(primary, opposingAccent)) {   // HUECLASH
     // Prefer the team's own alt — but only if it's readable AND doesn't itself
     // clash with the home accent.
-    if (alt && _isReadable(alt) && _colorDistance(alt, opposingAccent) >= 100) {
+    if (alt && _isReadable(alt) && !_acClash(alt, opposingAccent)) {
       return alt;
     }
     // No usable alt (e.g. CIN's alt is black): fall back to a neutral light
@@ -94197,7 +94475,8 @@ function renderFenwayBoxScore(bx, game) {
         var _lit = _lightenToReadable(_awHex);
         if (_lit) _awHex = _lit;
       }
-      var _clash = (typeof _colorDistance === 'function') && _colorDistance(_awHex, _bxHomeAccent) < 100;
+      var _clash = (typeof _acClash === 'function') ? _acClash(_awHex, _bxHomeAccent)
+        : ((typeof _colorDistance === 'function') && _colorDistance(_awHex, _bxHomeAccent) < 100);   // HUECLASH
       _bxAwayAccent = _clash ? '#d4d4d8' : _awHex;
     }
   }
@@ -136162,6 +136441,84 @@ function _vbpPlayerShape(j, say) {
       say('    group 0 keys: ' + _vbpKeys(grp[0]).join(', '));
     }
   }
+}
+
+function skProbeTeamColors() {
+  var L = [];
+  function say(t) { L.push(t == null ? '' : String(t)); }
+  function flush() { if (typeof _skGpProbeShow === 'function') _skGpProbeShow(L.join('\n')); }
+
+  say('TEAM COLOUR PROBE');
+  say('');
+  say('Women\'s college volleyball had every team rendering the same blue,');
+  say('because ESPN\'s scoreboard for it carries no team colours and the app');
+  say('falls back to one slate for all of them. The fix reads the colours');
+  say('from the per-sport TEAMS endpoint instead. This says whether that');
+  say('endpoint is actually carrying them.');
+  say('');
+  flush();
+
+  var leagues = ['NCAAWVB', 'NCAAMB', 'NCAAFB'];
+  var open = (typeof courtGame !== 'undefined' && courtGame && courtGame.league) ?
+    String(courtGame.league) : null;
+  if (open && leagues.indexOf(open) < 0) leagues.unshift(open);
+
+  function one(lg) {
+    var cfg = (typeof LEAGUES !== 'undefined') && LEAGUES[lg];
+    if (!cfg || !cfg.sport || !cfg.slug) {
+      say(lg + ': not an ESPN league in this build');
+      return Promise.resolve();
+    }
+    var url = 'https://site.api.espn.com/apis/site/v2/sports/' + cfg.sport + '/' +
+      cfg.slug + '/teams?limit=900';
+    return fetch(url).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    }).then(function (d) {
+      var rows = (d && d.sports && d.sports[0] && d.sports[0].leagues &&
+        d.sports[0].leagues[0] && d.sports[0].leagues[0].teams) || [];
+      var withCol = 0, withAlt = 0, i, t, samples = [];
+      for (i = 0; i < rows.length; i++) {
+        t = rows[i].team || rows[i];
+        if (!t) continue;
+        if (_usableAccent(t.color)) withCol++;
+        else if (_usableAccent(t.alternateColor)) withAlt++;
+        if (samples.length < 4 && t.abbreviation && (t.color || t.alternateColor)) {
+          samples.push('  ' + t.abbreviation + '  ' + (t.color || '-') +
+            '  alt ' + (t.alternateColor || '-'));
+        }
+      }
+      say('== ' + lg + ' ==');
+      say('  ' + rows.length + ' teams listed');
+      say('  ' + withCol + ' with a usable primary, ' + withAlt + ' more via alternate');
+      if (samples.length) { say('  sample:'); for (i = 0; i < samples.length; i++) say(samples[i]); }
+      if (!rows.length) say('  -> the endpoint returned no teams at all.');
+      else if (!withCol && !withAlt) say('  -> teams come back, but with NO colours. Nothing to use.');
+      else say('  -> colours are there; this league will paint in its own colours.');
+      say('');
+    })['catch'](function (e) {
+      say('== ' + lg + ' ==');
+      say('  request failed: ' + (e && e.message ? e.message : e));
+      say('');
+    });
+  }
+
+  var chain = Promise.resolve();
+  leagues.forEach(function (lg) {
+    chain = chain.then(function () { return one(lg); }).then(flush);
+  });
+  chain.then(function () {
+    var cache = null;
+    try { cache = JSON.parse(localStorage.getItem('gd_teamcolors_v1') || '{}'); } catch (e) {}
+    say('== what is cached on this phone now ==');
+    var keys = cache ? Object.keys(cache) : [];
+    if (!keys.length) say('  nothing yet');
+    for (var i = 0; i < keys.length; i++) {
+      var n = (cache[keys[i]] && cache[keys[i]].t) ? Object.keys(cache[keys[i]].t).length : 0;
+      say('  ' + keys[i] + ': ' + n + ' teams');
+    }
+    flush();
+  });
 }
 
 function skProbeVolleyballPlays() {
