@@ -24357,7 +24357,53 @@
     color: var(--sk-gold);
     font-weight: 700;
   }
-  /* SEASONCTX -- the verdict under the ledger */
+  /* MOVES -- last week's adds and drops */
+.sk-briefing-moves {
+  margin: 0 16px 14px; padding: 14px 16px 12px; border-radius: 10px;
+  background: rgba(255,255,255,0.025); border: 1px solid rgba(255,255,255,0.06);
+}
+.sk-bm-sub {
+  display: flex; align-items: baseline; gap: 8px;
+  font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 500;
+  letter-spacing: 0.04em; color: rgba(255,255,255,0.34); margin-bottom: 10px;
+}
+.sk-bm-net { margin-left: auto; font-size: 12px; font-weight: 700; color: rgba(255,255,255,0.5); }
+.sk-bm-net.up { color: #6ee7a0; }
+.sk-bm-net.down { color: #f08a8a; }
+.sk-bm-league {
+  font-family: 'JetBrains Mono', monospace; font-size: 9px; font-weight: 600;
+  letter-spacing: 0.1em; text-transform: uppercase;
+  color: rgba(255,255,255,0.28); margin: 10px 0 4px;
+}
+.sk-bm-league:first-of-type { margin-top: 0; }
+.sk-bm-row {
+  display: flex; align-items: baseline; gap: 7px; padding: 3px 0;
+  font-size: 12.5px; color: rgba(245,240,228,0.76);
+}
+.sk-bm-ico {
+  flex: 0 0 auto; width: 13px; text-align: center; font-size: 11px;
+  font-weight: 700; color: rgba(255,255,255,0.3);
+}
+.sk-bm-ico.add { color: #6ee7a0; }
+.sk-bm-ico.drop { color: #f08a8a; }
+.sk-bm-name { flex: 1 1 auto; min-width: 0; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.sk-bm-swap { flex: 1 1 auto; min-width: 0; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.sk-bm-swap b { font-weight: 700; color: rgba(245,240,228,0.95); }
+.sk-bm-for { color: rgba(255,255,255,0.26); margin: 0 5px; font-size: 10.5px; }
+.sk-bm-pts, .sk-bm-delta {
+  flex: 0 0 auto; font-family: 'JetBrains Mono', monospace; font-size: 11.5px;
+  font-weight: 600; color: rgba(255,255,255,0.55);
+}
+.sk-bm-delta.up { color: #6ee7a0; }
+.sk-bm-delta.down { color: #f08a8a; }
+.sk-bm-note {
+  margin-top: 9px; font-family: 'JetBrains Mono', monospace; font-size: 9px;
+  font-weight: 500; letter-spacing: 0.04em; color: rgba(255,255,255,0.24);
+}
+
+/* SEASONCTX -- the verdict under the ledger */
 .sk-briefing-hero-verdict {
   margin-top: 14px; padding-top: 12px;
   border-top: 1px solid rgba(255,255,255,0.07);
@@ -128388,13 +128434,27 @@ function _skLoadBriefingData() {
     var seasonP = (myTeamKeyForSeason && typeof _skFetchSeasonMatchups === 'function')
       ? _skFetchSeasonMatchups(myTeamKeyForSeason).catch(function() { return null; })
       : Promise.resolve(null);
-    return Promise.all([sbP, settingsP, seasonP])
+    // MOVES -- the league's add/drop log. Yahoo will not filter it by
+    // team, so the whole log comes back and _skMovesParse picks out mine.
+    var txP = fyApi('/league/' + key + '/transactions;types=add,drop;count=100')
+      .then(function (r) { return r; }, function () { return null; });
+    return Promise.all([sbP, settingsP, seasonP, txP])
       .then(function(arr) {
         var res = arr[0];
         var myTeamKey = myTeamKeyForSeason;
         var result = _skParseLastWeekMyMatchup(res, myTeamKey, _skBriefScoring(league));
         var weeklyResults = arr[2]; // array of {week, result:'W'/'L'/'T', ...}
-        skBriefingCache[key] = { lastWeekResult: result, weeklyResults: weeklyResults || [], ts: Date.now() };
+        // MOVES -- mine, inside the week being recapped.
+        var moves = [];
+        try {
+          moves = _skMovesParse(arr[3], myTeamKey, _skMovesWindow());
+        } catch (eMv) { moves = []; }
+        skBriefingCache[key] = { lastWeekResult: result, weeklyResults: weeklyResults || [],
+          moves: moves, movesFp: null, ts: Date.now() };
+        if (!moves.length) return null;
+        return _skMovesFetchFp(key, moves, lastWeek).then(function (fpMap) {
+          if (skBriefingCache[key]) skBriefingCache[key].movesFp = fpMap || {};
+        }, function () {});
       })
       .catch(function(e) {
         skBriefingCache[key] = { error: e.message || 'fetch failed', ts: Date.now() };
@@ -128476,6 +128536,9 @@ function skRenderBriefing() {
 
   // ── Streaks ─────────────────────────────────────────────────
   html += _skBuildBriefingStreaksHTML(entries);
+
+  // ── Last week's moves ───────────────────────────────────────
+  html += _skBuildBriefingMovesHTML(entries);
 
   // ── Coming Up ───────────────────────────────────────────────
   html += _skBuildBriefingComingUpHTML(entries);
@@ -128710,6 +128773,229 @@ function _skBriefPctStr(p) {
   var v = Math.round(p * 1000);
   if (v >= 1000) return '1.000';
   return '.' + ('00' + v).slice(-3);
+}
+
+// ---------------------------------------------------------------
+// LAST WEEK'S MOVES -- MOVES --
+// What you did to your rosters last week, and what it was worth.
+//
+// The unit is Yahoo's TRANSACTION, not the player. An add/drop is one
+// decision recorded as one transaction, and that makes it the only
+// place in the whole feed with a counterfactual already attached: you
+// chose this man over that one, on the same day, for the same slot.
+// Comparing those two scores is a real grade. Comparing a lone add
+// against nothing is just a number, so a lone add is shown as one.
+//
+// What the numbers ARE, exactly: each player's fantasy points for the
+// week being recapped, whole. Not "points he scored for you" -- a
+// Saturday pickup is credited with his Tuesday too. Making that honest
+// needs a per-DATE read for every player moved, which is seven calls a
+// league instead of one, and the label says what is actually measured.
+// ---------------------------------------------------------------
+
+// The recapped week as unix seconds, from the same range the masthead
+// prints. Built from local midnights because a Yahoo timestamp is an
+// instant and the week is the user's, not UTC's.
+function _skMovesWindow() {
+  var r = _skLastWeekRange();
+  function mid(iso, plusDays) {
+    var p = String(iso).split('-');
+    var d = new Date(parseInt(p[0], 10), parseInt(p[1], 10) - 1,
+      parseInt(p[2], 10) + (plusDays || 0));
+    return Math.floor(d.getTime() / 1000);
+  }
+  return { from: mid(r.start, 0), to: mid(r.end, 1) };
+}
+
+// name + key out of a transaction's player entry
+function _skMovesPlayer(p) {
+  var arr = p && p[0];
+  if (!Array.isArray(arr)) return null;
+  var out = { key: '', name: '' }, i, f;
+  for (i = 0; i < arr.length; i++) {
+    f = arr[i];
+    if (!f || typeof f !== 'object') continue;
+    if (f.player_key) out.key = String(f.player_key);
+    if (f.name && f.name.full) out.name = String(f.name.full);
+  }
+  return out.key ? out : null;
+}
+
+// MY adds and drops inside the window, kept as whole transactions.
+function _skMovesParse(res, myTeamKey, win) {
+  var out = [];
+  if (!res || res.error || !myTeamKey) return out;
+  try {
+    var parts = _yahooArr(res.fantasy_content.league), txs = null, i;
+    for (i = 0; i < parts.length; i++) if (parts[i] && parts[i].transactions) txs = parts[i].transactions;
+    if (!txs) return out;
+    var n = parseInt(txs.count, 10) || 0, j;
+    for (j = 0; j < n; j++) {
+      var t = txs[String(j)] && txs[String(j)].transaction;
+      if (!t) continue;
+      var tArr = Array.isArray(t) ? t : [t];
+      var meta = tArr[0] || {};
+      if (meta.status && meta.status !== 'successful') continue;
+      var ts = parseInt(meta.timestamp, 10);
+      if (!ts || ts < win.from || ts >= win.to) continue;
+      var pl = tArr[1] && tArr[1].players;
+      if (!pl) continue;
+      var adds = [], drops = [], pc = parseInt(pl.count, 10) || 0, k;
+      for (k = 0; k < pc; k++) {
+        var pe = pl[String(k)] && pl[String(k)].player;
+        if (!pe) continue;
+        var who = _skMovesPlayer(pe);
+        if (!who) continue;
+        // transaction_data sits somewhere after the player's field list
+        var td = null, q;
+        for (q = 1; q < pe.length; q++) if (pe[q] && pe[q].transaction_data) td = pe[q].transaction_data;
+        if (!td) continue;
+        var tdArr = Array.isArray(td) ? td : [td], z;
+        for (z = 0; z < tdArr.length; z++) {
+          var d = tdArr[z] || {};
+          if (d.destination_team_key === myTeamKey) adds.push(who);
+          else if (d.source_team_key === myTeamKey) drops.push(who);
+        }
+      }
+      if (adds.length || drops.length) out.push({ ts: ts, adds: adds, drops: drops });
+    }
+  } catch (e) {}
+  out.sort(function (a, b) { return a.ts - b.ts; });
+  return out;
+}
+
+// Last week's points for everyone moved, in one call where Yahoo allows.
+function _skMovesFetchFp(leagueKey, moves, week) {
+  var keys = [], seen = {}, i, j, all;
+  for (i = 0; i < moves.length; i++) {
+    all = moves[i].adds.concat(moves[i].drops);
+    for (j = 0; j < all.length; j++) {
+      if (all[j].key && !seen[all[j].key]) { seen[all[j].key] = 1; keys.push(all[j].key); }
+    }
+  }
+  if (!keys.length || typeof _skCmpFetchFp !== 'function') return Promise.resolve({});
+  var type = 'week;week=' + week;
+  return _skCmpFetchFp(leagueKey, keys, type).then(function (map) {
+    map = map || {};
+    // A man you dropped is on waivers, and Yahoo leaves the points off a
+    // waiver player when the same batch also carries free agents -- The
+    // Wire hit this first and the cure is the same: ask again, one at a
+    // time, only for the ones that came back empty. Capped, because this
+    // is a recap and not worth a dozen round trips.
+    var missing = [], m;
+    for (m = 0; m < keys.length; m++) if (map[keys[m]] == null) missing.push(keys[m]);
+    if (!missing.length) return map;
+    return Promise.all(missing.slice(0, 8).map(function (k) {
+      return _skCmpFetchFp(leagueKey, [k], type).then(function (one) {
+        if (one && one[k] != null) map[k] = one[k];
+      }, function () {});
+    })).then(function () { return map; });
+  }, function () { return {}; });
+}
+
+// First initial plus surname, for the swap row only. Two full names and
+// two scores do not fit a phone, and when they overflow it is the second
+// man's SCORE that gets cut -- which is the half of the comparison the
+// row exists to make. Single-player rows have the width, and keep the
+// whole name.
+function _skMovesShort(name) {
+  var n = String(name || '').trim();
+  var sp = n.indexOf(' ');
+  if (sp < 1) return n;
+  return n.charAt(0) + '. ' + n.slice(sp + 1);
+}
+
+function _skMovesNum(v) {
+  return (v == null || isNaN(v)) ? null : Math.round(Number(v) * 10) / 10;
+}
+function _skMovesPts(v) {
+  var n = _skMovesNum(v);
+  return (n == null) ? String.fromCharCode(8212) : n.toFixed(1);
+}
+
+// -- the section ------------------------------------------------
+function _skBuildBriefingMovesHTML(entries) {
+  var blocks = '', nMoves = 0, inTot = 0, outTot = 0, haveAny = false;
+
+  entries.forEach(function (e) {
+    var key = e.league.league_key;
+    var cached = skBriefingCache[key];
+    var moves = cached && cached.moves;
+    if (!moves || !moves.length) return;
+    var fp = (cached && cached.movesFp) || {};
+    var rows = '';
+
+    moves.forEach(function (m) {
+      nMoves++;
+      var a, d, i;
+      for (i = 0; i < m.adds.length; i++) {
+        a = _skMovesNum(fp[m.adds[i].key]);
+        if (a != null) { inTot += a; haveAny = true; }
+      }
+      for (i = 0; i < m.drops.length; i++) {
+        d = _skMovesNum(fp[m.drops[i].key]);
+        if (d != null) { outTot += d; haveAny = true; }
+      }
+
+      // One in, one out, one decision: the only row that earns a verdict.
+      if (m.adds.length === 1 && m.drops.length === 1) {
+        var av = _skMovesNum(fp[m.adds[0].key]);
+        var dv = _skMovesNum(fp[m.drops[0].key]);
+        var delta = (av == null || dv == null) ? null : Math.round((av - dv) * 10) / 10;
+        var cls = (delta == null) ? '' : (delta > 0 ? ' up' : (delta < 0 ? ' down' : ''));
+        rows += '<div class="sk-bm-row">' +
+          '<span class="sk-bm-ico swap">' + String.fromCharCode(8644) + '</span>' +
+          '<span class="sk-bm-swap">' +
+            '<b>' + skEscape(_skMovesShort(m.adds[0].name)) + '</b> ' +
+              _skMovesPts(fp[m.adds[0].key]) +
+            '<span class="sk-bm-for">for</span>' +
+            skEscape(_skMovesShort(m.drops[0].name)) + ' ' +
+              _skMovesPts(fp[m.drops[0].key]) +
+          '</span>' +
+          (delta == null ? '' : '<span class="sk-bm-delta' + cls + '">' +
+            (delta > 0 ? '+' : '') + delta.toFixed(1) + '</span>') +
+          '</div>';
+        return;
+      }
+      // Anything else is reported, not graded.
+      m.adds.forEach(function (p) {
+        rows += '<div class="sk-bm-row">' +
+          '<span class="sk-bm-ico add">+</span>' +
+          '<span class="sk-bm-name">' + skEscape(p.name) + '</span>' +
+          '<span class="sk-bm-pts">' + _skMovesPts(fp[p.key]) + '</span></div>';
+      });
+      m.drops.forEach(function (p) {
+        rows += '<div class="sk-bm-row">' +
+          '<span class="sk-bm-ico drop">' + String.fromCharCode(8722) + '</span>' +
+          '<span class="sk-bm-name">' + skEscape(p.name) + '</span>' +
+          '<span class="sk-bm-pts">' + _skMovesPts(fp[p.key]) + '</span></div>';
+      });
+    });
+
+    if (rows) {
+      blocks += '<div class="sk-bm-league">' + skEscape(e.league.name || '') + '</div>' + rows;
+    }
+  });
+
+  if (!nMoves) return '';
+  inTot = Math.round(inTot * 10) / 10;
+  outTot = Math.round(outTot * 10) / 10;
+  var net = Math.round((inTot - outTot) * 10) / 10;
+  var sub = nMoves + ' move' + (nMoves === 1 ? '' : 's');
+  if (haveAny) {
+    sub += ' ' + String.fromCharCode(183) + ' in ' + inTot.toFixed(1) +
+      ', out ' + outTot.toFixed(1);
+  }
+  var netCls = net > 0 ? ' up' : (net < 0 ? ' down' : '');
+  return '<div class="sk-briefing-moves">' +
+    '<div class="sk-briefing-section-head">LAST WEEK' + String.fromCharCode(8217) + 'S MOVES</div>' +
+    '<div class="sk-bm-sub">' + sub +
+      (haveAny ? '<span class="sk-bm-net' + netCls + '">' +
+        (net > 0 ? '+' : '') + net.toFixed(1) + '</span>' : '') +
+    '</div>' +
+    blocks +
+    (haveAny ? '<div class="sk-bm-note">points each player scored last week, whole</div>' : '') +
+  '</div>';
 }
 
 function _skBuildBriefingHeroCardHTML(entries) {
