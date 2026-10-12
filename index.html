@@ -127793,36 +127793,164 @@ var skBriefingFetchInFlight = false;
 // of day-of-week AND ignores any prior dismissal — useful for
 // testing the briefing on non-Mondays without having to clear
 // localStorage on mobile.
-// What a Monday edition recaps: head-to-head leagues whose week has
-// actually finished. Returns the leagues AND what was deliberately held
-// back, so the page can say so rather than quietly coming up short.
+// ---------------------------------------------------------------
+// THE TUESDAY EDITION -- FBEDITION --
+// Football gets its own morning, because its week ends on a different
+// night to everybody else's.
 //
-// Football is held back. A Yahoo football week runs Tuesday to Monday,
-// so at Monday breakfast the current week still has Monday Night
-// Football in it, and the week before it closed eight days ago and was
-// recapped in the last edition. There is no football week that is both
-// finished and new on a Monday morning.
-function _skBriefingLeagues() {
+// A Yahoo football week runs TUESDAY to MONDAY. On Monday breakfast the
+// current one still has Monday Night Football in it and the one before
+// closed eight days ago, which is why the Monday edition sends football
+// away. Tuesday breakfast is the first moment a football week is both
+// finished and news, so that is when it runs.
+//
+// Which week closed is not guessed from current_week -- Yahoo's roll is
+// a moving target and the app has already been bitten by it. It is read
+// off /game/{key}/game_weeks, the official window list, by asking which
+// week contained YESTERDAY. On a Tuesday that is Monday, and Monday is
+// the closing day of the week just gone.
+// ---------------------------------------------------------------
+
+function _skDateStr(d) {
+  return d.getFullYear() + '-' +
+    ('0' + (d.getMonth() + 1)).slice(-2) + '-' + ('0' + d.getDate()).slice(-2);
+}
+function _skBriefYesterday() {
+  var d = new Date();
+  d.setDate(d.getDate() - 1);
+  return _skDateStr(d);
+}
+
+// Every H2H league, split by whether it keeps football's calendar.
+function _skBriefSplitLeagues() {
   var all = skSyncedLeagues().filter(function (l) {
     var s = l.scoring_type;
     return s === 'head' || s === 'headone' || s === 'headpoint';
   });
-  var leagues = [], held = [], i;
+  var football = [], other = [], i;
   for (i = 0; i < all.length; i++) {
-    if (typeof _skIsNflLeague === 'function' && _skIsNflLeague(all[i])) held.push(all[i]);
-    else leagues.push(all[i]);
+    if (typeof _skIsNflLeague === 'function' && _skIsNflLeague(all[i])) football.push(all[i]);
+    else other.push(all[i]);
   }
-  return { leagues: leagues, held: held };
+  return { football: football, other: other };
 }
 
+// Which edition today is, or null for a day with no edition. A day with
+// no leagues of its kind has no edition either -- a masthead over an
+// empty page is worse than no banner.
+function _skBriefEditionKind() {
+  var sp = _skBriefSplitLeagues();
+  var forced = _skBriefForcedKind();
+  if (forced === 'monday') return sp.other.length ? 'monday' : null;
+  if (forced === 'tuesday') return sp.football.length ? 'tuesday' : null;
+  if (forced === 'any') {
+    if (sp.other.length) return 'monday';
+    return sp.football.length ? 'tuesday' : null;
+  }
+  var d = new Date().getDay();
+  if (d === 1 && sp.other.length) return 'monday';
+  if (d === 2 && sp.football.length) return 'tuesday';
+  return null;
+}
+
+// ?briefing=preview forces an edition on any day, for testing on a
+// phone with no devtools. =monday and =tuesday name one.
+function _skBriefForcedKind() {
+  try {
+    var v = new URLSearchParams(location.search).get('briefing');
+    if (v === 'monday' || v === 'tuesday') return v;
+    if (v === 'preview') return 'any';
+  } catch (e) {}
+  return null;
+}
+
+// The football week that closed yesterday, with its own dates, straight
+// off Yahoo's schedule. null until game_weeks have loaded, which is a
+// couple of seconds after boot -- every caller has a fallback.
+function _skFbClosedWeek(leagueKey) {
+  var gk = String(leagueKey || '').split('.')[0];
+  var weeks = (typeof _skGameWeeksMem !== 'undefined') ? _skGameWeeksMem[gk] : null;
+  if (!weeks || !weeks.length) return null;
+  var y = _skBriefYesterday(), i;
+  for (i = 0; i < weeks.length; i++) {
+    if (y >= weeks[i].start && y <= weeks[i].end) {
+      return { week: weeks[i].week, start: weeks[i].start, end: weeks[i].end };
+    }
+  }
+  return null;
+}
+
+// The span this edition recaps. Monday's is the calendar week everybody
+// else plays; Tuesday's is football's own Tuesday-to-Monday window.
+function _skBriefRange() {
+  if (_skBriefEditionKind() !== 'tuesday') return _skLastWeekRange();
+  var fb = _skBriefSplitLeagues().football, i, w;
+  for (i = 0; i < fb.length; i++) {
+    w = _skFbClosedWeek(fb[i].league_key);
+    if (w) return { start: w.start, end: w.end };
+  }
+  // No schedule yet. A football week ends on a Monday and runs seven
+  // days, so yesterday closed it and it opened six days before that.
+  var d = new Date();
+  d.setDate(d.getDate() - 7);
+  return { start: _skDateStr(d), end: _skBriefYesterday() };
+}
+
+// Which week number to pull for one league. Football is asked of the
+// schedule; everybody else counts back one from the week they are in.
+function _skBriefRecapWeek(league, thisWeek) {
+  if (typeof _skIsNflLeague === 'function' && _skIsNflLeague(league)) {
+    var w = _skFbClosedWeek(league.league_key);
+    if (w && w.week) return w.week;
+  }
+  return thisWeek - 1;
+}
+
+// Masthead and banner wording, per edition.
+function _skBriefEditionCopy(kind) {
+  if (kind === 'tuesday') {
+    return { day: 'Tuesday', eyebrow: 'SKIPPER ' + String.fromCharCode(183) +
+      ' TUESDAY EDITION', banner: 'TUESDAY MORNING BRIEFING' };
+  }
+  return { day: 'Monday', eyebrow: 'SKIPPER ' + String.fromCharCode(183) +
+    ' MONDAY EDITION', banner: 'MONDAY MORNING BRIEFING' };
+}
+
+// What is NOT in this edition, and why. Monday holds football back
+// because it is still playing; Tuesday's other leagues are not missing,
+// they ran yesterday.
+function _skBriefHeldNote(kind, held) {
+  if (!held || !held.length) return '';
+  var n = held.length, s = (n === 1) ? '' : 's';
+  if (kind === 'tuesday') {
+    return n + ' other league' + s + ' ran in yesterday' +
+      String.fromCharCode(8217) + 's edition';
+  }
+  return n + ' football league' + s + ' still playing ' +
+    String.fromCharCode(183) + ' week closes tonight';
+}
+
+// What today's edition recaps, and what it is deliberately leaving out
+// so the page can say so rather than quietly coming up short. The shape
+// is the same either way; which side of the split goes where is the
+// only thing the edition changes.
+function _skBriefingLeagues() {
+  var sp = _skBriefSplitLeagues();
+  var kind = _skBriefEditionKind() || 'monday';
+  return (kind === 'tuesday')
+    ? { kind: 'tuesday', leagues: sp.football, held: sp.other }
+    : { kind: 'monday', leagues: sp.other, held: sp.football };
+}
+
+// Kept under its old name because the banner and the open path both
+// call it; what it answers is now "is there an edition today".
 function _skIsMondayBriefingActive() {
-  if (_skBriefingPreviewMode()) return true;
-  return new Date().getDay() === 1;
+  return !!_skBriefEditionKind();
 }
 function _skBriefingPreviewMode() {
   try {
-    var p = new URLSearchParams(location.search);
-    return p.get('briefing') === 'preview';
+    var p = new URLSearchParams(location.search).get('briefing');
+    return p === 'preview' || p === 'monday' || p === 'tuesday';
   } catch (e) { return false; }
 }
 
@@ -128233,8 +128361,9 @@ function skRenderBriefingBanner() {
   if (!_skIsMondayBriefingActive() || _skBriefingDismissedToday()) return;
   // Skip if user has no synced leagues — nothing to recap
   if (!skSyncedLeagues().length) return;
-  var range = _skLastWeekRange();
+  var range = _skBriefRange();
   var label = _skFormatBriefingDateRange(range);
+  var copy = _skBriefEditionCopy(_skBriefEditionKind());
   var banner = document.createElement('div');
   banner.id = 'skBriefingBanner';
   banner.className = 'sk-briefing-banner';
@@ -128242,7 +128371,7 @@ function skRenderBriefingBanner() {
     '<button class="sk-briefing-banner-tap" onclick="skOpenBriefing()" type="button">' +
       '<div class="sk-briefing-banner-eyebrow">' +
         '<span class="sk-briefing-banner-icon">\ud83d\udcf0</span>' +
-        '<span>MONDAY MORNING BRIEFING</span>' +
+        '<span>' + skEscape(copy.banner) + '</span>' +
       '</div>' +
       '<div class="sk-briefing-banner-tag">Last week: ' + skEscape(label) + ' \u00b7 tap for full recap \u2192</div>' +
     '</button>' +
@@ -128441,7 +128570,7 @@ function _skLoadBriefingData() {
       skRenderBriefing();
       return Promise.resolve();
     }
-    var lastWeek = thisWeek - 1;
+    var lastWeek = _skBriefRecapWeek(league, thisWeek);
     // Cats leagues need settings (stat_id → abbr/sortOrder) for the
     // "Week in Cats" highlight. Run in parallel with the scoreboard
     // fetch to keep total turn-around minimal.
@@ -128518,7 +128647,8 @@ function skRenderBriefing() {
 
   var _bl = _skBriefingLeagues();
   var leagues = _bl.leagues;
-  var range = _skLastWeekRange();
+  var _copy = _skBriefEditionCopy(_bl.kind);
+  var range = _skBriefRange();
   var dateLabel = _skFormatBriefingDateRange(range);
 
   // Build the data set: { league, result, rankDelta }
@@ -128537,15 +128667,16 @@ function skRenderBriefing() {
 
   // ── Masthead ────────────────────────────────────────────────
   var html = '<div class="sk-briefing-masthead">' +
-    '<div class="sk-briefing-eyebrow">SKIPPER \u00b7 MONDAY EDITION</div>' +
-    '<h1 class="sk-briefing-title">Monday Morning <em>Briefing</em></h1>' +
+    '<div class="sk-briefing-eyebrow">' + skEscape(_copy.eyebrow) + '</div>' +
+    '<h1 class="sk-briefing-title">' + skEscape(_copy.day) +
+      ' Morning <em>Briefing</em></h1>' +
     '<div class="sk-briefing-dateline">' + skEscape(dateLabel) + ' \u00b7 ' + leagues.length + ' league' + (leagues.length === 1 ? '' : 's') + '</div>' +
     // Say what is missing. Dropping seven leagues out of nineteen with
     // no explanation reads as a bug, which is the one thing a recap
     // cannot afford to look like.
     (_bl.held.length
-      ? '<div class="sk-briefing-heldback">' + _bl.held.length + ' football league' +
-        (_bl.held.length === 1 ? '' : 's') + ' still playing \u00b7 week closes tonight</div>'
+      ? '<div class="sk-briefing-heldback">' +
+        skEscape(_skBriefHeldNote(_bl.kind, _bl.held)) + '</div>'
       : '') +
   '</div>';
 
@@ -128824,7 +128955,9 @@ function _skBriefPctStr(p) {
 // prints. Built from local midnights because a Yahoo timestamp is an
 // instant and the week is the user's, not UTC's.
 function _skMovesWindow() {
-  var r = _skLastWeekRange();
+  // FBEDITION -- the span the EDITION covers, which on a Tuesday is
+  // football's Tuesday-to-Monday week and not the calendar's.
+  var r = _skBriefRange();
   function mid(iso, plusDays) {
     var p = String(iso).split('-');
     var d = new Date(parseInt(p[0], 10), parseInt(p[1], 10) - 1,
