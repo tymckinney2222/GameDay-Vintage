@@ -904,6 +904,29 @@
     text-align: center; border-bottom: 1px solid var(--ed-ink);
     padding-bottom: 4px; margin-bottom: 6px;
   }
+  /* ── upsets of the day ── EDUPSET ── */
+  .ed-ups { margin-top: 16px; border-top: 2px solid var(--ed-ink); padding-top: 9px; }
+  .ed-ups-h {
+    font-family: 'Playfair Display', Georgia, serif; font-weight: 800;
+    font-size: 15px; text-align: center; margin-bottom: 7px;
+  }
+  .ed-ups-row {
+    display: flex; gap: 7px; align-items: baseline; padding: 3px 0;
+    font-family: 'Barlow Condensed', sans-serif; font-size: 10.5px;
+    line-height: calc(var(--ed-base) * 0.82);
+    border-bottom: 1px solid var(--ed-rule);
+  }
+  .ed-ups-row:last-child { border-bottom: 0; }
+  .ed-ups-lg {
+    flex: 0 0 auto; font-weight: 800; font-size: 8px; letter-spacing: 0.16em;
+    text-transform: uppercase; color: var(--ed-ink-soft); min-width: 54px;
+  }
+  .ed-ups-t { flex: 1 1 auto; min-width: 0; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; }
+  .ed-ups-why {
+    flex: 0 0 auto; font-size: 8.5px; letter-spacing: 0.04em;
+    color: var(--ed-ink-soft); white-space: nowrap;
+  }
   .ed-foot {
     font-family: 'Barlow Condensed', sans-serif; font-size: 8.5px;
     letter-spacing: 0.16em; text-transform: uppercase; text-align: center;
@@ -41897,7 +41920,8 @@ function _edBuild() {
     if (!used[String(ranked[k].g.id)]) briefs.push(ranked[k].g);
   }
   briefs.forEach(function (g) { used[String(g.id)] = 1; });
-  var rest = all.filter(function (g) { return !used[String(g.id)]; });
+  // EDUPSET -- every game, not the leftovers. See the note above.
+  var rest = all.slice();
   return { all: all, lead: lead, two: two, briefs: briefs, rest: rest, mine: mine };
 }
 
@@ -43360,10 +43384,116 @@ function _edFantasyPage(d) {
   return h;
 }
 
+// == UPSETS OF THE DAY == EDUPSET ==
+//
+// The agate says who won. This says who was not supposed to.
+//
+// Two readings of "not supposed to", because the sports on this card do
+// not agree about what favours a team:
+//
+//   the poll    In college a weekly ranking is a better statement of who
+//               was expected to win than any record, and a ranked side
+//               losing to an unranked one is the upset everyone means.
+//   the record  Everywhere else, and in college where nobody is ranked,
+//               the gap in winning percentage is what there is.
+//
+// A ranked loss always outranks a record gap, because it is the firmer
+// claim. Among ranked losses the higher the beaten side was, the bigger
+// the story.
+//
+// Known and deliberate: ESPN's record on a game card usually INCLUDES
+// that game, so after an upset the gap this reads is already a little
+// narrower than it was at kick-off. It compresses the measure, it does
+// not invert it -- a side at 2-14 beating one at 11-3 still reads as a
+// gulf -- and a pre-game record is not in the payload to compare.
+
+var _ED_UPSET_MIN_GP = 4;      // a 1-0 is not a record yet
+var _ED_UPSET_MIN_GAP = 0.18;  // and 5-4 over 5-3 is not an upset
+var _ED_UPSET_MAX = 6;
+
+// "11-3", "10-8-2", "4-0-1" -> a winning percentage. The third number is
+// a tie in some sports and an overtime loss in others; both are worth
+// half, which is how every standings table in both sports counts them.
+function _edRecPct(rec) {
+  var m = String(rec == null ? '' : rec).trim().match(/^(\d+)\s*-\s*(\d+)(?:\s*-\s*(\d+))?/);
+  if (!m) return null;
+  var w = parseInt(m[1], 10), l = parseInt(m[2], 10);
+  var t = m[3] ? parseInt(m[3], 10) : 0;
+  var n = w + l + t;
+  if (!n) return null;
+  return { pct: (w + t / 2) / n, gp: n, s: m[0].replace(/\s+/g, '') };
+}
+
+function _edRankOf(team) {
+  var r = team && team.rank;
+  var n = r && r.current;
+  return (n && n >= 1 && n <= 25) ? n : null;
+}
+
+// Every finished game on the card that went the wrong way, best first.
+function _edUpsets(all) {
+  var out = [], i;
+  for (i = 0; i < (all || []).length; i++) {
+    var g = all[i];
+    if (!g || g.state !== 'post') continue;
+    var wl = _edWinLose(g);
+    if (!wl || !wl.w || !wl.l) continue;
+
+    var wRank = _edRankOf(wl.w), lRank = _edRankOf(wl.l);
+    var byRank = (lRank && !wRank) ? 1 : 0;
+
+    var wr = _edRecPct(wl.w.record), lr = _edRecPct(wl.l.record);
+    var gap = null;
+    if (wr && lr && wr.gp >= _ED_UPSET_MIN_GP && lr.gp >= _ED_UPSET_MIN_GP) {
+      gap = lr.pct - wr.pct;
+    }
+
+    if (!byRank && (gap == null || gap < _ED_UPSET_MIN_GAP)) continue;
+
+    // One number so the two readings can be sorted together. A ranked
+    // loss starts above anything a record alone can reach, and sorts
+    // within itself by how high the beaten side stood.
+    var score = byRank ? (2 + (26 - lRank) / 26) : 0;
+    if (gap != null && gap > 0) score += gap;
+
+    out.push({ g: g, w: wl.w, l: wl.l, ws: wl.ws, ls: wl.ls,
+      score: score, gap: gap, lRank: lRank, byRank: byRank,
+      wr: wr, lr: lr });
+  }
+  out.sort(function (a, b) { return b.score - a.score; });
+  return out.slice(0, _ED_UPSET_MAX);
+}
+
+// Why this one counts, in the fewest words that are still true.
+function _edUpsetWhy(u) {
+  // The ranking IS the reason, and setting the records behind it
+  // pushed the line past the column -- which cost the end of the
+  // record, the only part not already visible in the scoreline.
+  if (u.byRank) return 'unranked over No. ' + u.lRank;
+  return u.wr.s + ' over ' + u.lr.s;
+}
+
+function _edUpsetsBlock(all) {
+  var ups = _edUpsets(all);
+  if (!ups.length) return '';
+  var h = '<div class="ed-ups">' +
+    '<div class="ed-ups-h">Upsets of the Day</div>';
+  for (var i = 0; i < ups.length; i++) {
+    var u = ups[i];
+    h += '<div class="ed-ups-row">' +
+      '<span class="ed-ups-lg">' + _edEsc(String(u.g.league || '')) + '</span>' +
+      '<span class="ed-ups-t"><b>' + _edEsc(_edName(u.w)) + '</b> ' + u.ws +
+        ', ' + _edEsc(_edName(u.l)) + ' ' + u.ls + '</span>' +
+      '<span class="ed-ups-why">' + _edEsc(_edUpsetWhy(u)) + '</span>' +
+      '</div>';
+  }
+  return h + '</div>';
+}
+
 function _edGroundsPage(d, ed) {
   var h = _edFolio(d, 3) +
     '<div class="ed-pagehead">Around the Grounds</div>' +
-    '<div class="ed-pagesub">Every other result on the card</div>';
+    '<div class="ed-pagesub">Every result on the card</div>';
   if (ed.mine.length) {
     h += '<div class="ed-mine"><div class="ed-mine-h">Your Clubs</div>';
     for (var m = 0; m < ed.mine.length; m++) h += _edAgateRow(ed.mine[m]);
@@ -43372,6 +43502,9 @@ function _edGroundsPage(d, ed) {
   h += (ed.rest.length)
     ? ('<div class="ed-agate">' + _edAgate(ed.rest) + '</div>')
     : '<div class="ed-empty">Nothing further to report.</div>';
+  // EDUPSET -- at the foot, where a paper puts the thing you read after
+  // you have been through the scores.
+  h += _edUpsetsBlock(ed.all);
   return h;
 }
 
