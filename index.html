@@ -11427,6 +11427,65 @@
   color: rgba(255,255,255,0.26);
 }
 
+/* -- the live shot cards -- LIVESHOT ------------------------------- */
+.c3-live {
+  display: flex; gap: 6px; padding: 7px 10px 0;
+  background: rgba(0,0,0,0.26);
+}
+.c3-lv {
+  flex: 1 1 0; min-width: 0; padding: 5px 8px 6px; border-radius: 4px;
+  background: rgba(255,255,255,0.035);
+  border: 1px solid rgba(255,255,255,0.07);
+}
+.c3-lv-top { display: flex; align-items: baseline; gap: 6px; }
+.c3-lv-nm {
+  font-family: 'Barlow Condensed', sans-serif; font-size: 13px;
+  font-weight: 900; letter-spacing: 0.04em; text-transform: uppercase;
+  line-height: 1.05; min-width: 0; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+.c3-lv-res {
+  font-family: 'Barlow Condensed', sans-serif; font-size: 8.5px;
+  font-weight: 800; letter-spacing: 0.14em; flex: 0 0 auto; margin-left: auto;
+}
+.c3-lv-what {
+  font-family: 'Barlow Condensed', sans-serif; font-size: 9.5px;
+  font-weight: 600; letter-spacing: 0.04em; margin-top: 1px;
+  color: rgba(255,255,255,0.42);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.c3-lv-st { display: flex; gap: 10px; margin-top: 4px; }
+.c3-lv-st i { font-style: normal; }
+.c3-lv-st b {
+  font-family: 'Barlow Condensed', sans-serif; font-size: 12.5px;
+  font-weight: 900; color: #eef2f8;
+}
+.c3-lv-st span {
+  font-size: 7.5px; font-weight: 700; letter-spacing: 0.1em;
+  color: rgba(255,255,255,0.3); margin-left: 2px;
+}
+/* The card is rebuilt on every poll, and a CSS animation replays every
+   time its element is created -- so the class is only put on when the
+   shot actually changed. _c3Seen is what decides that. */
+.c3-lv.flash { animation: c3flash 1.6s ease-out 1; }
+@keyframes c3flash {
+  0%   { background: rgba(255,255,255,0.26);
+         border-color: var(--fl, rgba(255,255,255,0.6)); }
+  55%  { background: rgba(255,255,255,0.09); }
+  100% { background: rgba(255,255,255,0.035);
+         border-color: rgba(255,255,255,0.07); }
+}
+/* DRAWARC -- the reveal. Linear, because a ball in flight does not ease
+   in and out, and the duration is set per arc from its own length. */
+.c3-draw { animation: c3draw linear 1 forwards; }
+@keyframes c3draw { to { stroke-dashoffset: 0; } }
+.c3-play {
+  padding: 7px 14px 1px; background: rgba(0,0,0,0.26); text-align: center;
+  font-family: 'Barlow Condensed', sans-serif; font-size: 10.5px;
+  font-weight: 700; letter-spacing: 0.07em; color: rgba(255,255,255,0.4);
+}
+.c3-play b { color: rgba(255,255,255,0.78); font-weight: 700; }
+
 /* -- big play list -- BPLIST --------------------------------------- */
 .bpl-wrap { padding: 4px 12px 2px; }
 .bpl-row { display: grid; grid-template-columns: 30px 1fr; gap: 8px;
@@ -76705,7 +76764,13 @@ function _c3Shots(data, game) {
       isHome: isHome, athleteId: athleteId,
       three: /three point/i.test(txt),
       per: (p.period && p.period.number) || null,
-      text: txt
+      text: txt,
+      // LIVESHOT -- who took it, and a key that changes when the shot
+      // does. The index is in the key because a game can genuinely
+      // repeat a line of narration ("Jokic makes 2-foot layup") and two
+      // identical texts must still read as two different shots.
+      who: _c3ShotWho(p),
+      key: idx + '|' + txt
     });
   });
   return out;
@@ -77211,6 +77276,294 @@ function _c3Bowl(uid, homeColor) {
 }
 
 // The floor, drawn -- GYM3D.
+// ---------------------------------------------------------------
+// THE LIVE SHOT -- LIVESHOT --
+// The big floor stops being a shot chart and becomes the last thing that
+// happened: one shot per side, the most recent each team took, with the
+// ball's flight drawn from the shooter's hands to the rim.
+//
+// The full dot field is not lost -- the half court further down the page
+// still carries every shot of the game. That is the right division of
+// labour. A chart answers "where have they been shooting all night",
+// which is a question you study; this answers "what just happened",
+// which is a question you glance at. Trying to do both on one floor is
+// what made the big court a worse version of the small one.
+// ---------------------------------------------------------------
+var _C3_REL = 7.5;        // feet, where the ball leaves the shooter
+var _C3_RIM_H = 10;       // and the rim it is going to, per _c3Basket
+
+// Every athlete in the box score, by id, so a shooter named in the play
+// by play can be given a stat line. _c3OnFloor walks the same structure
+// but keeps only five a side; this keeps everyone, because the man who
+// just shot is quite often not one of the five it would have picked.
+function _c3StatMap(data) {
+  var blocks = (data && data.boxscore && data.boxscore.players) || [];
+  var map = {}, bi, gi, ai, li;
+  for (bi = 0; bi < blocks.length; bi++) {
+    var blk = blocks[bi] || {};
+    var tid = (blk.team && blk.team.id) != null ? String(blk.team.id) : '';
+    var groups = blk.statistics || [];
+    for (gi = 0; gi < groups.length; gi++) {
+      var labels = (groups[gi] && groups[gi].labels) || [];
+      var aths = (groups[gi] && groups[gi].athletes) || [];
+      for (ai = 0; ai < aths.length; ai++) {
+        var a = aths[ai] || {}, ath = a.athlete || {};
+        if (!ath.id) continue;
+        var sm = {}, st = a.stats || [];
+        for (li = 0; li < labels.length; li++) sm[labels[li]] = st[li];
+        map[String(ath.id)] = {
+          id: String(ath.id), teamId: tid,
+          name: _c3Last(ath.displayName || ath.shortName || ''),
+          pts: _c3Int(sm.PTS), reb: _c3Int(sm.REB), ast: _c3Int(sm.AST)
+        };
+      }
+    }
+  }
+  return map;
+}
+
+// Who took it. The athlete object when the feed attaches one, and the
+// narration when it does not -- every shot play leads with the shooter
+// and then "makes" or "misses", so the name is whatever sits in front
+// of that verb.
+function _c3ShotWho(p) {
+  var a = (p && p.athlete) ||
+    (p && p.participants && p.participants[0] && p.participants[0].athlete) || null;
+  if (a && (a.displayName || a.shortName)) return String(a.displayName || a.shortName);
+  var m = String((p && p.text) || '').match(/^(.+?)\s+(?:makes|misses)\b/i);
+  return m ? m[1] : '';
+}
+
+// And what it was, with the shooter and the verb taken off the front and
+// the assist credit off the back: "26-foot three point jumper". The
+// parenthetical is dropped because it is the longest part of the line
+// and the first thing to be cut off, which left cards reading
+// "27-foot three point jumper (Josh Giddey assi..." -- all tail, no shot.
+function _c3ShotWhat(txt) {
+  var t = String(txt || '').replace(/\s*\([^)]*\)\s*$/, '');
+  var m = t.match(/\b(?:makes|misses)\s+(.+?)\s*$/i);
+  return m ? m[1] : t;
+}
+
+// The last shot each side took. _c3Shots walks the plays in order, so
+// the last one assigned is the most recent -- no sorting, and no
+// dependence on a sequence number the feed may not carry.
+function _c3Latest(shots) {
+  var out = { away: null, home: null }, i;
+  for (i = 0; i < (shots || []).length; i++) {
+    if (!shots[i]) continue;
+    if (shots[i].isHome) out.home = shots[i]; else out.away = shots[i];
+  }
+  return out;
+}
+
+// Which rim a side is shooting at, in court feet. Matches _c3Basket,
+// which puts the rim 5.25 feet in from each baseline.
+function _c3RimAt(isHome) { return isHome ? (_C3_LEN - 5.25) : 5.25; }
+
+// The flight. A quadratic through three projected points, so the arc
+// obeys the same camera as the floor under it -- a shot from the far
+// corner is a flatter, smaller curve than the same shot taken near.
+// The length of a quadratic, by walking it. There is a closed form and
+// it is not worth the trouble: twenty-four straight segments are inside
+// a tenth of a unit on a curve this shallow, and this only has to be
+// good enough to set an animation's duration.
+function _c3QLen(p0, pc, p1) {
+  var n = 24, i, t, u, x, y, px = p0[0], py = p0[1], L = 0;
+  for (i = 1; i <= n; i++) {
+    t = i / n; u = 1 - t;
+    x = u * u * p0[0] + 2 * u * t * pc[0] + t * t * p1[0];
+    y = u * u * p0[1] + 2 * u * t * pc[1] + t * t * p1[1];
+    L += Math.sqrt((x - px) * (x - px) + (y - py) * (y - py));
+    px = x; py = y;
+  }
+  return L;
+}
+
+// age is milliseconds since this shot first appeared, or null for a
+// floor that is not tracking it. A negative animation-delay of that
+// much starts the reveal already part way through, which is what lets
+// a repaint mid-flight pick the ball up rather than drop it.
+function _c3Arc(sh, col, uid, side, age) {
+  var rimX = _c3RimAt(sh.isHome), rimY = _C3_WID / 2;
+  var rel = _c3Up(sh.cx, sh.cy, _C3_REL);
+  var rim = _c3Up(rimX, rimY, _C3_RIM_H);
+  var dx = sh.cx - rimX, dy = sh.cy - rimY;
+  var dist = Math.sqrt(dx * dx + dy * dy);
+  // A layup barely arcs and a thirty footer is thrown high, so the apex
+  // rides with the distance instead of sitting at one height for both.
+  // The constant term is what a layup gets. Scaling the whole thing off
+  // distance alone gave a three-footer a flight two feet high, which at
+  // this scale is a straight line and reads as a drawing error rather
+  // than a shot.
+  var apex = _C3_RIM_H + 3.4 + dist * 0.3;
+  // A quadratic passes through (P0 + 2C + P2)/4 at its midpoint, so to
+  // peak AT the apex the control point has to sit about twice as high.
+  var ctl = _c3Up((sh.cx + rimX) / 2, (sh.cy + rimY) / 2,
+    2 * apex - (_C3_REL + _C3_RIM_H) / 2);
+  // A shot from the far sideline is drawn small but high, and left alone
+  // its arc climbs into the underside of the scoreboard. The cap is in
+  // screen space because that is where the collision is.
+  var cap = _C3_BY1 + 2.5;
+  if (ctl[1] < cap) ctl[1] = cap;
+  var d = 'M ' + _c3n(rel[0]) + ' ' + _c3n(rel[1]) + ' Q ' + _c3n(ctl[0]) + ' ' +
+    _c3n(ctl[1]) + ' ' + _c3n(rim[0]) + ' ' + _c3n(rim[1]);
+  // The dark pass underneath reads the arc against pale maple, but at
+  // 1.6 it swallowed a layup's near-vertical flight into a solid bar.
+  var s = '<path d="' + d + '" fill="none" stroke="#1b1206" stroke-opacity="0.32"' +
+    ' stroke-width="1.15" stroke-linecap="round"/>';
+  s += '<path class="c3-lva" d="' + d + '" fill="none" stroke="' + col +
+    '" stroke-width="0.6" stroke-linecap="round" stroke-opacity="0.95"' +
+    // A miss got to the rim too; it just did not drop.
+    (sh.made ? '' : ' stroke-dasharray="2.4 1.7"') + '/>';
+  // the ball, at the point it left -- outside the reveal, so the spot a
+  // shot came from is there from the first frame rather than fading up
+  var ball = '<circle class="c3-lvb" cx="' + _c3n(rel[0]) + '" cy="' +
+    _c3n(rel[1]) + '" r="0.85" fill="#e2622a" stroke="#1b1206"' +
+    ' stroke-opacity="0.5" stroke-width="0.2"/>';
+  if (age == null) return s + ball;
+
+  // DRAWARC -- the flight, drawn on, but only while the shot is still
+  // arriving. The floor is rebuilt every five seconds and a CSS
+  // animation replays every time its element is created, so an arc that
+  // animated on every paint would be a tic rather than a replay.
+  var L = _c3QLen(rel, ctl, rim);
+  // Half a second of lead-in so even a layup registers, then one pace
+  // for everything. A thirty footer lands near a second and a half.
+  var dur = Math.max(0.6, Math.min(1.9, 0.5 + L / 70));
+  if (age >= dur * 1000) return s + ball;      // it already landed
+  var mid = 'am' + String(uid || '') + String(side || '');
+  // The mask box is given in user space and drawn generously: the
+  // default is a margin around the path's own box, and a stroke this
+  // thick can sit outside it.
+  var m = '<defs><mask id="' + mid + '" maskUnits="userSpaceOnUse"' +
+    ' x="-20" y="-220" width="240" height="460">' +
+    '<path class="c3-draw" d="' + d + '" fill="none" stroke="#fff"' +
+    ' stroke-width="3.6" stroke-linecap="round" stroke-dasharray="' +
+    _c3n(L) + '" stroke-dashoffset="' + _c3n(L) +
+    '" style="animation-duration:' + _c3n(dur) + 's;animation-delay:' +
+    _c3n(-age / 1000) + 's"/></mask></defs>';
+  return m + '<g mask="url(#' + mid + ')">' + s + '</g>' + ball;
+}
+
+// The spot it was taken from, and whose it was. Bigger than a chart dot
+// and ringed, because there are two of these on the floor rather than a
+// hundred and each one is meant to be found at a glance.
+function _c3LiveMark(sh, col, abbr) {
+  var p = _c3Proj(sh.cx, sh.cy), k = _c3K(sh.cy);
+  var r = 1.5 * k;
+  var s = '<g class="c3-lvm" data-made="' + (sh.made ? '1' : '0') +
+    '" data-side="' + (sh.isHome ? 'home' : 'away') + '">';
+  // the shadow on the maple, which is what sits it ON the floor
+  s += '<ellipse cx="' + _c3n(p[0]) + '" cy="' + _c3n(p[1]) + '" rx="' + _c3n(r * 2.1) +
+    '" ry="' + _c3n(r * 0.75) + '" fill="' + col + '" fill-opacity="0.2"/>';
+  s += '<circle cx="' + _c3n(p[0]) + '" cy="' + _c3n(p[1]) + '" r="' + _c3n(r * 1.75) +
+    '" fill="none" stroke="' + col + '" stroke-width="0.3" stroke-opacity="0.65"/>';
+  if (sh.made) {
+    s += '<circle cx="' + _c3n(p[0]) + '" cy="' + _c3n(p[1]) + '" r="' + _c3n(r) +
+      '" fill="' + col + '" stroke="rgba(30,20,8,0.6)" stroke-width="0.25"/>';
+  } else {
+    var d = r * 0.92;
+    s += '<path d="M ' + _c3n(p[0] - d) + ' ' + _c3n(p[1] - d) + ' L ' +
+      _c3n(p[0] + d) + ' ' + _c3n(p[1] + d) + ' M ' + _c3n(p[0] - d) + ' ' +
+      _c3n(p[1] + d) + ' L ' + _c3n(p[0] + d) + ' ' + _c3n(p[1] - d) +
+      '" stroke="rgba(30,20,8,0.45)" stroke-width="0.95" stroke-linecap="round"/>';
+    s += '<path d="M ' + _c3n(p[0] - d) + ' ' + _c3n(p[1] - d) + ' L ' +
+      _c3n(p[0] + d) + ' ' + _c3n(p[1] + d) + ' M ' + _c3n(p[0] - d) + ' ' +
+      _c3n(p[1] + d) + ' L ' + _c3n(p[0] + d) + ' ' + _c3n(p[1] - d) +
+      '" stroke="' + col + '" stroke-width="0.6" stroke-linecap="round"/>';
+  }
+  // No name on the floor. It was the obvious thing to put here and it
+  // does not survive contact with the two places shots actually cluster:
+  // at the rim the label lands under the basket and is unreadable, and
+  // from the near corner it falls off the wood onto the chairs. The
+  // cards below name both shooters in full with room to spare, and the
+  // colour already ties a dot to its card.
+  return s + '</g>';
+}
+
+// Has this side's latest shot CHANGED since the last paint? -- LIVESHOT.
+//
+// The flash is a CSS animation, and a CSS animation replays every time
+// the element is created. The floor is rebuilt from scratch on every
+// five second poll, so without this the cards would strobe all game
+// whether or not anything happened. Keyed by game, so switching games
+// does not inherit the last one's state.
+//
+// First sight of a side is deliberately NOT a change: opening the panel
+// already puts the whole thing in front of you, and a flash on top of
+// that is noise.
+var _C3_SEEN = {};
+
+// Reports, for one side:
+//
+//   code  0  the same shot as last paint -- nothing to announce
+//         1  a different shot than last paint
+//         2  the first time this side has been seen in this game
+//   age   milliseconds since this shot FIRST appeared
+//
+// The age is what makes the flight survive a repaint. Several things
+// re-render the gym besides the five second poll -- fantasy rosters
+// finishing their load, a season average arriving, tapping a player --
+// and any of them lands inside the second or so an arc takes to draw.
+// Without the age the element is rebuilt without its animation and the
+// arc snaps whole; with it the animation is restarted at a negative
+// delay and picks up exactly where the old one was.
+function _c3Seen(gameId, side, key) {
+  var g = 'g' + String(gameId || '');
+  if (!_C3_SEEN[g]) _C3_SEEN[g] = {};
+  var rec = _C3_SEEN[g], now = Date.now();
+  var prev = rec[side];
+  if (!prev) { rec[side] = { key: key, at: now }; return { code: 2, age: 0 }; }
+  if (prev.key !== key) { rec[side] = { key: key, at: now }; return { code: 1, age: 0 }; }
+  return { code: 0, age: now - prev.at };
+}
+
+// The most recent play of any kind, which is not always a shot -- a foul,
+// a timeout and a substitution are all things you want to see named.
+function _c3LastPlay(data) {
+  var plays = (data && data.plays) || [], i, t;
+  for (i = plays.length - 1; i >= 0; i--) {
+    t = plays[i] && String(plays[i].text || '').replace(/\s+/g, ' ').trim();
+    if (t) {
+      return { text: t,
+        clock: (plays[i].clock && plays[i].clock.displayValue) || '',
+        per: (plays[i].period && plays[i].period.number) || null };
+    }
+  }
+  return null;
+}
+
+// One side's card: who shot, what it was, and where that leaves him.
+function _c3LiveCard(sh, smap, col, abbr, flash) {
+  var who = sh ? (sh.who || '') : '';
+  var st = (sh && sh.athleteId && smap[sh.athleteId]) || null;
+  var nm = _c3Last(who) || (st && st.name) || '';
+  if (!sh) {
+    return '<div class="c3-lv"><div class="c3-lv-top">' +
+      '<span class="c3-lv-nm" style="color:' + col + '">' +
+      skEscapeMaybe(String(abbr)) + '</span></div>' +
+      '<div class="c3-lv-what">no shot yet</div></div>';
+  }
+  var s = '<div class="c3-lv' + (flash ? ' flash' : '') + '" style="--fl:' + col + '">';
+  s += '<div class="c3-lv-top">' +
+    '<span class="c3-lv-nm" style="color:' + col + '">' +
+      skEscapeMaybe(nm || String(abbr)) + '</span>' +
+    '<span class="c3-lv-res" style="color:' +
+      (sh.made ? col : 'rgba(255,255,255,0.3)') + '">' +
+      (sh.made ? 'MADE' : 'MISS') + '</span>' +
+    '</div>';
+  s += '<div class="c3-lv-what">' + skEscapeMaybe(_c3ShotWhat(sh.text)) + '</div>';
+  if (st) {
+    s += '<div class="c3-lv-st">' +
+      '<i><b>' + st.pts + '</b><span>PTS</span></i>' +
+      '<i><b>' + st.reb + '</b><span>REB</span></i>' +
+      '<i><b>' + st.ast + '</b><span>AST</span></i>' +
+      '</div>';
+  }
+  return s + '</div>';
+}
+
 function _gymFloor3D(o) {
   o = o || {};
   var lg = o.league || 'NBA';
@@ -77350,9 +77703,35 @@ function _gymFloor3D(o) {
     '" stroke-width="0.62" stroke-opacity="0.7"/>';
 
   // ---- the shots ------------------------------------------------------
+  // LIVESHOT -- the latest from each side, with the ball's flight. The
+  // every-shot field this used to draw still exists, on the half court
+  // further down the page, which is the better place for it.
+  var lvMarks = '';
+  if (o.live) {
+    var lv = [], lk;
+    if (o.live.away) lv.push(o.live.away);
+    if (o.live.home) lv.push(o.live.home);
+    // far one first, for the same reason the dot field sorts
+    lv.sort(function (a, b) { return a.cy - b.cy; });
+    for (lk = 0; lk < lv.length; lk++) {
+      // The flight goes in here, behind the baskets, because the end of
+      // it genuinely does pass behind the backboard.
+      var lvSide = lv[lk].isHome ? 'home' : 'away';
+      s += _c3Arc(lv[lk], lv[lk].isHome ? home : away, uid, lvSide,
+        (o.liveAge && o.liveAge[lvSide] != null) ? o.liveAge[lvSide] : null);
+      // The spot does not: held back to the very end so it survives the
+      // basket being drawn over it. Layups and dunks are a large share
+      // of every game and they all land under the rim, which is exactly
+      // where the stanchion is -- drawn in order, the most common shot
+      // in basketball was the one you could not see.
+      lvMarks += _c3LiveMark(lv[lk], lv[lk].isHome ? home : away);
+    }
+  }
+
   // Far ones first, so a near shot covers a far one and not the reverse.
   var list = (o.shots || []).slice().sort(function (a, b) { return a.cy - b.cy; });
   var i, sh, col, p, k, r, dmk = '';
+  if (o.live) list = [];
   for (i = 0; i < list.length; i++) {
     sh = list[i];
     col = sh.isHome ? home : away;
@@ -77386,6 +77765,8 @@ function _gymFloor3D(o) {
   // a shot taken from under them.
   s += _c3Basket(0, 1, home);
   s += _c3Basket(_C3_LEN, -1, home);
+
+  s += lvMarks;   // LIVESHOT -- last of all, so nothing can cover them
 
   return s + '</svg>';
 }
@@ -77444,6 +77825,20 @@ function _gymFloorPanel(data, game, awayAccent, homeAccent, divStyle, venue) {
     catch (eR) { roster = null; }
   }
 
+  // LIVESHOT -- the last shot each side took, and everyone's line, so
+  // the man who just shot can be given one whether or not he is among
+  // the five on the floor above.
+  var latest = { away: null, home: null }, smap = {};
+  try { latest = _c3Latest(shots); } catch (eL) {}
+  try { smap = _c3StatMap(data); } catch (eSM) { smap = {}; }
+
+  // DRAWARC -- read once, because _c3Seen moves on when it answers.
+  var seenA = { code: 0, age: 1e9 }, seenH = { code: 0, age: 1e9 };
+  try {
+    seenA = _c3Seen(game.id, 'away', latest.away ? latest.away.key : '');
+    seenH = _c3Seen(game.id, 'home', latest.home ? latest.home.key : '');
+  } catch (eSN) {}
+
   var aLogo = (typeof vLogo === 'function'
     ? (vLogo(game.away.abbr, game.league, game.away.logo) || game.away.logo || '')
     : (game.away.logo || ''));
@@ -77461,6 +77856,10 @@ function _gymFloorPanel(data, game, awayAccent, homeAccent, divStyle, venue) {
       homeLogo: hLogo,
       awayLogo: aLogo,
       shots: shots,
+      live: latest,                                  // LIVESHOT
+      // DRAWARC -- how long ago each side's shot arrived. The arc
+      // decides from that whether it is still in flight.
+      liveAge: { away: seenA.age, home: seenH.age },
       // JUMBO -- what is lit up on the board overhead
       boardName: venue || '',
       awayPts: board.a, homePts: board.h,
@@ -77478,6 +77877,27 @@ function _gymFloorPanel(data, game, awayAccent, homeAccent, divStyle, venue) {
     if (shots[i].isHome) { hN++; if (shots[i].made) hM++; }
     else { aN++; if (shots[i].made) aM++; }
   }
+  // LIVESHOT -- the two shooters, and whatever happened last.
+  var cards = '';
+  if (all.length) {
+    cards = '<div class="c3-live">' +
+      _c3LiveCard(latest.away, smap, awayAccent, game.away.abbr, seenA.code === 1) +
+      _c3LiveCard(latest.home, smap, homeAccent, game.home.abbr, seenH.code === 1) +
+      '</div>';
+  }
+  var lastPlay = null;
+  try { lastPlay = _c3LastPlay(data); } catch (eLP) { lastPlay = null; }
+  var playLine = '';
+  if (lastPlay) {
+    playLine = '<div class="c3-play">' +
+      ((lastPlay.per ? _c3QLabel(lastPlay.per) : '') +
+        (lastPlay.clock ? ' ' + lastPlay.clock : '')).replace(/^\s+/, '') +
+      (lastPlay.per || lastPlay.clock
+        ? '<span style="color:rgba(255,255,255,0.2);margin:0 7px">' +
+          String.fromCharCode(183) + '</span>' : '') +
+      '<b>' + skEscapeMaybe(lastPlay.text) + '</b></div>';
+  }
+
   // the chips
   var chips = '';
   if (all.length && maxPer > 1) {
@@ -77501,10 +77921,14 @@ function _gymFloorPanel(data, game, awayAccent, homeAccent, divStyle, venue) {
       '<span style="color:' + homeAccent + '">' + skEscapeMaybe(String(game.home.abbr)) +
         ' ' + hM + '/' + hN + '</span>' +
       '<span style="color:rgba(255,255,255,0.28);margin-left:10px">' +
-        'filled = made' + '</span>' +
+        'on the night' + '</span>' +
       // The feed normalises every shot to one basket, so which end a team
       // is drawn at is this app's choice, not ESPN's record of the game.
-      '<div class="c3-note">each side shown at its own basket</div>'
+      // Still says the ends are a convention. The first version of this
+      // note dropped that, which quietly removed the only place the app
+      // explains why one team's shots are all at one end of the floor.
+      '<div class="c3-note">latest shot only, each side at its own basket ' +
+        String.fromCharCode(183) + ' every shot is on the chart below</div>'
     : '<span style="color:rgba(255,255,255,0.3)">' +
       (all.length ? ('Nothing taken in ' + _c3QLabel(pick))
                   : 'No shot locations in the feed yet') + '</span>';
@@ -77515,6 +77939,8 @@ function _gymFloorPanel(data, game, awayAccent, homeAccent, divStyle, venue) {
       'PROBE</button>' +
     '</div>' +
     '<div class="c3-wrap">' + svg + '</div>' +
+    cards +
+    playLine +
     chips +
     '<div class="c3-cap" style="border-bottom:' + divStyle + '">' + caption + '</div>';
 }
