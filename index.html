@@ -24403,6 +24403,29 @@
   font-weight: 500; letter-spacing: 0.04em; color: rgba(255,255,255,0.24);
 }
 
+/* SPORTSPLIT -- the ledger, per sport */
+.sk-briefing-hero-sports {
+  margin-top: 12px; padding-top: 10px;
+  border-top: 1px solid rgba(255,255,255,0.07);
+  display: flex; justify-content: center; flex-wrap: wrap; gap: 6px 22px;
+}
+.sk-bhs-row { display: flex; align-items: baseline; gap: 8px; }
+.sk-bhs-tag {
+  font-family: 'JetBrains Mono', monospace; font-size: 9.5px; font-weight: 700;
+  letter-spacing: 0.12em; color: rgba(255,255,255,0.3);
+}
+.sk-bhs-rec {
+  font-family: 'JetBrains Mono', monospace; font-size: 12px; font-weight: 700;
+  color: rgba(245,240,228,0.72);
+}
+.sk-bm-sport {
+  font-family: 'JetBrains Mono', monospace; font-size: 9.5px; font-weight: 700;
+  letter-spacing: 0.14em; color: rgba(255,255,255,0.42);
+  margin: 13px 0 2px; padding-bottom: 4px;
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+}
+.sk-bm-sport:first-child { margin-top: 0; }
+
 /* SEASONCTX -- the verdict under the ledger */
 .sk-briefing-hero-verdict {
   margin-top: 14px; padding-top: 12px;
@@ -128436,8 +128459,12 @@ function _skLoadBriefingData() {
       : Promise.resolve(null);
     // MOVES -- the league's add/drop log. Yahoo will not filter it by
     // team, so the whole log comes back and _skMovesParse picks out mine.
-    var txP = fyApi('/league/' + key + '/transactions;types=add,drop;count=100')
-      .then(function (r) { return r; }, function () { return null; });
+    // Only for leagues scored in points: a categories league has nothing
+    // to grade a swap with, so the call is not worth making.
+    var txP = _skMovesPointsLeague(league)
+      ? fyApi('/league/' + key + '/transactions;types=add,drop;count=100')
+          .then(function (r) { return r; }, function () { return null; })
+      : Promise.resolve(null);
     return Promise.all([sbP, settingsP, seasonP, txP])
       .then(function(arr) {
         var res = arr[0];
@@ -128452,7 +128479,7 @@ function _skLoadBriefingData() {
         skBriefingCache[key] = { lastWeekResult: result, weeklyResults: weeklyResults || [],
           moves: moves, movesFp: null, ts: Date.now() };
         if (!moves.length) return null;
-        return _skMovesFetchFp(key, moves, lastWeek).then(function (fpMap) {
+        return _skMovesFetchFp(key, moves, lastWeek, league).then(function (fpMap) {
           if (skBriefingCache[key]) skBriefingCache[key].movesFp = fpMap || {};
         }, function () {});
       })
@@ -128864,8 +128891,30 @@ function _skMovesParse(res, myTeamKey, win) {
   return out;
 }
 
+// Is this league scored in POINTS? A categories league has no fantasy
+// point total behind it, so "he scored 28.4" is not a thing that
+// happened -- which is why moves covers points leagues only.
+// _skBriefScoring already answers the football-is-points question.
+function _skMovesPointsLeague(l) {
+  if (!l) return false;
+  return _skBriefScoring(l) === 'headpoint' || l.scoring_type === 'point';
+}
+
+// Which stat window to ask Yahoo for.
+//
+// ;type=week;week=N is the FOOTBALL window -- weekly sports have
+// numbered weeks and daily ones do not. Asking for it on a hockey
+// league returns a player with no player_points at all, which arrives
+// as 0.0 rather than as nothing. The scout sheet settled this already;
+// this is the same rule, in one place.
+function _skMovesFpType(league, week) {
+  var sp = String((league && league.sport) || '').toLowerCase();
+  if (sp === 'nfl' || sp === 'cfb') return 'week;week=' + Math.max(1, week);
+  return 'lastweek';
+}
+
 // Last week's points for everyone moved, in one call where Yahoo allows.
-function _skMovesFetchFp(leagueKey, moves, week) {
+function _skMovesFetchFp(leagueKey, moves, week, league) {
   var keys = [], seen = {}, i, j, all;
   for (i = 0; i < moves.length; i++) {
     all = moves[i].adds.concat(moves[i].drops);
@@ -128874,18 +128923,28 @@ function _skMovesFetchFp(leagueKey, moves, week) {
     }
   }
   if (!keys.length || typeof _skCmpFetchFp !== 'function') return Promise.resolve({});
-  var type = 'week;week=' + week;
+  var type = _skMovesFpType(league, week);
+  // The men you dropped, who are the ones Yahoo gets shy about.
+  var dropped = {};
+  for (i = 0; i < moves.length; i++) {
+    for (j = 0; j < moves[i].drops.length; j++) dropped[moves[i].drops[j].key] = 1;
+  }
   return _skCmpFetchFp(leagueKey, keys, type).then(function (map) {
     map = map || {};
     // A man you dropped is on waivers, and Yahoo leaves the points off a
     // waiver player when the same batch also carries free agents -- The
     // Wire hit this first and the cure is the same: ask again, one at a
-    // time, only for the ones that came back empty. Capped, because this
-    // is a recap and not worth a dozen round trips.
+    // time. The test has to be "nothing or nought" rather than "nothing",
+    // because the parser starts every player at 0 and only raises it when
+    // player_points is present: an absent total is indistinguishable from
+    // a quiet week. A man who really did score nothing costs one extra
+    // call and comes back nought again.
     var missing = [], m;
-    for (m = 0; m < keys.length; m++) if (map[keys[m]] == null) missing.push(keys[m]);
+    for (m = 0; m < keys.length; m++) {
+      if (dropped[keys[m]] && !map[keys[m]]) missing.push(keys[m]);
+    }
     if (!missing.length) return map;
-    return Promise.all(missing.slice(0, 8).map(function (k) {
+    return Promise.all(missing.slice(0, 6).map(function (k) {
       return _skCmpFetchFp(leagueKey, [k], type).then(function (one) {
         if (one && one[k] != null) map[k] = one[k];
       }, function () {});
@@ -128914,10 +128973,44 @@ function _skMovesPts(v) {
 }
 
 // -- the section ------------------------------------------------
+// NHL, NBA, MLB. The raw code, upper-cased: the briefing's own voice is
+// mono small-caps and a label like "Hockey" reads softer than the
+// league names underneath it.
+function _skSportTag(l) {
+  return String((l && l.sport) || '').toUpperCase() || 'OTHER';
+}
+
+// Which sports are actually in play. Used to decide whether a split is
+// worth drawing at all -- with one sport it is a heading over the whole
+// list, which is just noise.
+function _skSportsIn(entries, filter) {
+  var out = [], i, t;
+  for (i = 0; i < (entries || []).length; i++) {
+    if (filter && !filter(entries[i])) continue;
+    t = _skSportTag(entries[i].league);
+    if (out.indexOf(t) === -1) out.push(t);
+  }
+  return out;
+}
+
 function _skBuildBriefingMovesHTML(entries) {
   var blocks = '', nMoves = 0, inTot = 0, outTot = 0, haveAny = false;
+  // SPORTSPLIT -- grouped by sport, but only labelled when there is
+  // more than one. Sorted so the grouping actually holds together.
+  var sports = _skSportsIn(entries, function (e) {
+    return _skMovesPointsLeague(e.league) &&
+      (skBriefingCache[e.league.league_key] || {}).moves &&
+      (skBriefingCache[e.league.league_key] || {}).moves.length;
+  });
+  var multi = sports.length > 1;
+  var lastSport = '';
+  entries = entries.slice().sort(function (a, b) {
+    var sa = _skSportTag(a.league), sb = _skSportTag(b.league);
+    return sa < sb ? -1 : (sa > sb ? 1 : 0);
+  });
 
   entries.forEach(function (e) {
+    if (!_skMovesPointsLeague(e.league)) return;      // points leagues only
     var key = e.league.league_key;
     var cached = skBriefingCache[key];
     var moves = cached && cached.moves;
@@ -128973,6 +129066,11 @@ function _skBuildBriefingMovesHTML(entries) {
     });
 
     if (rows) {
+      var tag = _skSportTag(e.league);
+      if (multi && tag !== lastSport) {
+        blocks += '<div class="sk-bm-sport">' + skEscape(tag) + '</div>';
+        lastSport = tag;
+      }
       blocks += '<div class="sk-bm-league">' + skEscape(e.league.name || '') + '</div>' + rows;
     }
   });
@@ -128996,6 +129094,36 @@ function _skBuildBriefingMovesHTML(entries) {
     blocks +
     (haveAny ? '<div class="sk-bm-note">points each player scored last week, whole</div>' : '') +
   '</div>';
+}
+
+// SPORTSPLIT -- the ledger, per sport. Hockey and basketball overlap
+// for most of the winter and a single 8-6 says nothing about which of
+// them is going well. Drawn only when there IS more than one sport:
+// one heading over one row is a worse version of the line above it.
+function _skBriefSportSplit(ready) {
+  var tags = _skSportsIn(ready), i, e, t;
+  if (tags.length < 2) return '';
+  var byTag = {};
+  for (i = 0; i < ready.length; i++) {
+    e = ready[i];
+    t = _skSportTag(e.league);
+    if (!byTag[t]) byTag[t] = { w: 0, l: 0, t: 0 };
+    var v = e.result && e.result.verdict;
+    if (v === 'won') byTag[t].w++;
+    else if (v === 'lost') byTag[t].l++;
+    else if (v === 'tied') byTag[t].t++;
+  }
+  tags.sort();
+  var EN = String.fromCharCode(8211);
+  var html = '<div class="sk-briefing-hero-sports">';
+  for (i = 0; i < tags.length; i++) {
+    var r = byTag[tags[i]];
+    html += '<div class="sk-bhs-row">' +
+      '<span class="sk-bhs-tag">' + skEscape(tags[i]) + '</span>' +
+      '<span class="sk-bhs-rec">' + r.w + EN + r.l + (r.t ? EN + r.t : '') + '</span>' +
+      '</div>';
+  }
+  return html + '</div>';
 }
 
 function _skBuildBriefingHeroCardHTML(entries) {
@@ -129028,6 +129156,7 @@ function _skBuildBriefingHeroCardHTML(entries) {
     // Only once the week is actually in. Half-loaded leagues would be
     // measured against a season they are not all in yet.
     (loading === 0 ? _skBriefSeasonLine(season) : '') +
+    _skBriefSportSplit(ready) +
   '</div>';
   return html;
 }
