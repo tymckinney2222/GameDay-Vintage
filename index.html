@@ -24357,7 +24357,25 @@
     color: var(--sk-gold);
     font-weight: 700;
   }
-  .sk-briefing-dateline {
+  /* SEASONCTX -- the verdict under the ledger */
+.sk-briefing-hero-verdict {
+  margin-top: 14px; padding-top: 12px;
+  border-top: 1px solid rgba(255,255,255,0.07);
+  font-family: 'Playfair Display', Georgia, serif; font-style: italic;
+  font-size: 15px; font-weight: 500; color: rgba(245,240,228,0.82);
+}
+.sk-briefing-hero-verdict.up { color: #6ee7a0; }
+.sk-briefing-hero-verdict.down { color: #f08a8a; }
+.sk-briefing-hero-season {
+  margin-top: 5px; font-family: 'JetBrains Mono', monospace;
+  font-size: 10px; font-weight: 500; letter-spacing: 0.04em;
+  color: rgba(255,255,255,0.32);
+}
+.sk-briefing-heldback {
+  margin-top: 7px; font-family: 'JetBrains Mono', monospace; font-size: 10px;
+  font-weight: 500; letter-spacing: 0.04em; color: rgba(255,255,255,0.3);
+}
+.sk-briefing-dateline {
     font-family: var(--sk-font-mono);
     font-size: 11px;
     color: var(--sk-text-3);
@@ -127706,6 +127724,28 @@ var skBriefingFetchInFlight = false;
 // of day-of-week AND ignores any prior dismissal — useful for
 // testing the briefing on non-Mondays without having to clear
 // localStorage on mobile.
+// What a Monday edition recaps: head-to-head leagues whose week has
+// actually finished. Returns the leagues AND what was deliberately held
+// back, so the page can say so rather than quietly coming up short.
+//
+// Football is held back. A Yahoo football week runs Tuesday to Monday,
+// so at Monday breakfast the current week still has Monday Night
+// Football in it, and the week before it closed eight days ago and was
+// recapped in the last edition. There is no football week that is both
+// finished and new on a Monday morning.
+function _skBriefingLeagues() {
+  var all = skSyncedLeagues().filter(function (l) {
+    var s = l.scoring_type;
+    return s === 'head' || s === 'headone' || s === 'headpoint';
+  });
+  var leagues = [], held = [], i;
+  for (i = 0; i < all.length; i++) {
+    if (typeof _skIsNflLeague === 'function' && _skIsNflLeague(all[i])) held.push(all[i]);
+    else leagues.push(all[i]);
+  }
+  return { leagues: leagues, held: held };
+}
+
 function _skIsMondayBriefingActive() {
   if (_skBriefingPreviewMode()) return true;
   return new Date().getDay() === 1;
@@ -128168,6 +128208,17 @@ function skOpenBriefing() {
 // Parse last week's scoreboard for the user's matchup. Similar to
 // the current-week parser but scoped to a single team's row and
 // returning a smaller "result" shape suitable for briefing cards.
+// Which shape a league's result has, asked of the league rather than of
+// its scoring_type string. Yahoo reports BOTH an NFL points league and
+// an NHL categories league as 'head'; only the sport separates them.
+// Returns the scoring_type the briefing should RENDER as.
+function _skBriefScoring(league) {
+  if (typeof _skIsPointsH2HLeague === 'function' && _skIsPointsH2HLeague(league)) {
+    return 'headpoint';
+  }
+  return (league && league.scoring_type) || '';
+}
+
 function _skParseLastWeekMyMatchup(scoreboardRes, myTeamKey, scoringType) {
   var out = { hasMatchup: false, scoringType: scoringType };
   if (!scoreboardRes || scoreboardRes.error || !scoreboardRes.fantasy_content) return out;
@@ -128297,9 +128348,7 @@ function _skParseLastWeekMyMatchup(scoreboardRes, myTeamKey, scoringType) {
 // pick up newly-ready leagues without re-fetching old ones.
 function _skLoadBriefingData() {
   if (skBriefingFetchInFlight) return;
-  var leagues = skSyncedLeagues().filter(function(l) {
-    var s = l.scoring_type;
-    if (s !== 'head' && s !== 'headone' && s !== 'headpoint') return false;
+  var leagues = _skBriefingLeagues().leagues.filter(function(l) {
     // Already attempted? Don't retry.
     if (skBriefingCache[l.league_key]) return false;
     // Hydration not ready yet? Defer (will be picked up next call).
@@ -128343,7 +128392,7 @@ function _skLoadBriefingData() {
       .then(function(arr) {
         var res = arr[0];
         var myTeamKey = myTeamKeyForSeason;
-        var result = _skParseLastWeekMyMatchup(res, myTeamKey, league.scoring_type);
+        var result = _skParseLastWeekMyMatchup(res, myTeamKey, _skBriefScoring(league));
         var weeklyResults = arr[2]; // array of {week, result:'W'/'L'/'T', ...}
         skBriefingCache[key] = { lastWeekResult: result, weeklyResults: weeklyResults || [], ts: Date.now() };
       })
@@ -128380,10 +128429,8 @@ function skRenderBriefing() {
   var body = document.getElementById('skBriefingBody');
   if (!body) return;
 
-  var leagues = skSyncedLeagues().filter(function(l) {
-    var s = l.scoring_type;
-    return s === 'head' || s === 'headone' || s === 'headpoint';
-  });
+  var _bl = _skBriefingLeagues();
+  var leagues = _bl.leagues;
   var range = _skLastWeekRange();
   var dateLabel = _skFormatBriefingDateRange(range);
 
@@ -128403,9 +128450,16 @@ function skRenderBriefing() {
 
   // ── Masthead ────────────────────────────────────────────────
   var html = '<div class="sk-briefing-masthead">' +
-    '<div class="sk-briefing-eyebrow">SKIPPER \u00b7 SUNDAY EDITION</div>' +
+    '<div class="sk-briefing-eyebrow">SKIPPER \u00b7 MONDAY EDITION</div>' +
     '<h1 class="sk-briefing-title">Monday Morning <em>Briefing</em></h1>' +
     '<div class="sk-briefing-dateline">' + skEscape(dateLabel) + ' \u00b7 ' + leagues.length + ' league' + (leagues.length === 1 ? '' : 's') + '</div>' +
+    // Say what is missing. Dropping seven leagues out of nineteen with
+    // no explanation reads as a bug, which is the one thing a recap
+    // cannot afford to look like.
+    (_bl.held.length
+      ? '<div class="sk-briefing-heldback">' + _bl.held.length + ' football league' +
+        (_bl.held.length === 1 ? '' : 's') + ' still playing \u00b7 week closes tonight</div>'
+      : '') +
   '</div>';
 
   // ── Hero card (cross-league summary) ───────────────────────
@@ -128511,6 +128565,153 @@ function _skComputeRankDeltaForLeague(league) {
 }
 
 // ── Hero summary card (cross-league results) ────────────────
+// ---------------------------------------------------------------
+// WAS IT A GOOD WEEK -- SEASONCTX --
+// The ledger said 8-6-5 and stopped. Eight wins is only good or bad
+// against something, and the briefing already had the something: it
+// fetches every league's whole season to find a two-game streak and
+// then throws the rest away. This spends none of it twice -- no new
+// request, just arithmetic on what is already in skBriefingCache.
+// ---------------------------------------------------------------
+
+// One league's completed weeks, oldest first, as W / L / T.
+//
+// Lifted out of the streaks section, which derived this inline and was
+// the only thing that knew how. Yahoo gives a winning team key and a
+// tie flag, never a result from your side, so somebody has to do this
+// and it should not be two somebodies.
+function _skBriefWeeklyWLT(leagueKey) {
+  var cached = skBriefingCache[leagueKey];
+  var wr = cached && cached.weeklyResults;
+  if (!wr || !wr.length) return [];
+  var myKey = (skLeagueData[leagueKey] && skLeagueData[leagueKey].team &&
+    skLeagueData[leagueKey].team.team_key) || '';
+  return wr.filter(function (w) { return w.complete; })
+    .sort(function (a, b) { return (a.week || 0) - (b.week || 0); })
+    .map(function (w) {
+      var res = w.matchupIsTied ? 'T'
+        : (w.matchupWinner && w.matchupWinner === myKey) ? 'W' : 'L';
+      return { week: w.week, res: res, pts: w.myPts };
+    });
+}
+
+// A record as one number, so weeks of different sizes compare. A tie is
+// half a win, the way every standings page in the world counts it.
+function _skBriefPct(w, l, t) {
+  var n = w + l + t;
+  return n ? (w + t / 2) / n : 0;
+}
+
+// The season behind last week's ledger.
+//
+// Two numbers that need no alignment: the season record, which is just
+// every completed matchup added up, and last week's rate against the
+// season's rate.
+//
+// Ranking weeks needs more care, because a week NUMBER does not mean
+// the same thing in two leagues -- hockey's week 3 and baseball's week
+// 3 are months apart, and a user's leagues do not start together. So
+// weeks are compared by counting BACK from last week instead: slice 0
+// is each league's most recent completed week, slice 1 the one before
+// it, and so on. Every league contributes exactly one matchup to each
+// slice, which makes the slices the same shape as the ledger itself.
+// A slice missing leagues is not comparable and is left out of the
+// ranking rather than quietly dragging the average around.
+function _skBriefSeason(entries) {
+  var series = [], i, k;
+  for (i = 0; i < entries.length; i++) {
+    var wl = _skBriefWeeklyWLT(entries[i].league.league_key);
+    if (wl.length) series.push(wl);
+  }
+  if (!series.length) return null;
+
+  // the season, every completed matchup in every league
+  var sw = 0, sl = 0, st = 0;
+  for (i = 0; i < series.length; i++) {
+    for (k = 0; k < series[i].length; k++) {
+      var r = series[i][k].res;
+      if (r === 'W') sw++; else if (r === 'L') sl++; else st++;
+    }
+  }
+  if (!(sw + sl + st)) return null;
+
+  // the slices, counting back from each league's last completed week
+  var deepest = 0;
+  for (i = 0; i < series.length; i++) {
+    if (series[i].length > deepest) deepest = series[i].length;
+  }
+  var slices = [];
+  for (k = 0; k < deepest; k++) {
+    var w = 0, l = 0, t = 0, n = 0;
+    for (i = 0; i < series.length; i++) {
+      var row = series[i][series[i].length - 1 - k];
+      if (!row) continue;
+      n++;
+      if (row.res === 'W') w++; else if (row.res === 'L') l++; else t++;
+    }
+    slices.push({ w: w, l: l, t: t, n: n, pct: _skBriefPct(w, l, t) });
+  }
+
+  var cur = slices[0];
+  var comparable = [cur], better = 0, equal = 0;
+  var EPS = 1e-9;
+  for (k = 1; k < slices.length; k++) {
+    if (slices[k].n !== cur.n) continue;      // a different set of leagues
+    comparable.push(slices[k]);
+    if (slices[k].pct > cur.pct + EPS) better++;
+    else if (Math.abs(slices[k].pct - cur.pct) <= EPS) equal++;
+  }
+
+  var seasonPct = _skBriefPct(sw, sl, st);
+  var out = {
+    won: sw, lost: sl, tied: st, seasonPct: seasonPct,
+    weekPct: cur.pct, weeks: comparable.length, rank: better + 1,
+    verdict: 'par'
+  };
+  // "Best of the season" is worth saying only when there is a season to
+  // be best of, and only when last week is better than every other week
+  // rather than merely level with them. A run of identical weeks has no
+  // best one, and calling the most recent of them your best week is the
+  // sort of flattery that teaches you to stop reading the line.
+  if (comparable.length >= 4 && better === 0 && equal === 0) out.verdict = 'best';
+  else if (comparable.length >= 4 && equal === 0 &&
+    better === comparable.length - 1) out.verdict = 'worst';
+  else if (cur.pct - seasonPct > 0.08) out.verdict = 'better';
+  else if (seasonPct - cur.pct > 0.08) out.verdict = 'worse';
+  return out;
+}
+
+function _skBriefSeasonLine(s) {
+  if (!s) return '';
+  var head = {
+    best:   'Your best week of the season',
+    worst:  'Your worst week of the season',
+    better: 'Ahead of your season pace',
+    worse:  'Below your season pace',
+    par:    'Right about your season pace'
+  }[s.verdict] || '';
+  var cls = (s.verdict === 'best' || s.verdict === 'better') ? ' up'
+    : (s.verdict === 'worst' || s.verdict === 'worse') ? ' down' : '';
+  var EN = String.fromCharCode(8211), MID = String.fromCharCode(183);
+  var rec = s.won + EN + s.lost + (s.tied ? EN + s.tied : '');
+  var sub = 'Season ' + rec;
+  if (s.verdict === 'best' || s.verdict === 'worst') {
+    sub += ' ' + MID + ' ' + s.weeks + ' weeks in';
+  } else {
+    sub += ' ' + MID + ' ' + _skBriefPctStr(s.weekPct) + ' last week, ' +
+      _skBriefPctStr(s.seasonPct) + ' on the year';
+  }
+  return '<div class="sk-briefing-hero-verdict' + cls + '">' + skEscape(head) + '</div>' +
+    '<div class="sk-briefing-hero-season">' + skEscape(sub) + '</div>';
+}
+
+// .548, the way a batting average is written -- no leading zero.
+function _skBriefPctStr(p) {
+  var v = Math.round(p * 1000);
+  if (v >= 1000) return '1.000';
+  return '.' + ('00' + v).slice(-3);
+}
+
 function _skBuildBriefingHeroCardHTML(entries) {
   var ready = entries.filter(function(e) { return e.result && e.result.hasMatchup; });
   var loading = entries.length - ready.length;
@@ -128520,6 +128721,10 @@ function _skBuildBriefingHeroCardHTML(entries) {
   var won = ready.filter(function(e) { return e.result.verdict === 'won'; }).length;
   var lost = ready.filter(function(e) { return e.result.verdict === 'lost'; }).length;
   var tied = ready.filter(function(e) { return e.result.verdict === 'tied'; }).length;
+  // SEASONCTX -- eight wins is only good or bad against something.
+  var season = null;
+  try { season = _skBriefSeason(ready); } catch (eS) { season = null; }
+
   var html = '<div class="sk-briefing-hero">' +
     '<div class="sk-briefing-hero-headline">Last week\u2019s ledger</div>' +
     '<div class="sk-briefing-hero-tally">' +
@@ -128534,6 +128739,9 @@ function _skBuildBriefingHeroCardHTML(entries) {
       ' across ' + ready.length + ' of ' + entries.length + ' leagues' +
       (loading > 0 ? ' \u00b7 <em>still loading ' + loading + '\u2026</em>' : '') +
     '</div>' +
+    // Only once the week is actually in. Half-loaded leagues would be
+    // measured against a season they are not all in yet.
+    (loading === 0 ? _skBriefSeasonLine(season) : '') +
   '</div>';
   return html;
 }
@@ -128671,21 +128879,10 @@ function _skBuildBriefingStreaksHTML(entries) {
   var streakRows = [];
   entries.forEach(function(e) {
     var key = e.league.league_key;
-    var cached = skBriefingCache[key];
-    var wr = cached && cached.weeklyResults;
-    if (!wr || !wr.length) return;
-
-    // _skParseMatchupsWithScores returns matchupWinner (team key) and
-    // matchupIsTied — no pre-computed result field. Derive it.
-    var myKey = (skLeagueData[key] && skLeagueData[key].team && skLeagueData[key].team.team_key) || '';
-    var sorted = wr.filter(function(w) { return w.complete; })
-      .sort(function(a, b) { return (a.week || 0) - (b.week || 0); })
-      .map(function(w) {
-        var res = w.matchupIsTied ? 'T'
-                : (w.matchupWinner && w.matchupWinner === myKey) ? 'W' : 'L';
-        return { week: w.week, res: res };
-      });
-
+    // SEASONCTX -- shared with the ledger's season line, so there is one
+    // place that knows how to turn Yahoo's winning-team-key into a
+    // result from your side.
+    var sorted = _skBriefWeeklyWLT(key);
     if (!sorted.length) return;
     var lastRes = sorted[sorted.length - 1].res;
     if (lastRes === 'T') return;
@@ -129131,7 +129328,7 @@ function _skBuildBriefingLeagueCardHTML(entry) {
 
   // Score / cats string
   var scoreStr = '';
-  if (l.scoring_type === 'headpoint') {
+  if (_skBriefScoring(l) === 'headpoint') {
     scoreStr = (r.myScore != null ? r.myScore.toFixed(1) : '\u2014') + ' \u2013 ' + (r.oppScore != null ? r.oppScore.toFixed(1) : '\u2014');
   } else if (l.scoring_type === 'head') {
     scoreStr = r.myCatsWon + '\u2013' + r.oppCatsWon + (r.tiedCats > 0 ? '\u2013' + r.tiedCats : '');
@@ -129145,12 +129342,17 @@ function _skBuildBriefingLeagueCardHTML(entry) {
   // Falls back to margin-based generic if cats data or settings
   // aren't ready yet.
   var story = '';
-  if (l.scoring_type === 'headpoint') {
-    if (r.margin >= 100) story = 'Wire-to-wire blowout.';
-    else if (r.margin >= 30) story = 'Comfortable margin.';
-    else if (r.margin >= 10) story = 'Solid result.';
+  // A margin on its own does not know who it belongs to. Every one of
+  // these used to read as a win, so a 311-389 defeat came back as
+  // "Comfortable margin." and a 607.7-637.5 defeat as "Solid result."
+  var _won = r.verdict === 'won', _tie = r.verdict === 'tied';
+  if (_skBriefScoring(l) === 'headpoint') {
+    if (_tie) story = 'Dead even.';
+    else if (r.margin >= 100) story = _won ? 'Wire-to-wire blowout.' : 'Never in it.';
+    else if (r.margin >= 30) story = _won ? 'Comfortable margin.' : 'Beaten comfortably.';
+    else if (r.margin >= 10) story = _won ? 'Solid result.' : 'Came up short.';
     else story = 'Came down to the wire.';
-  } else if (l.scoring_type === 'head' || l.scoring_type === 'headone') {
+  } else if (_skIsCatsLeague(l)) {
     var settings = (typeof leagueSettingsCache !== 'undefined') ? leagueSettingsCache[l.league_key] : null;
     var statsMeta = settings && settings.stats;
     var highlight = _skPickWeekInCatsHighlight(r, statsMeta);
@@ -129176,7 +129378,7 @@ function _skBuildBriefingLeagueCardHTML(entry) {
 
   // Category breakdown (for cat leagues)
   var catBreakdown = '';
-  if ((l.scoring_type === 'head' || l.scoring_type === 'headone')) {
+  if (_skIsCatsLeague(l)) {
     var settings = (typeof leagueSettingsCache !== 'undefined') ? leagueSettingsCache[l.league_key] : null;
     var statsMeta = settings && settings.stats;
     catBreakdown = _skBuildBriefingCatBreakdown(r, statsMeta);
@@ -129184,7 +129386,7 @@ function _skBuildBriefingLeagueCardHTML(entry) {
   
   // Top scorers (for points leagues - this week's leaders)
   var topScorers = '';
-  if (l.scoring_type === 'headpoint' || l.scoring_type === 'point') {
+  if (_skBriefScoring(l) === 'headpoint' || l.scoring_type === 'point') {
     var currentWeek = parseInt(l.current_week, 10) || 1;
     topScorers = _skBuildBriefingTopScorers(l.league_key, currentWeek, r.verdict);
   }
