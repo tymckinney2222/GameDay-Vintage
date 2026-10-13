@@ -32921,6 +32921,144 @@
 </nav>
 
 <script>
+// ==================================================================
+// THE WRITE GUARD -- LSGUARD --
+//
+// Ty, at 8.1 MB of a 10 MB origin and about to add basketball: "why does
+// everything have to go to local storage?"
+//
+// The migration off it is the next job. This is the thing that had to come
+// first, because of what a full quota actually looks like from the inside.
+// There are ninety-nine localStorage writes in this file. Eighty-five of
+// them sit inside a bare catch that swallows whatever comes out, fourteen
+// would throw outright, and exactly two test for QuotaExceededError. So
+// "full" does not announce itself. It looks like some things quietly
+// stopped saving, and the one that would hurt is a SNAPSHOT -- the only
+// data in here that cannot be fetched again.
+//
+// -- WHY IT WRAPS THE SETTER RATHER THAN THE CALL SITES --
+// Ninety-nine call sites is ninety-nine chances to miss one, and the one
+// missed is the one that matters at two in the morning in October. Wrapping
+// Storage.prototype.setItem once covers every write in the file, including
+// any written after this, and needs no call site to remember anything.
+//
+// -- WHAT IT DOES WHEN THE DISK SAYS NO --
+// It sheds, in order, from the most expendable cache to the least, and
+// retries the write after every step. It never sheds a snapshot: those are
+// the irreplaceable ones and they are what the shedding is FOR. If the
+// ladder runs out it records the failure and says so on screen, which is
+// the whole point -- a write that did not happen should not look like one
+// that did.
+// ==================================================================
+
+// The irreplaceable ones. Everything else in the app can be fetched again
+// from Yahoo or ESPN; these are banked history and a login, and losing one
+// is permanent. A failed write to any of these is worth interrupting for.
+var _SK_DURABLE_KEYS = [
+  /^cats_snap_v/, /^pts_snap_v/, /^esp_pts_snap_v/, /^ext_pts_snap_v/,
+  /^gdhq_pickem_/, /^gdhq_mgr_record/,
+  /^gdhq_sleeper_/, /^gdhq_fantrax_/
+];
+function _skDurableKey(k) {
+  var s = String(k || ''), i;
+  for (i = 0; i < _SK_DURABLE_KEYS.length; i++) {
+    if (_SK_DURABLE_KEYS[i].test(s)) return true;
+  }
+  return false;
+}
+
+// Chrome says QuotaExceededError, Firefox says NS_ERROR_DOM_QUOTA_REACHED,
+// and older builds of both only set a numeric code. Any of them means the
+// same thing: there is no room.
+function _skIsQuotaError(e) {
+  if (!e) return false;
+  var n = e.name || '', c = e.code;
+  return n === 'QuotaExceededError' || n === 'NS_ERROR_DOM_QUOTA_REACHED' ||
+    c === 22 || c === 1014;
+}
+
+// THE LADDER, most expendable first. Every rung is an existing purge -- this
+// adds no new idea of what is safe to delete, it just runs the ones already
+// written in a deliberate order. Snapshot purges are NOT on it.
+var _SK_SHED_LADDER = [
+  function () { if (typeof _skSparkPrune === 'function') _skSparkPrune(); },
+  function () { if (typeof _purgeOldFpCachesByDate === 'function') _purgeOldFpCachesByDate(14); },
+  function () {
+    if (typeof _purgedOldSettings !== 'undefined') _purgedOldSettings = false;
+    if (typeof _purgeOldSettingsCaches === 'function') _purgeOldSettingsCaches();
+    if (typeof _purgedOldFpCaches !== 'undefined') _purgedOldFpCaches = false;
+    if (typeof _purgeOldFpCaches === 'function') _purgeOldFpCaches();
+  },
+  function () { if (typeof _purgeOldFpCachesByDate === 'function') _purgeOldFpCachesByDate(7); },
+  function () { if (typeof _purgeOldFpCachesByDate === 'function') _purgeOldFpCachesByDate(3); },
+  function () { if (typeof _purgeOldFpCachesByDate === 'function') _purgeOldFpCachesByDate(1); }
+];
+
+// What the guard has had to do, for the storage panel to report.
+var _skGuardState = { shed: 0, failed: 0, durableFailed: 0, lastKey: '', at: 0 };
+var _skGuardBusy = false;        // no re-entry: the purges write too
+var _skGuardToasted = false;
+
+function _skGuardNoteFail(k) {
+  _skGuardState.failed++;
+  _skGuardState.lastKey = String(k || '');
+  _skGuardState.at = Date.now();
+  if (!_skDurableKey(k)) return;
+  _skGuardState.durableFailed++;
+  // ONCE PER SESSION, and only for the irreplaceable ones. A cache that
+  // could not be written will simply be fetched again and is nobody's
+  // business; a snapshot that could not be written is lost for good.
+  if (_skGuardToasted) return;
+  _skGuardToasted = true;
+  try {
+    if (typeof skToast === 'function') {
+      skToast('Storage full - that did not save. Open Storage usage to clear space.');
+    }
+  } catch (e) {}
+}
+
+// The guard itself, kept separate from the install so it can be driven
+// directly by a test with a setter that fails on demand. Filling a real
+// ten megabytes to find out whether the retry works is not a test anybody
+// runs twice.
+function _skGuardedSet(raw, store, k, v) {
+  try { return raw.call(store, k, v); } catch (e) {
+    if (!_skIsQuotaError(e)) throw e;
+    if (_skGuardBusy) { _skGuardNoteFail(k); return; }
+    _skGuardBusy = true;
+    try {
+      var i;
+      for (i = 0; i < _SK_SHED_LADDER.length; i++) {
+        try { _SK_SHED_LADDER[i](); } catch (e2) {}
+        try {
+          raw.call(store, k, v);
+          _skGuardState.shed++;
+          return;
+        } catch (e3) {
+          if (!_skIsQuotaError(e3)) throw e3;
+        }
+      }
+      _skGuardNoteFail(k);
+    } finally { _skGuardBusy = false; }
+  }
+}
+
+var _skGuardInstalled = false;
+function _skInstallWriteGuard() {
+  if (_skGuardInstalled) return false;
+  try {
+    if (typeof Storage === 'undefined' || !Storage.prototype) return false;
+    var raw = Storage.prototype.setItem;
+    if (typeof raw !== 'function') return false;
+    Storage.prototype.setItem = function (k, v) {
+      return _skGuardedSet(raw, this, k, v);
+    };
+    _skGuardInstalled = true;
+    return true;
+  } catch (e) { return false; }
+}
+_skInstallWriteGuard();
+
 // ---- SKJSERR ----
 // Every script this page pulls from another origin registers here while it
 // is in flight. An error thrown inside one of those comes back to window
@@ -43535,11 +43673,8 @@ var _ED_FDSPORT = { nhl: 'Hockey', nba: 'Basketball', mlb: 'Baseball',
 // The day's bucket out of the player-spark store, or null. One read, not
 // one per player: at forty leagues this is called a few hundred times.
 function _edSparkDay(iso) {
-  if (!iso || typeof SK_PSPARK_PREFIX === 'undefined') return null;
-  try {
-    var o = JSON.parse(localStorage.getItem(SK_PSPARK_PREFIX + iso) || 'null');
-    return (o && typeof o === 'object') ? o : null;
-  } catch (e) { return null; }
+  if (!iso || typeof _skSparkDayRaw !== 'function') return null;
+  try { return _skSparkDayRaw(iso); } catch (e) { return null; }
 }
 
 // PSPARKG's three answers, kept distinct: a number he scored, 'ng' for a
@@ -94363,8 +94498,170 @@ function _allInByGameHtml(players, sport) {
 // bars fill in from the day this ships.
 // ══════════════════════════════════════════════════════════════════
 var SK_PSPARK_PREFIX = 'sk_pspark_v1_';
-var SK_PSPARK_DAYS = 14;        // kept; the card draws 10
+var SK_PSPARK_DAYS = 10;        // what the card draws, and now what
+                                // is kept: the four extra days were
+                                // stored and never shown
 var _skSparkMem = null;
+
+// ==================================================================
+// THE SPARKLINE STORE, COMPACTED -- PSPARK2 --
+//
+// One feature was using a third of the whole origin quota. The player
+// sparkline banked one key per calendar day, keyed inside by
+// playername|league_key, and kept fourteen of them: six of those keys read
+// 160 to 189 KB in Ty's storage panel, which puts the fortnight at about
+// 2.4 MB. The row the panel calls "Skipper settings / misc" totals 2.6 MB
+// across sixteen hundred keys -- so fourteen sparkline keys were 2.4 of it
+// and the other sixteen hundred shared two hundred KB between them.
+//
+// -- WHAT WAS ACTUALLY BIG WAS THE KEYS --
+// Ty's own read of it: "most of these values are stored, can they be copied
+// and then just be values?" Right, and more exactly: a day's entry is a
+// name and a league key written out in full against one number, and the
+// SAME name and league key were written out again in all fourteen buckets.
+// The numbers were never the problem.
+//
+// So the names live once now, in a table that maps playername|league_key to
+// a short base-36 id, and a day is ids against values. A day drops from
+// about 177 KB to under twenty, the table costs about one old day once, and
+// the window comes down from fourteen days to ten -- which is what the card
+// actually draws, so nothing on screen changes.
+//
+// -- IDS ARE NEVER REUSED --
+// The table drops entries no kept day refers to any more, but the counter
+// only ever goes up. Reusing a number would silently reassign somebody
+// else's fortnight to a new player, and base 36 gives sixty million ids
+// before four characters run out.
+// ==================================================================
+var SK_PSPARK2_PREFIX = 'sk_pspark_v2_';
+var SK_PSPARK_IDS_KEY = 'sk_pspark_ids_v2';
+var _skSparkIdsMem = null;
+var _skSparkInvMem = null;
+var _skSparkMigratedRun = false;
+
+// The table, as stored: n is the next id to hand out, m maps the full
+// name|league key to the short one.
+function _skSparkIds() {
+  if (_skSparkIdsMem) return _skSparkIdsMem;
+  var t = null;
+  try { t = JSON.parse(localStorage.getItem(SK_PSPARK_IDS_KEY) || 'null'); } catch (e) {}
+  if (!t || typeof t !== 'object' || typeof t.m !== 'object' || !t.m) {
+    t = { n: 1, m: {} };
+  }
+  if (typeof t.n !== 'number' || !(t.n > 0)) t.n = 1;
+  _skSparkIdsMem = t;
+  return t;
+}
+// REPORTS WHETHER IT LANDED, and every caller checks. If the table failed
+// to save but a day bucket went down anyway, that day would hold ids the
+// table does not know -- and worse, the next session would hand those same
+// numbers to different players and quietly file one man's fortnight under
+// another's name. No table, no day.
+function _skSparkIdsSave(t) {
+  var ok = false;
+  try {
+    localStorage.setItem(SK_PSPARK_IDS_KEY, JSON.stringify({ n: t.n, m: t.m }));
+    ok = true;
+  } catch (e) {}
+  _skSparkIdsMem = t;
+  _skSparkInvMem = null;
+  return ok;
+}
+function _skSparkIdFor(fullKey, t) {
+  var id = t.m[fullKey];
+  if (id) return id;
+  id = (t.n++).toString(36);
+  t.m[fullKey] = id;
+  return id;
+}
+// id back to name|league, which is what every reader still speaks.
+function _skSparkInv() {
+  if (_skSparkInvMem) return _skSparkInvMem;
+  var t = _skSparkIds(), inv = {}, k;
+  for (k in t.m) { if (t.m.hasOwnProperty(k)) inv[t.m[k]] = k; }
+  _skSparkInvMem = inv;
+  return inv;
+}
+
+// ONE DAY, IN THE SHAPE EVERY READER ALREADY EXPECTS. The compaction is a
+// storage decision and stops at the storage edge: callers still get an
+// object keyed by name|league and never learn an id exists. Falls back to
+// the old store for any day the migration has not reached yet, so no day
+// goes blank in between.
+function _skSparkDayRaw(iso) {
+  var o = null, out, kk, inv;
+  try { o = JSON.parse(localStorage.getItem(SK_PSPARK2_PREFIX + iso) || 'null'); } catch (e) {}
+  if (o && typeof o === 'object') {
+    inv = _skSparkInv();
+    out = {};
+    for (kk in o) {
+      if (!o.hasOwnProperty(kk)) continue;
+      if (inv[kk]) out[inv[kk]] = o[kk];
+    }
+    return out;
+  }
+  try { o = JSON.parse(localStorage.getItem(SK_PSPARK_PREFIX + iso) || 'null'); } catch (e2) {}
+  return (o && typeof o === 'object') ? o : null;
+}
+
+// THE OLD FORTNIGHT, CARRIED OVER. Out-of-window days are dropped outright
+// rather than converted, and they are dealt with FIRST -- they are the
+// oldest and the biggest thing in the way, so the space they free is what
+// the converted days are then written into.
+function _skSparkMigrate() {
+  if (_skSparkMigratedRun) return 0;
+  _skSparkMigratedRun = true;
+  var keys = [], i, k;
+  try {
+    for (i = 0; i < localStorage.length; i++) {
+      k = localStorage.key(i);
+      if (k && k.indexOf(SK_PSPARK_PREFIX) === 0) keys.push(k);
+    }
+  } catch (e) { return 0; }
+  if (!keys.length) return 0;
+  var keep = {}, ds = _skSparkDates(SK_PSPARK_DAYS);
+  for (i = 0; i < ds.length; i++) keep[ds[i]] = 1;
+
+  var todo = [];
+  for (i = 0; i < keys.length; i++) {
+    var iso = keys[i].slice(SK_PSPARK_PREFIX.length);
+    if (keep[iso]) { todo.push([keys[i], iso]); continue; }
+    try { localStorage.removeItem(keys[i]); } catch (e2) {}
+  }
+
+  var moved = 0;
+  for (i = 0; i < todo.length; i++) {
+    var old = null;
+    try { old = JSON.parse(localStorage.getItem(todo[i][0]) || 'null'); } catch (e3) {}
+    if (old && typeof old === 'object' && _skSparkPack(todo[i][1], old)) moved++;
+    // the old copy goes the moment the new one is down, so the two shapes
+    // are never both carrying the whole fortnight
+    try { localStorage.removeItem(todo[i][0]); } catch (e4) {}
+  }
+  _skSparkMem = null;
+  return moved;
+}
+
+// ONE DAY, WRITTEN IN THE CURRENT SHAPE, from a map keyed the way the rest
+// of the app speaks: name|league against a value. The migration is its first
+// caller and will not be its last -- this is the single place that knows how
+// a day is laid down, so moving the store again (to IndexedDB, next) changes
+// this function and nothing that calls it.
+function _skSparkPack(iso, fullMap) {
+  if (!iso || !fullMap || typeof fullMap !== 'object') return false;
+  var t = _skSparkIds(), packed = {}, kk, any = false;
+  for (kk in fullMap) {
+    if (!fullMap.hasOwnProperty(kk)) continue;
+    packed[_skSparkIdFor(kk, t)] = fullMap[kk];
+    any = true;
+  }
+  if (!any) return false;
+  if (!_skSparkIdsSave(t)) return false;
+  try { localStorage.setItem(SK_PSPARK2_PREFIX + iso, JSON.stringify(packed)); }
+  catch (e) { return false; }
+  _skSparkMem = null;
+  return true;
+}
 
 function _skSparkKey(name, leagueKey) {
   var nk = (typeof _pmNameKey === 'function') ? _pmNameKey(name)
@@ -94398,16 +94695,17 @@ function _skSparkWrite(teamKey, date, fpMap) {
       ? fyLeagues.filter(function (l) { return l.league_key === leagueKey; })[0] : null;
     if (lg && typeof _skIsNflLeague === 'function' && _skIsNflLeague(lg)) return;
   } catch (e) {}
-  var k = SK_PSPARK_PREFIX + date, bucket = null;
+  var k = SK_PSPARK2_PREFIX + date, bucket = null;
   try { bucket = JSON.parse(localStorage.getItem(k) || 'null'); } catch (e2) {}
   if (!bucket || typeof bucket !== 'object') bucket = {};
-  var wrote = false, pk;
+  var t = _skSparkIds(), wrote = false, fresh = false, pk;
   for (pk in fpMap) {
     if (!fpMap.hasOwnProperty(pk)) continue;
     var e3 = fpMap[pk];
     if (!e3 || !e3.name || typeof e3.fp !== 'number' || isNaN(e3.fp)) continue;
     var sk = _skSparkKey(e3.name, leagueKey);
     if (!sk) continue;
+    if (!t.m[sk]) fresh = true;
     // == A NIGHT OFF IS NOT A COLD NIGHT == PSPARKG ==
     //
     // Yahoo reports 0.00 for a rostered player whose club had no game, and
@@ -94418,41 +94716,80 @@ function _skSparkWrite(teamKey, date, fpMap) {
     //
     // Now a day he did not play is stored as the sentinel '-'. It is a
     // STRING, so nothing that reads a number is confused by it, and days
-    // banked under the old rule keep reading as the numbers they are. No
-    // migration, nothing lost, and a mixed record for the next fortnight.
-    bucket[sk] = _skPlayedThatDay(e3) ? (Math.round(e3.fp * 10) / 10) : '-';
+    // banked under the old rule keep reading as the numbers they are.
+    bucket[_skSparkIdFor(sk, t)] =
+      _skPlayedThatDay(e3) ? (Math.round(e3.fp * 10) / 10) : '-';
     wrote = true;
   }
   if (!wrote) return;
+  // the names first, and only then the day that refers to them
+  if (fresh && !_skSparkIdsSave(t)) return;
   try { localStorage.setItem(k, JSON.stringify(bucket)); } catch (e4) { return; }
   _skSparkMem = null;
   _skSparkPrune();
 }
 
-// Anything older than the window. Cheap, and it runs on a write rather than
-// on a timer so a phone that never opens the app never pays for it.
+// PSPARK2PRUNE
+// Anything outside the window, in either shape. The names table is swept
+// too, but only on a day the window actually moved: the sweep reads all ten
+// buckets and this runs after every team's write, which at forty leagues
+// would be four hundred passes for one day's worth of change.
 function _skSparkPrune() {
   try {
-    var keep = {}, ds = _skSparkDates(SK_PSPARK_DAYS), i;
-    for (i = 0; i < ds.length; i++) keep[SK_PSPARK_PREFIX + ds[i]] = 1;
+    var keepIso = {}, ds = _skSparkDates(SK_PSPARK_DAYS), i, k;
+    for (i = 0; i < ds.length; i++) keepIso[ds[i]] = 1;
     var drop = [];
     for (i = 0; i < localStorage.length; i++) {
-      var k = localStorage.key(i);
-      if (k && k.indexOf(SK_PSPARK_PREFIX) === 0 && !keep[k]) drop.push(k);
+      k = localStorage.key(i);
+      if (!k) continue;
+      if (k.indexOf(SK_PSPARK2_PREFIX) === 0) {
+        if (!keepIso[k.slice(SK_PSPARK2_PREFIX.length)]) drop.push(k);
+      } else if (k.indexOf(SK_PSPARK_PREFIX) === 0) {
+        if (!keepIso[k.slice(SK_PSPARK_PREFIX.length)]) drop.push(k);
+      }
     }
-    for (i = 0; i < drop.length; i++) { try { localStorage.removeItem(drop[i]); } catch (e) {} }
-  } catch (e2) {}
+    for (i = 0; i < drop.length; i++) {
+      try { localStorage.removeItem(drop[i]); } catch (e) {}
+    }
+    if (drop.length) _skSparkGc();
+  } catch (e3) {}
+}
+
+// PSPARK2GC
+// THE NAMES NO KEPT DAY STILL REFERS TO. Split out from the prune because
+// the prune only used to do this when a day had just fallen out of the
+// window, and days leave by other doors -- so a table that had already
+// shed its day kept every retired player in it until the window moved
+// again. The janitor runs this once a day whatever else happened.
+function _skSparkGc() {
+  try {
+    var ds = _skSparkDates(SK_PSPARK_DAYS), live = {}, i, k, o;
+    for (i = 0; i < ds.length; i++) {
+      o = null;
+      try { o = JSON.parse(localStorage.getItem(SK_PSPARK2_PREFIX + ds[i]) || 'null'); } catch (e) {}
+      if (!o || typeof o !== 'object') continue;
+      for (k in o) { if (o.hasOwnProperty(k)) live[k] = 1; }
+    }
+    var t = _skSparkIds(), kept = {}, gone = 0, kk;
+    for (kk in t.m) {
+      if (!t.m.hasOwnProperty(kk)) continue;
+      if (live[t.m[kk]]) kept[kk] = t.m[kk]; else gone++;
+    }
+    if (!gone) return 0;
+    t.m = kept;
+    _skSparkIdsSave(t);
+    return gone;
+  } catch (e2) { return 0; }
 }
 
 // Every bucket in the window, parsed ONCE. A card with fifty players would
 // otherwise re-parse fourteen JSON blobs per player.
 function _skSparkLoad() {
   if (_skSparkMem && (Date.now() - _skSparkMem.ts) < 60000) return _skSparkMem;
+  try { _skSparkMigrate(); } catch (e0) {}
   var days = [], ds = _skSparkDates(SK_PSPARK_DAYS), i;
   for (i = 0; i < ds.length; i++) {
-    var o = null;
-    try { o = JSON.parse(localStorage.getItem(SK_PSPARK_PREFIX + ds[i]) || 'null'); } catch (e) {}
-    days.push({ d: ds[i], m: (o && typeof o === 'object') ? o : null });
+    days.push({ d: ds[i], m: _skSparkDayRaw(ds[i]) });
   }
   _skSparkMem = { ts: Date.now(), days: days };
   return _skSparkMem;
@@ -202662,6 +202999,9 @@ function skExtTodayCardsHtml() {
 function _skStorageGroups() {
   var groups = [
     { id: 'fpday',   label: 'FP day caches (fp_v4_)',        test: function(k) { return k.indexOf('fp_v4_') === 0; } },
+    // ITS OWN ROW NOW, because it was a third of the quota on its own
+    // and hiding inside the sk_* catch-all where nobody would look.
+    { id: 'spark',   label: 'Player sparkline (10 days)',   test: function(k) { return k.indexOf('sk_pspark_') === 0; } },
     { id: 'fptot',   label: 'Daily totals (fpt_v1_)',        test: function(k) { return k.indexOf('fpt_v1_') === 0; } },
     { id: 'pstats',  label: 'Player stat caches',            test: function(k) { return k.indexOf('sk_player_stats_v1_') === 0; } },
     { id: 'fpstale', label: 'Stale FP versions (fp_v1-3_)',  test: function(k) { return /^fp_v\d+_/.test(k) && k.indexOf('fp_v4_') !== 0; } },
@@ -202731,6 +203071,8 @@ function _skStorageJanitor() {
   try { _purgeOldCatsSnapshots(); } catch (e) {}
   try { _purgeOldPtsSnapshots(); } catch (e) {}
   try { _purgeOldFpCachesByDate(SK_JANITOR_CACHE_DAYS); } catch (e) {}
+  try { _skSparkMigrate(); } catch (e) {}
+  try { _skSparkGc(); } catch (e) {}
   try { localStorage.setItem(SK_JANITOR_STAMP, today); } catch (e) {}
 }
 
@@ -202772,6 +203114,27 @@ function skRenderStorageReport() {
     '<div style="height:8px;border-radius:4px;background:rgba(255,255,255,0.07);overflow:hidden;margin-bottom:14px;">' +
       '<div style="height:100%;width:' + pct + '%;background:' + barColor + ';"></div>' +
     '</div>';
+  // WHAT THE GUARD HAS HAD TO DO. Shedding is housekeeping and worth
+  // knowing about; a write it could not land after shedding is the line
+  // that matters, because that is data this app does not have.
+  try {
+    if (typeof _skGuardState !== 'undefined' && _skGuardState) {
+      if (_skGuardState.durableFailed) {
+        html += '<div style="font-size:11px;color:#f87171;border:1px solid rgba(248,113,113,0.4);' +
+          'border-radius:8px;padding:8px 10px;margin-bottom:12px;">' +
+          _skGuardState.durableFailed + ' snapshot or login write could not be saved ' +
+          'even after clearing caches. Run a cleanup, then reload.</div>';
+      } else if (_skGuardState.failed) {
+        html += '<div style="font-size:11px;color:#fbbf24;border:1px solid rgba(251,191,36,0.35);' +
+          'border-radius:8px;padding:8px 10px;margin-bottom:12px;">' +
+          _skGuardState.failed + ' cache write skipped for want of room. ' +
+          'Nothing lost - it will be fetched again.</div>';
+      } else if (_skGuardState.shed) {
+        html += '<div style="font-size:11px;color:rgba(255,255,255,0.45);margin-bottom:12px;">' +
+          'Made room automatically ' + _skGuardState.shed + ' time(s) this session.</div>';
+      }
+    }
+  } catch (eG) {}
   for (var i = 0; i < rep.order.length; i++) {
     var g = rep.byId[rep.order[i].id];
     if (!g.count) continue;
