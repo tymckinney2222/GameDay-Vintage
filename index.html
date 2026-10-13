@@ -33210,21 +33210,15 @@ var SK_IDB_DONE_KEY = 'sk_idb_copied_v1';
 function _skIdbCopy(batch) {
   batch = batch || SK_IDB_BATCH;
   return _idbAll().then(function (have) {
-    var map = {}, strays = {}, n = 0, strayN = 0, i, k, v, pending = 0;
-    // ANYTHING IN THERE THAT SHOULD NOT BE, ON THE WAY PAST. The first build
-    // of this migrated without asking whose key it was and swept in the
-    // other apps on the origin; a store that has already done that heals
-    // itself on the next pass rather than needing to be rebuilt.
-    for (k in have) {
-      if (!have.hasOwnProperty(k)) continue;
-      if (!_skMigrates(k)) { strays[k] = 1; strayN++; }
-    }
+    var map = {}, strays = {}, n = 0, strayN = 0, strayLeft = 0;
+    var mine = {}, i, k, v, pending = 0;
     try {
       for (i = 0; i < localStorage.length; i++) {
         k = localStorage.key(i);
         if (!k || !_skMigrates(k)) continue;
         v = localStorage.getItem(k);
         if (v === null) continue;
+        mine[k] = 1;
         if (have[k] === v) continue;
         pending++;
         if (n >= batch) continue;
@@ -33232,25 +33226,54 @@ function _skIdbCopy(batch) {
         n++;
       }
     } catch (e) {}
+    // ANYTHING IN HERE THAT LOCALSTORAGE DOES NOT HAVE IS STALE, and that is
+    // two different mistakes caught by one rule. One is another app's key,
+    // which an earlier build copied in before this asked whose key it was.
+    // The other is a key of GameDay's own that was copied and has since been
+    // deleted -- by a purge, a prune, or the cleanup buttons -- where the
+    // delete did not reach here.
+    //
+    // Safe to do precisely because of what this phase is: localStorage is
+    // the source of truth until the cut-over, so the second store holding
+    // something it does not is always the second store being wrong.
+    //
+    // CHUNKED, like the copy. The first version built one transaction with
+    // every eviction in it, which on Ty's store was two thousand deletes in
+    // a single commit -- and it stopped partway, leaving 562 keys behind and
+    // reporting the copy complete.
+    for (k in have) {
+      if (!have.hasOwnProperty(k)) continue;
+      if (mine[k]) continue;
+      strayLeft++;
+      if (strayN >= batch * 2) continue;
+      strays[k] = 1;
+      strayN++;
+    }
+    strayLeft -= strayN;
     if (!n && !strayN) {
       _idbState.copyDone = true;
       try { localStorage.setItem(SK_IDB_DONE_KEY, String(Date.now())); } catch (e2) {}
-      return { copied: 0, remaining: 0, evicted: 0, done: true };
+      return { copied: 0, remaining: 0, evicted: 0, strayLeft: 0, done: true };
     }
     return _idbPutBatch(map, strays).then(function () {
       _idbState.copied += n;
       _idbState.evicted += strayN;
       var left = pending - n;
-      _idbState.copyDone = (left === 0);
+      // NOT DONE WHILE EITHER IS OUTSTANDING. The first version decided this
+      // on the copies alone, so a pass that still had evictions to make
+      // could call itself finished.
+      _idbState.copyDone = (left === 0 && strayLeft === 0);
       if (_idbState.copyDone) {
         try { localStorage.setItem(SK_IDB_DONE_KEY, String(Date.now())); } catch (e3) {}
       }
-      return { copied: n, remaining: left, evicted: strayN, done: left === 0 };
+      return { copied: n, remaining: left, evicted: strayN, strayLeft: strayLeft,
+        done: _idbState.copyDone };
     });
   })['catch'](function (e) {
     _idbState.errors++;
     _idbState.lastError = String((e && e.message) || e);
-    return { copied: 0, remaining: -1, evicted: 0, done: false, error: _idbState.lastError };
+    return { copied: 0, remaining: -1, evicted: 0, strayLeft: -1, done: false,
+      error: _idbState.lastError };
   });
 }
 
@@ -33274,7 +33297,7 @@ function _skIdbCopyAll(onStep) {
 // key in IndexedDB back against localStorage.
 function _skIdbVerify() {
   return _idbAll().then(function (have) {
-    var out = { checked: 0, missing: [], differing: [], extra: [], ok: false };
+    var out = { checked: 0, missing: [], differing: [], extra: [], extraN: 0, ok: false };
     var seen = {}, i, k, v;
     try {
       for (i = 0; i < localStorage.length; i++) {
@@ -33294,12 +33317,20 @@ function _skIdbVerify() {
     } catch (e) {}
     for (k in have) {
       if (!have.hasOwnProperty(k)) continue;
-      if (!seen[k] && out.extra.length < 8) out.extra.push(k);
+      if (seen[k]) continue;
+      out.extraN++;
+      if (out.extra.length < 8) out.extra.push(k);
     }
-    out.ok = !out.missing.length && !out.differing.length;
+    // EXTRAS COUNT AS A FAILURE. The first version waved them through on
+    // the grounds that a cleanup might remove a key between the copy and
+    // the check -- true, but it also meant 562 stale keys read as a clean
+    // result. The delete travels with a short debounce, so if a flush really
+    // was in flight the next press comes back clean.
+    out.extraCount = out.extraN;
+    out.ok = !out.missing.length && !out.differing.length && !out.extraN;
     return out;
   })['catch'](function (e) {
-    return { checked: 0, missing: [], differing: [], extra: [], ok: false,
+    return { checked: 0, missing: [], differing: [], extra: [], extraN: 0, ok: false,
       error: String((e && e.message) || e) };
   });
 }
@@ -33341,12 +33372,33 @@ function _skIdbPersist() {
 // ---- boot ---------------------------------------------------------------
 // Deferred, like the janitor: nothing here is wanted before first paint, and
 // the copy is the heaviest thing the app does on a cold start.
+// AND FLUSH BEFORE THE APP GOES AWAY. The queue waits four hundred
+// milliseconds so a burst of writes costs one transaction rather than three
+// hundred -- which is right, and means a queue in flight when the app is
+// closed is simply lost. A purge that ran and whose deletes never arrived is
+// the likeliest way Ty's store ended up holding 562 keys localStorage no
+// longer had. The sweep in the copy repairs that on the next pass either
+// way; this is what stops it happening in the first place.
+function _skIdbFlushOnHide() {
+  try {
+    document.addEventListener('visibilitychange', function () {
+      if (document.visibilityState === 'hidden') {
+        try { _idbFlush(); } catch (e) {}
+      }
+    });
+    window.addEventListener('pagehide', function () {
+      try { _idbFlush(); } catch (e) {}
+    });
+  } catch (e2) {}
+}
+
 var _idbBooted = false;
 function _skIdbBoot() {
   if (_idbBooted) return;
   _idbBooted = true;
   try {
     _skIdbPersist();
+    _skIdbFlushOnHide();
     _idbOpen().then(function () {
       return _skIdbCopyAll();
     })['catch'](function (e) {
@@ -203694,13 +203746,13 @@ function _skIdbPanelFill() {
         var b3 = document.getElementById('sk-idb-verify');
         if (!b3) return;
         if (v.error) { b3.textContent = 'Could not check: ' + v.error; return; }
-        // MISSING AND DIFFERING ARE FAILURES; EXTRA IS NOT. A key in
-        // IndexedDB that localStorage no longer has is usually one the
-        // cleanup removed between the copy and the check, which is the
-        // right way round -- nothing was lost.
+        // EXTRA IS REPORTED TOO. It used to be swallowed as harmless, and
+        // that is how 562 stale keys sat in the store reading as a clean
+        // check: the count was simply never shown.
         b3.textContent = v.ok
           ? ('All ' + v.checked + ' keys match')
-          : (v.missing.length + ' missing, ' + v.differing.length + ' different of ' + v.checked);
+          : (v.missing.length + ' missing, ' + v.differing.length +
+             ' different, ' + v.extraN + ' stale, of ' + v.checked);
         b3.style.color = v.ok ? '#4ade80' : '#fbbf24';
       })['catch'](function () {
         var b4 = document.getElementById('sk-idb-verify');
