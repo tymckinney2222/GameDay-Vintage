@@ -32952,6 +32952,373 @@
 // ==================================================================
 
 // ==================================================================
+// INDEXEDDB -- SKIDB -- PHASE ONE: COPY, AND KEEP BOTH IN STEP.
+//
+// localStorage is capped at ten megabytes per ORIGIN, shared by every app on
+// tymckinney2222.github.io, and that cap is a property of localStorage alone.
+// IndexedDB sits on the same origin, needs no server and no account, and is
+// allowed up to sixty per cent of the disk. Same page, same offline
+// behaviour, about a thousand times the room.
+//
+// -- WHAT MOVES, AND WHY IT IS NEARLY EVERYTHING --
+// The first plan was to move the caches and keep the history where it was.
+// Ty's own numbers killed that: his storage panel reported 4.5 MB kept
+// against 2.9 re-fetchable, and 1.6 of the kept was his OTHER apps -- so
+// GameDay's own irreplaceable data is 2.9 MB, not the sub-megabyte I had
+// told him. Moving only caches would have left him at 4.5 MB of a 10 MB cap
+// with no caches at all, and climbing: snapshots accumulate, the day bank
+// writes a row every day, the manager record gains a week every week.
+//
+// The reason to keep something in localStorage is that it is READ
+// SYNCHRONOUSLY AT STARTUP, not that it is precious. IndexedDB is not a less
+// safe place for history, only an asynchronous one. So the line is drawn by
+// access pattern: small settings and flags stay, everything bulky moves.
+//
+// -- MIGRATE BY DEFAULT --
+// The list below names what STAYS. Anything it has not heard of moves. That
+// is the opposite default from the keep-list next door, and deliberately so:
+// there, forgetting an entry would have thrown away history, and here,
+// forgetting one only means a key stays in localStorage where it already
+// was. The dangerous direction is the one each default protects against.
+//
+// -- AND NOTHING IS DELETED IN THIS PHASE --
+// Ty's call, and the right one. Everything is copied into IndexedDB and
+// every later write goes to both; localStorage stays the source of truth
+// for reads. Normal use then exercises the copy for days before anything is
+// removed, and the panel can be asked at any time to compare the two stores
+// key by key. The cut-over is a separate, later, deliberate act.
+// ==================================================================
+var SK_IDB_NAME = 'gdhq_store';
+var SK_IDB_STORE = 'kv';
+var SK_IDB_VER = 1;
+var SK_IDB_BATCH = 250;          // keys per transaction
+var SK_IDB_FLUSH_MS = 400;       // debounce on the dual-write queue
+
+var _idbDb = null;
+var _idbOpenPromise = null;
+var _idbQueue = {};              // key -> value, waiting to be written
+var _idbQueueDel = {};           // key -> 1, waiting to be removed
+var _idbFlushTimer = null;
+var _idbState = {
+  open: false, copied: 0, copyDone: false, errors: 0, lastError: '',
+  persisted: null, queued: 0, wrote: 0
+};
+
+// THE KEYS THAT STAY. Small, read at startup, and cheap to leave where they
+// are: the look of the app, which filters are showing, what is collapsed,
+// and the two provider logins -- which are a few bytes and wanted before
+// anything else can load.
+var _SK_LOCAL_ONLY = [
+  /^gdhq_(theme|bigtiles|fpp|scorepop|fanbell|tapdebug)$/,
+  /^gdhq_(field|gym|rink|fw)_mode$/,
+  /^gdhq_fw_(song|sound|form_collapsed)$/,
+  /^gdhq_(conf|org|ranked)_filter$/,
+  /^gdhq_(buzz|tools)_collapsed$/,
+  /^gdhq_(crs_size|crs_font|sb_brightness)$/,
+  /^gdhq_fav_teams$/,
+  /^gdhq_vintage_teams?$/,
+  /^gdhq_sleeper_/, /^gdhq_fantrax_/,
+  /^sk_(atbat|fy_alerts)_enabled_v1$/,
+  /^sk_(briefing_dismissed|ext_synced_v1|pulse_settings|yahoo_paused)$/,
+  /^sk_janitor_last$/,
+  /^sk_idb_/                     // this migration's own bookkeeping
+];
+function _skStaysLocal(k) {
+  var s = String(k || ''), i;
+  for (i = 0; i < _SK_LOCAL_ONLY.length; i++) {
+    if (_SK_LOCAL_ONLY[i].test(s)) return true;
+  }
+  return false;
+}
+function _skMigrates(k) { return !!k && !_skStaysLocal(k); }
+
+// ---- the store ----------------------------------------------------------
+function _idbOpen() {
+  if (_idbOpenPromise) return _idbOpenPromise;
+  _idbOpenPromise = new Promise(function (resolve, reject) {
+    var req;
+    try {
+      if (typeof indexedDB === 'undefined' || !indexedDB) {
+        reject(new Error('no indexedDB'));
+        return;
+      }
+      req = indexedDB.open(SK_IDB_NAME, SK_IDB_VER);
+    } catch (e) { reject(e); return; }
+    req.onupgradeneeded = function () {
+      try {
+        var db = req.result;
+        if (!db.objectStoreNames.contains(SK_IDB_STORE)) db.createObjectStore(SK_IDB_STORE);
+      } catch (e2) {}
+    };
+    req.onsuccess = function () {
+      _idbDb = req.result;
+      _idbState.open = true;
+      resolve(_idbDb);
+    };
+    req.onerror = function () {
+      _idbState.errors++;
+      _idbState.lastError = String((req.error && req.error.message) || 'open failed');
+      reject(req.error || new Error('open failed'));
+    };
+  });
+  return _idbOpenPromise;
+}
+
+function _idbTx(mode) {
+  return _idbOpen().then(function (db) {
+    return db.transaction(SK_IDB_STORE, mode).objectStore(SK_IDB_STORE);
+  });
+}
+
+// One transaction for the whole batch, because a transaction per key turns
+// two thousand keys into two thousand round trips.
+function _idbPutBatch(map, dels) {
+  return _idbTx('readwrite').then(function (st) {
+    return new Promise(function (resolve, reject) {
+      var n = 0, k;
+      try {
+        for (k in map) { if (map.hasOwnProperty(k)) { st.put(map[k], k); n++; } }
+        for (k in (dels || {})) { if (dels.hasOwnProperty(k)) { st['delete'](k); n++; } }
+      } catch (e) { reject(e); return; }
+      st.transaction.oncomplete = function () { _idbState.wrote += n; resolve(n); };
+      st.transaction.onerror = function () {
+        _idbState.errors++;
+        _idbState.lastError = String((st.transaction.error &&
+          st.transaction.error.message) || 'write failed');
+        reject(st.transaction.error || new Error('write failed'));
+      };
+    });
+  });
+}
+
+// Everything in the store, as a plain object. Used by the verify and by the
+// panel; a cursor rather than getAll so a large store does not build one
+// enormous array before the first key is seen.
+function _idbAll() {
+  return _idbTx('readonly').then(function (st) {
+    return new Promise(function (resolve, reject) {
+      var out = {}, req;
+      try { req = st.openCursor(); } catch (e) { reject(e); return; }
+      req.onsuccess = function () {
+        var c = req.result;
+        if (!c) { resolve(out); return; }
+        out[c.key] = c.value;
+        c['continue']();
+      };
+      req.onerror = function () { reject(req.error || new Error('read failed')); };
+    });
+  });
+}
+
+function _idbKeyCount() {
+  return _idbTx('readonly').then(function (st) {
+    return new Promise(function (resolve, reject) {
+      var req;
+      try { req = st.count(); } catch (e) { reject(e); return; }
+      req.onsuccess = function () { resolve(req.result || 0); };
+      req.onerror = function () { reject(req.error || new Error('count failed')); };
+    });
+  });
+}
+
+function _idbClear() {
+  return _idbTx('readwrite').then(function (st) {
+    return new Promise(function (resolve, reject) {
+      var req;
+      try { req = st.clear(); } catch (e) { reject(e); return; }
+      req.onsuccess = function () { resolve(true); };
+      req.onerror = function () { reject(req.error || new Error('clear failed')); };
+    });
+  });
+}
+
+// ---- the dual write -----------------------------------------------------
+// Every write that lands in localStorage is queued for IndexedDB and sent a
+// moment later in one transaction. Debounced because a sync writes hundreds
+// of keys in a burst and each one should not cost a trip of its own.
+function _idbQueueWrite(k, v) {
+  if (!_skMigrates(k)) return;
+  _idbQueue[k] = v;
+  delete _idbQueueDel[k];
+  _idbState.queued++;
+  _idbScheduleFlush();
+}
+function _idbQueueRemove(k) {
+  if (!_skMigrates(k)) return;
+  _idbQueueDel[k] = 1;
+  delete _idbQueue[k];
+  _idbState.queued++;
+  _idbScheduleFlush();
+}
+function _idbScheduleFlush() {
+  if (_idbFlushTimer) return;
+  _idbFlushTimer = setTimeout(function () {
+    _idbFlushTimer = null;
+    _idbFlush();
+  }, SK_IDB_FLUSH_MS);
+}
+function _idbFlush() {
+  var map = _idbQueue, dels = _idbQueueDel;
+  _idbQueue = {};
+  _idbQueueDel = {};
+  var any = false, k;
+  for (k in map) { if (map.hasOwnProperty(k)) { any = true; break; } }
+  if (!any) { for (k in dels) { if (dels.hasOwnProperty(k)) { any = true; break; } } }
+  if (!any) return Promise.resolve(0);
+  return _idbPutBatch(map, dels)['catch'](function () { return 0; });
+}
+
+// ---- the copy -----------------------------------------------------------
+// RESUMABLE, AND IN SLICES. Two thousand keys and five megabytes is not
+// something to do in one go on a phone between innings: each pass takes a
+// batch, and the next pass picks up whatever is still missing. It is driven
+// off what IndexedDB already holds rather than off a saved position, so an
+// interrupted copy needs no repair.
+var SK_IDB_DONE_KEY = 'sk_idb_copied_v1';
+function _skIdbCopy(batch) {
+  batch = batch || SK_IDB_BATCH;
+  return _idbAll().then(function (have) {
+    var map = {}, n = 0, i, k, v, pending = 0;
+    try {
+      for (i = 0; i < localStorage.length; i++) {
+        k = localStorage.key(i);
+        if (!k || !_skMigrates(k)) continue;
+        v = localStorage.getItem(k);
+        if (v === null) continue;
+        if (have[k] === v) continue;
+        pending++;
+        if (n >= batch) continue;
+        map[k] = v;
+        n++;
+      }
+    } catch (e) {}
+    if (!n) {
+      _idbState.copyDone = true;
+      try { localStorage.setItem(SK_IDB_DONE_KEY, String(Date.now())); } catch (e2) {}
+      return { copied: 0, remaining: 0, done: true };
+    }
+    return _idbPutBatch(map, null).then(function () {
+      _idbState.copied += n;
+      var left = pending - n;
+      _idbState.copyDone = (left === 0);
+      if (_idbState.copyDone) {
+        try { localStorage.setItem(SK_IDB_DONE_KEY, String(Date.now())); } catch (e3) {}
+      }
+      return { copied: n, remaining: left, done: left === 0 };
+    });
+  })['catch'](function (e) {
+    _idbState.errors++;
+    _idbState.lastError = String((e && e.message) || e);
+    return { copied: 0, remaining: -1, done: false, error: _idbState.lastError };
+  });
+}
+
+// Keep taking slices until there is nothing left, with a breath between so
+// the app stays responsive while it runs.
+function _skIdbCopyAll(onStep) {
+  function step() {
+    return _skIdbCopy().then(function (r) {
+      if (typeof onStep === 'function') { try { onStep(r); } catch (e) {} }
+      if (r.done || r.remaining < 0) return r;
+      return new Promise(function (res) { setTimeout(res, 60); }).then(step);
+    });
+  }
+  return step();
+}
+
+// ---- the proof ----------------------------------------------------------
+// KEY BY KEY, BOTH WAYS. Counting is not checking: a store with the right
+// number of keys and the wrong value in one of them looks perfect. This
+// compares every migratable key in localStorage against IndexedDB and every
+// key in IndexedDB back against localStorage.
+function _skIdbVerify() {
+  return _idbAll().then(function (have) {
+    var out = { checked: 0, missing: [], differing: [], extra: [], ok: false };
+    var seen = {}, i, k, v;
+    try {
+      for (i = 0; i < localStorage.length; i++) {
+        k = localStorage.key(i);
+        if (!k || !_skMigrates(k)) continue;
+        v = localStorage.getItem(k);
+        if (v === null) continue;
+        seen[k] = 1;
+        out.checked++;
+        if (!have.hasOwnProperty(k)) {
+          if (out.missing.length < 8) out.missing.push(k);
+          continue;
+        }
+        if (have[k] !== v && out.differing.length < 8) out.differing.push(k);
+        else if (have[k] !== v) out.differing.push('');
+      }
+    } catch (e) {}
+    for (k in have) {
+      if (!have.hasOwnProperty(k)) continue;
+      if (!seen[k] && out.extra.length < 8) out.extra.push(k);
+    }
+    out.ok = !out.missing.length && !out.differing.length;
+    return out;
+  })['catch'](function (e) {
+    return { checked: 0, missing: [], differing: [], extra: [], ok: false,
+      error: String((e && e.message) || e) };
+  });
+}
+
+// What the store weighs, for the panel.
+function _skIdbSize() {
+  return _idbAll().then(function (have) {
+    var n = 0, b = 0, k;
+    for (k in have) {
+      if (!have.hasOwnProperty(k)) continue;
+      n++;
+      b += (k.length + String(have[k] == null ? '' : have[k]).length) * 2;
+    }
+    return { count: n, bytes: b };
+  })['catch'](function () { return { count: 0, bytes: 0 }; });
+}
+
+// ---- eviction -----------------------------------------------------------
+// ASK TO BE KEPT. Browser-managed storage is best-effort by default and can
+// be dropped when the device runs short; a persisted origin is skipped. It
+// costs one call and Chrome answers from how the site has been used rather
+// than by asking him anything.
+function _skIdbPersist() {
+  try {
+    if (!navigator.storage || !navigator.storage.persist) {
+      _idbState.persisted = null;
+      return Promise.resolve(null);
+    }
+    return navigator.storage.persisted().then(function (already) {
+      if (already) { _idbState.persisted = true; return true; }
+      return navigator.storage.persist().then(function (granted) {
+        _idbState.persisted = !!granted;
+        return !!granted;
+      });
+    })['catch'](function () { _idbState.persisted = null; return null; });
+  } catch (e) { _idbState.persisted = null; return Promise.resolve(null); }
+}
+
+// ---- boot ---------------------------------------------------------------
+// Deferred, like the janitor: nothing here is wanted before first paint, and
+// the copy is the heaviest thing the app does on a cold start.
+var _idbBooted = false;
+function _skIdbBoot() {
+  if (_idbBooted) return;
+  _idbBooted = true;
+  try {
+    _skIdbPersist();
+    _idbOpen().then(function () {
+      return _skIdbCopyAll();
+    })['catch'](function (e) {
+      _idbState.errors++;
+      _idbState.lastError = String((e && e.message) || e);
+    });
+  } catch (e2) {
+    _idbState.errors++;
+    _idbState.lastError = String((e2 && e2.message) || e2);
+  }
+}
+
+// ==================================================================
 // WHAT IS WORTH KEEPING -- KEEPLIST --
 //
 // Ty, asked what matters: "Snapshots, settings both app settings and league
@@ -33110,8 +33477,23 @@ function _skGuardNoteFail(k) {
 // directly by a test with a setter that fails on demand. Filling a real
 // ten megabytes to find out whether the retry works is not a test anybody
 // runs twice.
+// MIRRORED ON THE WAY PAST. Every write that lands in localStorage is
+// queued for IndexedDB too, so the two stores never drift apart between the
+// copy and the cut-over. sessionStorage shares this prototype and is not
+// mirrored; nothing in this app uses it, but the check costs nothing.
+function _skGuardMirror(store, k, v) {
+  try {
+    if (store !== localStorage) return;
+    if (typeof _idbQueueWrite === 'function') _idbQueueWrite(k, v);
+  } catch (e) {}
+}
+
 function _skGuardedSet(raw, store, k, v) {
-  try { return raw.call(store, k, v); } catch (e) {
+  try {
+    var r = raw.call(store, k, v);
+    _skGuardMirror(store, k, v);
+    return r;
+  } catch (e) {
     if (!_skIsQuotaError(e)) throw e;
     if (_skGuardBusy) { _skGuardNoteFail(k); return; }
     _skGuardBusy = true;
@@ -33122,6 +33504,7 @@ function _skGuardedSet(raw, store, k, v) {
         try {
           raw.call(store, k, v);
           _skGuardState.shed++;
+          _skGuardMirror(store, k, v);
           return;
         } catch (e3) {
           if (!_skIsQuotaError(e3)) throw e3;
@@ -33142,6 +33525,21 @@ function _skInstallWriteGuard() {
     Storage.prototype.setItem = function (k, v) {
       return _skGuardedSet(raw, this, k, v);
     };
+    // A DELETE HAS TO TRAVEL TOO, or the shed ladder and the cleanup buttons
+    // would free space in one store and leave the other holding what they
+    // threw away.
+    var rawDel = Storage.prototype.removeItem;
+    if (typeof rawDel === 'function') {
+      Storage.prototype.removeItem = function (k) {
+        var out = rawDel.call(this, k);
+        try {
+          if (this === localStorage && typeof _idbQueueRemove === 'function') {
+            _idbQueueRemove(k);
+          }
+        } catch (e) {}
+        return out;
+      };
+    }
     _skGuardInstalled = true;
     return true;
   } catch (e) { return false; }
@@ -106954,6 +107352,9 @@ function skApplyConnectionState() {
     // Daily storage maintenance — deferred so it never slows first paint.
     if (typeof _skPurgeLegacyKeys === 'function') setTimeout(_skPurgeLegacyKeys, 2000);
     if (typeof _skStorageJanitor === 'function') setTimeout(_skStorageJanitor, 3000);
+    // after the janitor, so its purges happen before the copy rather
+    // than the copy carrying across what it is about to delete
+    if (typeof _skIdbBoot === 'function') setTimeout(_skIdbBoot, 4500);
     // Official football week windows (NFL + CFB) — powers date-derived
     // snapshot week tagging. Cached 7 days; tiny fetch.
     if (typeof _skLoadGameWeeks === 'function') setTimeout(_skLoadGameWeeks, 2500);
@@ -203203,6 +203604,70 @@ function skOpenStorageReport() {
   skRenderStorageReport();
 }
 
+// --- SKIDB PANEL ------------------------------------------------------
+// What the second store holds, and a way to prove it matches the first.
+// Deliberately plain: this phase deletes nothing, so the only thing worth
+// reporting is whether the copy is complete and whether it is correct.
+function _skIdbPanelHtml() {
+  return '<div id="sk-idb-box" style="border:1px solid rgba(96,165,250,0.3);' +
+    'border-radius:8px;padding:9px 11px;margin:12px 0 2px;">' +
+    '<div style="font-size:9.5px;letter-spacing:0.12em;color:rgba(147,197,253,0.85);">' +
+      'INDEXEDDB &middot; COPYING, NOTHING DELETED YET</div>' +
+    '<div id="sk-idb-lines" style="font-size:11px;color:rgba(255,255,255,0.6);' +
+      'margin-top:5px;line-height:1.6;">reading&hellip;</div>' +
+    '<button id="sk-idb-verify" style="margin-top:7px;width:100%;padding:8px;' +
+      'border-radius:7px;border:1px solid rgba(96,165,250,0.35);' +
+      'background:rgba(96,165,250,0.1);color:#93c5fd;font-size:11.5px;' +
+      'font-weight:700;cursor:pointer;">Check both stores match</button>' +
+    '</div>';
+}
+
+function _skIdbPanelFill() {
+  var box = document.getElementById('sk-idb-lines');
+  if (!box) return;
+  function row(a, b) {
+    return '<div style="display:flex;justify-content:space-between;gap:8px;">' +
+      '<span>' + a + '</span><span style="color:rgba(255,255,255,0.85);">' +
+      b + '</span></div>';
+  }
+  try {
+    _skIdbSize().then(function (s) {
+      var b2 = document.getElementById('sk-idb-lines');
+      if (!b2) return;
+      var st = _idbState.errors ? ('error: ' + _idbState.lastError)
+        : (_idbState.copyDone ? 'copy complete' : 'copying ' + _idbState.copied + ' so far');
+      var p = (_idbState.persisted === true) ? 'granted'
+        : (_idbState.persisted === false ? 'not granted' : 'unknown');
+      b2.innerHTML =
+        row('holds', s.count + ' keys &middot; ' + _skFmtBytes(s.bytes)) +
+        row('status', st) +
+        row('kept through low disk', p);
+    })['catch'](function () {});
+  } catch (e) {}
+  var btn = document.getElementById('sk-idb-verify');
+  if (btn) {
+    btn.onclick = function () {
+      btn.textContent = 'Checking...';
+      _skIdbVerify().then(function (v) {
+        var b3 = document.getElementById('sk-idb-verify');
+        if (!b3) return;
+        if (v.error) { b3.textContent = 'Could not check: ' + v.error; return; }
+        // MISSING AND DIFFERING ARE FAILURES; EXTRA IS NOT. A key in
+        // IndexedDB that localStorage no longer has is usually one the
+        // cleanup removed between the copy and the check, which is the
+        // right way round -- nothing was lost.
+        b3.textContent = v.ok
+          ? ('All ' + v.checked + ' keys match')
+          : (v.missing.length + ' missing, ' + v.differing.length + ' different of ' + v.checked);
+        b3.style.color = v.ok ? '#4ade80' : '#fbbf24';
+      })['catch'](function () {
+        var b4 = document.getElementById('sk-idb-verify');
+        if (b4) b4.textContent = 'Could not check';
+      });
+    };
+  }
+}
+
 function skRenderStorageReport() {
   var body = document.getElementById('sk-storage-body');
   if (!body) return;
@@ -203267,6 +203732,7 @@ function skRenderStorageReport() {
       '<span style="color:rgba(255,255,255,0.5);font-family:monospace;flex-shrink:0;">' + g.count + ' \u00b7 ' + _skFmtBytes(g.bytes) + '</span>' +
     '</div>';
   }
+  try { html += _skIdbPanelHtml(); } catch (eI) {}
   html += '<div style="color:rgba(255,255,255,0.4);font-size:10px;letter-spacing:0.1em;margin:14px 0 4px;">LARGEST KEYS</div>';
   for (var b = 0; b < rep.biggest.length; b++) {
     var big = rep.biggest[b];
@@ -203283,6 +203749,7 @@ function skRenderStorageReport() {
     '</div>' +
     '<div style="color:rgba(255,255,255,0.35);font-size:10.5px;line-height:1.5;margin-top:10px;">Free everything re-fetchable: drops every cache with a source to fetch it back from and keeps the rest \u2014 snapshots, app and league settings, manager record, Pick \u2019Em, logins. Standard: stale versions (FP + settings) + snapshots past TTL + FP/roster/team-stat dates past TTL. Aggressive: same but caches trimmed to the last 14 days (covers this week + last week; older charts re-fetch). NOTE: every app on tymckinney2222.github.io shares this one quota \u2014 GameDay\u2019s cleanup never touches other apps\u2019 data (mcpRtHist etc. belongs to the SPP dashboard).</div>';
   body.innerHTML = html;
+  try { _skIdbPanelFill(); } catch (eF) {}
 }
 
 // Run the same purge ladder the snapshot writers use — plus the cache
