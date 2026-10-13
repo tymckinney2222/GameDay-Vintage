@@ -32951,20 +32951,109 @@
 // that did.
 // ==================================================================
 
-// The irreplaceable ones. Everything else in the app can be fetched again
-// from Yahoo or ESPN; these are banked history and a login, and losing one
-// is permanent. A failed write to any of these is worth interrupting for.
-var _SK_DURABLE_KEYS = [
-  /^cats_snap_v/, /^pts_snap_v/, /^esp_pts_snap_v/, /^ext_pts_snap_v/,
-  /^gdhq_pickem_/, /^gdhq_mgr_record/,
-  /^gdhq_sleeper_/, /^gdhq_fantrax_/
+// ==================================================================
+// WHAT IS WORTH KEEPING -- KEEPLIST --
+//
+// Ty, asked what matters: "Snapshots, settings both app settings and league
+// settings, manager record and the new pick em feature we built. The
+// sparklines are cool but I have so many players it's honestly hard to keep
+// track of things like that. If I could just be able to keep those items I
+// mentioned, I'd be very happy. The rest is debatable."
+//
+// -- SO THE DEFAULT IS INVERTED --
+// The first version of this listed what was PROTECTED and treated the rest
+// as fair game. That is the wrong way round for a brief like his, because
+// the list can only ever be incomplete: every key added next season would
+// have been disposable by default, silently, and the one that got away
+// would be the one somebody banked a season of history into.
+//
+// So the list below names what can be THROWN AWAY -- caches with a source
+// to fetch them from again -- and everything else is kept. Being wrong
+// about an entry here costs a few kilobytes held longer than necessary.
+// Being wrong the other way costs history that does not come back.
+//
+// -- WHAT THE AMBIGUOUS ONES TURNED OUT TO BE --
+// Worth writing down, because two of them look like caches and are not.
+//   sk_arch_v1_       the archive of league finishes, hand-edits included
+//   sk_bank_v1_       the day bank: the whole season, one row per day
+//   sk_mr_            the manager record, which he named outright
+// against
+//   sk_final_league_  a finished league's data, held one week
+//   gdhq_stadium_venues  venue data on a thirty day TTL
+// ==================================================================
+var _SK_CACHE_KEYS = [
+  /^fp_v\d+_/,                     // FP day caches, current and stale
+  /^fpt_v1_/,                      // daily totals
+  /^sk_player_stats_v/,
+  /^sk_team_stats_v/,
+  /^sk_cats_roster_v/,
+  /^sk_pspark_/,                   // the sparkline: days and the names table
+  /^sk_league_settings_v[1-7]_/,   // STALE versions only; v8 is his settings
+  /^sk_final_league_v/,            // one week
+  /^sk_game_weeks_v/,              // football week windows, seven days
+  /^esp_gp_(base|slot)_v/,
+  /^gdhq_dbpool_v/,                // draft board pools
+  /^gdhq_affiliate_cache_v/,
+  /^gdhq_slp_names_v/,
+  /^gdhq_stadium_venues$/,         // thirty days
+  /^gd_teamcolors_v/
 ];
-function _skDurableKey(k) {
+
+function _skCacheKey(k) {
   var s = String(k || ''), i;
-  for (i = 0; i < _SK_DURABLE_KEYS.length; i++) {
-    if (_SK_DURABLE_KEYS[i].test(s)) return true;
+  for (i = 0; i < _SK_CACHE_KEYS.length; i++) {
+    if (_SK_CACHE_KEYS[i].test(s)) return true;
   }
   return false;
+}
+
+// KEPT UNLESS PROVEN OTHERWISE. This is what decides whether a write that
+// could not be saved is worth interrupting him for.
+function _skDurableKey(k) {
+  if (!k) return false;
+  return !_skCacheKey(k);
+}
+
+// The two halves, sized. The storage panel leads with this because it is
+// the only number that answers the question he actually asked: how much of
+// this is mine, and how much is just the app being busy.
+function _skStorageSplit() {
+  var keepN = 0, keepB = 0, dropN = 0, dropB = 0, i, k, v;
+  try {
+    for (i = 0; i < localStorage.length; i++) {
+      k = localStorage.key(i);
+      if (!k) continue;
+      v = localStorage.getItem(k) || '';
+      // UTF-16, same as the rest of this panel counts
+      var b = (k.length + v.length) * 2;
+      if (_skCacheKey(k)) { dropN++; dropB += b; } else { keepN++; keepB += b; }
+    }
+  } catch (e) {}
+  return { keepCount: keepN, keepBytes: keepB, dropCount: dropN, dropBytes: dropB };
+}
+
+// EVERYTHING WITH A SOURCE TO COME BACK FROM, gone in one go. Not a tidier
+// cleanup than the two already there -- a different promise. Those trim by
+// age and version and leave a judgement about what is stale; this one keeps
+// precisely the list above and drops the rest, so what is left is what he
+// said he wanted to keep.
+function _skFreeDisposable() {
+  var drop = [], i, k, freed = 0;
+  try {
+    for (i = 0; i < localStorage.length; i++) {
+      k = localStorage.key(i);
+      if (k && _skCacheKey(k)) drop.push(k);
+    }
+    for (i = 0; i < drop.length; i++) {
+      freed += (drop[i].length + (localStorage.getItem(drop[i]) || '').length) * 2;
+      try { localStorage.removeItem(drop[i]); } catch (e) {}
+    }
+  } catch (e2) {}
+  // the sparkline keeps a names table that is only meaningful beside its
+  // days, and both have just gone; drop what the app holds in memory too so
+  // nothing writes a day against a table that no longer exists
+  try { _skSparkIdsMem = null; _skSparkInvMem = null; _skSparkMem = null; } catch (e3) {}
+  return { count: drop.length, bytes: freed };
 }
 
 // Chrome says QuotaExceededError, Firefox says NS_ERROR_DOM_QUOTA_REACHED,
@@ -203129,6 +203218,26 @@ function skRenderStorageReport() {
     '<div style="height:8px;border-radius:4px;background:rgba(255,255,255,0.07);overflow:hidden;margin-bottom:14px;">' +
       '<div style="height:100%;width:' + pct + '%;background:' + barColor + ';"></div>' +
     '</div>';
+  // THE ONLY NUMBER THAT ANSWERS THE QUESTION HE ASKED: how much of this is
+  // his, and how much is the app being busy. Everything in the second row
+  // has somewhere to be fetched back from.
+  try {
+    var sp = _skStorageSplit();
+    html += '<div style="display:flex;gap:8px;margin-bottom:12px;">' +
+      '<div style="flex:1;border:1px solid rgba(74,222,128,0.3);border-radius:8px;padding:8px 10px;">' +
+        '<div style="font-size:9.5px;letter-spacing:0.12em;color:rgba(74,222,128,0.8);">YOURS, KEPT</div>' +
+        '<div style="font-size:14px;font-weight:800;color:#fff;margin-top:2px;">' +
+          _skFmtBytes(sp.keepBytes) + '</div>' +
+        '<div style="font-size:9.5px;color:rgba(255,255,255,0.4);">' + sp.keepCount + ' keys</div>' +
+      '</div>' +
+      '<div style="flex:1;border:1px solid rgba(255,255,255,0.14);border-radius:8px;padding:8px 10px;">' +
+        '<div style="font-size:9.5px;letter-spacing:0.12em;color:rgba(255,255,255,0.45);">RE-FETCHABLE</div>' +
+        '<div style="font-size:14px;font-weight:800;color:rgba(255,255,255,0.75);margin-top:2px;">' +
+          _skFmtBytes(sp.dropBytes) + '</div>' +
+        '<div style="font-size:9.5px;color:rgba(255,255,255,0.4);">' + sp.dropCount + ' keys</div>' +
+      '</div>' +
+    '</div>';
+  } catch (eS) {}
   // WHAT THE GUARD HAS HAD TO DO. Shedding is housekeeping and worth
   // knowing about; a write it could not land after shedding is the line
   // that matters, because that is data this app does not have.
@@ -203170,8 +203279,9 @@ function skRenderStorageReport() {
     '<div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap;">' +
       '<button onclick="skStorageCleanup(false)" style="flex:1;padding:10px;border-radius:8px;border:1px solid rgba(255,255,255,0.2);background:rgba(255,255,255,0.06);color:#fff;font-size:12px;font-weight:700;cursor:pointer;">Standard cleanup</button>' +
       '<button onclick="skStorageCleanup(true)" style="flex:1;padding:10px;border-radius:8px;border:1px solid rgba(251,191,36,0.4);background:rgba(251,191,36,0.12);color:#fbbf24;font-size:12px;font-weight:700;cursor:pointer;">Aggressive (caches \u2192 14d)</button>' +
+      '<button onclick="skFreeDisposable()" style="flex:1 1 100%;padding:10px;border-radius:8px;border:1px solid rgba(96,165,250,0.45);background:rgba(96,165,250,0.12);color:#93c5fd;font-size:12px;font-weight:700;cursor:pointer;">Free everything re-fetchable</button>' +
     '</div>' +
-    '<div style="color:rgba(255,255,255,0.35);font-size:10.5px;line-height:1.5;margin-top:10px;">Standard: stale versions (FP + settings) + snapshots past TTL + FP/roster/team-stat dates past TTL. Aggressive: same but caches trimmed to the last 14 days (covers this week + last week; older charts re-fetch). NOTE: every app on tymckinney2222.github.io shares this one quota \u2014 GameDay\u2019s cleanup never touches other apps\u2019 data (mcpRtHist etc. belongs to the SPP dashboard).</div>';
+    '<div style="color:rgba(255,255,255,0.35);font-size:10.5px;line-height:1.5;margin-top:10px;">Free everything re-fetchable: drops every cache with a source to fetch it back from and keeps the rest \u2014 snapshots, app and league settings, manager record, Pick \u2019Em, logins. Standard: stale versions (FP + settings) + snapshots past TTL + FP/roster/team-stat dates past TTL. Aggressive: same but caches trimmed to the last 14 days (covers this week + last week; older charts re-fetch). NOTE: every app on tymckinney2222.github.io shares this one quota \u2014 GameDay\u2019s cleanup never touches other apps\u2019 data (mcpRtHist etc. belongs to the SPP dashboard).</div>';
   body.innerHTML = html;
 }
 
@@ -203242,6 +203352,18 @@ function skStorageCleanup(aggressive) {
   } catch (e) {}
   skRenderStorageReport();
   if (typeof skToast === 'function') skToast('Cleanup done \u2014 report refreshed.');
+}
+
+// THE ONE THAT MATCHES THE BRIEF. The other two trim by age and version and
+// leave a judgement about what counts as stale; this one keeps the list and
+// drops everything else, so what survives is what he said he wanted.
+function skFreeDisposable() {
+  var r = { count: 0, bytes: 0 };
+  try { r = _skFreeDisposable(); } catch (e) {}
+  skRenderStorageReport();
+  if (typeof skToast === 'function') {
+    skToast('Freed ' + _skFmtBytes(r.bytes) + ' \u2014 your history is untouched.');
+  }
 }
 
 // Register Service Worker
