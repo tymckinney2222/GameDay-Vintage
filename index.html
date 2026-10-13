@@ -33000,7 +33000,7 @@ var _idbQueue = {};              // key -> value, waiting to be written
 var _idbQueueDel = {};           // key -> 1, waiting to be removed
 var _idbFlushTimer = null;
 var _idbState = {
-  open: false, copied: 0, copyDone: false, errors: 0, lastError: '',
+  open: false, copied: 0, evicted: 0, copyDone: false, errors: 0, lastError: '',
   persisted: null, queued: 0, wrote: 0
 };
 
@@ -33023,6 +33023,38 @@ var _SK_LOCAL_ONLY = [
   /^sk_janitor_last$/,
   /^sk_idb_/                     // this migration's own bookkeeping
 ];
+// GAMEDAY'S OWN KEYS, AND ONLY THOSE.
+//
+// This was missing, and Ty's storage panel is what showed it: the IndexedDB
+// block reported 3,035 keys when GameDay owns about 2,380 of the 5,100 on
+// the origin. Migrating "everything not on the settings list" never asked
+// WHOSE key it was, so it was quietly copying the other apps on
+// tymckinney2222.github.io -- Bill Tracker, Crafty Planner, the SPP
+// dashboard -- into GameDay's store.
+//
+// Wasteful on its own, and far worse than wasteful at the cut-over: those
+// apps read localStorage and have never heard of this database. Deleting a
+// key here that Crafty Planner wrote would take it away from an app that
+// has no idea where it went.
+//
+// The panel has always drawn this line for its own report -- its last row
+// is "Everything else on this origin" -- so this is the same line, drawn
+// once more where it decides what gets touched.
+var _SK_OWN_KEYS = [
+  /^sk_/, /^gdhq_/,
+  /^fp_v\d+_/, /^fpt_v\d+_/,
+  /^cats_snap_v/, /^pts_snap_v/,
+  /^esp_pts_snap_v/, /^esp_gp_/, /^ext_pts_snap_v/,
+  /^gd_teamcolors_v/, /^fx_lineup_v/
+];
+function _skOwnKey(k) {
+  var s = String(k || ''), i;
+  for (i = 0; i < _SK_OWN_KEYS.length; i++) {
+    if (_SK_OWN_KEYS[i].test(s)) return true;
+  }
+  return false;
+}
+
 function _skStaysLocal(k) {
   var s = String(k || ''), i;
   for (i = 0; i < _SK_LOCAL_ONLY.length; i++) {
@@ -33030,7 +33062,7 @@ function _skStaysLocal(k) {
   }
   return false;
 }
-function _skMigrates(k) { return !!k && !_skStaysLocal(k); }
+function _skMigrates(k) { return !!k && _skOwnKey(k) && !_skStaysLocal(k); }
 
 // ---- the store ----------------------------------------------------------
 function _idbOpen() {
@@ -33178,7 +33210,15 @@ var SK_IDB_DONE_KEY = 'sk_idb_copied_v1';
 function _skIdbCopy(batch) {
   batch = batch || SK_IDB_BATCH;
   return _idbAll().then(function (have) {
-    var map = {}, n = 0, i, k, v, pending = 0;
+    var map = {}, strays = {}, n = 0, strayN = 0, i, k, v, pending = 0;
+    // ANYTHING IN THERE THAT SHOULD NOT BE, ON THE WAY PAST. The first build
+    // of this migrated without asking whose key it was and swept in the
+    // other apps on the origin; a store that has already done that heals
+    // itself on the next pass rather than needing to be rebuilt.
+    for (k in have) {
+      if (!have.hasOwnProperty(k)) continue;
+      if (!_skMigrates(k)) { strays[k] = 1; strayN++; }
+    }
     try {
       for (i = 0; i < localStorage.length; i++) {
         k = localStorage.key(i);
@@ -33192,24 +33232,25 @@ function _skIdbCopy(batch) {
         n++;
       }
     } catch (e) {}
-    if (!n) {
+    if (!n && !strayN) {
       _idbState.copyDone = true;
       try { localStorage.setItem(SK_IDB_DONE_KEY, String(Date.now())); } catch (e2) {}
-      return { copied: 0, remaining: 0, done: true };
+      return { copied: 0, remaining: 0, evicted: 0, done: true };
     }
-    return _idbPutBatch(map, null).then(function () {
+    return _idbPutBatch(map, strays).then(function () {
       _idbState.copied += n;
+      _idbState.evicted += strayN;
       var left = pending - n;
       _idbState.copyDone = (left === 0);
       if (_idbState.copyDone) {
         try { localStorage.setItem(SK_IDB_DONE_KEY, String(Date.now())); } catch (e3) {}
       }
-      return { copied: n, remaining: left, done: left === 0 };
+      return { copied: n, remaining: left, evicted: strayN, done: left === 0 };
     });
   })['catch'](function (e) {
     _idbState.errors++;
     _idbState.lastError = String((e && e.message) || e);
-    return { copied: 0, remaining: -1, done: false, error: _idbState.lastError };
+    return { copied: 0, remaining: -1, evicted: 0, done: false, error: _idbState.lastError };
   });
 }
 
@@ -203636,6 +203677,7 @@ function _skIdbPanelFill() {
       if (!b2) return;
       var st = _idbState.errors ? ('error: ' + _idbState.lastError)
         : (_idbState.copyDone ? 'copy complete' : 'copying ' + _idbState.copied + ' so far');
+      if (_idbState.evicted) st += ' (' + _idbState.evicted + ' foreign keys removed)';
       var p = (_idbState.persisted === true) ? 'granted'
         : (_idbState.persisted === false ? 'not granted' : 'unknown');
       b2.innerHTML =
