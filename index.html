@@ -154026,14 +154026,27 @@ function skRenderDetailRoster(league, players) {
         var statsMeta = (res[1] && res[1].stats) || {};
         var byKey = {};
         playerStats.forEach(function(ps) { if (ps && ps.playerKey) byKey[ps.playerKey] = ps; });
-        // Stamp a pre-built cat-stat HTML line onto each player. Empty stat
-        // maps (didn't play / no game) leave the dash in place.
+        // THE STAMP IS AUTHORITATIVE FOR ITS DATE. NHLDATE
+        // It used to only ever set _line, and to return early for a player
+        // the new date had no stats for -- so a line stamped on Tuesday sat
+        // on the same player object on Wednesday and the roster showed
+        // Tuesday's numbers under Wednesday's date. MLB is immune because it
+        // reads a cache keyed by date; here the line hangs off the player,
+        // and the player outlives the date.
+        //
+        // So: write EVERY player on every pass, not only the ones with
+        // stats, and stamp the date the line belongs to. An empty stat map
+        // (did not play, no game) now clears the line rather than leaving
+        // the last one it had.
         players.forEach(function(p) {
+          var lineHtml = '';
           var ps = p.playerKey ? byKey[p.playerKey] : null;
-          if (!ps || !ps.stats) return;
-          var lineHtml = (typeof _skBuildCatStatLine === 'function')
-            ? _skBuildCatStatLine(ps.stats, statsMeta, 6) : '';
-          if (lineHtml) { p._line = lineHtml; p._lineHtml = true; }
+          if (ps && ps.stats && typeof _skBuildCatStatLine === 'function') {
+            lineHtml = _skBuildCatStatLine(ps.stats, statsMeta, 6) || '';
+          }
+          p._line = lineHtml;
+          p._lineHtml = !!lineHtml;
+          p._lineDate = targetDate;
         });
         skUpdateRosterLinesInPlace(players, targetDate);
       }).catch(function() { /* leave dashes on failure */ });
@@ -154122,27 +154135,43 @@ function skRenderDetailRoster(league, players) {
     }
     if (_eTKey) {
       var _expectCount = players ? players.length : 0;
-      var _seasonAttempt = function(isRetry) {
+      var _seasonBest = -1;   // most players any attempt has resolved so far
+      var _seasonAttempt = function(attempt) {
         _skFetchEspnSeasonStats(sport, _eTKey, players).then(function(entry) {
           if (skState.activeLeagueKey !== leagueKeyAtStart) return;
           if (!entry || !entry.byPlayerKey) return;
           _skUpdateEspnSeasonStatsInPlace(sport, players, entry.byPlayerKey);
+          // KEEP ASKING WHILE IT IS STILL FINDING PEOPLE. NHLSEASON
           // First load fires a burst of ESPN id lookups for the whole roster
-          // (both daily line + season). If ESPN rate-limited some of them, the
-          // first result is sparse — retry ONCE after a short delay so the user
-          // doesn't have to flip the date to force a re-fetch. Null ids are no
-          // longer cached, so the retry can actually resolve them.
+          // (daily line and season at once), and ESPN rate-limits some of
+          // them, so the first answer comes back short.
+          //
+          // The old rule only retried when it came back BADLY short -- under
+          // sixty percent of the roster. A load that resolved eight of
+          // eleven therefore never retried, and those three rows stayed
+          // blank until the date was stepped back and forward, which forces
+          // a re-fetch with the ids now warm. That is exactly what Ty
+          // described, and it is the threshold, not the fetch.
+          //
+          // The test is progress, not a ratio: another attempt is worth
+          // making for as long as each one resolves more players than the
+          // last. When an attempt finds nobody new, whoever is still missing
+          // is missing because ESPN has nothing for them -- a call-up with no
+          // games played -- and asking again will not change that. So this
+          // stops on its own without needing to know which case it is in.
           var _got = Object.keys(entry.byPlayerKey).length;
-          if (!isRetry && _expectCount >= 4 && _got < Math.ceil(_expectCount * 0.6)) {
-            // The sparse result may have been cached (any non-empty map is).
-            // Clear it so the retry actually re-resolves the rate-limited ids
-            // instead of returning the same sparse entry.
+          var _again = _skSeasonRetryAgain(_got, _expectCount, _seasonBest, attempt);
+          if (_got > _seasonBest) _seasonBest = _got;
+          if (_again) {
+            // A short answer may have been cached (any non-empty map is).
+            // Clear it so the next attempt actually re-resolves the
+            // rate-limited ids instead of handing back the same short map.
             try {
               if (typeof _espnSeasonCache !== 'undefined') delete _espnSeasonCache[sport + '|' + _eTKey];
             } catch (e) {}
             setTimeout(function() {
               if (skState.activeLeagueKey !== leagueKeyAtStart) return;
-              _seasonAttempt(true);
+              _seasonAttempt(attempt + 1);
             }, 1500);
           }
         });
@@ -154154,7 +154183,7 @@ function skRenderDetailRoster(league, players) {
       // that keeps football's Yahoo tabs from timing out.)
       setTimeout(function() {
         if (skState.activeLeagueKey !== leagueKeyAtStart) return;
-        _seasonAttempt(false);
+        _seasonAttempt(1);
       }, 1200);
     }
   }
@@ -154369,6 +154398,27 @@ function skRenderDetailDepth(league, players) {
 // In-place season-line update for NBA/NHL (ESPN-sourced). Mirrors
 // _skUpdateSeasonStatsInPlace but formats via _formatEspnSeasonLine and
 // writes into the same data-season-stats element by data-player-key.
+// IS ANOTHER ATTEMPT WORTH MAKING? NHLSEASON
+// A cold roster load fires a burst of ESPN id lookups and ESPN rate-limits
+// some of them, so the first answer comes back short of the roster.
+//
+// The rule this replaces retried only when the answer was BADLY short --
+// under sixty percent. Eight of eleven never retried, so those three rows
+// stayed blank until the date was stepped back and forward, which forces a
+// re-fetch with the ids now warm. That was the bug.
+//
+// The test is progress, not a ratio. Ask again for as long as each attempt
+// resolves more players than the last; when one finds nobody new, whoever
+// is still missing is missing because ESPN has nothing for them -- a call-up
+// with no games played -- and asking again will not change it. That way the
+// policy stops on its own without having to know which case it is in.
+function _skSeasonRetryAgain(got, expect, best, attempt) {
+  if (!(expect > 0)) return false;          // nothing to be short of
+  if (got >= expect) return false;          // everybody resolved
+  if (!(got > best)) return false;          // no progress: the rest are absent
+  return (attempt < 3);                     // and a hard ceiling either way
+}
+
 function _skUpdateEspnSeasonStatsInPlace(sportKey, players, byPlayer) {
   if (!players || !byPlayer) return;
   players.forEach(function(p) {
@@ -155691,8 +155741,10 @@ function skUpdateRosterLinesInPlace(players, targetDate) {
         line = _skNflRosterMatchupLine(p.teamAbbr) || null;
       }
     } else if (_ulSport === 'nba' || _ulSport === 'nhl') {
-      // NBA/NHL: pre-built cat-stat HTML from Yahoo's date stats (p._lineHtml).
-      line = (p._line != null && p._line !== '') ? p._line : null;
+      // NBA/NHL: pre-built cat-stat HTML from Yahoo's date stats (p._lineHtml),
+      // and only when it was stamped for the date being shown. NHLDATE
+      line = (p._lineDate === targetDate && p._line != null && p._line !== '')
+        ? p._line : null;
       _isHtmlLine = (p._lineHtml === true && !!line);
     } else {
       line = getCachedMlbLine({ player_key: p.playerKey, name: p.name, team: p.teamAbbr }, targetDate);
@@ -155872,7 +155924,8 @@ function skBuildRosterGroup(label, players, league, hasLiveStats) {
       // NBA/NHL daily line comes from Yahoo's date stats (pre-built cat-stat
       // HTML stamped onto p._line by the roster's hydration pass). Seed it on
       // initial render so a warm cache paints immediately instead of a dash.
-      if (p._line != null && p._line !== '') line = p._line;
+      // ONLY IF IT BELONGS TO THE DATE ON SCREEN. NHLDATE
+      if (p._lineDate === targetDate && p._line != null && p._line !== '') line = p._line;
     }
     // NFL: same source as the in-place updater, so any re-render that happens
     // after the schedule has landed (week step, group collapse) keeps the
