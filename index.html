@@ -204069,6 +204069,25 @@ function _skFmtBytes(b) {
   if (b >= 1024) return Math.round(b / 1024) + ' KB';
   return b + ' B';
 }
+// The one above stops at megabytes, which is right for everything it has
+// ever been pointed at -- a ten megabyte cap does not need gigabytes. The
+// disk-based quota does: Chrome offers this site a share of free space, and
+// printing that as "12288 MB" would bury the very point of the number.
+function _skFmtBig(b) {
+  if (b >= 1073741824) return (Math.round(b / 107374182.4) / 10) + ' GB';
+  return _skFmtBytes(b);
+}
+function _skCommas(n) {
+  return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+function _skShareWord(part, whole) {
+  if (!whole) return '';
+  var p = (part / whole) * 100;
+  if (p >= 10) return Math.round(p) + '%';
+  if (p >= 1) return (Math.round(p * 10) / 10) + '%';
+  if (p >= 0.01) return (Math.round(p * 100) / 100) + '%';
+  return 'under 0.01%';
+}
 
 // ── STORAGE JANITOR — automatic once-a-day maintenance so the shared
 // 10 MB origin quota never creeps back to the wall. CACHES trim to
@@ -204150,6 +204169,62 @@ function _skIdbPanelHtml() {
     '</div>';
 }
 
+// THE HEADLINE FOR THE SECOND STORE. Same shape as the localStorage bar
+// above it on purpose: the comparison is the message, and two figures drawn
+// the same way make it without a word of explanation -- a megabyte or so
+// against a hard ten, and a few megabytes against whatever share of the
+// disk Chrome is willing to give the site.
+//
+// Two different measures are shown and they are not the same thing. The
+// headline counts the characters in the store, the way every other figure
+// in this panel counts, so it can be compared with the rows. The disk
+// figure comes from the browser and is what the quota is actually spent
+// against -- indexes and overhead included, which is why it reads higher.
+function _skIdbKpiFill() {
+  if (!document.getElementById('sk-idb-kpi-fig')) return;
+  function paint(s, est) {
+    var f = document.getElementById('sk-idb-kpi-fig');
+    var c = document.getElementById('sk-idb-kpi-cap');
+    var bar = document.getElementById('sk-idb-kpi-bar');
+    var sub = document.getElementById('sk-idb-kpi-sub');
+    if (!f) return;
+    f.textContent = _skFmtBytes(s.bytes) + ' in IndexedDB';
+    var quota = (est && est.quota) ? est.quota : 0;
+    if (c) c.textContent = quota ? ('of ' + _skFmtBig(quota) + ' available') : 'no fixed cap';
+    // THE BAR SHOWS THE BROWSER'S OWN FIGURES, not the headline against the
+    // quota. What Chrome counts against that quota is everything this site
+    // keeps on disk -- the store, its indexes, the offline cache -- so
+    // measuring only the characters in the store would understate the one
+    // thing a bar is for, which is how close something is to full.
+    var used = (est && est.usage) ? est.usage : 0;
+    var pct = 0;
+    if (quota) {
+      pct = (used / quota) * 100;
+      if (pct < 1 && used > 0) pct = 1;
+      if (pct > 100) pct = 100;
+    }
+    if (bar) bar.style.width = pct + '%';
+    if (sub) {
+      sub.textContent = _skCommas(s.count) + ' keys' +
+        (quota ? ('. This site is using ' + _skFmtBig(used) + ' of the ' +
+          _skFmtBig(quota) + ' Chrome allows it here \u2014 ' +
+          _skShareWord(used, quota)) : '') +
+        '. The store grows with your phone\u2019s free space, not a 10 MB budget.';
+    }
+  }
+  try {
+    var sized = _skIdbSize();
+    var est = (navigator.storage && navigator.storage.estimate)
+      ? navigator.storage.estimate()['catch'](function () { return null; })
+      : Promise.resolve(null);
+    Promise.all([sized, est]).then(function (both) {
+      paint(both[0] || { count: 0, bytes: 0 }, both[1]);
+    })['catch'](function () {
+      paint({ count: 0, bytes: 0 }, null);
+    });
+  } catch (e) {}
+}
+
 function _skIdbPanelFill() {
   var box = document.getElementById('sk-idb-lines');
   if (!box) return;
@@ -204169,7 +204244,8 @@ function _skIdbPanelFill() {
       var p = (_idbState.persisted === true) ? 'granted'
         : (_idbState.persisted === false ? 'not granted' : 'unknown');
       b2.innerHTML =
-        row('holds', s.count + ' keys &middot; ' + _skFmtBytes(s.bytes)) +
+        // 'holds' is the headline at the top of the panel now; repeating it
+        // here was the same number twice and nothing else
         row('status', st) +
         (_idbState.reclaimed
           ? row('taken out of localStorage', _idbState.reclaimed + ' keys') : '') +
@@ -204240,6 +204316,21 @@ function skRenderStorageReport() {
       'longer counts against this cap. What is left here is settings, logins, and your ' +
       'other apps on this address.</div>';
   }
+  // and the store it moved to, given the same shape as the bar above
+  html += '<div id="sk-idb-kpi" style="margin-bottom:14px;">' +
+    '<div style="display:flex;justify-content:space-between;font-size:12px;' +
+      'color:#fff;margin-bottom:4px;gap:8px;">' +
+      '<span style="font-weight:800;" id="sk-idb-kpi-fig">reading\u2026</span>' +
+      '<span style="color:rgba(147,197,253,0.65);text-align:right;" ' +
+        'id="sk-idb-kpi-cap"></span>' +
+    '</div>' +
+    '<div style="height:8px;border-radius:4px;background:rgba(255,255,255,0.07);' +
+      'overflow:hidden;margin-bottom:5px;">' +
+      '<div id="sk-idb-kpi-bar" style="height:100%;width:0%;background:#60a5fa;"></div>' +
+    '</div>' +
+    '<div id="sk-idb-kpi-sub" style="font-size:10.5px;color:rgba(255,255,255,0.4);' +
+      'line-height:1.5;"></div>' +
+  '</div>';
   // THE ONLY NUMBER THAT ANSWERS THE QUESTION HE ASKED: how much of this is
   // his, and how much is the app being busy. Everything in the second row
   // has somewhere to be fetched back from.
@@ -204312,6 +204403,7 @@ function skRenderStorageReport() {
     '<div style="color:rgba(255,255,255,0.35);font-size:10.5px;line-height:1.5;margin-top:10px;">Free everything safe to clear: drops every cache with a source to fetch it back from and keeps the rest \u2014 snapshots, app and league settings, manager record, Pick \u2019Em, logins. The one item in there that does NOT come back is the player sparkline: its ten days are banked as they happen, so clearing them starts the chart over. Standard: stale versions (FP + settings) + snapshots past TTL + FP/roster/team-stat dates past TTL. Aggressive: same but caches trimmed to the last 14 days (covers this week + last week; older charts re-fetch). NOTE: every app on tymckinney2222.github.io shares this one quota \u2014 GameDay\u2019s cleanup never touches other apps\u2019 data (mcpRtHist etc. belongs to the SPP dashboard).</div>';
   body.innerHTML = html;
   try { _skIdbPanelFill(); } catch (eF) {}
+  try { _skIdbKpiFill(); } catch (eK) {}
 }
 
 // Run the same purge ladder the snapshot writers use — plus the cache
