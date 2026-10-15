@@ -33073,7 +33073,10 @@ var _SK_LOCAL_ONLY = [
   /^gdhq_sport2_/,               // which sport groups are collapsed
   /^gdhq_starred_players$/,      // the star list, sibling of fav_teams
   /^sk_espn_leagues_v1$/,
-  /^sk_synced_leagues_v1$/
+  /^sk_synced_leagues_v1$/,
+  // when THIS phone last wrote a backup. Restoring a file from another
+  // phone should not tell him he backed up on a date he did not.
+  /^sk_backup_/
 ];
 // GAMEDAY'S OWN KEYS, AND ONLY THOSE.
 //
@@ -204284,6 +204287,245 @@ function _skIdbPanelFill() {
   }
 }
 
+
+// ==================================================================
+// BACKUP AND RESTORE
+// ==================================================================
+// Six months of this live on one phone. The cut-over got the data out from
+// under the ten megabyte cap, which is not at all the same as getting it
+// somewhere safe: Chrome's "delete data and reset permissions" takes
+// IndexedDB with everything else, and a phone that is lost, replaced or
+// wiped takes it without asking. Persistence granted only stops the browser
+// evicting the store on its own when the disk runs short.
+//
+// WHAT GOES IN THE FILE is exactly what the panel's green box counts: every
+// key of GameDay's that has no source to fetch it back from. Caches are
+// left out on purpose -- they are two thirds of the bytes and all of them
+// refill on their own, so putting them in would make the file several times
+// bigger and no more useful.
+//
+// IT IS PLAIN JSON, uncompressed and readable. A backup's one job is to
+// restore, and every clever thing done to the format is another way that
+// can fail years later on a phone that does not exist yet.
+var SK_BACKUP_FORMAT = 'gameday-backup';
+var SK_BACKUP_VERSION = 1;
+var SK_BACKUP_LAST = 'sk_backup_last_v1';
+var SK_BACKUP_CHUNK = 250;
+
+// LOGINS STAY OUT. The Fantrax id goes to their API as userSecretId and
+// this app already masks it on screen; the Yahoo tokens are the keys to
+// the account. A backup is a file that ends up in Drive, or mailed to
+// yourself, and sits there for years. Signing in again after a restore is
+// a minute's work, and that is the better trade.
+var _SK_BACKUP_SKIP = [
+  /^gdhq_sleeper_/, /^gdhq_fantrax_/,
+  /token/i, /secret/i, /_auth/i, /password/i
+];
+function _skBackupSkip(k) {
+  var s = String(k || ''), i;
+  for (i = 0; i < _SK_BACKUP_SKIP.length; i++) {
+    if (_SK_BACKUP_SKIP[i].test(s)) return true;
+  }
+  return false;
+}
+
+// Reads through the shim, so it sees the store and localStorage as one --
+// which is what it wants: the question is what is his, not where it sits.
+function _skBackupData() {
+  var out = {}, i, k, v, n = 0, b = 0;
+  try {
+    for (i = 0; i < localStorage.length; i++) {
+      k = localStorage.key(i);
+      if (!k || !_skOwnKey(k)) continue;
+      if (_skCacheKey(k)) continue;
+      if (_skBackupSkip(k)) continue;
+      v = localStorage.getItem(k);
+      if (v === null) continue;
+      out[k] = v;
+      n++;
+      b += (k.length + v.length) * 2;
+    }
+  } catch (e) {}
+  return { keys: out, count: n, bytes: b };
+}
+
+function _skBackupText() {
+  var d = _skBackupData();
+  return JSON.stringify({
+    format: SK_BACKUP_FORMAT,
+    version: SK_BACKUP_VERSION,
+    app: 'GameDay / Skipper',
+    build: (typeof SK_BUILD !== 'undefined') ? String(SK_BUILD) : '',
+    made: new Date().toISOString(),
+    counts: { keys: d.count, bytes: d.bytes },
+    note: 'Snapshots, app and league settings, manager record, Pick Em, ' +
+      'archive and day bank. Caches are left out because they fetch again ' +
+      'by themselves. Logins are left out on purpose.',
+    keys: d.keys
+  });
+}
+
+function _skBackupName() {
+  var d = new Date();
+  return 'gameday-backup-' + d.getFullYear() + '-' +
+    String(d.getMonth() + 1).padStart(2, '0') + '-' +
+    String(d.getDate()).padStart(2, '0') + '.json';
+}
+
+function skSaveBackup() {
+  var txt, blob, url, a;
+  try {
+    txt = _skBackupText();
+    blob = new Blob([txt], { type: 'application/json;charset=utf-8' });
+    url = URL.createObjectURL(blob);
+    a = document.createElement('a');
+    a.href = url;
+    a.download = _skBackupName();
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function () { try { URL.revokeObjectURL(url); } catch (e) {} }, 4000);
+    try { localStorage.setItem(SK_BACKUP_LAST, new Date().toISOString()); } catch (e2) {}
+    try { skRenderStorageReport(); } catch (e3) {}
+    if (typeof skToast === 'function') {
+      var n = 0;
+      try { n = JSON.parse(txt).counts.keys; } catch (e4) {}
+      skToast('Backup saved \u2014 ' + n + ' keys. Keep it somewhere off this phone.');
+    }
+  } catch (e5) {
+    if (typeof skToast === 'function') skToast('Could not save the backup: ' + e5);
+  }
+}
+
+// ---- restore ------------------------------------------------------------
+// AFTER A RESTORE THE STORE IS THE TRUTH, which is a different situation
+// from the cut-over and needs a different door. _skCutOver proves the store
+// against localStorage before it switches, and that is the right test when
+// localStorage is where the data came from. Here it came from a file:
+// localStorage has none of it, so that check would call every restored key
+// stale and refuse. Adopting it directly is safe for the same reason -- there
+// is nothing in localStorage that preferring the store could lose.
+function _skAdoptStore() {
+  return _skHydrate().then(function () {
+    var stamped = false;
+    try {
+      _SK_RAWSET.call(localStorage, SK_IDB_CUT_KEY, '1');
+      stamped = (_skRawGet(SK_IDB_CUT_KEY) === '1');
+    } catch (e) {}
+    _SK_CUT = true;
+    _idbState.cut = true;
+    _skMemDirty();
+    // same interlock as the cut-over: without the stamp the next start
+    // would not load the store, so nothing may be taken out of localStorage
+    if (!stamped) return { ok: true, stamped: false };
+    return _skIdbReclaimAll().then(function () {
+      return { ok: true, stamped: true };
+    });
+  });
+}
+
+function _skRestoreCheck(txt) {
+  var o;
+  try { o = JSON.parse(txt); } catch (e) { return { error: 'That file is not readable JSON.' }; }
+  if (!o || o.format !== SK_BACKUP_FORMAT) {
+    return { error: 'That does not look like a GameDay backup.' };
+  }
+  if (!(o.version <= SK_BACKUP_VERSION)) {
+    return { error: 'That backup was made by a newer version of the app.' };
+  }
+  if (!o.keys || typeof o.keys !== 'object') return { error: 'That backup has no data in it.' };
+  var n = 0, k;
+  for (k in o.keys) { if (o.keys.hasOwnProperty(k)) n++; }
+  if (!n) return { error: 'That backup has no data in it.' };
+  return { ok: true, data: o, count: n };
+}
+
+// THE KEYS GO STRAIGHT INTO THE STORE, not through localStorage. On a fresh
+// phone the restore would otherwise have to fit three megabytes under a ten
+// megabyte cap that other apps are already using, and could fail halfway
+// for no reason that has anything to do with the backup.
+function _skRestoreApply(o, onStep) {
+  var keys = o.keys, names = [], mig = [], loc = [], k, i;
+  for (k in keys) { if (keys.hasOwnProperty(k)) names.push(k); }
+  for (i = 0; i < names.length; i++) {
+    if (_skMigrates(names[i])) mig.push(names[i]); else loc.push(names[i]);
+  }
+  var done = 0, failed = 0;
+  for (i = 0; i < loc.length; i++) {
+    try { localStorage.setItem(loc[i], keys[loc[i]]); done++; }
+    catch (e) { failed++; }
+  }
+  function step(ix) {
+    if (ix >= mig.length) return Promise.resolve();
+    var map = {}, j, end = Math.min(ix + SK_BACKUP_CHUNK, mig.length);
+    for (j = ix; j < end; j++) map[mig[j]] = keys[mig[j]];
+    return _idbPutBatch(map, {}).then(function () {
+      var m;
+      if (_SK_MEM) {
+        for (m in map) { if (map.hasOwnProperty(m)) _SK_MEM[m] = map[m]; }
+      }
+      done += (end - ix);
+      if (typeof onStep === 'function') {
+        try { onStep(done, names.length); } catch (e2) {}
+      }
+      return new Promise(function (r) { setTimeout(r, 0); }).then(function () {
+        return step(end);
+      });
+    });
+  }
+  return step(0).then(function () {
+    _skMemDirty();
+    return _skAdoptStore().then(function (a) {
+      return { restored: done, failed: failed, total: names.length, adopt: a };
+    });
+  });
+}
+
+function skPickRestore() {
+  var inp = document.createElement('input');
+  inp.type = 'file';
+  inp.accept = '.json,application/json';
+  inp.onchange = function () {
+    var f = inp.files && inp.files[0];
+    if (!f) return;
+    var rd = new FileReader();
+    rd.onload = function () {
+      var chk = _skRestoreCheck(String(rd.result || ''));
+      if (chk.error) {
+        if (typeof skToast === 'function') skToast(chk.error);
+        return;
+      }
+      var made = '';
+      try { made = new Date(chk.data.made).toLocaleString(); } catch (e) {}
+      var msg = 'Restore ' + chk.count + ' keys from this backup' +
+        (made ? (', made ' + made) : '') + '?\n\n' +
+        'It adds and overwrites, and removes nothing that is not in the file. ' +
+        'The app will reload when it finishes.';
+      if (!window.confirm(msg)) return;
+      if (typeof skToast === 'function') skToast('Restoring\u2026');
+      _skRestoreApply(chk.data, function (n, tot) {
+        if (typeof skToast === 'function' && (n % 1000 === 0)) {
+          skToast('Restoring\u2026 ' + n + ' of ' + tot);
+        }
+      }).then(function (r) {
+        return _idbFlush().then(function () { return r; });
+      }).then(function (r) {
+        if (typeof skToast === 'function') {
+          skToast('Restored ' + r.restored + ' keys. Reloading\u2026');
+        }
+        setTimeout(function () { try { location.reload(); } catch (e) {} }, 1200);
+      })['catch'](function (e) {
+        if (typeof skToast === 'function') skToast('Restore failed: ' + e);
+      });
+    };
+    rd.onerror = function () {
+      if (typeof skToast === 'function') skToast('Could not read that file.');
+    };
+    rd.readAsText(f);
+  };
+  inp.click();
+}
+
 function skRenderStorageReport() {
   var body = document.getElementById('sk-storage-body');
   if (!body) return;
@@ -204401,6 +204643,45 @@ function skRenderStorageReport() {
       '<button onclick="skFreeDisposable()" style="flex:1 1 100%;padding:10px;border-radius:8px;border:1px solid rgba(96,165,250,0.45);background:rgba(96,165,250,0.12);color:#93c5fd;font-size:12px;font-weight:700;cursor:pointer;">Free everything safe to clear</button>' +
     '</div>' +
     '<div style="color:rgba(255,255,255,0.35);font-size:10.5px;line-height:1.5;margin-top:10px;">Free everything safe to clear: drops every cache with a source to fetch it back from and keeps the rest \u2014 snapshots, app and league settings, manager record, Pick \u2019Em, logins. The one item in there that does NOT come back is the player sparkline: its ten days are banked as they happen, so clearing them starts the chart over. Standard: stale versions (FP + settings) + snapshots past TTL + FP/roster/team-stat dates past TTL. Aggressive: same but caches trimmed to the last 14 days (covers this week + last week; older charts re-fetch). NOTE: every app on tymckinney2222.github.io shares this one quota \u2014 GameDay\u2019s cleanup never touches other apps\u2019 data (mcpRtHist etc. belongs to the SPP dashboard).</div>';
+  // ---- BACKUP ----------------------------------------------------------
+  // Deliberately the last thing in the panel and in its own box, because it
+  // is not housekeeping. The buttons above free space; this one is the only
+  // thing here that answers "what if this phone is gone".
+  try {
+    var bl = '';
+    try { bl = localStorage.getItem(SK_BACKUP_LAST) || ''; } catch (eB) {}
+    var bd = _skBackupData();
+    var when = 'never', warn = true;
+    if (bl) {
+      var ageD = Math.floor((Date.now() - new Date(bl).getTime()) / 86400000);
+      warn = !(ageD >= 0 && ageD <= 14);
+      when = (ageD <= 0) ? 'today' : (ageD === 1 ? 'yesterday' : (ageD + ' days ago'));
+    }
+    html += '<div style="border:1px solid ' +
+        (warn ? 'rgba(251,191,36,0.45)' : 'rgba(74,222,128,0.3)') +
+        ';border-radius:8px;padding:10px 11px;margin-top:14px;">' +
+      '<div style="font-size:9.5px;letter-spacing:0.12em;color:' +
+        (warn ? 'rgba(251,191,36,0.9)' : 'rgba(74,222,128,0.8)') +
+        ';">BACKUP &middot; LAST SAVED ' + when.toUpperCase() + '</div>' +
+      '<div style="font-size:11px;color:rgba(255,255,255,0.6);margin-top:5px;' +
+        'line-height:1.6;">' + _skCommas(bd.count) + ' keys &middot; about ' +
+        _skFmtBytes(bd.bytes) + ' \u2014 your snapshots, settings, manager record, ' +
+        'Pick \u2019Em, archive and day bank. Caches are left out because they ' +
+        'fetch again on their own, and logins are left out on purpose.</div>' +
+      '<div style="display:flex;gap:8px;margin-top:9px;">' +
+        '<button onclick="skSaveBackup()" style="flex:1;padding:10px;border-radius:8px;' +
+          'border:1px solid rgba(74,222,128,0.45);background:rgba(74,222,128,0.12);' +
+          'color:#4ade80;font-size:12px;font-weight:700;cursor:pointer;">Save a backup file</button>' +
+        '<button onclick="skPickRestore()" style="flex:1;padding:10px;border-radius:8px;' +
+          'border:1px solid rgba(255,255,255,0.22);background:rgba(255,255,255,0.06);' +
+          'color:#fff;font-size:12px;font-weight:700;cursor:pointer;">Restore from a file</button>' +
+      '</div>' +
+      '<div style="font-size:10.5px;color:rgba(255,255,255,0.35);margin-top:9px;' +
+        'line-height:1.5;">Chrome\u2019s \u201cDelete data &amp; reset permissions\u201d ' +
+        'takes IndexedDB too, and so does a lost or replaced phone. Keep the file ' +
+        'somewhere that is not this phone.</div>' +
+    '</div>';
+  } catch (eBK) {}
   body.innerHTML = html;
   try { _skIdbPanelFill(); } catch (eF) {}
   try { _skIdbKpiFill(); } catch (eK) {}
