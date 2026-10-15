@@ -33001,8 +33001,50 @@ var _idbQueueDel = {};           // key -> 1, waiting to be removed
 var _idbFlushTimer = null;
 var _idbState = {
   open: false, copied: 0, evicted: 0, copyDone: false, errors: 0, lastError: '',
-  persisted: null, queued: 0, wrote: 0
+  persisted: null, queued: 0, wrote: 0,
+  hydrated: 0, reclaimed: 0, cut: false, hydrateFailed: false
 };
+
+// THE REAL localStorage, taken aside before anything wraps it. The shim and
+// the reclaim both need to ask what is actually on disk rather than what
+// the app has been told, and a wrapper calling itself would either loop or
+// lie about the very thing being measured.
+var _SK_RAWLEN = null, _SK_RAWKEY = null, _SK_RAWGET = null,
+    _SK_RAWSET = null, _SK_RAWDEL = null;
+(function () {
+  try {
+    var d = Object.getOwnPropertyDescriptor(Storage.prototype, 'length');
+    _SK_RAWLEN = (d && typeof d.get === 'function') ? d.get : null;
+    _SK_RAWKEY = Storage.prototype.key;
+    _SK_RAWGET = Storage.prototype.getItem;
+    _SK_RAWSET = Storage.prototype.setItem;
+    _SK_RAWDEL = Storage.prototype.removeItem;
+  } catch (e) {}
+})();
+function _skRawLen() {
+  try { return _SK_RAWLEN ? _SK_RAWLEN.call(localStorage) : 0; } catch (e) { return 0; }
+}
+function _skRawKey(i) {
+  try { return _SK_RAWKEY ? _SK_RAWKEY.call(localStorage, i) : null; } catch (e) { return null; }
+}
+function _skRawGet(k) {
+  try { return _SK_RAWGET ? _SK_RAWGET.call(localStorage, k) : null; } catch (e) { return null; }
+}
+// What localStorage itself is holding: the number the ten megabyte cap
+// actually applies to. After the cut-over that is settings and other apps,
+// and none of GameDay's bulk -- which is the whole point, and the reason
+// the panel must stop reporting the shimmed view at the top of the screen.
+function _skRawBytes() {
+  var i, k, v, n = 0, b = 0, rl = _skRawLen();
+  for (i = 0; i < rl; i++) {
+    k = _skRawKey(i);
+    if (!k) continue;
+    v = _skRawGet(k) || '';
+    b += (k.length + v.length) * 2;
+    n++;
+  }
+  return { count: n, bytes: b };
+}
 
 // THE KEYS THAT STAY. Small, read at startup, and cheap to leave where they
 // are: the look of the app, which filters are showing, what is collapsed,
@@ -33021,7 +33063,17 @@ var _SK_LOCAL_ONLY = [
   /^sk_(atbat|fy_alerts)_enabled_v1$/,
   /^sk_(briefing_dismissed|ext_synced_v1|pulse_settings|yahoo_paused)$/,
   /^sk_janitor_last$/,
-  /^sk_idb_/                     // this migration's own bookkeeping
+  /^sk_idb_/,                    // this migration's own bookkeeping
+  // READ BEFORE THE STORE CAN ANSWER, so they stay where a synchronous read
+  // always finds them. These were found by watching the app start in a
+  // browser rather than by reading the source, which had missed every one
+  // of them: the league indexes are the spine the rest hangs off, and the
+  // sport flags and the star list are settings that were only ever on this
+  // side of the line by accident.
+  /^gdhq_sport2_/,               // which sport groups are collapsed
+  /^gdhq_starred_players$/,      // the star list, sibling of fav_teams
+  /^sk_espn_leagues_v1$/,
+  /^sk_synced_leagues_v1$/
 ];
 // GAMEDAY'S OWN KEYS, AND ONLY THOSE.
 //
@@ -33369,6 +33421,321 @@ function _skIdbPersist() {
   } catch (e) { _idbState.persisted = null; return Promise.resolve(null); }
 }
 
+
+// ==================================================================
+// THE CUT-OVER -- the app reads from the store
+// ==================================================================
+// Phase one copied every bulky key into IndexedDB and left the original
+// sitting in localStorage, so nothing depended on the new store yet. This
+// is the half that makes it load-bearing: reads come from IndexedDB,
+// localStorage keeps the handful of settings, and the ten megabyte cap
+// stops being GameDay's problem.
+//
+// The awkward part is that localStorage answers on the spot and IndexedDB
+// does not. Every one of this file's hundred-odd reads expects a value
+// returned, not a promise, and no amount of rewriting call sites changes
+// that. So the store is read into memory once at startup and the
+// synchronous calls are answered from there: memory is the working copy,
+// IndexedDB is where it survives a reload.
+//
+// -- WHY THE PROTOTYPE AND NOT THE CALL SITES --
+// There are 31 loops in this file that walk localStorage by index, and
+// every one of them treats "not enumerated" as "does not exist". Rewriting
+// all 31 was the first plan. The trouble is the failure mode: miss one and
+// it throws no error, it just sees an empty world and draws nothing. So
+// length and key() are shimmed instead and all 31 keep working untouched,
+// including any this file's author never thought to look for. Checked
+// first that the browser allows it -- Storage.prototype.length is a
+// configurable accessor, and sessionStorage is left alone because the shim
+// asks which store it was called on.
+
+var SK_IDB_CUT_KEY = 'sk_idb_cut_v1';
+
+var _SK_MEM = null;        // key -> value. The working copy. null until read.
+var _SK_CUT = false;       // true once reads are answered from _SK_MEM
+var _SK_CUTSHIM = false;
+var _SK_MEMK = null;       // enumeration snapshot
+var _SK_MEMD = true;       // snapshot needs rebuilding
+var _SK_MEMRL = -1;        // raw localStorage length when it was built
+var _SK_EARLY = 0;         // store reads answered before the store was ready
+var _SK_HYDRATED = false;
+
+// Keys in memory that raw localStorage does not also hold: what the shim
+// appends to the enumeration.
+//
+// -- WHY THIS IS NOT JUST Object.keys EVERY TIME --
+// length is read once per iteration of every one of those 31 loops, so
+// anything done here happens thousands of times per loop. Measured at Ty's
+// shape -- 2,400 keys left in localStorage, 3,100 in the store -- a plain
+// scan of all 5,500 costs 73ms, which is fine. A purge loop that deletes as
+// it goes cost 8.8 SECONDS on a desktop, which on a phone is the app
+// hanging. Every delete invalidated the snapshot and the next read of
+// length rebuilt the whole thing: n-squared, exactly what the cache was
+// meant to avoid.
+//
+// Two things fix it.
+//
+// A DELETE NO LONGER INVALIDATES. The key stays in the array and key()
+// returns null for it instead, which every loop in this file already
+// handles -- they all guard with "if (!k) continue", because real
+// localStorage has always been able to shift under an index. So length
+// becomes an upper bound that settles on the next rebuild rather than a
+// figure that must be exact the instant a key goes.
+//
+// AND THE SCAN OF localStorage IS SKIPPED ONCE IT IS POINTLESS. It is only
+// there to catch keys sitting in both places at once, which happens between
+// the switch and the end of the reclaim and never again -- writes of
+// migrated keys stop going to localStorage at the switch, so the overlap
+// can only shrink. The first rebuild finds out whether there is any, and if
+// there is not, later ones skip straight to the keys.
+var _SK_OVERLAP = true;
+function _skMemKeys() {
+  var rl = _skRawLen(), i, k, seen = null, out, over = false;
+  if (_SK_MEMK && !_SK_MEMD && _SK_MEMRL === rl) return _SK_MEMK;
+  if (_SK_OVERLAP) {
+    seen = {};
+    for (i = 0; i < rl; i++) { k = _skRawKey(i); if (k) seen[k] = 1; }
+  }
+  out = [];
+  if (_SK_MEM) {
+    for (k in _SK_MEM) {
+      if (!_SK_MEM.hasOwnProperty(k)) continue;
+      if (seen && seen[k]) { over = true; continue; }
+      out.push(k);
+    }
+  }
+  if (_SK_OVERLAP && !over) _SK_OVERLAP = false;
+  _SK_MEMK = out;
+  _SK_MEMD = false;
+  _SK_MEMRL = rl;
+  return out;
+}
+
+// Called when a key ARRIVES, or after a bulk change. Not on a delete: see
+// above, that is the whole point.
+function _skMemDirty() { _SK_MEMD = true; }
+
+// Read the store into memory. Only what still migrates: a key that has
+// since been reclassified as a setting lives in localStorage now, and must
+// not be shadowed by the copy IndexedDB still has of it.
+function _skHydrate() {
+  if (_SK_HYDRATED && _SK_MEM) return Promise.resolve(_SK_MEM);
+  return _idbAll().then(function (have) {
+    var m = {}, k, n = 0;
+    for (k in have) {
+      if (!have.hasOwnProperty(k)) continue;
+      if (!_skMigrates(k)) continue;
+      m[k] = String(have[k] == null ? '' : have[k]);
+      n++;
+    }
+    _SK_MEM = m;
+    _SK_HYDRATED = true;
+    // localStorage still has everything the reclaim has not removed, so the
+    // two overlap again until a rebuild or a finished reclaim says they do not
+    _SK_OVERLAP = true;
+    _skMemDirty();
+    _idbState.hydrated = n;
+    return m;
+  });
+}
+
+// INERT UNTIL _SK_CUT FLIPS. Installed at parse time all the same, so that
+// a read arriving before the store is ready can be counted rather than
+// quietly answered with nothing -- that count is what triggers the repaint
+// below.
+function _skInstallCutShim() {
+  if (_SK_CUTSHIM) return true;
+  try {
+    var d = Object.getOwnPropertyDescriptor(Storage.prototype, 'length');
+    if (!d || typeof d.get !== 'function' || !d.configurable) return false;
+    if (!_SK_RAWKEY || !_SK_RAWGET) return false;
+    var rawLenGet = d.get;
+    Object.defineProperty(Storage.prototype, 'length', {
+      configurable: true,
+      get: function () {
+        var n = rawLenGet.call(this);
+        if (this !== localStorage || !_SK_CUT) return n;
+        return n + _skMemKeys().length;
+      }
+    });
+    Storage.prototype.key = function (i) {
+      if (this === localStorage && _SK_CUT) {
+        var n = _skRawLen(), ks, kk;
+        if (i >= n) {
+          ks = _skMemKeys();
+          kk = ((i - n) < ks.length) ? ks[i - n] : null;
+          // a key deleted since the snapshot was taken enumerates as a gap
+          // rather than as itself, which is what stops a delete having to
+          // rebuild the list
+          return (kk && _SK_MEM && _SK_MEM.hasOwnProperty(kk)) ? kk : null;
+        }
+      }
+      return _SK_RAWKEY.call(this, i);
+    };
+    Storage.prototype.getItem = function (k) {
+      if (this === localStorage) {
+        if (_SK_CUT && _SK_MEM && _SK_MEM.hasOwnProperty(k)) return _SK_MEM[k];
+        if (!_SK_CUT && _skMigrates(k)) _SK_EARLY++;
+      }
+      return _SK_RAWGET.call(this, k);
+    };
+    _SK_CUTSHIM = true;
+    return true;
+  } catch (e) {
+    _idbState.lastError = String((e && e.message) || e);
+    return false;
+  }
+}
+
+// ---- taking the originals out of localStorage ---------------------------
+// THE DELETE HERE IS THE RAW ONE ON PURPOSE, and it is the most dangerous
+// line in this file. The wrapped removeItem queues a delete against
+// IndexedDB, which is exactly right everywhere else and exactly wrong here:
+// this runs through keys it has just confirmed IndexedDB holds, so going
+// through the wrapper would delete each one from the store it was copied
+// into. The copy would erase itself, key by key, and report success.
+//
+// A key is only taken out when the store holds it with a byte-identical
+// value. Anything that does not match is left where it is and counted, so a
+// later pass can try again rather than this one guessing.
+function _skIdbReclaim(batch) {
+  batch = batch || 400;
+  return _idbAll().then(function (have) {
+    var i, k, v, drop = [], left = 0, freed = 0, rl = _skRawLen();
+    for (i = 0; i < rl; i++) {
+      k = _skRawKey(i);
+      if (!k || !_skMigrates(k)) continue;
+      v = _skRawGet(k);
+      if (v === null) continue;
+      if (!have.hasOwnProperty(k) || have[k] !== v) { left++; continue; }
+      if (drop.length >= batch) { left++; continue; }
+      drop.push(k);
+    }
+    for (i = 0; i < drop.length; i++) {
+      k = drop[i];
+      if (_SK_MEM) _SK_MEM[k] = have[k];
+      freed += (k.length + String(have[k] == null ? '' : have[k]).length) * 2;
+      try { _SK_RAWDEL.call(localStorage, k); } catch (e) {}
+    }
+    // a bulk change is the right moment to pay for a rebuild
+    _skMemDirty();
+    _idbState.reclaimed += drop.length;
+    if (left === 0) _SK_OVERLAP = false;
+    return { freed: drop.length, bytes: freed, left: left };
+  })['catch'](function (e) {
+    _idbState.errors++;
+    _idbState.lastError = String((e && e.message) || e);
+    return { freed: 0, bytes: 0, left: -1, error: _idbState.lastError };
+  });
+}
+
+function _skIdbReclaimAll(onStep) {
+  function step() {
+    return _skIdbReclaim().then(function (r) {
+      if (typeof onStep === 'function') { try { onStep(r); } catch (e) {} }
+      if (r.left <= 0 || r.freed === 0) return r;
+      return new Promise(function (res) { setTimeout(res, 60); }).then(step);
+    });
+  }
+  return step();
+}
+
+// ---- the switch ---------------------------------------------------------
+// GATED ON THE PROOF, not on the copy saying it finished. The verify walks
+// every key both ways; nothing moves until it comes back clean.
+function _skCutOver(force) {
+  if (_SK_CUT) return Promise.resolve({ already: true });
+  return _skIdbVerify().then(function (v) {
+    if (!v.ok && !force) {
+      return { ok: false, reason: 'verify', verify: v };
+    }
+    return _skHydrate().then(function () {
+      // THE STAMP GOES DOWN FIRST AND IS READ BACK BEFORE ANYTHING IS
+      // DELETED. It is the one thing the next boot looks at to know it
+      // should read from the store. If it failed to save -- a full disk is
+      // the obvious way -- and the reclaim ran anyway, the next boot would
+      // find no stamp, not load the store, and go looking in a localStorage
+      // this had just emptied. So: no stamp, no reclaim.
+      var stamped = false;
+      try {
+        _SK_RAWSET.call(localStorage, SK_IDB_CUT_KEY, '1');
+        stamped = (_skRawGet(SK_IDB_CUT_KEY) === '1');
+      } catch (e) {}
+      if (!stamped) return { ok: false, reason: 'stamp' };
+      _SK_CUT = true;
+      _skMemDirty();
+      return _skIdbReclaimAll().then(function (r) {
+        _idbState.cut = true;
+        return { ok: true, reclaimed: _idbState.reclaimed, left: r.left };
+      });
+    });
+  })['catch'](function (e) {
+    _idbState.errors++;
+    _idbState.lastError = String((e && e.message) || e);
+    return { ok: false, reason: 'error', error: _idbState.lastError };
+  });
+}
+
+// ---- starting up --------------------------------------------------------
+// Anything that needs the store waits here. Before the cut-over that is no
+// wait at all, because localStorage still has everything.
+var _skReadyQ = [];
+var _skReadyDone = false;
+function _skWhenReady(fn) {
+  if (_skReadyDone) { try { fn(); } catch (e) {} return; }
+  _skReadyQ.push(fn);
+}
+function _skReadyFire() {
+  if (_skReadyDone) return;
+  _skReadyDone = true;
+  var q = _skReadyQ, i;
+  _skReadyQ = [];
+  for (i = 0; i < q.length; i++) { try { q[i](); } catch (e) {} }
+}
+
+// THE NET. The gate above covers the boot path as measured, but a render
+// reached some other way would have read an empty store and drawn an empty
+// screen with nothing to correct it. So every store read answered before
+// the store was ready is counted, and if any were, the views that depend on
+// it are drawn again once it is. Costs one repaint in the case where it was
+// not needed; saves a blank screen in the case nobody found.
+function _skBootRepaint() {
+  var names = ['renderLeaguePills', 'renderLeagueDrawerBody'], i, f;
+  for (i = 0; i < names.length; i++) {
+    try {
+      f = window[names[i]];
+      if (typeof f === 'function') f();
+    } catch (e) {}
+  }
+}
+
+var _skStoreBooted = false;
+function _skStoreBoot() {
+  if (_skStoreBooted) return;
+  _skStoreBooted = true;
+  _skInstallCutShim();
+  var cut = false;
+  try { cut = _skRawGet(SK_IDB_CUT_KEY) === '1'; } catch (e) {}
+  if (!cut) { _skReadyFire(); return; }
+  _skHydrate().then(function () {
+    _SK_CUT = true;
+    _idbState.cut = true;
+    _skMemDirty();
+    _skReadyFire();
+    if (_SK_EARLY > 0) _skBootRepaint();
+  })['catch'](function (e) {
+    // THE STORE DID NOT OPEN. Nothing is deleted and nothing is lost -- the
+    // data is still in IndexedDB, just out of reach this once. Reads fall
+    // back to localStorage and writes go there too, which the mirror then
+    // copies across, so the app keeps working and repairs itself. The panel
+    // says so rather than leaving him to wonder why a screen looks thin.
+    _idbState.errors++;
+    _idbState.hydrateFailed = true;
+    _idbState.lastError = String((e && e.message) || e);
+    _skReadyFire();
+  });
+}
+
 // ---- boot ---------------------------------------------------------------
 // Deferred, like the janitor: nothing here is wanted before first paint, and
 // the copy is the heaviest thing the app does on a cold start.
@@ -33401,6 +33768,23 @@ function _skIdbBoot() {
     _skIdbFlushOnHide();
     _idbOpen().then(function () {
       return _skIdbCopyAll();
+    }).then(function (r) {
+      // ALREADY SWITCHED? Then the job is to finish what an earlier run
+      // started. The reclaim goes in slices so the app stays usable while
+      // thousands of keys come out, which means it can be cut short -- the
+      // app closed, the phone asleep -- with the stamp already down and
+      // keys still in localStorage. Next start, _SK_CUT is true before this
+      // line and _skCutOver would say "already" and do nothing, leaving
+      // those keys there for good. Not dangerous, because the store has
+      // them and reads come from the store; just space he was promised back
+      // and would never see. Cheap when there is nothing left to do.
+      if (_SK_CUT) return _skIdbReclaimAll();
+      // AND OTHERWISE, ONLY IF IT PROVES OUT, the switch. Nothing here
+      // forces it: a store that does not verify stays a mirror and the app
+      // goes on reading localStorage, which is the arrangement it has been
+      // running safely in for days.
+      if (!r || !r.done) return null;
+      return _skCutOver();
     })['catch'](function (e) {
       _idbState.errors++;
       _idbState.lastError = String((e && e.message) || e);
@@ -33483,6 +33867,15 @@ function _skStorageSplit() {
     for (i = 0; i < localStorage.length; i++) {
       k = localStorage.key(i);
       if (!k) continue;
+      // GAMEDAY'S OWN, AND ONLY THOSE. The box is headed "yours, kept" and
+      // it was counting every app on the address: of the 4.5 MB it once
+      // showed Ty, 1.6 was Crafty Planner and Bill Tracker and the SPP
+      // dashboard. Harmless while the number was only ever a rough sense of
+      // scale, and wrong the moment the label beneath it started claiming
+      // the boxes describe GameDay's data. The row further down -- "
+      // everything else on this origin" -- is where the rest is reported,
+      // and it is the same ownership test the migration uses.
+      if (typeof _skOwnKey === 'function' && !_skOwnKey(k)) continue;
       v = localStorage.getItem(k) || '';
       // UTF-16, same as the rest of this panel counts
       var b = (k.length + v.length) * 2;
@@ -33582,6 +33975,18 @@ function _skGuardMirror(store, k, v) {
 }
 
 function _skGuardedSet(raw, store, k, v) {
+  // AFTER THE CUT-OVER localStorage is not where this goes. The value is
+  // kept in memory so the synchronous reads still find it and queued for
+  // IndexedDB so it survives; writing it to localStorage as well would put
+  // the bulk straight back under the cap this whole exercise was about.
+  if (_SK_CUT && store === localStorage && _skMigrates(k)) {
+    try {
+      _SK_MEM[k] = String(v);
+      _skMemDirty();
+      _idbQueueWrite(k, String(v));
+    } catch (eC) {}
+    return;
+  }
   try {
     var r = raw.call(store, k, v);
     _skGuardMirror(store, k, v);
@@ -33626,8 +34031,16 @@ function _skInstallWriteGuard() {
       Storage.prototype.removeItem = function (k) {
         var out = rawDel.call(this, k);
         try {
-          if (this === localStorage && typeof _idbQueueRemove === 'function') {
-            _idbQueueRemove(k);
+          if (this === localStorage) {
+            // the working copy too, or a purge would delete a key that the
+            // next read then answers from memory as though it survived
+            if (_SK_MEM && _SK_MEM.hasOwnProperty(k)) {
+              // NO _skMemDirty() HERE ON PURPOSE. key() returns a gap for
+              // it already, and invalidating on every delete is what made a
+              // purge loop take nine seconds.
+              delete _SK_MEM[k];
+            }
+            if (typeof _idbQueueRemove === 'function') _idbQueueRemove(k);
           }
         } catch (e) {}
         return out;
@@ -33638,6 +34051,10 @@ function _skInstallWriteGuard() {
   } catch (e) { return false; }
 }
 _skInstallWriteGuard();
+// AT PARSE TIME, not on a timer. The shim has to be in place before the
+// first read of the file below it, and if this build has already cut over
+// the store has to be loaded before anything draws.
+_skStoreBoot();
 
 // ---- SKJSERR ----
 // Every script this page pulls from another origin registers here while it
@@ -203584,7 +204001,11 @@ function _skStorageGroups() {
     { id: 'fpday',   label: 'FP day caches (fp_v4_)',        test: function(k) { return k.indexOf('fp_v4_') === 0; } },
     // ITS OWN ROW NOW, because it was a third of the quota on its own
     // and hiding inside the sk_* catch-all where nobody would look.
-    { id: 'spark',   label: 'Player sparkline (10 days)',   test: function(k) { return k.indexOf('sk_pspark_') === 0; } },
+    // NOT 're-fetchable', whatever bucket it sits in. A day of sparkline is
+    // banked from that day's scores and there is nowhere to ask for it
+    // again; it was grouped with the caches because it is disposable, which
+    // is a different thing, and the label said the wrong one.
+    { id: 'spark',   label: 'Player sparkline (10 days, no refill)',   test: function(k) { return k.indexOf('sk_pspark_') === 0; } },
     { id: 'fptot',   label: 'Daily totals (fpt_v1_)',        test: function(k) { return k.indexOf('fpt_v1_') === 0; } },
     { id: 'pstats',  label: 'Player stat caches',            test: function(k) { return k.indexOf('sk_player_stats_v1_') === 0; } },
     { id: 'fpstale', label: 'Stale FP versions (fp_v1-3_)',  test: function(k) { return /^fp_v\d+_/.test(k) && k.indexOf('fp_v4_') !== 0; } },
@@ -203716,8 +204137,10 @@ function skOpenStorageReport() {
 function _skIdbPanelHtml() {
   return '<div id="sk-idb-box" style="border:1px solid rgba(96,165,250,0.3);' +
     'border-radius:8px;padding:9px 11px;margin:12px 0 2px;">' +
-    '<div style="font-size:9.5px;letter-spacing:0.12em;color:rgba(147,197,253,0.85);">' +
-      'INDEXEDDB &middot; COPYING, NOTHING DELETED YET</div>' +
+    '<div id="sk-idb-head" style="font-size:9.5px;letter-spacing:0.12em;' +
+      'color:rgba(147,197,253,0.85);">' +
+      (_idbState.cut ? 'INDEXEDDB &middot; GAMEDAY READS FROM HERE'
+                     : 'INDEXEDDB &middot; COPYING, NOTHING DELETED YET') + '</div>' +
     '<div id="sk-idb-lines" style="font-size:11px;color:rgba(255,255,255,0.6);' +
       'margin-top:5px;line-height:1.6;">reading&hellip;</div>' +
     '<button id="sk-idb-verify" style="margin-top:7px;width:100%;padding:8px;' +
@@ -203740,14 +204163,25 @@ function _skIdbPanelFill() {
       var b2 = document.getElementById('sk-idb-lines');
       if (!b2) return;
       var st = _idbState.errors ? ('error: ' + _idbState.lastError)
-        : (_idbState.copyDone ? 'copy complete' : 'copying ' + _idbState.copied + ' so far');
+        : (_idbState.cut ? 'live \u2014 reads come from here'
+          : (_idbState.copyDone ? 'copy complete' : 'copying ' + _idbState.copied + ' so far'));
       if (_idbState.evicted) st += ' (' + _idbState.evicted + ' foreign keys removed)';
       var p = (_idbState.persisted === true) ? 'granted'
         : (_idbState.persisted === false ? 'not granted' : 'unknown');
       b2.innerHTML =
         row('holds', s.count + ' keys &middot; ' + _skFmtBytes(s.bytes)) +
         row('status', st) +
-        row('kept through low disk', p);
+        (_idbState.reclaimed
+          ? row('taken out of localStorage', _idbState.reclaimed + ' keys') : '') +
+        row('kept through low disk', p) +
+        // SAID OUT LOUD RATHER THAN LEFT TO LOOK LIKE A THIN SCREEN. If the
+        // store would not open this once, the app falls back to
+        // localStorage and repairs itself, but a glance at the app would
+        // just show less than it should and no reason why.
+        (_idbState.hydrateFailed
+          ? '<div style="color:#fbbf24;margin-top:4px;line-height:1.5;">Could not open ' +
+            'the store this time \u2014 nothing is lost, it is still saved. Close and ' +
+            'reopen the app to try again.</div>' : '');
     })['catch'](function () {});
   } catch (e) {}
   var btn = document.getElementById('sk-idb-verify');
@@ -203778,17 +204212,34 @@ function skRenderStorageReport() {
   var body = document.getElementById('sk-storage-body');
   if (!body) return;
   var rep = _skStorageGroups();
+  // THE BAR MEASURES localStorage ITSELF, and after the cut-over that is a
+  // different question from the one the rows below answer. Those rows
+  // describe GameDay's data wherever it now lives, and nearly all of it
+  // lives in IndexedDB -- so counting it against the ten megabyte cap would
+  // put a number here that has nothing to do with the cap any more. This is
+  // the thing the panel would otherwise get wrong the moment it mattered.
+  var raw = (typeof _skRawBytes === 'function') ? _skRawBytes()
+    : { bytes: rep.total, count: 0 };
   var budget = 10 * 1048576; // Chrome's real per-origin localStorage cap
-  var pct = Math.min(100, Math.round((rep.total / budget) * 100));
+  var pct = Math.min(100, Math.round((raw.bytes / budget) * 100));
+  // a sliver rather than nothing: after the cut-over the honest figure
+  // rounds to zero percent, and an empty bar reads as a broken one
+  if (pct < 1 && raw.bytes > 0) pct = 1;
   var barColor = pct >= 90 ? '#f87171' : (pct >= 70 ? '#fbbf24' : '#4ade80');
   var html =
     '<div style="display:flex;justify-content:space-between;font-size:12px;color:#fff;margin-bottom:4px;">' +
-      '<span style="font-weight:800;">' + _skFmtBytes(rep.total) + ' used</span>' +
+      '<span style="font-weight:800;">' + _skFmtBytes(raw.bytes) + ' used</span>' +
       '<span style="color:rgba(255,255,255,0.45);">of ~10 MB Chrome quota</span>' +
     '</div>' +
     '<div style="height:8px;border-radius:4px;background:rgba(255,255,255,0.07);overflow:hidden;margin-bottom:14px;">' +
       '<div style="height:100%;width:' + pct + '%;background:' + barColor + ';"></div>' +
     '</div>';
+  if (_idbState.cut) {
+    html += '<div style="font-size:10.5px;color:rgba(74,222,128,0.75);' +
+      'margin:-8px 0 12px;line-height:1.5;">GameDay\u2019s data has moved to IndexedDB and no ' +
+      'longer counts against this cap. What is left here is settings, logins, and your ' +
+      'other apps on this address.</div>';
+  }
   // THE ONLY NUMBER THAT ANSWERS THE QUESTION HE ASKED: how much of this is
   // his, and how much is the app being busy. Everything in the second row
   // has somewhere to be fetched back from.
@@ -203802,12 +204253,17 @@ function skRenderStorageReport() {
         '<div style="font-size:9.5px;color:rgba(255,255,255,0.4);">' + sp.keepCount + ' keys</div>' +
       '</div>' +
       '<div style="flex:1;border:1px solid rgba(255,255,255,0.14);border-radius:8px;padding:8px 10px;">' +
-        '<div style="font-size:9.5px;letter-spacing:0.12em;color:rgba(255,255,255,0.45);">RE-FETCHABLE</div>' +
+        '<div style="font-size:9.5px;letter-spacing:0.12em;color:rgba(255,255,255,0.45);">SAFE TO CLEAR</div>' +
         '<div style="font-size:14px;font-weight:800;color:rgba(255,255,255,0.75);margin-top:2px;">' +
           _skFmtBytes(sp.dropBytes) + '</div>' +
         '<div style="font-size:9.5px;color:rgba(255,255,255,0.4);">' + sp.dropCount + ' keys</div>' +
       '</div>' +
-    '</div>';
+    '</div>' +
+    '<div style="font-size:10.5px;color:rgba(255,255,255,0.35);margin:-6px 0 12px;' +
+      'line-height:1.5;">Both boxes count GameDay\u2019s data wherever it lives' +
+      (_idbState.cut ? ', which is now IndexedDB' : '') + '. Everything in the second ' +
+      'box refills by itself when the app next needs it \u2014 except the player ' +
+      'sparkline, which is banked day by day and has no source to fetch back.</div>';
   } catch (eS) {}
   // WHAT THE GUARD HAS HAD TO DO. Shedding is housekeeping and worth
   // knowing about; a write it could not land after shedding is the line
@@ -203851,9 +204307,9 @@ function skRenderStorageReport() {
     '<div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap;">' +
       '<button onclick="skStorageCleanup(false)" style="flex:1;padding:10px;border-radius:8px;border:1px solid rgba(255,255,255,0.2);background:rgba(255,255,255,0.06);color:#fff;font-size:12px;font-weight:700;cursor:pointer;">Standard cleanup</button>' +
       '<button onclick="skStorageCleanup(true)" style="flex:1;padding:10px;border-radius:8px;border:1px solid rgba(251,191,36,0.4);background:rgba(251,191,36,0.12);color:#fbbf24;font-size:12px;font-weight:700;cursor:pointer;">Aggressive (caches \u2192 14d)</button>' +
-      '<button onclick="skFreeDisposable()" style="flex:1 1 100%;padding:10px;border-radius:8px;border:1px solid rgba(96,165,250,0.45);background:rgba(96,165,250,0.12);color:#93c5fd;font-size:12px;font-weight:700;cursor:pointer;">Free everything re-fetchable</button>' +
+      '<button onclick="skFreeDisposable()" style="flex:1 1 100%;padding:10px;border-radius:8px;border:1px solid rgba(96,165,250,0.45);background:rgba(96,165,250,0.12);color:#93c5fd;font-size:12px;font-weight:700;cursor:pointer;">Free everything safe to clear</button>' +
     '</div>' +
-    '<div style="color:rgba(255,255,255,0.35);font-size:10.5px;line-height:1.5;margin-top:10px;">Free everything re-fetchable: drops every cache with a source to fetch it back from and keeps the rest \u2014 snapshots, app and league settings, manager record, Pick \u2019Em, logins. Standard: stale versions (FP + settings) + snapshots past TTL + FP/roster/team-stat dates past TTL. Aggressive: same but caches trimmed to the last 14 days (covers this week + last week; older charts re-fetch). NOTE: every app on tymckinney2222.github.io shares this one quota \u2014 GameDay\u2019s cleanup never touches other apps\u2019 data (mcpRtHist etc. belongs to the SPP dashboard).</div>';
+    '<div style="color:rgba(255,255,255,0.35);font-size:10.5px;line-height:1.5;margin-top:10px;">Free everything safe to clear: drops every cache with a source to fetch it back from and keeps the rest \u2014 snapshots, app and league settings, manager record, Pick \u2019Em, logins. The one item in there that does NOT come back is the player sparkline: its ten days are banked as they happen, so clearing them starts the chart over. Standard: stale versions (FP + settings) + snapshots past TTL + FP/roster/team-stat dates past TTL. Aggressive: same but caches trimmed to the last 14 days (covers this week + last week; older charts re-fetch). NOTE: every app on tymckinney2222.github.io shares this one quota \u2014 GameDay\u2019s cleanup never touches other apps\u2019 data (mcpRtHist etc. belongs to the SPP dashboard).</div>';
   body.innerHTML = html;
   try { _skIdbPanelFill(); } catch (eF) {}
 }
