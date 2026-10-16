@@ -51236,6 +51236,14 @@ async function fetchMlbTeamPage(espnTeamId) {
       'https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/teams/' + espnTeamId);
     var espnData = _mlbEspn.data;
     var espnTeam = espnData?.team || {};
+    // TEAMIDENT - ESPN is asked here only for a name to map the club by, and
+    // when that call is the one failing, the browser list answers it for
+    // free. Without this the page stopped on a team it could see in the list
+    // it was opened from.
+    if (!espnTeam.abbreviation && !espnTeam.displayName) {
+      var _mlbIdent = _espTeamIdentityLocal(espnTeamId, 'MLB');
+      if (_mlbIdent) espnTeam = _mlbIdent;
+    }
     var abbr = espnTeam.abbreviation || '';
     var teamName = espnTeam.displayName || espnTeam.name || '';
 
@@ -106661,6 +106669,50 @@ async function _espGetJson(url) {
   }
 }
 
+// WHO THIS TEAM IS, WITHOUT ASKING ESPN. TEAMIDENT
+// tbCache holds every team in a league as { id, name, fullName, abbr, logo,
+// record } -- it is what the teams browser draws, which is what was tapped
+// to get here, so by the time a team page opens it is already in memory.
+// _tcGet holds the colour by abbreviation, and for basketball and hockey the
+// arena themes carry one with no network at all.
+//
+// Shaped like ESPN's own team object so every reader downstream -- the
+// header, the crest, the player cards, _espTeamGPFrom -- needs no change.
+function _espTeamIdentityLocal(teamId, league) {
+  var rows = null;
+  try { rows = (typeof tbCache !== 'undefined' && tbCache) ? tbCache[league] : null; } catch (e) {}
+  if (!rows || !rows.length) return null;
+  var row = null, i;
+  for (i = 0; i < rows.length; i++) {
+    if (rows[i] && String(rows[i].id) === String(teamId)) { row = rows[i]; break; }
+  }
+  if (!row) return null;
+
+  var abbr = row.abbr && row.abbr !== '?' ? String(row.abbr).toUpperCase() : '';
+  var col = '';
+  try {
+    if (abbr && typeof _tcGet === 'function') col = _tcGet(league, abbr) || '';
+    if (!col && abbr && league === 'NBA' && typeof nbaArenaTheme === 'function') {
+      var nt = nbaArenaTheme(abbr); col = (nt && nt.accent) || '';
+    }
+    if (!col && abbr && league === 'NHL' && typeof nhlArenaTheme === 'function') {
+      var ht = nhlArenaTheme(abbr); col = (ht && ht.accent) || '';
+    }
+  } catch (e2) { col = ''; }
+
+  return {
+    id: row.id,
+    displayName: row.fullName || row.name || '',
+    shortDisplayName: row.name || '',
+    name: row.name || '',
+    abbreviation: abbr,
+    // renderTeamPage builds '#' + team.color, so this carries no hash
+    color: col ? String(col).replace('#', '') : '',
+    logos: row.logo ? [{ href: row.logo }] : [],
+    record: row.record || ''
+  };
+}
+
 // What to tell someone looking at a blank page. The old text covered every
 // cause with one sentence, so it could not be acted on: a league ESPN has
 // stopped serving and a phone that cannot reach ESPN at all read the same.
@@ -106787,6 +106839,21 @@ async function fetchTeamPage(teamId, league) {
         // Flat array fallback
         if (!rosterAthletes.length && Array.isArray(rosterData.athletes)) {
           rosterAthletes = rosterData.athletes;
+        }
+      }
+    }
+
+    // TEAMIDENT - a roster with no team attached to it. The page can be
+    // built from what is already in memory rather than left under a question
+    // mark, so recover the identity before deciding anything is missing.
+    var _tdTeam = (teamData && teamData.team) || teamData;
+    if (!_tdTeam || !(_tdTeam.displayName || _tdTeam.name)) {
+      var _ident = _espTeamIdentityLocal(teamId, league);
+      if (_ident) {
+        teamData = { team: _ident };
+        if (typeof __skDiag !== 'undefined' && __skDiag.push) {
+          __skDiag.push({ stage: 'team-page:identity', note: league + ' team ' + teamId +
+            ' named from the browser list (' + (_ident.abbreviation || '?') + ')' });
         }
       }
     }
