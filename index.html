@@ -51228,8 +51228,13 @@ async function fetchMlbTeamPage(espnTeamId) {
 
   try {
     // Get team name from ESPN to map to MLB Stats API
-    var espnRes = await fetch('https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/teams/' + espnTeamId);
-    var espnData = espnRes.ok ? await espnRes.json() : null;
+    // TEAMFETCH - answer, do not throw. The roster below comes from the MLB
+    // Stats API; ESPN is consulted here only for a name to map by, and it
+    // must not be able to take the page down when it is the one thing on
+    // this page that is not needed.
+    var _mlbEspn = await _espGetJson(
+      'https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/teams/' + espnTeamId);
+    var espnData = _mlbEspn.data;
     var espnTeam = espnData?.team || {};
     var abbr = espnTeam.abbreviation || '';
     var teamName = espnTeam.displayName || espnTeam.name || '';
@@ -51246,7 +51251,14 @@ async function fetchMlbTeamPage(espnTeamId) {
       }
     }
     if (!mlbTeam) {
-      body.innerHTML = '<div class="pm-loading">Could not find team in MLB Stats API</div>';
+      // TEAMFETCH - name the service that actually failed. With ESPN down
+      // there is no abbreviation to map by, and saying the MLB Stats API
+      // could not find the team points at the one source still answering.
+      header.innerHTML = '';
+      body.innerHTML = _mlbEspn.ok
+        ? '<div class="pm-loading">Could not find team in MLB Stats API</div>'
+        : _espTeamFailHtml(_mlbEspn.why, _mlbEspn.status, espnTeamId, 'MLB',
+            'fetchMlbTeamPage(' + JSON.stringify(String(espnTeamId)) + ')');
       return;
     }
 
@@ -106621,6 +106633,66 @@ function closeTeamPage() {
   if (typeof _bpNavBack === 'function') _bpNavBack();
 }
 
+// AN ESPN READ THAT ANSWERS INSTEAD OF THROWING. TEAMFETCH
+// Three things can go wrong and they want three different answers:
+//
+//   unreachable  fetch itself rejects -- refused, DNS, TLS, or the browser
+//                blocking it cross-origin. The page never saw a response.
+//   http         a response arrived carrying a status we cannot use.
+//   notjson      a response arrived and was not JSON, which is what an
+//                error page looks like when it is served as HTML.
+//
+// The caller gets all three as a value. Nothing here throws, so one bad
+// answer no longer skips the fallback that would have saved the page.
+async function _espGetJson(url) {
+  var res = null;
+  try {
+    res = await fetch(url);
+  } catch (eF) {
+    return { ok: false, status: 0, data: null, why: 'unreachable' };
+  }
+  if (!res || !res.ok) {
+    return { ok: false, status: (res && res.status) || 0, data: null, why: 'http' };
+  }
+  try {
+    return { ok: true, status: res.status, data: await res.json(), why: '' };
+  } catch (eP) {
+    return { ok: false, status: res.status, data: null, why: 'notjson' };
+  }
+}
+
+// What to tell someone looking at a blank page. The old text covered every
+// cause with one sentence, so it could not be acted on: a league ESPN has
+// stopped serving and a phone that cannot reach ESPN at all read the same.
+function _espTeamFailHtml(why, status, teamId, league, retryCall) {
+  var head, note;
+  if (why === 'unreachable') {
+    head = 'Can\'t reach ESPN';
+    note = 'The request never got a reply. That is usually the connection, ' +
+           'or ESPN refusing this page from the browser.';
+  } else if (why === 'notjson') {
+    head = 'ESPN sent something unreadable';
+    note = 'A reply arrived but it was not data -- usually an error page. ' +
+           'This normally clears on its own.';
+  } else if (why === 'http') {
+    head = 'ESPN turned the request down';
+    note = 'It answered with status ' + (status || '?') + '.';
+  } else {
+    head = 'No roster came back';
+    note = 'ESPN answered, but there were no players in it.';
+  }
+  var retry = retryCall || ('fetchTeamPage(' + JSON.stringify(String(teamId)) + ',' +
+    JSON.stringify(String(league)) + ')');
+  return '<div class="pm-loading" style="line-height:1.55">' +
+    '<div style="font-weight:700;margin-bottom:6px">' + head + '</div>' +
+    '<div style="opacity:0.75;font-size:12px;max-width:34em;margin:0 auto">' + note + '</div>' +
+    '<div style="margin-top:14px"><button onclick="' + retry + '" ' +
+    'style="font:inherit;font-size:12px;letter-spacing:0.08em;padding:7px 16px;' +
+    'border-radius:999px;border:1px solid rgba(255,255,255,0.25);' +
+    'background:transparent;color:inherit">TRY AGAIN</button></div>' +
+    '</div>';
+}
+
 async function fetchTeamPage(teamId, league) {
   var header = document.getElementById('tpHeader');
   var body = document.getElementById('tpBody');
@@ -106645,8 +106717,13 @@ async function fetchTeamPage(teamId, league) {
 
     body.innerHTML = '<div class="pm-loading">Loading team data...</div>';
 
-    var teamRes = await fetch(teamUrl);
-    var teamData = teamRes.ok ? await teamRes.json() : null;
+    // TEAMFETCH - this used to be `await teamRes.json()`, which throws on a
+    // reply that is not JSON and took the whole page with it, fallbacks and
+    // all. Now it answers, and the roster call below still gets its turn.
+    var _teamGet = await _espGetJson(teamUrl);
+    var teamData = _teamGet.data;
+    var _espWhy = _teamGet.ok ? '' : _teamGet.why;
+    var _espStatus = _teamGet.status;
 
     // Extract roster from the combined response or fetch separately
     var rosterAthletes = [];
@@ -106683,13 +106760,21 @@ async function fetchTeamPage(teamId, league) {
       var seasonYr = (typeof _seasonYearFor === 'function') ? _seasonYearFor(league) : null;
       var rosterUrl = seasonYr ? (rosterBase + '?season=' + seasonYr) : rosterBase;
 
-      var rosterRes = await fetch(rosterUrl);
-      rosterData = rosterRes.ok ? await rosterRes.json() : null;
+      var _rosGet = await _espGetJson(rosterUrl);
+      rosterData = _rosGet.data;
+      if (!_rosGet.ok) { _espWhy = _rosGet.why; _espStatus = _rosGet.status; }
       var _gotAthletes = !!(rosterData && rosterData.athletes &&
         (rosterData.athletes.length || Object.keys(rosterData.athletes).length));
+      // TEAMFETCH - the condition is unchanged on purpose. I widened it to
+      // run whenever no squad came back, then a canary would not fire on the
+      // difference: _seasonYearFor always returns a year, so seasonYr is
+      // always truthy and the two conditions are the same test. Worse, in the
+      // one case they differ -- no _seasonYearFor at all -- rosterUrl IS
+      // rosterBase, so the wider version re-fetches a URL it has just tried.
       if (!_gotAthletes && seasonYr) {
-        rosterRes = await fetch(rosterBase);
-        rosterData = rosterRes.ok ? await rosterRes.json() : null;
+        var _rosGet2 = await _espGetJson(rosterBase);
+        if (_rosGet2.ok) { rosterData = _rosGet2.data; _espWhy = ''; _espStatus = _rosGet2.status; }
+        else if (!rosterData) { _espWhy = _rosGet2.why; _espStatus = _rosGet2.status; }
       }
       if (rosterData && rosterData.athletes) {
         rosterData.athletes.forEach(function(group) {
@@ -106706,6 +106791,19 @@ async function fetchTeamPage(teamId, league) {
       }
     }
 
+    // TEAMFETCH - nothing to show and a reason worth naming. Before this the
+    // page said "Unable to load team data" for every cause there is, so the
+    // one thing it could have told you -- which of them it was -- was the
+    // one thing it left out.
+    if (!rosterAthletes.length) {
+      if (typeof __skDiag !== 'undefined' && __skDiag.push) {
+        __skDiag.push({ stage: 'team-page:empty', note: league + ' team ' + teamId +
+          ' -- ' + (_espWhy || 'no athletes') + (_espStatus ? (' (' + _espStatus + ')') : '') });
+      }
+      header.innerHTML = '';
+      body.innerHTML = _espTeamFailHtml(_espWhy, _espStatus, teamId, league);
+      return;
+    }
     body.innerHTML = '<div class="pm-loading">Loading player stats (' + rosterAthletes.length + ' players)...</div>';
 
     // Phase 2: fetch each player's overview for season stats (batched)
@@ -106825,7 +106923,18 @@ async function fetchTeamPage(teamId, league) {
     renderTeamPage(combined, teamId, league);
   } catch(e) {
     console.error('Team page error:', e);
-    body.innerHTML = '<div class="pm-loading">Unable to load team data</div>';
+    // TEAMFETCH - the reads above answer rather than throw, so anything
+    // landing here came from building the page, not from the network. Say so
+    // and record it, rather than blaming ESPN for our own bug.
+    if (typeof __skDiag !== 'undefined' && __skDiag.push) {
+      __skDiag.push({ stage: 'team-page:error', note: league + ' team ' + teamId +
+        ' -- ' + String((e && e.message) || e) });
+    }
+    header.innerHTML = '';
+    body.innerHTML = '<div class="pm-loading" style="line-height:1.55">' +
+      '<div style="font-weight:700;margin-bottom:6px">Couldn\'t build this team page</div>' +
+      '<div style="opacity:0.75;font-size:12px">' + skEscape(String((e && e.message) || e)) +
+      '</div></div>';
   }
 }
 
