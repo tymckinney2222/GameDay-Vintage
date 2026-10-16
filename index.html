@@ -154225,10 +154225,38 @@ function skRenderDetailRoster(league, players) {
       // 3-at-a-time throttle above caps concurrency; this delay staggers the
       // start so the two never compete on a cold load. (This is the pairing
       // that keeps football's Yahoo tabs from timing out.)
-      setTimeout(function() {
-        if (skState.activeLeagueKey !== leagueKeyAtStart) return;
-        _seasonAttempt(1);
-      }, 1200);
+      var _startEspnSeason = function() {
+        setTimeout(function() {
+          if (skState.activeLeagueKey !== leagueKeyAtStart) return;
+          _seasonAttempt(1);
+        }, 1200);
+      };
+      // SEASONYH -- hockey and basketball ask Yahoo first, and fall back to
+      // the ESPN road only if Yahoo paints nothing for this roster. Football
+      // keeps ESPN outright: its sub-line is position-driven and reads each
+      // field out of a separate passing/rushing/receiving block, which is a
+      // different shape from a flat map of the league's categories.
+      var _yhSeasonFirst = (sport === 'nba' || sport === 'nhl') &&
+        typeof fetchTeamFpSeason === 'function';
+      if (!_yhSeasonFirst) {
+        _startEspnSeason();
+      } else {
+        var _yhSetP = (typeof leagueSettingsCache !== 'undefined' && leagueSettingsCache[league.league_key])
+          ? Promise.resolve(leagueSettingsCache[league.league_key])
+          : ensureLeagueSettings(league.league_key);
+        Promise.all([fetchTeamFpSeason(_eTKey), _yhSetP]).then(function(_yr) {
+          if (skState.activeLeagueKey !== leagueKeyAtStart) return;
+          var _yhBy = _yr[0] || {};
+          var _yhMeta = (_yr[1] && _yr[1].stats) || null;
+          var _yhOrd = _skSeasonCatOrder(_yr[1], _yhMeta);
+          var _painted = _skUpdateYahooSeasonStatsInPlace(players, _yhBy, _yhMeta, _yhOrd);
+          if (typeof __skDiag !== 'undefined' && __skDiag.push) {
+            __skDiag.push({ stage: 'season-yahoo', note: _painted + ' rows painted from Yahoo' +
+              (_painted ? '' : ' -- falling back to ESPN') });
+          }
+          if (!_painted) _startEspnSeason();
+        })['catch'](function() { _startEspnSeason(); });
+      }
     }
   }
 }
@@ -154547,6 +154575,67 @@ function _skSeasonRetryAgain(got, expect, best, attempt) {
   if (got >= expect) return false;          // everybody resolved
   if (!(got > best)) return false;          // no progress: the rest are absent
   return (attempt < 3);                     // and a hard ceiling either way
+}
+
+// SEASON TOTALS FROM YAHOO. SEASONYH
+// Yahoo answers the whole roster in one request, in the league's own stat_id
+// space: /team/{team_key}/roster/players/stats;type=season. That removes a
+// whole class of problem -- no name to match, no athlete id to resolve,
+// nothing to rate-limit a burst of, and no second provider whose numbers can
+// disagree with the daily line sitting directly above them.
+//
+// Nothing new is fetched for it. fetchTeamFpSeason already calls that URL and
+// caches it per team, and _parseTeamFpResponse has always returned a per-stat
+// map beside the fantasy-point total -- the FP callers just never read it. So
+// this reads a response the app already knows how to get.
+//
+// THE LEAGUE'S OWN ORDER, NOT THE BIGGEST NUMBER FIRST. SEASONYH
+// Left to itself the cat builder sorts by raw value, which is right for a
+// single night -- the notable thing leads -- and wrong for a season, where
+// shots on goal would open every line and goals would close it. Worse, every
+// card would start with a different category, so the column cannot be read
+// down. Yahoo publishes the league's display order, which is the order its
+// own app shows and the order the ESPN line happened to use; when a cached
+// settings record predates that field, stat_id ascending is the same idea.
+function _skSeasonCatOrder(settings, statsMeta) {
+  var so = settings && settings.statOrder;
+  if (so && so.length) return so.slice();
+  var ids = [], sid;
+  for (sid in (statsMeta || {})) {
+    if (statsMeta.hasOwnProperty(sid)) ids.push(String(sid));
+  }
+  ids.sort(function (a, b) { return parseInt(a, 10) - parseInt(b, 10); });
+  return ids;
+}
+
+// Returns how many rows were written, which is what decides whether the ESPN
+// fallback is still needed.
+function _skUpdateYahooSeasonStatsInPlace(players, byKey, statsMeta, order) {
+  if (!players || !byKey || !statsMeta) return 0;
+  if (typeof _skBuildCatStatLine !== 'function') return 0;
+  var _opts = (order && order.length) ? { order: order } : null;
+  var painted = 0;
+  players.forEach(function (p) {
+    if (!p || !p.playerKey) return;
+    var rec = byKey[p.playerKey];
+    var stats = rec && rec.stats;
+    if (!stats) return;
+    var line = _skBuildCatStatLine(stats, statsMeta, 6, null, _opts) || '';
+    if (!line) return;
+    try {
+      var sel = '[data-player-key="' + String(p.playerKey).replace(/"/g, '\\"') + '"]';
+      var row = document.querySelector(sel);
+      if (!row) return;
+      var el = row.querySelector('[data-season-stats]');
+      if (!el) return;
+      // The cat line is already markup -- the same builder the daily line
+      // uses -- so it goes in as markup, not through the plain-string
+      // wrapper the ESPN line needs.
+      el.innerHTML = line;
+      painted++;
+    } catch (e) {}
+  });
+  return painted;
 }
 
 function _skUpdateEspnSeasonStatsInPlace(sportKey, players, byPlayer) {
@@ -156017,6 +156106,23 @@ function skBuildRosterGroup(label, players, league, hasLiveStats) {
     var _eck = _rgSport + '|' + teamKey;
     espnSeasonByPlayer = (_espnSeasonCache[_eck] && _espnSeasonCache[_eck].byPlayerKey) || null;
   }
+  // SEASONYH -- the same seeding for Yahoo's season totals, off the cache
+  // fetchTeamFpSeason already fills, so returning to the roster with a warm
+  // cache paints the sub-lines on the first frame rather than a beat later.
+  var _yhSeasonByKey = null, _yhSeasonMeta = null, _yhSeasonOrd = null;
+  if ((_rgSport === 'nba' || _rgSport === 'nhl') && teamKey &&
+      typeof skSeasonTotalFpCache !== 'undefined' && skSeasonTotalFpCache) {
+    _yhSeasonByKey = skSeasonTotalFpCache[teamKey] || null;
+    try {
+      _yhSeasonMeta = (typeof leagueSettingsCache !== 'undefined' &&
+        leagueSettingsCache[league.league_key] &&
+        leagueSettingsCache[league.league_key].stats) || null;
+    } catch (_eYm) { _yhSeasonMeta = null; }
+    if (!_yhSeasonMeta) _yhSeasonByKey = null;   // no categories, no line
+    if (_yhSeasonByKey && typeof _skSeasonCatOrder === 'function') {
+      _yhSeasonOrd = _skSeasonCatOrder(leagueSettingsCache[league.league_key], _yhSeasonMeta);
+    }
+  }
   // Yahoo deep-link target for this league+team, resolved once for the
   // empty-slot "Tap to add" rows below. Empty when the sport has no Yahoo
   // fantasy route (e.g. CFB) — those rows then render without a tap action.
@@ -156147,7 +156253,19 @@ function skBuildRosterGroup(label, players, league, hasLiveStats) {
     // player. Lives in a separate element with data-season-stats so
     // the in-place updater can populate it after the fetch lands.
     var seasonLine = '';
-    if (seasonStatsByPlayer && p.playerKey) {
+    var _seasonIsHtml = false;
+    // SEASONYH -- Yahoo's own totals first for hockey and basketball. They
+    // arrive from the same builder the daily line uses, so the two lines on a
+    // card are the same categories formatted the same way.
+    if (_yhSeasonByKey && p.playerKey && typeof _skBuildCatStatLine === 'function') {
+      var _yhRec = _yhSeasonByKey[p.playerKey];
+      if (_yhRec && _yhRec.stats) {
+        seasonLine = _skBuildCatStatLine(_yhRec.stats, _yhSeasonMeta, 6, null,
+          (_yhSeasonOrd && _yhSeasonOrd.length) ? { order: _yhSeasonOrd } : null) || '';
+        _seasonIsHtml = !!seasonLine;
+      }
+    }
+    if (!seasonLine && seasonStatsByPlayer && p.playerKey) {
       var ps = seasonStatsByPlayer[p.playerKey];
       if (ps) seasonLine = _skFormatSeasonStatsLine(ps, p.pos || p.displayPos);
     }
@@ -156190,7 +156308,10 @@ function skBuildRosterGroup(label, players, league, hasLiveStats) {
       '    <span class="' + (_rowIsHtmlLine ? 'sk-roster-line sk-roster-line-active' : rendered.lineCls) + '">' + (_rowIsHtmlLine ? line : rendered.lineText) + '</span>' +
       rendered.fpHtml +
       '  </div>' +
-      '  <div class="sk-roster-season-row" data-season-stats>' + (typeof _skSeasonLineHtml === 'function' ? _skSeasonLineHtml(seasonLine) : seasonLine) + '</div>' +
+      '  <div class="sk-roster-season-row" data-season-stats>' +
+      (_seasonIsHtml ? seasonLine
+        : (typeof _skSeasonLineHtml === 'function' ? _skSeasonLineHtml(seasonLine) : seasonLine)) +
+      '</div>' +
       '</div>' +
       '</div>';
   }).join('');
