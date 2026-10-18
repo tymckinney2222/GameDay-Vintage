@@ -38448,7 +38448,14 @@ function _lcDominant(img) {
 
 function _lcAsk(league, abbr, url) {
   if (!league || !abbr || !url) return;
-  var k = league + '|' + String(abbr).toUpperCase();
+  // COLLEGECOL -- keyed on the MARK as well as the club. It used to be
+  // club-only, which was fine while the only caller was the last-resort
+  // fallback. Now that a college club's colour is read from its badge up
+  // front, the first resolve can claim the slot with whatever URL it
+  // happened to hold -- and a later call carrying a better mark was
+  // dropped on the floor, silently and for good. Deduping the same mark
+  // is the point; deduping a DIFFERENT one was never the point.
+  var k = league + '|' + String(abbr).toUpperCase() + '|' + url;
   if (_lcAsked[k]) return;
   _lcAsked[k] = 1;
   var img = new Image();
@@ -38616,14 +38623,43 @@ function getTeamColor(team, league) {
   if (_ab && String(league || '').indexOf('NCAA') === 0 && _TEAM_COLOR_OVERRIDE[_ab]) {
     return _TEAM_COLOR_OVERRIDE[_ab];
   }
-  // COLLEGECOL -- primary first, but a primary too dark to draw honestly
-  // gives way to the club's second colour rather than being lifted into
-  // a colour the school does not wear.
   var _acP = _usableAccent(team && team.color)
     ? '#' + String(team.color).replace('#', '') : '';
   var _acA = _usableAccent(team && team.alternateColor)
     ? '#' + String(team.alternateColor).replace('#', '') : '';
-  var _acPick = _acPreferAlt(_acP, _acA);
+
+  // COLLEGECOL -- FOR COLLEGE, ASK THE CLUB'S OWN MARK BEFORE THE FEED.
+  //
+  // ESPN's college payloads carry colours that are simply not the
+  // school's. Probed live on a Duke-at-Notre-Dame match: ESPN said
+  // Notre Dame #313a98 and Duke #004a7b, against their real #0c2340 and
+  // #00539b. Neither is DARK -- Notre Dame's reads luminance 0.247 --
+  // so the too-dark rule never fired, and no amount of lifting or
+  // saturating turns a wrong colour into a right one.
+  //
+  // The canonical teams endpoint would settle it and is CORS-blocked;
+  // the control request beside it returns 200, so it is a refusal and
+  // not an outage (see skProbeTeamColors, which records the same). The
+  // logo route DOES work, and read Duke Blue off the mark exactly. A
+  // club's own badge is the most authoritative thing still reachable.
+  //
+  // The alternate still comes off the feed, which is the half ESPN gets
+  // right: Notre Dame's #c99700 gold was there all along. Mark for the
+  // primary, feed for the second colour, and the swap rule on top.
+  var _acLogoFirst = '';
+  if (_ab && String(league || '').indexOf('NCAA') === 0) {
+    var _acMark = (typeof _tcGet === 'function') ? _tcGet(league, _ab) : null;
+    if (_acMark) {
+      _acLogoFirst = _acMark;
+    } else if (typeof _lcAsk === 'function') {
+      // nothing read yet: set it going so the next render has it, and
+      // fall through to the feed for this one rather than drawing nothing
+      var _acUrl = (team && (team.logo ||
+        (team.logos && team.logos[0] && team.logos[0].href))) || '';
+      if (_acUrl) { try { _lcAsk(league, _ab, _acUrl); } catch (e) {} }
+    }
+  }
+  var _acPick = _acPreferAlt(_acLogoFirst || _acP, _acA);
   // A summary payload does not always carry alternateColor, and without
   // one the rule above has nothing to swap to and settles for a navy it
   // cannot draw. The league team list carries both colours for every
@@ -38731,7 +38767,12 @@ function vibrant(hex, minLightness) {
   //
   // A caller that asks for a specific brightness still gets one: the
   // panels that pass 0.68 want a bright variant, not an accurate one.
-  var achroma = (s < 0.08);
+  // 0.08 was too wide a net. Philadelphia's silver #a5acaf carries a
+  // real if slight tint at saturation 0.059, and flattening it to a
+  // dead grey threw away a colour the club actually wears. Only what is
+  // genuinely colourless -- a black, a white, a true grey -- has no hue
+  // to keep.
+  var achroma = (s < 0.03);
   if (achroma) {
     // No hue to preserve, and none to invent. The old rule bumped the
     // saturation of a grey, and a grey's hue defaults to zero, so black
@@ -55645,10 +55686,14 @@ function renderCourt() {
   }
   var note = (header && header.notes && header.notes[0] && header.notes[0].headline) || '';
   if (note) venueBits.unshift(note);
-  if (venueBits.length) {
-    h += '<div class="court-venue">' + esc(game.venue || '') +
-      '<span class="court-venue-sub">' + esc(venueBits.join(' \u00b7 ')) + '</span></div>';
-  }
+  h += '<div class="court-venue">' + esc(game.venue || '') +
+    (venueBits.length
+      ? '<span class="court-venue-sub">' + esc(venueBits.join(' \u00b7 ')) + '</span>'
+      : '') +
+    '<button class="stad-probe" onclick="event.stopPropagation();' +
+    'skProbeStadium(\'court\')">PROBE</button>' +
+    '<button class="stad-probe" onclick="event.stopPropagation();' +
+    'skProbeTeamColors()">COLOURS</button></div>';
 
   // ── Big score: SETS won ──
   h += '<div class="court-score" style="border-bottom:' + div + '">' +
@@ -157450,6 +157495,53 @@ function skProbeStadium(mode) {
     if (typeof _skGpProbeShow === 'function') _skGpProbeShow(L.join('\n'));
     return;
   }
+
+  // ---- COLLEGECOL: the whole accent chain, step by step ---------------
+  // Three times now I have reasoned about where a club's colour comes
+  // from and been wrong, because the only evidence available here is the
+  // rendered pixel. This reads the chain out of what the app already
+  // holds -- the raw feed values, what each stage made of them, and what
+  // is sitting in the cache -- so the answer is measured rather than
+  // deduced from a screenshot.
+  (function () {
+    say('== accent chain ==');
+    var comp = null;
+    try { comp = d.header.competitions[0]; } catch (e) {}
+    var cs = (comp && comp.competitors) || [];
+    function hx(v) { return v ? ('#' + String(v).replace('#', '')) : '(none)'; }
+    for (var ci = 0; ci < cs.length; ci++) {
+      var t = (cs[ci] && cs[ci].team) || {};
+      var side = (cs[ci] && cs[ci].homeAway) || ('#' + ci);
+      var ab = t.abbreviation || '?';
+      say(side + ' ' + ab);
+      say('   feed color     ' + hx(t.color));
+      say('   feed alternate ' + hx(t.alternateColor));
+      try {
+        say('   usable(prim)   ' + _usableAccent(t.color) +
+            '   tooDark ' + _acTooDark(hx(t.color)));
+        say('   usable(alt)    ' + _usableAccent(t.alternateColor));
+        say('   preferAlt ->   ' + (_acPreferAlt(
+              _usableAccent(t.color) ? hx(t.color) : '',
+              _usableAccent(t.alternateColor) ? hx(t.alternateColor) : '') || '(none)'));
+        say('   getTeamColor   ' + getTeamColor(t, g.league));
+      } catch (e2) { say('   (chain threw: ' + e2.message + ')'); }
+      try { say('   cached list    ' + (_tcGet(g.league, ab) || '(nothing)')); } catch (e3) {}
+    }
+    say('');
+    say('what the view is PAINTING with:');
+    try {
+      say('   game.away.color ' + (g.away && g.away.color) +
+          '  -> vibrant ' + vibrant(g.away && g.away.color));
+      say('   game.home.color ' + (g.home && g.home.color) +
+          '  -> vibrant ' + vibrant(g.home && g.home.color));
+    } catch (e4) { say('   (threw: ' + e4.message + ')'); }
+    try {
+      say('   cache key      ' + _TC_KEY);
+      var raw = localStorage.getItem(_TC_KEY);
+      say('   cache bytes    ' + (raw ? raw.length : 0));
+    } catch (e5) {}
+    say('');
+  })();
 
   // ---- what sections came back ---------------------------------------
   function size(v) {
