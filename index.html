@@ -11914,6 +11914,18 @@
   align-items: start; padding: 5px 0;
   border-top: 1px solid rgba(255,255,255,0.05); }
 .bpl-row:first-child { border-top: 0; }
+/* BPFOCUS -- tap a line to isolate its arc on the field */
+.bpl-row { cursor: pointer; padding-left: 7px; margin-left: -7px;
+  border-left: 2px solid transparent; border-radius: 3px;
+  transition: opacity .14s ease, background .14s ease; }
+.bpl-row.on { background: rgba(255,255,255,0.055);
+  border-left-color: var(--bpl-accent, rgba(255,255,255,0.5)); }
+.bpl-row.off { opacity: 0.38; }
+.bpl-row.off:hover { opacity: 0.62; }
+.bpl-hint { font-family: 'Barlow Condensed', sans-serif; font-size: 9px;
+  font-weight: 700; letter-spacing: 0.12em; cursor: pointer;
+  color: rgba(255,255,255,0.4); padding: 2px 0 6px; }
+.bpl-hint b { color: rgba(255,255,255,0.78); }
 .bpl-yds { font-family: 'Barlow Condensed', sans-serif; font-size: 17px;
   font-weight: 900; line-height: 1; text-align: right; padding-top: 1px; }
 .bpl-top { display: flex; align-items: center; gap: 7px; line-height: 1; }
@@ -38314,6 +38326,47 @@ var _TEAM_COLOR_OVERRIDE = {
   IOWA: '#ffcd00'   // Old Gold - ESPN primary is 000000
 };
 
+// ---- COLLEGECOL: a primary too dark to draw honestly gives way --------
+//
+// Notre Dame's navy is #0C2340, lightness 0.15. Anything that makes it
+// readable on a dark screen has to lift it most of the way to a mid
+// blue -- the app was drawing #317bd8 -- and no amount of tuning makes a
+// readable navy look like navy. Past a certain darkness the choice is
+// not "how faithful" but "which colour", and the honest answer is the
+// OTHER colour the school actually owns. Notre Dame wears gold.
+//
+// This is a rule, not a list: it reads whatever second colour the feed
+// carries, so it covers every school without anybody curating them. A
+// school whose second colour is white or black gets no help from it and
+// keeps its primary, because a lifted navy still beats a colour nobody
+// can see at all -- which is why Duke and Penn State stay blue.
+var _AC_TOO_DARK = 0.20;      // same simple luminance _usableAccent uses
+
+function _acLum(hex) {
+  var h = String(hex == null ? '' : hex).replace('#', '').toLowerCase();
+  if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+  if (!/^[0-9a-f]{6}$/.test(h)) return -1;
+  return (0.2126 * parseInt(h.slice(0, 2), 16) +
+          0.7152 * parseInt(h.slice(2, 4), 16) +
+          0.0722 * parseInt(h.slice(4, 6), 16)) / 255;
+}
+
+function _acTooDark(hex) {
+  var l = _acLum(hex);
+  return l >= 0 && l < _AC_TOO_DARK;
+}
+
+// Returns the colour the club should actually be drawn in, given both of
+// the ones the feed carries. The alternate has to be usable AND brighter
+// than the bar itself, or swapping just trades one unreadable colour for
+// another.
+function _acPreferAlt(primary, alternate) {
+  var pOk = _usableAccent(primary), aOk = _usableAccent(alternate);
+  if (!pOk) return aOk ? alternate : '';
+  if (aOk && _acTooDark(primary) && !_acTooDark(alternate)) return alternate;
+  return primary;
+}
+
 // Is this hex usable as an accent on the dark UI? Rejects near-black and
 // near-white. The bounds are deliberately tight: a genuinely dark navy like
 // Penn State's 041e42 must still pass, so only true black-ish is refused.
@@ -38429,7 +38482,11 @@ function _lcAsk(league, abbr, url) {
 // app already calls that endpoint elsewhere for ids and logos. So it is
 // fetched once per league, kept for a month (a school changes its colours
 // about never), and consulted before the slate.
-var _TC_KEY = 'gd_teamcolors_v1';
+// COLLEGECOL -- v2. Every phone that has opened the app in the last
+// month is holding a colour map built by the OLD rule, with a thirty-day
+// life on it. Left alone, the fix would not show on those devices until
+// the cache aged out. The key moves with the rule that fills it.
+var _TC_KEY = 'gd_teamcolors_v2';
 var _TC_TTL = 30 * 24 * 3600 * 1000;
 var _TC_SLATE = '#4a5568';
 var _tcMem = null, _tcAsked = {};
@@ -38465,8 +38522,11 @@ function _tcFetch(league) {
       t = rows[i].team || rows[i];
       ab = (t && t.abbreviation) ? String(t.abbreviation).toUpperCase() : '';
       if (!ab) continue;
-      col = _usableAccent(t.color) ? t.color :
-        (_usableAccent(t.alternateColor) ? t.alternateColor : '');
+      // COLLEGECOL -- the same rule the live chooser uses, or the cache
+      // and the live path would disagree about the same club.
+      col = _acPreferAlt(
+        _usableAccent(t.color) ? '#' + String(t.color).replace('#', '') : '',
+        _usableAccent(t.alternateColor) ? '#' + String(t.alternateColor).replace('#', '') : '');
       if (!col) continue;
       map[ab] = '#' + String(col).replace('#', '');
       n++;
@@ -38556,9 +38616,25 @@ function getTeamColor(team, league) {
   if (_ab && String(league || '').indexOf('NCAA') === 0 && _TEAM_COLOR_OVERRIDE[_ab]) {
     return _TEAM_COLOR_OVERRIDE[_ab];
   }
-  if (_usableAccent(team && team.color)) return '#' + String(team.color).replace('#', '');
-  // Primary unusable - try ESPN's alternate before giving up on the team.
-  if (_usableAccent(team && team.alternateColor)) return '#' + String(team.alternateColor).replace('#', '');
+  // COLLEGECOL -- primary first, but a primary too dark to draw honestly
+  // gives way to the club's second colour rather than being lifted into
+  // a colour the school does not wear.
+  var _acP = _usableAccent(team && team.color)
+    ? '#' + String(team.color).replace('#', '') : '';
+  var _acA = _usableAccent(team && team.alternateColor)
+    ? '#' + String(team.alternateColor).replace('#', '') : '';
+  var _acPick = _acPreferAlt(_acP, _acA);
+  // A summary payload does not always carry alternateColor, and without
+  // one the rule above has nothing to swap to and settles for a navy it
+  // cannot draw. The league team list carries both colours for every
+  // club, so ask that before giving up -- and set it fetching if it has
+  // not been, so the next render has it even when this one does not.
+  if (_acPick && _acTooDark(_acPick) && !_acA && _ab) {
+    var _acCached = (typeof _tcGet === 'function') ? _tcGet(league, _ab) : null;
+    if (_acCached && !_acTooDark(_acCached)) return _acCached;
+    if (typeof _tcFetch === 'function') { try { _tcFetch(league); } catch (e) {} }
+  }
+  if (_acPick) return _acPick;
   // VBCOLOR / LOGOCOL -- before the one-size-fits-all slate, ask what has
   // already been worked out for this club, and if nothing has, set both
   // sources going: its own logo, and the league's team list. The slate
@@ -38610,7 +38686,7 @@ function tLogo(logo, teamId, league, style) {
   return '<img src="' + logo + '"' + clickable + '>';
 }
 
-function vibrant(hex, minLightness = 0.48) {
+function vibrant(hex, minLightness) {
   // VBCOLOR -- a guard, not a feature. Anything that is not a readable hex
   // comes back as a plain neutral so the caller paints SOMETHING legible.
   var _vin = String(hex == null ? '' : hex).replace('#', '');
@@ -38630,9 +38706,42 @@ function vibrant(hex, minLightness = 0.48) {
     else if (max === g) h = ((b - r) / d + 2) / 6;
     else h = ((r - g) / d + 4) / 6;
   }
-  // Boost lightness and saturation for dark colors
-  if (l < minLightness) l = minLightness;
-  if (s < 0.4) s = Math.min(s + 0.2, 0.7);
+  // COLLEGECOL -- what this used to do, and why it was wrong.
+  //
+  // It shoved EVERY colour to lightness 0.48 and bumped the saturation,
+  // which is fatal to a navy, because being dark is what a navy IS.
+  // Notre Dame's #0C2340 came out #2771ce, a bright mid blue; Virginia's
+  // #232D4B came out #3558bf, a periwinkle the school does not own.
+  //
+  // The lift was also doing a job that was ALREADY DONE, twenty lines
+  // below: _stAccentFloor walks a colour up until it clears 3.4:1 of
+  // real perceived contrast against the arena background. That one
+  // measures the right thing -- HSL lightness says nothing about how
+  // bright a colour looks, which is the whole reason that floor was
+  // written. So every accent was being lifted twice: once by a blunt
+  // rule that did not track legibility, and then again by a careful one
+  // that did.
+  //
+  // Worse, the blunt rule missed in BOTH directions. It pushed Texas to
+  // 6.6:1, far past anything it needed, while leaving LSU at 2.65:1 and
+  // Northwestern at 2.74:1 -- under the bar it was supposedly setting.
+  // Dropping it leaves the careful floor to do the work alone, and a
+  // colour that is already legible is now left exactly as the school
+  // wears it.
+  //
+  // A caller that asks for a specific brightness still gets one: the
+  // panels that pass 0.68 want a bright variant, not an accurate one.
+  var achroma = (s < 0.08);
+  if (achroma) {
+    // No hue to preserve, and none to invent. The old rule bumped the
+    // saturation of a grey, and a grey's hue defaults to zero, so black
+    // came out RED.
+    h = 0; s = 0;
+    if (l < 0.62) l = 0.62;
+  } else if (minLightness != null) {
+    if (l < minLightness) l = minLightness;
+    if (s < 0.4) s = Math.min(s + 0.2, 0.7);
+  }
   // HSL to RGB
   function hue2rgb(p, q, t) {
     if (t < 0) t += 1; if (t > 1) t -= 1;
@@ -47136,14 +47245,18 @@ async function openPastGame(eventId, league) {
       away: {
         id: awayT.id, abbr: awayT.abbreviation||'?', name: awayT.displayName||'?',
         fullName: awayT.displayName||'?', score: awayC?.score||0,
-        winner: awayC?.winner||false, color: awayT.color||'333333',
+        winner: awayC?.winner||false,
+        color: getTeamColor(awayT, league) || ('#' + String(awayT.color || '333333').replace('#','')),
+        altColor: _altColorOf(awayT),
         logo: awayT.logo||(awayT.logos&&awayT.logos[0]?.href)||'',
         record: awayC?.record?.[0]?.summary||''
       },
       home: {
         id: homeT.id, abbr: homeT.abbreviation||'?', name: homeT.displayName||'?',
         fullName: homeT.displayName||'?', score: homeC?.score||0,
-        winner: homeC?.winner||false, color: homeT.color||'333333',
+        winner: homeC?.winner||false,
+        color: getTeamColor(homeT, league) || ('#' + String(homeT.color || '333333').replace('#','')),
+        altColor: _altColorOf(homeT),
         logo: homeT.logo||(homeT.logos&&homeT.logos[0]?.href)||'',
         record: homeC?.record?.[0]?.summary||''
       },
@@ -55039,55 +55152,304 @@ function _courtRankChip(comp, side, league) {
   return '<span class="court-rank" style="color:' + _RANK_GOLD + '">#' + cur + mv + '</span>';
 }
 
-// The court, drawn to regulation proportions. ── VBCOURT ──
+// The court, in perspective. ── VBCOURT3D ──
 //
-//   court        18m x 9m            -> viewBox 360 x 180, a true 2:1
-//   attack line  3m either side      -> 60 units, at x=120 and x=240
-//   net          on the halfway line -> x=180
+// It used to be a flat 2:1 rectangle with each half washed in its team's
+// colour: true to the regulation proportions and completely unlike a
+// volleyball court, which is a wood floor inside a free zone painted in
+// the HOME side's colour and branded end to end.
 //
-// Getting those right matters more than it sounds: a court drawn square, or
-// with the attack lines at the quarters, reads as "some lines" rather than as
-// volleyball. Each half is washed in its own team's colour so the sides are
-// legible without text.
+// IT LOOKS DOWN THE COURT, not along it. The football field runs its
+// length across the screen, and the first attempt at this did the same
+// -- which puts the centre line pointing straight away from the camera,
+// so the net standing on it is edge-on and collapses to a vertical
+// sliver. The projection was right; the axis was wrong. Turned ninety
+// degrees, the net spans the frame and becomes the thing you see, which
+// is the view every photograph of a volleyball court is taken from.
+//
+//   cw  runs ACROSS the width, 0 at the left sideline, 9 at the right
+//   cl  runs ALONG the length, 0 at the NEAR end line, 18 at the far
+//
+//   court       18m x 9m, regulation
+//   attack line 3m either side of the centre line
+//   net         on the centre line, 2.24m to the top of the tape
+//
+var _VC_WID = 9, _VC_LEN = 18;      // the court itself, in metres
+var _VC_END = 4.6;                  // free zone beyond each end line
+var _VC_SIDE = 3.4;                 // and beyond each sideline
+var _VC_CX = 100, _VC_SX = 11.19;   // screen centre, and units per metre across
+var _VC_SHRINK = 0.32;              // how much the far end narrows
+var _VC_NEAR_Y = 120;
+
+// ONE CAMERA, NOT THREE GUESSES. How far apart the end lines look, and
+// how tall the net looks, are both consequences of how high the camera
+// is: a metre of ground depth lands sin(tilt) screen units away, a metre
+// of height lands cos(tilt). Picking the two independently is what put
+// the net a quarter of the way down the court and left almost no far
+// half to see -- the numbers described a camera at eye level and a net
+// drawn for one on the ceiling. Derived from the tilt they cannot
+// disagree with each other again.
+var _VC_TILT = 28 * Math.PI / 180;
+var _VC_DEPTH = _VC_LEN * _VC_SX * Math.sin(_VC_TILT);
+var _VC_HSCALE = _VC_SX * Math.cos(_VC_TILT);
+var _VC_NET_TOP = 2.24 * _VC_HSCALE;
+var _VC_NET_BOT = _VC_NET_TOP - 1.0 * _VC_HSCALE;
+
+function _vcProj(cw, cl) {
+  var t = cl / _VC_LEN;                      // 0 at the near end, 1 at the far
+  var k = 1 - _VC_SHRINK * t;
+  return [_VC_CX + (cw - _VC_WID / 2) * _VC_SX * k, _VC_NEAR_Y - _VC_DEPTH * t];
+}
+
+// A point standing h units above the floor. Height is screen vertical but
+// still shrinks with depth, or the far net post would stand taller than
+// the near one.
+function _vcUp(cw, cl, h) {
+  var p = _vcProj(cw, cl);
+  var k = 1 - _VC_SHRINK * (cl / _VC_LEN);
+  return [p[0], p[1] - h * k];
+}
+
+function _vcN(n) { return Math.round(n * 100) / 100; }
+function _vcPt(cw, cl) { var p = _vcProj(cw, cl); return _vcN(p[0]) + ',' + _vcN(p[1]); }
+function _vcUpPt(cw, cl, h) { var p = _vcUp(cw, cl, h); return _vcN(p[0]) + ',' + _vcN(p[1]); }
+
+// A patch of floor between two widths and two lengths.
+function _vcQuad(w0, w1, l0, l1) {
+  return _vcPt(w0, l0) + ' ' + _vcPt(w1, l0) + ' ' +
+         _vcPt(w1, l1) + ' ' + _vcPt(w0, l1);
+}
+
+// A line painted ON the floor. Both ends are projected separately, or it
+// will not lie down.
+function _vcFloorLine(w0, l0, w1, l1, col, wid, op, tag) {
+  var a = _vcProj(w0, l0), b = _vcProj(w1, l1);
+  return '<line x1="' + _vcN(a[0]) + '" y1="' + _vcN(a[1]) + '" x2="' +
+    _vcN(b[0]) + '" y2="' + _vcN(b[1]) + '" stroke="' + col +
+    '" stroke-width="' + wid + '"' + (op != null ? ' opacity="' + op + '"' : '') +
+    (tag ? ' data-vc="' + tag + '"' : '') + '/>';
+}
+
+// Screen displacement per metre along each floor axis at a point.
+function _vcAxis(cw, cl) {
+  var a = _vcProj(cw + 1, cl), b = _vcProj(cw - 1, cl);
+  var c = _vcProj(cw, cl + 1), d = _vcProj(cw, cl - 1);
+  return { wx: (a[0] - b[0]) / 2, wy: (a[1] - b[1]) / 2,
+           lx: (c[0] - d[0]) / 2, ly: (c[1] - d[1]) / 2 };
+}
+
+// Lettering painted across an end of the free zone, lying in the floor.
+// Two scales rather than one -- the advance runs across the width, the
+// glyph height along the length -- because the length is foreshortened
+// and a uniformly scaled name comes out as a smudge, the same reason the
+// end zone names are built this way.
+//
+// The fit works out to something pleasantly simple. Screen width is
+// (wx * adv) * est and we want it to be metres * wx, so the wx cancels
+// and adv is just metres over the string's own advance. Same for the
+// height against the cap height.
+var _VC_GLYPH = 4.6;                // average advance at font-size 10
+var _VC_CAP = 7.0;                  // and cap height
+
+function _vcEndText(cl, txt, metres, tall, fill, op, weight) {
+  var est = Math.max(1, String(txt).length) * _VC_GLYPH;
+  var adv = metres / est;
+  var hgt = tall / _VC_CAP;
+  var ax = _vcAxis(_VC_WID / 2, cl), p = _vcProj(_VC_WID / 2, cl);
+  // glyph-down is screen-down at BOTH ends: a diagram is read from one
+  // side, however the real floor is painted.
+  var a = ax.wx * adv, b = ax.wy * adv;
+  var c = -ax.lx * hgt, d = -ax.ly * hgt;
+  return '<text x="0" y="0" transform="matrix(' + _vcN(a) + ',' + _vcN(b) + ',' +
+    _vcN(c) + ',' + _vcN(d) + ',' + _vcN(p[0]) + ',' + _vcN(p[1]) + ')"' +
+    ' text-anchor="middle" dominant-baseline="central"' +
+    ' font-family="Barlow Condensed,sans-serif" font-size="10" font-weight="' +
+    (weight || 900) + '" fill="' + fill + '" opacity="' + op +
+    '" letter-spacing="1.1">' + _tpEsc(txt) + '</text>';
+}
+
+// The school and the nickname, worked out from the PAIR of names the
+// game object carries rather than from a rule about which field is
+// which -- because the feeds do not agree, and I guessed wrong twice.
+//
+// The ESPN scoreboard sends name="Fighting Irish", fullName="Notre Dame
+// Fighting Irish" for some clubs and name="Notre Dame" for others: its
+// shortDisplayName is sometimes the nickname and sometimes the school.
+// The volleyball overlay sends the SAME string in both fields. All
+// three shapes were painting the school twice on the floor.
+//
+// So neither field is trusted to be anything. Take the longer of the
+// two as "<school> <nickname>", and if the shorter one sits at one end
+// of it, the rest is the other half. When they tell us nothing -- the
+// two are equal, or unrelated -- the end simply gets one line, which is
+// better than inventing a second.
+function _vcNames(team) {
+  var a = String((team && team.name) || '').trim();
+  var b = String((team && team.fullName) || '').trim();
+  if (!a && !b) return { school: String((team && team.abbr) || ''), nick: '' };
+  if (!a) a = b;
+  if (!b) b = a;
+  var lng = (b.length >= a.length) ? b : a;
+  var sht = (b.length >= a.length) ? a : b;
+  var L = lng.toLowerCase(), S = sht.toLowerCase();
+  if (sht && lng.length > sht.length) {
+    // "Notre Dame" + " Fighting Irish"
+    if (L.indexOf(S + ' ') === 0) {
+      return { school: sht, nick: lng.slice(sht.length).trim() };
+    }
+    // "Kansas " + "Jayhawks"
+    if (L.lastIndexOf(' ' + S) === L.length - S.length - 1) {
+      return { school: lng.slice(0, lng.length - sht.length).trim(), nick: sht };
+    }
+  }
+  return { school: lng, nick: '' };
+}
+
+// Kept as the name the rest of the file knows, now a thin read of the pair.
+function _vcSchoolOf(t) { return _vcNames(t).school; }
+function _vcNickOf(t) { return _vcNames(t).nick; }
+
+// The net, built as a sheet standing on the centre line rather than as a
+// rectangle with a mesh pattern over it. A pattern does not take the
+// perspective: its squares stay square while everything behind them
+// converges, and the net reads as a sticker on the glass. These cords
+// are projected like anything else, so they converge with the floor.
+function _vcNet() {
+  var MID = _VC_LEN / 2, A = -1.0, B = _VC_WID + 1.0;
+  var TOP = _VC_NET_TOP, BOT = _VC_NET_BOT;
+  var s = '', i, j, cw;
+  // the sheet, to knock back what shows through it
+  s += '<polygon points="' + _vcUpPt(A, MID, TOP) + ' ' + _vcUpPt(B, MID, TOP) +
+    ' ' + _vcUpPt(B, MID, BOT) + ' ' + _vcUpPt(A, MID, BOT) +
+    '" fill="#0b0f16" fill-opacity="0.2"/>';
+  // the cords across
+  for (i = 0; i <= 5; i++) {
+    var h = BOT + (TOP - BOT) * i / 5;
+    s += '<line x1="' + _vcN(_vcUp(A, MID, h)[0]) + '" y1="' + _vcN(_vcUp(A, MID, h)[1]) +
+      '" x2="' + _vcN(_vcUp(B, MID, h)[0]) + '" y2="' + _vcN(_vcUp(B, MID, h)[1]) +
+      '" stroke="rgba(255,255,255,0.4)" stroke-width="0.45"/>';
+  }
+  // and the cords down, every quarter metre
+  var n = Math.round((B - A) * 4);
+  for (i = 0; i <= n; i++) {
+    cw = A + (B - A) * i / n;
+    s += '<line x1="' + _vcN(_vcUp(cw, MID, TOP)[0]) + '" y1="' + _vcN(_vcUp(cw, MID, TOP)[1]) +
+      '" x2="' + _vcN(_vcUp(cw, MID, BOT)[0]) + '" y2="' + _vcN(_vcUp(cw, MID, BOT)[1]) +
+      '" stroke="rgba(255,255,255,0.28)" stroke-width="0.35"/>';
+  }
+  // the white tape along the top, which is the thing that says "net"
+  s += '<polygon points="' + _vcUpPt(A, MID, TOP) + ' ' + _vcUpPt(B, MID, TOP) +
+    ' ' + _vcUpPt(B, MID, TOP - 1.3) + ' ' + _vcUpPt(A, MID, TOP - 1.3) +
+    '" fill="#f2f4f7"/>';
+  s += '<polygon points="' + _vcUpPt(A, MID, BOT) + ' ' + _vcUpPt(B, MID, BOT) +
+    ' ' + _vcUpPt(B, MID, BOT - 0.7) + ' ' + _vcUpPt(A, MID, BOT - 0.7) +
+    '" fill="#dfe4ea" fill-opacity="0.8"/>';
+  // the antennae, striped, standing over the sidelines
+  var ant = [0, _VC_WID];
+  for (j = 0; j < 2; j++) {
+    for (i = 0; i < 4; i++) {
+      var h0 = TOP - 1.3 + i * 2.2, h1 = h0 + 2.2;
+      s += '<line x1="' + _vcN(_vcUp(ant[j], MID, h0)[0]) + '" y1="' +
+        _vcN(_vcUp(ant[j], MID, h0)[1]) + '" x2="' + _vcN(_vcUp(ant[j], MID, h1)[0]) +
+        '" y2="' + _vcN(_vcUp(ant[j], MID, h1)[1]) + '" stroke="' +
+        (i % 2 ? '#f2f4f7' : '#e8441f') + '" stroke-width="0.8"/>';
+    }
+  }
+  // the posts, outside the sidelines
+  for (j = 0; j < 2; j++) {
+    var pc = (j === 0) ? A : B;
+    s += '<line x1="' + _vcN(_vcUp(pc, MID, 0)[0]) + '" y1="' + _vcN(_vcUp(pc, MID, 0)[1]) +
+      '" x2="' + _vcN(_vcUp(pc, MID, TOP + 1.0)[0]) + '" y2="' +
+      _vcN(_vcUp(pc, MID, TOP + 1.0)[1]) +
+      '" stroke="#b6bdc9" stroke-width="1.5" stroke-linecap="round"/>';
+    s += '<ellipse cx="' + _vcN(_vcProj(pc, MID)[0]) + '" cy="' +
+      _vcN(_vcProj(pc, MID)[1]) + '" rx="1.5" ry="0.5" fill="#0b0f16"' +
+      ' fill-opacity="0.22"/>';
+  }
+  return s;
+}
+
 function _courtDiagram(game, aAcc, hAcc, aLogo, hLogo, esc) {
-  var W = 360, H = 180, NET = 180, ATK_A = 120, ATK_H = 240;
-  var line = 'rgba(255,255,255,0.30)';
+  var home = (game && game.home) || {};
+  var HOME = hAcc || '#2b3444';
+  var LN = -_VC_END, LF = _VC_LEN + _VC_END;     // free zone, near end to far
+  var WL = -_VC_SIDE, WR = _VC_WID + _VC_SIDE;   // and left to right
+  var paint = 'rgba(255,255,255,0.9)';
   var s = '<div class="court-diagram">';
-  s += '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="xMidYMid meet" ' +
+  s += '<svg viewBox="0 0 200 146" preserveAspectRatio="xMidYMid meet" ' +
        'role="img" aria-label="Volleyball court">';
 
-  // Halves, each in its own accent.
-  s += '<rect x="0" y="0" width="' + NET + '" height="' + H + '" fill="' + aAcc + '" opacity="0.10"/>';
-  s += '<rect x="' + NET + '" y="0" width="' + (W - NET) + '" height="' + H + '" fill="' + hAcc + '" opacity="0.10"/>';
+  s += '<defs>' +
+    '<linearGradient id="vcWood" x1="0" y1="0" x2="0" y2="1">' +
+      '<stop offset="0" stop-color="#a98a5e"/>' +
+      '<stop offset="0.5" stop-color="#c9a775"/>' +
+      '<stop offset="1" stop-color="#ddc095"/></linearGradient>' +
+    '<linearGradient id="vcSur" x1="0" y1="0" x2="0" y2="1">' +
+      '<stop offset="0" stop-color="#000" stop-opacity="0.45"/>' +
+      '<stop offset="0.62" stop-color="#000" stop-opacity="0.08"/>' +
+      '<stop offset="1" stop-color="#fff" stop-opacity="0.1"/></linearGradient>' +
+    '<filter id="vcCrest" x="-12%" y="-12%" width="124%" height="124%">' +
+      '<feColorMatrix type="matrix" values="' +
+      '0.97 0 0 0 0  0 0.97 0 0 0  0 0 0.97 0 0  0 0 0 0.92 0"/>' +
+      '</filter></defs>';
 
-  // Boundary + attack lines.
-  s += '<rect x="1" y="1" width="' + (W - 2) + '" height="' + (H - 2) + '" fill="none" ' +
-       'stroke="' + line + '" stroke-width="2"/>';
-  s += '<line x1="' + ATK_A + '" y1="1" x2="' + ATK_A + '" y2="' + (H - 1) + '" stroke="' + line + '" stroke-width="1.5"/>';
-  s += '<line x1="' + ATK_H + '" y1="1" x2="' + ATK_H + '" y2="' + (H - 1) + '" stroke="' + line + '" stroke-width="1.5"/>';
+  // THE FREE ZONE, in the home club's colour, all the way round. This is
+  // the change that makes it a floor instead of a diagram.
+  s += '<polygon points="' + _vcQuad(WL, WR, LN, LF) + '" fill="' + HOME + '"/>';
+  s += '<polygon points="' + _vcQuad(WL, WR, LN, LF) + '" fill="url(#vcSur)"/>';
 
-  // The net: a mesh band standing above the centre line, with posts and the
-  // white tape along its top edge — the detail that makes it read as a net
-  // rather than a divider.
-  s += '<defs><pattern id="vbNetMesh" width="6" height="6" patternUnits="userSpaceOnUse">' +
-       '<path d="M6 0H0V6" fill="none" stroke="rgba(255,255,255,0.34)" stroke-width="0.8"/>' +
-       '</pattern></defs>';
-  s += '<line x1="' + NET + '" y1="1" x2="' + NET + '" y2="' + (H - 1) + '" stroke="' + line + '" stroke-width="1"/>';
-  s += '<rect x="' + (NET - 13) + '" y="-16" width="26" height="' + (H + 32) + '" fill="url(#vbNetMesh)"/>';
-  s += '<rect x="' + (NET - 13) + '" y="-16" width="26" height="3" fill="rgba(255,255,255,0.55)"/>';
-  s += '<rect x="' + (NET - 13) + '" y="' + (H + 13) + '" width="26" height="3" fill="rgba(255,255,255,0.55)"/>';
-  // Posts, just outside the sidelines.
-  s += '<rect x="' + (NET - 1.5) + '" y="-22" width="3" height="10" fill="rgba(255,255,255,0.45)"/>';
-  s += '<rect x="' + (NET - 1.5) + '" y="' + (H + 12) + '" width="3" height="10" fill="rgba(255,255,255,0.45)"/>';
+  // the wood inside it
+  s += '<polygon points="' + _vcQuad(0, _VC_WID, 0, _VC_LEN) + '" fill="url(#vcWood)"/>';
+
+  // THE BRANDING, at both ends: school then nickname, reading outward.
+  var _vcn = _vcNames(home);
+  var school = _vcn.school, nick = _vcn.nick;
+  var twice = (nick && nick.toLowerCase() !== String(school).toLowerCase());
+  var ei, inner, outer;
+  for (ei = 0; ei < 2; ei++) {
+    var near = (ei === 0);
+    inner = near ? -1.55 : _VC_LEN + 1.55;
+    outer = near ? -3.35 : _VC_LEN + 3.35;
+    if (school) {
+      s += _vcEndText(inner, String(school).toUpperCase(), 7.4, 1.6,
+        'rgba(255,255,255,0.95)', 1, 900);
+    }
+    if (twice) {
+      s += _vcEndText(outer, String(nick).toUpperCase(), 5.7, 1.1,
+        'rgba(255,255,255,0.7)', 1, 800);
+    }
+  }
+
+  // THE CREST at centre court, lying in the floor rather than pasted flat
+  // on it. The net crosses it, the way it crosses the real one.
+  if (hLogo) {
+    var mid = _vcProj(_VC_WID / 2, _VC_LEN / 2);
+    var mk = 1 - _VC_SHRINK * 0.5;
+    var ax = _vcAxis(_VC_WID / 2, _VC_LEN / 2);
+    var squash = Math.abs(ax.ly) / Math.abs(ax.wx || 1);
+    s += '<g transform="translate(' + _vcN(mid[0]) + ',' + _vcN(mid[1]) +
+      ') scale(' + _vcN(mk) + ',' + _vcN(mk * squash) + ')">' +
+      '<image href="' + hLogo + '" x="-30" y="-30" width="60" height="60"' +
+      ' filter="url(#vcCrest)" preserveAspectRatio="xMidYMid meet"' +
+      ' onerror="this.remove()"/></g>';
+  }
+
+  // THE LINES. Boundary, the centre line under the net, and an attack
+  // line three metres either side of it.
+  s += '<polygon points="' + _vcQuad(0, _VC_WID, 0, _VC_LEN) + '" fill="none" stroke="' +
+    paint + '" stroke-width="0.8"/>';
+  s += _vcFloorLine(0, 6, _VC_WID, 6, paint, 0.6, 0.9, 'atk');
+  s += _vcFloorLine(0, 12, _VC_WID, 12, paint, 0.6, 0.9, 'atk');
+  s += _vcFloorLine(0, 9, _VC_WID, 9, paint, 0.5, 0.6, 'centre');
+
+  // THE NET, last, because it stands in front of all of it.
+  s += _vcNet();
 
   s += '</svg>';
-
-  // Crests centred in each half, at the same weight as the court washes so
-  // they sit in the surface rather than on top of it.
-  if (aLogo) s += '<img class="court-dg-logo away" src="' + aLogo + '" alt="" onerror="this.style.display=\'none\'">';
-  if (hLogo) s += '<img class="court-dg-logo home" src="' + hLogo + '" alt="" onerror="this.style.display=\'none\'">';
-  s += '<span class="court-dg-side left" style="color:' + aAcc + '">' + esc(game.away.abbr || '') + '</span>';
-  s += '<span class="court-dg-side right" style="color:' + hAcc + '">' + esc(game.home.abbr || '') + '</span>';
+  s += '<span class="court-dg-side left" style="color:' + aAcc + '">' +
+    esc(game.away.abbr || '') + '</span>';
+  s += '<span class="court-dg-side right" style="color:' + hAcc + '">' +
+    esc(game.home.abbr || '') + '</span>';
   s += '</div>';
   return s;
 }
@@ -69541,7 +69903,7 @@ function _f3LightDefs() {
 function _f3Tower(bx, baseY) {
   var POLE = 18, BW = 13, BH = 3.8;
   var ty = baseY - POLE;
-  var s = '<g>';
+  var s = '<g data-f3="tower">';
   s += '<ellipse cx="' + _f3n(bx) + '" cy="' + _f3n(ty + BH / 2) +
     '" rx="13" ry="9" fill="url(#f3glow)"/>';
   // the shaft, aimed down the field toward the near sideline
@@ -69574,6 +69936,529 @@ function _f3Tower(bx, baseY) {
   return s + '</g>';
 }
 
+// ════════════════════════════════════════════════════════════════════
+// THE BOWL.
+//
+// Ty: "now that we've done all that work with the stadiums and
+// basketball courts these football fields seem bare. Anything you would
+// recommend? I was thinking stands."
+//
+// Stands, yes -- it is the whole of what is missing. The field itself
+// was finished: turf, mow stripes, hash marks, numbers, end zones,
+// posts, floods and the board. What it had no trace of was a building
+// around it, so it read as a pitch marked out in a dark field.
+//
+// A U, NOT A RING, and that is the camera rather than a shortcut. This
+// view is taken from the near sideline, which is where the near stand
+// is: you are sitting in it. A real sideline camera sees the far side
+// and both ends wrapping toward you, and nothing of the stand at its
+// back. Drawing a fourth side across the bottom would be drawing the
+// seats this picture is taken from.
+//
+// AND IT STOPS UNDER THE BOARD. The scoreboard occupies y 24 to 59 and
+// the far sideline projects to y 70, so the bowl has eleven units to
+// live in. The top tier is sized to land just under the board rather
+// than behind it -- a stand that swallows the scoreboard is worse than
+// no stand.
+// How far the end stands come toward the camera, as a fraction of the
+// field's width. At 0.42 they stopped two fifths of the way along the
+// end zones and left an open wedge at each corner -- the stand simply
+// ran out beside the paint. Real end stands close the corner, so these
+// now run almost the whole way; the last tenth is left open because the
+// near sideline is where the benches and the camera well go, and that is
+// also the gap the broadcast angle actually shows.
+var _F3_BOWL_NEAR = 0.9;
+
+function _f3BowlEdge(d, h) {
+  var pts = [], i, n = 9;
+  var near = _F3_WID * _F3_BOWL_NEAR;
+  // the left end, from as far forward as it comes back to the far corner
+  for (i = 0; i <= n; i++) {
+    pts.push(_f3Up(-d, near - (near + d) * i / n, h));
+  }
+  // the far side, left to right
+  for (i = 1; i <= n * 2; i++) {
+    pts.push(_f3Up(_F3_LEN * i / (n * 2), -d, h));
+  }
+  // the right end, far corner back forward
+  for (i = 1; i <= n; i++) {
+    pts.push(_f3Up(_F3_LEN + d, -d + (near + d) * i / n, h));
+  }
+  return pts;
+}
+
+function _f3Bowl(o) {
+  var home = o.homeColor || '#888';
+  var away = o.awayColor || '#888';
+  var s = '', i, j;
+  // THREE TIERS, each further back and higher than the last. The depth
+  // runs in field yards and the height in screen units, because that
+  // is how the rest of this file is built -- _f3Up already shrinks a
+  // height with distance, which is why the back tier needs a big
+  // number to clear the front one at all.
+  var TIERS = [
+    { d0: 0,  d1: 11, h0: 0,  h1: 16, fill: '#171d26' },
+    { d0: 11, d1: 20, h0: 16, h1: 25, fill: '#141a22' },
+    { d0: 20, d1: 27, h0: 25, h1: 32, fill: '#10151c' }
+  ];
+  function ring(d0, d1, h0, h1, fill, op) {
+    var inner = _f3BowlEdge(d0, h0), outer = _f3BowlEdge(d1, h1);
+    var p = '', k;
+    for (k = 0; k < inner.length; k++) {
+      p += (k ? 'L' : 'M') + _f3n(inner[k][0]) + ' ' + _f3n(inner[k][1]);
+    }
+    for (k = outer.length - 1; k >= 0; k--) {
+      p += 'L' + _f3n(outer[k][0]) + ' ' + _f3n(outer[k][1]);
+    }
+    return '<path d="' + p + 'Z" fill="' + fill + '"' +
+      (op ? ' fill-opacity="' + op + '"' : '') + '/>';
+  }
+  for (i = 0; i < TIERS.length; i++) {
+    var t = TIERS[i];
+    s += ring(t.d0, t.d1, t.h0, t.h1, t.fill);
+  }
+  // THE CROWD. Deterministic, so the stand does not reseat itself every
+  // time the score changes -- the ballparks learned that one first.
+  // The home club's colour at about one in six, the visitors' at one in
+  // twenty, and the rest the greys and browns a crowd actually is.
+  var seed = 19200101;
+  function rnd() { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; }
+  var NEUT = ['#3b4250', '#4a5160', '#55504a', '#2f3542', '#5b5f6b', '#464b44'];
+  var dots = '';
+  for (i = 0; i < TIERS.length; i++) {
+    var tt = TIERS[i];
+    var rows = 7 + i * 2, cols = 120;
+    for (var r = 0; r < rows; r++) {
+      var fr = (r + 0.5) / rows;
+      var dd = tt.d0 + (tt.d1 - tt.d0) * fr;
+      var hh = tt.h0 + (tt.h1 - tt.h0) * fr;
+      var edge = _f3BowlEdge(dd, hh);
+      for (j = 0; j < cols; j++) {
+        var u = j / (cols - 1) * (edge.length - 1);
+        var ui = Math.floor(u), uf = u - ui;
+        if (ui >= edge.length - 1) { ui = edge.length - 2; uf = 1; }
+        var px = edge[ui][0] + (edge[ui + 1][0] - edge[ui][0]) * uf;
+        var py = edge[ui][1] + (edge[ui + 1][1] - edge[ui][1]) * uf;
+        var q = rnd();
+        var col = (q < 0.17) ? home : (q < 0.22) ? away
+          : NEUT[Math.floor(rnd() * NEUT.length)];
+        dots += '<circle cx="' + _f3n(px + (rnd() - 0.5) * 0.9) +
+          '" cy="' + _f3n(py + (rnd() - 0.5) * 0.5) +
+          '" r="' + _f3n(0.32 + rnd() * 0.18) + '" fill="' + col +
+          '" fill-opacity="' + _f3n(0.5 + rnd() * 0.4) + '"/>';
+      }
+    }
+  }
+  s += dots;
+  // THE ROOFLINE along the back, which is what makes it a building
+  // rather than a drift of confetti. Without a hard edge at the top the
+  // crowd simply faded out into the sky.
+  var roof = _f3BowlEdge(27, 32), rp = '', q2;
+  for (q2 = 0; q2 < roof.length; q2++) {
+    rp += (q2 ? 'L' : 'M') + _f3n(roof[q2][0]) + ' ' + _f3n(roof[q2][1]);
+  }
+  s += '<path d="' + rp + '" fill="none" stroke="#2b3340" stroke-width="1.4"/>';
+  s += '<path d="' + rp + '" fill="none" stroke="#454f5e" stroke-width="0.5"/>';
+
+  // The lip along the front of the stand, which is what separates it
+  // from the grass instead of letting the crowd bleed onto the field.
+  var lip = _f3BowlEdge(0, 0), lp = '', m;
+  for (m = 0; m < lip.length; m++) {
+    lp += (m ? 'L' : 'M') + _f3n(lip[m][0]) + ' ' + _f3n(lip[m][1]);
+  }
+  s += '<path d="' + lp + '" fill="none" stroke="#0a0e14" stroke-width="1.1"/>';
+  s += '<path d="' + lp + '" fill="none" stroke="' + home +
+    '" stroke-width="0.4" stroke-opacity="0.55"/>';
+  return '<g data-f3="bowl">' + s + '</g>';
+}
+
+// The backdrop, on its own. It used to be the first thing inside
+// _f3LightTowers, which forced the standards to the very back of the
+// drawing with it -- and once the bowl went in, the bowl swallowed them.
+// The sky is a backdrop and the standards are objects; they are two
+// different layers and they are now drawn as two.
+// A quad lying flat on the grass between two lengths and two widths.
+// _f3Quad only ever spans the full width, which is all the turf and the
+// mow stripes ever needed; the sideline furniture needs a patch.
+function _f3Patch(fx0, fx1, fy0, fy1) {
+  return _f3Pt(fx0, fy0) + ' ' + _f3Pt(fx1, fy0) + ' ' +
+         _f3Pt(fx1, fy1) + ' ' + _f3Pt(fx0, fy1);
+}
+
+// A standing panel: a wall rising H units from the ground along the line
+// from (fx0, fy) to (fx1, fy).
+function _f3Panel(fx0, fx1, fy, h) {
+  var a = _f3Up(fx0, fy, 0), b = _f3Up(fx1, fy, 0);
+  var c = _f3Up(fx1, fy, h), d = _f3Up(fx0, fy, h);
+  return _f3n(a[0]) + ',' + _f3n(a[1]) + ' ' + _f3n(b[0]) + ',' + _f3n(b[1]) +
+    ' ' + _f3n(c[0]) + ',' + _f3n(c[1]) + ' ' + _f3n(d[0]) + ',' + _f3n(d[1]);
+}
+
+// A team bench, seen from behind and above -- which is what this camera
+// sees of the near sideline. The club's colour is on the seat back
+// because that is the only part of a bench a broadcast angle shows.
+// ---- the near sideline -------------------------------------------------
+//
+// THE RULE DOWN HERE: nothing standing on the apron may rise above the
+// near sideline. The sideline projects to y=92 and everything above it
+// is playing surface, so a figure that crosses it is standing in front
+// of the field -- the first pass put the squad's heads up among the yard
+// numbers and hid the 10, 20, 30 and 40. The goalposts are no use as a
+// scale reference: they are deliberately oversized to read at this size.
+// The sideline is the reference, and these depths and heights are chosen
+// against it with a little room to spare.
+//
+//   y(fy) = 92 + 0.4128 * (fy - _F3_WID),  k(fy) = 1 + 0.46 * (fy - _F3_WID) / _F3_WID
+//   head y = y(fy) - h * k(fy)   and that must stay below 92
+//
+var _F3_SL_STAND = 60;     // where the people at the paint stand
+var _F3_SL_NEAR = 68;      // where the benches and the drinks are
+var _F3_APRON = 78;        // how far past the near sideline the apron runs
+
+// The tallest a thing standing at depth fy may be without its head
+// crossing the near sideline. Everything on the apron is sized through
+// this, so the rule holds by construction instead of by me doing the
+// sums right for the row's nominal depth and then jittering figures off
+// that depth afterwards.
+function _f3ApronMax(fy, rad) {
+  var base = _f3Proj(0, fy)[1];
+  var k = 1 - _F3_SHRINK * ((_F3_WID - fy) / _F3_WID);
+  return Math.max(0, (base - _F3_NEAR_Y - 0.3 - (rad || 0)) / k);
+}
+
+function _f3Bench(fx0, fx1, fy, col) {
+  var s = '', i, n, fx, sh, hd, hip;
+  // the duckboard
+  s += '<polygon points="' + _f3Patch(fx0 - 1.2, fx1 + 1.2, fy - 2.2, fy + 3.0) +
+    '" fill="#1e2228"/>';
+  // the seat plank, lying flat, and the back standing behind it
+  s += '<polygon points="' + _f3Patch(fx0, fx1, fy + 0.5, fy + 2.1) +
+    '" fill="#3a4049"/>';
+  s += '<polygon points="' + _f3Panel(fx0, fx1, fy + 2.1, 1.8) +
+    '" fill="#161a20"/>';
+  s += '<polygon points="' + _f3Panel(fx0, fx1, fy + 2.1, 1.45) +
+    '" fill="' + col + '" fill-opacity="0.72"/>';
+  s += '<polygon points="' + _f3Panel(fx0, fx1, fy + 2.1, 1.8) +
+    '" fill="none" stroke="#0a0e14" stroke-width="0.22"/>';
+  // the uprights between seats, which is what stops the back reading as
+  // one painted stripe -- a bench has legs and a bench has divisions
+  n = Math.round((fx1 - fx0) / 4);
+  for (i = 0; i <= n; i++) {
+    fx = fx0 + (fx1 - fx0) * i / n;
+    hip = _f3Up(fx, fy + 2.1, 0);
+    sh = _f3Up(fx, fy + 2.1, 1.8);
+    s += '<line x1="' + _f3n(hip[0]) + '" y1="' + _f3n(hip[1]) + '" x2="' +
+      _f3n(sh[0]) + '" y2="' + _f3n(sh[1]) +
+      '" stroke="#0a0e14" stroke-width="0.26" stroke-opacity="0.6"/>';
+  }
+  // and the squad on it, head and shoulders over the rail. Jittered,
+  // because the first pass put every figure at the same height and the
+  // same spacing and the bench came out looking like a hair comb. The
+  // jitter is seeded off the bench's own position so a given bench sits
+  // the same way every render.
+  var sd = Math.round(fx0 * 977 + fx1 * 131) + 7919;
+  function jr() { sd = (sd * 1103515245 + 12345) % 2147483648; return sd / 2147483648; }
+  n = Math.max(3, Math.round((fx1 - fx0) / 3.3));
+  for (i = 0; i < n; i++) {
+    fx = fx0 + 1.0 + (fx1 - fx0 - 2.0) * (i + 0.5) / n + (jr() - 0.5) * 1.3;
+    var dep = fy + 0.8 + jr() * 0.7;
+    var tall = Math.min(2.6 + jr() * 0.6, _f3ApronMax(dep, 0.52));
+    sh = _f3Up(fx, dep, tall - 1.5);
+    hd = _f3Up(fx, dep, tall);
+    s += '<line x1="' + _f3n(sh[0]) + '" y1="' + _f3n(sh[1]) + '" x2="' +
+      _f3n(hd[0]) + '" y2="' + _f3n(hd[1]) + '" stroke="' + col +
+      '" stroke-width="' + _f3n(1.05 + jr() * 0.3) + '" stroke-linecap="round"/>';
+    // the helmet, in the club's colour with a highlight off the floods
+    s += '<circle cx="' + _f3n(hd[0]) + '" cy="' + _f3n(hd[1]) +
+      '" r="0.52" fill="' + col + '"/>';
+    s += '<circle cx="' + _f3n(hd[0] - 0.14) + '" cy="' + _f3n(hd[1] - 0.16) +
+      '" r="0.24" fill="#ffffff" fill-opacity="0.32"/>';
+  }
+  return s;
+}
+
+// The people standing at the paint -- coaches, the next unit on, the
+// chain crew. A real sideline is a wall of standing bodies in front of
+// the bench, and without them the bench sat alone on an empty apron.
+function _f3SideStanders(fx0, fx1, fy, col, nmen) {
+  var s = '', i, fx, a, b, h;
+  var sd = Math.round(fx0 * 613 + fx1 * 457) + 104729;
+  function jr() { sd = (sd * 1103515245 + 12345) % 2147483648; return sd / 2147483648; }
+  for (i = 0; i < nmen; i++) {
+    fx = fx0 + (fx1 - fx0) * (i + 0.5) / nmen + (jr() - 0.5) * 1.9;
+    var dep = fy + (jr() - 0.5) * 2.4;
+    var tall = Math.min(2.5 + jr() * 0.45, _f3ApronMax(dep, 0.46));
+    var dark = (jr() < 0.34);
+    a = _f3Up(fx, dep, 0);
+    b = _f3Up(fx, dep, tall - 0.7);
+    s += '<line x1="' + _f3n(a[0]) + '" y1="' + _f3n(a[1]) + '" x2="' +
+      _f3n(b[0]) + '" y2="' + _f3n(b[1]) + '" stroke="' +
+      (dark ? '#20252c' : col) + '" stroke-width="' + _f3n(0.95 + jr() * 0.35) +
+      '" stroke-linecap="round"/>';
+    h = _f3Up(fx, dep, tall);
+    s += '<circle cx="' + _f3n(h[0]) + '" cy="' + _f3n(h[1]) + '" r="0.46" fill="' +
+      (dark ? '#2b3038' : col) + '"/>';
+  }
+  return s;
+}
+
+// A drinks table: a trestle top, a pair of coolers and a row of cups.
+// Orange because that is what is on every sideline in the sport, and the
+// cups are the only white things down here that are not paint.
+function _f3GatorTable(fx, fy) {
+  var s = '', i, cx, a, b;
+  var W = 7.0, D = 3.0;
+  // the top, the coolers on it and the lid above them all have to fit
+  var TOP = Math.min(1.9, Math.max(0.5, _f3ApronMax(fy - D / 2, 0.44) - 2.5));
+  for (i = 0; i < 2; i++) {
+    cx = fx - W / 2 + 1.0 + i * (W - 2.0);
+    a = _f3Up(cx, fy, 0);
+    b = _f3Up(cx, fy, TOP);
+    s += '<line x1="' + _f3n(a[0]) + '" y1="' + _f3n(a[1]) + '" x2="' +
+      _f3n(b[0]) + '" y2="' + _f3n(b[1]) + '" stroke="#464c55" stroke-width="0.45"/>';
+  }
+  // the top, and the skirt hanging off the near edge
+  var t0 = _f3Up(fx - W / 2, fy - D / 2, TOP), t1 = _f3Up(fx + W / 2, fy - D / 2, TOP);
+  var t2 = _f3Up(fx + W / 2, fy + D / 2, TOP), t3 = _f3Up(fx - W / 2, fy + D / 2, TOP);
+  s += '<polygon points="' + _f3n(t0[0]) + ',' + _f3n(t0[1]) + ' ' +
+    _f3n(t1[0]) + ',' + _f3n(t1[1]) + ' ' + _f3n(t2[0]) + ',' + _f3n(t2[1]) +
+    ' ' + _f3n(t3[0]) + ',' + _f3n(t3[1]) + '" fill="#b9c0ca"/>';
+  s += '<polygon points="' + _f3Panel(fx - W / 2, fx + W / 2, fy + D / 2, TOP) +
+    '" fill="#7d848e" fill-opacity="0.6"/>';
+  // the coolers, standing on the top
+  for (i = 0; i < 2; i++) {
+    cx = fx - W / 4 + i * (W / 2);
+    a = _f3Up(cx, fy - 0.3, TOP);
+    b = _f3Up(cx, fy - 0.3, TOP + 1.9);
+    s += '<line x1="' + _f3n(a[0]) + '" y1="' + _f3n(a[1]) + '" x2="' +
+      _f3n(b[0]) + '" y2="' + _f3n(b[1]) +
+      '" stroke="#e8701a" stroke-width="1.9" stroke-linecap="butt"/>';
+    s += '<line x1="' + _f3n(a[0] - 0.62) + '" y1="' + _f3n(a[1]) + '" x2="' +
+      _f3n(b[0] - 0.62) + '" y2="' + _f3n(b[1]) +
+      '" stroke="#ffffff" stroke-width="0.38" stroke-opacity="0.24"/>';
+    s += '<ellipse cx="' + _f3n(b[0]) + '" cy="' + _f3n(b[1]) +
+      '" rx="1.05" ry="0.44" fill="#f0f3f7"/>';
+  }
+  // and the cups, in a row along the front of the top
+  for (i = 0; i < 8; i++) {
+    cx = fx - W / 2 + 0.75 + i * ((W - 1.5) / 7);
+    a = _f3Up(cx, fy + D / 2 - 0.7, TOP + 0.38);
+    s += '<ellipse cx="' + _f3n(a[0]) + '" cy="' + _f3n(a[1]) +
+      '" rx="0.32" ry="0.4" fill="#fdfdfd" fill-opacity="0.95"/>';
+  }
+  return s;
+}
+
+// The whole near sideline. Everything here lives between the near
+// sideline and the bottom of the frame, which was empty dark before --
+// the one part of the picture with nothing in it once the bowl went up.
+function _f3Sideline(o) {
+  var home = o.homeColor || '#888', away = o.awayColor || '#888';
+  var s = '';
+  // the apron itself, running off both sides of the frame
+  s += '<defs><linearGradient id="f3apron" x1="0" y1="0" x2="0" y2="1">' +
+    '<stop offset="0" stop-color="#363d47"/>' +
+    '<stop offset="0.45" stop-color="#242a33"/>' +
+    '<stop offset="1" stop-color="#11151b"/></linearGradient></defs>';
+  s += '<polygon points="' + _f3Patch(-40, _F3_LEN + 40, _F3_WID, _F3_APRON) +
+    '" fill="url(#f3apron)"/>';
+  // the grass verge between the paint and the concrete
+  s += '<polygon points="' + _f3Patch(-40, _F3_LEN + 40, _F3_WID, _F3_WID + 3.0) +
+    '" fill="#1a3522"/>';
+  // the white sideline border
+  s += '<polygon points="' + _f3Patch(-40, _F3_LEN + 40, _F3_WID + 3.0, _F3_WID + 3.8) +
+    '" fill="#9aa3ae" fill-opacity="0.35"/>';
+  // the people at the paint
+  s += _f3SideStanders(14, 52, _F3_SL_STAND, away, 14);
+  s += _f3SideStanders(68, 106, _F3_SL_STAND, home, 14);
+  // the two benches, flanking the 50, visitors on the left
+  s += _f3Bench(18, 52, _F3_SL_NEAR, away);
+  s += _f3Bench(68, 102, _F3_SL_NEAR, home);
+  // drinks in the gaps between the benches rather than parked under one
+  s += _f3GatorTable(60, _F3_SL_NEAR);
+  s += _f3GatorTable(8, _F3_SL_NEAR);
+  s += _f3GatorTable(112, _F3_SL_NEAR);
+  return '<g data-f3="sideline">' + s + '</g>';
+}
+
+// ---- the tunnel --------------------------------------------------------
+// Where the clubs come out. It is cut into the face of the RIGHT-HAND END
+// stand, not into the far side: the far side is the backdrop to every
+// play and a black arch in the middle of it would read as a hole in the
+// picture. A corner tunnel is also what most grounds actually have.
+//
+// Placed by measurement rather than by eye. The face of the end stand is
+// the bowl's lip at fx=_F3_LEN, and fy=8 on that face projects to about
+// (158, 73) -- which is where the mouth wanted to be -- with eleven units
+// of rise putting the crown of the arch at about y=62.
+var _F3_TUN_FX = _F3_LEN;  // on the end line, where the end stand faces in
+var _F3_TUN_A = 3;         // the mouth runs between these two depths
+var _F3_TUN_B = 13;
+var _F3_TUN_H = 12.5;      // and rises this far up the stand
+
+// The mouth is a plane: fx is fixed, fy runs across it, h runs up it.
+// Straight jambs to two thirds and an arch over the top. grow pushes the
+// whole outline outwards, which is how the surround is built from the
+// same shape as the opening instead of from a second set of numbers.
+function _f3TunnelArch(grow) {
+  var pts = [], i, n = 14, u, fy, hh;
+  var g = grow || 0;
+  var a = _F3_TUN_A - g, b = _F3_TUN_B + g, h = _F3_TUN_H + g;
+  pts.push(_f3Up(_F3_TUN_FX, a, 0));
+  for (i = 0; i <= n; i++) {
+    u = i / n;
+    fy = a + (b - a) * u;
+    hh = h * (0.64 + 0.36 * Math.sin(Math.PI * u));
+    pts.push(_f3Up(_F3_TUN_FX, fy, hh));
+  }
+  pts.push(_f3Up(_F3_TUN_FX, b, 0));
+  return pts;
+}
+
+function _f3Tunnel() {
+  var s = '', i;
+  function pathOf(pts) {
+    var p = '', k;
+    for (k = 0; k < pts.length; k++) {
+      p += (k ? 'L' : 'M') + _f3n(pts[k][0]) + ' ' + _f3n(pts[k][1]);
+    }
+    return p + 'Z';
+  }
+  s += '<defs><radialGradient id="f3tun" cx="0.5" cy="0.84" r="0.8">' +
+    '<stop offset="0" stop-color="#9c8349"/>' +
+    '<stop offset="0.4" stop-color="#312d24"/>' +
+    '<stop offset="1" stop-color="#090b0f"/></radialGradient></defs>';
+  // the concrete surround, built out from the opening's own outline
+  s += '<path d="' + pathOf(_f3TunnelArch(2.0)) + '" fill="#262c35"/>';
+  s += '<path d="' + pathOf(_f3TunnelArch(0.9)) + '" fill="#3a424e"/>';
+  // the opening, with the light coming up it
+  s += '<path d="' + pathOf(_f3TunnelArch(0)) + '" fill="url(#f3tun)"/>';
+  // the header, which is what makes it a built thing rather than a hole.
+  // It follows the arch, because an arch's header is an arch.
+  s += '<path d="' + pathOf(_f3TunnelArch(1.45)) +
+    '" fill="none" stroke="#5a6472" stroke-width="0.4"/>';
+  s += '<path d="' + pathOf(_f3TunnelArch(0)) +
+    '" fill="none" stroke="#0b0e13" stroke-width="0.32"/>';
+  // the squad coming out of it, smallest and deepest first
+  var FIG = [[4.6, 0.26, 0.60], [6.2, 0.52, 0.82], [7.9, 0.78, 1.00],
+             [9.6, 1.00, 1.14], [11.3, 0.62, 0.88], [5.4, 0.92, 1.06]];
+  for (i = 0; i < FIG.length; i++) {
+    var fy = FIG[i][0], dep = FIG[i][1], tall = FIG[i][2] * 2.6;
+    var a = _f3Up(_F3_TUN_FX - dep * 3, fy, 0);
+    var b = _f3Up(_F3_TUN_FX - dep * 3, fy, tall - 0.55);
+    var hd = _f3Up(_F3_TUN_FX - dep * 3, fy, tall);
+    s += '<line x1="' + _f3n(a[0]) + '" y1="' + _f3n(a[1]) + '" x2="' +
+      _f3n(b[0]) + '" y2="' + _f3n(b[1]) +
+      '" stroke="#0a0d12" stroke-width="' + _f3n(0.55 + dep * 0.62) +
+      '" stroke-linecap="round"/>';
+    s += '<circle cx="' + _f3n(hd[0]) + '" cy="' + _f3n(hd[1]) + '" r="' +
+      _f3n(0.26 + dep * 0.26) + '" fill="#0a0d12"/>';
+  }
+  return '<g data-f3="tunnel">' + s + '</g>';
+}
+
+// ---- the chains --------------------------------------------------------
+// The crew works the FAR side here, because the near side is the bench
+// and the camera well. The box stands at the ball and the two rods ten
+// yards apart with the front one on the line to gain, which is how a real
+// crew stands -- and it means the whole set moves with the ball instead
+// of being decoration. It is driven by ballAbs, possTeam and distance:
+// the same three inputs the scrimmage and to-gain lines already use, so
+// the rods cannot drift out of agreement with the lines.
+var _F3_CHAIN_FY = 2.2;    // the box man, just inside the far sideline
+var _F3_ROD_FY = 0.7;      // the chain men, a pace outside him
+var _F3_CHAIN_H = 6.2;
+
+function _f3ChainRod(fx, tag) {
+  var s = '';
+  var b = _f3Up(fx, _F3_ROD_FY, 0), t = _f3Up(fx, _F3_ROD_FY, _F3_CHAIN_H);
+  // the padded sleeve, tapering up the way the real ones do
+  s += '<polygon points="' + _f3n(b[0] - 0.5) + ',' + _f3n(b[1]) + ' ' +
+    _f3n(b[0] + 0.5) + ',' + _f3n(b[1]) + ' ' + _f3n(t[0] + 0.26) + ',' +
+    _f3n(t[1]) + ' ' + _f3n(t[0] - 0.26) + ',' + _f3n(t[1]) +
+    '" fill="#e8441f"/>';
+  // the chevrons up the sleeve
+  var i, u, p0, p1;
+  for (i = 1; i <= 3; i++) {
+    u = i / 4;
+    p0 = _f3Up(fx, _F3_ROD_FY, _F3_CHAIN_H * u);
+    s += '<line x1="' + _f3n(p0[0] - 0.33) + '" y1="' + _f3n(p0[1] + 0.22) +
+      '" x2="' + _f3n(p0[0]) + '" y2="' + _f3n(p0[1] - 0.12) +
+      '" stroke="#ffffff" stroke-width="0.17" stroke-opacity="0.85"/>';
+    s += '<line x1="' + _f3n(p0[0] + 0.33) + '" y1="' + _f3n(p0[1] + 0.22) +
+      '" x2="' + _f3n(p0[0]) + '" y2="' + _f3n(p0[1] - 0.12) +
+      '" stroke="#ffffff" stroke-width="0.17" stroke-opacity="0.85"/>';
+  }
+  // and the bullseye on top
+  var cy = t[1] - 0.82;
+  s += '<circle cx="' + _f3n(t[0]) + '" cy="' + _f3n(cy) + '" r="1.0" fill="#e8441f"/>';
+  s += '<circle cx="' + _f3n(t[0]) + '" cy="' + _f3n(cy) + '" r="0.62" fill="#121a2b"/>';
+  s += '<circle cx="' + _f3n(t[0]) + '" cy="' + _f3n(cy) + '" r="0.28" fill="#e8441f"/>';
+  return '<g data-f3="' + tag + '">' + s + '</g>';
+}
+
+function _f3DownBox(fx, n) {
+  var s = '';
+  var b = _f3Up(fx, _F3_CHAIN_FY, 0), t = _f3Up(fx, _F3_CHAIN_FY, _F3_CHAIN_H * 0.62);
+  s += '<polygon points="' + _f3n(b[0] - 0.46) + ',' + _f3n(b[1]) + ' ' +
+    _f3n(b[0] + 0.46) + ',' + _f3n(b[1]) + ' ' + _f3n(t[0] + 0.3) + ',' +
+    _f3n(t[1]) + ' ' + _f3n(t[0] - 0.3) + ',' + _f3n(t[1]) +
+    '" fill="#e8441f"/>';
+  var cy = t[1] - 1.55;
+  s += '<rect x="' + _f3n(t[0] - 1.3) + '" y="' + _f3n(cy - 1.5) +
+    '" width="2.6" height="3.0" rx="0.34" fill="#121a2b" stroke="#39445c"' +
+    ' stroke-width="0.18"/>';
+  s += '<text x="' + _f3n(t[0]) + '" y="' + _f3n(cy + 1.0) +
+    '" text-anchor="middle" font-size="2.7" font-weight="800"' +
+    ' fill="#f26a23" font-family="system-ui,sans-serif">' + n + '</text>';
+  return '<g data-f3="downbox">' + s + '</g>';
+}
+
+function _f3Chains(o) {
+  var EZ = 10;
+  var ball = (o.ballAbs != null) ? Number(o.ballAbs) : null;
+  if (ball == null || isNaN(ball) || ball < 0 || ball > 100) return '';
+  var dir = (o.possTeam === 'away') ? 1 : (o.possTeam === 'home' ? -1 : 0);
+  var dist = (o.distance != null) ? Number(o.distance) : null;
+  if (dist != null && (isNaN(dist) || dist <= 0)) dist = null;
+  var dn = (o.down != null && !isNaN(Number(o.down)) && Number(o.down) > 0)
+    ? Number(o.down) : null;
+  var s = '';
+  if (dir !== 0 && dist != null) {
+    // GOAL TO GO -- the line to gain is the goal line, and the crew
+    // still stands on it. Clamped rather than suppressed: the to-gain
+    // LINE is suppressed there because broadcasts stop drawing a second
+    // stripe over the goal line, but the rods are physical objects and
+    // they do not vanish.
+    var tg = ball + dir * dist;
+    if (tg > 100) tg = 100;
+    if (tg < 0) tg = 0;
+    var rear = tg - dir * 10;
+    if (rear > 100) rear = 100;
+    if (rear < 0) rear = 0;
+    // the chain itself, slack between the rods
+    var ra = _f3Up(EZ + rear, _F3_ROD_FY, 0.5);
+    var rb = _f3Up(EZ + tg, _F3_ROD_FY, 0.5);
+    s += '<path d="M' + _f3n(ra[0]) + ' ' + _f3n(ra[1]) + 'Q' +
+      _f3n((ra[0] + rb[0]) / 2) + ' ' + _f3n((ra[1] + rb[1]) / 2 + 0.55) + ' ' +
+      _f3n(rb[0]) + ' ' + _f3n(rb[1]) +
+      '" fill="none" stroke="#d2d7df" stroke-width="0.26" stroke-opacity="0.9"/>';
+    s += _f3ChainRod(EZ + rear, 'rod-rear');
+    s += _f3ChainRod(EZ + tg, 'rod-front');
+  }
+  if (dn) s += _f3DownBox(EZ + ball, dn);
+  return '<g data-f3="chains">' + s + '</g>';
+}
+
+function _f3LightSky() {
+  var s = _f3LightDefs();
+  // Full height, not just down to the far sideline. Stopping it there left a
+  // tonal step running off both sides of the frame where the backdrop ended
+  // and the page began; the turf hides the middle of it either way.
+  s += '<rect x="0" y="22" width="200" height="80" fill="url(#f3sky)"/>';
+  return s;
+}
+
 function _f3LightTowers() {
   var fl = _f3Proj(0, 0), fr = _f3Proj(_F3_LEN, 0);
   var baseY = fl[1];
@@ -69586,11 +70471,7 @@ function _f3LightTowers() {
   // evenly: evenly spaced, the inner two sat behind the board.
   var x0 = fl[0] - 28, x1 = fr[0] + 28, span = x1 - x0;
   var AT = [0.05, 0.26, 0.74, 0.95];
-  var s = _f3LightDefs();
-  // Full height, not just down to the far sideline. Stopping it there left a
-  // tonal step running off both sides of the frame where the backdrop ended
-  // and the page began; the turf hides the middle of it either way.
-  s += '<rect x="0" y="22" width="200" height="78" fill="url(#f3sky)"/>';
+  var s = '';
   for (var i = 0; i < AT.length; i++) s += _f3Tower(x0 + span * AT[i], baseY);
   return s;
 }
@@ -69626,10 +70507,20 @@ function _fwField3D(o) {
   // everything above that was empty sky. SBOARD put a scoreboard and four
   // light standards up there, so the top opens to y=26 to hold them. The
   // field itself does not move or change size: the element is simply taller.
-  var s = '<svg viewBox="0 22 200 78" style="width:100%;height:auto;display:block"' +
+  var s = '<svg viewBox="0 22 200 80" style="width:100%;height:auto;display:block"' +
     ' preserveAspectRatio="xMidYMid meet">';
 
-  // FLOODS -- first of all, because everything else stands in front of them.
+  // SKY -- the backdrop, and nothing else at this depth.
+  s += _f3LightSky();
+  // THE BOWL -- against the sky, behind everything solid.
+  s += _f3Bowl(o);
+  // TUNNEL -- cut into the face of the end stand, so after the bowl.
+  s += _f3Tunnel();
+  // FLOODS -- in FRONT of the bowl. They were behind it, which put three
+  // tiers of crowd over the lamps and left the field lit by nothing
+  // visible. A floodlight standard is the tallest thing in a ground and
+  // it stands outside the stand, so it crosses the roofline and the
+  // crowd, not the other way round.
   s += _f3LightTowers();
   // SBOARD -- between the inner pair of standards.
   s += _f3Scoreboard(o);
@@ -69654,9 +70545,11 @@ function _fwField3D(o) {
   s += _f3LightPools();
 
   // End zones in team colour, with the abbreviation painted on the grass.
+  s += '<g data-f3="ez">';
   s += '<polygon points="' + _f3Quad(0, EZ) + '" fill="' + awayCol + '" opacity="0.62"/>';
   s += '<polygon points="' + _f3Quad(_F3_LEN - EZ, _F3_LEN) + '" fill="' + homeCol +
     '" opacity="0.62"/>';
+  s += '</g>';
   var _ezA = _f3EndZoneFit(awayAbbr), _ezH = _f3EndZoneFit(homeAbbr);
   s += _f3EndZoneText(EZ / 2, awayAbbr, '#fff', 0.95, _ezA.adv, _ezA.hgt);
   s += _f3EndZoneText(_F3_LEN - EZ / 2, homeAbbr, '#fff', 0.95, _ezH.adv, _ezH.hgt);
@@ -69717,6 +70610,10 @@ function _fwField3D(o) {
   s += _f3Posts(0.6, '#f5d020');
   s += _f3Posts(_F3_LEN - 0.6, '#f5d020');
 
+  // SIDELINE -- benches and drinks on the apron, nearest the camera of
+  // anything in the frame and so drawn after all of the paint.
+  s += _f3Sideline(o);
+
   // ---- live furniture: scrimmage, to-gain ----
   var ball = (o.ballAbs != null) ? Number(o.ballAbs) : null;
   if (ball != null && !isNaN(ball) && ball >= 0 && ball <= 100) {
@@ -69732,6 +70629,10 @@ function _fwField3D(o) {
     var tg = ball + _dir * _dist;
     if (tg > 0 && tg < 100) s += _f3Line(EZ + tg, '#f5d020', 0.7, ' opacity="0.95"');
   }
+
+  // CHAINS -- after the scrimmage and to-gain lines, because the crew
+  // stands ON the paint, and before the arc, which is the top layer.
+  s += _f3Chains(o);
 
   // ---- the play arc ----
   // BIGPLAY -- before the live arc, so the latest play stays on top.
@@ -69912,7 +70813,10 @@ function _f3BigArcs(list, awayCol, homeCol) {
       (p.score ? 1.15 : 0.85) + '" fill="' + (p.score ? col : 'none') +
       '" stroke="' + col + '" stroke-width="0.5" stroke-opacity="' + op + '"/>';
   }
-  return g;
+  // BPFOCUS -- named, so how many arcs are on the grass is a thing that
+  // can be counted rather than inferred from a path tally shared with
+  // every other curve in the drawing.
+  return '<g data-f3="bigarcs">' + g + '</g>';
 }
 
 // ---- the big plays, spelled out -- BPLIST ---------------------------
@@ -69936,18 +70840,28 @@ function _bpQLabel(n) {
   return (n === 5) ? 'OT' : ('OT' + (n - 4));
 }
 
-function _fwBigPlayList(list, game, awayAccent, homeAccent) {
+function _fwBigPlayList(list, game, awayAccent, homeAccent, focus) {
   if (!list || !list.length) return '';
   var awayAbbr = (game && game.away && game.away.abbr) || 'AWAY';
   var homeAbbr = (game && game.home && game.home.abbr) || 'HOME';
+  var fi = (focus == null) ? -1 : focus;
   var html = '<div class="bpl-wrap">';
-  var i, p, col, abbr, when;
+  // BPFOCUS -- when one is isolated, say so and offer the way back. A
+  // view that has quietly stopped showing five of six things needs to
+  // admit it on screen, not only in the row highlight.
+  if (fi >= 0 && list[fi]) {
+    html += '<div class="bpl-hint" onclick="event.stopPropagation();_fwClearBigFocus()">' +
+      'SHOWING 1 OF ' + list.length + ' &middot; <b>SHOW ALL</b></div>';
+  }
+  var i, p, col, abbr, when, cls;
   for (i = 0; i < list.length; i++) {
     p = list[i];
     col = (p.side === 'away') ? awayAccent : homeAccent;
     abbr = (p.side === 'away') ? awayAbbr : homeAbbr;
     when = _bpQLabel(p.per) + (p.clock ? ' ' + p.clock : '');
-    html += '<div class="bpl-row">';
+    cls = 'bpl-row' + (fi < 0 ? '' : (i === fi ? ' on' : ' off'));
+    html += '<div class="' + cls + '" onclick="event.stopPropagation();_fwFocusBig(' +
+      i + ')" style="' + (i === fi ? '--bpl-accent:' + col + ';' : '') + '">';
     html += '<div class="bpl-yds" style="color:' + col + '">' + p.yds + '</div>';
     html += '<div class="bpl-mid">';
     html += '<div class="bpl-top"><span class="bpl-team" style="color:' + col +
@@ -69962,9 +70876,67 @@ function _fwBigPlayList(list, game, awayAccent, homeAccent) {
   return html + '</div>';
 }
 
+// ---- BPFOCUS: one big play at a time -----------------------------
+// Six arcs over one field is a thicket. Tapping a line in the list
+// isolates that play on the grass; tapping it again lets the rest back.
+//
+// The focus is held by the play's IDENTITY, not by its position in the
+// list. The list is sorted by yardage and rebuilt on every poll, so in a
+// live game a longer play arriving pushes everything down a slot -- and
+// an index-held focus would quietly jump to a different play without
+// anything looking wrong. Held by identity it either still finds its
+// play or drops, which is the honest pair of outcomes.
+function _fwBigKeyOf(p) {
+  if (!p) return '';
+  return [p.side, p.from, p.to, p.yds, p.per || '', p.clock || ''].join('|');
+}
+
+var _fwBigFocusKey = null;   // which play is isolated
+var _fwBigFocusGid = null;   // and which game it belongs to
+var _fwBigAllCur = null;     // the list the rendered rows were built from
+var _fwBigGidCur = null;     // and the game those rows belong to
+
+// The index of the focused play in THIS list, or -1. A focus set on
+// another game, or on a play that is no longer in the list, is no focus.
+function _fwBigFocusIdx(list, gid) {
+  if (!list || !list.length) return -1;
+  if (!_fwBigFocusKey || _fwBigFocusGid == null) return -1;
+  if (String(_fwBigFocusGid) !== String(gid)) return -1;
+  for (var i = 0; i < list.length; i++) {
+    if (_fwBigKeyOf(list[i]) === _fwBigFocusKey) return i;
+  }
+  return -1;
+}
+
+// Which arcs the field is given: none when they are switched off, the
+// focused one alone when one is focused, otherwise all of them.
+function _fwBigDrawList(all, show, fi) {
+  if (!show || !all || !all.length) return [];
+  if (fi != null && fi >= 0 && all[fi]) return [all[fi]];
+  return all;
+}
+
+function _fwFocusBig(i) {
+  var list = _fwBigAllCur || [];
+  var p = list[i];
+  if (!p) return;
+  var key = _fwBigKeyOf(p);
+  if (_fwBigFocusKey === key) { _fwBigFocusKey = null; _fwBigFocusGid = null; }
+  else { _fwBigFocusKey = key; _fwBigFocusGid = _fwBigGidCur; }
+  try { if (typeof renderFieldStadium === 'function') renderFieldStadium(); } catch (e) {}
+}
+
+function _fwClearBigFocus() {
+  _fwBigFocusKey = null; _fwBigFocusGid = null;
+  try { if (typeof renderFieldStadium === 'function') renderFieldStadium(); } catch (e) {}
+}
+
 function _fwToggleBig() {
   var now = !_fwBigOn();
   try { localStorage.setItem(_FW_BIG_KEY, now ? '1' : '0'); } catch (e) {}
+  // Hiding them drops the focus too, or turning them back on would come
+  // up showing one arc with no sign of why.
+  _fwBigFocusKey = null; _fwBigFocusGid = null;
   try { if (typeof renderFieldStadium === 'function') renderFieldStadium(); } catch (e) {}
 }
 
@@ -71082,12 +72054,16 @@ function renderFieldStadium() {
     catch (eF3) { _f3i = {}; }
     // BIGPLAY -- found whether or not they are being shown, because the
     // button has to say how many there are before you turn it on.
-    var _fwBigAll = [], _fwBigShow = false, _fwBigList = [];
+    var _fwBigAll = [], _fwBigShow = false, _fwBigList = [], _fwBigFi = -1;
     try {
       _fwBigAll = _fwBigPlays(data, game) || [];
       _fwBigShow = _fwBigOn();
-      _fwBigList = _fwBigShow ? _fwBigAll : [];
-    } catch (eBp) { _fwBigAll = []; _fwBigList = []; }
+      // BPFOCUS -- the rows the user can tap are these ones, in this game
+      _fwBigAllCur = _fwBigAll;
+      _fwBigGidCur = game.id;
+      _fwBigFi = _fwBigShow ? _fwBigFocusIdx(_fwBigAll, game.id) : -1;
+      _fwBigList = _fwBigDrawList(_fwBigAll, _fwBigShow, _fwBigFi);
+    } catch (eBp) { _fwBigAll = []; _fwBigList = []; _fwBigFi = -1; }
     html += '<div style="padding:8px 10px 6px;border-bottom:' + divStyle + '">';
     html += _fwField3D({
       awayAbbr: game.away.abbr, homeAbbr: game.home.abbr,
@@ -71111,7 +72087,17 @@ function renderFieldStadium() {
       ballOn: (ballAbs == null || isNaN(ballAbs)) ? null :
         Math.round(ballAbs > 50 ? (100 - ballAbs) : ballAbs),
       awayTol: awayTimeouts, homeTol: homeTimeouts,
-      boardName: (theme.nickname || theme.name || game.venue || ''),
+      // NEUTRALBOARD -- the board over the field said EVERBANK STADIUM
+      // for a Texans-Jaguars game at Wembley, while the header three
+      // inches above it said WEMBLEY STADIUM, LONDON, ENGLAND, NEUTRAL
+      // SITE. The header works that out properly -- _fwVenueOff is
+      // already true and _fwVenueReal already holds the real ground --
+      // and then this line threw all of it away and asked the HOME
+      // CLUB'S theme instead. The same mistake was caught once before
+      // for the city (see the note above about a match at Tottenham
+      // printing Jacksonville); the board was missed that time.
+      boardName: (_fwVenueOff ? _fwVenueReal
+        : (theme.nickname || theme.name || game.venue || '')),
       bigPlays: _fwBigList                      // BIGPLAY
     });
     // The toggle sits under the field it draws on. Off by default, and the
@@ -71125,7 +72111,7 @@ function renderFieldStadium() {
       // BPLIST -- the arcs say where, this says who and what.
       if (_fwBigShow) {
         try {
-          html += _fwBigPlayList(_fwBigAll, game, awayAccent, homeAccent);
+          html += _fwBigPlayList(_fwBigAll, game, awayAccent, homeAccent, _fwBigFi);
         } catch (eBl) { try { console.error('Big play list:', eBl); } catch (e8) {} }
       }
     }
@@ -91844,7 +92830,16 @@ function _stLift(hex, want) {
   // No chroma: there is no hue to preserve and lifting only yields grey, so
   // the callers that know what to do about that are left to do it.
   if (!c || c.chroma < 0.04) return hex;
-  var out = hex, l = c.l, sat = Math.max(c.s, 0.55), guard = 0;
+  // COLLEGECOL -- the note above this function says "hue and saturation
+  // are held", and until now the next line said sat = max(c.s, 0.55),
+  // which holds neither. Every muted colour was forced to 55% saturation
+  // on its way up, and that is what turned Virginia's #232D4B into a
+  // periwinkle the school does not own: its real saturation is 36%.
+  // A school that wears a muted navy should come out wearing a muted
+  // navy, just light enough to read. The small floor that remains is
+  // only there to stop a nearly-grey colour bleaching to white as it
+  // lifts -- a washed-out pastel is its own kind of unreadable.
+  var out = hex, l = c.l, sat = Math.max(c.s, 0.30), guard = 0;
   while (guard < 40 && l < 0.92 &&
          ((_luminance(out) + 0.05) / (bg + 0.05)) < want) {
     l += 0.02; guard++;
