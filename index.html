@@ -11385,6 +11385,12 @@
   }
 
   /* Weather */
+  /* FWWX -- the conditions chip on the field's venue strip */
+  .fw-wx-chip {
+    font-family: 'Barlow Condensed', sans-serif; font-size: 9px;
+    font-weight: 700; letter-spacing: 0.12em; margin-left: 10px;
+    color: rgba(255,255,255,0.42);
+  }
   .fw-weather {
     display: flex; gap: 16px; padding: 8px 16px; align-items: center;
     border-bottom: 1px solid #060708;
@@ -69916,6 +69922,280 @@ function _f3Scoreboard(o) {
 // row of televisions. They straddle the frame instead.
 var _F3_TOWERS = 4;
 
+// ---- FWWX: the weather, as the field needs it ------------------------
+//
+// ESPN hands this over on the game it is already parsed onto -- temperature,
+// conditionId, gust and precipitation. A live probe of a Saints-at-Giants
+// match returned:
+//
+//   {"temperature":59,"highTemperature":59,"lowTemperature":59,
+//    "conditionId":"Sunny","gust":4,"precipitation":0}
+//
+// THAT IS THE ONLY SAMPLE I HAVE, AND IT IS A FINE DAY. What conditionId
+// says for rain or snow is unknown: ESPN ships a word here and a numeric
+// AccuWeather icon code in other feeds. So this matches BOTH, on
+// substrings rather than on an exact vocabulary, and anything it does not
+// recognise falls to clear rather than guessing. A field drawn in clear
+// weather when it is drizzling is a small miss; a blizzard on a fine day
+// because a word was mismapped is a loud one.
+var _F3_WX_WORDS = [
+  ['snow', 'snow'], ['sleet', 'snow'], ['flurr', 'snow'], ['blizzard', 'snow'],
+  ['wintry', 'snow'], ['ice', 'snow'], ['freezing', 'snow'],
+  ['thunder', 'storm'], ['tstorm', 'storm'], ['t-storm', 'storm'],
+  ['rain', 'rain'], ['shower', 'rain'], ['drizzle', 'rain'],
+  ['fog', 'fog'], ['mist', 'fog'], ['haze', 'fog'],
+  ['overcast', 'overcast'], ['cloudy', 'cloud'], ['cloud', 'cloud'],
+  ['sun', 'clear'], ['clear', 'clear'], ['fair', 'clear']
+];
+
+// AccuWeather's icon numbers, which is what conditionId carries when it is
+// numeric. Ranges rather than a table of 44: the groups are contiguous.
+function _f3WxFromCode(n) {
+  if (n >= 1 && n <= 5) return 'clear';
+  if (n >= 6 && n <= 8) return 'cloud';
+  if (n === 11) return 'fog';
+  if (n >= 12 && n <= 14) return 'rain';
+  if (n >= 15 && n <= 17) return 'storm';
+  if (n === 18) return 'rain';
+  if (n >= 19 && n <= 23) return 'snow';
+  if (n >= 24 && n <= 26) return 'snow';
+  if (n === 29) return 'snow';
+  if (n >= 30 && n <= 31) return 'clear';
+  if (n >= 32 && n <= 34) return 'clear';
+  if (n >= 35 && n <= 38) return 'cloud';
+  if (n >= 39 && n <= 40) return 'rain';
+  if (n >= 41 && n <= 42) return 'storm';
+  if (n >= 43 && n <= 44) return 'snow';
+  return '';
+}
+
+function _f3WxKind(conditionId) {
+  var raw = String(conditionId == null ? '' : conditionId).trim();
+  if (!raw) return '';
+  // numeric first: "12" is a code, not a word with a 1 in it
+  if (/^\d+$/.test(raw)) {
+    var k = _f3WxFromCode(parseInt(raw, 10));
+    if (k) return k;
+  }
+  var low = raw.toLowerCase();
+  for (var i = 0; i < _F3_WX_WORDS.length; i++) {
+    if (low.indexOf(_F3_WX_WORDS[i][0]) > -1) return _F3_WX_WORDS[i][1];
+  }
+  return '';
+}
+
+// Roofed NFL grounds. ESPN reports the weather OUTSIDE a dome, which is
+// true and useless: it would snow on a game being played indoors. There
+// is park metadata carrying a roof field for baseball and nothing like it
+// for football, so this is a list -- short, and it only ever has to name
+// the grounds that have a roof at all.
+var _F3_ROOFED = {
+  ATL: 1, ARI: 1, DAL: 1, DET: 1, HOU: 1, IND: 1,
+  LV: 1, LAR: 1, LAC: 1, MIN: 1, NO: 1
+};
+
+// F3DOME -- and the shorter list of grounds that get a CEILING DRAWN.
+//
+// These two lists are deliberately different, because they answer two
+// different questions and the cost of being wrong is not the same.
+//
+// Atlanta, Dallas, Houston, Arizona and Indianapolis have roofs that
+// OPEN, and nothing in ESPN's payload says whether the roof was open for
+// a given game. Drawing a sealed dome over a match played under open sky
+// is a loud mistake you would spot instantly. Suppressing rain at a
+// ground whose roof was in fact open is a quiet one -- the pitch just
+// looks dry.
+//
+// So the retractables keep their weather suppressed, which is right far
+// more often than not, and keep an open sky overhead, which cannot be
+// embarrassingly wrong. Only the four grounds that are ALWAYS closed get
+// a lid drawn over them. SoFi is left out on purpose: its canopy covers
+// the bowl but the sides are open and daylight reaches the pitch, so it
+// is closer to an open ground than a dome.
+var _F3_DOMED = { DET: 1, MIN: 1, NO: 1, LV: 1 };
+
+function _f3WxRead(game) {
+  var w = (game && game.weather) || null;
+  if (!w) return null;
+  var home = (game && game.home && game.home.abbr) || '';
+  var hk = String(home).toUpperCase();
+  var roofed = !!_F3_ROOFED[hk];
+  var domed = !!_F3_DOMED[hk];
+  var kind = _f3WxKind(w.conditionId);
+  var t = (w.temperature != null) ? Number(w.temperature) : null;
+  if (t != null && isNaN(t)) t = null;
+  var g = (w.gust != null) ? Number(w.gust) : null;
+  if (g != null && isNaN(g)) g = null;
+  return {
+    temp: t,
+    gust: g,
+    precip: (w.precipitation != null) ? Number(w.precipitation) : null,
+    // indoors the sky is a roof: the temperature still reads, the weather
+    // does not fall on the pitch
+    kind: roofed ? 'roof' : (kind || 'clear'),
+    roofed: roofed,
+    domed: domed,
+    raw: String(w.conditionId == null ? '' : w.conditionId)
+  };
+}
+
+// ---- F3DAY: is this a day game -----------------------------------------
+// The field has always drawn a floodlit night, which is wrong for about
+// half the schedule. ESPN's kickoff is UTC and nothing in the payload says
+// what the clock reads at the ground, so this keys off the UTC hour: an
+// American afternoon kickoff lands between 13:00 and 23:59 UTC (1pm ET is
+// 18:00, 4.25pm ET is 21:25), a night kickoff after midnight UTC (8.20pm
+// ET is 01:20), and a London game at 2.30pm local is 14:30. It is an
+// approximation and it says so: a late-autumn 4.25pm kickoff finishes
+// under lights and will still be drawn as day.
+// The conditions in words, for the venue strip. No glyph table: the first
+// pass had one and nothing used it, and two of its escapes were \u with
+// five hex digits, which is a four-digit escape followed by a stray
+// character rather than the emoji intended. Dead code that is also wrong
+// is worse than no code.
+function _fwWxChip(game) {
+  var wx = _f3WxRead(game);
+  if (!wx) return '';
+  var bits = [];
+  if (wx.temp != null) bits.push(Math.round(wx.temp) + '\u00b0');
+  // the feed's own word, not my bucket for it: "Mostly Cloudy" is better
+  // than "CLOUD", and if the vocabulary surprises me the chip still says
+  // something true even when the field drew clear weather.
+  if (wx.raw) bits.push(String(wx.raw).toUpperCase());
+  if (wx.roofed) bits.push('INDOORS');
+  else if (wx.gust != null && wx.gust >= 10) bits.push('GUST ' + Math.round(wx.gust));
+  if (!bits.length) return '';
+  return '<span class="fw-wx-chip">' + skEscapeMaybe(bits.join(' \u00b7 ')) + '</span>';
+}
+
+function _f3IsDayGame(game) {
+  var d = game && game.date;
+  if (!d) return false;
+  var t = new Date(d);
+  if (isNaN(t.getTime())) return false;
+  var h = t.getUTCHours();
+  return h >= 13 && h <= 23;
+}
+
+// ---- FWWX: what the weather does to the picture ----------------------
+// Two layers, because precipitation is in two places at once: lying on
+// the ground, and falling between the camera and everything else. The
+// ground layer goes down with the turf; the falling layer goes over the
+// field but UNDER the scrimmage lines and the play arc, which are
+// telestration drawn on top of a picture rather than things in the
+// weather.
+//
+// Deterministic, seeded once. The crowd learned this first: a field that
+// re-randomises its snowfall every time the score changes is a field
+// that flickers.
+function _f3WxRnd(seed) {
+  var s = seed;
+  return function () { s = (s * 1103515245 + 12345) % 2147483648; return s / 2147483648; };
+}
+
+function _f3WxGround(o) {
+  var wx = o.wx; if (!wx) return '';
+  var k = wx.kind, s = '';
+  if (k === 'snow') {
+    // lying snow on the PITCH. The free zone gets its own pass further
+    // down: the sideline paints its apron after this point, and the first
+    // attempt put snow under it where nobody could see it.
+    s += '<polygon points="' + _f3Quad(0, _F3_LEN) +
+      '" fill="#eaf1f8" fill-opacity="0.34"/>';
+    s += '<polygon points="' + _f3Patch(-40, _F3_LEN + 40, _F3_WID, _F3_WID + 1.6) +
+      '" fill="#f4f8fc" fill-opacity="0.8"/>';
+  } else if (k === 'rain' || k === 'storm') {
+    // wet grass is DARKER, not lighter, and it throws the lights back
+    s += '<polygon points="' + _f3Quad(0, _F3_LEN) +
+      '" fill="#0a1a12" fill-opacity="0.3"/>';
+    var r = _f3WxRnd(70413), i, px, py;
+    for (i = 0; i < 26; i++) {
+      px = _f3Proj(r() * _F3_LEN, r() * _F3_WID);
+      s += '<ellipse cx="' + _f3n(px[0]) + '" cy="' + _f3n(px[1]) +
+        '" rx="' + _f3n(3 + r() * 7) + '" ry="' + _f3n(0.5 + r() * 0.8) +
+        '" fill="#cfe4ff" fill-opacity="' + _f3n(0.05 + r() * 0.07) + '"/>';
+    }
+  }
+  return s ? '<g data-f3="wxground">' + s + '</g>' : '';
+}
+
+// Snow lying on the free zone, over the benches and the drinks rather
+// than under them -- it falls on the furniture too.
+function _f3WxApron(o) {
+  var wx = o.wx;
+  if (!wx || wx.kind !== 'snow') return '';
+  return '<g data-f3="wxapron"><polygon points="' +
+    _f3Patch(-40, _F3_LEN + 40, _F3_WID + 1.2, _F3_APRON) +
+    '" fill="#eef3f8" fill-opacity="0.55"/></g>';
+}
+
+function _f3WxFall(o) {
+  var wx = o.wx; if (!wx) return '';
+  var k = wx.kind;
+  if (k !== 'snow' && k !== 'rain' && k !== 'storm' && k !== 'fog') return '';
+  var day = !!o.isDay;
+  // a gust blows precipitation off the vertical. 40mph is about as hard
+  // as it sensibly leans; past that it stops reading as weather.
+  var g = (wx.gust != null && !isNaN(wx.gust)) ? Number(wx.gust) : 0;
+  var tilt = Math.max(-0.6, Math.min(0.6, g / 40));
+  var Y0 = 22, Y1 = 102, s = '', i, x, y, d, a;
+  var r = _f3WxRnd(19551107);
+
+  if (k === 'fog') {
+    // Densest at the FAR STAND, which is the most distant thing in the
+    // frame, and thinning both above it and toward the camera. The first
+    // version was densest at the top of the box and the scoreboard --
+    // the one thing on this screen that has to stay readable -- sat
+    // behind the thickest part of it.
+    s += '<defs><linearGradient id="f3fog" x1="0" y1="0" x2="0" y2="1">' +
+      '<stop offset="0" stop-color="' + (day ? '#cdd6de' : '#59616b') +
+      '" stop-opacity="0.06"/>' +
+      '<stop offset="0.42" stop-color="' + (day ? '#d2dae2' : '#525a65') +
+      '" stop-opacity="0.2"/>' +
+      '<stop offset="0.62" stop-color="' + (day ? '#d6dee5' : '#4b535d') +
+      '" stop-opacity="0.66"/>' +
+      '<stop offset="0.82" stop-color="' + (day ? '#dae1e8' : '#474f59') +
+      '" stop-opacity="0.4"/>' +
+      '<stop offset="1" stop-color="' + (day ? '#dde4ea' : '#444c56') +
+      '" stop-opacity="0.1"/></linearGradient></defs>';
+    s += '<rect x="0" y="' + Y0 + '" width="200" height="' + (Y1 - Y0) +
+      '" fill="url(#f3fog)"/>';
+    return '<g data-f3="wxfall">' + s + '</g>';
+  }
+
+  if (k === 'snow') {
+    // Depth comes from size and opacity, not from count: a fleck near the
+    // camera is bigger and brighter, one at the back is a faint speck.
+    for (i = 0; i < 260; i++) {
+      x = r() * 206 - 3;
+      y = Y0 + r() * (Y1 - Y0);
+      d = (y - Y0) / (Y1 - Y0);              // 0 far, 1 near
+      s += '<circle cx="' + _f3n(x + tilt * (1 - d) * 6) + '" cy="' + _f3n(y) +
+        '" r="' + _f3n(0.22 + d * 0.62 + r() * 0.2) +
+        '" fill="#ffffff" fill-opacity="' + _f3n(0.38 + d * 0.5) + '"/>';
+    }
+    return '<g data-f3="wxfall">' + s + '</g>';
+  }
+
+  // rain and storm: streaks, leaning with the gust
+  var col = day ? '#dfe9f4' : '#cfe0f5';
+  for (i = 0; i < 230; i++) {
+    x = r() * 212 - 6;
+    y = Y0 + r() * (Y1 - Y0);
+    d = (y - Y0) / (Y1 - Y0);
+    a = 1.6 + d * 4.2 + r() * 1.4;           // longer as it nears the camera
+    s += '<line x1="' + _f3n(x) + '" y1="' + _f3n(y) + '" x2="' +
+      _f3n(x + tilt * a) + '" y2="' + _f3n(y + a) + '" stroke="' + col +
+      '" stroke-width="' + _f3n(0.14 + d * 0.22) +
+      '" stroke-opacity="' + _f3n(0.16 + d * 0.3) + '"/>';
+  }
+  if (k === 'storm') {
+    s += '<rect x="0" y="' + Y0 + '" width="200" height="' + (Y1 - Y0) +
+      '" fill="#0b1018" fill-opacity="0.22"/>';
+  }
+  return '<g data-f3="wxfall">' + s + '</g>';
+}
+
 function _f3LightDefs() {
   return '<defs>' +
     '<radialGradient id="f3glow">' +
@@ -69938,6 +70218,23 @@ function _f3LightDefs() {
     '<stop offset="0.66" stop-color="#0a1322" stop-opacity="0.85"/>' +
     '<stop offset="1" stop-color="#0a1322" stop-opacity="0.85"/>' +
     '</linearGradient>' +
+    // F3DAY -- the daylight skies. One per condition rather than one sky
+    // dimmed, because an overcast afternoon is not a blue sky with the
+    // brightness turned down: it is flatter AND greyer AND has no gradient
+    // to speak of, which is most of what makes it read as overcast.
+    '<linearGradient id="f3skyDay" x1="0" y1="0" x2="0" y2="1">' +
+    '<stop offset="0" stop-color="#6f9dc8"/>' +
+    '<stop offset="0.62" stop-color="#9dc0dc"/>' +
+    '<stop offset="1" stop-color="#c3d7e6"/></linearGradient>' +
+    '<linearGradient id="f3skyGrey" x1="0" y1="0" x2="0" y2="1">' +
+    '<stop offset="0" stop-color="#6b727c"/>' +
+    '<stop offset="0.62" stop-color="#848b95"/>' +
+    '<stop offset="1" stop-color="#9aa0a8"/></linearGradient>' +
+    '<linearGradient id="f3skyMurk" x1="0" y1="0" x2="0" y2="1">' +
+    '<stop offset="0" stop-color="#12161d" stop-opacity="0.2"/>' +
+    '<stop offset="0.66" stop-color="#1b212b" stop-opacity="0.9"/>' +
+    '<stop offset="1" stop-color="#1b212b" stop-opacity="0.9"/>' +
+    '</linearGradient>' +
     '</defs>';
 }
 
@@ -69945,18 +70242,24 @@ function _f3LightDefs() {
 // top, the halo around it and the shaft of light it drops. The foot runs
 // below the far sideline so the turf covers it and the tower reads as
 // standing behind the bowl rather than on it.
-function _f3Tower(bx, baseY) {
+function _f3Tower(bx, baseY, lit) {
   var POLE = 18, BW = 13, BH = 3.8;
   var ty = baseY - POLE;
   var s = '<g data-f3="tower">';
-  s += '<ellipse cx="' + _f3n(bx) + '" cy="' + _f3n(ty + BH / 2) +
-    '" rx="13" ry="9" fill="url(#f3glow)"/>';
-  // the shaft, aimed down the field toward the near sideline
-  s += '<polygon points="' + _f3n(bx - BW / 2) + ',' + _f3n(ty + BH) + ' ' +
-    _f3n(bx + BW / 2) + ',' + _f3n(ty + BH) + ' ' +
-    _f3n(bx + 24) + ',' + _f3n(baseY + 22) + ' ' +
-    _f3n(bx - 24) + ',' + _f3n(baseY + 22) +
-    '" fill="url(#f3beam)"/>';
+  // F3DAY -- in daylight the standards are still THERE. They are steel in
+  // the air whether or not anyone has switched them on, and deleting them
+  // for a day game left the sky oddly empty. What goes is the halo and
+  // the shaft, because there is no beam to see in sunlight.
+  if (lit !== false) {
+    s += '<ellipse cx="' + _f3n(bx) + '" cy="' + _f3n(ty + BH / 2) +
+      '" rx="13" ry="9" fill="url(#f3glow)"/>';
+    // the shaft, aimed down the field toward the near sideline
+    s += '<polygon points="' + _f3n(bx - BW / 2) + ',' + _f3n(ty + BH) + ' ' +
+      _f3n(bx + BW / 2) + ',' + _f3n(ty + BH) + ' ' +
+      _f3n(bx + 24) + ',' + _f3n(baseY + 22) + ' ' +
+      _f3n(bx - 24) + ',' + _f3n(baseY + 22) +
+      '" fill="url(#f3beam)"/>';
+  }
   s += '<line x1="' + _f3n(bx) + '" y1="' + _f3n(baseY + 4) + '" x2="' + _f3n(bx) +
     '" y2="' + _f3n(ty + BH) + '" stroke="#4b5c78" stroke-width="1.1"/>';
   // two stays, which is what stops it reading as a lollipop
@@ -69975,7 +70278,7 @@ function _f3Tower(bx, baseY) {
       lx = bx - BW / 2 + (BW / cols) * (ci + 0.5);
       ly = ty + (BH / rows) * (ri + 0.5);
       s += '<circle cx="' + _f3n(lx) + '" cy="' + _f3n(ly) + '" r="0.72"' +
-        ' fill="#fffbe6"/>';
+        ' fill="' + (lit === false ? '#2b3645' : '#fffbe6') + '"/>';
     }
   }
   return s + '</g>';
@@ -70041,7 +70344,18 @@ function _f3Bowl(o) {
   // is how the rest of this file is built -- _f3Up already shrinks a
   // height with distance, which is why the back tier needs a big
   // number to clear the front one at all.
-  var TIERS = [
+  // F3DAY -- a stand lit by the sun is not a stand lit by floodlights
+  // with the brightness raised: the near tier catches the light and the
+  // back of the bowl stays in its own shadow, which is the opposite of
+  // the night case where the back rows are the ones nearest the lamps.
+  // F3DOME -- a roofed crowd is lit like a day crowd: evenly, to the back
+  // row, because nothing is throwing a beam across them.
+  var _dy = !!(o && (o.isDay || (o.wx && o.wx.domed)));
+  var TIERS = _dy ? [
+    { d0: 0,  d1: 11, h0: 0,  h1: 16, fill: '#59616e' },
+    { d0: 11, d1: 20, h0: 16, h1: 25, fill: '#4c5461' },
+    { d0: 20, d1: 27, h0: 25, h1: 32, fill: '#3e4654' }
+  ] : [
     { d0: 0,  d1: 11, h0: 0,  h1: 16, fill: '#171d26' },
     { d0: 11, d1: 20, h0: 16, h1: 25, fill: '#141a22' },
     { d0: 20, d1: 27, h0: 25, h1: 32, fill: '#10151c' }
@@ -70068,7 +70382,9 @@ function _f3Bowl(o) {
   // twenty, and the rest the greys and browns a crowd actually is.
   var seed = 19200101;
   function rnd() { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; }
-  var NEUT = ['#3b4250', '#4a5160', '#55504a', '#2f3542', '#5b5f6b', '#464b44'];
+  var NEUT = _dy
+    ? ['#8e949e', '#a6abb3', '#9b9289', '#7d838f', '#b2b6bd', '#8a9083']
+    : ['#3b4250', '#4a5160', '#55504a', '#2f3542', '#5b5f6b', '#464b44'];
   var dots = '';
   for (i = 0; i < TIERS.length; i++) {
     var tt = TIERS[i];
@@ -70102,8 +70418,10 @@ function _f3Bowl(o) {
   for (q2 = 0; q2 < roof.length; q2++) {
     rp += (q2 ? 'L' : 'M') + _f3n(roof[q2][0]) + ' ' + _f3n(roof[q2][1]);
   }
-  s += '<path d="' + rp + '" fill="none" stroke="#2b3340" stroke-width="1.4"/>';
-  s += '<path d="' + rp + '" fill="none" stroke="#454f5e" stroke-width="0.5"/>';
+  s += '<path d="' + rp + '" fill="none" stroke="' +
+    (_dy ? '#6c7483' : '#2b3340') + '" stroke-width="1.4"/>';
+  s += '<path d="' + rp + '" fill="none" stroke="' +
+    (_dy ? '#99a1ae' : '#454f5e') + '" stroke-width="0.5"/>';
 
   // The lip along the front of the stand, which is what separates it
   // from the grass instead of letting the crowd bleed onto the field.
@@ -70301,15 +70619,17 @@ function _f3Sideline(o) {
   var home = o.homeColor || '#888', away = o.awayColor || '#888';
   var s = '';
   // the apron itself, running off both sides of the frame
+  var _apD = !!(o && o.isDay);
   s += '<defs><linearGradient id="f3apron" x1="0" y1="0" x2="0" y2="1">' +
-    '<stop offset="0" stop-color="#363d47"/>' +
-    '<stop offset="0.45" stop-color="#242a33"/>' +
-    '<stop offset="1" stop-color="#11151b"/></linearGradient></defs>';
+    '<stop offset="0" stop-color="' + (_apD ? '#7b8390' : '#363d47') + '"/>' +
+    '<stop offset="0.45" stop-color="' + (_apD ? '#646b77' : '#242a33') + '"/>' +
+    '<stop offset="1" stop-color="' + (_apD ? '#4d545e' : '#11151b') + '"/>' +
+    '</linearGradient></defs>';
   s += '<polygon points="' + _f3Patch(-40, _F3_LEN + 40, _F3_WID, _F3_APRON) +
     '" fill="url(#f3apron)"/>';
   // the grass verge between the paint and the concrete
   s += '<polygon points="' + _f3Patch(-40, _F3_LEN + 40, _F3_WID, _F3_WID + 3.0) +
-    '" fill="#1a3522"/>';
+    '" fill="' + (_apD ? '#2b5c37' : '#1a3522') + '"/>';
   // the white sideline border
   s += '<polygon points="' + _f3Patch(-40, _F3_LEN + 40, _F3_WID + 3.0, _F3_WID + 3.8) +
     '" fill="#9aa3ae" fill-opacity="0.35"/>';
@@ -70495,8 +70815,123 @@ function _f3Chains(o) {
   return '<g data-f3="chains">' + s + '</g>';
 }
 
-function _f3LightSky() {
+// ---- F3DOME: the eleven grounds with a lid --------------------------
+//
+// A roofed ground is not an open one with the weather switched off. The
+// sky is a ceiling, the light comes from a rig hung off it rather than
+// from four standards outside the bowl, and the crowd is lit evenly all
+// the way to the back because nothing is casting a beam across them.
+//
+// The ceiling meets the TOP OF THE BOWL rather than a drawn line: the
+// bowl's own roofline is already computed, so the lid lands exactly on
+// it at every point and the two cannot drift apart.
+function _f3Dome(o) {
+  var s = '', i, k;
+  var roof = _f3BowlEdge(27, 32);
+  // only the upper arc of that edge is the back of the stand; the ends
+  // run forward past the camera and would wrap the lid around the field
+  var up = [];
+  for (i = 0; i < roof.length; i++) {
+    if (roof[i][1] < 58) up.push(roof[i]);
+  }
+  if (up.length < 2) return '';
+
+  s += '<defs>' +
+    '<linearGradient id="f3roof" x1="0" y1="0" x2="0" y2="1">' +
+    '<stop offset="0" stop-color="#1b212c"/>' +
+    '<stop offset="0.55" stop-color="#262e3b"/>' +
+    '<stop offset="1" stop-color="#323b4a"/></linearGradient>' +
+    '<radialGradient id="f3panel">' +
+    '<stop offset="0" stop-color="#fff8e2" stop-opacity="0.85"/>' +
+    '<stop offset="0.45" stop-color="#ffeec2" stop-opacity="0.3"/>' +
+    '<stop offset="1" stop-color="#ffe8ae" stop-opacity="0"/>' +
+    '</radialGradient>' +
+    '<linearGradient id="f3domewash" x1="0" y1="0" x2="0" y2="1">' +
+    '<stop offset="0" stop-color="#fff4d8" stop-opacity="0.1"/>' +
+    '<stop offset="1" stop-color="#fff4d8" stop-opacity="0"/>' +
+    '</linearGradient></defs>';
+
+  // the lid itself, from the top of the frame down onto the bowl
+  var p = 'M0 22 L200 22 L200 ' + _f3n(up[up.length - 1][1]);
+  for (k = up.length - 1; k >= 0; k--) {
+    p += 'L' + _f3n(up[k][0]) + ' ' + _f3n(up[k][1]);
+  }
+  p += 'L0 ' + _f3n(up[0][1]) + 'Z';
+  s += '<path d="' + p + '" fill="url(#f3roof)"/>';
+
+  // the ribs. A roof this size is held up by something, and a flat fill
+  // reads as a power cut rather than as a building.
+  // The first pass drew these at half a unit and 0.75 opacity and they
+  // came out as scratches on the ceiling rather than as the thing holding
+  // it up. A truss is structure: it reads, or it should not be there.
+  var apexX = 100, apexY = 10;
+  for (i = 0; i <= 16; i++) {
+    var t = i / 16;
+    var ex = -16 + 232 * t;
+    var ey = 44 + (1 - Math.abs(t - 0.5) * 2) * 14;
+    // each rib cased dark then lit along its edge, the way every other
+    // standing thing in this drawing is built
+    s += '<line x1="' + _f3n(apexX) + '" y1="' + apexY + '" x2="' + _f3n(ex) +
+      '" y2="' + _f3n(ey) + '" stroke="#10151d" stroke-width="1.5"/>';
+    s += '<line x1="' + _f3n(apexX) + '" y1="' + apexY + '" x2="' + _f3n(ex) +
+      '" y2="' + _f3n(ey) + '" stroke="#55627a" stroke-width="0.6"/>';
+  }
+  // the rings that tie them together, and the catwalk slung under them
+  for (i = 1; i <= 4; i++) {
+    var ry = 19 + i * 6.5;
+    s += '<path d="M-10 ' + _f3n(ry + 7) + ' Q100 ' + _f3n(ry - 9) + ' 210 ' +
+      _f3n(ry + 7) + '" fill="none" stroke="#10151d" stroke-width="1.1"/>';
+    s += '<path d="M-10 ' + _f3n(ry + 7) + ' Q100 ' + _f3n(ry - 9) + ' 210 ' +
+      _f3n(ry + 7) + '" fill="none" stroke="#4d5a70" stroke-width="0.45"/>';
+  }
+  // A compression ring at the crown went here and was deleted: at cy 12
+  // with ry 5 it spanned y 7 to 17, and this box starts at y 22. It was
+  // drawing nobody could ever see. The ribs converge above the frame,
+  // which is what a camera under a roof sees anyway -- the crown is
+  // behind the scoreboard.
+
+  // the light rig: banks hung off the ceiling, which is where a dome's
+  // light actually comes from
+  var BANKS = [22, 42, 62, 100, 138, 158, 178];
+  for (i = 0; i < BANKS.length; i++) {
+    var bx = BANKS[i];
+    var by = 34 + Math.abs(bx - 100) * 0.055;
+    s += '<ellipse cx="' + _f3n(bx) + '" cy="' + _f3n(by + 3) +
+      '" rx="13" ry="8" fill="url(#f3panel)"/>';
+    s += '<rect x="' + _f3n(bx - 6) + '" y="' + _f3n(by) + '" width="12"' +
+      ' height="2.6" rx="0.5" fill="#11161f" stroke="#49556a"' +
+      ' stroke-width="0.25"/>';
+    var c, cx;
+    for (c = 0; c < 4; c++) {
+      cx = bx - 6 + 3 * (c + 0.5);
+      s += '<circle cx="' + _f3n(cx) + '" cy="' + _f3n(by + 1.3) +
+        '" r="0.62" fill="#fffbe8"/>';
+    }
+  }
+  // the wash the rig throws down over the back of the stand
+  s += '<rect x="0" y="22" width="200" height="46" fill="url(#f3domewash)"/>';
+  return '<g data-f3="dome">' + s + '</g>';
+}
+
+function _f3LightSky(day, wx) {
+  // F3DOME -- a lid instead of a sky. Day and night mean nothing under
+  // one, which is the point of building one.
+  if (wx && wx.domed) return _f3LightDefs() + _f3Dome({ wx: wx });
   var s = _f3LightDefs();
+  var kind = (wx && wx.kind) || 'clear';
+  if (day) {
+    // a roof is drawn as a fine day: whatever is happening outside is
+    // not happening over this pitch
+    var g = (kind === 'rain' || kind === 'snow' || kind === 'storm' ||
+             kind === 'overcast' || kind === 'fog') ? 'f3skyGrey' : 'f3skyDay';
+    return s + '<rect x="0" y="0" width="200" height="110" fill="url(#' + g + ')"/>';
+  }
+  if (kind === 'rain' || kind === 'snow' || kind === 'storm' || kind === 'fog') {
+    // a night with weather in it has no clear black: the cloud deck holds
+    // the ground light and the sky goes muddy rather than dark
+    s += '<rect x="0" y="22" width="200" height="88" fill="url(#f3skyMurk)"/>';
+    return s;
+  }
   // Full height, not just down to the far sideline. Stopping it there left a
   // tonal step running off both sides of the frame where the backdrop ended
   // and the page began; the turf hides the middle of it either way.
@@ -70504,7 +70939,7 @@ function _f3LightSky() {
   return s;
 }
 
-function _f3LightTowers() {
+function _f3LightTowers(lit) {
   var fl = _f3Proj(0, 0), fr = _f3Proj(_F3_LEN, 0);
   var baseY = fl[1];
   // Out past the far sideline on both sides. Real standards sit outside the
@@ -70517,7 +70952,7 @@ function _f3LightTowers() {
   var x0 = fl[0] - 28, x1 = fr[0] + 28, span = x1 - x0;
   var AT = [0.05, 0.26, 0.74, 0.95];
   var s = '';
-  for (var i = 0; i < AT.length; i++) s += _f3Tower(x0 + span * AT[i], baseY);
+  for (var i = 0; i < AT.length; i++) s += _f3Tower(x0 + span * AT[i], baseY, lit);
   return s;
 }
 
@@ -70540,7 +70975,10 @@ function _fwField3D(o) {
   var awayAbbr = o.awayAbbr || 'AWAY', homeAbbr = o.homeAbbr || 'HOME';
   var awayCol = o.awayColor || '#888', homeCol = o.homeColor || '#888';
   var EZ = 10;
-  var grass = '#1d4428', grassAlt = '#215030';
+  // F3DAY -- grass in sunlight is a different green from grass under
+  // sodium light, not the same green turned up.
+  var grass = o.isDay ? '#2f7040' : '#1d4428';
+  var grassAlt = o.isDay ? '#36804a' : '#215030';
   var paint = 'rgba(255,255,255,0.82)';
 
   var lg = String(o.league || 'NFL').toUpperCase();
@@ -70555,8 +70993,15 @@ function _fwField3D(o) {
   var s = '<svg viewBox="0 22 200 80" style="width:100%;height:auto;display:block"' +
     ' preserveAspectRatio="xMidYMid meet">';
 
+  // FWWX / F3DAY -- the hour and the weather, read once and threaded
+  // through everything that answers to them.
+  var _wx = o.wx || null;
+  var _day = !!o.isDay;
+  var _wet = _wx && (_wx.kind === 'rain' || _wx.kind === 'storm');
+  var _snowy = _wx && _wx.kind === 'snow';
+
   // SKY -- the backdrop, and nothing else at this depth.
-  s += _f3LightSky();
+  s += _f3LightSky(_day, _wx);
   // THE BOWL -- against the sky, behind everything solid.
   s += _f3Bowl(o);
   // TUNNEL -- cut into the face of the end stand, so after the bowl.
@@ -70566,7 +71011,11 @@ function _fwField3D(o) {
   // visible. A floodlight standard is the tallest thing in a ground and
   // it stands outside the stand, so it crosses the roofline and the
   // crowd, not the other way round.
-  s += _f3LightTowers();
+  // F3DOME -- no standards indoors. A dome's light hangs off the ceiling,
+  // which _f3Dome has already drawn; four masts outside the bowl would be
+  // standing in the car park.
+  var _domed = !!(_wx && _wx.domed);
+  if (!_domed) s += _f3LightTowers(!_day);
   // SBOARD -- between the inner pair of standards.
   s += _f3Scoreboard(o);
 
@@ -70585,9 +71034,20 @@ function _fwField3D(o) {
     }
   }
 
+  // FWWX -- what is LYING on the ground goes down with the turf, under
+  // the paint: snow settles on the grass and the lines are cleared.
+  s += _f3WxGround(o);
+
   // FLOODS -- the light lands here, over the turf and under everything that
-  // is painted on it.
-  s += _f3LightPools();
+  // is painted on it. In daylight there is no pool to land: the sun does
+  // not put four bright ellipses on a pitch.
+  // F3DOME -- a rig hung over the whole pitch lights it evenly, so the
+  // four discrete pools of four standards are wrong indoors. One broad
+  // wash instead.
+  if (_domed) {
+    s += '<polygon points="' + _f3Quad(0, _F3_LEN) +
+      '" fill="#fff6dd" fill-opacity="0.07"/>';
+  } else if (!_day) s += _f3LightPools();
 
   // End zones in team colour, with the abbreviation painted on the grass.
   s += '<g data-f3="ez">';
@@ -70658,6 +71118,13 @@ function _fwField3D(o) {
   // SIDELINE -- benches and drinks on the apron, nearest the camera of
   // anything in the frame and so drawn after all of the paint.
   s += _f3Sideline(o);
+  // FWWX -- and the snow that has settled on all of it
+  s += _f3WxApron(o);
+
+  // FWWX -- and what is FALLING goes over the picture but under the
+  // telestration. The scrimmage line and the play arc are drawn on the
+  // broadcast, not standing in the rain.
+  s += _f3WxFall(o);
 
   // ---- live furniture: scrimmage, to-gain ----
   var ball = (o.ballAbs != null) ? Number(o.ballAbs) : null;
@@ -71990,6 +72457,10 @@ function renderFieldStadium() {
     // STADPROBE -- the probes used to live in the account menu, three taps
     // and a scroll from the game you wanted to look at. This one reads the
     // payload for the game that is open, so it belongs on the game.
+    // FWWX -- the conditions, said plainly. The field shows them; this
+    // says what they are, including the temperature, which no amount of
+    // snow on the pitch can tell you.
+    _fwWxChip(game) +
     '<button class="stad-probe" onclick="event.stopPropagation();skProbeStadium(\'field\')">' +
     'PROBE</button>' +
     '</div>';
@@ -72143,7 +72614,11 @@ function renderFieldStadium() {
       // printing Jacksonville); the board was missed that time.
       boardName: (_fwVenueOff ? _fwVenueReal
         : (theme.nickname || theme.name || game.venue || '')),
-      bigPlays: _fwBigList                      // BIGPLAY
+      bigPlays: _fwBigList,                     // BIGPLAY
+      // FWWX / F3DAY -- the hour and the sky. Both read off the game the
+      // app already has; nothing extra is fetched.
+      isDay: _f3IsDayGame(game),
+      wx: _f3WxRead(game)
     });
     // The toggle sits under the field it draws on. Off by default, and the
     // choice is remembered -- it is a way of looking at the game, not a
