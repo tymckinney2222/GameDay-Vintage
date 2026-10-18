@@ -41892,9 +41892,13 @@ function openVenueGallery(lg) {
   _vgLg = lg || _vgLg || 'NBA';
   ov.classList.add('open');
   _vgRender();
+  // SKBACK -- the back gesture closes the gallery instead of the app.
+  skSheetOpen('venuegallery', _closeVenueGalleryInternal);
 }
 
-function closeVenueGallery() {
+// The teardown, with no history in it, so popstate can call it after the
+// browser has already moved the pointer.
+function _closeVenueGalleryInternal() {
   var ov = document.getElementById('vgOverlay');
   if (ov) { ov.classList.remove('open'); }
   // LET THE SVG GO. Shutting the gallery with thirty arenas still in the
@@ -41903,6 +41907,10 @@ function closeVenueGallery() {
   if (_vgObs) { _vgObs.disconnect(); _vgObs = null; }
   var sc = document.getElementById('vgScroll');
   if (sc) { sc.innerHTML = ''; }
+}
+
+function closeVenueGallery() {
+  skSheetClose('venuegallery', _closeVenueGalleryInternal);
 }
 
 function _vgPick(lg) { _vgLg = lg; _vgRender(); }
@@ -119157,6 +119165,30 @@ function skNavPopAll() {
   return true;
 }
 
+// ==================================================================
+// SKBACK -- joining the back stack, for everything that is not Skipper.
+//
+// skNavPush/popstate were built for the Skipper overlay and its
+// sub-views. Any other sheet can now join with these two, instead of
+// hand-rolling its own history handling or (far more usually) having
+// none at all and leaving the back gesture to exit the app.
+//
+// skSheetClose exists because skNavPop() calls history.back() whenever
+// the stack is non-empty, WITHOUT checking what is on top. An X button
+// that called it blindly would close whatever happened to be underneath
+// this sheet. So the manual close path pops history only when this sheet
+// really is the top entry, and otherwise just tears itself down.
+function skSheetOpen(key, closeFn) {
+  skNavPush(key, closeFn);
+}
+
+function skSheetClose(key, closeFn) {
+  var top = skNavStack.length ? skNavStack[skNavStack.length - 1] : null;
+  if (top && top.type === key) { skNavPop(); return true; }
+  try { closeFn(); } catch (e) {}
+  return false;
+}
+
 // Single popstate listener routes ALL system back gestures (swipe,
 // hardware back button, browser back) into our internal close logic.
 // It looks at the new history state to figure out what depth we're
@@ -133549,13 +133581,33 @@ function skManualRefresh() {
 }
 
 // View navigation — Today is default; Detail / Lab are sub-views
+// SKSCROLL -- where each view was left, by view name. Not persisted: it is
+// about the trip you are on, not the session you had yesterday.
+var _skScrollMem = {};
+
 function skSwitchView(name) {
+  var _main = document.getElementById('skMain');
+  // Remember where the view being LEFT was sitting, before anything is
+  // hidden -- a hidden element's scroll position is not readable.
+  if (_main && skState.view && skState.view !== name) {
+    _skScrollMem[skState.view] = _main.scrollTop;
+  }
   ['today', 'detail', 'lab', 'briefing', 'extdetail'].forEach(function(v) {
     var el = document.getElementById('sk-view-' + v);
     if (el) el.classList.toggle('hidden', v !== name);
   });
   skState.view = name;
-  document.getElementById('skMain').scrollTo({ top: 0, behavior: 'instant' });
+  if (_main) {
+    // The toggle above just changed what is in the scroller, so its height
+    // is stale. Read it to force the layout BEFORE scrolling, or the
+    // browser clamps the restore to a scrollHeight that has not caught up
+    // yet and you land at the top anyway -- the exact bug, reintroduced by
+    // the fix for it.
+    var _h = _main.scrollHeight;
+    var _y = _skScrollMem[name];
+    if (_y == null || _h <= _main.clientHeight) { _y = 0; }
+    _main.scrollTo({ top: _y, behavior: 'instant' });
+  }
   // If external-league enrichment (Sleeper/Fantrax standings, draft date, etc.)
   // landed while we were off the Today view, its repaint was deferred — flush it
   // now so freshly-synced cards show their records and become clickable without
@@ -133704,6 +133756,10 @@ function skOpenDetail(leagueKey) {
   // Tab choice doesn't persist across leagues; each open is a fresh
   // start.
   skState.detailTab = 'matchup';
+  // SKSCROLL -- a league opened is a fresh start, so the detail view starts
+  // at the top rather than wherever the LAST league's detail was left. The
+  // Today list's own position is untouched and is what you come back to.
+  _skScrollMem.detail = 0;
   // Drop any transient stat lines (pre-game, live, errors) so reopening
   // a league after some time elapses re-fetches them. Final stat lines
   // from past games are immutable and stay cached.
@@ -157284,10 +157340,19 @@ function _skGpProbeShow(text) {
   // parsed as markup.
   var pre = document.getElementById('skGpProbeText');
   if (pre) pre.textContent = text;
+  // SKBACK -- a probe is usually opened from on top of something else (the
+  // gallery, a league screen), so it wants its own entry: back closes the
+  // probe and leaves what it was opened over. A probe that reprints itself
+  // mid-run -- several do, to show a header before the request lands --
+  // pushes once, because skNavPush no-ops when this type is already on top.
+  skSheetOpen('probesheet', _skGpProbeCloseInternal);
 }
-function _skGpProbeClose() {
+function _skGpProbeCloseInternal() {
   var el = document.getElementById('skGpProbeSheet');
   if (el && el.parentNode) el.parentNode.removeChild(el);
+}
+function _skGpProbeClose() {
+  skSheetClose('probesheet', _skGpProbeCloseInternal);
 }
 function _skGpProbeCopy() {
   var pre = document.getElementById('skGpProbeText');
