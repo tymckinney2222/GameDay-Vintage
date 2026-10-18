@@ -11661,6 +11661,27 @@
 .pe-tag.o { color: rgba(255,255,255,0.4); border: 1px solid rgba(255,255,255,0.14); }
 
 .pe-sides { display: flex; align-items: stretch; gap: 6px; }
+/* PGINTEL -- the pregame strip under a row. */
+.pg-row {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-top: 7px; padding-top: 7px;
+  border-top: 1px solid rgba(255,255,255,0.06);
+}
+.pg-btn {
+  padding: 4px 9px; border-radius: 6px; border: 0;
+  background: rgba(255,255,255,0.07); color: rgba(255,255,255,0.58);
+  font-size: 9px; font-weight: 800; letter-spacing: 0.1em; cursor: pointer;
+}
+.pg-btn:active { background: rgba(255,255,255,0.14); }
+.pg-wait { font-size: 9.5px; color: rgba(255,255,255,0.38); letter-spacing: 0.04em; }
+.pg-lines { width: 100%; display: flex; flex-direction: column; gap: 3px; }
+.pg-line {
+  display: flex; align-items: baseline; gap: 7px;
+  font-size: 10px; letter-spacing: 0.04em;
+}
+.pg-line span { flex: 0 0 74px; color: rgba(255,255,255,0.33); font-weight: 800; font-size: 8.5px; }
+.pg-line b { color: rgba(255,255,255,0.78); font-weight: 700; }
+.pg-line.flip b { color: #f5d020; }
 .pe-at {
   flex: 0 0 auto; align-self: center; font-size: 10px; font-weight: 700;
   color: rgba(255,255,255,0.22);
@@ -33262,6 +33283,26 @@
     text-transform: uppercase; cursor: pointer;
   }
   .vg-tab.on { background: #fff; color: #0b111c; }
+  /* VGBENCH -- the scene controls. Only the football fields read scene
+     state (weather, sky, roof, down and distance), so the row is absent
+     for the other three leagues rather than present and inert. */
+  .vg-bench { display: none; padding: 0 12px 10px; }
+  .vg-bench.on { display: block; }
+  .vg-bench-row {
+    display: flex; align-items: center; gap: 5px; margin-top: 6px;
+    overflow-x: auto; -webkit-overflow-scrolling: touch;
+  }
+  .vg-bench-lab {
+    flex: 0 0 auto; font-size: 9px; font-weight: 800; letter-spacing: 0.12em;
+    color: rgba(255,255,255,0.35); padding-right: 2px;
+  }
+  .vg-chip {
+    flex: 0 0 auto; padding: 5px 9px; border-radius: 6px; border: 0;
+    background: rgba(255,255,255,0.07); color: rgba(255,255,255,0.6);
+    font-size: 9.5px; font-weight: 800; letter-spacing: 0.08em;
+    text-transform: uppercase; cursor: pointer; white-space: nowrap;
+  }
+  .vg-chip.on { background: #f5d020; color: #0b111c; }
   .vg-scroll {
     flex: 1 1 auto; overflow-y: auto; -webkit-overflow-scrolling: touch;
     padding: 14px 14px 40px 14px;
@@ -33299,6 +33340,7 @@
       <button class="vg-x" onclick="closeVenueGallery()" aria-label="Close">&#10005;</button>
     </div>
     <div class="vg-tabs" id="vgTabs"></div>
+    <div class="vg-bench" id="vgBench"></div>
   </div>
   <div class="vg-scroll" id="vgScroll"></div>
 </div>
@@ -41675,6 +41717,126 @@ function _vgList(lg) {
   return out;
 }
 
+// ==================================================================
+// VGBENCH -- THE SCENE BENCH.
+//
+// The field renderer grew a sky, six kinds of weather, a roof and a chain
+// crew, and every one of them only ever drew when a real game happened to
+// be in that state. Reviewing the snow meant waiting for snow. So the
+// gallery gets a row of controls, and the football cards redraw from them.
+//
+// THE CONTROLS GO THROUGH THE APP'S OWN READERS. A hand-built weather
+// object is exactly how a test sails past a rewritten _f3WxRead -- that
+// has already happened once here -- so the bench builds a synthetic GAME
+// and hands it to _f3WxRead and _f3IsDayGame. If those are rewritten the
+// bench follows them, because it is asking them rather than imitating them.
+//
+// The defaults are the gallery as it was: night, clear, roof AUTO, no
+// down. Nothing moves until a chip is tapped. AUTO is the only honest
+// roof setting -- _F3_ROOFED is keyed by club, so it is the real answer
+// for this ground; DOME and OPEN are forced, and the chip says so.
+var _VG_SCENE = { day: 0, wx: 1, roof: 'auto', dd: 0 };
+
+// AccuWeather codes, not words, so the numeric branch of _f3WxKind is the
+// one under test -- it is the branch a real payload takes.
+var _VG_WX = [
+  ['CLEAR', 1], ['CLOUD', 7], ['FOG', 11],
+  ['RAIN', 13], ['STORM', 16], ['SNOW', 22]
+];
+
+// Possession is 'home' throughout, so the drive runs toward absolute 0 and
+// the to-gain line is ball MINUS distance. GOAL TO GO is ball 4, distance
+// 4: the line to gain IS the goal line, which is the case the renderer
+// suppresses the second line for and the chain crew has to clamp against.
+var _VG_DD = [
+  { lab: 'NONE', down: null, dist: null, ball: null },
+  { lab: '1ST & 10', down: 1, dist: 10, ball: 75 },
+  { lab: '3RD & 2', down: 3, dist: 2, ball: 42 },
+  { lab: '4TH & 1', down: 4, dist: 1, ball: 31 },
+  { lab: 'GOAL TO GO', down: 2, dist: 4, ball: 4 }
+];
+
+// The synthetic fixture. One game object, both readers.
+function _vgSceneGame(v) {
+  return {
+    home: { abbr: (v && v.abbr) || '' },
+    // 18:00Z is an American afternoon, 01:20Z the following day is a night
+    // kickoff -- the two cases _f3IsDayGame draws the line between.
+    date: _VG_SCENE.day ? '2026-10-18T18:00:00Z' : '2026-10-19T01:20:00Z',
+    weather: {
+      conditionId: String(_VG_SCENE.wx),
+      temperature: _VG_SCENE.day ? 58 : 41,
+      gust: 14
+    }
+  };
+}
+
+function _vgSceneWx(v) {
+  var wx = _f3WxRead(_vgSceneGame(v));
+  if (!wx) { return null; }
+  if (_VG_SCENE.roof === 'dome') {
+    wx.roofed = true; wx.domed = true; wx.kind = 'roof';
+  } else if (_VG_SCENE.roof === 'open') {
+    wx.roofed = false; wx.domed = false;
+    wx.kind = _f3WxKind(String(_VG_SCENE.wx)) || 'clear';
+  }
+  return wx;
+}
+
+function _vgChip(key, val, lab) {
+  var on = (String(_VG_SCENE[key]) === String(val)) ? ' on' : '';
+  var arg = (typeof val === 'number') ? String(val) : ("'" + val + "'");
+  return '<button class="vg-chip' + on + '" onclick="_vgSceneSet(\'' +
+    key + '\',' + arg + ')">' + lab + '</button>';
+}
+
+function _vgBenchHtml() {
+  if (_vgLg !== 'NFL') { return ''; }
+  var s = '', i;
+  s += '<div class="vg-bench-row">' +
+       '<span class="vg-bench-lab">SKY</span>' +
+       _vgChip('day', 0, 'NIGHT') + _vgChip('day', 1, 'DAY') +
+       '<span class="vg-bench-lab" style="padding-left:7px">ROOF</span>' +
+       _vgChip('roof', 'auto', 'AUTO') +
+       _vgChip('roof', 'dome', 'DOME') +
+       _vgChip('roof', 'open', 'OPEN') +
+       '</div>';
+  s += '<div class="vg-bench-row">' +
+       '<span class="vg-bench-lab">SKY FX</span>';
+  for (i = 0; i < _VG_WX.length; i++) {
+    s += _vgChip('wx', _VG_WX[i][1], _VG_WX[i][0]);
+  }
+  s += '</div>';
+  s += '<div class="vg-bench-row">' +
+       '<span class="vg-bench-lab">DOWN</span>';
+  for (i = 0; i < _VG_DD.length; i++) {
+    s += _vgChip('dd', i, _VG_DD[i].lab);
+  }
+  s += '</div>';
+  return s;
+}
+
+// REDRAW IN PLACE, not a re-render. _vgRender resets scrollTop, which on a
+// phone throws you back to the top of the list every time you tap a chip.
+// Only the slots the observer has already filled are redrawn; the rest are
+// still empty and will be drawn with the new scene when they are reached.
+function _vgSceneSet(key, val) {
+  _VG_SCENE[key] = val;
+  var b = document.getElementById('vgBench');
+  if (b) { b.innerHTML = _vgBenchHtml(); }
+  var sc = document.getElementById('vgScroll');
+  if (!sc) { return; }
+  var list = _vgList(_vgLg);
+  var slots = sc.querySelectorAll('.vg-art');
+  var i, idx;
+  for (i = 0; i < slots.length; i++) {
+    if (!slots[i].firstChild) { continue; }
+    idx = parseInt(slots[i].getAttribute('data-vg'), 10);
+    if (isNaN(idx) || !list[idx]) { continue; }
+    slots[i].innerHTML = _vgDraw(_vgLg, list[idx]);
+  }
+}
+
 // ONE VENUE, as SVG. The fixture is synthetic and deliberately empty of
 // play: no shots, no roster, no puck -- the point is the building.
 function _vgDraw(lg, v) {
@@ -41708,9 +41870,15 @@ function _vgDraw(lg, v) {
         homeColor: v.accent, awayColor: v.alt, homeLogo: logo, awayLogo: '' });
     }
     if (lg === 'NFL') {
+      // VGBENCH -- the only card that reads the scene row.
+      var _sg = _vgSceneGame(v);
+      var _sd = _VG_DD[_VG_SCENE.dd] || _VG_DD[0];
       return _fwField3D({ league: 'NFL', uid: uid, homeAbbr: v.abbr,
         awayAbbr: '', homeColor: v.accent, awayColor: v.alt,
-        homeLogo: logo, awayLogo: '' });
+        homeLogo: logo, awayLogo: '',
+        isDay: _f3IsDayGame(_sg), wx: _vgSceneWx(v),
+        possTeam: (_sd.down != null) ? 'home' : null,
+        ballAbs: _sd.ball, down: _sd.down, distance: _sd.dist });
     }
   } catch (e) {
     try { console.error('venue gallery:', lg, v.abbr, e); } catch (e2) {}
@@ -41751,6 +41919,12 @@ function _vgRender() {
       '" onclick="_vgPick(\'' + lg + '\')">' + lg + '</button>';
   }
   tabs.innerHTML = s;
+
+  var bench = document.getElementById('vgBench');
+  if (bench) {
+    bench.innerHTML = _vgBenchHtml();
+    bench.className = (_vgLg === 'NFL') ? 'vg-bench on' : 'vg-bench';
+  }
 
   var list = _vgList(_vgLg);
   if (cnt) {
@@ -71141,7 +71315,7 @@ function _fwField3D(o) {
   // ---- live furniture: scrimmage, to-gain ----
   var ball = (o.ballAbs != null) ? Number(o.ballAbs) : null;
   if (ball != null && !isNaN(ball) && ball >= 0 && ball <= 100) {
-    s += _f3Line(EZ + ball, '#38bdf8', 0.7, ' opacity="0.95"');
+    s += _f3Line(EZ + ball, '#38bdf8', 0.7, ' opacity="0.95" data-f3="scrim"');
   }
   // To-gain, worked out here from the same three inputs the flat field used,
   // so the call site did not have to change. Suppressed on goal-to-go: the
@@ -71151,7 +71325,9 @@ function _fwField3D(o) {
   if (_dist != null && (isNaN(_dist) || _dist <= 0)) _dist = null;
   if (_dir !== 0 && _dist != null && ball != null && !isNaN(ball)) {
     var tg = ball + _dir * _dist;
-    if (tg > 0 && tg < 100) s += _f3Line(EZ + tg, '#f5d020', 0.7, ' opacity="0.95"');
+    if (tg > 0 && tg < 100) {
+      s += _f3Line(EZ + tg, '#f5d020', 0.7, ' opacity="0.95" data-f3="togain"');
+    }
   }
 
   // CHAINS -- after the scrimmage and to-gain lines, because the crew
@@ -191578,6 +191754,196 @@ function _peTeamBtn(g, side, st) {
     '</button>';
 }
 
+// ==================================================================
+// PGINTEL -- WHAT THE BOOK AND THE MODEL THINK, BEFORE YOU PICK.
+//
+// Everything below is written against a probe of the real payload rather
+// than against a memory of ESPN's field names -- which is the whole reason
+// the probe shipped a build before this did.
+//
+// SUMMARY ONLY. The scoreboard has none of these, so each row fetches its
+// own and keeps it. Nothing is fetched until a row is asked.
+var _pgCache = {};
+
+function _pgSide(o) {
+  o = o || {};
+  return {
+    id: (o.teamId != null) ? String(o.teamId) : '',
+    ml: (o.moneyLine != null && o.moneyLine !== '') ? Number(o.moneyLine) : null,
+    fav: !!o.favorite,
+    favOpen: !!o.favoriteAtOpen
+  };
+}
+
+function _pgRead(sum) {
+  if (!sum) { return null; }
+  var out = { model: null, book: null, ats: null };
+
+  // predictor -- ESPN's own pregame number, kept BY TEAM ID. The two sides
+  // came back 51.9 and 47.7 on the probe: they do not sum to 100, so
+  // neither is ever derived from the other.
+  var p = sum.predictor;
+  if (p && p.homeTeam && p.awayTeam) {
+    var hp = parseFloat(p.homeTeam.gameProjection);
+    var ap = parseFloat(p.awayTeam.gameProjection);
+    if (!isNaN(hp) && !isNaN(ap)) {
+      out.model = {
+        homeId: String(p.homeTeam.id == null ? '' : p.homeTeam.id), homePct: hp,
+        awayId: String(p.awayTeam.id == null ? '' : p.awayTeam.id), awayPct: ap
+      };
+    }
+  }
+
+  // pickcenter -- the BOOK. Not the public: there is no betting-percentage
+  // field anywhere in it.
+  var pc = sum.pickcenter;
+  var e = (pc && pc.length) ? pc[0] : null;
+  if (e) {
+    out.book = {
+      name: (e.provider && e.provider.name) ? String(e.provider.name) : '',
+      details: (e.details != null) ? String(e.details) : '',
+      overUnder: (e.overUnder != null && e.overUnder !== '') ? Number(e.overUnder) : null,
+      home: _pgSide(e.homeTeamOdds),
+      away: _pgSide(e.awayTeamOdds)
+    };
+  }
+
+  // againstTheSpread -- present with both clubs named and records EMPTY in
+  // the one sample there is. Read it if it ever fills; promise nothing.
+  var a = sum.againstTheSpread, map = {}, any = false, i, t, r, v;
+  if (a && a.length) {
+    for (i = 0; i < a.length; i++) {
+      t = a[i] && a[i].team;
+      r = (a[i] && a[i].records) || [];
+      if (!t || !r.length) { continue; }
+      v = r[0].summary || r[0].displayValue || '';
+      if (!v) { continue; }
+      map[String(t.id)] = String(v);
+      any = true;
+    }
+  }
+  if (any) { out.ats = map; }
+
+  return (out.model || out.book || out.ats) ? out : null;
+}
+
+// Match on TEAM ID, with the away/home position only as a fallback. The
+// market record learned this one already: abbreviations move, ids do not.
+function _pgBySide(away, home, g) {
+  var aId = String((g.away && g.away.id) || ''), hId = String((g.home && g.home.id) || '');
+  if (away.id && home.id && aId && hId) {
+    if (away.id === hId && home.id === aId) { return { away: home, home: away }; }
+  }
+  return { away: away, home: home };
+}
+
+function _pgTap(gid) {
+  var gs = _peSlate || [], i;
+  for (i = 0; i < gs.length; i++) {
+    if (String(gs[i].id) === String(gid)) { _pgFetch(gs[i]); return; }
+  }
+}
+
+function _pgFetch(g) {
+  var id = String((g && g.id) || '');
+  if (!id) { return; }
+  if (_pgCache[id] && _pgCache[id].state === 'load') { return; }
+  var cfg = (typeof LEAGUES !== 'undefined') ? LEAGUES[g.league] : null;
+  if (!cfg || !cfg.sport || !cfg.slug) {
+    _pgCache[id] = { state: 'err', why: 'not an ESPN league here' };
+    _peRender(); return;
+  }
+  _pgCache[id] = { state: 'load' };
+  _peRender();
+  fetch('https://site.api.espn.com/apis/site/v2/sports/' + cfg.sport + '/' +
+    cfg.slug + '/summary?event=' + encodeURIComponent(id))
+    .then(function (r) {
+      if (!r.ok) { throw new Error('HTTP ' + r.status); }
+      return r.json();
+    })
+    .then(function (d) {
+      var v = _pgRead(d);
+      _pgCache[id] = v ? { state: 'ok', data: v }
+                       : { state: 'err', why: 'nothing in the payload' };
+      _peRender();
+    })['catch'](function (e) {
+      _pgCache[id] = { state: 'err', why: (e && e.message) ? e.message : 'failed' };
+      _peRender();
+    });
+}
+
+function _pgPct(x) { return (Math.round(x * 10) / 10) + '%'; }
+
+function _pgMl(n) {
+  if (n == null || isNaN(n)) { return ''; }
+  return (n > 0) ? ('+' + n) : String(n);
+}
+
+function _pgLine(lab, val, cls) {
+  return '<div class="pg-line' + (cls ? (' ' + cls) : '') + '"><span>' +
+    lab + '</span><b>' + val + '</b></div>';
+}
+
+function _pgStripHtml(g) {
+  // Pregame only: a model projection for a game already played is a
+  // curiosity, and the point of this strip is the decision in front of you.
+  if (!g || g.state !== 'pre' || _peDead(g)) { return ''; }
+  var id = String(g.id), c = _pgCache[id];
+  var btn = function (t) {
+    return '<button class="pg-btn" onclick="event.stopPropagation();_pgTap(\'' +
+      id + '\')">' + t + '</button>';
+  };
+  if (!c) {
+    return '<div class="pg-row">' + btn('PREGAME INTEL') + '</div>';
+  }
+  if (c.state === 'load') {
+    return '<div class="pg-row"><span class="pg-wait">reading the book' +
+      String.fromCharCode(8230) + '</span></div>';
+  }
+  if (c.state === 'err') {
+    return '<div class="pg-row"><span class="pg-wait">' + slEsc(c.why) +
+      '</span>' + btn('RETRY') + '</div>';
+  }
+
+  var d = c.data, L = '', dot = ' ' + String.fromCharCode(183) + ' ';
+  var aAb = slEsc(g.away.abbr), hAb = slEsc(g.home.abbr);
+
+  if (d.model) {
+    var m = _pgBySide({ id: d.model.awayId, pct: d.model.awayPct },
+                      { id: d.model.homeId, pct: d.model.homePct }, g);
+    L += _pgLine('ESPN MODEL',
+      aAb + ' ' + _pgPct(m.away.pct) + dot + hAb + ' ' + _pgPct(m.home.pct));
+  }
+  if (d.book) {
+    var b = d.book, bits = [];
+    if (b.details) { bits.push(slEsc(b.details)); }
+    if (b.overUnder != null && !isNaN(b.overUnder)) { bits.push('O/U ' + b.overUnder); }
+    if (bits.length) { L += _pgLine(slEsc(b.name || 'BOOK').toUpperCase(), bits.join(dot)); }
+
+    var sd = _pgBySide(b.away, b.home, g);
+    var aMl = _pgMl(sd.away.ml), hMl = _pgMl(sd.home.ml);
+    if (aMl || hMl) {
+      L += _pgLine('MONEYLINE',
+        aAb + ' ' + (aMl || '--') + dot + hAb + ' ' + (hMl || '--'));
+    }
+    // favoriteAtOpen is the one thing here the app had no way to know:
+    // the line flipped since it opened.
+    var nowFav = sd.home.fav ? hAb : (sd.away.fav ? aAb : '');
+    var opnFav = sd.home.favOpen ? hAb : (sd.away.favOpen ? aAb : '');
+    if (nowFav && opnFav && nowFav !== opnFav) {
+      L += _pgLine('LINE MOVED', 'opened ' + opnFav + ', now ' + nowFav, 'flip');
+    }
+  }
+  if (d.ats) {
+    var aAts = d.ats[String(g.away.id)] || '', hAts = d.ats[String(g.home.id)] || '';
+    if (aAts || hAts) {
+      L += _pgLine('ATS', aAb + ' ' + (aAts || '--') + dot + hAb + ' ' + (hAts || '--'));
+    }
+  }
+  if (!L) { return '<div class="pg-row"><span class="pg-wait">nothing to report</span></div>'; }
+  return '<div class="pg-row"><div class="pg-lines">' + L + '</div></div>';
+}
+
 function _peRowHtml(g, store, now) {
   var st = _peResultOf(store, g, now);
   var dead = _peDead(g);
@@ -191600,6 +191966,7 @@ function _peRowHtml(g, store, now) {
     '</div>' +
     '<div class="pe-sides">' + _peTeamBtn(g, 'away', st) +
       '<span class="pe-at">@</span>' + _peTeamBtn(g, 'home', st) + '</div>' +
+    _pgStripHtml(g) +
     '</div>';
 }
 
@@ -191648,6 +192015,10 @@ function _peRender() {
 
   // -- the record so far --
   h += _peRecordStrip(tally, store);
+  // PGPROBE -- unconditional. Hung off the record strip it vanished on a
+  // fresh season, which is exactly when someone is most likely to go
+  // looking for it.
+  h += _pePgProbeBtn();
   h += _peVsMarketHtml(tally.all, true);
 
   if (_peErr) {
@@ -191701,8 +192072,8 @@ function _peRender() {
 
   h += '<div class="pe-foot">' +
     '<button class="pe-export" onclick="_peExport()">EXPORT MY PICKS</button>' +
-    '<div class="pe-foot-note">Every game that finishes without a pick counts ' +
-      'as a miss, so the percentage is the whole slate, not the easy half.</div>' +
+    '<div class="pe-foot-note">Games that finish without a pick are logged ' +
+      'but do not count: the record is the calls you actually made.</div>' +
     '</div>';
 
   body.innerHTML = h;
@@ -191757,6 +192128,159 @@ function _peResetTap() {
       if (e2) { e2.className = 'pe-reset'; e2.textContent = 'RESET RECORD'; }
     }, 6000);
   }
+}
+
+// ==================================================================
+// PGPROBE -- THE PREGAME PAYLOAD PROBE.
+//
+// Three blocks sit in ESPN's per-game summary that nothing in this app
+// reads: pickcenter, againstTheSpread, predictor. Between them they carry
+// where the public money is, how each side has covered this season, and
+// ESPN's own pregame win percentage -- all of which belong next to a pick.
+//
+// What is NOT known from here is their field names, and the sandbox this
+// was written in cannot reach ESPN to look. So this prints the real thing
+// from the phone. It reports BOTH endpoints, because which one carries
+// them decides the whole design: on the scoreboard the pick list gets them
+// free, and only in the summary means a fetch per game.
+var _PG_BLOCKS = ['pickcenter', 'againstTheSpread', 'predictor'];
+
+function _pgTrim(v) {
+  var t = String(v);
+  return (t.length > 70) ? (t.slice(0, 70) + '...') : t;
+}
+
+// Print the shape AND the values. A shape alone would leave me guessing
+// which of two plausible fields holds the number.
+function _pgWalk(say, label, v, depth) {
+  if (v === null || v === undefined) { say(label + ': null'); return; }
+  var t = typeof v;
+  if (t !== 'object') { say(label + ': ' + _pgTrim(v)); return; }
+  if (depth <= 0) { say(label + ': {...}'); return; }
+  var i;
+  if (Object.prototype.toString.call(v) === '[object Array]') {
+    say(label + ': array[' + v.length + ']');
+    var n = Math.min(v.length, 2);
+    for (i = 0; i < n; i++) { _pgWalk(say, label + '[' + i + ']', v[i], depth - 1); }
+    if (v.length > n) { say(label + '[..]: ' + (v.length - n) + ' more, not shown'); }
+    return;
+  }
+  var ks = [], k;
+  for (k in v) {
+    if (Object.prototype.hasOwnProperty.call(v, k)) { ks.push(k); }
+  }
+  say(label + ': {' + ks.join(', ') + '}');
+  for (i = 0; i < ks.length; i++) {
+    _pgWalk(say, label + '.' + ks[i], v[ks[i]], depth - 1);
+  }
+}
+
+function skProbePregame() {
+  var L = [], capped = false;
+  function say(t) {
+    if (L.length >= 400) { capped = true; return; }
+    L.push(t == null ? '' : String(t));
+  }
+  function flush() {
+    if (capped) { L.push(''); L.push('(output capped at 400 lines)'); }
+    if (typeof _skGpProbeShow === 'function') { _skGpProbeShow(L.join('\n')); }
+  }
+  try { _skProbeTitle = 'PREGAME PAYLOAD PROBE'; } catch (eT) {}
+
+  say('PREGAME PAYLOAD PROBE');
+  say('');
+  say('Three blocks in ESPN\u2019s payload have no reader in this app:');
+  say('pickcenter, againstTheSpread, predictor. Between them: where the');
+  say('public money is, how each side has covered, and ESPN\u2019s own');
+  say('pregame win percentage.');
+  say('');
+  say('This prints what they really contain, and WHICH ENDPOINT has them.');
+  say('The pick screen reads the scoreboard, so if they are there the');
+  say('pick list gets them free; if they are only in the per-game summary');
+  say('it costs one fetch per game and should be done on demand.');
+  say('');
+  say('Best run on a day with NFL games not yet started.');
+  say('');
+  flush();
+
+  var cfg = (typeof LEAGUES !== 'undefined') ? LEAGUES['NFL'] : null;
+  if (!cfg || !cfg.sport || !cfg.slug) {
+    say('NFL is not an ESPN league in this build'); flush(); return;
+  }
+  var base = 'https://site.api.espn.com/apis/site/v2/sports/' +
+    cfg.sport + '/' + cfg.slug + '/';
+
+  fetch(base + 'scoreboard').then(function (r) {
+    if (!r.ok) { throw new Error('scoreboard HTTP ' + r.status); }
+    return r.json();
+  }).then(function (d) {
+    var evs = (d && d.events) || [], chosen = null, i, st;
+    for (i = 0; i < evs.length; i++) {
+      st = evs[i].status && evs[i].status.type;
+      if (st && st.state === 'pre') { chosen = evs[i]; break; }
+    }
+    if (!chosen && evs.length) { chosen = evs[0]; }
+    if (!chosen) {
+      say('no NFL games on the board today -- try again on a game day');
+      flush(); return null;
+    }
+    say('game  : ' + (chosen.name || chosen.shortName || chosen.id));
+    say('state : ' + ((chosen.status && chosen.status.type &&
+      chosen.status.type.state) || '?'));
+    say('');
+    say('--- THE SCOREBOARD (what the pick screen already has) ---');
+    var comp = (chosen.competitions && chosen.competitions[0]) || {};
+    var k, ck = [];
+    for (k in comp) {
+      if (Object.prototype.hasOwnProperty.call(comp, k)) { ck.push(k); }
+    }
+    say('competition keys: ' + ck.join(', '));
+    for (i = 0; i < _PG_BLOCKS.length; i++) {
+      say('  ' + _PG_BLOCKS[i] + ': ' +
+        ((comp[_PG_BLOCKS[i]] || chosen[_PG_BLOCKS[i]]) ? 'PRESENT' : 'absent'));
+    }
+    say('');
+    return fetch(base + 'summary?event=' + chosen.id).then(function (r) {
+      if (!r.ok) { throw new Error('summary HTTP ' + r.status); }
+      return r.json();
+    });
+  }).then(function (sum) {
+    if (!sum) { flush(); return; }
+    say('--- THE SUMMARY ---');
+    var k, keys = [];
+    for (k in sum) {
+      if (Object.prototype.hasOwnProperty.call(sum, k)) { keys.push(k); }
+    }
+    say('summary keys: ' + keys.join(', '));
+    say('');
+    var i, nm, v;
+    for (i = 0; i < _PG_BLOCKS.length; i++) {
+      nm = _PG_BLOCKS[i];
+      v = sum[nm];
+      if (v == null && sum.competitions && sum.competitions[0]) {
+        v = sum.competitions[0][nm];
+      }
+      say('=== ' + nm + ' ===');
+      if (v == null) { say('absent from the summary too'); say(''); continue; }
+      _pgWalk(say, nm, v, 4);
+      say('');
+    }
+    flush();
+  })['catch'](function (e) {
+    say('request failed: ' + ((e && e.message) ? e.message : String(e)));
+    say('');
+    say('A refusal here is the network, not a missing field.');
+    flush();
+  });
+}
+
+// The button goes where it can be FOUND. The last probe was wired to a
+// screen that had no button for it and Ty was sent looking for something
+// that did not exist; this one sits on the pick screen, in the row the
+// reset button uses, and is present whether or not anything is banked.
+function _pePgProbeBtn() {
+  return '<div class="pe-reset-row"><button class="pe-reset"' +
+    ' onclick="event.stopPropagation();skProbePregame()">PREGAME PROBE</button></div>';
 }
 
 function _peResetBtn(tally) {
