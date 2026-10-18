@@ -11579,6 +11579,18 @@
   background: rgba(234,179,8,0.05); border: 1px solid rgba(234,179,8,0.28);
   margin: 0 0 10px;
 }
+/* PERESET -- quiet until armed, then unmistakable */
+.pe-reset-row { display: flex; justify-content: flex-end; padding: 6px 2px 0; }
+.pe-reset {
+  font-family: 'Barlow Condensed', sans-serif; font-size: 10px;
+  font-weight: 700; letter-spacing: 0.14em; cursor: pointer;
+  background: transparent; border: 1px solid rgba(255,255,255,0.12);
+  color: rgba(255,255,255,0.34); padding: 4px 10px; border-radius: 2px;
+}
+.pe-reset.armed {
+  border-color: #ef4444; color: #fecaca; background: rgba(239,68,68,0.12);
+}
+.pe-stat b.mut { color: rgba(255,255,255,0.38); }
 .pe-strip.empty {
   display: block; font-size: 11.5px; color: rgba(255,255,255,0.45);
   background: rgba(255,255,255,0.03); border-color: rgba(255,255,255,0.08);
@@ -191348,14 +191360,21 @@ function _peTally(store) {
 
     // THE MARKET, ON THE SAME GAMES. Only where the feed carried a line and
     // the game was graded, so the two records are over the same slate.
+    // PEONLYPICKED -- and over the games YOU PICKED, not every game that
+    // carried a line. Scoring your misses as losses here was deliberate
+    // once -- the chalk had a result and you did not -- but it is the
+    // same penalty for forgetting, wearing a different hat. Restricted
+    // to picked games the two columns are still the identical set, which
+    // was the whole point of the comparison.
     var fid = _peRowFav(row);
-    if (fid && row.w && (row.res === 'W' || row.res === 'L' || row.res === 'M')) {
+    if (fid && row.w && (row.res === 'W' || row.res === 'L')) {
       var favWon = (String(row.w) === fid);
       if (favWon) { all.fw++; t.fw++; } else { all.fl++; t.fl++; }
       // mine, over exactly those games
+      // no miss branch: the guard above no longer lets one through, and a
+      // tally nothing can increment is just a lie waiting to be read
       if (row.res === 'W') { all.mw++; t.mw++; }
-      else if (row.res === 'L') { all.ml++; t.ml++; }
-      else { all.mm++; t.mm++; }
+      else { all.ml++; t.ml++; }
       if (row.favP != null) { all.fx += row.favP; t.fx += row.favP; all.fn++; t.fn++; }
       // with the chalk, or against it
       if (row.pid) {
@@ -191368,9 +191387,17 @@ function _peTally(store) {
   return { all: all, by: by };
 }
 
-// Games that count toward the headline: wins, losses and misses. No contests
-// are outside it entirely, which is the point of calling them that.
-function _peGraded(t) { return t.w + t.l + t.m; }
+// PEONLYPICKED -- Games that count toward the headline: WINS AND LOSSES.
+//
+// This used to include misses, so a night you forgot about arrived as a
+// column of losses and dragged the percentage down for good. Ty builds
+// this app during the games; forgetting to pick is a fact about a busy
+// Sunday, not a judgement about picking. A record is of decisions MADE.
+//
+// Misses are still recorded and still shown -- "9 already locked without
+// a pick" is worth knowing -- they simply no longer score.
+function _peGraded(t) { return t.w + t.l; }
+function _peMissed(t) { return t.m || 0; }
 function _pePct(t) {
   var n = _peGraded(t);
   return n ? (t.w / n) : 0;
@@ -191386,26 +191413,29 @@ function _peFmtPct(x) {
   return (v === Math.round(v)) ? (v + '.0%') : (v + '%');
 }
 
-// The current streak, newest first, as {kind:'W'|'L', n:int}. Misses break a
-// streak without starting one of their own -- a night you were not there for
-// is not a run of bad picks.
+// The current streak, newest first, as {kind:'W'|'L', n:int}.
+//
+// PEONLYPICKED -- this used to break a streak on a miss, reasoning that a
+// run read through a night nobody picked is two streaks with a gap in the
+// middle. That reasoning belonged to the old model, where a miss was a
+// scored result. It is not one any more: a streak is a run of consecutive
+// correct DECISIONS, and a night with no decision is not part of the
+// sequence at all. Breaking a run because Ty was busy building the app is
+// the same penalty for forgetting, wearing a different hat.
 function _peStreak(store) {
   store = store || _peLoad();
-  // MISSES ARE WALKED, not filtered out. Skipping them would allow a run of
-  // wins to read straight through a night nobody picked -- which is not a
-  // streak, it is two streaks with a gap in the middle. They break one and
-  // start none: being asleep is not a run of bad picks.
   var rows = [], id;
   for (id in store.picks) {
     if (!store.picks.hasOwnProperty(id)) continue;
     var r = store.picks[id];
-    if (r.res === 'W' || r.res === 'L' || r.res === 'M') rows.push(r);
+    if (r.res === 'W' || r.res === 'L') rows.push(r);
   }
   rows.sort(function (a, b) {
     var ta = new Date(a.st).getTime() || 0, tb = new Date(b.st).getTime() || 0;
     return tb - ta;
   });
-  if (!rows.length || rows[0].res === 'M') return null;
+  // (no miss check: a miss cannot reach this list any more)
+  if (!rows.length) return null;
   var kind = rows[0].res, n = 0, i;
   for (i = 0; i < rows.length; i++) {
     if (rows[i].res !== kind) break;
@@ -191693,6 +191723,50 @@ function _peChip(key, label, n) {
     '<i>' + n + '</i></button>';
 }
 
+// PERESET -- wiping the record.
+//
+// Two taps, not one. The first arms it and the button says what it will
+// do; the second does it. A record built over a season should not be one
+// stray tap from gone, and a confirm() dialog on a phone is a modal
+// nobody reads. Arming lapses after a few seconds, so a button left
+// armed and forgotten does not fire on a later tap.
+var _peArmed = 0;
+
+function _peResetTap() {
+  var now = Date.now();
+  if (_peArmed && (now - _peArmed) < 6000) {
+    _peArmed = 0;
+    // _peLoad reads the store fresh every call, so clearing the key IS
+    // clearing the state. (A _peMem = null went here first, inventing a
+    // global to clear a cache that does not exist.)
+    try { localStorage.removeItem(_PE_KEY); } catch (e) {}
+    if (typeof _peRender === 'function') { _peRender(); return; }
+    if (typeof renderPickEm === 'function') { renderPickEm(); return; }
+    try { location.reload(); } catch (e) {}
+    return;
+  }
+  _peArmed = now;
+  var el = document.getElementById('peResetBtn');
+  if (el) {
+    el.className = 'pe-reset armed';
+    el.textContent = 'TAP AGAIN TO ERASE';
+    setTimeout(function () {
+      if (!_peArmed) return;
+      _peArmed = 0;
+      var e2 = document.getElementById('peResetBtn');
+      if (e2) { e2.className = 'pe-reset'; e2.textContent = 'RESET RECORD'; }
+    }, 6000);
+  }
+}
+
+function _peResetBtn(tally) {
+  var a = tally && tally.all;
+  var n = a ? (a.w + a.l + (a.m || 0)) : 0;
+  if (!n) return '';
+  return '<div class="pe-reset-row"><button id="peResetBtn" class="pe-reset"' +
+    ' onclick="event.stopPropagation();_peResetTap()">RESET RECORD</button></div>';
+}
+
 function _peRecordStrip(tally, store) {
   var a = tally.all, n = _peGraded(a);
   if (!n) {
@@ -191700,15 +191774,19 @@ function _peRecordStrip(tally, store) {
       String.fromCharCode(183) + ' pick tonight\u2019s slate and the record starts</div>';
   }
   var sk = _peStreak(store);
+  // PEONLYPICKED -- the record is now wins and losses only, so PICK % and
+  // ON PICKS MADE had become the same number printed twice. The third
+  // slot says how many went unpicked instead, which is the thing the old
+  // record was really carrying.
+  var _miss = _peMissed(a);
   return '<div class="pe-strip">' +
-    '<div class="pe-stat"><span>RECORD</span><b>' + a.w + '-' + a.l +
-      (a.m ? ('-' + a.m) : '') + '</b></div>' +
+    '<div class="pe-stat"><span>RECORD</span><b>' + a.w + '-' + a.l + '</b></div>' +
     '<div class="pe-stat"><span>PICK %</span><b>' + _peFmtPct(_pePct(a)) + '</b></div>' +
-    '<div class="pe-stat"><span>ON PICKS MADE</span><b>' +
-      _peFmtPct(_pePickedPct(a)) + '</b></div>' +
+    (_miss ? ('<div class="pe-stat"><span>NOT PICKED</span><b class="mut">' +
+      _miss + '</b></div>') : '') +
     (sk ? ('<div class="pe-stat"><span>STREAK</span><b class="' +
       (sk.kind === 'W' ? 'up' : 'dn') + '">' + sk.kind + sk.n + '</b></div>') : '') +
-    '</div>';
+    '</div>' + _peResetBtn(tally);
 }
 
 // ---------------------------------------------------------------
