@@ -101965,6 +101965,57 @@ function _bpPark(abbr) {
 // line. Built from whichever of the eleven markers the source actually
 // carried, with zeros skipped -- the wall simply runs straight from one
 // measured bearing to the next, which is what an outfield wall does.
+// WHICH TEAM'S PARK THIS IS. BALLPARKS is keyed by abbreviation and the
+// entries do not carry their own key, so the centre-field watermark --
+// which needs the abbreviation to ask _vtLogoUrl for the club's logo --
+// looks it up by identity. Thirty-one entries; cheap enough to do on
+// the way past, and it beats threading an abbreviation through every
+// call site that draws a park.
+function _bpAbbrOf(p) {
+  if (!p) return '';
+  for (var k in BALLPARKS) {
+    if (BALLPARKS.hasOwnProperty(k) && BALLPARKS[k] === p) return k;
+  }
+  return '';
+}
+
+// THE CLUB'S MARK IN THE CENTRE-FIELD GRASS.
+//
+// Ty: "add each teams watermark logo in the center field grass."
+//
+// IT IS THE CLUB'S OWN HOSTED IMAGE, fetched from the same ESPN CDN
+// path _vtLogoUrl already serves to the rest of the app -- the card
+// headers, the standings rows, the full-page watermark. Nothing here
+// draws anybody's mark; it places the rights-holder's file on the
+// grass, which is what every scoreboard app in the world does.
+//
+// LAID FLAT, not pasted on. The image is placed through a matrix built
+// from three points on the actual ground plane -- the centre of the
+// mark, half its width to the right, and half its depth toward home --
+// so it recedes with the turf instead of standing up off it like a
+// sticker. Get this wrong and it reads as a logo floating over a
+// ballpark rather than one mown into it.
+function _bpTurfMark(p, o) {
+  var ab = _bpAbbrOf(p);
+  if (!ab || typeof _vtLogoUrl !== 'function') return '';
+  var url = _vtLogoUrl('MLB', ab);
+  if (!url) return '';
+  var dep = (o && o.markDepth) || 300;    // feet from the plate
+  var size = (o && o.markSize) || 86;     // feet across
+  var C = _bpXY(0, dep);
+  var R = _bpXY(size / 2, dep);
+  var N = _bpXY(0, dep - size / 2);
+  var ax = (R[0] - C[0]) * 2, ay = (R[1] - C[1]) * 2;
+  var bx = (N[0] - C[0]) * 2, by = (N[1] - C[1]) * 2;
+  return '<image href="' + url + '" xlink:href="' + url + '"' +
+    ' x="-0.5" y="-0.5" width="1" height="1"' +
+    ' preserveAspectRatio="xMidYMid meet"' +
+    ' onerror="this.remove()"' +
+    ' transform="matrix(' + _bp3n(ax) + ' ' + _bp3n(ay) + ' ' +
+    _bp3n(bx) + ' ' + _bp3n(by) + ' ' + _bp3n(C[0]) + ' ' + _bp3n(C[1]) + ')"' +
+    ' opacity="' + _bp3n((o && o.markOpacity) || 0.5) + '"/>';
+}
+
 function _bpWall(p, step) {
   if (!p || !p.d) return [];
   step = step || 3;
@@ -102668,6 +102719,9 @@ function _bpField(o, uid) {
   // the grass
   s += '<path d="' + _bpFairPath(p) + '" fill="url(#turf' + uid + ')"/>';
   s += _bpMow(p, 20, 430, 26);
+  // ON TOP OF THE MOWING and under the warning track, which is where a
+  // painted or mown device sits: on the grass, inside the fence.
+  s += _bpTurfMark(p, o);
 
   // the warning track, then the dirt
   s += '<path d="' + _bpTrackPath(p) + '" fill="#9c6f42" fill-opacity="0.85"/>';
@@ -102779,8 +102833,21 @@ function _bpBowl(o, uid) {
     _bpMix('#101722', '#454f60', _dm) + '"/>';
   // THE SKY ABOVE THE BACK ROW, which is the one surface in the drawing
   // that says what time it is.
+  //
+  // UNLESS THERE ISN'T ONE. Tropicana Field is the only ground in this
+  // table with a roof that never opens, and from in there the sky is
+  // not dark -- it is a lit ceiling, and the panel that says what time
+  // it is says nothing at all. Covering it with a slab of roof was the
+  // first try and it is the wrong shape of fix: the frame is sized to
+  // fit its contents, so any change anywhere re-opens a strip of night
+  // along the top of a building that is shut. A park that has no sky
+  // says so, and names the colour of its own ceiling.
+  var _art0 = (typeof _bpArt === 'function') ? _bpArt(o.park) : null;
+  var _ceil = _art0 && _art0.ceiling;
   s += '<path d="' + _bpTierPath(tN, false) +
-    'L224 -78L-24 -78Z" fill="url(#sky' + uid + ')"/>';
+    'L224 -78L-24 -78Z" fill="' +
+    (_ceil ? _bpMix(_ceil, _art0.ceilingDay || _ceil, _dm)
+      : ('url(#sky' + uid + ')')) + '"/>';
 
   // Deterministic, so the park does not reseat itself every five seconds.
   var seed = 20240413;
@@ -104449,6 +104516,7 @@ function _bpaRoof(p, it, mix) {
   var lift = (it.lift == null) ? 150 : it.lift;   // feet at the crown
   var back = (it.back == null) ? 120 : it.back;
   var step = (it.step == null) ? 42 : it.step;
+  var low = (it.archLow == null) ? 0.34 : it.archLow;
   mix = Math.max(0, Math.min(1, mix == null ? 0 : mix));
   // THE COLOUR COMES FROM THE RECORD when the record has one. Steel
   // grey is Milwaukee's, and was written in here because Milwaukee was
@@ -104471,12 +104539,473 @@ function _bpaRoof(p, it, mix) {
         ((it.a1 == null ? 94 : it.a1) - (it.a0 == null ? -4 : it.a0)) * j / m;
       // the arch: highest in the middle of the span, down at both ends
       pts += (j ? 'L' : 'M') +
-        at(a, bk, up * (0.34 + 0.66 * Math.sin(Math.PI * j / m)));
+        at(a, bk, up * (low + (1 - low) * Math.sin(Math.PI * j / m)));
     }
     s += '<path d="' + pts + '" fill="none" stroke="' +
       (i === n - 1 ? edge : beam) + '" stroke-opacity="' +
       _bp3n(0.5 + 0.4 * (i + 1) / n) + '" stroke-width="' +
       _bp3n(0.5 + 0.5 * (i + 1) / n) + '"/>';
+  }
+  // THE PARKED PANELS. Milwaukee, Houston, Phoenix and Toronto all shut
+  // over the field, so a fan of ribs against the sky IS the roof and
+  // there is nothing solid to draw. Seattle's never closes over the
+  // field at all: three panels nine acres between them park above and
+  // behind the right-field seats, and from in here you are looking at
+  // the underside of them. So at this park the ribs are half the
+  // structure and a solid deck is the other half.
+  if (it.panels) {
+    var qa0 = (it.panelA0 == null) ? 38 : it.panelA0;
+    var qa1 = (it.panelA1 == null) ? 100 : it.panelA1;
+    var qb0 = (it.panelBack == null) ? back : it.panelBack;
+    var qb1 = qb0 + ((it.panelDeep == null) ? 300 : it.panelDeep);
+    var qLift = (it.panelLift == null) ? lift * 0.72 : it.panelLift;
+    var qTh = (it.panelDrop == null) ? 16 : it.panelDrop;
+    var qm = 16, qk, qa, qf, qFwd = '', qBack = '', qLow = '';
+    // the same arch the ribs use, so the deck sits under them rather
+    // than cutting across at its own angle
+    function qUp(t) { return qLift * (low + (1 - low) * Math.sin(Math.PI * t)); }
+    for (qk = 0; qk <= qm; qk++) {
+      qa = qa0 + (qa1 - qa0) * qk / qm;
+      qf = qUp(qk / qm);
+      qFwd += (qk ? 'L' : 'M') + at(qa, qb0, qf);
+      qLow += (qk ? 'L' : 'M') + at(qa, qb0, qf - qTh);
+    }
+    for (qk = qm; qk >= 0; qk--) {
+      qa = qa0 + (qa1 - qa0) * qk / qm;
+      qBack += 'L' + at(qa, qb1, qUp(qk / qm));
+    }
+    // the deck, seen from underneath and so nearly flat on
+    s += '<path d="' + qFwd + qBack + 'Z" fill="' +
+      _bpMix(it.panelFill || '#222b35', it.panelDay || '#8b949f', mix) + '"/>';
+    // the leading edge end-on, which is the one part with a thickness
+    var qFace = '';
+    for (qk = 0; qk <= qm; qk++) {
+      qa = qa0 + (qa1 - qa0) * qk / qm;
+      qFace += (qk ? 'L' : 'M') + at(qa, qb0, qUp(qk / qm));
+    }
+    for (qk = qm; qk >= 0; qk--) {
+      qa = qa0 + (qa1 - qa0) * qk / qm;
+      qFace += 'L' + at(qa, qb0, qUp(qk / qm) - qTh);
+    }
+    s += '<path d="' + qFace + 'Z" fill="' +
+      _bpMix(it.panelFace || '#161d26', it.panelFaceDay || '#6d7682', mix) + '"/>';
+    // and the lit lip along it, the one thing that says the deck has
+    // a bottom rather than being a hole cut in the sky
+    s += '<path d="' + qLow + '" fill="none" stroke="' + edge +
+      '" stroke-opacity="0.75" stroke-width="0.7"/>';
+    s += '<path d="' + qFwd + '" fill="none" stroke="' + edge +
+      '" stroke-opacity="0.9" stroke-width="0.9"/>';
+    // THE RIBS ON THE CEILING. A roof parked off to one side is a slab
+    // and reads as one; a dome shut over the whole ground is the only
+    // thing in the frame that big, and drawn plain it came out as a
+    // sheet of grey with nothing in it. These run back from the rim at
+    // fixed bearings -- the radial structure you are looking straight
+    // up at from in there.
+    var qR = it.domeRibs || 0, qi, qb;
+    for (qi = 1; qi < qR; qi++) {
+      qb = qa0 + (qa1 - qa0) * qi / qR;
+      qf = qUp(qi / qR);
+      s += '<path d="M' + at(qb, qb0, qf) + 'L' + at(qb, qb1, qf) +
+        '" fill="none" stroke="' + _bpMix(it.ribFill || '#5b6572',
+          it.ribDay || '#aab3bf', mix) +
+        '" stroke-opacity="0.55" stroke-width="0.55"/>';
+    }
+    // AND THE LAMPS, which at this park hang off the ceiling rather
+    // than standing on masts behind the seats. Drawn in the roof
+    // because that is where they are: the park declares no towers and
+    // is still lit, which is the whole point of asking the DRAWING
+    // whether a ground shows a light rather than asking the table.
+    var qL = it.domeLights || 0, qc, qcx, qcy, qj, qk2;
+    var qBulb = _bpMix('#48505c', '#fff4d8', 1 - mix);
+    var qCase = _bpMix('#2b333e', '#8d97a4', mix);
+    for (qi = 0; qi < qL; qi++) {
+      qc = (qi + 0.5) / qL;
+      qb = qa0 + (qa1 - qa0) * qc;
+      qf = qUp(qc) - qTh - 2;
+      var qPt = _bpUp(qb - 45,
+        _bpWallDistAt(p, Math.max(0, Math.min(90, qb))) + qb0 + 26, qf);
+      qcx = qPt[0]; qcy = qPt[1];
+      s += '<rect x="' + _bp3n(qcx - 3.4) + '" y="' + _bp3n(qcy - 1.5) +
+        '" width="6.8" height="3" rx="0.5" fill="' + qCase + '"/>';
+      for (qj = 0; qj < 2; qj++) {
+        for (qk2 = 0; qk2 < 4; qk2++) {
+          s += '<circle cx="' + _bp3n(qcx - 2.55 + qk2 * 1.7) +
+            '" cy="' + _bp3n(qcy - 0.72 + qj * 1.44) +
+            '" r="0.62" fill="' + qBulb + '"/>';
+        }
+      }
+    }
+  }
+  // DRAWN AFTER THE SLAB, not before it. First time round the truss
+  // went down first and the panel fill painted straight over the
+  // lattice, leaving the leading edge as a plain line -- the work
+  // was all being done and none of it could be seen.
+  // THE LEADING TRUSS, drawn as steel rather than as a line. The four
+  // roofs that shut over a field are seen nearly edge-on from directly
+  // underneath and read fine as single arcs. Seattle's leading truss is
+  // side-on to this camera, the photograph shows it as open lattice --
+  // two chords with bracing between -- and without that it was a wire
+  // strung across the left-field sky.
+  if (it.truss) {
+    var tD = (it.trussDeep == null) ? 9 : it.trussDeep;
+    // ON THE SLAB'S OWN EDGE when there is a slab, so the lattice has
+    // a boundary to read against instead of floating among the ribs.
+    var tA0 = it.panels ? ((it.panelA0 == null) ? 38 : it.panelA0)
+      : (it.a0 == null ? -4 : it.a0);
+    var tA1 = it.panels ? ((it.panelA1 == null) ? 100 : it.panelA1)
+      : (it.a1 == null ? 94 : it.a1);
+    var tBk = it.panels ? ((it.panelBack == null) ? back : it.panelBack) : back;
+    var tUp = it.panels ? ((it.panelLift == null) ? lift * 0.72 : it.panelLift)
+      : lift * (0.55 + 0.45 / n);
+    var tm = 26, tk, ta, tf, tTop = '', tBot = '', tZig = '', tNext;
+    for (tk = 0; tk <= tm; tk++) {
+      ta = tA0 + (tA1 - tA0) * tk / tm;
+      tf = tUp * (low + (1 - low) * Math.sin(Math.PI * tk / tm));
+      tTop += (tk ? 'L' : 'M') + at(ta, tBk, tf);
+      tBot += (tk ? 'L' : 'M') + at(ta, tBk, tf - tD);
+      if (tk < tm) {
+        tNext = tUp * (low + (1 - low) * Math.sin(Math.PI * (tk + 1) / tm));
+        tZig += 'M' + at(ta, tBk, tf - (tk % 2 ? 0 : tD)) +
+          'L' + at(tA0 + (tA1 - tA0) * (tk + 1) / tm, tBk,
+            tNext - (tk % 2 ? tD : 0));
+      }
+    }
+    s += '<path d="' + tZig + '" fill="none" stroke="' + beam +
+      '" stroke-opacity="0.85" stroke-width="0.4"/>';
+    s += '<path d="' + tTop + '" fill="none" stroke="' + edge +
+      '" stroke-width="0.8"/>';
+    s += '<path d="' + tBot + '" fill="none" stroke="' + edge +
+      '" stroke-width="0.6" stroke-opacity="0.85"/>';
+  }
+  return s;
+}
+
+// PENNANTS, hung from a rim. Tropicana Field flies eight of them along
+// the left-hand rim and none anywhere else in the picture, which is
+// why they are placed with a bearing range rather than run right round
+// the park the way the advertising is.
+//
+// DRAWN BLANK. Each one carries a year and a title in the photograph
+// and neither is legible from this distance, so the lettering would be
+// invention; and the club's own marks are not drawn here in any case.
+function _bpaPennants(p, it, mix) {
+  var n = it.n || 8, i, s = '';
+  var back = (it.back == null) ? 16 : it.back;
+  var h = (it.h == null) ? 76 : it.h;
+  var drop = (it.drop == null) ? 11 : it.drop;
+  mix = Math.max(0, Math.min(1, mix == null ? 0 : mix));
+  var fill = _bpMix(it.fill || '#b9c4d0', it.fillDay || '#e8eef4', mix);
+  var rail = _bpMix(it.rail || '#5d6773', it.railDay || '#8d97a4', mix);
+  function at(bear, ft) {
+    return _bpUpPt(bear - 45,
+      _bpWallDistAt(p, Math.max(0, Math.min(90, bear))) + back, ft);
+  }
+  var span = (it.a1 - it.a0) / n;
+  s += '<path d="M' + at(it.a0, h) + 'L' + at(it.a1, h) +
+    '" fill="none" stroke="' + rail + '" stroke-width="0.5"/>';
+  for (i = 0; i < n; i++) {
+    var b0 = it.a0 + span * (i + 0.12), b1 = it.a0 + span * (i + 0.88);
+    s += '<path d="M' + at(b0, h) + 'L' + at(b1, h) +
+      'L' + at((b0 + b1) / 2, h - drop) + 'Z" fill="' + fill +
+      '" fill-opacity="0.92"/>';
+  }
+  return s;
+}
+
+
+// ════════════════════════════════════════════════════════════════════
+// FLAGPOLES.
+//
+// Ty: "add flag poles with the United States flag and each states
+// state flag below the US flag."
+//
+// THESE ARE GOVERNMENT FLAGS, drawn rather than fetched -- nobody's
+// trademark, and no CDN has a file for "the flag of Ohio at twelve
+// pixels wide" anyway.
+//
+// HOW HONEST EACH ONE IS. Some state flags are a handful of shapes and
+// come out right: Texas, Ohio, Maryland, Colorado, Arizona, Georgia,
+// Missouri, California, Florida, the District. Eight others -- New
+// York, Pennsylvania, Michigan, Wisconsin, Illinois, Massachusetts,
+// Washington, and Minnesota's old one -- are a seal on a plain field,
+// and a seal drawn twelve pixels across is a smudge pretending to be
+// heraldry. Those are drawn as the correct field colour with a plain
+// device standing in for the seal, and this comment is the honest
+// record of that rather than a claim they are accurate.
+//
+// MINNESOTA IS THE 2024 FLAG, not the seal-on-blue it replaced.
+// TORONTO FLIES CANADA AND ONTARIO, because Toronto is in Ontario.
+// THE REAL FLAGS, FETCHED. Ty, looking at New York drawn as a blue
+// rectangle with a yellow blob in it: "Why can't we do any better on
+// the state flags? Could you reference an image link rather than
+// draw?" Yes -- and it is the same answer as the club logos one turn
+// earlier: don't draw somebody's artwork badly when the artwork is
+// sitting on a server.
+//
+// WIKIMEDIA'S Special:FilePath, which is the one form of Commons URL
+// that can be built from the file NAME alone. The ordinary thumbnail
+// path carries an MD5 hash in it -- /commons/thumb/1/1a/... -- and a
+// hash cannot be guessed, so twenty of those would have been twenty
+// chances at a silent 404. FilePath redirects to the file, and
+// ?width= redirects to a raster of it.
+//
+// GEORGIA IS THE EXCEPTION in the naming, because the country Georgia
+// holds the plain title. Everything else is Flag_of_<Name>.svg.
+//
+// THE DRAWN FLAG IS STILL UNDERNEATH, and that is deliberate. I cannot
+// reach these URLs from where this was built -- outbound is blocked --
+// so I cannot prove all twenty resolve. If one does not, the shapes
+// below show through and the pole still flies something the right
+// colour, instead of a bare halyard. A silent 404 degrades to the old
+// simplified flag rather than to nothing.
+var _BP_FLAG_IMG = {
+  US: 'Flag_of_the_United_States.svg', CAN: 'Flag_of_Canada.svg',
+  AZ: 'Flag_of_Arizona.svg', CA: 'Flag_of_California.svg',
+  CO: 'Flag_of_Colorado.svg', DC: 'Flag_of_the_District_of_Columbia.svg',
+  FL: 'Flag_of_Florida.svg', GA: 'Flag_of_Georgia_(U.S._state).svg',
+  IL: 'Flag_of_Illinois.svg', MA: 'Flag_of_Massachusetts.svg',
+  MD: 'Flag_of_Maryland.svg', MI: 'Flag_of_Michigan.svg',
+  MN: 'Flag_of_Minnesota.svg', MO: 'Flag_of_Missouri.svg',
+  NY: 'Flag_of_New_York.svg', OH: 'Flag_of_Ohio.svg',
+  ON: 'Flag_of_Ontario.svg', PA: 'Flag_of_Pennsylvania.svg',
+  TX: 'Flag_of_Texas.svg', WA: 'Flag_of_Washington.svg',
+  WI: 'Flag_of_Wisconsin.svg'
+};
+
+function _bpFlagImgUrl(code) {
+  var f = _BP_FLAG_IMG[code];
+  if (!f) return '';
+  return 'https://commons.wikimedia.org/wiki/Special:FilePath/' + f +
+    '?width=320';
+}
+
+var _BP_FLAG = {
+  US: [['stripes', '#b31942', '#ffffff'], ['canton', '#0a3161', 0.4, 0.538],
+       ['stars', '#ffffff', 0.4, 0.538]],
+  CAN: [['rect', '#d80621', 0, 0, 0.25, 1], ['rect', '#ffffff', 0.25, 0, 0.5, 1],
+        ['rect', '#d80621', 0.75, 0, 0.25, 1], ['leaf', '#d80621', 0.5, 0.5, 0.3]],
+  AZ: [['rays', '#ce5c17', '#fecb00'], ['rect', '#002868', 0, 0.5, 1, 0.5],
+       ['star', '#b87333', 0.5, 0.5, 0.17]],
+  CA: [['rect', '#ffffff', 0, 0, 1, 1], ['rect', '#bf0a30', 0, 0.85, 1, 0.15],
+       ['star', '#bf0a30', 0.16, 0.2, 0.1], ['bear', '#6b4a2b', 0.5, 0.48, 0.3]],
+  CO: [['rect', '#002868', 0, 0, 1, 0.33], ['rect', '#ffffff', 0, 0.33, 1, 0.34],
+       ['rect', '#002868', 0, 0.67, 1, 0.33], ['ring', '#bf0a30', 0.3, 0.5, 0.3],
+       ['disc', '#ffd700', 0.3, 0.5, 0.12]],
+  DC: [['rect', '#ffffff', 0, 0, 1, 1], ['star', '#cf142b', 0.26, 0.26, 0.1],
+       ['star', '#cf142b', 0.5, 0.26, 0.1], ['star', '#cf142b', 0.74, 0.26, 0.1],
+       ['rect', '#cf142b', 0, 0.48, 1, 0.14], ['rect', '#cf142b', 0, 0.7, 1, 0.14]],
+  FL: [['rect', '#ffffff', 0, 0, 1, 1], ['saltire', '#d21034', 0.16],
+       ['disc', '#ffffff', 0.5, 0.5, 0.2], ['ring', '#c8a24a', 0.5, 0.5, 0.2]],
+  GA: [['rect', '#bf0a30', 0, 0, 1, 0.33], ['rect', '#ffffff', 0, 0.33, 1, 0.34],
+       ['rect', '#bf0a30', 0, 0.67, 1, 0.33], ['canton', '#002868', 0.42, 0.6],
+       ['ring', '#f0c75e', 0.21, 0.3, 0.22]],
+  IL: [['rect', '#ffffff', 0, 0, 1, 1], ['seal', '#6d7a86', 0.5, 0.5, 0.3]],
+  MA: [['rect', '#ffffff', 0, 0, 1, 1], ['shield', '#1a3a7a', 0.5, 0.5, 0.34]],
+  MD: [['rect', '#ffbf00', 0, 0, 0.5, 0.5], ['check', '#000000', 0, 0, 0.5, 0.5],
+       ['rect', '#ffbf00', 0.5, 0.5, 0.5, 0.5], ['check', '#000000', 0.5, 0.5, 0.5, 0.5],
+       ['rect', '#ffffff', 0.5, 0, 0.5, 0.5], ['cross', '#e03c31', 0.5, 0, 0.5, 0.5],
+       ['rect', '#ffffff', 0, 0.5, 0.5, 0.5], ['cross', '#e03c31', 0, 0.5, 0.5, 0.5]],
+  MI: [['rect', '#11356b', 0, 0, 1, 1], ['seal', '#c9d2dd', 0.5, 0.5, 0.3]],
+  MN: [['rect', '#7fc7e8', 0, 0, 1, 1], ['kite', '#0a2342', 0.46],
+       ['star', '#ffffff', 0.16, 0.5, 0.15]],
+  MO: [['rect', '#bf0a30', 0, 0, 1, 0.33], ['rect', '#ffffff', 0, 0.33, 1, 0.34],
+       ['rect', '#002868', 0, 0.67, 1, 0.33], ['disc', '#ffffff', 0.5, 0.5, 0.26],
+       ['ring', '#002868', 0.5, 0.5, 0.26]],
+  NY: [['rect', '#11356b', 0, 0, 1, 1], ['seal', '#d8cfae', 0.5, 0.5, 0.3]],
+  OH: [['stripes5', '#bf0a30', '#ffffff'], ['tri', '#002868', 0.42],
+       ['disc', '#ffffff', 0.17, 0.5, 0.2], ['ring', '#bf0a30', 0.17, 0.5, 0.2]],
+  ON: [['rect', '#d80621', 0, 0, 1, 1], ['canton', '#012169', 0.46, 0.5],
+       ['jack', '#ffffff', 0.46, 0.5], ['shield', '#f4f4f4', 0.74, 0.5, 0.3]],
+  PA: [['rect', '#11356b', 0, 0, 1, 1], ['seal', '#d8cfae', 0.5, 0.5, 0.3]],
+  TX: [['rect', '#002868', 0, 0, 0.34, 1], ['rect', '#ffffff', 0.34, 0, 0.66, 0.5],
+       ['rect', '#bf0a30', 0.34, 0.5, 0.66, 0.5], ['star', '#ffffff', 0.17, 0.5, 0.22]],
+  WA: [['rect', '#136034', 0, 0, 1, 1], ['disc', '#e9e3cf', 0.5, 0.5, 0.3]],
+  WI: [['rect', '#11356b', 0, 0, 1, 1], ['seal', '#d8cfae', 0.5, 0.5, 0.3]]
+};
+
+// WHICH FLAG EACH GROUND FLIES. The park's own state, and Toronto's
+// province. Sutter Health Park is in West Sacramento, California.
+var _BP_PARK_FLAG = {
+  'Chase Field': 'AZ', 'Truist Park': 'GA',
+  'Oriole Park at Camden Yards': 'MD', 'Fenway Park': 'MA',
+  'Wrigley Field': 'IL', 'Rate Field': 'IL',
+  'Great American Ball Park': 'OH', 'Progressive Field': 'OH',
+  'Coors Field': 'CO', 'Comerica Park': 'MI', 'Daikin Park': 'TX',
+  'Kauffman Stadium': 'MO', 'Angel Stadium': 'CA', 'Dodger Stadium': 'CA',
+  'loanDepot park': 'FL', 'American Family Field': 'WI',
+  'Target Field': 'MN', 'Citi Field': 'NY', 'Yankee Stadium': 'NY',
+  'Citizens Bank Park': 'PA', 'PNC Park': 'PA', 'Petco Park': 'CA',
+  'T-Mobile Park': 'WA', 'Oracle Park': 'CA', 'Busch Stadium': 'MO',
+  'Tropicana Field': 'FL', 'Globe Life Field': 'TX',
+  'Rogers Centre': 'ON', 'Nationals Park': 'DC',
+  'Sutter Health Park': 'CA'
+};
+
+// ONE FLAG, in a unit box with the hoist at x=0.
+function _bpaFlagFace(spec, x, y, w, h, code) {
+  var s = '', i, op;
+  function R(a, b, c, d, f, o) {
+    return '<rect x="' + _bp3n(x + a * w) + '" y="' + _bp3n(y + b * h) +
+      '" width="' + _bp3n(c * w) + '" height="' + _bp3n(d * h) +
+      '" fill="' + f + '"' + (o ? ' fill-opacity="' + o + '"' : '') + '/>';
+  }
+  function D(cx, cy, r, f) {
+    return '<ellipse cx="' + _bp3n(x + cx * w) + '" cy="' + _bp3n(y + cy * h) +
+      '" rx="' + _bp3n(r * w * 0.5) + '" ry="' + _bp3n(r * h * 0.5) +
+      '" fill="' + f + '"/>';
+  }
+  for (i = 0; i < spec.length; i++) {
+    op = spec[i];
+    if (op[0] === 'rect') { s += R(op[2], op[3], op[4], op[5], op[1]); }
+    else if (op[0] === 'disc') { s += D(op[2], op[3], op[4], op[1]); }
+    else if (op[0] === 'ring') {
+      s += '<ellipse cx="' + _bp3n(x + op[2] * w) + '" cy="' + _bp3n(y + op[3] * h) +
+        '" rx="' + _bp3n(op[4] * w * 0.5) + '" ry="' + _bp3n(op[4] * h * 0.5) +
+        '" fill="none" stroke="' + op[1] + '" stroke-width="' +
+        _bp3n(Math.max(0.12, h * 0.1)) + '"/>';
+    }
+    else if (op[0] === 'star' || op[0] === 'seal' || op[0] === 'shield' ||
+             op[0] === 'bear' || op[0] === 'leaf') {
+      // A STAR, A SEAL, A SHIELD, A BEAR AND A MAPLE LEAF all come out
+      // of the same few pixels at this size. The star gets points
+      // because a five-pointed star still reads; the rest are a blob
+      // of the right colour in the right place, which is the honest
+      // limit of a flag this small.
+      if (op[0] === 'star') {
+        var sx = x + op[2] * w, sy = y + op[3] * h;
+        var rr = op[4] * Math.min(w, h) * 0.75, pts = '', k, ang, rad;
+        for (k = 0; k < 10; k++) {
+          ang = -Math.PI / 2 + k * Math.PI / 5;
+          rad = (k % 2) ? rr * 0.42 : rr;
+          pts += (k ? 'L' : 'M') + _bp3n(sx + Math.cos(ang) * rad) +
+            ' ' + _bp3n(sy + Math.sin(ang) * rad);
+        }
+        s += '<path d="' + pts + 'Z" fill="' + op[1] + '"/>';
+      } else if (op[0] === 'shield') {
+        var hx = x + op[2] * w, hy = y + op[3] * h, hw = op[4] * w * 0.5,
+            hh = op[4] * h * 0.72;
+        s += '<path d="M' + _bp3n(hx - hw) + ' ' + _bp3n(hy - hh) +
+          'L' + _bp3n(hx + hw) + ' ' + _bp3n(hy - hh) +
+          'L' + _bp3n(hx + hw) + ' ' + _bp3n(hy + hh * 0.3) +
+          'L' + _bp3n(hx) + ' ' + _bp3n(hy + hh) +
+          'L' + _bp3n(hx - hw) + ' ' + _bp3n(hy + hh * 0.3) +
+          'Z" fill="' + op[1] + '"/>';
+      } else { s += D(op[2], op[3], op[4], op[1]); }
+    }
+    else if (op[0] === 'canton') { s += R(0, 0, op[2], op[3], op[1]); }
+    else if (op[0] === 'stripes') {
+      // THIRTEEN STRIPES when there is room for thirteen, seven when
+      // there is not. At a flag ten units tall, thirteen stripes are
+      // three quarters of a unit each and come out as a pink smear;
+      // seven read as stripes, which is the thing the eye is after.
+      var ns = (h >= 11) ? 13 : 7, j;
+      s += R(0, 0, 1, 1, op[2]);
+      for (j = 0; j < ns; j += 2) { s += R(0, j / ns, 1, 1 / ns, op[1]); }
+    }
+    else if (op[0] === 'stripes5') {
+      var m5;
+      s += R(0, 0, 1, 1, op[2]);
+      for (m5 = 0; m5 < 5; m5 += 2) { s += R(0, m5 / 5, 1, 1 / 5, op[1]); }
+    }
+    else if (op[0] === 'stars') {
+      var gx, gy;
+      for (gy = 0; gy < 3; gy++) {
+        for (gx = 0; gx < 4; gx++) {
+          s += '<rect x="' + _bp3n(x + (0.06 + gx * 0.095) * w) +
+            '" y="' + _bp3n(y + (0.08 + gy * 0.17) * h) +
+            '" width="' + _bp3n(w * 0.035) + '" height="' + _bp3n(h * 0.055) +
+            '" fill="' + op[1] + '"/>';
+        }
+      }
+    }
+    else if (op[0] === 'rays') {
+      var ry;
+      for (ry = 0; ry < 13; ry++) {
+        s += R(ry / 13, 0, 1 / 13, 0.5, (ry % 2) ? op[2] : op[1]);
+      }
+    }
+    else if (op[0] === 'saltire') {
+      s += '<path d="M' + _bp3n(x) + ' ' + _bp3n(y) + 'L' + _bp3n(x + w) +
+        ' ' + _bp3n(y + h) + 'M' + _bp3n(x + w) + ' ' + _bp3n(y) +
+        'L' + _bp3n(x) + ' ' + _bp3n(y + h) + '" stroke="' + op[1] +
+        '" stroke-width="' + _bp3n(op[2] * h) + '" fill="none"/>';
+    }
+    else if (op[0] === 'cross') {
+      s += '<path d="M' + _bp3n(x + (op[2] + op[4] / 2) * w) + ' ' + _bp3n(y + op[3] * h) +
+        'L' + _bp3n(x + (op[2] + op[4] / 2) * w) + ' ' + _bp3n(y + (op[3] + op[5]) * h) +
+        'M' + _bp3n(x + op[2] * w) + ' ' + _bp3n(y + (op[3] + op[5] / 2) * h) +
+        'L' + _bp3n(x + (op[2] + op[4]) * w) + ' ' + _bp3n(y + (op[3] + op[5] / 2) * h) +
+        '" stroke="' + op[1] + '" stroke-width="' + _bp3n(h * 0.1) + '" fill="none"/>';
+    }
+    else if (op[0] === 'check') {
+      var cq, cr;
+      for (cq = 0; cq < 3; cq++) {
+        for (cr = 0; cr < 3; cr++) {
+          if ((cq + cr) % 2) { continue; }
+          s += R(op[2] + cq * op[4] / 3, op[3] + cr * op[5] / 3,
+            op[4] / 3, op[5] / 3, op[1]);
+        }
+      }
+    }
+    else if (op[0] === 'tri') {
+      s += '<path d="M' + _bp3n(x) + ' ' + _bp3n(y) + 'L' +
+        _bp3n(x + op[2] * w) + ' ' + _bp3n(y + h / 2) + 'L' + _bp3n(x) +
+        ' ' + _bp3n(y + h) + 'Z" fill="' + op[1] + '"/>';
+    }
+    else if (op[0] === 'kite') {
+      s += '<path d="M' + _bp3n(x) + ' ' + _bp3n(y) + 'L' +
+        _bp3n(x + op[2] * w) + ' ' + _bp3n(y + h / 2) + 'L' + _bp3n(x) +
+        ' ' + _bp3n(y + h) + 'Z" fill="' + op[1] + '"/>';
+    }
+    else if (op[0] === 'jack') {
+      s += '<path d="M' + _bp3n(x) + ' ' + _bp3n(y + op[3] * h / 2) +
+        'L' + _bp3n(x + op[2] * w) + ' ' + _bp3n(y + op[3] * h / 2) +
+        'M' + _bp3n(x + op[2] * w / 2) + ' ' + _bp3n(y) +
+        'L' + _bp3n(x + op[2] * w / 2) + ' ' + _bp3n(y + op[3] * h) +
+        '" stroke="' + op[1] + '" stroke-width="' + _bp3n(h * 0.07) +
+        '" fill="none"/>';
+    }
+  }
+  // AND THE REAL THING OVER THE TOP OF ALL THAT. preserveAspectRatio
+  // is none because the flag rectangle is already the right shape and
+  // the image should fill it exactly rather than letterbox inside it.
+  var iurl = code ? _bpFlagImgUrl(code) : '';
+  if (iurl) {
+    s += '<image href="' + iurl + '" xlink:href="' + iurl +
+      '" x="' + _bp3n(x) + '" y="' + _bp3n(y) +
+      '" width="' + _bp3n(w) + '" height="' + _bp3n(h) +
+      '" preserveAspectRatio="none" onerror="this.remove()"/>';
+  }
+  return s;
+}
+
+// THE POLE, AND THE TWO FLAGS ON IT.
+function _bpaFlagpole(p, it, mix) {
+  var back = (it.back == null) ? 28 : it.back;
+  var h0 = it.h0 || 0, hh = (it.h == null) ? 96 : it.h;
+  mix = Math.max(0, Math.min(1, mix == null ? 0 : mix));
+  var mast = _bpMix(it.mast || '#aeb6bf', it.mastDay || '#78808a', mix);
+  function at(bear, ft) {
+    return _bpUp(bear - 45,
+      _bpWallDistAt(p, Math.max(0, Math.min(90, bear))) + back, ft);
+  }
+  var foot = at(it.a, h0), top = at(it.a, h0 + hh);
+  var span = foot[1] - top[1];
+  if (!(span > 4)) { return ''; }
+  var s = '';
+  s += '<path d="M' + _bp3n(foot[0]) + ' ' + _bp3n(foot[1]) + 'L' +
+    _bp3n(top[0]) + ' ' + _bp3n(top[1]) + '" stroke="' + mast +
+    '" stroke-width="' + _bp3n(Math.max(0.3, span * 0.022)) + '" fill="none"/>';
+  s += '<circle cx="' + _bp3n(top[0]) + '" cy="' + _bp3n(top[1]) +
+    '" r="' + _bp3n(Math.max(0.3, span * 0.028)) + '" fill="' + mast + '"/>';
+  var fw = span * 0.46, fh = fw * 0.53;
+  var upper = _BP_FLAG[it.upper || 'US'] || _BP_FLAG.US;
+  var lower = _BP_FLAG[it.st] || null;
+  var upCode = it.upper || 'US';
+  s += _bpaFlagFace(upper, top[0], top[1] + span * 0.05, fw, fh, upCode);
+  if (lower) {
+    s += _bpaFlagFace(lower, top[0], top[1] + span * 0.05 + fh * 1.3,
+      fw, fh, it.st);
   }
   return s;
 }
@@ -105297,6 +105826,147 @@ function _bpaPropPath(it, cx, by, w, h) {
     s += g1;
     return s;
   }
+  if (it.shape === 'bell') {
+    s += g0;
+    var beW = w * 0.5, beB = by, beT = by - h;
+    var beLip = h * 0.055, beYoke = h * 0.10, beCrown = h * 0.10;
+    var beBody = beT + beYoke + beCrown;   // the top of the bell proper
+    var beBot = beB - beLip;               // where the lip band starts
+    var beH = beBot - beBody;              // the height of the wall itself
+    var beFill = it.fill || '#3f4a3a';
+    var beNeon = it.neon || '#e8e06a';
+    // THE FRAME IT HANGS FROM, drawn FIRST so the bell's own metal
+    // covers the middle of it. A bell is suspended, not balanced: with
+    // nothing under the yoke this was the Big A floating over Anaheim
+    // again. The legs run on down past the lip, and because the prop is
+    // listed ahead of the bleachers in the table the deck in front of
+    // it cuts them off at the right height by itself.
+    if (it.frame !== false) {
+      var bfC = it.frameFill || '#2a3038';
+      var bfT = beT, bfB = beB + h * (it.frameDrop == null ? 1 : it.frameDrop);
+      var bfW = Math.max(0.3, w * 0.05);
+      var bfL0 = cx - beW * 0.58, bfL1 = cx - beW * 0.86;
+      var bfR0 = cx + beW * 0.58, bfR1 = cx + beW * 0.86;
+      s += '<path d="M' + _bp3n(bfL0) + ' ' + _bp3n(bfT) +
+        'L' + _bp3n(bfL1) + ' ' + _bp3n(bfB) +
+        'M' + _bp3n(bfR0) + ' ' + _bp3n(bfT) +
+        'L' + _bp3n(bfR1) + ' ' + _bp3n(bfB) +
+        '" stroke="' + bfC + '" stroke-width="' + _bp3n(bfW) +
+        '" fill="none"/>';
+      var bfF, bfY;
+      for (var bfi = 0; bfi < 3; bfi++) {
+        bfF = 0.42 + bfi * 0.19;
+        bfY = bfT + (bfB - bfT) * bfF;
+        s += '<path d="M' + _bp3n(bfL0 + (bfL1 - bfL0) * bfF) + ' ' + _bp3n(bfY) +
+          'L' + _bp3n(bfR0 + (bfR1 - bfR0) * bfF) + ' ' + _bp3n(bfY) +
+          '" stroke="' + bfC + '" stroke-width="' + _bp3n(bfW * 0.6) +
+          '" fill="none" stroke-opacity="0.8"/>';
+      }
+    }
+    // A BELL, NOT A FLASK. Drawn first with the wall tapering steadily
+    // in from the bottom, which is a conical vessel and read as one. A
+    // bell leaves its lip almost UPRIGHT and holds that line for two
+    // thirds of the way up; the turn in to the crown comes late and
+    // fast. One cubic for the long near-vertical run, a second for the
+    // shoulder, and the waist two thirds up rather than half way.
+    var beWaist = beBot - beH * 0.62;
+    var beWall = 'M' + _bp3n(cx - beW * 0.95) + ' ' + _bp3n(beBot) +
+      'C' + _bp3n(cx - beW * 0.93) + ' ' + _bp3n(beBot - beH * 0.22) +
+      ' ' + _bp3n(cx - beW * 0.8) + ' ' + _bp3n(beBot - beH * 0.45) +
+      ' ' + _bp3n(cx - beW * 0.72) + ' ' + _bp3n(beWaist) +
+      'C' + _bp3n(cx - beW * 0.66) + ' ' + _bp3n(beWaist - beH * 0.14) +
+      ' ' + _bp3n(cx - beW * 0.52) + ' ' + _bp3n(beBody + beH * 0.11) +
+      ' ' + _bp3n(cx - beW * 0.2) + ' ' + _bp3n(beBody) +
+      'L' + _bp3n(cx + beW * 0.2) + ' ' + _bp3n(beBody) +
+      'C' + _bp3n(cx + beW * 0.52) + ' ' + _bp3n(beBody + beH * 0.11) +
+      ' ' + _bp3n(cx + beW * 0.66) + ' ' + _bp3n(beWaist - beH * 0.14) +
+      ' ' + _bp3n(cx + beW * 0.72) + ' ' + _bp3n(beWaist) +
+      'C' + _bp3n(cx + beW * 0.8) + ' ' + _bp3n(beBot - beH * 0.45) +
+      ' ' + _bp3n(cx + beW * 0.93) + ' ' + _bp3n(beBot - beH * 0.22) +
+      ' ' + _bp3n(cx + beW * 0.95) + ' ' + _bp3n(beBot);
+    s += '<path d="' + beWall + 'Z" fill="' + beFill + '"/>';
+    // THE LIP. The widest part of a bell is its bottom EDGE, and the
+    // metal flares out to get there. The first version put the flange
+    // above the rim and narrowed into the floor, which is upside down.
+    s += '<path d="M' + _bp3n(cx - beW * 0.95) + ' ' + _bp3n(beBot) +
+      'L' + _bp3n(cx - beW) + ' ' + _bp3n(beB) +
+      'L' + _bp3n(cx + beW) + ' ' + _bp3n(beB) +
+      'L' + _bp3n(cx + beW * 0.95) + ' ' + _bp3n(beBot) +
+      'Z" fill="' + beFill + '"/>';
+    // THE CROWN: a flat cap over the shoulder, then the canons that
+    // carry the bell on its beam.
+    s += '<path d="M' + _bp3n(cx - beW * 0.26) + ' ' + _bp3n(beBody) +
+      'L' + _bp3n(cx + beW * 0.26) + ' ' + _bp3n(beBody) +
+      'L' + _bp3n(cx + beW * 0.2) + ' ' + _bp3n(beBody - h * 0.025) +
+      'L' + _bp3n(cx - beW * 0.2) + ' ' + _bp3n(beBody - h * 0.025) +
+      'Z" fill="' + beFill + '"/>';
+    s += '<path d="M' + _bp3n(cx - beW * 0.17) + ' ' + _bp3n(beBody - h * 0.02) +
+      'L' + _bp3n(cx - beW * 0.13) + ' ' + _bp3n(beT + beYoke) +
+      'L' + _bp3n(cx + beW * 0.13) + ' ' + _bp3n(beT + beYoke) +
+      'L' + _bp3n(cx + beW * 0.17) + ' ' + _bp3n(beBody - h * 0.02) +
+      'Z" fill="' + beFill + '"/>';
+    // THE YOKE, the beam it hangs from.
+    s += '<path d="M' + _bp3n(cx - beW * 0.62) + ' ' + _bp3n(beT) +
+      'L' + _bp3n(cx + beW * 0.62) + ' ' + _bp3n(beT) +
+      'L' + _bp3n(cx + beW * 0.54) + ' ' + _bp3n(beT + beYoke) +
+      'L' + _bp3n(cx - beW * 0.54) + ' ' + _bp3n(beT + beYoke) +
+      'Z" fill="' + beFill + '"/>';
+    // THE CRACK, which is the half of it that says WHICH bell. It runs
+    // up from the lip itself, not from the band above it.
+    s += '<path d="M' + _bp3n(cx + beW * 0.3) + ' ' + _bp3n(beB) +
+      'L' + _bp3n(cx + beW * 0.2) + ' ' + _bp3n(beBot - beH * 0.18) +
+      'L' + _bp3n(cx + beW * 0.36) + ' ' + _bp3n(beBot - beH * 0.34) +
+      'L' + _bp3n(cx + beW * 0.24) + ' ' + _bp3n(beBot - beH * 0.52) +
+      '" fill="none" stroke="' + (it.crack || '#1b1f1a') +
+      '" stroke-width="' + _bp3n(Math.max(0.3, w * 0.05)) + '"/>';
+    // AND THE NEON ROUND THE OUTSIDE, which is how it reads at night.
+    // Reusing beWall rather than retracing it keeps the light on the
+    // metal however the profile is next adjusted.
+    s += '<path d="' + beWall +
+      '" fill="none" stroke="' + beNeon + '" stroke-width="' +
+      _bp3n(Math.max(0.3, w * 0.05)) + '" stroke-opacity="0.9"/>';
+    s += '<path d="M' + _bp3n(cx - beW) + ' ' + _bp3n(beB) +
+      'L' + _bp3n(cx + beW) + ' ' + _bp3n(beB) +
+      '" stroke="' + beNeon + '" stroke-width="' +
+      _bp3n(Math.max(0.3, w * 0.05)) + '" stroke-opacity="0.9"/>';
+    s += g1;
+    return s;
+  }
+
+  if (it.shape === 'obelisk') {
+    s += g0;
+    // THE WASHINGTON MONUMENT. Ty circled it and the Capitol on his
+    // photograph and asked for both: "two major monuments that I'd
+    // like to be able to see." So they are drawn as themselves rather
+    // than left to the skyline, which would make the tallest stone
+    // structure in the world into one more block in a row of blocks.
+    var obW = w * 0.5, obB = by, obT = by - h;
+    var obCap = h * 0.11;              // the pyramidion
+    var obNeck = obT + obCap;
+    var obTopW = obW * 0.62;           // it tapers the whole way up
+    var obFill = it.fill || '#d6d0c2';
+    s += '<path d="M' + _bp3n(cx - obW) + ' ' + _bp3n(obB) +
+      'L' + _bp3n(cx - obTopW) + ' ' + _bp3n(obNeck) +
+      'L' + _bp3n(cx + obTopW) + ' ' + _bp3n(obNeck) +
+      'L' + _bp3n(cx + obW) + ' ' + _bp3n(obB) +
+      'Z" fill="' + obFill + '"/>';
+    s += '<path d="M' + _bp3n(cx - obTopW) + ' ' + _bp3n(obNeck) +
+      'L' + _bp3n(cx) + ' ' + _bp3n(obT) +
+      'L' + _bp3n(cx + obTopW) + ' ' + _bp3n(obNeck) +
+      'Z" fill="' + (it.cap || '#e8e3d8') + '"/>';
+    // THE SEAM a third of the way up, where the marble changes colour
+    // because the money ran out in 1854 and the quarry had changed by
+    // the time it started again. It is the one marking on the thing.
+    var obSy = obB - (obB - obNeck) * 0.36;
+    var obSw = obW - (obW - obTopW) * 0.36;
+    s += '<path d="M' + _bp3n(cx - obSw) + ' ' + _bp3n(obSy) +
+      'L' + _bp3n(cx + obSw) + ' ' + _bp3n(obSy) +
+      '" stroke="' + (it.seam || '#b3ab99') + '" stroke-width="' +
+      _bp3n(Math.max(0.2, w * 0.03)) + '" fill="none"/>';
+    s += g1;
+    return s;
+  }
+
   if (it.shape === 'apple') {
     s += g0;
     var apR = w * 0.5, apC = by - apR * 0.98;
@@ -105926,9 +106596,17 @@ function _bpArt3D(o, uid, phase) {
     } else if (byd) {
       continue;
     } else {
+    // A FLAGPOLE IS BEHIND THE WALL. It keeps its setback inside its
+    // own renderer rather than declaring one, so the test above -- which
+    // files anything with a `back` as behind-the-wall -- could not see
+    // it and filed it as paint ON the wall instead. It still drew, which
+    // is why nothing looked wrong; what it stopped doing was counting
+    // toward the frame, because the frame is measured off the layer
+    // behind the wall. A hundred-foot pole that the picture is not
+    // sized for is a pole with its flags cut off.
     var beh = isCut || it.kind === 'grove' || it.kind === 'bleachers' ||
       it.kind === 'marquee' || it.kind === 'hedge' || it.kind === 'seat' ||
-      it.kind === 'slide' || it.kind === 'roof' ||
+      it.kind === 'slide' || it.kind === 'roof' || it.kind === 'flagpole' ||
       !!(it.back || it.d || it.from != null);
     if (beh !== wantBehind) continue;
     }
@@ -106281,6 +106959,12 @@ function _bpArt3D(o, uid, phase) {
 
     } else if (it.kind === 'roof') {
       s += _bpaRoof(p, it, _bpMix3D(o));
+
+    } else if (it.kind === 'flagpole') {
+      s += _bpaFlagpole(p, it, _bpMix3D(o));
+
+    } else if (it.kind === 'pennants') {
+      s += _bpaPennants(p, it, _bpMix3D(o));
 
     } else if (it.kind === 'ridge') {
       s += _bpaRidge(p, it, _bpMix3D(o));
@@ -106637,6 +107321,30 @@ function _bpaBoxOfSvg(svg) {
     noteY(parseFloat(m[2])); noteY(parseFloat(m[4]));
     noteX(parseFloat(m[1])); noteX(parseFloat(m[3]));
   }
+  // IMAGES, which the art started emitting when the flags and the
+  // centre-field logo went in. bpart_test.js caught this the moment
+  // they did: a shape the reader cannot read is a shape the frame is
+  // not sized for, and the flags are the TOPMOST thing in the art at
+  // several grounds -- the frame would have been measured below them
+  // and clipped them off.
+  //
+  // ONLY THE ONES WITHOUT A TRANSFORM. The flags are placed with plain
+  // x/y/width/height and can be read straight off. The turf mark is
+  // placed through a ground-plane matrix and its raw attributes are
+  // x="-0.5" y="-0.5" in its own unit box -- reading those as frame
+  // coordinates would drag the top of every picture to -0.5 for a
+  // thing that is lying on the grass.
+  var reI = /<image\b[^>]*>/g;
+  while ((m = reI.exec(svg)) !== null) {
+    var tg = m[0];
+    if (tg.indexOf('transform=') >= 0) continue;
+    var mx = /\sx="(-?[\d.]+)"/.exec(tg), my = /\sy="(-?[\d.]+)"/.exec(tg);
+    var mw = /\swidth="(-?[\d.]+)"/.exec(tg);
+    if (!mx || !my) continue;
+    noteY(parseFloat(my[1]));
+    noteX(parseFloat(mx[1]));
+    if (mw) noteX(parseFloat(mx[1]) + parseFloat(mw[1]));
+  }
   // text sits ON its baseline and the letters stand above it
   var reT = /<text[^>]*\sy="(-?[\d.]+)"[^>]*font-size="(-?[\d.]+)"/g;
   while ((m = reT.exec(svg)) !== null) {
@@ -106749,9 +107457,41 @@ function _bpTowers(o, uid, mix) {
     lx = pt[0]; ly = pt[1];
     // the mast, rooted a few units INTO the back row so no gap shows
     var mW = st && st.mastW ? st.mastW : 1.6;
+    if (st && st.lattice) {
+      // AN OPEN STEEL TOWER, not a pole. Seattle's stand over left
+      // field as trussed frames wide enough to read as structure --
+      // the slim mast every other ground here uses looked like a
+      // lamp on a stick beside them.
+      var kW = (st.footW == null ? mW * 3.4 : st.footW), kT = mW * 1.25;
+      var kTop = ly - (mH - 4), kBot = ly + 4, kN = st.bays || 5, kj;
+      var kx0, kx1, ky0, ky1, kL = '', kR = '', kX = '';
+      for (kj = 0; kj <= kN; kj++) {
+        ky0 = kBot + (kTop - kBot) * kj / kN;
+        kx0 = kW / 2 + (kT / 2 - kW / 2) * kj / kN;
+        kL += (kj ? 'L' : 'M') + _bp3n(lx - kx0) + ' ' + _bp3n(ky0);
+        kR += (kj ? 'L' : 'M') + _bp3n(lx + kx0) + ' ' + _bp3n(ky0);
+        if (kj < kN) {
+          ky1 = kBot + (kTop - kBot) * (kj + 1) / kN;
+          kx1 = kW / 2 + (kT / 2 - kW / 2) * (kj + 1) / kN;
+          kX += 'M' + _bp3n(lx - kx0) + ' ' + _bp3n(ky0) +
+            'L' + _bp3n(lx + kx1) + ' ' + _bp3n(ky1) +
+            'M' + _bp3n(lx + kx0) + ' ' + _bp3n(ky0) +
+            'L' + _bp3n(lx - kx1) + ' ' + _bp3n(ky1) +
+            'M' + _bp3n(lx - kx1) + ' ' + _bp3n(ky1) +
+            'L' + _bp3n(lx + kx1) + ' ' + _bp3n(ky1);
+        }
+      }
+      s += '<path d="' + kX + '" fill="none" stroke="' + mast +
+        '" stroke-width="' + _bp3n(mW * 0.42) + '" stroke-opacity="0.9"/>';
+      s += '<path d="' + kL + '" fill="none" stroke="' + mast +
+        '" stroke-width="' + _bp3n(mW * 0.72) + '"/>';
+      s += '<path d="' + kR + '" fill="none" stroke="' + mast +
+        '" stroke-width="' + _bp3n(mW * 0.72) + '"/>';
+    } else {
     s += '<rect x="' + _bp3n(lx - mW / 2) + '" y="' + _bp3n(ly - (mH - 4)) +
       '" width="' + _bp3n(mW) + '" height="' + _bp3n(mH) +
       '" fill="' + mast + '"/>';
+    }
     s += '<rect x="' + _bp3n(lx - hW / 2) + '" y="' + _bp3n(ly - mH - 3) +
       '" width="' + _bp3n(hW) + '" height="' + _bp3n(hH) +
       '" rx="0.6" fill="' + head + '"/>';
@@ -107963,7 +108703,8 @@ var WALLART = {
       { kind: 'roof', ribs: 6, a0: -8, a1: 98, back: 104, step: 52,
         lift: 136, beam: '#1f4f54', edge: '#2f7a80',
         beamDay: '#5f9aa0', edgeDay: '#8fc3c8' },
-      { kind: 'ads', a0: 2, a1: 88, n: 15 }
+      { kind: 'ads', a0: 2, a1: 88, n: 15 },
+      { kind: 'flagpole', a: 49, st: 'TX' }
     ]
   },
 
@@ -108053,24 +108794,37 @@ var WALLART = {
         fill: '#33442f' },
       { kind: 'grove', shape: 'palm', a0: 76, a1: 88, back: 54,
         trees: 4, h: 64, spread: 16, rockH: 0, mask: false,
-        fill: '#33442f' }
+        fill: '#33442f' },
       // AND NO ADVERTISING RIBBON. Every other park in this table has
       // one because every photograph of every one of them does. This
       // park has been the exception since 1962 -- the outfield fence and
       // the pavilion canopy carry nothing but painted distance numbers,
       // and for a long time the 76 ball was the only brand visible in
       // the place. Leaving it off is the statement.
+      { kind: 'flagpole', a: 45, st: 'CA' }
     ]
   },
   'Petco Park': {
-    // NO LIGHT TOWERS, AND FOR A THIRD REASON. Milwaukee and Houston
-    // declare none because they are roofed and the lamps are in the
-    // roof. This park's lights are on two two-hundred-foot towers that
-    // rise through the stands behind first and third base, carrying
-    // suites and lifts as well as the lamps -- which is to say outside
-    // this view, because these cameras see from the left-field line
-    // round to the right and those towers are past both ends of it.
-    towers: [],   // Petco Park: lights on the first- and third-base towers
+    // LIGHTS. Ty: "there are no lights." He was right, and the note
+    // that used to sit here was half right: the park's two big lighting
+    // structures ARE the towers behind first and third base, which
+    // carry suites and lifts as well as lamps (Clem), and those are
+    // past both ends of a camera that sees from the left-field line
+    // round to the right. What the note got wrong was the conclusion.
+    // A ballpark at night is lit from more than two corners, and this
+    // one showed a dark bank of crowd right across the right half while
+    // every other park in the table showed lamps.
+    //
+    // HOW SURE I AM OF THESE FOUR: not very. No source I could find --
+    // the club, Musco's own project page, Clem, Wikipedia -- documents
+    // a mounting position at this park beyond those two towers. These
+    // are placed along the outfield rim to read as lit, clear of the
+    // board (which carries its own pair) and short of the frame edge.
+    // They are a plausible rim line, not a surveyed one. The outermost
+    // was first put at 79 and its lamp head ran off the right edge of
+    // the frame -- the third time that has happened, after Truist and
+    // Citizens Bank. Anything past about 75 here does not fit.
+    towers: [26, 46, 64, 73],
     // DARK BLUE SEATS, which with the sandstone and the white steel is
     // the whole palette of the place -- the design brief threw out
     // retro red brick and green seats on purpose, and then one red
@@ -108130,7 +108884,8 @@ var WALLART = {
       { kind: 'grove', shape: 'palm', a0: 66, a1: 80, back: 20,
         trees: 5, h: 54, spread: 15, rockH: 0, mask: false,
         fill: '#2f432f' },
-      { kind: 'ads', a0: 2, a1: 88, n: 15 }
+      { kind: 'ads', a0: 2, a1: 88, n: 15 },
+      { kind: 'flagpole', a: 36, st: 'CA' }
     ]
   },
   // ---------------------------------------------------------------
@@ -108224,7 +108979,8 @@ var WALLART = {
         screen: ['#58202c', '#732b38'], edge: '#16141a' },
 
       // and the wall carries a great deal of advertising
-      { kind: 'ads', a0: 2, a1: 88, n: 18 }
+      { kind: 'ads', a0: 2, a1: 88, n: 18 },
+      { kind: 'flagpole', a: 45, st: 'CA' }
     ]
   },
 
@@ -108291,7 +109047,8 @@ var WALLART = {
         crown: 'none', clock: false, pennants: false,
         sidePanels: 0, adPanels: 0,
         screen: ['#24405a', '#35566f'], edge: '#1b2b3c' },
-      { kind: 'ads', a0: 2, a1: 88, n: 15 }
+      { kind: 'ads', a0: 2, a1: 88, n: 15 },
+      { kind: 'flagpole', a: 37, st: 'MO' }
     ]
   },
   'Fenway Park': {
@@ -108389,7 +109146,8 @@ var WALLART = {
       // the advertising on the wall, which at this park goes everywhere
       // the Monster's own painted signage and the batter's eye do not
       { kind: 'ads', a0: 29, a1: 40, n: 3 },
-      { kind: 'ads', a0: 55, a1: 88, n: 7 }
+      { kind: 'ads', a0: 55, a1: 88, n: 7 },
+      { kind: 'flagpole', a: 14, st: 'MA' }
     ]
   },
 
@@ -108464,7 +109222,8 @@ var WALLART = {
       // centre field seating, which is what sets it here.
       { kind: 'videoboard', a: 45, d: 448, w: 153, h: 71, h0: 62,
         name: 'ORACLE PARK', clock: true, pennants: true,
-        sidePanels: 4, adPanels: 6 }
+        sidePanels: 4, adPanels: 6 },
+      { kind: 'flagpole', a: 74, st: 'CA' }
     ]
   },
 
@@ -108565,7 +109324,8 @@ var WALLART = {
         panels: 0, fill: '#13271d' },
 
       // and the wall carries advertising
-      { kind: 'ads', a0: 2, a1: 88, n: 14 }
+      { kind: 'ads', a0: 2, a1: 88, n: 14 },
+      { kind: 'flagpole', a: 14, st: 'AZ' }
     ]
   },
 
@@ -108659,7 +109419,8 @@ var WALLART = {
         r: 5.6, colLo: 9, colHi: 19, postW: 3.4 },
 
       // and the wall carries advertising
-      { kind: 'ads', a0: 2, a1: 88, n: 15 }
+      { kind: 'ads', a0: 2, a1: 88, n: 15 },
+      { kind: 'flagpole', a: 18, st: 'IL' }
     ]
   },
 
@@ -108798,7 +109559,8 @@ var WALLART = {
         rows: 7, perRow: 46 },
 
       // and the advertising round the wall
-      { kind: 'ads', a0: 4, a1: 40, n: 8 }
+      { kind: 'ads', a0: 4, a1: 40, n: 8 },
+      { kind: 'flagpole', a: 43, st: 'MN' }
     ]
   },
 
@@ -108873,7 +109635,8 @@ var WALLART = {
       // House stands on top of this wall rather than in place of it,
       // so stopping the boards at the Chop House left sixteen feet of
       // bare green under the busiest corner of the park.
-      { kind: 'ads', a0: 2, a1: 88, n: 15 }
+      { kind: 'ads', a0: 2, a1: 88, n: 15 },
+      { kind: 'flagpole', a: 66, st: 'GA' }
     ]
   },
 
@@ -108928,7 +109691,7 @@ var WALLART = {
   // Target Field.
   // ---------------------------------------------------------------
   'Citi Field': {
-    towers: [],   // the light banks ride on the sign structures here
+    towers: [12, 30, 60, 74],
     // METS BLUE through the bowl, which is what the picture shows:
     // a dark navy with the orange kept for the rails and the poles.
     bowlTiers: [
@@ -109007,7 +109770,124 @@ var WALLART = {
         rows: 10, perRow: 76 },
 
       // and the wall is advertising the whole way round
-      { kind: 'ads', a0: 2, a1: 88, n: 15 }
+      { kind: 'ads', a0: 2, a1: 88, n: 15 },
+      { kind: 'flagpole', a: 21, st: 'NY' }
+    ]
+  },
+
+  // ---------------------------------------------------------------
+  // CITIZENS BANK PARK. Ty: "Citizens Bank Park is up next! Please use
+  // the image as your guide!"
+  //
+  // WHAT THE PHOTOGRAPH SHOWS, left to right:
+  //
+  // LEFT AND LEFT CENTRE -- the board, and standing right beside it an
+  // open steel lattice light tower that goes up half as high again.
+  // The two together are the thing you see from the plate at this
+  // park: a screen with a girder tower next to it, not a screen on its
+  // own. The green park sign sits on the band under the board.
+  //
+  // CENTRE -- brick. Ashburn Alley runs across the back of the
+  // outfield as a low brick concourse with the flagpoles along it, and
+  // the batter's eye is a dark green bank in dead centre.
+  //
+  // RIGHT -- two decks under a canopy, with more lattice towers over
+  // them, and horizontal advertising ribbons along the deck fronts.
+  //
+  // AND PHILADELPHIA IS A LONG WAY OFF. The skyline is there, but it
+  // is four miles up Broad Street: a thin low band on the horizon, not
+  // the wall of building that stands over Detroit or Minneapolis. It
+  // is drawn as the FARTHEST city in the table and nearly the lowest,
+  // which is what the picture shows.
+  //
+  // THE BOARD IS THE NEW ONE. Ty's photograph predates it -- the
+  // screen in the picture is the 97 by 76 that came out after 2022,
+  // and what is there now is 152 by 86, which is nearly twice the
+  // area and changes the proportion of that whole corner. The LAYOUT
+  // is the photograph's; the size is the one standing there today.
+  //
+  // THE PHILLIES SCRIPT on top of the board is the club's wordmark and
+  // is not drawn. The frame it stands on is steel and is.
+  // ---------------------------------------------------------------
+  'Citizens Bank Park': {
+    // FOUR LATTICE TOWERS, which is what the picture has: one hard
+    // against the board in left centre, one out over centre, two over
+    // the right field deck.
+    // PULLED IN FROM 84. The outermost tower ran to x 209 against a
+    // frame that stops at 206 -- the same fault Truist's towers had,
+    // caught by the same check.
+    towers: [33, 56, 70, 79],
+    // PHILLIES RED, which is what this bowl is from the first row to
+    // the last -- no navy, no green.
+    bowlTiers: [
+      [0.5, '#7a2230'],
+      [0.8, '#651c28'],
+      [1, '#4e1620']
+    ],
+    items: [
+      // PHILADELPHIA, FOUR MILES UP BROAD STREET: the farthest skyline
+      // in this table and nearly the lowest, which is the whole point
+      // of it. Drawn any nearer or any taller and this becomes a
+      // different ballpark.
+      // LOWER AGAIN. At ninety-two feet it came out as a row of
+      // buildings standing over the back of the park; in the
+      // photograph it is a thin pale band you have to look for, a
+      // thumbnail high. Four miles is four miles.
+      { kind: 'skyline', a0: 14, a1: 72, d: 1180, n: 16, low: 16, high: 52 },
+
+      // THE PALE BLOCK BEYOND RIGHT CENTRE, which is the hotel standing
+      // over the back of the stands in the picture.
+      { kind: 'rooftop', a0: 56, a1: 78, d: 700, n: 3, h: 80, deck: false },
+
+      // ASHBURN ALLEY: the low brick concourse across the back of
+      // centre field, which is what this park has instead of a wall of
+      // signs.
+      { kind: 'marquee', a0: 30, a1: 62, back: 24, h0: 22, h1: 44,
+        panels: 7, fill: '#43231c',
+        panelFill: '#6d3a2c', panelOp: 0.55 },
+
+      // THE BOARD, in left and left centre. A hundred and fifty-two
+      // feet by eighty-six, which is the size of the one that went in
+      // for 2023 -- the picture still has the 97 by 76 it replaced.
+      { kind: 'videoboard', a: 19, d: 446, w: 152, h: 86, h0: 42,
+        crown: 'none', clock: false, pennants: false,
+        name: 'CITIZENS BANK PARK', nameFill: '#5fbf7a',
+        sidePanels: 2, adPanels: 5,
+        screen: ['#1a2b3e', '#2a4664'], edge: '#1a1410' },
+
+      // THE BATTER'S EYE, the dark green bank in dead centre.
+      { kind: 'hedge', a0: 41, a1: 50, back: 4, h: 26 },
+
+      // THE LIBERTY BELL, in right centre: fifty feet tall and
+      // thirty-five wide, standing a hundred feet over the street,
+      // which from the field is high over the back of the concourse.
+      // Neon outline, and it swings when a Phillie goes deep.
+      // AT 63, NOT 59: at 59 the light tower at 56 ran straight
+      // through it. In the photograph the bell stands BESIDE a tower,
+      // not behind one.
+      { kind: 'prop', shape: 'bell', a: 63, d: 492, w: 35, h: 50,
+        h0: 62, plinth: false, fill: '#44503c', neon: '#ecd96a',
+        crack: '#171a16' },
+
+      // THE DECKS. Left is shallow under the board; right carries the
+      // two banks with the canopy over the upper one.
+      { kind: 'bleachers', a0: 3, a1: 16, back: 5, h0: 8, h: 22,
+        rows: 6, perRow: 30 },
+      { kind: 'bleachers', a0: 62, a1: 88, back: 5, h0: 10, h: 38,
+        // NO CANOPY. There IS a long horizontal plane over the back
+        // of this deck in the photograph, and I read it as a roof --
+        // but it is the light tower GANTRY, a trussed platform on
+        // columns carrying the lamps, not a canopy sheltering the
+        // seats. canopy_test exists because three parks were once
+        // given awnings they do not have, and it caught this within
+        // the hour. The gantry is worth drawing; it is not worth
+        // drawing by calling it something it is not.
+        rows: 11, perRow: 72 },
+
+      // and the advertising, which at this park is ribbons along the
+      // deck fronts rather than a wall of boards
+      { kind: 'ads', a0: 2, a1: 88, n: 13 },
+      { kind: 'flagpole', a: 44, st: 'PA' }
     ]
   },
 
@@ -109051,7 +109931,8 @@ var WALLART = {
         screen: ['#161f30', '#243852'], edge: '#12161e' },
 
       // and the wall carries advertising
-      { kind: 'ads', a0: 2, a1: 88, n: 15 }
+      { kind: 'ads', a0: 2, a1: 88, n: 15 },
+      { kind: 'flagpole', a: 51, st: 'MI' }
     ]
   },
 
@@ -109163,7 +110044,8 @@ var WALLART = {
 
       // and the wall carries advertising, stopping short of the
       // out-of-town board built into it
-      { kind: 'ads', a0: 2, a1: 64, n: 12 }
+      { kind: 'ads', a0: 2, a1: 64, n: 12 },
+      { kind: 'flagpole', a: 52, st: 'CO' }
     ]
   },
 
@@ -109229,7 +110111,8 @@ var WALLART = {
       // twenty-one feet of wall with a board inside it, which is why this
       // one is low and long where Fenway's is tall.
       { kind: 'board', a0: 66, a1: 87, h0: 2, h1: 17.5,
-        head: 1.8, divide: 7.4, slots: 12, rows: [[10, 14]] }
+        head: 1.8, divide: 7.4, slots: 12, rows: [[10, 14]] },
+      { kind: 'flagpole', a: 53, st: 'PA' }
     ]
   },
 
@@ -109278,7 +110161,8 @@ var WALLART = {
       // and the wall carries advertising, but NOT across the span the
       // out-of-town board occupies -- painted last, the ribbon went
       // straight over it and buried the one thing in right field.
-      { kind: 'ads', a0: 2, a1: 64, n: 12 }
+      { kind: 'ads', a0: 2, a1: 64, n: 12 },
+      { kind: 'flagpole', a: 56, st: 'OH' }
     ]
   },
   // ---------------------------------------------------------------
@@ -109301,6 +110185,91 @@ var WALLART = {
   // the same way before the 2020 season and are a bar now, so there is
   // no water in this outfield either.
   // ---------------------------------------------------------------
+  // ---------------------------------------------------------------
+  // YANKEE STADIUM. Ty: "knock out Yankee Stadium next? Please refer
+  // the attached image."
+  //
+  // BUILT OFF THE PHOTOGRAPH, in the order the photograph has it.
+  //
+  // WHAT THIS OUTFIELD IS, from the plate: a continuous BAND OF
+  // ADVERTISING right across the back of the bleachers, pole to pole,
+  // in two rows -- a shallow strip along the top and a deeper row of
+  // panels under it. The board sits in the middle of that band rather
+  // than on a tower of its own, which is what makes this outfield read
+  // as a wall of signs with a screen in it instead of a screen with
+  // signs beside it. The bleachers run the whole way round underneath.
+  //
+  // IN DEAD CENTRE, the black batter's eye, with Monument Park behind
+  // it -- which is below the sightline from here and not drawn.
+  //
+  // AND BEYOND THE RIM, the Bronx: pale low-rise apartment blocks
+  // standing over the back of the stands, mostly across centre and
+  // right. NOT a downtown -- there is no skyline here, and putting one
+  // in would be the Target Field mistake again.
+  //
+  // THE FRIEZE IS NOT HERE, and it is the one thing anybody would name
+  // first about this ballpark. The white scalloped facade runs along
+  // the grandstand ROOF, round the infield, which is the top edge of
+  // the bowl -- a place no art kind in this file draws, because every
+  // one of them is placed as a setback from the outfield wall. It
+  // needs its own machinery and it is worth doing properly rather than
+  // faked onto the back of the bleachers, where it is not.
+  // ---------------------------------------------------------------
+  'Yankee Stadium': {
+    towers: [16, 74],
+    // YANKEE NAVY, which is the whole bowl.
+    bowlTiers: [
+      [0.5, '#1c2b4a'],
+      [0.8, '#17243d'],
+      [1, '#131c30']
+    ],
+    items: [
+      // THE BRONX OVER THE BACK OF THE STANDS. Low pale blocks, not a
+      // downtown -- five and six storeys of masonry, heaviest across
+      // centre and right where the photograph shows them.
+      { kind: 'rooftop', a0: 18, a1: 96, d: 640, n: 11, h: 74,
+        deck: false },
+
+      // THE BAND, TOP ROW: the shallow strip of signs along the very
+      // top, pole to pole.
+      { kind: 'marquee', a0: 6, a1: 86, back: 22, h0: 66, h1: 74,
+        panels: 12, fill: '#10141c',
+        panelFill: '#2d3b52', panelOp: 0.8 },
+
+      // THE BAND, DEEPER ROW: the big panels under it, which are what
+      // you actually read from the seats.
+      // NO panelFill ON THIS ROW ON PURPOSE: left off, the marquee
+      // cycles its own advertising palette, so the panels come out
+      // mixed the way a wall of different signs actually looks rather
+      // than nine of the same red.
+      { kind: 'marquee', a0: 6, a1: 86, back: 22, h0: 46, h1: 65,
+        panels: 9, fill: '#10141c', panelOp: 0.78 },
+
+      // THE BOARD, SET INTO THE BAND IN CENTRE rather than standing on
+      // a tower of its own: a hundred and one feet by fifty-nine,
+      // which is the published size.
+      { kind: 'videoboard', a: 45, d: 466, w: 101, h: 59, h0: 46,
+        crown: 'none', clock: false, pennants: false,
+        name: 'YANKEE STADIUM', nameFill: '#e8ecf3',
+        sidePanels: 0, adPanels: 0,
+        screen: ['#1d2b45', '#2f4a72'], edge: '#0d1017' },
+
+      // THE BATTER'S EYE, black and dead centre.
+      { kind: 'marquee', a0: 41, a1: 50, back: 6, h0: 8, h1: 38,
+        panels: 0, fill: '#0e1119' },
+
+      // THE BLEACHERS, the whole way round the outfield.
+      { kind: 'bleachers', a0: 4, a1: 40, back: 5, h0: 8, h: 36,
+        rows: 11, perRow: 78 },
+      { kind: 'bleachers', a0: 51, a1: 88, back: 5, h0: 8, h: 36,
+        rows: 11, perRow: 80 },
+
+      // and the wall carries advertising right round
+      { kind: 'ads', a0: 2, a1: 88, n: 14 },
+      { kind: 'flagpole', a: 28, st: 'NY' }
+    ]
+  },
+
   'loanDepot park': {
     towers: [],   // roofed
     // MARLINS BLUE, which is most of what this bowl is. The club's
@@ -109371,7 +110340,8 @@ var WALLART = {
 
       // and the wall carries advertising, but not across the window or
       // the board let into it
-      { kind: 'ads', a0: 20, a1: 62, n: 9 }
+      { kind: 'ads', a0: 20, a1: 62, n: 9 },
+      { kind: 'flagpole', a: 14, st: 'FL' }
     ]
   },
 
@@ -109416,7 +110386,8 @@ var WALLART = {
         screen: ['#2f4a60', '#44647e'], edge: '#1f3a2a' },
       // AND THE WALL ITSELF CARRIES ADVERTISING, which every wall in
       // every photograph of every one of these grounds does.
-      { kind: 'ads', a0: 2, a1: 88, n: 15 }
+      { kind: 'ads', a0: 2, a1: 88, n: 15 },
+      { kind: 'flagpole', a: 36, st: 'MD' }
     ]
   },
   'Wrigley Field': {
@@ -109462,7 +110433,8 @@ var WALLART = {
       // AND THE WALL ITSELF, which at this park is the whole story: brick
       // from 1914, ivy from 1937, and the basket from 1970 standing out
       // over the top of it.
-      { kind: 'ivy', a0: 0, a1: 90 }
+      { kind: 'ivy', a0: 0, a1: 90 },
+      { kind: 'flagpole', a: 33, st: 'IL' }
     ]
   },
   'American Family Field': {
@@ -109522,7 +110494,8 @@ var WALLART = {
         lift: 128 },
 
       // and the wall carries advertising
-      { kind: 'ads', a0: 2, a1: 88, n: 15 }
+      { kind: 'ads', a0: 2, a1: 88, n: 15 },
+      { kind: 'flagpole', a: 14, st: 'WI' }
     ]
   },
   // ---------------------------------------------------------------
@@ -109601,7 +110574,8 @@ var WALLART = {
         h0: 30, h: 72, w: 9.5 },
 
       // and the wall carries advertising
-      { kind: 'ads', a0: 2, a1: 88, n: 14 }
+      { kind: 'ads', a0: 2, a1: 88, n: 14 },
+      { kind: 'flagpole', a: 54, st: 'OH' }
     ]
   },
 
@@ -109658,7 +110632,408 @@ var WALLART = {
 
       // and the wall carries advertising, as every wall in every
       // photograph of this ground does
-      { kind: 'ads', a0: 2, a1: 88, n: 15 }
+      { kind: 'ads', a0: 2, a1: 88, n: 15 },
+      { kind: 'flagpole', a: 30, st: 'MO' }
+    ]
+  },
+
+  // ════════════════════════════════════════════════════════════════
+  // T-MOBILE PARK
+  //
+  // Ty: "you can start on T-Mobile park using the image I attached."
+  // Read off that photograph left to right, which is the habit Target
+  // Field taught me, and checked against ballparksofbaseball.
+  //
+  //   LEFT        three decks from the foul pole round, a teal banner
+  //               board along the second deck, and the park's name on
+  //               the structure above it. Two LIGHT TOWERS over that --
+  //               open steel lattice, not the slim masts the rest of
+  //               this table uses.
+  //   LEFT CENTRE Seattle, low and small and a long way off. Downtown
+  //               is NORTH of this park and home plate faces north by
+  //               north-east, so the city sits beyond left centre.
+  //               Checked, because getting this backwards is exactly
+  //               what went wrong at Target Field.
+  //   CENTRE      the board, over the bleachers: 201 feet by 56.5,
+  //               new for 2026 and the widest in this table by a long
+  //               way. The hitter's backdrop under it.
+  //   RIGHT       three decks to the pole and round into right centre,
+  //               and the ROOF resting above and behind them.
+  //
+  // THE ROOF IS THE PARK. Nine acres, twenty-two million pounds, and
+  // it does not enclose the ground -- when it is open it parks above
+  // and behind the right-field seats, which is where this camera sees
+  // it from underneath. It needs machinery of its own and gets it.
+  //
+  // THE WAVE WORDMARK ON THOSE BANNER BOARDS IS NOT DRAWN. The boards
+  // are, lit teal, because they are the structure; the club's script
+  // across them is the line this table has held since Comerica's
+  // tigers and Minnie and Paul.
+  'T-Mobile Park': {
+    towers: [17, 26],
+    towerStyle: { lattice: true, mast: 34, mastW: 2.1, footW: 7.4,
+                  bays: 6, headW: 19, headH: 7.4, cols: 4, rows: 2 },
+    // DARK GREEN SEATS, the whole bowl, which with the grey steel is
+    // most of the colour in the place.
+    bowlTiers: [
+      [0.5, '#2c4b40'],
+      [0.8, '#223c33'],
+      [1, '#1a2e28']
+    ],
+    items: [
+      // SEATTLE, low and far. In the photograph the city shows as a
+      // narrow band of small blocks between the light towers and the
+      // near edge of the roof -- not a wall of towers over the fence.
+      // Lower and nearer than the first attempt, which put the city in
+      // a thin band along the very top of the frame with the park a
+      // long way beneath it. In the photograph Seattle sits just above
+      // the left-field deck, small, with sky over it.
+      { kind: 'skyline', a0: 30, a1: 47, d: 1400, n: 9, low: 26, high: 54 },
+
+      // LEFT FIELD. Three levels run from the pole round towards home,
+      // with bleachers above the left-field bullpens.
+      { kind: 'bleachers', a0: 0, a1: 34, back: 5, h0: 7, h: 36,
+        rows: 10, perRow: 50 },
+      // THE BANNER BOARD along the front of the second deck.
+      { kind: 'marquee', a0: 11, a1: 32, back: 9, h0: 30, h1: 41,
+        panels: 5, fill: '#0a2f33', panelFill: '#1ea7a0', panelOp: 0.75 },
+
+      // THE BOARD, over the bleachers in dead centre, 201 by 56.5 and
+      // new for 2026. Written here first as the widest and shallowest
+      // in the table, which it is not: measured, it is third by width
+      // behind Progressive's 221 and Great American's 215, and fourth
+      // by both area and ratio. Wide and shallow for this table, and
+      // not the most of anything.
+      { kind: 'videoboard', a: 50, d: 462, w: 201, h: 56.5, h0: 38,
+        crown: 'none', name: 'T-MOBILE PARK', nameFill: '#4fd0c4',
+        sidePanels: 2, adPanels: 6, screen: ['#123043', '#1d4d63'],
+        edge: '#141c24' },
+
+      // THE HITTER'S BACKDROP under it. Blank by the convention this
+      // table uses for a batter's eye: no panels at all.
+      { kind: 'marquee', a0: 40, a1: 53, back: 4, h0: 0, h1: 22,
+        panels: 0, fill: '#132a21' },
+
+      // RIGHT FIELD. Three levels to the pole and round into right
+      // centre, and the deepest bank of seating in the park.
+      { kind: 'bleachers', a0: 55, a1: 90, back: 5, h0: 10, h: 50,
+        rows: 14, perRow: 86 },
+      // and the banner boards along the right-field facade
+      { kind: 'marquee', a0: 60, a1: 86, back: 10, h0: 44, h1: 55,
+        panels: 4, fill: '#0a2f33', panelFill: '#1ea7a0', panelOp: 0.75 },
+
+      // THE ROOF. Ribs for the open steel that arches over, panels for
+      // the three parked slabs above and behind right field.
+      { kind: 'roof', ribs: 3, a0: 38, a1: 104, back: 150, step: 60,
+        lift: 236, archLow: 0.82, beam: '#39434f', edge: '#7e8896',
+        beamDay: '#939dab', edgeDay: '#bcc5d1',
+        panels: true, panelA0: 36, panelA1: 104, panelBack: 86,
+        panelDeep: 320, panelLift: 150, panelDrop: 15,
+        panelFill: '#232c36', panelFace: '#151c25',
+        truss: true, trussDeep: 11 },
+
+      { kind: 'ads', a0: 2, a1: 88, n: 14 },
+      { kind: 'flagpole', a: 74, st: 'WA' }
+    ]
+  },
+
+  // ════════════════════════════════════════════════════════════════
+  // TROPICANA FIELD
+  //
+  // Ty: "Up next, Tropicana Field. Please reference the image."
+  // Read off that photograph left to right.
+  //
+  //   LEFT        upper deck under a rim hung with PENNANTS -- eight of
+  //               them, white, on the left side of the rim and nowhere
+  //               else in the picture.
+  //   RIGHT OF    the flags, and then the COKE BOTTLE: a tall red
+  //   CENTRE      bottle standing against the facade in right centre.
+  //   CENTRE      the batter's eye, one solid blue panel.
+  //   RIGHT       the main videoboard, which is NOT in dead centre at
+  //               this park -- it sits out in right centre, and the
+  //               park's own name is lettered along the rim above it.
+  //
+  // AND RIGHT ROUND THE TOP, UNBROKEN: advertising. Every other ground
+  // in this table has signs; this one has a continuous lit ring of them
+  // the whole circumference, with a second band along the outfield wall
+  // under it. That doubled ring is as much the look of the place as the
+  // roof is, so it is drawn as two marquees that very nearly meet the
+  // foul poles rather than as a few boards with gaps between.
+  //
+  // THE DOME IS FIXED. Milwaukee, Houston, Phoenix and Toronto can open
+  // theirs and Seattle's never closes; this one is shut, always, and it
+  // is the only one in the table that is. The lamps hang from it.
+  //
+  // THE CLUB MARKS ARE NOT DRAWN: the roundel on the facade and the one
+  // over left field are the Rays', the same line held since Comerica's
+  // tigers. The pennants are drawn blank, which is also what they are
+  // from this distance.
+  'Tropicana Field': {
+    towers: [],   // Tropicana Field: roofed, and the lamps hang from the dome
+    // AND NO SKY. See _bpPark3D: this is the only park that sets this.
+    ceiling: '#3b434f',
+    ceilingDay: '#737d8a',
+    // DARK BLUE, the whole bowl.
+    bowlTiers: [
+      [0.5, '#1f4474'],
+      [0.8, '#183763'],
+      [1, '#122a4e']
+    ],
+    items: [
+      // THE UPPER DECK, round both sides.
+      { kind: 'bleachers', a0: 0, a1: 38, back: 6, h0: 9, h: 44,
+        rows: 12, perRow: 60 },
+      { kind: 'bleachers', a0: 55, a1: 90, back: 6, h0: 9, h: 44,
+        rows: 12, perRow: 60 },
+
+      // THE BATTER'S EYE: one solid blue panel in dead centre, blank by
+      // the convention this table uses for an eye.
+      { kind: 'marquee', a0: 38, a1: 55, back: 5, h0: 0, h1: 30,
+        panels: 0, fill: '#1b3f6b' },
+
+      // THE RING. Unbroken advertising right round the facade, and no
+      // panelFill on either so each cycles the table's own advertising
+      // palette -- a wall of different hoardings, which is what the
+      // photograph shows rather than one colour repeated.
+      { kind: 'marquee', a0: 1, a1: 89, back: 14, h0: 52, h1: 68,
+        panels: 17, fill: '#101c2e' },
+      { kind: 'marquee', a0: 1, a1: 89, back: 10, h0: 36, h1: 48,
+        panels: 14, fill: '#122236' },
+
+      // THE BOARD, out in right centre where this park keeps it.
+      { kind: 'videoboard', a: 70, d: 455, w: 118, h: 40, h0: 20,
+        crown: 'none', name: 'TROPICANA FIELD', nameFill: '#8fbce6',
+        sidePanels: 1, adPanels: 3, screen: ['#13293f', '#1f4668'],
+        edge: '#0e1722' },
+
+      // THE PENNANTS, along the left rim and nowhere else.
+      { kind: 'pennants', a0: 2, a1: 32, n: 8, back: 18, h: 74, drop: 10 },
+
+      // THE DOME. Shut, fixed, and the whole ceiling of the place --
+      // so this is the one park in the table with no night sky in it
+      // at all. Drawn as the panel slab rather than the rib fan,
+      // because what you see from in here is a surface and not a set
+      // of arches against the dark, with the ribs over it for the
+      // structure that carries it.
+      { kind: 'roof', ribs: 0, a0: -8, a1: 98, back: 70, step: 40,
+        lift: 128, archLow: 0.88, beam: '#5b6572', edge: '#78828f',
+        beamDay: '#9aa3ad', edgeDay: '#c2cad4',
+        panels: true, panelA0: -8, panelA1: 98, panelBack: 36,
+        panelDeep: 660, panelLift: 76, panelDrop: 7,
+        panelFill: '#49525f', panelFace: '#333b46',
+        domeRibs: 13, domeLights: 7, ribFill: '#5b6572' },
+
+      { kind: 'ads', a0: 2, a1: 88, n: 15 },
+      { kind: 'flagpole', a: 14, st: 'FL' }
+    ]
+  },
+
+  // ════════════════════════════════════════════════════════════════
+  // GLOBE LIFE FIELD
+  //
+  // Ty: "Globe Life Field is next and I've attached an image."
+  //
+  //   RIGHT ROUND   the GLASS. A curtain wall of tall arched bays the
+  //                 whole way round the outfield, daylight behind it.
+  //                 It is the thing you cannot mistake for anywhere
+  //                 else, and it gets the machinery built for Miami.
+  //   OVER THE TOP  the roof, shut: a dark steel space frame with big
+  //                 diagonal braces, and no sky anywhere in the frame.
+  //   RIGHT CENTRE  the main board, very large, with the park's name
+  //                 lettered over it.
+  //   LEFT CORNER   a second board, smaller, high over the line.
+  //   CENTRE        the batter's eye, and the flags above it.
+  //
+  // THE ROOF IS SHUT IN TY'S PHOTOGRAPH, so this park declares a
+  // ceiling the way Tropicana does, and it is the second to do it.
+  // The difference between them is worth keeping straight: Tropicana's
+  // roof never opens and the ceiling is simply what that ground IS;
+  // this one opens, and is drawn shut because that is the picture I
+  // was given. Chase, Daikin and American Family are all retractable
+  // too and are drawn open, against a night sky -- so a fourth park
+  // arriving with a roof is not automatically either thing.
+  //
+  // THE SPONSOR LETTERING ON THE GRASS IS NOT DRAWN, nor the club's
+  // marks, which is where this table has stood since Comerica.
+  'Globe Life Field': {
+    // NO TOWERS: the lamps are in the roof, the way Tropicana's are.
+    // lights_test.js caught this park drawing none at all and the
+    // right answer was to light it rather than to add a fifth name to
+    // that file's list of grounds allowed to show no lamp -- the list
+    // is four specific roofed parks and a reason, and it only stays
+    // worth having if a park has to earn its way onto it.
+    towers: [],
+    // AND NO SKY, because the roof is shut. See _bpPark3D.
+    ceiling: '#171b23',
+    ceilingDay: '#4e5664',
+    bowlTiers: [
+      [0.5, '#1d3356'],
+      [0.8, '#172a46'],
+      [1, '#122138']
+    ],
+    items: [
+      // THE GLASS, in two runs with the centre structure between them.
+      { kind: 'glass', a0: 1, a1: 39, back: 22, h0: 42, h1: 88,
+        panes: 9, sky: '#1b354f', city: '#2c4e70', towers: 8,
+        lights: '#ecdfb2', tint: '#5f93bd', frame: '#8d9cab' },
+      { kind: 'glass', a0: 51, a1: 89, back: 22, h0: 42, h1: 88,
+        panes: 9, sky: '#1b354f', city: '#2c4e70', towers: 8,
+        lights: '#ecdfb2', tint: '#5f93bd', frame: '#8d9cab' },
+
+      // THE DECKS either side of centre.
+      { kind: 'bleachers', a0: 0, a1: 37, back: 6, h0: 8, h: 34,
+        rows: 9, perRow: 54 },
+      { kind: 'bleachers', a0: 53, a1: 90, back: 6, h0: 8, h: 34,
+        rows: 9, perRow: 54 },
+
+      // THE BATTER'S EYE, blank and in dead centre.
+      { kind: 'marquee', a0: 39, a1: 53, back: 5, h0: 0, h1: 27,
+        panels: 0, fill: '#1d3a2b' },
+
+      // THE BOARDS. The big one out in right centre with the park's
+      // name over it, and the smaller one high over the left-field
+      // corner.
+      { kind: 'videoboard', a: 72, d: 468, w: 152, h: 56, h0: 66,
+        crown: 'none', name: 'GLOBE LIFE FIELD', nameFill: '#6fc27a',
+        sidePanels: 2, adPanels: 4, screen: ['#13263c', '#204060'],
+        edge: '#12161d' },
+      { kind: 'videoboard', a: 10, d: 392, w: 74, h: 34, h0: 66,
+        crown: 'none', sidePanels: 1, adPanels: 2,
+        screen: ['#13263c', '#204060'], edge: '#12161d' },
+
+      // THE ROOF, shut. A dark steel space frame rather than a pale
+      // ceiling: the panels are what you are looking at, the radial
+      // members are the structure across them, and the leading truss
+      // is the open lattice along its near edge -- the same three
+      // pieces Seattle and Tropicana use, in the proportions this
+      // park has them.
+      { kind: 'roof', ribs: 0, a0: -8, a1: 98, back: 70, step: 40,
+        lift: 170, archLow: 0.9, beam: '#39414d', edge: '#5d6775',
+        beamDay: '#8d97a4', edgeDay: '#aab3bf',
+        panels: true, panelA0: -8, panelA1: 98, panelBack: 40,
+        panelDeep: 640, panelLift: 185, panelDrop: 9,
+        panelFill: '#242a35', panelFace: '#191e26',
+        domeRibs: 15, ribFill: '#4d586a',
+        domeLights: 8,
+        truss: true, trussDeep: 10 },
+
+      { kind: 'ads', a0: 2, a1: 88, n: 16 },
+      { kind: 'flagpole', a: 39, st: 'TX' }
+    ]
+  },
+
+  // ════════════════════════════════════════════════════════════════
+  // ROGERS CENTRE
+  //
+  //   OVERHEAD   the roof, OPEN. What fills two thirds of Ty's
+  //              photograph is not a ceiling but the vast open steel
+  //              arch the panels ride on, with the retracted panel a
+  //              pale band above it and daylight past both ends. So
+  //              this park keeps its sky, and the rib fan that serves
+  //              Chase, Daikin and American Family is exactly the
+  //              right tool -- it was built for this.
+  //   CENTRE     the HOTEL. Rooms overlook the field from either side
+  //              of the board, which no other ground in this table
+  //              has, and they get the window machinery.
+  //   AND A ROW OF LIGHT CLUSTERS along the rim under the arch.
+  'Rogers Centre': {
+    towers: [],
+    items: [
+      { kind: 'bleachers', a0: 0, a1: 35, back: 6, h0: 9, h: 40,
+        rows: 11, perRow: 58 },
+      { kind: 'bleachers', a0: 55, a1: 90, back: 6, h0: 9, h: 40,
+        rows: 11, perRow: 58 },
+
+      // THE BATTER'S EYE, blank and in dead centre.
+      { kind: 'marquee', a0: 38, a1: 53, back: 4, h0: 0, h1: 26,
+        panels: 0, fill: '#1b2b3f' },
+
+      // THE HOTEL ROOMS, one bank each side of the board.
+      { kind: 'glass', a0: 26, a1: 38, back: 18, h0: 54, h1: 86,
+        panes: 7, sky: '#4a5a6d', city: '#8e9bab', towers: 9,
+        lights: '#fff3cf', tint: '#9fc0da', frame: '#dfe6ec' },
+      { kind: 'glass', a0: 53, a1: 65, back: 18, h0: 54, h1: 86,
+        panes: 7, sky: '#4a5a6d', city: '#8e9bab', towers: 9,
+        lights: '#fff3cf', tint: '#9fc0da', frame: '#dfe6ec' },
+
+      // THE BOARD, between them in dead centre.
+      { kind: 'videoboard', a: 45, d: 452, w: 134, h: 62, h0: 52,
+        crown: 'none', name: 'ROGERS CENTRE', nameFill: '#79a6d8',
+        sidePanels: 2, adPanels: 4, screen: ['#14355c', '#1d4d82'],
+        edge: '#111822' },
+
+      // THE ARCH. Many ribs and a dark steel, because from in there it
+      // is a lattice rather than a roof, and the pale slab high above
+      // it is the panel that has slid back out of the way.
+      { kind: 'roof', ribs: 7, a0: -10, a1: 100, back: 64, step: 38,
+        lift: 196, archLow: 0.42, beam: '#2e3744', edge: '#5d6775',
+        beamDay: '#8d97a4', edgeDay: '#aab3bf',
+        panels: true, panelA0: -10, panelA1: 100, panelBack: 300,
+        panelDeep: 520, panelLift: 232, panelDrop: 9,
+        panelFill: '#9aa3ad', panelFace: '#767f8a',
+        domeLights: 9 },
+
+      { kind: 'ads', a0: 2, a1: 88, n: 16 },
+      { kind: 'flagpole', a: 14, st: 'ON', upper: 'CAN' }
+    ]
+  },
+
+  // ════════════════════════════════════════════════════════════════
+  // NATIONALS PARK
+  //
+  // Ty: "I've circled two major monuments that I'd like to be able to
+  // see when you build Nationals Park out."
+  //
+  // THE CAPITOL AND THE WASHINGTON MONUMENT, beyond left field, drawn
+  // as themselves. Both would otherwise have gone into the skyline as
+  // two more blocks among a dozen, which is how a city gets drawn when
+  // nothing in it is worth naming -- and these two are the reason
+  // anybody photographs this ballpark from up there at all. The dome
+  // is the shape Busch Stadium's courthouse already uses; the obelisk
+  // is new.
+  //
+  // THEY ARE PUBLIC MONUMENTS, which is the same ground the Liberty
+  // Bell stood on: a thing the public owns, not a club's mark. The
+  // curly W on the scoreboard and the neon one beside it are the
+  // club's, and are not drawn.
+  'Nationals Park': {
+    towers: [62, 76],
+    bowlTiers: [
+      [0.5, '#8a2432'],
+      [0.8, '#6f1d29'],
+      [1, '#55161f']
+    ],
+    items: [
+      // WASHINGTON, low and wide behind the left-field side.
+      { kind: 'skyline', a0: 2, a1: 44, d: 1500, n: 15, low: 14, high: 36 },
+
+      // THE CAPITOL, over the left-field corner.
+      { kind: 'prop', shape: 'dome', a: 30, d: 1260, w: 108, h: 96,
+        h0: 26, plinth: false, fill: '#e3d9b8', drumFill: '#cfc6ac' },
+
+      // AND THE MONUMENT, taller than anything else in the frame by a
+      // long way, which is the whole point of it.
+      { kind: 'prop', shape: 'obelisk', a: 37, d: 1340, w: 54, h: 250,
+        h0: 30, plinth: false, fill: '#d6d0c2', cap: '#e8e3d8',
+        seam: '#b3ab99' },
+
+      { kind: 'bleachers', a0: 0, a1: 36, back: 6, h0: 8, h: 32,
+        rows: 9, perRow: 52 },
+      { kind: 'bleachers', a0: 54, a1: 90, back: 6, h0: 8, h: 36,
+        rows: 10, perRow: 58 },
+
+      // THE BATTER'S EYE, blank and in dead centre.
+      { kind: 'marquee', a0: 37, a1: 52, back: 4, h0: 0, h1: 28,
+        panels: 0, fill: '#17382a' },
+
+      // THE BOARD, out in right centre with the park's name over it.
+      { kind: 'videoboard', a: 70, d: 448, w: 140, h: 58, h0: 44,
+        crown: 'none', name: 'NATIONALS PARK', nameFill: '#d8828c',
+        sidePanels: 2, adPanels: 4, screen: ['#3d1a22', '#6b2c38'],
+        edge: '#1a1014' },
+
+      { kind: 'ads', a0: 2, a1: 88, n: 15 },
+      { kind: 'flagpole', a: 14, st: 'DC' }
     ]
   }
 };
@@ -110087,6 +111462,18 @@ function _plArt(p, aim, o) {
     } else if (it.kind === 'roof') {
       // AND A ROOF IS DIRECTLY OVERHEAD from down here, which is the one
       // direction this camera does not look.
+      //
+      // TRUE OF FOUR ROOFS AND NOT OF THE FIFTH. Milwaukee, Houston,
+      // Phoenix and Toronto shut over the field and are overhead by
+      // definition. Seattle's never closes: it parks above and behind
+      // the right-field seats, which is in front of a batter rather
+      // than over him, and from the plate you can see it. It is not
+      // drawn here yet and the reason is honest rather than settled --
+      // this camera places everything as a setback from the wall, and
+      // the roof is sixty-eight degrees of bearing wide, which is the
+      // span the warehouse note below says comes out bent round the
+      // outfield. Drawing it needs that solved first, not a slab
+      // pushed through the helper that is known to curve it.
       s += '';
 
     } else if (it.kind === 'ridge') {
@@ -114568,6 +115955,72 @@ function _espTeamFailHtml(why, status, teamId, league, retryCall) {
     '</div>';
 }
 
+// ---- NHLROSTER ----
+// Ty: "The rosters page for NHL won't load. All other sports render the
+// rosters and their season stats."
+//
+// WHAT THE PAGE SHOWED was five rows -- "? Centers", "? Left Wings",
+// "? Right Wings", "? Defense", "? Goalies" -- and a note saying no
+// player statistics were available. Those are ESPN's POSITION GROUPS
+// drawn as if they were players: a group carries a `position` string
+// and no identity at all, so the name fell through to '?' and the
+// position label landed in the slot beside it.
+//
+// TWO FAULTS, one hiding the other.
+//
+// 1. "DID A ROSTER COME BACK" COUNTED GROUPS, NOT PLAYERS. The roster
+//    is fetched with ?season=<year> and retried without it when the
+//    first call comes back empty. The test was `athletes.length` --
+//    and five empty groups is a length of five, so the retry that
+//    would have recovered this never ran. Every league goes through
+//    the same code; NHL is the one where the season-pinned call
+//    answers with the group skeleton and no players in it.
+//
+// 2. AND THE FLAT FALLBACK ADOPTED THE GROUPS. When unwrapping
+//    produced nothing, the old code assigned `athletes` straight
+//    across on the grounds that ESPN sometimes sends a flat list of
+//    players. It does -- but it also sends groups, and the fallback
+//    could not tell the difference, so it put five position labels on
+//    the page as people.
+//
+// ONE HELPER FOR BOTH, because the unwrap happened in two places (the
+// combined team call and the separate roster call) and only one of
+// them is where the bug showed.
+function _espRosterPlayers(athletes) {
+  var out = [];
+  if (!athletes || !Array.isArray(athletes)) return out;
+  athletes.forEach(function (g) {
+    if (!g) return;
+    // A GROUP: take what is inside it and nothing else. An empty group
+    // contributes nothing, which is the honest answer and the one that
+    // lets the caller know to try again.
+    //
+    // THREE KEYS, BECAUSE I CANNOT SEE THE REPLY. ESPN is not reachable
+    // from where this was fixed, so the shape of the NHL roster is
+    // inferred from what the page drew -- five position labels where
+    // five players should have been. That symptom has two explanations
+    // and they need different handling: either the groups carried
+    // `items` and the array was empty, or they carried their players
+    // under a key this code never looked for. Reading `items`,
+    // `athletes` and `entries` covers both, and costs nothing if the
+    // first guess was right: a flat player object has none of them.
+    var list = Array.isArray(g.items) ? g.items
+      : Array.isArray(g.athletes) ? g.athletes
+      : Array.isArray(g.entries) ? g.entries : null;
+    if (list) {
+      list.forEach(function (a) { if (a) out.push(a); });
+      return;
+    }
+    // A PLAYER: something with an identity. This is the flat-list case
+    // and it is also the guard -- a position group has no id, no
+    // athlete and no name, so it can never be mistaken for one again.
+    if (g.id || g.athlete || g.displayName || g.fullName || g.shortName) {
+      out.push(g);
+    }
+  });
+  return out;
+}
+
 async function fetchTeamPage(teamId, league) {
   var header = document.getElementById('tpHeader');
   var body = document.getElementById('tpBody');
@@ -114607,16 +116060,8 @@ async function fetchTeamPage(teamId, league) {
     
     // Try to get athletes from team response (enable=roster format)
     if (teamObj?.athletes) {
-      // Could be grouped by position or flat
-      if (Array.isArray(teamObj.athletes)) {
-        teamObj.athletes.forEach(function(group) {
-          if (group.items) {
-            group.items.forEach(function(a) { rosterAthletes.push(a); });
-          } else if (group.id || group.athlete) {
-            rosterAthletes.push(group);
-          }
-        });
-      }
+      // Grouped by position or flat; the helper knows the difference.
+      rosterAthletes = _espRosterPlayers(teamObj.athletes);
     }
 
     // If no athletes from team endpoint, fetch roster separately
@@ -114638,8 +116083,11 @@ async function fetchTeamPage(teamId, league) {
       var _rosGet = await _espGetJson(rosterUrl);
       rosterData = _rosGet.data;
       if (!_rosGet.ok) { _espWhy = _rosGet.why; _espStatus = _rosGet.status; }
-      var _gotAthletes = !!(rosterData && rosterData.athletes &&
-        (rosterData.athletes.length || Object.keys(rosterData.athletes).length));
+      // PLAYERS, NOT GROUPS. This counted `athletes.length`, which for
+      // a grouped reply is the number of position groups -- so a reply
+      // carrying five empty groups read as five athletes and the
+      // no-season retry below never fired. That is the NHL bug.
+      var _gotAthletes = _espRosterPlayers(rosterData && rosterData.athletes).length > 0;
       // TEAMFETCH - the condition is unchanged on purpose. I widened it to
       // run whenever no squad came back, then a canary would not fire on the
       // difference: _seasonYearFor always returns a year, so seasonYr is
@@ -114652,17 +116100,12 @@ async function fetchTeamPage(teamId, league) {
         else if (!rosterData) { _espWhy = _rosGet2.why; _espStatus = _rosGet2.status; }
       }
       if (rosterData && rosterData.athletes) {
-        rosterData.athletes.forEach(function(group) {
-          if (group.items) {
-            group.items.forEach(function(a) { rosterAthletes.push(a); });
-          } else if (group.id || group.athlete) {
-            rosterAthletes.push(group);
-          }
-        });
-        // Flat array fallback
-        if (!rosterAthletes.length && Array.isArray(rosterData.athletes)) {
-          rosterAthletes = rosterData.athletes;
-        }
+        // NO FLAT FALLBACK ANY MORE. It used to assign `athletes`
+        // across whenever the unwrap came up empty, which is how five
+        // position groups ended up on the page as five players. The
+        // helper already handles a genuinely flat list; an empty result
+        // now stays empty and the page says so honestly.
+        rosterAthletes = _espRosterPlayers(rosterData.athletes);
       }
     }
 
