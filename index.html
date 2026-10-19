@@ -27444,13 +27444,33 @@
   .sk-gl-row.total {
     background: rgba(255,255,255,0.03); border-top: 1px solid var(--sk-border);
   }
-  .sk-gl-cell {
-    font-family: var(--sk-font-mono); font-size: 12px; font-weight: 700;
-    color: var(--sk-text-2); padding: 7px 12px;
+  /* NFLGLBARS -- each week is a bar mirrored around the week number and
+     scaled to the biggest week on the page, with the figure pinned to the
+     outer edge so the numbers still read as a column. */
+  .sk-gl-sum {
+    display: grid; grid-template-columns: 1fr 40px 1fr; gap: 4px;
+    padding: 0 4px 7px; font-family: var(--sk-font-mono);
+    font-size: 8.5px; font-weight: 700; letter-spacing: 0.09em;
+    color: var(--sk-text-4);
   }
-  .sk-gl-cell.my { text-align: right; }
-  .sk-gl-cell.op { text-align: left; }
+  .sk-gl-sum .op { text-align: right; }
+  .sk-gl-sum b { color: var(--sk-text-2); font-weight: 700; }
+  .sk-gl-cell {
+    display: flex; align-items: center; gap: 7px;
+    font-family: var(--sk-font-mono); font-size: 12px; font-weight: 700;
+    color: var(--sk-text-2); padding: 6px 11px;
+  }
+  .sk-gl-cell.op { flex-direction: row-reverse; }
+  .sk-gl-num { flex: 0 0 38px; text-align: right; }
+  .sk-gl-track { flex: 1; min-width: 0; display: flex; justify-content: flex-end; }
+  .sk-gl-bar {
+    display: block; height: 7px; border-radius: 2px; min-width: 2px;
+    background: rgba(255,255,255,0.17);
+  }
+  .sk-gl-bar.win { background: var(--sk-green); }
+  .sk-gl-bar.cur { background: var(--sk-gold); }
   .sk-gl-cell.win { color: var(--sk-green); }
+  .sk-gl-row.total .sk-gl-track { visibility: hidden; }
   .sk-gl-row.total .sk-gl-cell { color: var(--sk-gold); font-weight: 800; }
   .sk-gl-wk {
     font-family: var(--sk-font-mono); font-size: 9.5px; font-weight: 700;
@@ -165774,8 +165794,9 @@ function _skNflGameLogDiagHTML(entry, myWeeks, opWeeks, keys) {
   '</div>';
 }
 
-// Build the two-column (mine | week | opp) weekly table HTML. Byes and future/
-// unplayed weeks show a dash. Highlights the higher FP on each decided week.
+// Build the two-column (mine | week | opp) weekly log. Each week is a pair
+// of bars mirrored around the week number; the higher figure on a decided
+// week is greened.
 function _skBuildNflGameLogHTML(myPl, myWeeks, opPl, opWeeks, startWk, endWk, st) {
   function fmt(v) {
     if (v == null) return '\u2014';
@@ -165785,10 +165806,22 @@ function _skBuildNflGameLogHTML(myPl, myWeeks, opPl, opWeeks, startWk, endWk, st
   var curWk = parseInt(st.currentWeek, 10) || 0;
   var myName = myPl ? (myPl.name || '') : '';
   var opName = opPl ? (opPl.name || '') : '';
-  // Running totals across weeks that actually have a value.
+
+  // NFLGLFUTURE -- stop at the current week.
+  //
+  // Yahoo returns 0, not null, for a week nobody has played, so every week
+  // between now and the end of the season rendered as a 0.0 row: twelve
+  // rows of nothing under the five that meant something. A future week is
+  // not a zero. It is not a row.
+  var lastWk = (curWk && curWk < endWk) ? curWk : endWk;
+
+  // Collected in one pass so the bars can be scaled to the biggest week on
+  // the page and the summary worked out before anything is drawn.
+  var weeks = [], max = 0, w;
   var myTot = 0, opTot = 0, myHas = false, opHas = false;
-  var rows = '';
-  for (var w = startWk; w <= endWk; w++) {
+  var myWon = 0, opWon = 0, myN = 0, opN = 0;
+  var mySet = 0, opSet = 0;      // points from FINISHED weeks only
+  for (w = startWk; w <= lastWk; w++) {
     var mv = (myWeeks && myWeeks[w] != null) ? myWeeks[w] : null;
     var ov = (opWeeks && opWeeks[w] != null) ? opWeeks[w] : null;
     // Seed the CURRENT week from the live matchup value. Yahoo's weekly
@@ -165802,28 +165835,74 @@ function _skBuildNflGameLogHTML(myPl, myWeeks, opPl, opWeeks, startWk, endWk, st
       if (mv == null && myPl && myPl.fp != null) mv = Number(myPl.fp);
       if (ov == null && opPl && opPl.fp != null) ov = Number(opPl.fp);
     }
-    if (mv != null) { myTot += mv; myHas = true; }
-    if (ov != null) { opTot += ov; opHas = true; }
-    var myWin = (mv != null && ov != null && mv > ov);
-    var opWin = (mv != null && ov != null && ov > mv);
-    var isCur = (w === curWk);
-    rows += '<div class="sk-gl-row' + (isCur ? ' cur' : '') + '">' +
-      '<div class="sk-gl-cell my' + (myWin ? ' win' : '') + '">' + fmt(mv) + '</div>' +
-      '<div class="sk-gl-wk">' + w + '</div>' +
-      '<div class="sk-gl-cell op' + (opWin ? ' win' : '') + '">' + fmt(ov) + '</div>' +
+    // The total takes every point on the board, the live week included.
+    var settled = (w !== curWk);
+    if (mv != null) { myTot += mv; myHas = true; if (mv > max) max = mv; if (settled) { myN++; mySet += mv; } }
+    if (ov != null) { opTot += ov; opHas = true; if (ov > max) max = ov; if (settled) { opN++; opSet += ov; } }
+    // WON and AVG are claims about FINISHED weeks. A week still being
+    // played is neither won nor a fair divisor -- a player who kicks off on
+    // Monday night is not a player who scored nothing.
+    if (settled && mv != null && ov != null) {
+      if (mv > ov) { myWon++; } else if (ov > mv) { opWon++; }
+    }
+    weeks.push({ w: w, mv: mv, ov: ov });
+  }
+
+  // A zero week draws no bar: a two-pixel stub reads as a small score when
+  // the player did not play at all.
+  function cell(v, isOp, win, isCur) {
+    var pct = (max > 0 && v != null && v > 0) ? Math.max(3, (v / max) * 100) : 0;
+    var barCls = win ? ' win' : (isCur ? ' cur' : '');
+    return '<div class="sk-gl-cell ' + (isOp ? 'op' : 'my') + (win ? ' win' : '') + '">' +
+      '<span class="sk-gl-num">' + fmt(v) + '</span>' +
+      '<span class="sk-gl-track">' +
+        (pct ? '<i class="sk-gl-bar' + barCls + '" style="width:' + pct.toFixed(1) + '%"></i>' : '') +
+      '</span>' +
     '</div>';
   }
+
+  var rows = '';
+  for (var i = 0; i < weeks.length; i++) {
+    var k = weeks[i];
+    var myWin = (k.mv != null && k.ov != null && k.mv > k.ov);
+    var opWin = (k.mv != null && k.ov != null && k.ov > k.mv);
+    var isCur = (k.w === curWk);
+    rows += '<div class="sk-gl-row' + (isCur ? ' cur' : '') + '">' +
+      cell(k.mv, false, myWin, isCur) +
+      '<div class="sk-gl-wk">' + k.w + '</div>' +
+      cell(k.ov, true, opWin, isCur) +
+    '</div>';
+  }
+
   var totalRow = '<div class="sk-gl-row total">' +
-    '<div class="sk-gl-cell my">' + (myHas ? fmt(myTot) : '\u2014') + '</div>' +
+    '<div class="sk-gl-cell my"><span class="sk-gl-num">' +
+      (myHas ? fmt(myTot) : '\u2014') + '</span><span class="sk-gl-track"></span></div>' +
     '<div class="sk-gl-wk">TOT</div>' +
-    '<div class="sk-gl-cell op">' + (opHas ? fmt(opTot) : '\u2014') + '</div>' +
+    '<div class="sk-gl-cell op"><span class="sk-gl-num">' +
+      (opHas ? fmt(opTot) : '\u2014') + '</span><span class="sk-gl-track"></span></div>' +
   '</div>';
+
+  // The question the table was being read to answer, answered.
+  // The average is over finished weeks, so it must be divided by the
+  // points from those weeks, not by the running total that includes the
+  // live one.
+  function sum(won, settledTot, n) {
+    return '<b>' + won + '</b> WON \u00b7 <b>' +
+      (n ? fmt(settledTot / n) : '\u2014') + '</b> AVG';
+  }
+  var strip = '<div class="sk-gl-sum">' +
+      '<div>' + sum(myWon, mySet, myN) + '</div>' +
+      '<div></div>' +
+      '<div class="op">' + sum(opWon, opSet, opN) + '</div>' +
+    '</div>';
+
   return '<div class="sk-gl-head">WEEKLY FAN PTS</div>' +
     '<div class="sk-gl-namerow">' +
       '<div class="sk-gl-name my">' + skEscape(myName) + '</div>' +
       '<div class="sk-gl-name-mid"></div>' +
       '<div class="sk-gl-name op">' + skEscape(opName) + '</div>' +
     '</div>' +
+    strip +
     '<div class="sk-gl-table">' + rows + totalRow + '</div>';
 }
 
