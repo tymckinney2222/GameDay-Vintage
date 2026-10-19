@@ -167398,6 +167398,15 @@ async function skLoadRosterForLeague(leagueKey) {
 //                    on every render so it doesn't bleed between
 //                    leagues or dates.
 var skCurrentFpMap = null;
+
+// ROSTERGRID6 -- the date-scoped category stats for the roster on screen,
+// kept rather than discarded once the cards have been built from them.
+// { leagueKey: { date: 'YYYY-MM-DD', byKey: { playerKey: { stats } } } }
+//
+// One entry per league, carrying the date it was fetched for. A reader that
+// wants another date must miss rather than be handed this one: a line that
+// outlived its date is a bug this roster has already had.
+var skDailyCatStatsCache = {};
 // Stat metadata (stat_id → {abbr, displayName, pointModifier, …}) for the
 // currently-viewed NFL league. Read by skUpdateRosterLinesInPlace to format
 // each row's stat line. Reset on every render so it doesn't bleed leagues.
@@ -167725,6 +167734,9 @@ function skRenderDetailRoster(league, players) {
         var statsMeta = (res[1] && res[1].stats) || {};
         var byKey = {};
         playerStats.forEach(function(ps) { if (ps && ps.playerKey) byKey[ps.playerKey] = ps; });
+        // ROSTERGRID6 -- keep the figures, not just the sentence built from
+        // them. The table needs the numbers; the card needed the line.
+        skDailyCatStatsCache[league.league_key] = { date: targetDate, byKey: byKey };
         // THE STAMP IS AUTHORITATIVE FOR ITS DATE. NHLDATE
         // It used to only ever set _line, and to return early for a player
         // the new date had no stats for -- so a line stamped on Tuesday sat
@@ -170068,13 +170080,22 @@ function _rgContext(league) {
     // THE DAY, AND ONLY THE DAY. The season is consulted for the shape of
     // the table and never for a number in it: a season total standing in
     // for a game not yet played is a lie no footer could undo.
-    byKey = dayBy || {};
-    shapeBy = seasonBy || dayBy;
-    if (!shapeBy) { return null; }
     var dstr = (typeof skDetailDate !== 'undefined' && skDetailDate) ||
       (typeof _todayDateString === 'function' ? _todayDateString() : '');
     var isToday = (typeof _todayDateString === 'function') &&
       dstr === _todayDateString();
+    // ROSTERGRID6 -- a categories league never fills skCurrentFpMap; only
+    // the points branch does. Its day figures live in the category cache,
+    // which every NBA and NHL roster fills whatever it scores by. The date
+    // must match, or yesterday's night would be served under today's label.
+    if (!dayBy || !Object.keys(dayBy).length) {
+      var _dc = (typeof skDailyCatStatsCache !== 'undefined')
+        ? skDailyCatStatsCache[league.league_key] : null;
+      if (_dc && _dc.date === dstr && _dc.byKey) { dayBy = _dc.byKey; }
+    }
+    byKey = dayBy || {};
+    shapeBy = seasonBy || dayBy;
+    if (!shapeBy) { return null; }
     label = isToday ? 'Today'
       : ((typeof skFormatDateLabel === 'function') ? skFormatDateLabel(dstr) : dstr);
     if (!_rgHasAnyValue(byKey)) {
