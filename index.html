@@ -141899,7 +141899,14 @@ function skSetDetailFpMode(mode) {
   skDetailFpMode = mode;
   var nav = document.getElementById('skDetailDateNav');
   if (nav) nav.style.display = (mode === 'season' ? 'none' : '');
-  var btns = document.querySelectorAll('.sk-fpmode-row .sk-side-btn');
+  // ROSTERGRID4 -- scoped to THIS row. It used to be every .sk-fpmode-row
+  // on the page, which was one row until the Table/Cards toggle borrowed
+  // the class; then it was four buttons, the length check failed, and the
+  // highlight stopped moving without a word.
+  var btns = document.querySelectorAll('.sk-fpmode-scope .sk-side-btn');
+  if (!btns || btns.length !== 2) {
+    btns = document.querySelectorAll('.sk-fpmode-row:not(.rg-toggle) .sk-side-btn');
+  }
   if (btns && btns.length === 2) {
     if (mode === 'day') { btns[0].classList.add('active'); btns[1].classList.remove('active'); }
     else { btns[1].classList.add('active'); btns[0].classList.remove('active'); }
@@ -142515,7 +142522,7 @@ function skBuildDetailHTML(league) {
         '  </button>' +
         '</div>'
       : (isPointsLeague
-        ? '<div class="sk-fpmode-row">' +
+        ? '<div class="sk-fpmode-row sk-fpmode-scope">' +
           '  <button class="sk-side-btn' + (skDetailFpMode !== 'season' ? ' active' : '') + '" onclick="skSetDetailFpMode(\'day\')">Daily</button>' +
           '  <button class="sk-side-btn' + (skDetailFpMode === 'season' ? ' active' : '') + '" onclick="skSetDetailFpMode(\'season\')">Season Total</button>' +
           '</div>'
@@ -169574,7 +169581,10 @@ function skUpdateRosterLinesInPlace(players, targetDate) {
   if (!rosterEl) return;
   // ROSTERGRID3 -- a table has no .sk-roster-row elements, so without this
   // the bail below threw away every update that arrived after first paint.
-  if (typeof _rgRepaint === 'function' && _rgRepaint()) { return; }
+  if (typeof _rgRepaint === 'function' && _rgRepaint()) {
+    _skUpdateGroupSubtotals(players, rosterEl);
+    return;
+  }
   var rows = rosterEl.querySelectorAll('.sk-roster-row');
   if (!rows.length) return;
   // NFL rows get their line from the weekly stats map + league stat
@@ -169658,9 +169668,19 @@ function skUpdateRosterLinesInPlace(players, targetDate) {
     }
   });
 
-  // After per-row updates, re-aggregate FP into each group's subtotal.
-  // Players are partitioned into Active / Bench / IL by the same
-  // filters skRenderDetailRoster used; we just match by data-group-label.
+  _skUpdateGroupSubtotals(players, rosterEl);
+}
+
+// Re-aggregate FP into each group's header. Players are partitioned into
+// Active / Bench / IL by the same filters skRenderDetailRoster used; we
+// just match by data-group-label.
+//
+// ROSTERGRID4 -- its own function because the table repaint returns early
+// out of the updater above, and that early return quietly stopped the
+// group header's "275.8 fp" from ever being written again. This never
+// needed the rows; it only ever needed the groups.
+function _skUpdateGroupSubtotals(players, rosterEl) {
+  if (!players || !rosterEl) { return; }
   var byGroup = {
     ACTIVE: players.filter(function(p) { return !p.isBench && !p.isIL; }),
     BENCH:  players.filter(function(p) { return p.isBench; }),
@@ -169740,10 +169760,23 @@ function _rgMode() {
 
 function skSetRosterView(mode) {
   try { localStorage.setItem('gd_roster_cards', mode === 'cards' ? '1' : '0'); } catch (e) {}
+  // ROSTERGRID4 -- this row sits in the detail HEADER, outside the roster
+  // element, so re-rendering the roster never repainted it and the gold
+  // ring stayed on whichever button had been chosen BEFORE.
+  _rgSyncToggle();
   var lk = (typeof skState !== 'undefined') ? skState.activeLeagueKey : '';
   var league = (fyLeagues || []).find(function (l) { return l.league_key === lk; });
   var c = league && skDetailRosterCache[lk];
   if (league && c) { skRenderDetailRoster(league, c.players); }
+}
+
+function _rgSyncToggle() {
+  var btns = document.querySelectorAll('.rg-toggle .sk-side-btn');
+  if (!btns || btns.length !== 2) { return false; }
+  var t = (_rgMode() === 'table');
+  btns[0].classList.toggle('active', t);
+  btns[1].classList.toggle('active', !t);
+  return true;
 }
 
 function _rgToggleHtml() {
@@ -169805,7 +169838,12 @@ function _rgFmt(v, m) {
 // value in each column is marked -- a comparison the stat line could never
 // make, and the reason to have a grid at all.
 function _rgTable(rows, byKey, meta, ord, sport, opts) {
-  var cols = _rgCols(rows, byKey, meta, ord);
+  // ROSTERGRID4 -- WHICH columns and WHAT is in them are two questions.
+  // The season says which categories this roster plays; the map in hand
+  // says what has been put up so far. On a morning with nothing played
+  // that is a full table of em-dashes, rather than no table at all.
+  var shapeBy = (opts && opts.shapeBy) || byKey;
+  var cols = _rgCols(rows, shapeBy, meta, ord);
   if (!cols.length || !rows.length) { return ''; }
   var best = {}, c, r;
   for (c = 0; c < cols.length; c++) {
@@ -169901,7 +169939,11 @@ function _rgTable(rows, byKey, meta, ord, sport, opts) {
 // The whole group as grids: skaters, then goalies. Returns '' when there
 // is nothing to tabulate, and the caller falls back to the cards.
 function _rgGroupHtml(players, byKey, meta, ord, sport, opts) {
-  if (!players || !players.length || !byKey || !meta) { return ''; }
+  if (!players || !players.length || !meta) { return ''; }
+  if (!byKey) { byKey = {}; }
+  // An empty map is a legitimate day -- nothing played yet -- but only
+  // when something else is supplying the shape.
+  if (!(opts && opts.shapeBy) && !Object.keys(byKey).length) { return ''; }
   var real = [], i;
   for (i = 0; i < players.length; i++) {
     if (players[i] && !players[i]._isEmptySlot && players[i].playerKey) {
@@ -169925,6 +169967,27 @@ function _rgGroupHtml(players, byKey, meta, ord, sport, opts) {
   var what = (opts && opts.scopeLabel) || 'Season totals';
   return h + '<div class="rg-foot">' + skEscape(what) +
     ' \u00b7 gold is best on this roster \u00b7 scroll for more</div>';
+}
+
+// Has anything at all been put up yet? A map that has not arrived and a
+// map of players who have not played look the same from here, and both
+// mean the table is still waiting on the night.
+function _rgHasAnyValue(byKey) {
+  if (!byKey) { return false; }
+  var ks = Object.keys(byKey), i, j;
+  for (i = 0; i < ks.length; i++) {
+    var rec = byKey[ks[i]];
+    if (!rec) { continue; }
+    if (rec.fp != null && rec.fp !== '' && Number(rec.fp) !== 0) { return true; }
+    var st = rec.stats;
+    if (!st) { continue; }
+    var sk = Object.keys(st);
+    for (j = 0; j < sk.length; j++) {
+      var v = st[sk[j]];
+      if (v != null && v !== '' && Number(v) !== 0) { return true; }
+    }
+  }
+  return false;
 }
 
 // ROSTERGRID3 -- everything the grid needs for one league, worked out in
@@ -169953,19 +170016,35 @@ function _rgContext(league) {
     ? (skSeasonTotalFpCache[teamKey] || null) : null;
   var wantDay = (typeof skDetailFpMode !== 'undefined' && skDetailFpMode !== 'season');
   var dayBy = (typeof skCurrentFpMap !== 'undefined') ? skCurrentFpMap : null;
-  var byKey = null, label = 'Season totals';
-  if (wantDay && dayBy) {
-    byKey = dayBy; label = 'Today';
-  } else if (wantDay && seasonBy) {
-    byKey = seasonBy; label = 'Season totals \u00b7 today\u2019s not in yet';
+  var byKey, shapeBy, label;
+
+  if (wantDay) {
+    // THE DAY, AND ONLY THE DAY. The season is consulted for the shape of
+    // the table and never for a number in it: a season total standing in
+    // for a game not yet played is a lie no footer could undo.
+    byKey = dayBy || {};
+    shapeBy = seasonBy || dayBy;
+    if (!shapeBy) { return null; }
+    var dstr = (typeof skDetailDate !== 'undefined' && skDetailDate) ||
+      (typeof _todayDateString === 'function' ? _todayDateString() : '');
+    var isToday = (typeof _todayDateString === 'function') &&
+      dstr === _todayDateString();
+    label = isToday ? 'Today'
+      : ((typeof skFormatDateLabel === 'function') ? skFormatDateLabel(dstr) : dstr);
+    if (!_rgHasAnyValue(byKey)) {
+      label += isToday ? ' \u00b7 nothing played yet' : ' \u00b7 nothing recorded';
+    }
   } else {
-    byKey = seasonBy || dayBy;
+    byKey = seasonBy;
+    if (!byKey) { return null; }
+    shapeBy = byKey;
+    label = 'Season totals';
   }
-  if (!byKey) { return null; }
+
   var isPts = !!(league.scoring_type === 'headpoint' || league.scoring_type === 'point' ||
     (typeof _skIsPointsH2HLeague === 'function' && _skIsPointsH2HLeague(league)));
-  return { byKey: byKey, meta: meta, ord: ord, sport: sport,
-           opts: { fp: isPts, scopeLabel: label } };
+  return { byKey: byKey, shapeBy: shapeBy, meta: meta, ord: ord, sport: sport,
+           opts: { fp: isPts, scopeLabel: label, shapeBy: shapeBy } };
 }
 
 function _rgBuildFor(league, players) {
