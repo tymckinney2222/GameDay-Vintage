@@ -17150,6 +17150,41 @@
     color: var(--sk-gold, #f5d547);
   }
   /* Top summary strip — quick portfolio-wide tally */
+  /* PPSPORT -- sport filter. Literal fallbacks on every variable: this
+     overlay sits outside .sk-overlay, where none of them are declared. */
+  .pp-sport-bar {
+    display: flex; gap: 6px;
+    padding: 9px 14px 2px;
+    flex-shrink: 0; overflow-x: auto;
+    -webkit-overflow-scrolling: touch; scrollbar-width: none;
+  }
+  .pp-sport-bar:empty { display: none; }
+  .pp-sport-bar::-webkit-scrollbar { display: none; }
+  .pp-sport-pill {
+    flex-shrink: 0;
+    display: inline-flex; align-items: center; gap: 5px;
+    font-family: var(--sk-font-mono, 'JetBrains Mono', monospace);
+    font-size: 10px; font-weight: 700; letter-spacing: 0.08em;
+    text-transform: uppercase;
+    padding: 7px 11px;
+    background: var(--sk-bg-elev, rgba(255,255,255,0.03));
+    border: 1px solid var(--sk-border, rgba(255,255,255,0.08));
+    color: var(--sk-text-3, rgba(255,255,255,0.6));
+    border-radius: 999px;
+    cursor: pointer; -webkit-tap-highlight-color: transparent;
+    transition: all 0.10s ease;
+  }
+  .pp-sport-pill:active { transform: scale(0.97); }
+  .pp-sport-pill.active {
+    background: rgba(245,213,71,0.10);
+    border-color: var(--sk-gold, #f5d547);
+    color: var(--sk-gold, #f5d547);
+  }
+  .pp-sport-pill .emo { font-size: 12px; letter-spacing: 0; }
+  .pp-sport-pill .ct {
+    font-size: 9px; opacity: 0.65; letter-spacing: 0.04em;
+  }
+
   .pp-summary {
     display: flex;
     gap: 6px;
@@ -32691,6 +32726,9 @@
     <button class="pp-mode-pill active" data-mode="actual" onclick="setPlayoffPictureMode('actual')">Actual</button>
     <button class="pp-mode-pill" data-mode="projected" onclick="setPlayoffPictureMode('projected')">If week ended now</button>
   </div>
+  <!-- PPSPORT — sport filter. Hidden by its :empty rule when every
+       league is the same sport, because then it filters nothing. -->
+  <div class="pp-sport-bar" id="ppSportBar"></div>
   <div class="pp-summary" id="ppSummary"></div>
   <div class="pp-body" id="ppBody">
     <div class="pp-loading">Loading your portfolio\u2026</div>
@@ -180443,6 +180481,55 @@ var _ppExpanded = {};
 // so projected mode is a recompute over cached data — no extra fetches.
 var _ppMode = 'actual';
 
+// PPSPORT -- which sport the list is filtered to, or 'all'.
+var _ppSport = 'all';
+
+// Surrogate pairs, not \U-escapes: JavaScript has no \U form, so
+// '\U0001f3c8' is the letter U followed by digits.
+var _PP_SPORT_EMO = {
+  mlb: '\u26be',
+  nfl: '\ud83c\udfc8', cfb: '\ud83c\udfc8',
+  nba: '\ud83c\udfc0',
+  nhl: '\ud83c\udfd2', nhlgoalie: '\ud83c\udfd2'
+};
+
+function _ppSportOf(l) {
+  return String((l && l.sport) || '').toLowerCase();
+}
+
+function setPlayoffPictureSport(sport) {
+  var s = String(sport || 'all').toLowerCase();
+  if (_ppSport === s) { return; }
+  _ppSport = s;
+  _ppRender();
+}
+
+// The filter is built from the leagues actually in the portfolio, so it
+// never offers a sport with nothing behind it.
+function _ppSportBarHtml(leagues) {
+  var order = [], seen = {}, i, sp;
+  for (i = 0; i < leagues.length; i++) {
+    sp = _ppSportOf(leagues[i]);
+    if (!sp) { continue; }
+    if (!seen[sp]) { seen[sp] = 0; order.push(sp); }
+    seen[sp]++;
+  }
+  // One sport is not a choice.
+  if (order.length < 2) { return ''; }
+  order.sort(function (a, b) { return seen[b] - seen[a] || (a < b ? -1 : 1); });
+  var h = '<button class="pp-sport-pill' + (_ppSport === 'all' ? ' active' : '') +
+    '" onclick="setPlayoffPictureSport(\'all\')">All' +
+    '<span class="ct">' + leagues.length + '</span></button>';
+  for (i = 0; i < order.length; i++) {
+    sp = order[i];
+    h += '<button class="pp-sport-pill' + (_ppSport === sp ? ' active' : '') +
+      '" onclick="setPlayoffPictureSport(\'' + sp + '\')">' +
+      (_PP_SPORT_EMO[sp] ? '<span class="emo">' + _PP_SPORT_EMO[sp] + '</span>' : '') +
+      sp.toUpperCase() + '<span class="ct">' + seen[sp] + '</span></button>';
+  }
+  return h;
+}
+
 function setPlayoffPictureMode(mode) {
   if (mode !== 'actual' && mode !== 'projected') return;
   if (_ppMode === mode) return;
@@ -181131,14 +181218,32 @@ function _ppRender() {
     }
   }
 
-  var leagues = _ppLiveLeagues();
-  if (!leagues.length) {
+  var allLeagues = _ppLiveLeagues();
+  if (!allLeagues.length) {
     summary.innerHTML = '';
+    var sbE = document.getElementById('ppSportBar');
+    if (sbE) { sbE.innerHTML = ''; }
     body.innerHTML = '<div class="pp-empty">' +
       'No synced leagues. Open the league drawer and tap \u201cManage Leagues\u201d to pick which leagues to track.' +
     '</div>';
     return;
   }
+
+  // PPSPORT -- a sport the portfolio no longer has (the last one marked
+  // done, say) would leave the list empty with no way back, so the filter
+  // falls open rather than stranding you.
+  var i2, has = false;
+  for (i2 = 0; i2 < allLeagues.length; i2++) {
+    if (_ppSportOf(allLeagues[i2]) === _ppSport) { has = true; break; }
+  }
+  if (_ppSport !== 'all' && !has) { _ppSport = 'all'; }
+
+  var sportBar = document.getElementById('ppSportBar');
+  if (sportBar) { sportBar.innerHTML = _ppSportBarHtml(allLeagues); }
+
+  var leagues = (_ppSport === 'all') ? allLeagues : allLeagues.filter(function (l) {
+    return _ppSportOf(l) === _ppSport;
+  });
 
   // Build a status entry per league.
   var entries = leagues.map(function(league) {
