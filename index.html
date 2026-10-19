@@ -27224,6 +27224,28 @@
     font-weight: 400;
   }
 
+  /* SSNRACE -- the neighbourhood ladder inside the standing card. Same row
+     language as the leaderboard above, one column wider for the gap. */
+  .sk-ssnrace-head {
+    font-family: var(--sk-font-mono); font-size: 9px; font-weight: 700;
+    letter-spacing: 0.18em; color: var(--sk-text-4); text-transform: uppercase;
+    margin: 16px 0 6px;
+  }
+  .sk-ssnrace .sk-season-lb-row {
+    grid-template-columns: 26px 18px minmax(0, 1.35fr) minmax(34px, 0.75fr) 50px 52px;
+    gap: 7px;
+  }
+  .sk-ssnrace-d {
+    font-family: var(--sk-font-mono); font-size: 10.5px; font-weight: 700;
+    text-align: right; color: var(--sk-text-4); letter-spacing: 0.02em;
+  }
+  .sk-ssnrace-d.up { color: var(--sk-green); }
+  .sk-ssnrace-d.dn { color: var(--sk-red); }
+  .sk-ssnrace-note {
+    font-family: var(--sk-font-mono); font-size: 8.5px; letter-spacing: 0.08em;
+    color: var(--sk-text-4); text-align: right; margin-top: 7px;
+  }
+
   /* Points layout — two teams stacked vertically */
   .sk-detail-points-row {
     display: flex; align-items: center; justify-content: space-between;
@@ -166107,6 +166129,29 @@ function skBuildDetailMatchup(league, matchup, team, fmt, allTeams) {
       // the rank/record/pts-for row when we have enough data to
       // compute (need allTeams populated).
       var gap = skSeasonGapToNext({ allTeams: allTeams, team: team });
+      // SSNRACE -- a season-points league has no W-L record, so the RECORD
+      // tile could only ever show an em-dash. The distance to the leader
+      // goes there instead: it is the one number the whole tab is about.
+      var _race = _skSsnRaceRows(allTeams);
+      var _myI = -1;
+      for (var _ri = 0; _ri < _race.length; _ri++) {
+        if (_race[_ri].key === team.team_key) { _myI = _ri; break; }
+      }
+      var _leadTile = '';
+      if (_myI === 0 && _race.length > 1) {
+        _leadTile = '<div class="sk-cats-tile"><div class="sk-cats-num">' +
+          (_race[0].pf - _race[1].pf).toFixed(1) +
+          '</div><div class="sk-cats-lbl">LEAD</div></div>';
+      } else if (_myI > 0) {
+        _leadTile = '<div class="sk-cats-tile"><div class="sk-cats-num">' +
+          (_race[0].pf - _race[_myI].pf).toFixed(1) +
+          '</div><div class="sk-cats-lbl">BEHIND 1ST</div></div>';
+      } else if (team.record) {
+        // Not in the points race at all (no totals yet) -- fall back to
+        // whatever the standings gave us rather than showing nothing.
+        _leadTile = '<div class="sk-cats-tile"><div class="sk-cats-num">' +
+          team.record + '</div><div class="sk-cats-lbl">RECORD</div></div>';
+      }
       var gapTileHtml = '';
       if (gap) {
         var sign = gap.deltaPts >= 0 ? '+' : '\u2212';
@@ -166125,11 +166170,12 @@ function skBuildDetailMatchup(league, matchup, team, fmt, allTeams) {
         (myLogo ? '<div class="sk-detail-season-team">' + yahooLogoEl(myLogo, 32) +
           '<span class="sk-detail-season-name">' + (team.name || '') + '</span></div>' : '') +
         '  <div class="sk-detail-cats-tiles">' +
-        '    <div class="sk-cats-tile"><div class="sk-cats-num">' + skOrdinal(team.rank || '—') + '</div><div class="sk-cats-lbl">RANK</div></div>' +
-        '    <div class="sk-cats-tile"><div class="sk-cats-num">' + (team.record || '—') + '</div><div class="sk-cats-lbl">RECORD</div></div>' +
+        '    <div class="sk-cats-tile"><div class="sk-cats-num">' + skOrdinal(team.rank || '\u2014') + '</div><div class="sk-cats-lbl">RANK</div></div>' +
         (team.points_for != null ? '    <div class="sk-cats-tile"><div class="sk-cats-num">' + team.points_for.toFixed(1) + '</div><div class="sk-cats-lbl">PTS FOR</div></div>' : '') +
+        _leadTile +
         '  </div>' +
         gapTileHtml +
+        _skSsnRaceHTML(allTeams, team.team_key) +
         '</div>';
     }
   }
@@ -166145,6 +166191,83 @@ function skBuildDetailMatchup(league, matchup, team, fmt, allTeams) {
 // Idea #7: gives the user durable league-wide context that doesn't
 // require any new data fetches — everything is in skLeagueData.allTeams
 // and the team's W-L-T record.
+// SSNRACE -- every team in the points race, best first.
+//
+// Season-points leagues rank on points_for and nothing else, so the order
+// here IS the standings. Teams without a points total are left out rather
+// than sorted as zero, which would park them at the bottom as though they
+// had played and scored nothing.
+function _skSsnRaceRows(allTeams) {
+  var rows = [];
+  if (!allTeams) { return rows; }
+  Object.keys(allTeams).forEach(function (k) {
+    var t = allTeams[k];
+    if (!t || t.points_for == null || isNaN(t.points_for)) { return; }
+    rows.push({ key: k, pf: Number(t.points_for),
+      name: t.name || '', logo: t.logoUrl || '' });
+  });
+  rows.sort(function (a, b) { return b.pf - a.pf; });
+  for (var i = 0; i < rows.length; i++) { rows[i].rank = i + 1; }
+  return rows;
+}
+
+// The five rows around me: two above, me, two below, clamped at both ends
+// so first and last still get a full window rather than a stub.
+function _skSsnRaceWindow(rows, myKey, span) {
+  var n = rows.length, w = span || 5;
+  if (!n) { return { rows: [], myIdx: -1 }; }
+  var myIdx = -1, i;
+  for (i = 0; i < n; i++) { if (rows[i].key === myKey) { myIdx = i; break; } }
+  if (myIdx < 0) { return { rows: [], myIdx: -1 }; }
+  if (n <= w) { return { rows: rows, myIdx: myIdx }; }
+  var lo = myIdx - Math.floor(w / 2);
+  if (lo < 0) { lo = 0; }
+  if (lo + w > n) { lo = n - w; }
+  return { rows: rows.slice(lo, lo + w), myIdx: myIdx };
+}
+
+function _skSsnRaceHTML(allTeams, myKey) {
+  var all = _skSsnRaceRows(allTeams);
+  var win = _skSsnRaceWindow(all, myKey, 5);
+  if (!win.rows.length || win.myIdx < 0) { return ''; }
+  var myPf = all[win.myIdx].pf;
+  // The scale runs from last place to first, not from zero: these totals
+  // never start at zero and the interesting range is the field itself.
+  var top = all[0].pf;
+  var bot = all[all.length - 1].pf;
+  var span = top - bot;
+  var body = '';
+  for (var i = 0; i < win.rows.length; i++) {
+    var r = win.rows[i];
+    var mine = (r.key === myKey);
+    // 10% floor so last place still draws something: an empty track reads
+    // as missing data rather than as the bottom of the field.
+    var pct = (span > 0) ? (10 + 90 * ((r.pf - bot) / span)) : 100;
+    var d = myPf - r.pf;
+    var dTxt = mine ? '\u2014'
+      : ((d >= 0 ? '+' : '\u2212') + Math.abs(d).toFixed(1));
+    var dCls = mine ? '' : (d >= 0 ? ' up' : ' dn');
+    body += '<div class="sk-season-lb-row' + (mine ? ' mine' : '') + '">' +
+      '<div class="sk-season-lb-rank">' + skOrdinal(r.rank) + '</div>' +
+      (r.logo
+        ? '<img class="sk-season-lb-logo" src="' + r.logo +
+          '" alt="" onerror="this.style.visibility=\'hidden\'">'
+        : '<div class="sk-season-lb-logo-placeholder"></div>') +
+      '<div class="sk-season-lb-name">' + skEscape(r.name) + '</div>' +
+      '<div class="sk-season-lb-bar"><div class="sk-season-lb-bar-fill" style="width:' +
+        pct.toFixed(1) + '%"></div></div>' +
+      '<div class="sk-season-lb-fp">' + r.pf.toFixed(1) + '</div>' +
+      '<div class="sk-ssnrace-d' + dCls + '">' + dTxt + '</div>' +
+    '</div>';
+  }
+  var note = ((all.length > win.rows.length)
+      ? (win.rows.length + ' OF ' + all.length + ' \u00b7 ') : '') +
+    'GAP TO YOU \u00b7 BARS LAST\u2192FIRST';
+  return '<div class="sk-ssnrace-head">THE RACE</div>' +
+    '<div class="sk-ssnrace"><div class="sk-season-lb-body">' + body + '</div></div>' +
+    '<div class="sk-ssnrace-note">' + note + '</div>';
+}
+
 // Compute the points gap between MY team and the closest competitor
 // in the points-for race (season-points league only).
 //
