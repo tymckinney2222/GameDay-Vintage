@@ -203129,32 +203129,70 @@ function _erIsKeeper(it, game) {
   return String(it.slot || '').toUpperCase() === 'G';
 }
 
-// The categories these players actually carry, in the order ESPN lists
-// them -- which is the order the stat line reads in, so the table and the
-// card tell the same story in the same sequence. An unlabelled id is
-// skipped here exactly as the line skips it.
+// The categories these players carry, in ASCENDING STAT ID -- which is the
+// order the card's stat line reads in, because that is what for...in over
+// those keys produces. Built as a union in first-appearance order it was
+// only that order while every man carried every category; let the first man
+// be missing one and it was appended after all the rest, so ATOI, which
+// belongs sixth, sat out past PPP at the far right where it reads as
+// absent. An unlabelled id is skipped here exactly as the line skips it.
 function _erCols(items, winKey, game) {
-  var seen = {}, out = [], i, j;
+  // ESPNGRID3 -- one window or several. Several is how the shape is built:
+  // the fullest window in hand says which categories this roster plays, and
+  // the window on screen contributes anything it carries that the other
+  // does not.
+  var wins = (typeof winKey === 'string') ? [winKey] : (winKey || []);
+  var seen = {}, out = [], i, j, w;
   for (i = 0; i < items.length; i++) {
-    var wd = (items[i].windows && items[i].windows[winKey]) || null;
-    if (!wd || !wd.stats) { continue; }
-    var ids = Object.keys(wd.stats);
-    for (j = 0; j < ids.length; j++) {
-      var id = String(ids[j]);
-      if (seen[id]) { continue; }
-      var lbl = espStatName(game, id);
-      if (!lbl) { continue; }
-      seen[id] = 1;
-      out.push({ id: id, label: lbl });
+    for (w = 0; w < wins.length; w++) {
+      var wd = (items[i].windows && items[i].windows[wins[w]]) || null;
+      if (!wd || !wd.stats) { continue; }
+      var ids = Object.keys(wd.stats);
+      for (j = 0; j < ids.length; j++) {
+        var id = String(ids[j]);
+        if (seen[id]) { continue; }
+        var lbl = espStatName(game, id);
+        if (!lbl) { continue; }
+        seen[id] = 1;
+        out.push({ id: id, label: lbl });
+      }
     }
   }
+  out.sort(function (a, b) { return Number(a.id) - Number(b.id); });
+  return out;
+}
+
+// Which windows supply the SHAPE: the one on screen, plus the fullest one
+// in hand. Values always come from the window the picker names -- the shape
+// never puts a season figure in a cell labelled Today.
+//
+// ESPNGRID3 -- it used to be the window on screen ALONE whenever that
+// window had any columns of its own, which is right at 9am and wrong at
+// 7:05pm: one man with a shot on goal made the answer yes, and the table
+// collapsed to the two categories he had posted, then grew a column at a
+// time through the evening. A column has to mean the same thing at 10pm as
+// it did in the morning, so the shape is the union and it is settled before
+// the first puck drops.
+var _ER_SHAPE_ORDER = ['season', 'd30', 'd15', 'd7', 'proj', 'prev', 'today'];
+function _erShapeWins(items, winKey, game) {
+  var out = [winKey], best = null, bestN = 0, i;
+  for (i = 0; i < _ER_SHAPE_ORDER.length; i++) {
+    var k = _ER_SHAPE_ORDER[i];
+    if (k === winKey) { continue; }
+    var n = _erCols(items, k, game).length;
+    if (n > bestN) { bestN = n; best = k; }
+  }
+  if (best) { out.push(best); }
   return out;
 }
 
 // One table. Rows are the players, columns their categories, and the
 // values are the same ones the card prints -- same source, same formatter.
 function _erTable(items, winKey, game, sport, opts) {
-  var cols = _erCols(items, winKey, game);
+  // The columns are settled once for the whole roster and handed in, so a
+  // category one man carries is a column in every table of his kind. Worked
+  // out here only when nobody has settled them.
+  var cols = (opts && opts.cols) || _erCols(items, winKey, game);
   if (!cols.length || !items.length) { return ''; }
   var cats = !!(opts && opts.cats);
   var rowObj = opts && opts.row;
@@ -203167,7 +203205,14 @@ function _erTable(items, winKey, game, sport, opts) {
   // level pegging is not a lead, so a column of noughts crowns nobody.
   // Lower wins for GAA, GA and L, which are the only hockey ids where it
   // does; everywhere else more is better.
-  var LOW = (game === 'fhl') ? { '2': 1, '4': 1, '10': 1 } : {};
+  // ESPNGRID2 -- the app already knows which categories you want LOW, per
+  // sport and by name. This used to carry its own list, which said losses
+  // and goals against were lower-better in hockey where the app says GAA
+  // alone; a table that marked categories by a second opinion would have
+  // disagreed with every other surface in Skipper.
+  function low(id) {
+    return (typeof espIsLowerBetter === 'function') ? !!espIsLowerBetter(game, id) : false;
+  }
   var best = {};
   for (c = 0; c < cols.length; c++) {
     var bv = null, differs = false;
@@ -203178,7 +203223,7 @@ function _erTable(items, winKey, game, sport, opts) {
       v0 = Number(v0);
       if (bv == null) { bv = v0; continue; }
       if (v0 !== bv) { differs = true; }
-      if (LOW[cols[c].id] ? v0 < bv : v0 > bv) { bv = v0; }
+      if (low(cols[c].id) ? v0 < bv : v0 > bv) { bv = v0; }
     }
     best[cols[c].id] = (differs && items.length > 1) ? bv : null;
   }
@@ -203289,9 +203334,26 @@ function _erShortName(full) {
 // tabulate, and the caller falls back to the cards.
 function _erGroupHtml(items, winKey, game, sport, opts) {
   if (!items || !items.length) { return ''; }
-  var starters = [], bench = [], i;
+  var i;
+  // ESPNGRID2 -- the kinds are settled across the WHOLE roster, and so are
+  // their columns. Worked out per table instead, a category only one man
+  // carries existed only in his table: SHP on a bench player and nowhere
+  // else left the starters with no SHP column while the cards showed one.
+  var allSk = [], allGk = [];
   for (i = 0; i < items.length; i++) {
-    (items[i].starter ? starters : bench).push(items[i]);
+    (_erIsKeeper(items[i], game) ? allGk : allSk).push(items[i]);
+  }
+  var shapeWins = _erShapeWins(items, winKey, game);
+  var skCols = _erCols(allSk, shapeWins, game);
+  var gkCols = _erCols(allGk, shapeWins, game);
+  if (!skCols.length && !gkCols.length) { return ''; }
+
+  function tbl(list, cols) {
+    if (!list.length || !cols.length) { return ''; }
+    var o = {};
+    for (var k in opts) { if (opts.hasOwnProperty(k)) { o[k] = opts[k]; } }
+    o.cols = cols;
+    return _erTable(list, winKey, game, sport, o);
   }
   function section(list) {
     if (!list.length) { return ''; }
@@ -203299,13 +203361,16 @@ function _erGroupHtml(items, winKey, game, sport, opts) {
     for (j = 0; j < list.length; j++) {
       (_erIsKeeper(list[j], game) ? gk : sk).push(list[j]);
     }
-    var a = _erTable(sk, winKey, game, sport, opts);
-    var b = _erTable(gk, winKey, game, sport, opts);
+    var a = tbl(sk, skCols), b = tbl(gk, gkCols);
     if (!a && !b) { return ''; }
     var h = '';
     if (a) { h += (b ? '<div class="rg-sect">Skaters</div>' : '') + a; }
     if (b) { h += '<div class="rg-sect">Goaltenders</div>' + b; }
     return h;
+  }
+  var starters = [], bench = [];
+  for (i = 0; i < items.length; i++) {
+    (items[i].starter ? starters : bench).push(items[i]);
   }
   var top = section(starters), bot = section(bench);
   if (!top && !bot) { return ''; }
@@ -203397,8 +203462,24 @@ function _espRosterRowsHtml(row, myTeam) {
     } catch (_eEr) { _erHtml = ''; }
   }
   if (_erHtml) {
+    // Has anyone put anything up in the window on screen? If not the table
+    // is a shape waiting on the night, and the footer says so rather than
+    // letting a page of em-dashes look like a fault.
+    var _erAny = false;
+    for (var _ea = 0; _ea < items.length && !_erAny; _ea++) {
+      var _ew = (items[_ea].windows && items[_ea].windows[winKey]) || null;
+      if (!_ew) { continue; }
+      if (_ew.total != null && Number(_ew.total) !== 0) { _erAny = true; break; }
+      if (!_ew.stats) { continue; }
+      var _ek = Object.keys(_ew.stats);
+      for (var _eb = 0; _eb < _ek.length; _eb++) {
+        var _ev = _ew.stats[_ek[_eb]];
+        if (_ev != null && _ev !== '' && Number(_ev) !== 0) { _erAny = true; break; }
+      }
+    }
     html += _erHtml +
       '<div class="rg-foot">' + slEsc(win ? win.label : '') +
+      (_erAny ? '' : ' \u00b7 nothing played yet') +
       ' \u00b7 gold is best on this roster</div>';
   }
 
