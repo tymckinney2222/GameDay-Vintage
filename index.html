@@ -9222,6 +9222,7 @@
   .mu-done { background: rgba(255,255,255,0.22); }
   .mu-live { background: #e8243c; box-shadow: 0 0 8px rgba(232,36,60,0.6); }
   .mu-todo { background: #2fe3ff; box-shadow: 0 0 8px rgba(47,227,255,0.4); }
+  .mu-unk { background: repeating-linear-gradient(45deg, #6b5a2a 0 3px, #3a3320 3px 6px); }
   .mu-note { margin: 9px 14px 0; font-size: 12.5px; line-height: 1.5; color: rgba(255,255,255,0.62); }
   .mu-note b { color: #fff; }
   /* Neither block has a background, so the usual inter-card gutter reads as
@@ -127742,13 +127743,20 @@ function _skWireNflSchedule() {
         typeof skState !== 'undefined' && skState.mode === 'wire') {
       try { skRenderWireCards(); } catch (e2) {}
     }
+    // MUTAB -- the Matchup card is waiting on this too.
+    if (typeof _muFillCard === 'function') {
+      try { _muFillCard(); } catch (e3) {}
+    }
   });
   return c.data;
 }
 
 // Fold a normalized game list into per-club states for the week.
 function _skWireNflBuildStates(list, win) {
-  var out = { byTeam: {}, lastFinal: '', nextKick: null, anyLive: false, anyPre: false, games: 0 };
+  // gameOf: club -> a key for the game it is in, so callers can count
+  // GAMES rather than clubs. Two starters in one game is one game left.
+  var out = { byTeam: {}, gameOf: {}, lastFinal: '', nextKick: null,
+    anyLive: false, anyPre: false, games: 0 };
   if (!list || !list.length) return out;
   function ds(x) {
     return x.getFullYear() + '-' +
@@ -127777,11 +127785,14 @@ function _skWireNflBuildStates(list, win) {
       if (!ab) continue;
       ab = String(ab).toUpperCase();
       out.byTeam[ab] = state;
+      var gkey = String(g.id || (gds + '|' +
+        ((g.away && g.away.abbr) || '?') + '@' + ((g.home && g.home.abbr) || '?')));
+      out.gameOf[ab] = gkey;
       // Fantasy and site abbreviations are both ESPN's but come from
       // different APIs and don't always agree, so both spellings go in.
       if (typeof _skNormalizeTeamAbbr === 'function') {
         var nb = String(_skNormalizeTeamAbbr(ab) || '').toUpperCase();
-        if (nb && nb !== ab) out.byTeam[nb] = state;
+        if (nb && nb !== ab) { out.byTeam[nb] = state; out.gameOf[nb] = gkey; }
       }
     }
   }
@@ -164324,58 +164335,53 @@ var skStandingsState = null;
 // ==================================================================
 // MUTAB -- WHO IS LEFT TO PLAY.
 //
-// The starter objects on the Matchup tab carry no game state -- only
-// playerKey, name, teamAbbr, slot, fp and stats -- so this derives it
-// from the NFL slate by abbreviation, the same way the cross-league
-// matchup cards do, fyNormalizeAbbr included for the spellings Yahoo and
-// ESPN disagree on.
-function _muTeamGames() {
-  var map = {};
-  try {
-    if (typeof allGames !== 'object' || !allGames) { return map; }
-    var list = allGames.NFL || [];
-    for (var i = 0; i < list.length; i++) {
-      var g = list[i];
-      if (!g || !g.away || !g.home) { continue; }
-      var a = String(g.away.abbr || '').toUpperCase();
-      var h = String(g.home.abbr || '').toUpperCase();
-      if (a) { map[a] = g; }
-      if (h) { map[h] = g; }
-      if (typeof fyNormalizeAbbr === 'function') {
-        if (a) { map[fyNormalizeAbbr(a)] = g; }
-        if (h) { map[fyNormalizeAbbr(h)] = g; }
-      }
+// The starter objects carry no game state -- only playerKey, name,
+// teamAbbr, slot, fp and stats -- so it has to come from the schedule.
+//
+// It comes from the SAME place the Who's Left sheet gets it:
+// _skWireNflGameStates, which covers the whole football week, rather than
+// from allGames, which holds only the day the scoreboard is showing. That
+// distinction is the whole bug: six 49ers waiting on Monday night had no
+// entry in allGames, which is indistinguishable from a bye, and a bye
+// counts as finished. They were reported as done.
+//
+// _skWireNflSideState does the bucketing, including the UNRESOLVED bucket
+// that exists so a club the feed cannot place is never counted as played.
+function _muSide(players, gs) {
+  var st = _skWireNflSideState(players || [], gs);
+  // Zip the buckets back onto the real player objects: sideState pushes one
+  // entry per non-null starter, in order, and these arrays have no gaps. If
+  // that ever stops holding, the pace sentence is dropped rather than
+  // attached to the wrong players.
+  st.todoPlayers = [];
+  st.restPlayers = [];
+  if (st.players.length === (players || []).length) {
+    for (var i = 0; i < players.length; i++) {
+      var b = st.players[i].bucket;
+      if (b === 'left') { st.todoPlayers.push(players[i]); st.restPlayers.push(players[i]); }
+      else if (b === 'live') { st.restPlayers.push(players[i]); }
     }
-  } catch (e) {}
-  return map;
-}
-
-// done / live / still to play. A player on a bye has no game at all and
-// counts as neither -- he is not coming, so he is not "to play".
-function _muSplit(players, map) {
-  var out = { done: 0, live: 0, todo: 0, todoPlayers: [], restPlayers: [] };
-  for (var i = 0; i < (players || []).length; i++) {
-    var p = players[i];
-    if (!p) { continue; }
-    var g = map[String(p.teamAbbr || '').toUpperCase()];
-    if (!g) { out.done++; continue; }
-    if (g.state === 'in') { out.live++; out.restPlayers.push(p); }
-    else if (g.state === 'pre') { out.todo++; out.todoPlayers.push(p); out.restPlayers.push(p); }
-    else { out.done++; }
   }
-  return out;
+  return st;
 }
 
-// Distinct games, not players: four starters in one game is one game left.
-function _muGamesLeft(players, map) {
+// Distinct GAMES still to come, not players: six starters in one Monday
+// night game is one game left.
+function _muGamesLeft(players, gs) {
+  if (!gs || !gs.gameOf) { return 0; }
   var seen = {}, n = 0;
   for (var i = 0; i < (players || []).length; i++) {
     var p = players[i];
     if (!p) { continue; }
-    var g = map[String(p.teamAbbr || '').toUpperCase()];
-    if (!g || g.state === 'post') { continue; }
-    var k = String(g.id || ((g.away && g.away.abbr) + '@' + (g.home && g.home.abbr)));
-    if (seen[k]) { continue; }
+    var ab = String(p.teamAbbr || '').toUpperCase();
+    var lk = ab;
+    if (lk && typeof _skEspnNflAbbr === 'function') {
+      lk = String(_skEspnNflAbbr(lk) || lk).toUpperCase();
+    }
+    var stt = gs.byTeam[lk] || gs.byTeam[ab];
+    if (!stt || stt === 'post') { continue; }
+    var k = gs.gameOf[lk] || gs.gameOf[ab];
+    if (!k || seen[k]) { continue; }
     seen[k] = 1; n++;
   }
   return n;
@@ -164403,20 +164409,27 @@ function _muSyncDense() {
 }
 
 function _muBar(sp) {
-  var tot = sp.done + sp.live + sp.todo;
+  // A bye is finished -- nothing more is coming -- so it sits with done.
+  // Unresolved is NOT: it gets its own segment, because "we could not place
+  // this club" must not look like "this club has played".
+  var done = sp.done + sp.bye;
+  var tot = done + sp.live + sp.left + sp.unknown;
   if (!tot) { return '<div class="mu-track"></div>'; }
   var w = (100 / tot), h = '', i;
-  for (i = 0; i < sp.done; i++) { h += '<i class="mu-done" style="width:' + w + '%"></i>'; }
+  for (i = 0; i < done; i++) { h += '<i class="mu-done" style="width:' + w + '%"></i>'; }
   for (i = 0; i < sp.live; i++) { h += '<i class="mu-live" style="width:' + w + '%"></i>'; }
-  for (i = 0; i < sp.todo; i++) { h += '<i class="mu-todo" style="width:' + w + '%"></i>'; }
+  for (i = 0; i < sp.left; i++) { h += '<i class="mu-todo" style="width:' + w + '%"></i>'; }
+  for (i = 0; i < sp.unknown; i++) { h += '<i class="mu-unk" style="width:' + w + '%"></i>'; }
   return '<div class="mu-track">' + h + '</div>';
 }
 
 function _muSideHTML(label, sp) {
   var bits = [];
-  if (sp.done) { bits.push(sp.done + ' done'); }
+  var done = sp.done + sp.bye;
+  if (done) { bits.push(done + ' done'); }
   if (sp.live) { bits.push(sp.live + ' live'); }
-  bits.push(sp.todo + ' to play');
+  bits.push(sp.left + ' to play');
+  if (sp.unknown) { bits.push(sp.unknown + ' unresolved'); }
   return '<div class="mu-side"><div class="mu-slab"><b>' + label + '</b><span>' +
     bits.join(' \u00b7 ') + '</span></div>' + _muBar(sp) + '</div>';
 }
@@ -164431,6 +164444,95 @@ function _muPace(players, week) {
     if (typeof f === 'number' && !isNaN(f)) { sum += (f / wks); n++; }
   }
   return n ? sum : null;
+}
+
+// MUTAB -- what the card could not know when it was built.
+//
+// Called when the lineups land, when the football week lands, and when the
+// week is stepped. Everything it writes is derived from state it checks
+// first: a slot record belongs to this card only if the pairs it came from
+// belong to THIS league.
+var _muCardCtx = null;
+
+function _muFillCard() {
+  var ctx = _muCardCtx;
+  var gapEl = document.getElementById('muGapSlots');
+  var leftEl = document.getElementById('muLeft');
+  var wkEl = document.getElementById('muGamesLeft');
+  if (!ctx || !leftEl) { return; }
+
+  var st = (typeof _skNflH2hState !== 'undefined') ? _skNflH2hState : null;
+  // The guard that matters: these pairs must be this league's.
+  if (!st || !st.pairs || !st.pairs.length ||
+      String(st.leagueKey || '') !== String(skState.activeLeagueKey || '')) {
+    return;
+  }
+  var pairs = st.pairs;
+
+  var wins = 0, i;
+  var mineP = [], oppP = [];
+  for (i = 0; i < pairs.length; i++) {
+    var mf = pairs[i].mine ? pairs[i].mine.fp : null;
+    var of = pairs[i].opp ? pairs[i].opp.fp : null;
+    if (mf != null && of != null && mf > of) { wins++; }
+    if (pairs[i].mine) { mineP.push(pairs[i].mine); }
+    if (pairs[i].opp) { oppP.push(pairs[i].opp); }
+  }
+  if (gapEl && !ctx.useProj) {
+    gapEl.innerHTML = ' &nbsp;&middot;&nbsp; WINNING ' + wins + ' OF ' + pairs.length + ' SLOTS';
+  }
+
+  var gs = null;
+  try { gs = _skWireNflGameStates(); } catch (eG) { gs = null; }
+  if (!gs) {
+    // No zeros. "Nobody left to play" when the schedule simply has not
+    // arrived is the worst thing this card can say.
+    var sched = (typeof _skWireNflSched !== 'undefined') ? _skWireNflSched : null;
+    var why = (sched && sched.err)
+      ? 'This week\u2019s schedule didn\u2019t load, so who\u2019s left can\u2019t be worked out.'
+      : 'Working out who\u2019s left to play\u2026';
+    leftEl.innerHTML = '<div class="mu-sect"><span>WHO IS LEFT TO PLAY</span></div>' +
+      '<div class="mu-note">' + why + '</div>';
+    if (wkEl) { wkEl.innerHTML = ''; }
+    return;
+  }
+
+  var ms = _muSide(mineP, gs), os = _muSide(oppP, gs);
+  if (wkEl) {
+    var gl = _muGamesLeft(mineP.concat(oppP), gs);
+    wkEl.innerHTML = gl
+      ? ('&nbsp;&middot; ' + gl + ' GAME' + (gl === 1 ? '' : 'S') + ' LEFT')
+      : '';
+  }
+
+  var html = '<div class="mu-sect"><span>WHO IS LEFT TO PLAY</span></div>' +
+    _muSideHTML('YOU', ms) + _muSideHTML('THEM', os);
+  // "Still running" is live plus yet-to-start: from the trailing side's
+  // point of view a player at kickoff and a player mid-third-quarter are
+  // the same thing -- points that have not happened yet.
+  var chasing = ctx.ahead ? os : ms;
+  var rest = chasing.restPlayers.length;
+  var need = Math.abs(ctx.diff).toFixed(1);
+  var who = ctx.ahead ? 'They need' : 'You need';
+  // The season average is quoted only for players who have NOT started. A
+  // player in the third quarter has already banked most of his week.
+  var pace = _muPace(chasing.todoPlayers, ctx.week);
+  var paceTxt = (chasing.left > 0 && pace != null)
+    ? (' The <b>' + chasing.left + '</b> yet to start ' +
+       (chasing.left === 1 ? 'has' : 'have') + ' averaged <b>' +
+       pace.toFixed(1) + '</b> a week this season.')
+    : '';
+  if (rest > 0) {
+    html += '<div class="mu-note">' + who + ' <b>' + need + '</b> from <b>' +
+      rest + '</b> player' + (rest === 1 ? '' : 's') + ' still running.' + paceTxt + '</div>';
+  } else if (chasing.unknown > 0) {
+    html += '<div class="mu-note">Nobody left to play, but <b>' + chasing.unknown +
+      '</b> club' + (chasing.unknown === 1 ? '' : 's') + ' couldn\u2019t be placed ' +
+      'in this week\u2019s schedule.</div>';
+  } else {
+    html += '<div class="mu-note">Nobody left to play.</div>';
+  }
+  leftEl.innerHTML = html;
 }
 
 function _skBuildNflMatchupHTML(league, matchup, team, allTeams) {
@@ -164472,58 +164574,12 @@ function _skBuildNflMatchupHTML(league, matchup, team, allTeams) {
   var _useProj = (!live && _projDiff != null);
   var _diff = _useProj ? _projDiff : (_mine - _theirs);
   var _ahead = _diff >= 0;
-  var _st = (typeof _skNflH2hState !== 'undefined' && _skNflH2hState) ? _skNflH2hState : null;
-  var _pairs = (_st && _st.pairs) || [];
-  var _wins = 0, _tot = 0, _pi;
-  for (_pi = 0; _pi < _pairs.length; _pi++) {
-    var _mf = _pairs[_pi].mine ? _pairs[_pi].mine.fp : null;
-    var _of = _pairs[_pi].opp ? _pairs[_pi].opp.fp : null;
-    _tot++;
-    if (_mf != null && _of != null && _mf > _of) { _wins++; }
-  }
-  // The slot record is only worth printing once slots have been decided;
-  // "winning 0 of 22" on a Thursday says nothing.
-  var _slotTxt = _useProj
-    ? ' &nbsp;&middot;&nbsp; PROJECTED'
-    : (_tot ? (' &nbsp;&middot;&nbsp; WINNING ' + _wins + ' OF ' + _tot + ' SLOTS') : '');
-
-  var _map = _muTeamGames();
-  var _mineP = [], _oppP = [];
-  for (_pi = 0; _pi < _pairs.length; _pi++) {
-    if (_pairs[_pi].mine) { _mineP.push(_pairs[_pi].mine); }
-    if (_pairs[_pi].opp) { _oppP.push(_pairs[_pi].opp); }
-  }
-  var _ms = _muSplit(_mineP, _map), _os = _muSplit(_oppP, _map);
-  var _gleft = _muGamesLeft(_mineP.concat(_oppP), _map);
-  var _leftHtml = '';
-  if (_mineP.length || _oppP.length) {
-    _leftHtml = '<div class="mu-sect"><span>WHO IS LEFT TO PLAY</span></div>' +
-      _muSideHTML('YOU', _ms) + _muSideHTML('THEM', _os);
-    // "Still running" is live plus yet-to-start: from the trailing side's
-    // point of view a player at kickoff and a player mid-third-quarter are
-    // the same thing -- points that have not happened yet.
-    var _chasing = _ahead ? _os : _ms;
-    var _rest = _chasing.restPlayers.length;
-    var _need = Math.abs(_diff).toFixed(1);
-    var _who = _ahead ? 'They need' : 'You need';
-    // The season average is quoted only for players who have NOT started.
-    // A player in the third quarter has already banked most of his week, so
-    // including him turns the sentence into nonsense: "they need 14.9" next
-    // to "those slots average 146.4 a week".
-    var _pace = _muPace(_chasing.todoPlayers, wk);
-    var _paceTxt = (_chasing.todo > 0 && _pace != null)
-      ? (' The <b>' + _chasing.todo + '</b> yet to start ' +
-         (_chasing.todo === 1 ? 'has' : 'have') + ' averaged <b>' +
-         _pace.toFixed(1) + '</b> a week this season.')
-      : '';
-    if (_rest > 0) {
-      _leftHtml += '<div class="mu-note">' + _who + ' <b>' + _need + '</b> from <b>' +
-        _rest + '</b> player' + (_rest === 1 ? '' : 's') + ' still running.' +
-        _paceTxt + '</div>';
-    } else {
-      _leftHtml += '<div class="mu-note">Nobody left to play.</div>';
-    }
-  }
+  // Everything below the score depends on the lineup pairs and on the
+  // football week, neither of which exists yet when this runs. It is left
+  // empty and filled by _muFillCard; reading the stale _skNflH2hState here
+  // is what printed another league's slot record on this card.
+  _muCardCtx = { diff: _diff, ahead: _ahead, useProj: _useProj, week: wk };
+  var _slotTxt = _useProj ? ' &nbsp;&middot;&nbsp; PROJECTED' : '';
 
   function _muTeamRow(nm, meta, proj, val, cls, logo) {
     var _img = logo
@@ -164544,8 +164600,7 @@ function _skBuildNflMatchupHTML(league, matchup, team, allTeams) {
     '<div class="sk-detail-matchup mu-card">' +
     '<div class="mu-head">' +
       '<div class="mu-wk">' + (live ? '<i></i>' : '') + 'WEEK ' + wk +
-        (_gleft ? ('&nbsp;&middot; ' + _gleft + ' GAME' + (_gleft === 1 ? '' : 'S') + ' LEFT') : '') +
-        '</div>' +
+        '<span id="muGamesLeft"></span></div>' +
       _muTeamRow(((team && team.name) || 'My Team'), _myMeta,
         (_useProj ? null : (hasProj ? myProj : null)),
         (_useProj ? myProj.toFixed(1) : _mine.toFixed(1)),
@@ -164556,8 +164611,9 @@ function _skBuildNflMatchupHTML(league, matchup, team, allTeams) {
         (_ahead ? 'lose' : 'win'), oppLogo) +
     '</div>' +
     '<div class="mu-gap' + (_ahead ? '' : ' behind') + '">' +
-      (_ahead ? '+' : '\u2212') + Math.abs(_diff).toFixed(1) + _slotTxt + '</div>' +
-    _leftHtml +
+      (_ahead ? '+' : '\u2212') + Math.abs(_diff).toFixed(1) +
+      '<span id="muGapSlots">' + _slotTxt + '</span></div>' +
+    '<div id="muLeft"></div>' +
     '</div>';
 }
 
@@ -165198,11 +165254,15 @@ function _skBuildNflH2hHTML(pairs, week, statsMeta) {
   //
   // The toggle shows everything at once as a sheet, for a Sunday with four
   // leagues to check. Same rows, same tap, different question.
-  var _map = _muTeamGames();
+  var _gs = null;
+  try { _gs = _skWireNflGameStates(); } catch (eS) { _gs = null; }
   function _muLive(pl) {
-    if (!pl) { return false; }
-    var g = _map[String(pl.teamAbbr || '').toUpperCase()];
-    return !!(g && g.state === 'in');
+    if (!pl || !_gs) { return false; }
+    var ab = String(pl.teamAbbr || '').toUpperCase(), lk = ab;
+    if (lk && typeof _skEspnNflAbbr === 'function') {
+      lk = String(_skEspnNflAbbr(lk) || lk).toUpperCase();
+    }
+    return (_gs.byTeam[lk] || _gs.byTeam[ab]) === 'in';
   }
   function _muLine(pl) {
     if (!pl) { return ''; }
@@ -165255,7 +165315,7 @@ function _skBuildNflH2hHTML(pairs, week, statsMeta) {
       if (p.mine) { _all.push(p.mine); }
       if (p.opp) { _all.push(p.opp); }
     });
-    var _gl = _muGamesLeft(_all, _map);
+    var _gl = _muGamesLeft(_all, _gs);
     return '<div class="mu-stick">' +
         '<div class="mu-s"><em>' + _me.toFixed(1) + '</em> <i>vs</i> ' + _them.toFixed(1) +
           ' <i>&nbsp;' + (_gap >= 0 ? '+' : '\u2212') + Math.abs(_gap).toFixed(1) + '</i></div>' +
@@ -165327,6 +165387,13 @@ function _skHydrateNflH2h(league, week, leagueKeyAtStart) {
   var el = document.getElementById('skNflH2h');
   if (!el) return;
   _muSyncDense();
+  // Drop the previous league's pairs before anything can read them. They
+  // outlived their league and ended up on this card's banner.
+  _skNflH2hState = { pairs: [], statsMeta: {}, myName: '', oppName: '',
+    week: week, leagueKey: league.league_key, currentWeek: league.current_week,
+    myTeamKey: '', oppTeamKey: '', startWeek: league.start_week || 1,
+    endWeek: league.end_week || league.current_week };
+  _muFillCard();
   var leagueData = skLeagueData[league.league_key] || {};
   var myKey = leagueData.team && leagueData.team.team_key;
   var matchup = leagueData.matchup;
@@ -165372,6 +165439,7 @@ function _skHydrateNflH2h(league, week, leagueKeyAtStart) {
     };
     var el2 = document.getElementById('skNflH2h');
     if (el2) el2.innerHTML = _skBuildNflH2hHTML(pairs, week, _skNflH2hState.statsMeta);
+    try { _muFillCard(); } catch (eF) {}
   }).catch(function(err) {
     var el2 = document.getElementById('skNflH2h');
     if (el2) el2.innerHTML = '<div class="sk-h2h-head"><span class="sk-h2h-eyebrow">Head to Head</span></div>' +
