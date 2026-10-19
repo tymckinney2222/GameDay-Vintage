@@ -35143,7 +35143,19 @@ function _bcLeagueIndex() {
     var l = L[i];
     if (!l) { continue; }
     var k = l.league_key || l.key || l.id;
-    if (k) { idx[String(k)] = l; }
+    if (!k) { continue; }
+    // SKDONE -- a league marked "Done for the season" leaves Skipper's
+    // day-to-day views, and must leave this board too. This indexed the
+    // ALL lists, which exist precisely to IGNORE that flag (Manager
+    // Record reads them so history is never lost), so finished baseball
+    // leagues kept turning up here. The sport lookup still needs the All
+    // lists, so the flag is applied here rather than by swapping to the
+    // visible accessors -- those also impose Skipper's own sport and
+    // platform filters, which this board must not inherit.
+    try {
+      if (typeof _skIsDone === 'function' && _skIsDone(k)) { continue; }
+    } catch (eD) {}
+    idx[String(k)] = l;
   }
   return idx;
 }
@@ -192205,7 +192217,54 @@ function _pePick(gameId, teamId, game, now) {
   // offered the chance to avoid.
   if (!store.start || row.d < store.start) store.start = row.d;
   _peSave(store);
+  // PEMODEL -- the pick is already saved, so this is fire-and-forget: the
+  // model's pregame number is a bonus on top of a pick that stands with or
+  // without it.
+  try { _peFetchModel(game, gameId); } catch (ePm) {}
   return { ok: true };
+}
+
+// ESPN's own pregame percentage, banked onto the pick row. It lives on the
+// per-game summary, which the slate fetch does not carry, so this is the
+// one request a pick costs.
+function _peFetchModel(game, gameId) {
+  if (!game || !game.league) { return; }
+  var cfg = (typeof LEAGUES !== 'undefined') ? LEAGUES[game.league] : null;
+  if (!cfg || !cfg.sport || !cfg.slug) { return; }
+  fetch('https://site.api.espn.com/apis/site/v2/sports/' + cfg.sport + '/' +
+    cfg.slug + '/summary?event=' + encodeURIComponent(gameId))
+    .then(function (r) {
+      if (!r.ok) { throw new Error('HTTP ' + r.status); }
+      return r.json();
+    })
+    .then(function (d) {
+      var v = (typeof _pgRead === 'function') ? _pgRead(d) : null;
+      if (!v || !v.model) { return; }
+      var st = _peLoad();
+      var row = _peGet(st, gameId);
+      if (!row || !row.pid) { return; }
+      if (_peStampModel(row, v.model)) {
+        st.picks[String(gameId)] = row;
+        _peSave(st);
+        try { _peRender(); } catch (eR) {}
+      }
+    })['catch'](function () {});
+}
+
+// Match on TEAM ID both ways round, and bank nothing at all if the ids do
+// not line up -- a projection pinned to the wrong side is worse than none.
+function _peStampModel(row, m) {
+  if (!row || !m) { return false; }
+  var hid = String(row.hid || ''), aid = String(row.aid || '');
+  var homePct = (String(m.homeId) === hid) ? m.homePct
+    : ((String(m.awayId) === hid) ? m.awayPct : null);
+  var awayPct = (String(m.awayId) === aid) ? m.awayPct
+    : ((String(m.homeId) === aid) ? m.homePct : null);
+  if (homePct == null || awayPct == null) { return false; }
+  var onHome = (String(row.pid) === hid);
+  row.mp = Math.round((onHome ? homePct : awayPct) * 10) / 10;
+  row.mo = Math.round((onHome ? awayPct : homePct) * 10) / 10;
+  return true;
 }
 
 // The market, onto a pick row. One function because two places write rows --
@@ -192377,7 +192436,10 @@ function _peRunGrading() {
 function _peBlankTally() {
   return { w: 0, l: 0, m: 0, n: 0, open: 0,
     fw: 0, fl: 0, mw: 0, ml: 0, mm: 0, cw: 0, cl: 0, dw: 0, dl: 0, fx: 0, fn: 0,
-    pw: 0, pl: 0, ex: 0, best: null };
+    pw: 0, pl: 0, ex: 0, best: null,
+    // PEMODEL -- agreed with the model, disagreed, and who was right when
+    // you did disagree.
+    gAgree: 0, gDis: 0, gMe: 0, gThem: 0 };
 }
 
 // ---------------------------------------------------------------
@@ -192434,6 +192496,17 @@ function _peTally(store) {
     // HOW HARD THE PICKS WERE. Only picks that were actually made and that
     // carried a price, because the question is whether a call beat its own
     // number -- see the note on _peEdge.
+    // PEMODEL -- only graded picks that banked a projection. A game
+    // picked before the number was fetched, or one ESPN had no model for,
+    // simply does not take part.
+    if ((row.res === 'W' || row.res === 'L') && row.pid &&
+        row.mp != null && row.mo != null) {
+      if (row.mp > row.mo) { all.gAgree++; t.gAgree++; }
+      else if (row.mp < row.mo) {
+        all.gDis++; t.gDis++;
+        if (row.res === 'W') { all.gMe++; t.gMe++; } else { all.gThem++; t.gThem++; }
+      }
+    }
     if ((row.res === 'W' || row.res === 'L') && row.pid) {
       var pp = _pePickP(row);
       if (pp != null) {
@@ -192936,6 +193009,7 @@ function _peRender() {
   // looking for it.
   h += _pePgProbeBtn();
   h += _peVsMarketHtml(tally.all, true);
+  h += _peVsModelHtml(tally.all);
 
   if (_peErr) {
     h += '<div class="pe-note err">' + slEsc(_peErr) + '</div>';
@@ -193240,6 +193314,21 @@ function _peRecordStrip(tally, store) {
 // a line and have been graded count for either side, and your misses are in
 // your column on those games, because a game you did not pick is one the
 // chalk got and you did not.
+// PEMODEL -- the sibling of VS THE LINE, scored against ESPN's model
+// rather than the chalk, and only on the games where the two of you
+// actually wanted different sides. Agreement proves nothing either way.
+function _peVsModelHtml(a) {
+  if (!a || !a.gDis) { return ''; }
+  var lead = a.gMe - a.gThem;
+  return '<div class="pe-vs">' +
+    '<span class="pe-vs-k">VS ESPN</span>' +
+    'you <b>' + a.gMe + '</b>, the model <b>' + a.gThem + '</b> on the ' +
+    a.gDis + ' game' + (a.gDis === 1 ? '' : 's') + ' you disagreed' +
+    '<span class="pe-vs-d ' + (lead > 0 ? 'up' : (lead < 0 ? 'dn' : '')) + '">' +
+    (lead > 0 ? '+' : '') + lead + '</span>' +
+    '</div>';
+}
+
 function _peVsMarketHtml(a, compact) {
   var n = a.fw + a.fl;
   if (!n) return '';
