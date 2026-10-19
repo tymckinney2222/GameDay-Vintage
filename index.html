@@ -132494,6 +132494,13 @@ function _skScoutFetch(ctx) {
 
   var c = _skScoutCache[leagueKey];
   if (c && c.opp === oppKey && (Date.now() - c.ts) < 10 * 60 * 1000) {
+    // A report cached before its settings arrived would otherwise keep
+    // rendering "no stats to read yet" for the rest of the window.
+    var haveSet = !!(typeof leagueSettingsCache === 'object' && leagueSettingsCache[leagueKey]);
+    if (!haveSet && !c.settings && typeof ensureLeagueSettings === 'function') {
+      return ensureLeagueSettings(leagueKey)['catch'](function () { return null; })
+        .then(function (sx) { if (sx) { c.settings = sx; } return c; });
+    }
     return Promise.resolve(c);
   }
   if (_skScoutInflight[leagueKey]) { return _skScoutInflight[leagueKey]; }
@@ -132506,6 +132513,17 @@ function _skScoutFetch(ctx) {
   for (var w = first; w < cw; w++) weeks.push(w);
   var statsType = fb ? (';type=week;week=' + Math.max(1, cw - 1)) : ';type=lastweek';
   var st = (typeof _skWireScoringType === 'function') ? _skWireScoringType(league) : league.scoring_type;
+
+  // SCOUTBOOK -- the scoring settings, without which two whole sections
+  // have nothing to say. Cached per league, so this is free for any
+  // league already visited and one small call for the rest. It must not
+  // be able to fail the report: a scouting page with no category table
+  // still beats no scouting page.
+  var pSet = (typeof leagueSettingsCache === 'object' && leagueSettingsCache[leagueKey])
+    ? Promise.resolve(leagueSettingsCache[leagueKey])
+    : ((typeof ensureLeagueSettings === 'function')
+        ? ensureLeagueSettings(leagueKey)['catch'](function () { return null; })
+        : Promise.resolve(null));
 
   var pTeams = fyApi('/league/' + leagueKey + '/teams/stats;type=season')
     .then(_skScoutTeams, function () { return {}; });
@@ -132559,10 +132577,10 @@ function _skScoutFetch(ctx) {
   var pTx = fyApi('/league/' + leagueKey + '/transactions;types=add,drop,trade;count=100')
     .then(function (res) { return _skScoutTx(res, oppKey); }, function () { return null; });
 
-  var p = Promise.all([pTeams, pForm, pHot, pMine, pToday, pTx, pMyForm]).then(function (r) {
+  var p = Promise.all([pTeams, pForm, pHot, pMine, pToday, pTx, pMyForm, pSet]).then(function (r) {
     var data = { ts: Date.now(), opp: oppKey, me: myKey, st: st, sport: sport, fb: fb,
                  teams: r[0] || {}, form: r[1] || [], hot: r[2] || {}, mine: r[3] || {}, today: r[4], tx: r[5],
-                 myForm: r[6] || [] };
+                 myForm: r[6] || [], settings: r[7] || null };
     data.h2h = _skScoutH2H(leagueKey, oppKey, [ctx.mu.oppName, data.teams[oppKey] && data.teams[oppKey].name]);   // SKSCOUT6
     _skScoutCache[leagueKey] = data;
     delete _skScoutInflight[leagueKey];
@@ -132602,7 +132620,10 @@ function skOpenScouting(leagueKey) {
 
 function _skScoutHtml(league, d, subId) {
   var key = league.league_key;
-  var set = (typeof leagueSettingsCache === 'object' && leagueSettingsCache) ? leagueSettingsCache[key] : null;
+  // The settings fetched for THIS report are the fallback, so a purge of
+  // the global cache cannot empty a page that already has what it needs.
+  var set = ((typeof leagueSettingsCache === 'object' && leagueSettingsCache)
+    ? leagueSettingsCache[key] : null) || (d && d.settings) || null;
   var meta = (set && set.stats) || {};
   var isPts = (d.st === 'headpoint') || d.fb;
   var ld = (typeof skLeagueData === 'object' && skLeagueData) ? skLeagueData[key] : null;
