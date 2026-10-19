@@ -29580,6 +29580,21 @@
     color: var(--skrt, var(--sk-gold));
   }
   /* table.rg td is (0,1,2); a bare td.x is (0,1,1) and loses to it. */
+  /* The FP column pins next to the name -- 132px is the name column's
+     own fixed width, so the two travel together as one block. */
+  table.rg th.rg-fp, table.rg td.rg-fp {
+    position: sticky; left: 132px; z-index: 2;
+    background: var(--sk-bg-elev);
+    border-right: 1px solid rgba(255,255,255,0.18);
+    min-width: 52px;
+  }
+  table.rg tr:nth-child(even) td.rg-fp { background: #141a2a; }
+  table.rg th.rg-fp { background: #161c2c; color: var(--sk-gold); }
+  table.rg td.rg-fp {
+    color: var(--sk-text); font-weight: 800; font-size: 12.5px;
+  }
+  table.rg td.rg-fp.rg-best { color: var(--sk-gold); }
+  table.rg td.rg-fp.rg-fpz { color: var(--sk-text-4); font-weight: 600; }
   table.rg td.rg-z { color: var(--sk-text-4); }
   table.rg td.rg-best { color: var(--sk-gold); font-weight: 800; }
   table.rg td.rg-neg { color: var(--sk-red); }
@@ -168232,6 +168247,9 @@ function _skSeasonCatOrder(settings, statsMeta) {
 // fallback is still needed.
 function _skUpdateYahooSeasonStatsInPlace(players, byKey, statsMeta, order) {
   if (!players || !byKey || !statsMeta) return 0;
+  // ROSTERGRID3 -- same bail, same reason: in table mode the season
+  // figures belong in cells, not in a sub-line that is not on screen.
+  if (typeof _rgRepaint === 'function' && _rgRepaint()) { return players.length; }
   if (typeof _skBuildCatStatLine !== 'function') return 0;
   // ROSTERRATES -- rates are always wanted here; the order is only
   // added when the league gave us one.
@@ -169554,6 +169572,9 @@ function _skBuildPtsDayTotalsHTML(settings, playerStats, dateStr, leaderboardDat
 function skUpdateRosterLinesInPlace(players, targetDate) {
   var rosterEl = document.getElementById('skDetailRoster');
   if (!rosterEl) return;
+  // ROSTERGRID3 -- a table has no .sk-roster-row elements, so without this
+  // the bail below threw away every update that arrived after first paint.
+  if (typeof _rgRepaint === 'function' && _rgRepaint()) { return; }
   var rows = rosterEl.querySelectorAll('.sk-roster-row');
   if (!rows.length) return;
   // NFL rows get their line from the weekly stats map + league stat
@@ -169783,23 +169804,46 @@ function _rgFmt(v, m) {
 // One table. Rows are the players, columns their categories, and the best
 // value in each column is marked -- a comparison the stat line could never
 // make, and the reason to have a grid at all.
-function _rgTable(rows, byKey, meta, ord, sport) {
+function _rgTable(rows, byKey, meta, ord, sport, opts) {
   var cols = _rgCols(rows, byKey, meta, ord);
   if (!cols.length || !rows.length) { return ''; }
   var best = {}, c, r;
   for (c = 0; c < cols.length; c++) {
     var low = (cols[c].meta.sortOrder === 0);   // GAA, ERA: lower is better
-    var bv = null;
+    var bv = null, differs = false;
     for (r = 0; r < rows.length; r++) {
       var rec0 = rows[r].playerKey ? byKey[rows[r].playerKey] : null;
       var v0 = rec0 && rec0.stats ? rec0.stats[cols[c].sid] : null;
       if (v0 == null || isNaN(v0)) { continue; }
       v0 = Number(v0);
-      if (bv == null || (low ? v0 < bv : v0 > bv)) { bv = v0; }
+      if (bv == null) { bv = v0; continue; }
+      if (v0 !== bv) { differs = true; }
+      if (low ? v0 < bv : v0 > bv) { bv = v0; }
     }
-    best[cols[c].sid] = bv;
+    // A TIE IS NOT A LEAD. Every man level -- a column of zeroes, most
+    // often -- means nobody is ahead, so nobody is marked.
+    best[cols[c].sid] = differs ? bv : null;
   }
+  // ROSTERGRID3 -- the fantasy total, where the league has one. Its own
+  // leader is worked out the same way the categories' are, and on the same
+  // terms: level pegging is not a lead.
+  var wantFp = !!(opts && opts.fp), fpBest = null;
+  if (wantFp) {
+    var fpDiffers = false;
+    for (r = 0; r < rows.length; r++) {
+      var fr = rows[r].playerKey ? byKey[rows[r].playerKey] : null;
+      var fv = fr ? fr.fp : null;
+      if (fv == null || fv === '' || isNaN(fv)) { continue; }
+      fv = Number(fv);
+      if (fpBest == null) { fpBest = fv; continue; }
+      if (fv !== fpBest) { fpDiffers = true; }
+      if (fv > fpBest) { fpBest = fv; }
+    }
+    if (!fpDiffers || rows.length < 2) { fpBest = null; }
+  }
+
   var head = '<tr><th class="rg-p">Player</th>';
+  if (wantFp) { head += '<th class="rg-fp">FP</th>'; }
   for (c = 0; c < cols.length; c++) {
     head += '<th>' + skEscape(cols[c].meta.abbr || cols[c].meta.displayName ||
       cols[c].sid) + '</th>';
@@ -169828,6 +169872,16 @@ function _rgTable(rows, byKey, meta, ord, sport) {
             skEscape(p.teamAbbr || '') + '</div>' +
         '</div>' +
       '</div></td>';
+    if (wantFp) {
+      var pfp = rec ? rec.fp : null;
+      var pfn = (pfp == null || pfp === '' || isNaN(pfp)) ? null : Number(pfp);
+      var fcls = 'rg-fp';
+      if (pfn == null) { fcls += ' rg-fpz'; }
+      else if (fpBest != null && pfn === fpBest) { fcls += ' rg-best'; }
+      else if (pfn === 0) { fcls += ' rg-fpz'; }
+      body += '<td class="' + fcls + '">' +
+        (pfn == null ? '\u2014' : skEscape(pfn.toFixed(1))) + '</td>';
+    }
     for (c = 0; c < cols.length; c++) {
       var v = stats[cols[c].sid];
       var n = (v == null || v === '' || isNaN(v)) ? null : Number(v);
@@ -169846,7 +169900,7 @@ function _rgTable(rows, byKey, meta, ord, sport) {
 
 // The whole group as grids: skaters, then goalies. Returns '' when there
 // is nothing to tabulate, and the caller falls back to the cards.
-function _rgGroupHtml(players, byKey, meta, ord, sport) {
+function _rgGroupHtml(players, byKey, meta, ord, sport, opts) {
   if (!players || !players.length || !byKey || !meta) { return ''; }
   var real = [], i;
   for (i = 0; i < players.length; i++) {
@@ -169859,13 +169913,100 @@ function _rgGroupHtml(players, byKey, meta, ord, sport) {
   for (i = 0; i < real.length; i++) {
     (_rgIsKeeper(real[i], sport) ? keepers : skaters).push(real[i]);
   }
-  var a = _rgTable(skaters, byKey, meta, ord, sport);
-  var b = _rgTable(keepers, byKey, meta, ord, sport);
+  var a = _rgTable(skaters, byKey, meta, ord, sport, opts);
+  var b = _rgTable(keepers, byKey, meta, ord, sport, opts);
   if (!a && !b) { return ''; }
   var h = '';
   if (a) { h += (b ? '<div class="rg-sect">Skaters</div>' : '') + a; }
   if (b) { h += '<div class="rg-sect">Goaltenders</div>' + b; }
-  return h + '<div class="rg-foot">Season totals \u00b7 gold is best on this roster \u00b7 scroll for more</div>';
+  // The footer says which figures these actually are. In Daily mode before
+  // the day's numbers land the grid falls back to season totals rather than
+  // showing nothing -- and then it has to SAY so, or the switch is lying.
+  var what = (opts && opts.scopeLabel) || 'Season totals';
+  return h + '<div class="rg-foot">' + skEscape(what) +
+    ' \u00b7 gold is best on this roster \u00b7 scroll for more</div>';
+}
+
+// ROSTERGRID3 -- everything the grid needs for one league, worked out in
+// one place so the first paint and every repaint agree. Returns null when
+// this league has nothing to tabulate and the cards should stand.
+function _rgContext(league) {
+  if (!league) { return null; }
+  var sport = String(league.sport || 'mlb').toLowerCase();
+  if (sport !== 'nba' && sport !== 'nhl') { return null; }
+  var ld = (typeof skLeagueData !== 'undefined' && skLeagueData[league.league_key]) || {};
+  var teamKey = ld.team && ld.team.team_key;
+  if (!teamKey) { return null; }
+  var meta = null;
+  try {
+    meta = (typeof leagueSettingsCache !== 'undefined' &&
+      leagueSettingsCache[league.league_key] &&
+      leagueSettingsCache[league.league_key].stats) || null;
+  } catch (eM) { meta = null; }
+  if (!meta) { return null; }
+  var ord = null;
+  if (typeof _skSeasonCatOrder === 'function') {
+    try { ord = _skSeasonCatOrder(leagueSettingsCache[league.league_key], meta); }
+    catch (eO) { ord = null; }
+  }
+  var seasonBy = (typeof skSeasonTotalFpCache !== 'undefined' && skSeasonTotalFpCache)
+    ? (skSeasonTotalFpCache[teamKey] || null) : null;
+  var wantDay = (typeof skDetailFpMode !== 'undefined' && skDetailFpMode !== 'season');
+  var dayBy = (typeof skCurrentFpMap !== 'undefined') ? skCurrentFpMap : null;
+  var byKey = null, label = 'Season totals';
+  if (wantDay && dayBy) {
+    byKey = dayBy; label = 'Today';
+  } else if (wantDay && seasonBy) {
+    byKey = seasonBy; label = 'Season totals \u00b7 today\u2019s not in yet';
+  } else {
+    byKey = seasonBy || dayBy;
+  }
+  if (!byKey) { return null; }
+  var isPts = !!(league.scoring_type === 'headpoint' || league.scoring_type === 'point' ||
+    (typeof _skIsPointsH2HLeague === 'function' && _skIsPointsH2HLeague(league)));
+  return { byKey: byKey, meta: meta, ord: ord, sport: sport,
+           opts: { fp: isPts, scopeLabel: label } };
+}
+
+function _rgBuildFor(league, players) {
+  if (_rgMode() !== 'table') { return ''; }
+  var ctx = _rgContext(league);
+  if (!ctx) { return ''; }
+  try {
+    return _rgGroupHtml(players, ctx.byKey, ctx.meta, ctx.ord, ctx.sport, ctx.opts) || '';
+  } catch (eB) { return ''; }
+}
+
+// Redraw the grids in place when fresh figures land. The in-place line
+// updater walks .sk-roster-row elements, of which a table has none, so
+// without this every async update after the first paint was dropped.
+function _rgRepaint() {
+  if (_rgMode() !== 'table') { return false; }
+  var rosterEl = document.getElementById('skDetailRoster');
+  if (!rosterEl) { return false; }
+  var groups = rosterEl.querySelectorAll('.sk-roster-group');
+  if (!groups.length) { return false; }
+  var lk = (typeof skState !== 'undefined') ? skState.activeLeagueKey : '';
+  var league = (fyLeagues || []).find(function (l) { return l.league_key === lk; });
+  var cache = (typeof skDetailRosterCache !== 'undefined') ? skDetailRosterCache[lk] : null;
+  if (!league || !cache || !cache.players) { return false; }
+  var all = cache.players;
+  var pick = {
+    ACTIVE: function (p) { return !p.isBench && !p.isIL; },
+    BENCH: function (p) { return !!p.isBench; },
+    IL: function (p) { return !!p.isIL; }
+  };
+  var drew = false;
+  Array.prototype.forEach.call(groups, function (g) {
+    var lbl = String(g.getAttribute('data-group-label') || '').toUpperCase();
+    var f = pick[lbl];
+    if (!f) { return; }
+    var body = g.querySelector('.sk-roster-group-body');
+    if (!body || !body.querySelector('table.rg')) { return; }
+    var html = _rgBuildFor(league, all.filter(f));
+    if (html) { body.innerHTML = html; drew = true; }
+  });
+  return drew;
 }
 
 function skBuildRosterGroup(label, players, league, hasLiveStats) {
@@ -170104,13 +170245,7 @@ function skBuildRosterGroup(label, players, league, hasLiveStats) {
   // ROSTERGRID -- the table, when there is one to draw. An empty result
   // means this sport has no cached season categories, and the cards it
   // replaces are better than a table with no columns.
-  var _rgHtml = '';
-  if (_rgMode() === 'table') {
-    try {
-      _rgHtml = _rgGroupHtml(players, _yhSeasonByKey, _yhSeasonMeta,
-        _yhSeasonOrd, _rgSport) || '';
-    } catch (eRg) { _rgHtml = ''; }
-  }
+  var _rgHtml = _rgBuildFor(league, players);
   if (_rgHtml) { rows = _rgHtml; }
 
   // Collapse Bench and IL by default to save vertical space; Active
