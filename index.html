@@ -198312,8 +198312,15 @@ function _fyRateBlock() {
          (_fyBatch.filled
            ? ('<div style="margin-top:4px;color:#4ade80">Bulk: <b>' + _fyBatch.requests +
               '</b> request' + (_fyBatch.requests === 1 ? '' : 's') + ' answered for <b>' +
-              _fyBatch.filled + '</b> leagues \u2014 ' +
-              (_fyBatch.filled - _fyBatch.requests) + ' calls not made.</div>')
+              _fyBatch.filled + '</b> \u2014 ' +
+              (_fyBatch.filled - _fyBatch.requests) + ' calls not made.</div>' +
+              // TEAMCOALESCE -- which batch, not just how many. A zero here
+              // is the useful number: it means that one is falling back.
+              '<div style="margin-top:2px;color:#64748b">standings ' +
+              (_fyBatch.kinds.standings || 0) + ' \u00b7 settings ' +
+              (_fyBatch.kinds.settings || 0) + ' \u00b7 rosters ' +
+              (_fyBatch.kinds.rosters || 0) + ' \u00b7 team stats ' +
+              (_fyBatch.kinds.teamstats || 0) + '</div>')
            : ''))
       : ('<div style="color:#64748b">Nothing asked for in the last two minutes \u2014 the ' +
          'app is idle, so there is no rate to show. Everything below is from whenever it ' +
@@ -200377,7 +200384,17 @@ function _skCallNeedsDraft(path) {
 // the data to be wrong.
 var FY_BATCH_MAX = 25;
 var FY_BATCH_TTL_MS = 10 * 60 * 1000;
-var _fyBatch = { requests: 0, filled: 0, at: 0 };
+// TEAMCOALESCE -- per kind, because one number cannot say which of four
+// batches worked. "5 requests answered for 78 leagues" was true and told
+// me nothing about the roster batch contributing zero.
+var _fyBatch = { requests: 0, filled: 0, at: 0,
+                 kinds: { standings: 0, settings: 0, rosters: 0, teamstats: 0 } };
+function _fyBatchKind(kind, n) {
+  try {
+    if (!_fyBatch.kinds[kind]) { _fyBatch.kinds[kind] = 0; }
+    _fyBatch.kinds[kind] += (n || 0);
+  } catch (e) {}
+}
 
 function _fyBatchKeyOf(ent) {
   try {
@@ -200432,7 +200449,11 @@ async function _fyBatchPrefill(keys, suffix) {
     try {
       var res = await fyApi('/leagues;league_keys=' + chunks[i].join(',') + '/' + suffix);
       _fyBatch.requests++;
-      if (res && !res.error) { filled += _fyBatchSplit(res, suffix); }
+      if (res && !res.error) {
+        var got = _fyBatchSplit(res, suffix);
+        filled += got;
+        _fyBatchKind(suffix, got);   // TEAMCOALESCE
+      }
     } catch (e) {}
   }
   if (filled) {
@@ -200452,12 +200473,13 @@ async function _fyBatchPrefill(keys, suffix) {
 //
 // Depth is capped because a reply is data, not something to trust with
 // an unbounded recursion.
-function _fyFindTeams(node, out, depth) {
+function _fyFindTeams(node, out, depth, prop) {
+  var want = prop || 'roster';
   if (!node || typeof node !== 'object' || (depth || 0) > 12) { return out; }
   try {
     if (Array.isArray(node) && node.length >= 2) {
       var head = node[0], tail = node[1];
-      if (Array.isArray(head) && tail && typeof tail === 'object' && tail.roster) {
+      if (Array.isArray(head) && tail && typeof tail === 'object' && tail[want]) {
         for (var h = 0; h < head.length; h++) {
           if (head[h] && head[h].team_key) { out.push(node); return out; }
         }
@@ -200467,7 +200489,7 @@ function _fyFindTeams(node, out, depth) {
     for (k in node) {
       if (!node.hasOwnProperty(k)) { continue; }
       var v = node[k];
-      if (v && typeof v === 'object') { _fyFindTeams(v, out, (depth || 0) + 1); }
+      if (v && typeof v === 'object') { _fyFindTeams(v, out, (depth || 0) + 1, want); }
     }
   } catch (e) {}
   return out;
@@ -200523,6 +200545,7 @@ async function _fyBatchRosters(leagues) {
     _fyBatch.requests++;
     if (!res || res.error) { return 0; }
     var filled = _fyBatchRosterSplit(res);
+    _fyBatchKind('rosters', filled);   // TEAMCOALESCE
     if (filled) { _fyBatch.filled += filled; _fyBatch.at = Date.now(); }
     return filled;
   } catch (e) { return 0; }
@@ -200545,7 +200568,109 @@ async function _fyBatchWarm(leagues) {
   } catch (e) { return 0; }
 }
 
-async function fyApi(path) {
+// \u2500\u2500 TEAMCOALESCE \u2500\u2500 Gather the per-team dated calls as they arrive.
+//
+// These come from half a dozen callers that each know about exactly one
+// team -- the Wire, day totals, the week strip -- so there is no single
+// place to batch them from. Instead each one waits 50ms at the door,
+// joins whatever else is asking for the same thing on the same day, and
+// one request goes out for up to twenty-five teams.
+//
+// Only the documented collection form, and only this exact shape. If the
+// batch fails, every waiter asks for itself exactly as it does now; the
+// 50ms is the whole of the downside.
+var FY_COALESCE_MS = 50;
+var FY_COALESCE_MAX = 25;
+var _fyCoalesceQ = {};
+
+function _fyTeamCall(path) {
+  var m = String(path || '').match(
+    /^\/team\/(\d+\.l\.\d+\.t\.\d+)\/(stats;type=date;date=\d{4}-\d{2}-\d{2})$/);
+  if (!m) { return null; }
+  return { team: m[1], suffix: m[2] };
+}
+
+// Put each team's answer back in the shape its own call returns.
+function _fyBatchTeamSplit(data, suffix) {
+  var n = 0;
+  try {
+    var teams = _fyFindTeams(data, [], 0, 'team_stats');
+    for (var i = 0; i < teams.length; i++) {
+      var tk = _fyTeamKeyOf(teams[i]);
+      if (!tk) { continue; }
+      fyDataCache['/team/' + tk + '/' + suffix] = {
+        t: Date.now(), ttl: FY_BATCH_TTL_MS,
+        d: { fantasy_content: { team: teams[i] } }
+      };
+      n++;
+    }
+  } catch (e) {}
+  return n;
+}
+
+function _fyCoalesceFire(suffix) {
+  var b = _fyCoalesceQ[suffix];
+  if (!b) { return; }
+  delete _fyCoalesceQ[suffix];
+  if (b.timer) { clearTimeout(b.timer); b.timer = null; }
+  (function () {
+    return (async function () {
+      try {
+        var res = await fyApi('/teams;team_keys=' + b.list.join(',') + '/' + suffix, true);
+        _fyBatch.requests++;
+        if (res && !res.error) {
+          var got = _fyBatchTeamSplit(res, suffix);
+          _fyBatchKind('teamstats', got);
+          if (got) { _fyBatch.filled += got; _fyBatch.at = Date.now(); }
+        }
+      } catch (e) {}
+      // Hand each caller its own answer. Anything the batch did not cover
+      // simply asks for itself, which is what it would have done anyway.
+      for (var i = 0; i < b.waiters.length; i++) {
+        var w = b.waiters[i];
+        var hit = fyDataCache[w.path];
+        if (hit && hit.d && hit.t > Date.now() - (hit.ttl || 60000)) {
+          w.resolve(hit.d);
+        } else {
+          /* eslint-disable no-loop-func */
+          (function (waiter) {
+            fyApi(waiter.path, true).then(waiter.resolve, function (e) {
+              waiter.resolve({ error: String((e && e.message) || e) });
+            });
+          })(w);
+        }
+      }
+    })();
+  })();
+}
+
+function _fyCoalesceJoin(info, path) {
+  var b = _fyCoalesceQ[info.suffix];
+  if (!b) {
+    b = _fyCoalesceQ[info.suffix] = { list: [], seen: {}, waiters: [], timer: null };
+  }
+  if (!b.seen[info.team]) { b.seen[info.team] = 1; b.list.push(info.team); }
+  var p = new Promise(function (resolve) { b.waiters.push({ path: path, resolve: resolve }); });
+  if (b.list.length >= FY_COALESCE_MAX) {
+    _fyCoalesceFire(info.suffix);
+  } else if (!b.timer) {
+    b.timer = setTimeout(function () { _fyCoalesceFire(info.suffix); }, FY_COALESCE_MS);
+  }
+  return p;
+}
+
+async function fyApi(path, _noCoalesce) {
+  // TEAMCOALESCE -- a dated team-stats call waits a moment for company.
+  // An answer already in hand never waits, and the batch's own call comes
+  // back through here with _noCoalesce so it cannot join itself.
+  if (!_noCoalesce) {
+    var _ci = _fyTeamCall(path);
+    if (_ci) {
+      var _hit = fyDataCache[path];
+      if (_hit && _hit.d && _hit.t > Date.now() - (_hit.ttl || 60000)) { return _hit.d; }
+      return _fyCoalesceJoin(_ci, path);
+    }
+  }
   // PREDRAFT0 -- no draft means no roster and no stats to ask for.
   if (_skCallNeedsDraft(path)) {
     _skPreDraftSkips++;
