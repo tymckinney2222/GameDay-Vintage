@@ -51922,6 +51922,54 @@ function _skPreseasonWhen(ymd) {
   } catch (e) { return String(ymd); }
 }
 
+// ── PRESEASON5 ── When does this league's season actually start?
+//
+// Two stores hold it and neither is reliably first. fyLeagues gets it from
+// the league list, which the sync fills -- so it is empty during a sync and
+// for leagues added since. _skLeagueDates gets it from the settings call,
+// which happens on demand. Asking only one of them is how a guard that was
+// written for exactly this case failed to fire on exactly this case.
+//
+// Returns '' when genuinely unknown, and callers must treat that as "do
+// not know" rather than "has not started" -- silence is never inferred.
+function _skSeasonStartFor(leagueKeyOrTeamKey) {
+  var lgKey = String(leagueKeyOrTeamKey || '').split('.t.')[0];
+  if (!lgKey) { return ''; }
+  try {
+    var lgs = (typeof fyLeagues !== 'undefined' && fyLeagues) ? fyLeagues : [];
+    for (var i = 0; i < lgs.length; i++) {
+      if (lgs[i] && lgs[i].league_key === lgKey && lgs[i].start_date) {
+        return String(lgs[i].start_date);
+      }
+    }
+  } catch (e) {}
+  try {
+    var d = (typeof _skLeagueDates !== 'undefined' && _skLeagueDates)
+      ? _skLeagueDates[lgKey] : null;
+    if (d && d.start) { return String(d.start); }
+  } catch (e2) {}
+  return '';
+}
+
+// ── PRESEASON5 ── A dated call that has already failed.
+//
+// Nothing recorded a failure, so every surface that wanted the same day
+// asked again and got the same error: eight identical rows in the health
+// panel, five seconds apart, for one date. A PAST date that failed a
+// minute ago is not going to start working, so it is remembered -- but for
+// ten minutes rather than forever, because a transient failure must still
+// be able to heal itself without a reload.
+var _skFpMiss = {};
+var SK_FP_MISS_MS = 10 * 60 * 1000;
+function _skFpMissed(k) {
+  var t = _skFpMiss[k];
+  if (!t) { return false; }
+  if ((Date.now() - t) < SK_FP_MISS_MS) { return true; }
+  delete _skFpMiss[k];
+  return false;
+}
+function _skFpMissMark(k) { _skFpMiss[k] = Date.now(); }
+
 function _skRosterStatsPath(teamKey, dateStr) {
   var lgKey = String(teamKey || '').split('.t.')[0];
   var lg = null;
@@ -51943,8 +51991,20 @@ function _skRosterStatsPath(teamKey, dateStr) {
   //
   // Future days are skipped by the callers already; this is the same idea
   // pointed at the other end of the season.
-  if (lg && lg.start_date &&
-      String(dateStr) < String(lg.start_date) &&
+  // PRESEASON5 -- a league that has not drafted has no roster to ask
+  // about at all, and the comment above _skLeagueNotStarted describes this
+  // exact failure. The dated-stats path never called it.
+  try {
+    if (typeof _skLeagueNotStarted === 'function' && _skLeagueNotStarted(lgKey)) {
+      return null;
+    }
+  } catch (ePd) {}
+  // PRESEASON5 -- and the start date comes from either store, not just the
+  // one the sync happens to fill.
+  var _ssStart = (typeof _skSeasonStartFor === 'function')
+    ? _skSeasonStartFor(lgKey) : (lg && lg.start_date ? String(lg.start_date) : '');
+  if (_ssStart &&
+      String(dateStr) < _ssStart &&
       String(dateStr) < _todayDateString()) return null;
   var isNfl = (typeof _skIsNflLeague === 'function') && _skIsNflLeague(lg);
   if (!isNfl) {
@@ -52003,6 +52063,9 @@ async function fetchTeamFpForDate(teamKey, date) {
 
   // Dedup: if a fetch is already in flight for this key, await it
   if (teamFpInflight[memKey]) return teamFpInflight[memKey];
+  // PRESEASON5 -- and one that already failed is not asked again for ten
+  // minutes. Only PAST dates: today is still live and worth retrying.
+  if (isPastDate && _skFpMissed(memKey)) return null;
 
   var promise = (async function() {
     try {
@@ -52062,6 +52125,7 @@ async function fetchTeamFpForDate(teamKey, date) {
       return byKey;
     } catch (e) {
       console.warn('[fp] fetch failed for', teamKey, date, e);
+      if (isPastDate) { _skFpMissMark(memKey); }
       return null;
     } finally {
       delete teamFpInflight[memKey];
@@ -169672,6 +169736,10 @@ function _skFetchTeamPlayerStats(teamKey, dateStr) {
     }
   }
   if (_skPlayerStatsInflight[memKey]) return _skPlayerStatsInflight[memKey];
+  // PRESEASON5 -- same memo, same reason: the day-totals sweep and the
+  // week strip both want this date and both used to ask again after it
+  // had already failed.
+  if (isPastDate && _skFpMissed('ps|' + memKey)) return Promise.resolve([]);
 
   var p = (async function() {
     try {
@@ -169694,6 +169762,7 @@ function _skFetchTeamPlayerStats(teamKey, dateStr) {
       return out;
     } catch (e) {
       console.warn('[day-totals] fetch failed', teamKey, dateStr, e);
+      if (isPastDate) { _skFpMissMark('ps|' + memKey); }
       return [];
     } finally {
       delete _skPlayerStatsInflight[memKey];
