@@ -198054,6 +198054,10 @@ function _fyProbeLastFailure() {
   // carries, so it stands in for "does a preflight get through at all".
   // Only if BOTH fail is an unanswered OPTIONS the likely story.
   var plain = false, pre = false, ctype = false, authed = false, opaque = false;
+  // UPSTREAMHOP -- how long the authenticated call lasted before dying.
+  // A hop that was refused dies far quicker than one that was attempted,
+  // and that difference is the whole reading.
+  var authMs = 0;
   timed('no auth, no preflight', {}).then(function (a) {
     plain = a;
     return timed('custom header (preflight)', { headers: { 'X-Sk-Probe': '1' } }, true);
@@ -198065,7 +198069,9 @@ function _fyProbeLastFailure() {
     return fyGetToken();
   }).then(function (tok) {
     if (!tok) { say('<div style="color:#f59e0b">with token: no token available</div>'); return false; }
-    return timed('with token, CORS', { headers: { 'Authorization': 'Bearer ' + tok } });
+    var _tA = Date.now();
+    return timed('with token, CORS', { headers: { 'Authorization': 'Bearer ' + tok } })
+      .then(function (r2) { authMs = Date.now() - _tA; return r2; });
   }).then(function (b) {
     authed = b;
     return timed('no-cors, no auth', { mode: 'no-cors' });
@@ -198076,10 +198082,31 @@ function _fyProbeLastFailure() {
       v = 'It went through this time. The call itself is fine, so the failures happen only under load \u2014 ' +
           'a burst thing, not this endpoint.';
     } else if (plain && (pre || ctype)) {
-      v = 'A preflight DOES get through \u2014 ' + (ctype ? 'the content-type one' : 'the custom-header one') +
-          ' answered \u2014 and only the call carrying the token failed. So OPTIONS is being handled and this is ' +
-          'about that one header or about load. If it fails every time, add authorization to the Worker\u2019s ' +
-          'Access-Control-Allow-Headers; if it only fails in bursts, it is load and the Worker is fine.';
+      // \u2500\u2500 UPSTREAMHOP \u2500\u2500 This used to blame the header, and the
+      // header is allowed in both Workers. The real difference between
+      // the calls that answered and the one that did not is that only
+      // the authenticated call causes a SECOND hop: without a token the
+      // Worker returns 401 on the spot and never speaks to Yahoo.
+      //
+      // So an unauthenticated 401 coming back readable proves the Worker
+      // ran, CORS is right and preflights are handled. What failed is the
+      // hop beyond it -- and if it failed faster than a real upstream
+      // call takes, it never got there.
+      v = 'Unauthenticated calls answered with a readable HTTP 401, which means the Worker ' +
+          'ran and its CORS headers were on the reply \u2014 so CORS is right, preflights are ' +
+          'handled, and the Worker itself is fine. The ONLY call that failed is the only one ' +
+          'carrying a token, and that is also the only one that makes the Worker go and ask ' +
+          'Yahoo. So the failure is in that second hop, not in this app and not in the ' +
+          'header.' +
+          (authMs && authMs < 250
+            ? ' It died in ' + authMs + 'ms, far quicker than a real Yahoo call comes back, ' +
+              'so the hop was refused rather than attempted.'
+            : '') +
+          ' A refused hop throws out of a Worker whose /api/ branch has no try/catch, and ' +
+          'the error page Cloudflare sends in its place carries no CORS header \u2014 which ' +
+          'is why it reaches here as \u201cFailed to fetch\u201d with no status at all. Wrap ' +
+          'that fetch in try/catch and return the error WITH the CORS headers, and the next ' +
+          'one of these will arrive with its real reason written on it.';
     } else if (plain && !pre && !ctype) {
       v = 'Unauthenticated calls answer, and NO preflight gets through \u2014 content-type failed as well as the ' +
           'custom header, and neither carried credentials. That points at the OPTIONS request going unanswered: ' +
@@ -198294,7 +198321,13 @@ function _fyRateBlock() {
          '/min) for another ' + Math.ceil((_fySlowUntil - Date.now()) / 1000) +
          's \u2014 something answered without the header that lets the app read it, ' +
          'which is a refusal, so it is asking less often.</div>')
-      : '';
+      : (_fyColdSyncing()
+         ? ('<div style="margin-top:4px;color:#7dd3fc">Eased to one call every ' +
+            FY_COLD_GAP_MS + 'ms (about ' + Math.round(60000 / FY_COLD_GAP_MS) +
+            '/min) for another ' + Math.ceil((_fyColdUntil - Date.now()) / 1000) +
+            's \u2014 leagues are hydrating from nothing, which is the only thing ' +
+            'that runs the app flat out.</div>')
+         : '');
     var h = '<div style="color:#94a3b8;font-size:11px;margin:16px 0 4px">' +
       'How hard the app is asking</div>' +
       '<div style="background:#0d1220;border:1px solid rgba(255,255,255,0.08);' +
@@ -199694,7 +199727,41 @@ var FY_MIN_GAP_MS = 120;
 var FY_SLOW_GAP_MS = 500;
 var FY_SLOW_MS = 120000;
 var _fySlowUntil = 0, _fySlowCount = 0;
-function _fyGapNow() { return (Date.now() < _fySlowUntil) ? FY_SLOW_GAP_MS : FY_MIN_GAP_MS; }
+
+// \u2500\u2500 COLDSYNC \u2500\u2500 Adding leagues is the only thing that runs flat out.
+//
+// Measured at the door of fyApi: a cold league costs the same five calls
+// whatever sport it is -- roster, standings, scoreboard, settings, dated
+// roster -- and more once its roster parses and the per-player work
+// begins. Warm leagues top up a handful of calls; a newly added one pays
+// in full, and four added together pay simultaneously, on top of
+// everything already refreshing.
+//
+// That is why this has only ever happened twice, at two season starts,
+// and why it looks like whichever sport was being added at the time. The
+// sport was never the variable. Adding was.
+//
+// 120ms between calls is 500 a minute and nothing else the app does
+// sustains it. Four or more cold leagues eases that to 300ms -- 200 a
+// minute -- for the length of the sync. Slower, and only when it matters.
+var FY_COLD_GAP_MS = 300;
+var _fyColdUntil = 0, _fyColdCount = 0;
+function _fyColdSyncing() { return Date.now() < _fyColdUntil; }
+function _fyColdSyncNote(n) {
+  if (!n || n < 4) { return; }
+  // Roughly six seconds a league at this pace, with a ceiling so a huge
+  // account cannot talk the app into crawling for the rest of the day.
+  var until = Date.now() + Math.min(n * 6000, 180000);
+  if (until > _fyColdUntil) { _fyColdUntil = until; _fyColdCount++; }
+}
+
+// The refusal brake is firmer than the cold-start one; whichever is
+// stricter wins, and neither is ever looser than the normal gap.
+function _fyGapNow() {
+  if (Date.now() < _fySlowUntil) { return FY_SLOW_GAP_MS; }
+  if (_fyColdSyncing()) { return FY_COLD_GAP_MS; }
+  return FY_MIN_GAP_MS;
+}
 function _fySlowed() { return Date.now() < _fySlowUntil; }
 function _fySlowDown() {
   if (!_fySlowed()) { _fySlowCount++; }
@@ -200429,6 +200496,9 @@ async function fyAutoLoadAllRosters() {
   // when no selection is saved (first-run default).
   var leaguesToLoad = (typeof skSyncedLeagues === 'function') ? skSyncedLeagues() : fyLeagues;
   if (!leaguesToLoad.length) return;
+  // COLDSYNC -- this is the fan-out that has broken twice, at two season
+  // starts. Tell the pacer how big it is before a single call goes out.
+  try { _fyColdSyncNote(leaguesToLoad.length); } catch (eC) {}
 
   // Fetch all leagues in parallel, collect into allPlayers array — no parallel cache writes
   var allPlayers = [];
