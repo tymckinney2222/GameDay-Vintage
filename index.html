@@ -198683,11 +198683,17 @@ function _fyBulkDiagBlock() {
         (rej ? (' \u00b7 ' + rej + ' turned away') : '') +
         ' \u00b7 ' + ago + 's ago</div>' +
         (rej && !d.found
-          ? '<div style="color:#fbbf24;margin-top:2px">Every answer came back without ' +
-            'the stats that were asked for \u2014 Yahoo is honouring the roster part of ' +
-            'the request and dropping the stats part. Nothing was cached, so each team ' +
-            'is asking on its own, correctly but at full price.</div>'
-          : '');
+          ? '<div style="color:#fbbf24;margin-top:2px">Nothing in these answers carried ' +
+            'stats, and this request shape has not yet been seen answered with any. ' +
+            'Most likely a slate nobody has played yet. If it is still saying this once ' +
+            'games are final, Yahoo really is dropping the stats half of the request.' +
+            '</div>'
+          : (_fyBatchEmptyKept
+             ? '<div style="color:#94a3b8;margin-top:2px">' + _fyBatchEmptyKept +
+               ' answers kept as honestly empty \u2014 the chain is being answered, those ' +
+               'rosters simply have not played yet. Before CHAINHELD each of these was ' +
+               'thrown away and asked again one team at a time.</div>'
+             : ''));
       var detail = d.ok
         ? (d.found ? '' :
            '<div style="color:#94a3b8;margin-top:2px">It answered and nothing was ' +
@@ -201188,6 +201194,37 @@ function _fyPartCarriesStats(part) {
 // A number that must be read next to the "filled" one: a batch filling
 // nothing AND rejecting plenty is Yahoo declining to honour the chain,
 // which is a different thing from a batch that failed.
+// \u2500\u2500 CHAINHELD \u2500\u2500 Has this request shape ever been answered with stats?
+//
+// Keyed by the shape rather than the exact path, because the date moves
+// every day and the question does not. Proof arrives the first time any
+// team in any batch comes back carrying stats, and it holds for the
+// session: a later batch that happens to be all pre-season leagues has
+// nothing to prove itself with, and should not have to.
+var _fyChainHeld = {};
+function _fyChainShape(suffix) {
+  try { return String(suffix || '').replace(/=[0-9][0-9-]*/g, '='); }
+  catch (e) { return String(suffix || ''); }
+}
+
+// Yahoo's own word for a day that has not been scored. Present on the
+// roster node in exactly the answers being turned away.
+function _fyRosterPrescoring(part) {
+  try {
+    var r = part && part.roster;
+    if (!r) { return false; }
+    var v = r.is_prescoring;
+    if (v === undefined && r['0']) { v = r['0'].is_prescoring; }
+    return v === 1 || v === '1' || v === true;
+  } catch (e) {}
+  return false;
+}
+
+// Answers kept BECAUSE the day had not been played -- the ones bo85 threw
+// away. Worth a number of its own: it is the difference between the fix
+// working and the fix merely being quiet.
+var _fyBatchEmptyKept = 0;
+
 var _fyBatchRejected = {};
 function _fyBatchReject(kind, n) {
   try {
@@ -201202,7 +201239,17 @@ function _fyBatchTeamSplit(data, suffix) {
     // The chained form carries a roster; the bare one carries team_stats.
     var want = (String(suffix || '').indexOf('roster;') === 0) ? 'roster' : 'team_stats';
     var teams = _fyFindTeams(data, [], 0, want);
-    for (var i = 0; i < teams.length; i++) {
+    var shape = _fyChainShape(suffix);
+    var rows = [], honoured = false, i;
+
+    // \u2500\u2500 CHAINHELD \u2500\u2500 First pass: was the chain honoured at all?
+    //
+    // Every team here was asked with the SAME url. So this is one question
+    // about the response, not a question to be put to each team in turn --
+    // which is where bo85 went wrong. One team carrying stats proves the
+    // stats half of the request is being answered, and therefore that the
+    // teams without them are honestly empty rather than short-changed.
+    for (i = 0; i < teams.length; i++) {
       var tk = _fyTeamKeyOf(teams[i]);
       if (!tk) { continue; }
       // TEAMPART -- same normalising here. This batch already worked,
@@ -201210,16 +201257,31 @@ function _fyBatchTeamSplit(data, suffix) {
       // to depend on that.
       var tpart = _fyTeamPart(teams[i], want);
       if (!tpart) { continue; }
-      // BATCHVERIFY -- the chained form asked for stats. A roster without
-      // them is not the answer to that question, so it is not cached and
-      // the caller goes and asks properly.
-      if (want === 'roster' && !_fyPartCarriesStats(tpart)) {
-        _fyBatchReject('teamstats', 1);   // the kind the diag is keyed by
-        continue;
+      var carries = (want !== 'roster') || _fyPartCarriesStats(tpart);
+      if (want === 'roster' && carries) { honoured = true; }
+      rows.push({ k: tk, head: teams[i][0], part: tpart, carries: carries });
+    }
+    if (honoured) { _fyChainHeld[shape] = true; }
+    var trusted = honoured || !!_fyChainHeld[shape];
+
+    // Second pass: keep what the answer actually says.
+    for (i = 0; i < rows.length; i++) {
+      if (!rows[i].carries) {
+        // An empty roster is the right answer to a day nobody has played.
+        // Keep it when the chain is known to be honoured, or when Yahoo
+        // itself calls the day pre-scoring. Turn it away only when neither
+        // holds -- a shape never once seen answered with stats, on a day
+        // Yahoo has not said is unplayed -- which is the case BATCHVERIFY
+        // was built for and the only one it should ever have caught.
+        if (!trusted && !_fyRosterPrescoring(rows[i].part)) {
+          _fyBatchReject('teamstats', 1);   // the kind the diag is keyed by
+          continue;
+        }
+        _fyBatchEmptyKept++;
       }
-      fyDataCache['/team/' + tk + '/' + suffix] = {
+      fyDataCache['/team/' + rows[i].k + '/' + suffix] = {
         t: Date.now(), ttl: _fyBatchTtl('teamstats', suffix),
-        d: { fantasy_content: { team: [teams[i][0], tpart] } }
+        d: { fantasy_content: { team: [rows[i].head, rows[i].part] } }
       };
       n++;
     }
