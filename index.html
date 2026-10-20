@@ -198285,10 +198285,21 @@ function _fyRateBlock() {
       : ('<div style="color:#64748b">Nothing asked for in the last two minutes \u2014 the ' +
          'app is idle, so there is no rate to show. Everything below is from whenever it ' +
          'last ran.</div>');
+    // TURNEDAWAY -- and say so when the app has deliberately slowed down,
+    // because an app that has gone quiet for no visible reason is the
+    // kind of thing that gets reported as a different bug.
+    var slowLine = _fySlowed()
+      ? ('<div style="margin-top:4px;color:#7dd3fc">Slowed to one call every ' +
+         FY_SLOW_GAP_MS + 'ms (about ' + Math.round(60000 / FY_SLOW_GAP_MS) +
+         '/min) for another ' + Math.ceil((_fySlowUntil - Date.now()) / 1000) +
+         's \u2014 something answered without the header that lets the app read it, ' +
+         'which is a refusal, so it is asking less often.</div>')
+      : '';
     var h = '<div style="color:#94a3b8;font-size:11px;margin:16px 0 4px">' +
       'How hard the app is asking</div>' +
       '<div style="background:#0d1220;border:1px solid rgba(255,255,255,0.08);' +
-      'border-radius:8px;padding:8px;font-size:10px;line-height:1.5;color:#cbd5e1">' + inner;
+      'border-radius:8px;padding:8px;font-size:10px;line-height:1.5;color:#cbd5e1">' +
+      inner + slowLine;
     return h + '</div>';
   } catch (e) { return ''; }
 }
@@ -199661,9 +199672,37 @@ function _fyErrDetail(status, body) {
 var _fyPaceChain = Promise.resolve();
 var _fyLastCallTs = 0;
 var FY_MIN_GAP_MS = 120;
+
+// \u2500\u2500 TURNEDAWAY \u2500\u2500 Ask slower when something is turning us away.
+//
+// 120ms between calls is 500 a minute, and every one of them carries an
+// Authorization header -- which means a preflight each, so what actually
+// arrives upstream is nearer a thousand a minute. Twenty-one warm leagues
+// never got close. Thirty-nine cold ones, all hydrating at once, are
+// there in seconds.
+//
+// 500ms is 120 a minute. Slow enough that nothing has any reason to
+// refuse it, and barely noticeable on a sweep that was going to take
+// half a minute anyway.
+//
+// Engaged ONLY on evidence: the no-cors probe coming back opaque, which
+// means something answered and withheld the header that would let us
+// read it. Never on a guess, and it lifts on its own. Pacing every user
+// at a crawl forever to survive a burst that happens twice a year is the
+// wrong trade; pacing THIS user slowly for two minutes, right after the
+// app has been told it is being refused, is the right one.
+var FY_SLOW_GAP_MS = 500;
+var FY_SLOW_MS = 120000;
+var _fySlowUntil = 0, _fySlowCount = 0;
+function _fyGapNow() { return (Date.now() < _fySlowUntil) ? FY_SLOW_GAP_MS : FY_MIN_GAP_MS; }
+function _fySlowed() { return Date.now() < _fySlowUntil; }
+function _fySlowDown() {
+  if (!_fySlowed()) { _fySlowCount++; }
+  _fySlowUntil = Date.now() + FY_SLOW_MS;
+}
 function _fyPace() {
   _fyPaceChain = _fyPaceChain.then(function() {
-    var waitMs = FY_MIN_GAP_MS - (Date.now() - _fyLastCallTs);
+    var waitMs = _fyGapNow() - (Date.now() - _fyLastCallTs);   // TURNEDAWAY
     if (waitMs < 0) waitMs = 0;
     return new Promise(function(resolve) {
       setTimeout(function() { _fyLastCallTs = Date.now(); resolve(); }, waitMs);
@@ -199910,6 +199949,10 @@ function _fyEdgeProbeFire(path) {
       function () {
         _fyEdgeProbe = { state: 'opaque', path: String(path || ''),
                          at: Date.now(), ms: Date.now() - t0 };
+        // TURNEDAWAY -- opaque means something answered and hid it from
+        // us. That is a refusal, and the only answer to a refusal is to
+        // ask less often.
+        try { _fySlowDown(); } catch (eS) {}
       },
       function () {
         _fyEdgeProbe = { state: 'dead', path: String(path || ''),
