@@ -198239,6 +198239,72 @@ async function _fyProbeLeagueLadder() {
     'padding-top:6px">' + v + '</div>');
 }
 
+// \u2500\u2500 BURSTKILL \u2500\u2500 Did the failures arrive together, or separately?
+//
+// This is the whole question and the log already answers it. Walk the
+// network failures in time order and cut a new burst wherever there is a
+// gap of more than 250ms. Independent failures end up one per burst.
+// Collateral from a shared connection ends up five in a burst 30ms wide,
+// spanning four leagues -- a shape that cannot happen by coincidence.
+function _fyBurstBlock() {
+  try {
+    var log = (_fyHealth && _fyHealth.log) ? _fyHealth.log : [];
+    var fails = [], i;
+    for (i = 0; i < log.length; i++) {
+      if (log[i] && log[i].kind === 'network') { fails.push(log[i]); }
+    }
+    if (fails.length < 3) { return ''; }
+    fails.sort(function (a, b) { return a.t - b.t; });
+    var bursts = [], cur = null;
+    for (i = 0; i < fails.length; i++) {
+      if (cur && (fails[i].t - cur.last) <= 250) {
+        cur.n++; cur.last = fails[i].t;
+      } else {
+        cur = { n: 1, first: fails[i].t, last: fails[i].t, lgs: {} };
+        bursts.push(cur);
+      }
+      var m = String(fails[i].path || '').match(/(\d+\.l\.\d+)/);
+      cur.lgs[m ? m[1] : '_account'] = 1;
+    }
+    var best = bursts[0], k, nL;
+    for (i = 1; i < bursts.length; i++) {
+      if (bursts[i].n > best.n) { best = bursts[i]; }
+    }
+    nL = 0;
+    for (k in best.lgs) { if (best.lgs.hasOwnProperty(k)) { nL++; } }
+    var alone = 0;
+    for (i = 0; i < bursts.length; i++) { if (bursts[i].n === 1) { alone++; } }
+
+    var verdict;
+    if (best.n >= 3 && nL >= 2) {
+      verdict = 'Failures arriving together on different leagues are not ' +
+        'separate failures \u2014 they are one connection dying and taking ' +
+        'everything riding on it. That is why one league can stop the rest.';
+    } else if (best.n >= 3) {
+      verdict = 'They arrive together but all within one league, so this ' +
+        'looks like that league\u2019s own calls rather than a shared connection.';
+    } else {
+      verdict = 'They arrive one at a time, so each is its own failure \u2014 ' +
+        'not collateral from a shared connection.';
+    }
+    return '<div style="color:#94a3b8;font-size:11px;margin:16px 0 4px">' +
+      'How the failures arrived</div>' +
+      '<div style="background:#0d1220;border:1px solid rgba(255,255,255,0.08);' +
+      'border-radius:8px;padding:8px;font-size:10px;line-height:1.5;color:#cbd5e1">' +
+      '<div><b>' + fails.length + '</b> connection failures in <b>' + bursts.length +
+      '</b> burst' + (bursts.length === 1 ? '' : 's') + ' \u00b7 ' + alone +
+      ' arrived alone</div>' +
+      '<div style="margin-top:3px">biggest burst: <b>' + best.n + '</b> call' +
+      (best.n === 1 ? '' : 's') + ' inside <b>' + (best.last - best.first) +
+      'ms</b>, across <b>' + nL + '</b> league' + (nL === 1 ? '' : 's') + '</div>' +
+      '<div style="margin-top:4px;color:#94a3b8">' + verdict + '</div>' +
+      (_fyNarrowCount ? '<div style="margin-top:4px;color:#7dd3fc">Gate narrowed to one ' +
+        'request at a time ' + _fyNarrowCount + ' time' + (_fyNarrowCount === 1 ? '' : 's') +
+        ' because of this' + (_fyNarrowed() ? ' \u00b7 narrowed right now' : '') + '.</div>' : '') +
+      '</div>';
+  } catch (e) { return ''; }
+}
+
 // ── ERRBYLEAGUE ── The readout. Heaviest league first, because the shape
 // of the list IS the answer: one or two leagues carrying every failure is
 // a league problem, an even spread across all of them is a load problem.
@@ -198365,6 +198431,8 @@ function skShowApiHealth() {
       'font-weight:700;letter-spacing:0.06em">WALK THE FAILING LEAGUE</button>' +
       '<div id="_fyLadderOut" style="font-size:10px;margin-top:6px;line-height:1.5"></div>' +
     '</div>' +
+    // BURSTKILL -- together or separately, which is the whole question.
+    _fyBurstBlock() +
     // NETSPREAD -- is the breaker up, and what put it there.
     (_fyNetBreakerLine()
       ? '<div style="margin:14px 0 2px;padding:8px;border-radius:8px;' +
@@ -199653,14 +199721,56 @@ function skToggleYahooPause() { fySetPaused(!fyIsPaused()); }
 // skipped; the work simply arrives in order, a few at a time.
 var FY_MAX_INFLIGHT = 5;
 var _fyInflight = 0, _fyWaitQ = [];
+
+// \u2500\u2500 BURSTKILL \u2500\u2500 Five requests, one connection.
+//
+// The browser multiplexes concurrent requests to one origin onto a single
+// HTTP/2 connection. That is usually a gift, and it is a liability the
+// moment one reply kills the connection -- a Worker that throws after its
+// headers are out, a reset stream, a GOAWAY. Everything riding on it dies
+// in the same instant, whatever league it belonged to, and all of it
+// reaches the app as "Failed to fetch".
+//
+// Measured: the app's own counter read 60 calls and 60 connection
+// failures in two minutes while a hand-rolled fetch to the same Worker,
+// in the same seconds, answered four times including a 189 KB scoreboard.
+// The requests are not the problem. Running five of them over one
+// connection is.
+//
+// So when a burst arrives -- several failures, different paths, inside a
+// few milliseconds, which is collateral and cannot be coincidence -- the
+// gate narrows to ONE for twenty seconds. One request at a time cannot
+// take anything else down with it, and the pause lets the browser open a
+// fresh connection. It widens again on its own.
+var _fyNarrowUntil = 0, _fyNarrowCount = 0;
+var FY_NARROW_MS = 20000;
+function _fyCap() { return (Date.now() < _fyNarrowUntil) ? 1 : FY_MAX_INFLIGHT; }
+function _fyNarrowed() { return Date.now() < _fyNarrowUntil; }
+function _fyNarrow() {
+  _fyNarrowUntil = Date.now() + FY_NARROW_MS;
+  _fyNarrowCount++;
+  // Nothing else will come knocking once the window ends, so wake the
+  // queue ourselves rather than leaving it parked.
+  setTimeout(function () { _fyGateDrain(); }, FY_NARROW_MS + 20);
+}
+
+function _fyGateDrain() {
+  while (_fyWaitQ.length && _fyInflight < _fyCap()) {
+    _fyInflight++;
+    (_fyWaitQ.shift())();
+  }
+}
 function _fyGateEnter() {
-  if (_fyInflight < FY_MAX_INFLIGHT) { _fyInflight++; return Promise.resolve(); }
+  if (_fyInflight < _fyCap()) { _fyInflight++; return Promise.resolve(); }
   return new Promise(function (resolve) { _fyWaitQ.push(resolve); });
 }
 function _fyGateLeave() {
-  var next = _fyWaitQ.shift();
-  if (next) { next(); return; }        // hand the slot straight to the next caller
-  if (_fyInflight > 0) _fyInflight--;
+  // BURSTKILL -- the slot is released and then re-admitted under the
+  // CURRENT cap, rather than handed straight on. Handing it on ignored a
+  // narrowing entirely: five calls would keep passing one slot between
+  // themselves and never notice the gate had closed to one.
+  if (_fyInflight > 0) { _fyInflight--; }
+  _fyGateDrain();
 }
 
 // ── FYGATESLEEP ── Wait WITHOUT holding a slot.
@@ -199816,9 +199926,28 @@ function _fyNetSpread() {
            worstShare: _fyNetFails.length ? (worst / _fyNetFails.length) : 0 };
 }
 
+// BURSTKILL -- failures that arrive TOGETHER on different paths are one
+// event, not several. Independent failures do not land inside the same
+// 250ms on three different endpoints; requests sharing a dead connection
+// do, every time.
+var FY_BURST_MS = 250;
+function _fyBurstNow() {
+  var now = Date.now(), n = 0, paths = {}, nP = 0, i;
+  for (i = _fyNetFails.length - 1; i >= 0; i--) {
+    if ((now - _fyNetFails[i].t) > FY_BURST_MS) { break; }
+    n++;
+    if (!paths[_fyNetFails[i].p]) { paths[_fyNetFails[i].p] = 1; nP++; }
+  }
+  return { n: n, paths: nP };
+}
+
 function _fyNetNoted(path) {
   var now = Date.now();
   _fyNetFails.push({ t: now, p: String(path || ''), l: _fyNetLgOf(path) });
+  // BURSTKILL -- three or more at once across different paths is one
+  // connection dying, not three endpoints going wrong together.
+  var _b = _fyBurstNow();
+  if (_b.n >= 3 && _b.paths >= 2 && !_fyNarrowed()) { _fyNarrow(); }
   while (_fyNetFails.length && (now - _fyNetFails[0].t) > 30000) { _fyNetFails.shift(); }
   if (_fyNetFails.length < 8) { return; }
   var sp = _fyNetSpread();
