@@ -198108,6 +198108,65 @@ function _fyKB(n) {
   return (n / 1024).toFixed(n < 10240 ? 1 : 0) + ' KB';
 }
 
+// LADDERPEER -- a league of the SAME sport with nothing against it.
+//
+// Yahoo spells a league key <game>.l.<id>, and the game code is per sport
+// per season, so leagues sharing a prefix are the same sport in the same
+// year. The peer has to be clean: comparing two broken leagues answers
+// nothing.
+function _fyPeerLeague(key) {
+  var game = String(key || '').split('.l.')[0];
+  if (!game) { return ''; }
+  var lgs = (typeof fyLeagues !== 'undefined' && fyLeagues) ? fyLeagues : [];
+  for (var i = 0; i < lgs.length; i++) {
+    var k = String(lgs[i].league_key || '');
+    if (k === key) { continue; }
+    if (k.split('.l.')[0] !== game) { continue; }
+    if (_fyErrByLeague[k]) { continue; }
+    return k;
+  }
+  return '';
+}
+
+// LADDERPEER -- the four questions, asked of one league.
+async function _fyWalkOne(key, tok, say, tint) {
+  var rungs = [
+    { label: 'settings', p: '/league/' + key + '/settings' },
+    { label: 'teams', p: '/league/' + key + '/teams' },
+    { label: 'standings', p: '/league/' + key + '/standings' },
+    { label: 'scoreboard', p: '/league/' + key + '/scoreboard;out=matchups' }
+  ];
+  var r = { okBytes: 0, nOk: 0, nBad: 0, firstBad: '', bigOk: false };
+  for (var i = 0; i < rungs.length; i++) {
+    var t0 = Date.now();
+    try {
+      var res = await fetch(YAHOO_WORKER + '/api' + rungs[i].p,
+        { headers: { 'Authorization': 'Bearer ' + tok } });
+      var body = '';
+      try { body = await res.text(); } catch (eB) {}
+      var ms = Date.now() - t0;
+      if (res.ok) {
+        r.nOk++;
+        if (body.length > r.okBytes) { r.okBytes = body.length; }
+        if (i >= 2) { r.bigOk = true; }
+        say('<div style="color:#4ade80">' + tint + rungs[i].label + ': HTTP ' + res.status +
+          ' \u00b7 ' + ms + 'ms \u00b7 ' + _fyKB(body.length) + '</div>');
+      } else {
+        r.nBad++;
+        if (!r.firstBad) { r.firstBad = rungs[i].label; }
+        say('<div style="color:#f59e0b">' + tint + rungs[i].label + ': HTTP ' + res.status +
+          ' \u00b7 ' + ms + 'ms</div>');
+      }
+    } catch (e) {
+      r.nBad++;
+      if (!r.firstBad) { r.firstBad = rungs[i].label; }
+      say('<div style="color:#ef4444">' + tint + rungs[i].label + ': failed after ' +
+        (Date.now() - t0) + 'ms \u2014 nothing came back the browser would accept</div>');
+    }
+  }
+  return r;
+}
+
 async function _fyProbeLeagueLadder() {
   var out = document.getElementById('_fyLadderOut');
   var key = _fyWorstErrLeague();
@@ -198127,57 +198186,54 @@ async function _fyProbeLeagueLadder() {
     say('<div style="color:#f59e0b">No token available \u2014 reconnect Yahoo and try again.</div>');
     return;
   }
-  var rungs = [
-    { label: 'settings', p: '/league/' + key + '/settings' },
-    { label: 'teams', p: '/league/' + key + '/teams' },
-    { label: 'standings', p: '/league/' + key + '/standings' },
-    { label: 'scoreboard', p: '/league/' + key + '/scoreboard;out=matchups' }
-  ];
-  var okBytes = 0, nOk = 0, nBad = 0, firstBad = '';
-  for (var i = 0; i < rungs.length; i++) {
-    var t0 = Date.now();
-    try {
-      var res = await fetch(YAHOO_WORKER + '/api' + rungs[i].p,
-        { headers: { 'Authorization': 'Bearer ' + tok } });
-      var body = '';
-      try { body = await res.text(); } catch (eB) {}
-      var ms = Date.now() - t0;
-      if (res.ok) {
-        nOk++;
-        if (body.length > okBytes) { okBytes = body.length; }
-        say('<div style="color:#4ade80">' + rungs[i].label + ': HTTP ' + res.status +
-          ' \u00b7 ' + ms + 'ms \u00b7 ' + _fyKB(body.length) + '</div>');
-      } else {
-        nBad++;
-        if (!firstBad) { firstBad = rungs[i].label; }
-        say('<div style="color:#f59e0b">' + rungs[i].label + ': HTTP ' + res.status +
-          ' \u00b7 ' + ms + 'ms</div>');
-      }
-    } catch (e) {
-      nBad++;
-      if (!firstBad) { firstBad = rungs[i].label; }
-      say('<div style="color:#ef4444">' + rungs[i].label + ': failed after ' +
-        (Date.now() - t0) + 'ms \u2014 nothing came back the browser would accept</div>');
-    }
+  var bad = await _fyWalkOne(key, tok, say, '');
+
+  // LADDERPEER -- the same four questions at a clean league of the same
+  // sport, because "this league is odd" and "every league in this sport
+  // does this" look identical from one league alone.
+  var peer = _fyPeerLeague(key), peerR = null;
+  if (peer) {
+    say('<div style="color:#64748b;margin-top:6px">vs ' +
+      skEscapeMaybe(_fyLgName(peer)) + ' \u00b7 same sport, no failures</div>');
+    peerR = await _fyWalkOne(peer, tok, say, '\u2937 ');
   }
 
   var v;
-  if (!nBad) {
-    v = 'Every rung answered, the heaviest at ' + _fyKB(okBytes) + '. The endpoints are ' +
-        'fine and nothing about this league is special \u2014 so the failures were load, and ' +
-        'they will come back under load. Worth running again the moment it next goes wrong.';
-  } else if (nOk && firstBad !== 'settings') {
+  if (!bad.nBad && (!peerR || !peerR.nBad)) {
+    v = 'Every rung answered' + (peerR ? ' for both leagues' : '') + ', the heaviest at ' +
+        _fyKB(bad.okBytes) + '. The endpoints are fine and nothing about this league is ' +
+        'special \u2014 so the failures were load, and they will come back under load. Worth ' +
+        'running again the moment it next goes wrong.';
+  } else if (bad.firstBad === 'settings' && bad.nOk === 0) {
+    v = 'Even the smallest call fails, so this is not about the size of anything. The league ' +
+        'itself is being refused \u2014 check that it is still on the account and that the ' +
+        'token covers its sport.';
+  } else if (peerR && peerR.nBad && !peerR.bigOk) {
+    v = 'BOTH leagues fail on the big calls, and they are the same sport. So this is not ' +
+        'that one league \u2014 it is every league of this sport in the account, and the ' +
+        'cause is whatever makes this sport\u2019s standings and scoreboard heavier than the ' +
+        'ones that have been fine: more categories, bigger rosters, more teams playing on ' +
+        'the same day. The largest reply that got through anywhere here was ' +
+        _fyKB(Math.max(bad.okBytes, peerR.okBytes)) + ', which is the ceiling to raise. ' +
+        'The fix is on the Worker: stream the body straight through rather than buffering ' +
+        'and re-serialising it, and set the CORS headers on the error path too, so the next ' +
+        'one arrives as a real status instead of as \u201cFailed to fetch\u201d.';
+  } else if (peerR && !peerR.nBad) {
+    v = 'The other ' + skEscapeMaybe(_fyLgName(peer)) + ' answered every rung, up to ' +
+        _fyKB(peerR.okBytes) + ', while this one stops after ' + _fyKB(bad.okBytes) + '. ' +
+        'Same sport, same token, same minute \u2014 so it really is THIS league, not the ' +
+        'sport and not the connection. Something about its replies is bigger or stranger ' +
+        'than its neighbours\u2019: check its team count and scoring settings first.';
+  } else {
     v = 'The small answers come back and the big ones do not \u2014 the largest that got ' +
-        'through was ' + _fyKB(okBytes) + '. That is a size ceiling, not a connection: the ' +
-        'request reaches the Worker, the Worker falls over building the reply, and a reply ' +
-        'that never gets its CORS header can only ever reach the browser as ' +
+        'through was ' + _fyKB(bad.okBytes) + '. That is a size ceiling, not a connection: ' +
+        'the request reaches the Worker, the Worker falls over building the reply, and a ' +
+        'reply that never gets its CORS header can only ever reach the browser as ' +
         '\u201cFailed to fetch\u201d. The fix is on the Worker \u2014 stream the body straight ' +
         'through rather than buffering and re-serialising it, and make sure the error path ' +
-        'sets the CORS headers too, so the next one of these arrives as a real status.';
-  } else {
-    v = 'Even the smallest call fails, so this is not about the size of anything. The league ' +
-        'itself is being refused \u2014 check that it is still on the account and that the token ' +
-        'covers its sport.';
+        'sets the CORS headers too, so the next one of these arrives as a real status.' +
+        (peer ? '' : ' No clean league of the same sport to compare against, so this cannot ' +
+         'yet say whether the sport or the league is the thing.');
   }
   say('<div style="color:#e2e8f0;margin-top:6px;border-top:1px solid rgba(255,255,255,0.1);' +
     'padding-top:6px">' + v + '</div>');
