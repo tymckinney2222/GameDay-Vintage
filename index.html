@@ -200440,6 +200440,45 @@ function _skCallNeedsDraft(path) {
 // the data to be wrong.
 var FY_BATCH_MAX = 25;
 var FY_BATCH_TTL_MS = 10 * 60 * 1000;
+
+// \u2500\u2500 SCOREBATCH \u2500\u2500 How long a batched answer may be trusted.
+//
+// Ten minutes for everything was my shortcut and it is wrong where it
+// matters most: a scoreboard during a live game, or today's team stats
+// while he is watching the first NBA game of the season. A ten-minute-old
+// score is worse than no batching at all, because it is wrong rather than
+// merely slow.
+//
+// Settings never change. Standings move once a day. Rosters move when he
+// sets a lineup. Scores move every few seconds. A PAST day's stats never
+// move again.
+function _fyBatchTtl(kind, path) {
+  try {
+    var k = String(kind || '');
+    if (k.indexOf('settings') === 0) { return 30 * 60 * 1000; }
+    if (k.indexOf('scoreboard') === 0) { return 60 * 1000; }
+    if (k === 'teamstats') {
+      var today = (typeof _todayDateString === 'function') ? _todayDateString() : '';
+      if (today && String(path || '').indexOf(today) !== -1) { return 60 * 1000; }
+      return FY_BATCH_TTL_MS;   // a finished day is finished
+    }
+    return 5 * 60 * 1000;       // standings, rosters
+  } catch (e) { return 60 * 1000; }
+}
+
+// SCOREBATCH -- the same index lesson as the rosters, applied before it
+// bites. The league splitter assumed the payload sat at index 1; it does
+// for standings and settings, and I am not finding out the hard way
+// whether it does for scoreboards.
+function _fyLeaguePart(ent, want) {
+  try {
+    for (var j = 1; j < ent.length; j++) {
+      var p = ent[j];
+      if (p && typeof p === 'object' && !Array.isArray(p) && p[want]) { return p; }
+    }
+  } catch (e) {}
+  return null;
+}
 // TEAMCOALESCE -- per kind, because one number cannot say which of four
 // batches worked. "5 requests answered for 78 leagues" was true and told
 // me nothing about the roster batch contributing zero.
@@ -200528,10 +200567,16 @@ function _fyBatchSplit(data, suffix) {
       if (!ent) { continue; }
       var key = _fyBatchKeyOf(ent);
       if (!key) { continue; }
+      // SCOREBATCH -- find what we asked for wherever it sits, and hand
+      // back [meta, payload], which is what a single-league reply looks
+      // like and what every parser downstream reads.
+      var want = String(suffix || '').split(';')[0];
+      var part = _fyLeaguePart(ent, want);
+      if (!part) { continue; }
       fyDataCache['/league/' + key + '/' + suffix] = {
         t: Date.now(),
-        ttl: FY_BATCH_TTL_MS,
-        d: { fantasy_content: { league: ent } }
+        ttl: _fyBatchTtl(suffix, '/league/' + key + '/' + suffix),
+        d: { fantasy_content: { league: [ent[0], part] } }
       };
       n++;
     }
@@ -200699,7 +200744,7 @@ function _fyBatchRosterSplit(data) {
       if (!part) { continue; }
       fyDataCache['/league/' + lk + '/teams;is_owned_by_current_login=1/roster'] = {
         t: Date.now(),
-        ttl: FY_BATCH_TTL_MS,
+        ttl: _fyBatchTtl('rosters', ''),
         d: { fantasy_content: { league: [
           { league_key: lk },
           { teams: { count: 1, '0': { team: [teams[i][0], part] } } }
@@ -200747,7 +200792,12 @@ async function _fyBatchWarm(leagues) {
     var b = await _fyBatchPrefill(keys, 'settings');
     // ROSTERBATCH -- and every roster in the account, in one more request.
     var c = await _fyBatchRosters(leagues);
-    return a + b + c;
+    // SCOREBATCH -- the last per-league call in the sweep. Both shapes,
+    // because the app asks for it both ways and the cache key has to
+    // match the caller exactly.
+    var d = await _fyBatchPrefill(keys, 'scoreboard;out=matchups');
+    var e = await _fyBatchPrefill(keys, 'scoreboard');
+    return a + b + c + d + e;
   } catch (e) { return 0; }
 }
 
@@ -200799,7 +200849,7 @@ function _fyBatchTeamSplit(data, suffix) {
       var tpart = _fyTeamPart(teams[i], want);
       if (!tpart) { continue; }
       fyDataCache['/team/' + tk + '/' + suffix] = {
-        t: Date.now(), ttl: FY_BATCH_TTL_MS,
+        t: Date.now(), ttl: _fyBatchTtl('teamstats', suffix),
         d: { fantasy_content: { team: [teams[i][0], tpart] } }
       };
       n++;
