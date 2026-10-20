@@ -200580,13 +200580,32 @@ async function _fyBatchPrefill(keys, suffix) {
 //
 // Depth is capped because a reply is data, not something to trust with
 // an unbounded recursion.
+// \u2500\u2500 TEAMPART \u2500\u2500 The payload is not always at index 1.
+//
+// A single-team reply puts it there, which is why every parser in the app
+// reads team[1] and why the team-stats batch worked first time. The bulk
+// roster reply does not: the diagnostic found 39 teams carrying rosters
+// while the splitter, looking only at index 1, found none.
+//
+// So look along the array. Returns the element carrying what we want, or
+// null -- and null still means "not here", never a guess.
+function _fyTeamPart(teamArr, want) {
+  try {
+    for (var j = 1; j < teamArr.length; j++) {
+      var p = teamArr[j];
+      if (p && typeof p === 'object' && !Array.isArray(p) && p[want]) { return p; }
+    }
+  } catch (e) {}
+  return null;
+}
+
 function _fyFindTeams(node, out, depth, prop) {
   var want = prop || 'roster';
-  if (!node || typeof node !== 'object' || (depth || 0) > 12) { return out; }
+  if (!node || typeof node !== 'object' || (depth || 0) > 16) { return out; }
   try {
     if (Array.isArray(node) && node.length >= 2) {
-      var head = node[0], tail = node[1];
-      if (Array.isArray(head) && tail && typeof tail === 'object' && tail[want]) {
+      var head = node[0];
+      if (Array.isArray(head) && _fyTeamPart(node, want)) {
         for (var h = 0; h < head.length; h++) {
           if (head[h] && head[h].team_key) { out.push(node); return out; }
         }
@@ -200672,12 +200691,18 @@ function _fyBatchRosterSplit(data) {
       var tk = _fyTeamKeyOf(teams[i]);
       if (!tk || tk.indexOf('.t.') === -1) { continue; }
       var lk = tk.split('.t.')[0];
+      // TEAMPART -- rebuilt as [meta, payload], which is what a
+      // single-team reply looks like and what every parser downstream
+      // reads. Finding the roster at index 3 is no use if the app then
+      // goes looking at index 1.
+      var part = _fyTeamPart(teams[i], 'roster');
+      if (!part) { continue; }
       fyDataCache['/league/' + lk + '/teams;is_owned_by_current_login=1/roster'] = {
         t: Date.now(),
         ttl: FY_BATCH_TTL_MS,
         d: { fantasy_content: { league: [
           { league_key: lk },
-          { teams: { count: 1, '0': { team: teams[i] } } }
+          { teams: { count: 1, '0': { team: [teams[i][0], part] } } }
         ] } }
       };
       n++;
@@ -200768,9 +200793,14 @@ function _fyBatchTeamSplit(data, suffix) {
     for (var i = 0; i < teams.length; i++) {
       var tk = _fyTeamKeyOf(teams[i]);
       if (!tk) { continue; }
+      // TEAMPART -- same normalising here. This batch already worked,
+      // because its payload happened to sit at index 1; it has no reason
+      // to depend on that.
+      var tpart = _fyTeamPart(teams[i], want);
+      if (!tpart) { continue; }
       fyDataCache['/team/' + tk + '/' + suffix] = {
         t: Date.now(), ttl: FY_BATCH_TTL_MS,
-        d: { fantasy_content: { team: teams[i] } }
+        d: { fantasy_content: { team: [teams[i][0], tpart] } }
       };
       n++;
     }
