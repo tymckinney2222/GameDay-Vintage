@@ -197766,6 +197766,30 @@ async function _fyRefreshTokens() {
 // ══════════════════════════════════════════════════════════════════
 var _fyHealth = { log: [], max: 60 };
 
+// ── ERRBYLEAGUE ── A running count of failures per league.
+//
+// The log holds sixty entries and successes share it, so during a sweep
+// the errors are evicted within seconds of landing -- which is why the
+// error list could show eight failures without ever revealing whether
+// they came from two leagues or from all seventeen. That difference is
+// the diagnosis: a few leagues in an awkward state is a different fault
+// from a fan-out that is too wide, and they need different fixes.
+//
+// Kept for the session, never trimmed, counted once per CALL rather than
+// per attempt (the retry merge below returns before reaching this).
+var _fyErrByLeague = {};
+function _fyErrNote(kind, path) {
+  try {
+    if (!kind || kind === 'ok') { return; }
+    var m = String(path || '').match(/(\d+\.l\.\d+)/);
+    var k = m ? m[1] : '_account';
+    var e = _fyErrByLeague[k];
+    if (!e) { e = _fyErrByLeague[k] = { n: 0, kinds: {} }; }
+    e.n++;
+    e.kinds[kind] = (e.kinds[kind] || 0) + 1;
+  } catch (eN) {}
+}
+
 function _fyHealthRecord(kind, status, path, errText, ms, isRetry) {
   // ── FYHRETRY ── A network failure is attempted again inside fyApi, and
   // BOTH attempts used to land on the board as separate errors. Four failing
@@ -197793,6 +197817,7 @@ function _fyHealthRecord(kind, status, path, errText, ms, isRetry) {
   // most useful number for telling causes apart: an instant failure means
   // the connection was refused outright, while one that dies after seconds
   // was accepted and then dropped. FYHMS
+  _fyErrNote(kind, path);   // ERRBYLEAGUE -- once per call, not per attempt
   _fyHealth.log.push({ t: Date.now(), kind: kind, status: status || 0, path: path || '',
     err: errText ? String(errText).slice(0, 400) : '', ms: (ms != null ? ms : null),
     attempts: 1 });   // FYHRETRY
@@ -198038,6 +198063,49 @@ function _fyProbeLastFailure() {
   });
 }
 
+// ── ERRBYLEAGUE ── The readout. Heaviest league first, because the shape
+// of the list IS the answer: one or two leagues carrying every failure is
+// a league problem, an even spread across all of them is a load problem.
+function _fyErrLeagueBlock() {
+  try {
+    var keys = [], k;
+    for (k in _fyErrByLeague) {
+      if (_fyErrByLeague.hasOwnProperty(k)) { keys.push(k); }
+    }
+    if (!keys.length) { return ''; }
+    keys.sort(function (a, b) { return _fyErrByLeague[b].n - _fyErrByLeague[a].n; });
+    var total = 0;
+    for (var t = 0; t < keys.length; t++) { total += _fyErrByLeague[keys[t]].n; }
+    var lgs = (typeof fyLeagues !== 'undefined' && fyLeagues) ? fyLeagues : [];
+    var h = '<div style="color:#94a3b8;font-size:11px;margin:16px 0 4px">' +
+      'Failures by league (' + total + ' across ' + keys.length + ' this session)</div>';
+    for (var i = 0; i < keys.length; i++) {
+      var key = keys[i], ent = _fyErrByLeague[key];
+      var nm = (key === '_account') ? '\u2014 account-level calls' : key, ds = '';
+      for (var j = 0; j < lgs.length; j++) {
+        if (lgs[j].league_key === key) {
+          nm = lgs[j].name || key;
+          ds = String(lgs[j].draft_status || '');
+          break;
+        }
+      }
+      var parts = [], kk;
+      for (kk in ent.kinds) {
+        if (ent.kinds.hasOwnProperty(kk)) { parts.push(kk + '\u00d7' + ent.kinds[kk]); }
+      }
+      h += '<div style="display:flex;gap:8px;font-size:10px;padding:3px 0;' +
+        'border-bottom:1px solid rgba(255,255,255,0.05)">' +
+        '<span style="color:#e2e8f0;flex:1;min-width:0;overflow:hidden;' +
+          'text-overflow:ellipsis;white-space:nowrap">' + skEscapeMaybe(nm) + '</span>' +
+        (ds ? '<span style="color:#64748b">' + skEscapeMaybe(ds) + '</span>' : '') +
+        '<span style="color:#64748b">' + skEscapeMaybe(parts.join(' ')) + '</span>' +
+        '<span style="color:#fbbf24;font-weight:700">' + ent.n + '</span>' +
+        '</div>';
+    }
+    return h;
+  } catch (e) { return ''; }
+}
+
 // Tap the health dot / refresh area to see a quick breakdown overlay.
 function skShowApiHealth() {
   var s2 = _fyHealthSummary(120000);
@@ -198103,6 +198171,8 @@ function skShowApiHealth() {
     (_fyPathColdCount() ? row('\ud83e\uddca Set aside (repeat failures)', _fyPathColdCount(), '#7dd3fc') : '') +
     // PRESEASON7 -- calls not made because the day predates the season.
     (_skPreSkipCount() ? row('\ud83d\udcc5 Before the season (skipped)', _skPreSkipCount(), '#7dd3fc') : '') +
+    // PREDRAFT0 -- calls not made because the league has not drafted.
+    (_skPreDraftSkipCount() ? row('\ud83c\udfb2 Before the draft (skipped)', _skPreDraftSkipCount(), '#7dd3fc') : '') +
     // FYHPING — one tap, one unauthenticated call, a straight answer.
     '<div style="margin:14px 0 4px">' +
       '<button onclick="_fyPingWorker()" style="padding:8px 12px;border-radius:8px;border:1px solid rgba(255,255,255,0.2);' +
@@ -198114,6 +198184,8 @@ function skShowApiHealth() {
       'font-weight:700;letter-spacing:0.06em">DIAGNOSE LAST FAILURE</button>' +
       '<div id="_fyProbeOut" style="font-size:10px;margin-top:6px;line-height:1.5"></div>' +
     '</div>' +
+    // ERRBYLEAGUE -- the shape of this list says which fault it is.
+    _fyErrLeagueBlock() +
     // PRESEASON6 -- what the app believes about each league's season.
     // Two guesses at this from the outside were two too many.
     _skSeasonDatesBlock() +
@@ -199546,7 +199618,39 @@ function _skDatedCallIsPreSeason(path) {
   } catch (e) { return false; }
 }
 
+// ── PREDRAFT0 ── A league that has not drafted has no roster and no stats.
+//
+// Yahoo says so plainly in draft_status. The app already checks it in
+// seven separate places, which is six more than it should need and still
+// does not cover the Wire, the Plan scan or the fantasy panel -- each of
+// those builds its own calls. PRESEASON7 moved the season-date question
+// to the door for exactly this reason; this is the same question one step
+// earlier, asked where every call already passes.
+//
+// Only the calls that NEED a drafted team are refused. Settings, draft
+// results and the league itself stay open, because those are how the app
+// finds anything out about a league in that state. And an absent
+// draft_status is not a pre-draft league: silence is never inferred.
+var _skPreDraftSkips = 0;
+function _skPreDraftSkipCount() { return _skPreDraftSkips; }
+function _skCallNeedsDraft(path) {
+  try {
+    var p = String(path || '');
+    var lk = p.match(/(\d+\.l\.\d+)/);
+    if (!lk) { return false; }
+    if (typeof _skLeagueNotStarted !== 'function') { return false; }
+    var ns = _skLeagueNotStarted(lk[1]);
+    if (!ns || ns.reason !== 'predraft') { return false; }
+    return /\/roster|\/scoreboard|\/matchups|type=date|type=week|\/stats/.test(p);
+  } catch (e) { return false; }
+}
+
 async function fyApi(path) {
+  // PREDRAFT0 -- no draft means no roster and no stats to ask for.
+  if (_skCallNeedsDraft(path)) {
+    _skPreDraftSkips++;
+    return { error: 'League has not drafted yet', _predraft: true, _skip: true };
+  }
   // PRESEASON7 -- a day before this league's season has nothing in it, and
   // asking produces an error the proxy cannot attach CORS headers to, which
   // the browser then reports as a network failure on a healthy connection.
