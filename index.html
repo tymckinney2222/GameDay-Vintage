@@ -214284,7 +214284,7 @@ function espHasRotoPressure(row) {
 // rebuild has been checked against ESPN's own published season rate. One
 // that fails, or has no recipe (GAA has none; the goalie time unit was never
 // confirmed), holds at its season value and is named.
-function _espRotoLiveStats(row) {
+function _espRotoLiveStats(row, opts) {
   var game = (typeof _espSsGame === 'function') ? _espSsGame(row) : 'fhl';
   var teamsRaw = ((row.raw || {}).teams) || [];
   if (!teamsRaw.length) return null;
@@ -214332,7 +214332,12 @@ function _espRotoLiveStats(row) {
     seen[id] = 1;
     if (!espIsRate(game, id)) continue;
     var label = (typeof espStatLabel === 'function') ? (espStatLabel(game, id) || ('#' + id)) : ('#' + id);
-    var ok = 0, bad = 0, t2;
+    // ROTOFIRSTRATE -- these were one counter, and that was the bug. A
+    // rebuild that CONTRADICTS ESPN is evidence the recipe is wrong. A
+    // rebuild that could not run at all, because the season carries nothing
+    // to divide, is evidence of nothing whatever. Counting them together
+    // made an empty season look like a failed check.
+    var ok = 0, badMismatch = 0, badNoData = 0, t2;
     // ESPHELDWHY - keep the first disagreement, with its parts. "The rebuild
     // disagreed" is true and unactionable; the two numbers and the components
     // behind them are what says whether the recipe is wrong, the denominator
@@ -214349,9 +214354,11 @@ function _espRotoLiveStats(row) {
         if (!isNaN(vn)) dry[k] = vn;
       }
       var mine = _espApplyRates(dry, game)[id];
-      if (mine == null || !isFinite(mine)) { bad++; continue; }
+      // Nothing to divide: 0/0 on a season that has not started. Not a
+      // disagreement.
+      if (mine == null || !isFinite(mine)) { badNoData++; continue; }
       if (Math.abs(mine - pub) > Math.max(0.0015, Math.abs(pub) * 0.005)) {
-        bad++;
+        badMismatch++;
         if (!_ex) _ex = { pub: pub, mine: mine, dry: dry };
       } else ok++;
     }
@@ -214379,7 +214386,36 @@ function _espRotoLiveStats(row) {
       }
       denStuck = (numMoved && !denMoved);
     }
+    var bad = badMismatch + badNoData;
     if (ok >= 2 && !bad && !denStuck) { rebuilt.push(label); continue; }
+    // ROTOFIRSTRATE -- opening night. Every rebuild was 0/0 and NOT ONE
+    // contradicted ESPN, because there was nothing to contradict. Holding
+    // the rate here does not protect him from a wrong number, it hands him
+    // a wrong one: .000 for every team, all ten tied, and a roto total five
+    // points under what ESPN shows.
+    //
+    // Carried only when the caller asked for it, which is only the
+    // provisional board, which already says it is today-only and unchecked.
+    // One contradicting team anywhere, and this door is shut.
+    if (opts && opts.unverifiedRatesOk &&
+        ok === 0 && badMismatch === 0 && badNoData > 0) {
+      // A team that has not played has no quotient -- 0 attempts over 0 --
+      // and _espApplyRates leaves it empty. Empty is not absent: ESPN ranks
+      // those teams at .000 and so must this, or only the teams who played
+      // get ranked and the ladder runs 1..5 instead of 1..10. That scored
+      // his FT% dead last on .857 and came out five points BELOW where it
+      // started. The season's published value is that .000.
+      for (t2 = 0; t2 < teamsRaw.length; t2++) {
+        var tkU = String(teamsRaw[t2].id);
+        if (!vals[tkU]) { continue; }
+        var curU = vals[tkU][id];
+        if (curU != null && isFinite(curU)) { continue; }
+        var svU = (seasonOnly[tkU] || {})[id];
+        if (svU != null) { vals[tkU][id] = Number(svU); }
+      }
+      rebuilt.push(label + ' (unverified \u2014 the season has nothing to check it against)');
+      continue;
+    }
     // ESPROTOLIVE3 - name the actual obstacle. A rate held back is the
     // difference between a live total and one that still matches the
     // provider's, so "why" has to be on screen, not inferred.
@@ -214414,7 +214450,13 @@ function _espRotoLiveStats(row) {
       }
       why = miss.length
         ? ('ESPN\u2019s team totals carry no ' + miss.join(' or '))
-        : (ok ? 'rebuild disagreed with ESPN on some teams' : 'rebuild disagreed with ESPN');
+        // ROTOFIRSTRATE -- "disagreed" was being printed for a rebuild that
+        // never ran. On opening night every one is 0/0, which is absence,
+        // not disagreement, and saying the wrong one sends him looking in
+        // the wrong place.
+        : (!badMismatch && badNoData
+            ? 'the season carries no attempts yet, so the rebuild had nothing to check against'
+            : (ok ? 'rebuild disagreed with ESPN on some teams' : 'rebuild disagreed with ESPN'));
       // ESPHELDWHY - a worked example, in the league's own formatting.
       if (!miss.length && _ex) {
         function _fq(v, sid) {
@@ -214526,7 +214568,11 @@ function _espRotoLiveView(row) {
 // silently, this says on its face what it is.
 function _espRotoProvisionalHtml(row) {
   try {
-    var ls = (typeof _espRotoLiveStats === 'function') ? _espRotoLiveStats(row) : null;
+    // ROTOFIRSTRATE -- the one caller allowed to carry a rate the season
+    // cannot vouch for. The settled view below calls this with no options
+    // and behaves exactly as it always has.
+    var ls = (typeof _espRotoLiveStats === 'function')
+      ? _espRotoLiveStats(row, { unverifiedRatesOk: true }) : null;
     if (!ls || !ls.vals) { return ''; }
     var live = _espRotoAdapt(row, ls.vals);
     // Nothing played anywhere yet is still a level league, and that is the
