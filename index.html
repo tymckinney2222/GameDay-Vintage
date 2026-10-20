@@ -129453,6 +129453,19 @@ function _skWireKickLabel(ms) {
 async function skScanWireLeague(league) {
   var key = league.league_key;
   var dateStr = skYesterdayDateString();
+  // ── WIREPRE ── A league whose season had not begun on that day has
+  // nothing to report, and the scan walks EVERY synced league at once --
+  // so seventeen leagues drafted for a season starting today meant
+  // seventeen doomed calls in a single breath, which is enough on its own
+  // to fill the pipe before anything useful reaches it.
+  //
+  // Unknown stays unknown: no start date means the scan proceeds exactly
+  // as it always did.
+  try {
+    var _wStart = (typeof _skSeasonStartFor === 'function')
+      ? _skSeasonStartFor(key) : '';
+    if (_wStart && String(dateStr) < String(_wStart)) { return; }
+  } catch (eWp) {}
   var scoringType = _skWireScoringType(league);   // WIREFMT
 
   // Pull team identity from the live data cache (populated by
@@ -199391,6 +199404,24 @@ function _fyGateLeave() {
   if (_fyInflight > 0) _fyInflight--;
 }
 
+// ── FYGATESLEEP ── Wait WITHOUT holding a slot.
+//
+// The retry delays used to run inside the gate, because the release is in
+// fyApi's finally and that does not run until the retries are finished. So
+// a call that failed sat on one of the five slots for the whole of its
+// 700ms and 1800ms pauses, doing nothing. A burst of failures parks every
+// slot in setTimeout, the queue behind them stops moving, and more
+// failures take the freed slots and sleep on those too -- which is how a
+// handful of bad leagues stalls an entire account, and why three leagues
+// at a time worked where seventeen did not.
+//
+// The wait is unchanged. It simply happens where it costs nothing.
+async function _fyGateSleep(ms) {
+  _fyGateLeave();
+  await new Promise(function (resolve) { setTimeout(resolve, ms); });
+  await _fyGateEnter();
+}
+
 // ── FYNETBRK ── Retry a dropped call once, but know when to stop.
 // One quiet retry rescues a blip. Retrying every call when the connection
 // itself is gone just triples the damage and fills the panel with noise,
@@ -199534,7 +199565,8 @@ async function fyApi(path) {
     var result = await _fyApiOnce(path);
     if (result && result.error && result._server) {
       // Transient 5xx — wait briefly, then try exactly once more.
-      await new Promise(function(resolve){ setTimeout(resolve, 700); });
+      // FYGATESLEEP -- the slot goes back while we wait.
+      await _fyGateSleep(700);
       var retry = await _fyApiOnce(path);
       if (!retry || !retry.error) return retry; // recovered — logged as a clean "ok"
       // Retry also failed. NOW log the failure to health so it's visible, using
@@ -199566,7 +199598,8 @@ async function fyApi(path) {
         // after the burst that caused it, not to spend another half minute.
         var _delays = result._timeout ? [1500] : [700, 1800], again = result;
         for (var _a = 0; _a < _delays.length; _a++) {
-          await new Promise(function (resolve) { setTimeout(resolve, _delays[_a]); });
+          // FYGATESLEEP -- waiting here used to hold one of the five slots.
+          await _fyGateSleep(_delays[_a]);
           again = await _fyApiOnce(path, true);   // FYHRETRY — marked as a retry
           if (!again || !again.error) {
             _fyPathNote(path, true);
