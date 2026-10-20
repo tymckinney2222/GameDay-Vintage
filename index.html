@@ -210486,6 +210486,50 @@ function _espSeasonStatsHtml(row, mode) {
     });
   }
 
+  // \u2500\u2500 ROTOONENUMBER \u2500\u2500 TOT, the way ESPN's own standings lead with it.
+  //
+  // His question was the right one: the app can already produce every team's
+  // roto points -- it does it for the pressure board -- so they should be
+  // visible next to the category figures they are built from, for the whole
+  // league and not just his row.
+  //
+  // DAILY shows the LIVE total, season plus today, which is the number ESPN
+  // shows beside its daily stats. SEASON shows the published ladder, which on
+  // opening night is every team level on 44. Same table, two honest answers.
+  var rotoTot = null;
+  if (typeof extFormatKey === 'function' && extFormatKey(row) === 'roto') {
+    try {
+      var _ra = null;
+      if (mode === 'daily' && typeof _espRotoLiveStats === 'function') {
+        var _rls = _espRotoLiveStats(row);
+        _ra = _rls ? _espRotoAdapt(row, _rls.vals) : null;
+      } else if (typeof _espRotoAdapt === 'function') {
+        _ra = _espRotoAdapt(row);
+      }
+      if (_ra && _ra.allTeams) {
+        rotoTot = {};
+        for (var _rk in _ra.allTeams) {
+          if (!_ra.allTeams.hasOwnProperty(_rk)) { continue; }
+          var _sum = 0, _cp = _ra.allTeams[_rk].catPoints || {}, _ci;
+          for (_ci in _cp) { if (_cp.hasOwnProperty(_ci)) { _sum += _cp[_ci]; } }
+          rotoTot[String(_rk)] = Math.round(_sum * 10) / 10;
+        }
+      }
+    } catch (eRT) { rotoTot = null; }
+  }
+  // Ordered by the total, as ESPN orders it -- on a night when the published
+  // ladder is ten teams level, standings order is no order at all. An
+  // explicitly chosen column still wins.
+  if (rotoTot && !sort) {
+    srows.sort(function (a, b) {
+      var pa = rotoTot[String(a.teamId)], pb = rotoTot[String(b.teamId)];
+      if (pa == null && pb == null) { return 0; }
+      if (pa == null) { return 1; }
+      if (pb == null) { return -1; }
+      return pb - pa;
+    });
+  }
+
   var myIds = row.myTeamIds || {};
   var accent = extProvAccent('espn');
   var mono = 'font-family:var(--sk-font-mono,monospace);';
@@ -210502,7 +210546,8 @@ function _espSeasonStatsHtml(row, mode) {
   // Group header. colspan 0 is invalid, so a group with no columns is simply
   // not emitted — an NBA/NHL league puts everything in one group.
   h += '<thead><tr style="color:rgba(255,255,255,0.3);font-size:9px;letter-spacing:0.1em;">' +
-    '<th style="' + stick + cellPad + 'text-align:left;"></th>';
+    '<th style="' + stick + cellPad + 'text-align:left;"></th>' +
+    (rotoTot ? '<th style="' + cellPad + '"></th>' : '');
   if (cols.bat.length) {
     h += '<th colspan="' + cols.bat.length + '" style="' + cellPad +
       'text-align:center;border-bottom:1px solid rgba(255,255,255,0.10);">' +
@@ -210519,7 +210564,11 @@ function _espSeasonStatsHtml(row, mode) {
   h += '<tr style="color:rgba(255,255,255,0.42);font-size:9px;letter-spacing:0.08em;">' +
     '<th onclick="espSetSsSort(\'' + kAttr + '\',\'\')" ' +
       'style="' + stick + cellPad + 'text-align:left;cursor:pointer;' +
-      (sort ? '' : 'color:#ef4444;') + '">TEAM</th>';
+      (sort ? '' : 'color:#ef4444;') + '">TEAM</th>' +
+    (rotoTot
+      ? '<th style="' + cellPad + 'color:rgba(255,255,255,0.62);' +
+        'border-right:1px solid rgba(255,255,255,0.10);">TOT</th>'
+      : '');
   for (i = 0; i < all.length; i++) {
     var first = (cols.bat.length && i === cols.bat.length);
     var on = !!(sort && sort.id === all[i].id);
@@ -210541,7 +210590,14 @@ function _espSeasonStatsHtml(row, mode) {
       '<td style="' + stick + cellPad + 'text-align:left;max-width:118px;overflow:hidden;' +
       'text-overflow:ellipsis;' + (mine ? 'background:#1a0f13;' : '') +
       'color:' + (mine ? accent + ';font-weight:700' : 'rgba(255,255,255,0.82)') + ';">' +
-      slEsc(t && t.abbrev ? t.abbrev : (sr.teamName || '?')) + '</td>';
+      slEsc(t && t.abbrev ? t.abbrev : (sr.teamName || '?')) + '</td>' +
+      (rotoTot
+        ? ('<td style="' + cellPad + mono + bg +
+           'border-right:1px solid rgba(255,255,255,0.10);font-weight:700;' +
+           'color:' + (mine ? accent : 'rgba(255,255,255,0.92)') + ';">' +
+           (rotoTot[String(sr.teamId)] == null
+             ? '\u2014' : slEsc(String(rotoTot[String(sr.teamId)]))) + '</td>')
+        : '');
     for (j = 0; j < all.length; j++) {
       var v = vb ? vb[all[j].id] : null;
       var edge = (cols.bat.length && j === cols.bat.length)
@@ -214397,8 +214453,19 @@ function _espRotoLiveStats(row, opts) {
     // Carried only when the caller asked for it, which is only the
     // provisional board, which already says it is today-only and unchecked.
     // One contradicting team anywhere, and this door is shut.
-    if (opts && opts.unverifiedRatesOk &&
-        ok === 0 && badMismatch === 0 && badNoData > 0) {
+    // ROTOONENUMBER -- this used to require opts.unverifiedRatesOk, which
+    // meant the pressure board matched ESPN and the league card did not.
+    // Two numbers for one team in one app is a worse failure than either
+    // alone, and the opt-in bought nothing: the condition below is a fact
+    // about the data, not a judgement the caller is better placed to make.
+    //
+    // What earned the change is his screenshot. All ten teams reconciled
+    // against ESPN's published standings once the rates were carried. The
+    // label was guarding against a number nobody could check; this one has
+    // been checked, against the provider, and it agrees.
+    //
+    // A rebuild that CONTRADICTS ESPN is still held, everywhere, always.
+    if (ok === 0 && badMismatch === 0 && badNoData > 0) {
       // A team that has not played has no quotient -- 0 attempts over 0 --
       // and _espApplyRates leaves it empty. Empty is not absent: ESPN ranks
       // those teams at .000 and so must this, or only the teams who played
@@ -214568,11 +214635,7 @@ function _espRotoLiveView(row) {
 // silently, this says on its face what it is.
 function _espRotoProvisionalHtml(row) {
   try {
-    // ROTOFIRSTRATE -- the one caller allowed to carry a rate the season
-    // cannot vouch for. The settled view below calls this with no options
-    // and behaves exactly as it always has.
-    var ls = (typeof _espRotoLiveStats === 'function')
-      ? _espRotoLiveStats(row, { unverifiedRatesOk: true }) : null;
+    var ls = (typeof _espRotoLiveStats === 'function') ? _espRotoLiveStats(row) : null;
     if (!ls || !ls.vals) { return ''; }
     var live = _espRotoAdapt(row, ls.vals);
     // Nothing played anywhere yet is still a level league, and that is the
