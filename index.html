@@ -198350,6 +198350,52 @@ function _fyRateBlock() {
   } catch (e) { return ''; }
 }
 
+// \u2500\u2500 BULKDIAG \u2500\u2500 Why a bulk call filled nothing.
+//
+// A zero in the breakdown has two completely different causes -- the
+// request failed, or it answered and the parser did not recognise what
+// came back -- and they need opposite fixes. This says which, and for the
+// second shows the shape so the parser can be written against the real
+// thing rather than against documentation.
+function _fyBulkDiagBlock() {
+  try {
+    var kinds = [], k;
+    for (k in _fyBatchDiag) {
+      if (_fyBatchDiag.hasOwnProperty(k)) { kinds.push(k); }
+    }
+    if (!kinds.length) { return ''; }
+    kinds.sort();
+    var rows = '';
+    for (var i = 0; i < kinds.length; i++) {
+      var d = _fyBatchDiag[kinds[i]];
+      var ago = Math.round((Date.now() - d.at) / 1000);
+      var head = '<div style="color:' + (d.found ? '#4ade80' : '#f59e0b') + '"><b>' +
+        skEscapeMaybe(kinds[i]) + '</b> \u00b7 ' +
+        (d.ok ? ('answered, ' + d.found + ' filled') : 'failed') +
+        ' \u00b7 ' + ago + 's ago</div>';
+      var detail = d.ok
+        ? (d.found ? '' :
+           '<div style="color:#94a3b8;margin-top:2px">It answered and nothing was ' +
+           'recognised in it \u2014 so this is the parser, not the connection. The shape ' +
+           'below is what came back.</div>' +
+           '<div style="color:#64748b;margin-top:3px;white-space:pre-wrap;' +
+           'word-break:break-all;font-size:9px;line-height:1.35">' +
+           skEscapeMaybe(d.shape) + '</div>')
+        : ('<div style="color:#cbd5e1;margin-top:2px;word-break:break-word">' +
+           skEscapeMaybe(d.err) + '</div>');
+      rows += '<div style="padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.06)">' +
+        head + detail +
+        '<div style="color:#475569;margin-top:3px;word-break:break-all">' +
+        skEscapeMaybe(d.path) + '</div></div>';
+    }
+    return '<div style="color:#94a3b8;font-size:11px;margin:16px 0 4px">' +
+      'Bulk calls \u2014 what came back</div>' +
+      '<div style="background:#0d1220;border:1px solid rgba(255,255,255,0.08);' +
+      'border-radius:8px;padding:8px;font-size:10px;line-height:1.5;color:#cbd5e1">' +
+      rows + '</div>';
+  } catch (e) { return ''; }
+}
+
 // \u2500\u2500 BLACKOUT \u2500\u2500 The probe's answer, on its own, kept.
 //
 // This used to print inside the rate block, and the rate block prints
@@ -198618,6 +198664,8 @@ function skShowApiHealth() {
       'font-weight:700;letter-spacing:0.06em">WALK THE FAILING LEAGUE</button>' +
       '<div id="_fyLadderOut" style="font-size:10px;margin-top:6px;line-height:1.5"></div>' +
     '</div>' +
+    // BULKDIAG -- why a bulk call filled nothing, with the shape to prove it.
+    _fyBulkDiagBlock() +
     // BLACKOUT -- the probe's answer, which must never go missing again.
     _fyEdgeBlock() +
     // EDGEPROBE -- the rate the app was asking at.
@@ -200389,6 +200437,45 @@ var FY_BATCH_TTL_MS = 10 * 60 * 1000;
 // me nothing about the roster batch contributing zero.
 var _fyBatch = { requests: 0, filled: 0, at: 0,
                  kinds: { standings: 0, settings: 0, rosters: 0, teamstats: 0 } };
+// \u2500\u2500 BULKDIAG \u2500\u2500 What came back, structurally.
+//
+// Keys and array lengths, never values. Enough to see where Yahoo puts
+// things and nothing that belongs to anybody. Depth- and width-capped,
+// because a reply is data and this has to terminate on anything.
+function _fyShape(node, depth, prefix, out) {
+  if (out.length >= 36 || depth > 7) { return out; }
+  try {
+    if (Array.isArray(node)) {
+      out.push(prefix + '[' + node.length + ']');
+      if (node.length > 0) { _fyShape(node[0], depth + 1, prefix + '[0]', out); }
+      if (node.length > 1) { _fyShape(node[1], depth + 1, prefix + '[1]', out); }
+    } else if (node && typeof node === 'object') {
+      var ks = Object.keys(node).slice(0, 6);
+      out.push(prefix + '{' + ks.join(',') + '}');
+      for (var i = 0; i < ks.length && out.length < 36; i++) {
+        _fyShape(node[ks[i]], depth + 1, prefix + '.' + ks[i], out);
+      }
+    }
+  } catch (e) {}
+  return out;
+}
+
+// BULKDIAG -- the last attempt at each bulk call, kept so it can be read
+// rather than reasoned about.
+var _fyBatchDiag = {};
+function _fyBatchNote(kind, path, res, found) {
+  try {
+    _fyBatchDiag[kind] = {
+      at: Date.now(),
+      path: String(path || '').slice(0, 90),
+      ok: !!(res && !res.error),
+      err: (res && res.error) ? String(res.error).slice(0, 180) : '',
+      found: found || 0,
+      shape: (res && !res.error) ? _fyShape(res, 0, '', []).join('\n') : ''
+    };
+  } catch (e) {}
+}
+
 function _fyBatchKind(kind, n) {
   try {
     if (!_fyBatch.kinds[kind]) { _fyBatch.kinds[kind] = 0; }
@@ -200447,13 +200534,16 @@ async function _fyBatchPrefill(keys, suffix) {
   var filled = 0;
   for (i = 0; i < chunks.length; i++) {
     try {
-      var res = await fyApi('/leagues;league_keys=' + chunks[i].join(',') + '/' + suffix);
+      var _bp = '/leagues;league_keys=' + chunks[i].join(',') + '/' + suffix;
+      var res = await fyApi(_bp);
       _fyBatch.requests++;
+      var got = 0;
       if (res && !res.error) {
-        var got = _fyBatchSplit(res, suffix);
+        got = _fyBatchSplit(res, suffix);
         filled += got;
         _fyBatchKind(suffix, got);   // TEAMCOALESCE
       }
+      _fyBatchNote(suffix, _bp, res, got);   // BULKDIAG
     } catch (e) {}
   }
   if (filled) {
@@ -200540,11 +200630,12 @@ async function _fyBatchRosters(leagues) {
       if (g && !games[g]) { games[g] = 1; list.push(g); }
     }
     if (!list.length) { return 0; }
-    var res = await fyApi('/users;use_login=1/games;game_keys=' + list.join(',') +
-      '/teams/roster');
+    var _rp = '/users;use_login=1/games;game_keys=' + list.join(',') + '/teams/roster';
+    var res = await fyApi(_rp);
     _fyBatch.requests++;
-    if (!res || res.error) { return 0; }
+    if (!res || res.error) { _fyBatchNote('rosters', _rp, res, 0); return 0; }
     var filled = _fyBatchRosterSplit(res);
+    _fyBatchNote('rosters', _rp, res, filled);   // BULKDIAG
     _fyBatchKind('rosters', filled);   // TEAMCOALESCE
     if (filled) { _fyBatch.filled += filled; _fyBatch.at = Date.now(); }
     return filled;
@@ -200584,17 +200675,29 @@ var FY_COALESCE_MAX = 25;
 var _fyCoalesceQ = {};
 
 function _fyTeamCall(path) {
-  var m = String(path || '').match(
+  // BULKDIAG -- TWO shapes, not one. I matched only the bare stats form,
+  // and his error list was full of the other: _skRosterStatsPath builds
+  // the chained one, and that is what the Wire and the week strip use. So
+  // "team stats 0" may have meant the coalescer never saw a single call
+  // it recognised, which is a different problem from a parser that cannot
+  // read the reply -- and the readout above will now say which.
+  var p = String(path || '');
+  var m = p.match(
     /^\/team\/(\d+\.l\.\d+\.t\.\d+)\/(stats;type=date;date=\d{4}-\d{2}-\d{2})$/);
-  if (!m) { return null; }
-  return { team: m[1], suffix: m[2] };
+  if (m) { return { team: m[1], suffix: m[2], prop: 'team_stats' }; }
+  m = p.match(
+    /^\/team\/(\d+\.l\.\d+\.t\.\d+)\/(roster;date=\d{4}-\d{2}-\d{2}\/players\/stats;type=date;date=\d{4}-\d{2}-\d{2})$/);
+  if (m) { return { team: m[1], suffix: m[2], prop: 'roster' }; }
+  return null;
 }
 
 // Put each team's answer back in the shape its own call returns.
 function _fyBatchTeamSplit(data, suffix) {
   var n = 0;
   try {
-    var teams = _fyFindTeams(data, [], 0, 'team_stats');
+    // The chained form carries a roster; the bare one carries team_stats.
+    var want = (String(suffix || '').indexOf('roster;') === 0) ? 'roster' : 'team_stats';
+    var teams = _fyFindTeams(data, [], 0, want);
     for (var i = 0; i < teams.length; i++) {
       var tk = _fyTeamKeyOf(teams[i]);
       if (!tk) { continue; }
@@ -200616,13 +200719,16 @@ function _fyCoalesceFire(suffix) {
   (function () {
     return (async function () {
       try {
-        var res = await fyApi('/teams;team_keys=' + b.list.join(',') + '/' + suffix, true);
+        var _tp = '/teams;team_keys=' + b.list.join(',') + '/' + suffix;
+        var res = await fyApi(_tp, true);
         _fyBatch.requests++;
+        var got = 0;
         if (res && !res.error) {
-          var got = _fyBatchTeamSplit(res, suffix);
+          got = _fyBatchTeamSplit(res, suffix);
           _fyBatchKind('teamstats', got);
           if (got) { _fyBatch.filled += got; _fyBatch.at = Date.now(); }
         }
+        _fyBatchNote('teamstats', _tp, res, got);   // BULKDIAG
       } catch (e) {}
       // Hand each caller its own answer. Anything the batch did not cover
       // simply asks for itself, which is what it would have done anyway.
