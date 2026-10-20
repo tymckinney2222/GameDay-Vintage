@@ -198309,6 +198309,12 @@ function skShowApiHealth() {
       'font-weight:700;letter-spacing:0.06em">WALK THE FAILING LEAGUE</button>' +
       '<div id="_fyLadderOut" style="font-size:10px;margin-top:6px;line-height:1.5"></div>' +
     '</div>' +
+    // NETSPREAD -- is the breaker up, and what put it there.
+    (_fyNetBreakerLine()
+      ? '<div style="margin:14px 0 2px;padding:8px;border-radius:8px;' +
+        'background:#0d1220;border:1px solid rgba(255,255,255,0.08);' +
+        'font-size:10px;color:#cbd5e1;line-height:1.5">' + _fyNetBreakerLine() + '</div>'
+      : '') +
     // ERRBYLEAGUE -- the shape of this list says which fault it is.
     _fyErrLeagueBlock() +
     // PRESEASON6 -- what the app believes about each league's season.
@@ -199699,14 +199705,96 @@ function _fyPathColdCount() {
   return n;
 }
 
+// ── NETSPREAD ── A connection that is down fails EVERYWHERE.
+//
+// This counted network failures and, at eight inside thirty seconds,
+// declared the connection down and stopped all retrying for a minute. It
+// never asked where the eight came from -- so one league with two dead
+// endpoints read exactly the same as no connection at all. It is not
+// close to the same: measured on the build before this one, six calls at
+// a single bad league put the breaker up for 58 seconds, during which a
+// healthy league's one transient blip failed outright (retries being the
+// thing suppressed) and the league list failed with it, which is why a
+// single bad league took the whole account down.
+//
+// Eight still arms it. Tripping now also needs the failures to be SPREAD:
+// at least five distinct paths, and no single league accounting for more
+// than seven in ten of them. Both, because either alone is easy to fake --
+// a sweep of one league's teams makes a dozen distinct paths, and one
+// stray failure elsewhere makes the league count two.
+//
+// A real outage clears both in its first second. One bad league never
+// does -- and with the breaker left down, the per-path brake is free to
+// set its paths aside for two minutes, which is the right answer and the
+// one that could never be reached while the breaker was up.
+//
+// The deliberate consequence: an account whose failures all come from one
+// league will not trip this, even in a true outage. That costs two extra
+// retries per call and nothing else, because the per-path brake still
+// stands every failing path down after three goes. Not tripping is cheap;
+// tripping wrongly takes the whole account out, which is the bug this is.
 var _fyNetFails = [], _fyNetPauseUntil = 0;
-function _fyNetNoted() {
+var _fyNetTripWhy = '';
+function _fyNetLgOf(path) {
+  var m = String(path || '').match(/(\d+\.l\.\d+)/);
+  return m ? m[1] : '_account';
+}
+// NETSPREAD -- how widely the recent failures are scattered.
+//
+// Two numbers, because one bad league can fake either on its own. A sweep
+// of one league's teams produces a dozen DISTINCT paths, all of them that
+// league -- so distinct paths alone is not enough. And a single failure
+// somewhere else makes the league count two -- so league count alone is
+// not enough either. Taken together they are hard to fake: worstShare is
+// the fraction of recent failures coming from the single worst league.
+function _fyNetSpread() {
+  var paths = {}, lgs = {}, nP = 0, nL = 0, i, worst = 0;
+  for (i = 0; i < _fyNetFails.length; i++) {
+    if (!paths[_fyNetFails[i].p]) { paths[_fyNetFails[i].p] = 1; nP++; }
+    lgs[_fyNetFails[i].l] = (lgs[_fyNetFails[i].l] || 0) + 1;
+  }
+  for (i in lgs) {
+    if (lgs.hasOwnProperty(i)) { nL++; if (lgs[i] > worst) { worst = lgs[i]; } }
+  }
+  return { paths: nP, leagues: nL,
+           worstShare: _fyNetFails.length ? (worst / _fyNetFails.length) : 0 };
+}
+
+function _fyNetNoted(path) {
   var now = Date.now();
-  _fyNetFails.push(now);
-  while (_fyNetFails.length && (now - _fyNetFails[0]) > 30000) _fyNetFails.shift();
-  if (_fyNetFails.length >= 8) { _fyNetPauseUntil = now + 60000; _fyNetFails.length = 0; }
+  _fyNetFails.push({ t: now, p: String(path || ''), l: _fyNetLgOf(path) });
+  while (_fyNetFails.length && (now - _fyNetFails[0].t) > 30000) { _fyNetFails.shift(); }
+  if (_fyNetFails.length < 8) { return; }
+  var sp = _fyNetSpread();
+  // Concentrated in one place is evidence about that place, not about the
+  // connection. Leave the breaker down and let the per-path brake have it.
+  if (sp.paths < 5 || sp.worstShare > 0.7) { return; }
+  _fyNetTripWhy = _fyNetFails.length + ' failures across ' + sp.paths +
+    ' paths in ' + sp.leagues + ' league' + (sp.leagues === 1 ? '' : 's');
+  _fyNetPauseUntil = now + 60000;
+  _fyNetFails.length = 0;
 }
 function _fyNetCalm() { return Date.now() >= _fyNetPauseUntil; }
+
+// NETSPREAD -- what the breaker is doing, in words, because guessing at
+// this from the outside is what the last four passes were made of.
+function _fyNetBreakerLine() {
+  try {
+    if (!_fyNetCalm()) {
+      return 'Retries paused for another ' +
+        Math.ceil((_fyNetPauseUntil - Date.now()) / 1000) + 's \u2014 ' +
+        skEscapeMaybe(_fyNetTripWhy) + ' looked like the connection itself.';
+    }
+    if (!_fyNetFails.length) { return ''; }
+    var sp = _fyNetSpread(), nP = sp.paths, nL = sp.leagues;
+    return 'Breaker armed but down: ' + _fyNetFails.length + ' recent failure' +
+      (_fyNetFails.length === 1 ? '' : 's') + ' across ' + nP + ' path' +
+      (nP === 1 ? '' : 's') + ' in ' + nL + ' league' + (nL === 1 ? '' : 's') +
+      ', worst league ' + Math.round(sp.worstShare * 100) + '% of them. It only ' +
+      'stops retrying when failures are spread \u2014 5+ paths and no league over ' +
+      '70% \u2014 because one bad endpoint is not a dead connection.';
+  } catch (e) { return ''; }
+}
 
 // ── PRESEASON7 ── Is this dated call asking about a day before the
 // league's season began?
@@ -199809,7 +199897,7 @@ async function fyApi(path) {
     // the connection is plainly down.
     // FYTIMERETRY — timeouts ride the same path as connection failures now.
     if (result && result.error && (result._network || result._timeout)) {
-      _fyNetNoted();
+      _fyNetNoted(path);   // NETSPREAD -- where it failed, not just that it did
       if (_fyNetCalm()) {
         // ── FYNETPATIENT ── Two goes, not one, and further apart.
         //
@@ -199838,7 +199926,7 @@ async function fyApi(path) {
           // Both kinds are transient by nature; any other failure means
           // retrying is just noise. FYTIMERETRY
           if (!(again._network || again._timeout)) return again;
-          _fyNetNoted();
+          _fyNetNoted(path);   // NETSPREAD
           if (!_fyNetCalm()) break;               // the connection is down; stop
         }
         _fyPathNote(path, false);
