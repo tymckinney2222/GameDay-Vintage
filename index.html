@@ -168433,6 +168433,16 @@ async function skLoadRosterForLeague(leagueKey) {
 //                    on every render so it doesn't bleed between
 //                    leagues or dates.
 var skCurrentFpMap = null;
+// \u2500\u2500 FPMAPSCOPE \u2500\u2500 Which league and which day the map belongs to.
+//
+// The renderer used to null the map on every pass "so old data from a
+// different league/date doesn't bleed in". That is the right worry and
+// the wrong blast radius: it also emptied it for a re-render of the SAME
+// roster on the SAME day, which is all the Table/Cards switch is. The
+// grid reads that map, found nothing, and fell back to cards -- and only
+// recovered when a hydration happened to land afterwards, which on a
+// toggle it never does, because the figures are already cached.
+var _skFpMapScope = '';
 
 // ROSTERGRID6 -- the date-scoped category stats for the roster on screen,
 // kept rather than discarded once the cards have been built from them.
@@ -168669,10 +168679,16 @@ function skRenderDetailRoster(league, players) {
                        league.scoring_type === 'point' ||
                        _skIsPointsH2HLeague(league);
 
-  // Reset FP map for this render pass so old data from a different
-  // league/date doesn't bleed in. Will be (re)populated below if
-  // this is a points league and we have a team_key to fetch with.
-  skCurrentFpMap = null;
+  // FPMAPSCOPE -- reset it only when the scope genuinely changed: a
+  // different league, or a different day. Those are the two cases the
+  // original comment was guarding against, and the only two. Wiping it
+  // on a same-scope re-render is what left the grid with nothing to
+  // tabulate every time the view was switched back to Table.
+  var _fpScopeNow = String(league.league_key) + '|' +
+    String(skDetailDate || _todayDateString()) + '|' +
+    String(typeof skDetailFpMode !== 'undefined' ? skDetailFpMode : '');
+  if (_skFpMapScope !== _fpScopeNow) { skCurrentFpMap = null; }
+  _skFpMapScope = _fpScopeNow;
   skCurrentNflStatsMeta = null;
   skCurrentNflSchedMap = null;   // NFLOPPLINE
 
@@ -170875,6 +170891,22 @@ function skSetRosterView(mode) {
   // The cards fallback stays: it is the right thing to show while the
   // settings are in flight. What changes is that the request is no longer
   // forgotten once they land.
+  // FPMAPSCOPE -- the grid can only draw once its figures exist, and on a
+  // toggle they may already be in hand or may land a moment later. Try
+  // again on the next tick and once more shortly after; both do nothing
+  // at all if a table is already on screen.
+  if (mode === 'table') {
+    var _rgTry = function () {
+      try {
+        if (_rgMode() !== 'table') { return; }
+        var el = document.getElementById('skDetailRoster');
+        if (!el || el.querySelector('table')) { return; }   // drawn already
+        if (typeof _rgRepaint === 'function') { _rgRepaint(); }
+      } catch (eT) {}
+    };
+    setTimeout(_rgTry, 0);
+    setTimeout(_rgTry, 400);
+  }
   if (mode === 'table' && league) {
     try {
       var _needSettings = (typeof _rgContext === 'function') && !_rgContext(league) &&
