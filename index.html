@@ -198537,7 +198537,7 @@ function skShowApiHealth() {
   }
   var verdict;
   if (s2.auth > 0) verdict = '<span style="color:#ef4444">Auth errors \u2014 see the status below. A 401 means the token was rejected and re-auth fixes it. A 403 means Yahoo is refusing the APPLICATION itself, and re-authing will NOT help \u2014 check the app\u2019s Fantasy permission at developer.yahoo.com.</span>';
-  else if (s2.ratelimit > 0) verdict = '<span style="color:#f59e0b">Rate-limited (429/999) \u2014 too many calls too fast. Waiting a few minutes should restore it; throttling league-switches would prevent it.</span>';
+  else if (s2.ratelimit > 0) verdict = '<span style="color:#f59e0b">Rate-limited \u2014 Yahoo is refusing calls because they are coming too fast. This is the real thing, named: 999 is Yahoo\u2019s own throttle code, and until the proxy learned to pass it on it crashed the proxy instead, which is how it reached this app as \u201cFailed to fetch\u201d with no status for so long. The app has already eased off; it clears on its own in a minute or two. Adding several leagues at once is what reaches it.</span>';
   else if (s2.network > 0) verdict = '<span style="color:#f59e0b">Connection failures (\u201cFailed to fetch\u201d) \u2014 requests aren\u2019t reaching the server. NOT rate-limiting and not auth. Each one is retried twice, spaced out so a retry doesn\u2019t land inside the same burst that caused it, and a run of them puts retries on hold for a minute rather than hammering a dead connection. A long run on one endpoint usually means too many heavy calls at once; a run across every endpoint means connectivity or the Worker. \u201cTest the proxy\u201d below settles which.</span>';
   else if (s2.other > 0) verdict = '<span style="color:#f59e0b">Errors landing in \u201cOther\u201d \u2014 the proxy is returning something that isn\u2019t a clean 401/429/999. See the details below to identify the real status the Worker is sending back.</span>';
   else if (s2.timeout >= 2) verdict = '<span style="color:#f59e0b">Timeouts \u2014 calls aren\u2019t coming back inside 15s. Not throttling and not auth: a run of these on startup is the app\u2019s own doing, since opening hydrates every league at once and a few calls end up queued behind the rest. Each one is now retried after a pause, so they should recover on their own; if they persist once everything has loaded, the connection itself is slow.</span>';
@@ -199830,12 +199830,29 @@ async function _fyApiOnce(path, isRetry) {
       _fyHealthRecord('auth', 403, path, _fyErrDetail(403, f403));
       return { error: _fyErrDetail(403, f403) };
     }
-    // Yahoo throttle codes: 429 (standard) and 999 (Yahoo-specific).
+    // \u2500\u2500 YAHOO999 \u2500\u2500 Yahoo throttle codes: 429, and 999, which is
+    // Yahoo's own. The proxy now maps 999 into 429 because the Response
+    // constructor refuses anything outside 200-599 -- building a reply
+    // with status 999 threw, killed the Worker, and turned every single
+    // throttle into a statusless "Failed to fetch". That is why this
+    // branch has never once been reached, and why the rate-limited row
+    // has read zero all day while the connection row filled with ghosts.
+    //
+    // The real upstream number rides in X-Upstream-Status, so 999 stays
+    // distinguishable from an ordinary 429.
     if (res.status === 429 || res.status === 999) {
-      _fyHealthRecord('ratelimit', res.status, path);
+      var _up = 0;
+      try { _up = parseInt(res.headers.get('X-Upstream-Status'), 10) || 0; } catch (eU) {}
+      var _shown = _up || res.status;
+      _fyHealthRecord('ratelimit', _shown, path);
       var rlText = '';
       try { rlText = await res.text(); } catch (e) {}
-      return { error: 'HTTP ' + res.status + ': ' + rlText.slice(0, 200) };
+      // YAHOO999 -- being told "too fast" IS the evidence. No inference
+      // needed: slow down now, rather than waiting for the no-cors probe
+      // to deduce it from a shape.
+      try { if (typeof _fySlowDown === 'function') { _fySlowDown(); } } catch (eS) {}
+      return { error: 'HTTP ' + _shown + ': ' + rlText.slice(0, 200),
+               _ratelimit: true, _upstream: _up };
     }
     var text = await res.text();
     if (!res.ok) {
