@@ -44252,44 +44252,142 @@ function _levProgress(g) {
 // The same shape buildSparkline's arc uses, generalised off baseball
 // innings onto a 0-1 progress axis and scaled per sport.
 function _levWp(margin, progress, scale) {
-  var k = (0.45 + 3.2 * progress) / (scale || 1);
+  // LEVERAGE8 -- gentler than it was. The steeper slope ordered the slate
+  // identically, because ranking only ever reads the DIFFERENCE between
+  // two of these; it only became wrong when the card started PRINTING
+  // them, and said a two-goal deficit entering the third was 2%.
+  var k = (0.35 + 2.2 * progress) / (scale || 1);
   return 1 / (1 + Math.exp(-(margin || 0) * k));
 }
 
-// Your clubs and your starred men. Multiplies the score rather than
+// ── Who is in this game, and is he yours? ──────────────────────────
+//
+// Providers do not agree on club abbreviations and never have. These are
+// the genuine renames and relocations, where no amount of prefix matching
+// would help; everything that is merely a truncation is handled below it.
+// Scoped per sport, because NJ is the Devils and also Brooklyn, UTA is
+// the Jazz and also the Mammoth, and TB is three different clubs.
+var LEV_ABBR = {
+  nhl: { TB: 'TBL', NJ: 'NJD', LA: 'LAK', SJ: 'SJS', CLB: 'CBJ', CBJ: 'CBJ',
+         LV: 'VGK', VGS: 'VGK', UTAH: 'UTA', ARI: 'UTA', PHX: 'UTA',
+         WAS: 'WSH', MON: 'MTL', CLS: 'CBJ' },
+  nba: { GS: 'GSW', SA: 'SAS', NY: 'NYK', NO: 'NOP', PHO: 'PHX', UTH: 'UTA',
+         BRK: 'BKN', NJ: 'BKN', CHO: 'CHA', WAS: 'WSH' },
+  nfl: { WAS: 'WSH', OAK: 'LV', SD: 'LAC', STL: 'LAR', JAC: 'JAX', ARZ: 'ARI' },
+  mlb: { AZ: 'ARI', CHW: 'CWS', SFG: 'SF', SDP: 'SD', TBR: 'TB', KCR: 'KC',
+         WAS: 'WSH', LAD: 'LAD' }
+};
+function _levAbbrKey(abbr, sport) {
+  var a = String(abbr || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (!a) { return ''; }
+  var t = LEV_ABBR[String(sport || '').toLowerCase()];
+  return (t && t[a]) || a;
+}
+// Does this club sit in this game? Canonical first; then a prefix, but
+// only when the prefix picks out exactly ONE of the two sides -- NY
+// matches the Rangers and the Islanders alike and must settle neither.
+function _levWhichSide(abbr, sport, awayAb, homeAb) {
+  var k = _levAbbrKey(abbr, sport);
+  if (!k) { return 0; }
+  var ka = _levAbbrKey(awayAb, sport), kh = _levAbbrKey(homeAb, sport);
+  if (k === ka) { return -1; }
+  if (k === kh) { return 1; }
+  function pre(x, y) {
+    if (!x || !y || x.length < 2 || y.length < 2) { return false; }
+    return (x.indexOf(y) === 0) || (y.indexOf(x) === 0);
+  }
+  var pa = pre(k, ka), ph = pre(k, kh);
+  if (pa && !ph) { return -1; }
+  if (ph && !pa) { return 1; }
+  return 0;
+}
+
+// The fantasy index is the same walk the Players tab does. Memoised for a
+// few seconds because every game on the slate asks the same question on
+// every render pass, and the answer cannot change between them.
+var _levIdxCache = null, _levIdxAt = 0;
+function _levMyPlayers() {
+  var now = Date.now();
+  if (_levIdxCache && (now - _levIdxAt) < 8000) { return _levIdxCache; }
+  var out = [];
+  try { out = (typeof _myp2Index === 'function') ? (_myp2Index() || []) : []; }
+  catch (e) { out = []; }
+  _levIdxCache = out; _levIdxAt = now;
+  return out;
+}
+
+// Your clubs and your men. Multiplies the score rather than
 // adding to it: a blow-out is not worth switching to because your man is
 // in it, and the 0.6 floor keeps a great game between strangers ahead of
 // a dull one of yours.
 function _levStake(g) {
-  var out = { f: 0, chips: [], mine: false };
-  var ab = [String((g.away || {}).abbr || ''), String((g.home || {}).abbr || '')];
+  var out = { f: 0, chips: [], mine: false, men: 0 };
+  var away = String((g.away || {}).abbr || ''), home = String((g.home || {}).abbr || '');
   var lg = String(g.league || '');
+  var meta = (typeof LEAGUES === 'object' && LEAGUES && LEAGUES[lg]) || null;
+  // The fantasy index speaks in sports ('nhl'), the scoreboard in leagues
+  // ('NHL'). For the professional leagues they are the same word.
+  var sport = /^(NHL|NBA|NFL|MLB|WNBA)$/.test(lg) ? lg.toLowerCase() : '';
+
   try {
     var favs = (typeof getFavTeams === 'function') ? (getFavTeams() || []) : [];
     for (var i = 0; i < favs.length; i++) {
       var fk = String(favs[i] || '');
       var fab = fk.split('|')[0], flg = fk.split('|')[1];
-      if ((fab === ab[0] || fab === ab[1]) && (!flg || flg === lg)) {
+      if ((!flg || flg === lg) &&
+          _levWhichSide(fab, sport || lg.toLowerCase(), away, home) !== 0) {
         out.f += 0.55; out.mine = true;
         out.chips.push({ t: 'YOUR CLUB', cool: true });
         break;
       }
     }
   } catch (e) {}
+
+  // LEVERAGE7 -- the roster, not the star list. This read
+  // gdhq_starred_players, which is hand-curated and mostly empty, and so
+  // reported "nobody of yours" on a night when men of his were in every
+  // game on the board.
+  var named = {}, hits = 0;
+  if (sport) {
+    try {
+      var idx = _levMyPlayers();
+      for (var j = 0; j < idx.length; j++) {
+        var p = idx[j] || {};
+        if (String(p.sport || '').toLowerCase() !== sport) { continue; }
+        if (_levWhichSide(p.teamAbbr, sport, away, home) === 0) { continue; }
+        hits++;
+        if (out.chips.length < 4) {
+          var last = String(p.name || '').split(' ').pop().toUpperCase();
+          if (last && !named[last]) {
+            named[last] = 1;
+            var nL = (p.leagues && p.leagues.length) || 0;
+            out.chips.push({ t: last + (nL > 1 ? (' \u00b7 ' + nL) : '') });
+          }
+        }
+      }
+    } catch (e2) {}
+  }
+
+  // The star list still counts -- it is a deliberate choice, not a
+  // by-product of a draft -- it is just no longer the only list asked.
   try {
     var st = (typeof getStarredPlayers === 'function') ? (getStarredPlayers() || []) : [];
-    var hit = 0;
-    for (var j = 0; j < st.length && hit < 3; j++) {
-      var p = st[j] || {};
-      if (String(p.league || '') !== lg) { continue; }
-      var pab = String(p.teamAbbr || '');
-      if (pab !== ab[0] && pab !== ab[1]) { continue; }
-      hit++;
-      out.mine = true;
-      out.chips.push({ t: String(p.name || '').split(' ').pop().toUpperCase() });
+    for (var k = 0; k < st.length; k++) {
+      var sp2 = st[k] || {};
+      if (String(sp2.league || '') !== lg) { continue; }
+      if (_levWhichSide(sp2.teamAbbr, sport || lg.toLowerCase(), away, home) === 0) { continue; }
+      var ln = String(sp2.name || '').split(' ').pop().toUpperCase();
+      if (!ln || named[ln]) { continue; }
+      named[ln] = 1; hits++;
+      if (out.chips.length < 4) { out.chips.push({ t: ln }); }
     }
-    out.f += Math.min(hit, 3) * 0.15;
-  } catch (e2) {}
+  } catch (e3) {}
+
+  out.men = hits;
+  if (hits) { out.mine = true; }
+  // Three men in it is as interested as you get; a fourth does not make
+  // the game more worth watching than it already was.
+  out.f += Math.min(hits, 3) * 0.15;
   out.f = Math.min(out.f, 1);
   return out;
 }
@@ -44393,19 +44491,34 @@ function _levTrace(r) {
 
 // What this game is, in a sentence, using only what per-period data can
 // actually support. Never a cause.
+// LEVERAGE7 -- what moved, said as win probability rather than as
+// "points". In hockey, points are a thing clubs collect, so "swung it 26
+// points" is a sentence the reader has to be told how to parse. The two
+// percentages say the same thing and need no gloss.
+function _levGainer(r) {
+  var a = r.g.away || {}, h = r.g.home || {};
+  var up = (r.wpNow > r.wpPrev);
+  return {
+    side: up ? a : h,
+    from: Math.round((up ? r.wpPrev : (1 - r.wpPrev)) * 100),
+    to: Math.round((up ? r.wpNow : (1 - r.wpNow)) * 100)
+  };
+}
+
 function _levWhy(r) {
   var g = r.g, cfg = r.cfg;
   var a = g.away || {}, h = g.home || {};
   var pts = Math.round(r.swing * 100);
   var lead = (r.margin > 0) ? a : ((r.margin < 0) ? h : null);
-  var gained = (r.wpNow > r.wpPrev) ? a : h;
   var unit = (cfg.mins > 0) ? 'to play' : 'left';
   var clk = String(g.clock || '').trim();
   var late = (r.prog > 0.72);
 
   if (pts >= 12) {
-    return '<b>' + _levEsc(gained.name || gained.abbr || '') + '</b> have swung it ' +
-      '<b>' + pts + ' points</b> in the ' + _levOrdinal(Number(g.period), cfg) + '.' +
+    var gn = _levGainer(r);
+    return '<b>' + _levEsc(gn.side.name || gn.side.abbr || '') + '</b> have gone from ' +
+      '<b>' + gn.from + '%</b> to <b>' + gn.to + '%</b> in the ' +
+      _levOrdinal(Number(g.period), cfg) + '.' +
       (Math.abs(r.margin) <= 1 && late
         ? ' It is level enough to turn again.' : '');
   }
@@ -44503,9 +44616,11 @@ function _levDirectiveHtml(ranked) {
         '<div class="lev-wpcap"><span>WIN PROBABILITY \u00b7 ' +
           _levEsc(a.abbr || '') + '</span>' +
           (r.swing >= 0.02
-            ? '<b>' + Math.round(r.swing * 100) + ' PTS THIS ' +
-              _levEsc((Number(g.period) > r.cfg.periods)
-                ? 'OVERTIME' : _levUnitWord(r.cfg)) + '</b>'
+            ? (function () {
+                var gn = _levGainer(r);
+                return '<b>' + _levEsc(gn.side.abbr || '') + ' ' + gn.from +
+                  '% \u2192 ' + gn.to + '%</b>';
+              })()
             : '<span>' + Math.round(r.wpNow * 100) + '%</span>') +
         '</div>' +
         _levTrace(r) +
@@ -44558,7 +44673,7 @@ function _levOpen(id) {
 function _levBoardRow(r, i) {
   var g = r.g, a = g.away || {}, h = g.home || {};
   var cb = _levClockBits(g, r.cfg);
-  var up = (r.wpNow >= r.wpPrev);
+  var gn = _levGainer(r);
   var pts = Math.round(r.swing * 100);
   var chips = '', j;
   for (j = 0; j < r.stake.chips.length; j++) {
@@ -44568,12 +44683,16 @@ function _levBoardRow(r, i) {
   }
   var why = '';
   if (pts >= 3) {
-    why += '<span class="lv-swing' + (up ? '' : ' dn') + '">' +
-      (up ? '\u25b2 ' : '\u25bc ') + pts + ' pts</span>';
+    // LEVERAGE7 -- name the club that GAINED. Measured from the away
+    // side, every arrow on the board pointed down whenever the away side
+    // was losing ground, which was most of them: a column of red
+    // triangles that read as a fault rather than as information.
+    why += '<span class="lv-swing">\u25b2 ' +
+      _levEsc(gn.side.abbr || '') + ' +' + pts + '</span>';
   }
   if (why && chips) { why += '<span style="color:var(--text-faint)">\u00b7</span>'; }
   why += chips;
-  if (!why) { why = '<span style="color:var(--text-muted)">nobody of yours</span>'; }
+  if (!why) { why = '<span style="color:var(--text-muted)">quiet</span>'; }
 
   var barCol = (i === 0) ? 'var(--lev-accent,#f5d547)'
     : (r.lev >= 55 ? 'rgba(245,213,71,0.55)' : 'rgba(255,255,255,0.22)');
