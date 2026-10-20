@@ -51970,6 +51970,73 @@ function _skFpMissed(k) {
 }
 function _skFpMissMark(k) { _skFpMiss[k] = Date.now(); }
 
+// ── PRESEASON6 ── Find out when the season starts, if nobody knows.
+//
+// _skSeasonStartFor answers '' when neither store holds it, and '' has to
+// mean "do not know" -- inferring "has not started" from silence is how a
+// guard removes a working feature. But not knowing is a fixable state:
+// the league settings response carries start_date, and the app already
+// reads it there. One request per league, once, and only ever on the way
+// to a PAST date. Today is never made to wait for it.
+var _skStartAsk = {};
+function _skEnsureSeasonStart(lgKey) {
+  var k = String(lgKey || '');
+  if (!k) { return Promise.resolve(''); }
+  var known = _skSeasonStartFor(k);
+  if (known) { return Promise.resolve(known); }
+  if (_skStartAsk[k]) { return _skStartAsk[k]; }
+  var p = (function () {
+    try {
+      return fyApi('/league/' + k + '/settings').then(function (r) {
+        try {
+          var meta = r && r.fantasy_content && r.fantasy_content.league &&
+            r.fantasy_content.league[0];
+          if (meta && (meta.start_date || meta.end_date)) {
+            if (typeof _skLeagueDates === 'undefined') { window._skLeagueDates = {}; }
+            _skLeagueDates[k] = { start: meta.start_date || null,
+                                  end: meta.end_date || null };
+          }
+        } catch (e) {}
+        return _skSeasonStartFor(k);
+      })['catch'](function () { return ''; });
+    } catch (e2) { return Promise.resolve(''); }
+  })();
+  _skStartAsk[k] = p;
+  return p;
+}
+
+// ── PRESEASON6 ── A league whose dated stats keep failing.
+//
+// _fyPathCold needs three failures on the SAME path. Seven team keys
+// against one date are seven paths with one failure each, so nothing
+// counted them together and the brake never engaged. The failure belongs
+// to the LEAGUE, so that is what gets set aside -- after two distinct
+// dates have failed, not one, because a single bad day is a bad day.
+var _skLeagueColdDates = {};
+var _skLeagueCold = {};
+var SK_LEAGUE_COLD_MS = 10 * 60 * 1000;
+function _skLeagueIsCold(lgKey) {
+  var t = _skLeagueCold[lgKey];
+  if (!t) { return false; }
+  if ((Date.now() - t) < SK_LEAGUE_COLD_MS) { return true; }
+  delete _skLeagueCold[lgKey];
+  delete _skLeagueColdDates[lgKey];
+  return false;
+}
+function _skLeagueNoteFail(lgKey, dateStr) {
+  if (!lgKey) { return; }
+  var seen = _skLeagueColdDates[lgKey] || (_skLeagueColdDates[lgKey] = {});
+  seen[String(dateStr)] = 1;
+  var n = 0, k;
+  for (k in seen) { if (seen.hasOwnProperty(k)) { n++; } }
+  if (n >= 2) { _skLeagueCold[lgKey] = Date.now(); }
+}
+function _skLeagueNoteOk(lgKey) {
+  if (!lgKey) { return; }
+  delete _skLeagueCold[lgKey];
+  delete _skLeagueColdDates[lgKey];
+}
+
 function _skRosterStatsPath(teamKey, dateStr) {
   var lgKey = String(teamKey || '').split('.t.')[0];
   var lg = null;
@@ -52066,6 +52133,15 @@ async function fetchTeamFpForDate(teamKey, date) {
   // PRESEASON5 -- and one that already failed is not asked again for ten
   // minutes. Only PAST dates: today is still live and worth retrying.
   if (isPastDate && _skFpMissed(memKey)) return null;
+  // PRESEASON6 -- a league already set aside is not asked again.
+  var _lgK = String(teamKey).split('.t.')[0];
+  if (isPastDate && _skLeagueIsCold(_lgK)) return null;
+  // PRESEASON6 -- and if nobody knows when the season starts, find out
+  // BEFORE asking for a day that may be before it. Past dates only.
+  if (isPastDate && !_skSeasonStartFor(_lgK)) {
+    var _st0 = await _skEnsureSeasonStart(_lgK);
+    if (_st0 && date < _st0) return null;
+  }
 
   var promise = (async function() {
     try {
@@ -52089,6 +52165,7 @@ async function fetchTeamFpForDate(teamKey, date) {
         catch (e) { byKey._ts = Date.now(); }
       }
       teamFpCache[memKey] = byKey;
+      _skLeagueNoteOk(_lgK);   // PRESEASON6 -- one good answer clears it
       // Persist only definitely-final dates. Yesterday stays out of
       // localStorage so midnight-rollover fetches can't poison it.
       // Also guard against empty maps (failed parse): writing {} to
@@ -52125,7 +52202,7 @@ async function fetchTeamFpForDate(teamKey, date) {
       return byKey;
     } catch (e) {
       console.warn('[fp] fetch failed for', teamKey, date, e);
-      if (isPastDate) { _skFpMissMark(memKey); }
+      if (isPastDate) { _skFpMissMark(memKey); _skLeagueNoteFail(_lgK, date); }
       return null;
     } finally {
       delete teamFpInflight[memKey];
@@ -169740,16 +169817,25 @@ function _skFetchTeamPlayerStats(teamKey, dateStr) {
   // week strip both want this date and both used to ask again after it
   // had already failed.
   if (isPastDate && _skFpMissed('ps|' + memKey)) return Promise.resolve([]);
+  var _psLgK = String(teamKey).split('.t.')[0];
+  if (isPastDate && _skLeagueIsCold(_psLgK)) return Promise.resolve([]);
 
   var p = (async function() {
     try {
       // NFLROSTER — football rosters are week-addressed; the date form is a
       // guaranteed 400 there.
+      // PRESEASON6 -- find out when the season starts before asking for a
+      // past day that may fall before it.
+      if (isPastDate && !_skSeasonStartFor(_psLgK)) {
+        var _st1 = await _skEnsureSeasonStart(_psLgK);
+        if (_st1 && dateStr < _st1) return null;
+      }
       var _seg = _skRosterStatsPath(teamKey, dateStr);
       if (!_seg) return null;
       var url = '/team/' + teamKey + _seg;
       var data = await fyApi(url);
       var out = _skParsePlayerStatsResponse(data);
+      _skLeagueNoteOk(_psLgK);   // PRESEASON6 -- a good answer clears it
       try { Object.defineProperty(out, '_ts', { value: Date.now(), enumerable: false, writable: true }); }
       catch (e) { out._ts = Date.now(); }
       _skPlayerStatsCache[memKey] = out;
@@ -169762,7 +169848,7 @@ function _skFetchTeamPlayerStats(teamKey, dateStr) {
       return out;
     } catch (e) {
       console.warn('[day-totals] fetch failed', teamKey, dateStr, e);
-      if (isPastDate) { _skFpMissMark('ps|' + memKey); }
+      if (isPastDate) { _skFpMissMark('ps|' + memKey); _skLeagueNoteFail(_psLgK, dateStr); }
       return [];
     } finally {
       delete _skPlayerStatsInflight[memKey];
@@ -198013,6 +198099,9 @@ function skShowApiHealth() {
       'font-weight:700;letter-spacing:0.06em">DIAGNOSE LAST FAILURE</button>' +
       '<div id="_fyProbeOut" style="font-size:10px;margin-top:6px;line-height:1.5"></div>' +
     '</div>' +
+    // PRESEASON6 -- what the app believes about each league's season.
+    // Two guesses at this from the outside were two too many.
+    _skSeasonDatesBlock() +
     errBlock +
     '<div style="color:#94a3b8;font-size:11px;margin:16px 0 4px">Last 10 minutes (' + s10.total + ' calls)</div>' +
     row('\u2705 OK', s10.ok, '#4ade80') +
@@ -199336,6 +199425,38 @@ function _fyPathNote(path, ok) {
   // nobody sits waiting for it with the app in front of them.
   if (e.n >= 3) { e.until = Date.now() + 120000; e.n = 0; }
 }
+// PRESEASON6 -- every Yahoo league with the season start the app holds,
+// and where it came from. Read it rather than reason about it.
+function _skSeasonDatesBlock() {
+  try {
+    var lgs = (typeof fyLeagues !== 'undefined' && fyLeagues) ? fyLeagues : [];
+    if (!lgs.length) { return ''; }
+    var h = '<div style="color:#94a3b8;font-size:11px;margin:16px 0 4px">' +
+      'Season dates (what the app believes)</div>';
+    for (var i = 0; i < lgs.length; i++) {
+      var l = lgs[i] || {};
+      var k = String(l.league_key || '');
+      var fromL = l.start_date ? String(l.start_date) : '';
+      var dd = (typeof _skLeagueDates !== 'undefined' && _skLeagueDates)
+        ? _skLeagueDates[k] : null;
+      var fromS = (dd && dd.start) ? String(dd.start) : '';
+      var start = fromL || fromS;
+      var src = fromL ? 'league list' : (fromS ? 'settings' : 'NOT KNOWN');
+      h += '<div style="display:flex;gap:8px;font-size:10px;padding:3px 0;' +
+        'border-bottom:1px solid rgba(255,255,255,0.05)">' +
+        '<span style="color:#e2e8f0;flex:1;min-width:0;overflow:hidden;' +
+          'text-overflow:ellipsis;white-space:nowrap">' +
+          (l.name ? String(l.name) : k) + '</span>' +
+        '<span style="color:' + (start ? '#4ade80' : '#f59e0b') + '">' +
+          (start || '\u2014') + '</span>' +
+        '<span style="color:#64748b">' + src + '</span>' +
+        '<span style="color:#64748b">' + String(l.draft_status || '?') + '</span>' +
+        '</div>';
+    }
+    return h;
+  } catch (e) { return ''; }
+}
+
 function _fyPathCold(path) {
   var e = _fyPathFail[path];
   return !!(e && e.until && Date.now() < e.until);
