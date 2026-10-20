@@ -198063,6 +198063,126 @@ function _fyProbeLastFailure() {
   });
 }
 
+// ── LGLADDER ── Four calls at one league, smallest response first.
+//
+// When the board says a single league is carrying every failure, the
+// question is no longer "is the connection up" -- 56 other calls just
+// proved it is. It is "what about THIS league's answers". So: ask it four
+// things of increasing weight and measure what comes back in bytes.
+//
+//   settings   -- a few KB, one object
+//   teams      -- every team, no stats
+//   standings  -- every team with every category
+//   scoreboard -- every matchup with both rosters
+//
+// A ladder that answers at the bottom and fails at the top is a size
+// ceiling, and that lives on the Worker. One that answers all the way up
+// means the endpoint is fine and the failures were load. One that fails
+// at the bottom too means the league is being refused outright, and its
+// size has nothing to do with it.
+//
+// Deliberately NOT through fyApi: the gate, the response cache and the
+// cold-path brake would all have a say, and the point is to see what the
+// server does right now.
+function _fyWorstErrLeague() {
+  var key = '', best = 0, k;
+  for (k in _fyErrByLeague) {
+    if (!_fyErrByLeague.hasOwnProperty(k)) { continue; }
+    if (k === '_account') { continue; }
+    if (_fyErrByLeague[k].n > best) { best = _fyErrByLeague[k].n; key = k; }
+  }
+  return key;
+}
+
+function _fyLgName(key) {
+  var lgs = (typeof fyLeagues !== 'undefined' && fyLeagues) ? fyLeagues : [];
+  for (var i = 0; i < lgs.length; i++) {
+    if (lgs[i].league_key === key) { return lgs[i].name || key; }
+  }
+  return key;
+}
+
+function _fyKB(n) {
+  if (n == null) { return ''; }
+  if (n < 1024) { return n + ' B'; }
+  return (n / 1024).toFixed(n < 10240 ? 1 : 0) + ' KB';
+}
+
+async function _fyProbeLeagueLadder() {
+  var out = document.getElementById('_fyLadderOut');
+  var key = _fyWorstErrLeague();
+  if (!key) {
+    if (out) { out.innerHTML = '<span style="color:#94a3b8">No league has failed yet \u2014 nothing to walk.</span>'; }
+    return;
+  }
+  var lines = ['<div style="color:#64748b">' + skEscapeMaybe(_fyLgName(key)) +
+    ' \u00b7 ' + skEscapeMaybe(key) + '</div>'];
+  function say(html) { lines.push(html); if (out) { out.innerHTML = lines.join(''); } }
+  say('<div style="color:#94a3b8">walking\u2026</div>');
+  lines.splice(1, 1);
+
+  var tok = null;
+  try { tok = await fyGetToken(); } catch (eT) {}
+  if (!tok) {
+    say('<div style="color:#f59e0b">No token available \u2014 reconnect Yahoo and try again.</div>');
+    return;
+  }
+  var rungs = [
+    { label: 'settings', p: '/league/' + key + '/settings' },
+    { label: 'teams', p: '/league/' + key + '/teams' },
+    { label: 'standings', p: '/league/' + key + '/standings' },
+    { label: 'scoreboard', p: '/league/' + key + '/scoreboard;out=matchups' }
+  ];
+  var okBytes = 0, nOk = 0, nBad = 0, firstBad = '';
+  for (var i = 0; i < rungs.length; i++) {
+    var t0 = Date.now();
+    try {
+      var res = await fetch(YAHOO_WORKER + '/api' + rungs[i].p,
+        { headers: { 'Authorization': 'Bearer ' + tok } });
+      var body = '';
+      try { body = await res.text(); } catch (eB) {}
+      var ms = Date.now() - t0;
+      if (res.ok) {
+        nOk++;
+        if (body.length > okBytes) { okBytes = body.length; }
+        say('<div style="color:#4ade80">' + rungs[i].label + ': HTTP ' + res.status +
+          ' \u00b7 ' + ms + 'ms \u00b7 ' + _fyKB(body.length) + '</div>');
+      } else {
+        nBad++;
+        if (!firstBad) { firstBad = rungs[i].label; }
+        say('<div style="color:#f59e0b">' + rungs[i].label + ': HTTP ' + res.status +
+          ' \u00b7 ' + ms + 'ms</div>');
+      }
+    } catch (e) {
+      nBad++;
+      if (!firstBad) { firstBad = rungs[i].label; }
+      say('<div style="color:#ef4444">' + rungs[i].label + ': failed after ' +
+        (Date.now() - t0) + 'ms \u2014 nothing came back the browser would accept</div>');
+    }
+  }
+
+  var v;
+  if (!nBad) {
+    v = 'Every rung answered, the heaviest at ' + _fyKB(okBytes) + '. The endpoints are ' +
+        'fine and nothing about this league is special \u2014 so the failures were load, and ' +
+        'they will come back under load. Worth running again the moment it next goes wrong.';
+  } else if (nOk && firstBad !== 'settings') {
+    v = 'The small answers come back and the big ones do not \u2014 the largest that got ' +
+        'through was ' + _fyKB(okBytes) + '. That is a size ceiling, not a connection: the ' +
+        'request reaches the Worker, the Worker falls over building the reply, and a reply ' +
+        'that never gets its CORS header can only ever reach the browser as ' +
+        '\u201cFailed to fetch\u201d. The fix is on the Worker \u2014 stream the body straight ' +
+        'through rather than buffering and re-serialising it, and make sure the error path ' +
+        'sets the CORS headers too, so the next one of these arrives as a real status.';
+  } else {
+    v = 'Even the smallest call fails, so this is not about the size of anything. The league ' +
+        'itself is being refused \u2014 check that it is still on the account and that the token ' +
+        'covers its sport.';
+  }
+  say('<div style="color:#e2e8f0;margin-top:6px;border-top:1px solid rgba(255,255,255,0.1);' +
+    'padding-top:6px">' + v + '</div>');
+}
+
 // ── ERRBYLEAGUE ── The readout. Heaviest league first, because the shape
 // of the list IS the answer: one or two leagues carrying every failure is
 // a league problem, an even spread across all of them is a load problem.
@@ -198183,6 +198303,11 @@ function skShowApiHealth() {
       'border:1px solid rgba(255,255,255,0.2);background:#0d1220;color:#e2e8f0;font-family:inherit;font-size:11px;' +
       'font-weight:700;letter-spacing:0.06em">DIAGNOSE LAST FAILURE</button>' +
       '<div id="_fyProbeOut" style="font-size:10px;margin-top:6px;line-height:1.5"></div>' +
+      // LGLADDER -- for when the board says ONE league is failing.
+      '<button onclick="_fyProbeLeagueLadder()" style="margin-top:8px;padding:8px 12px;border-radius:8px;' +
+      'border:1px solid rgba(255,255,255,0.2);background:#0d1220;color:#e2e8f0;font-family:inherit;font-size:11px;' +
+      'font-weight:700;letter-spacing:0.06em">WALK THE FAILING LEAGUE</button>' +
+      '<div id="_fyLadderOut" style="font-size:10px;margin-top:6px;line-height:1.5"></div>' +
     '</div>' +
     // ERRBYLEAGUE -- the shape of this list says which fault it is.
     _fyErrLeagueBlock() +
