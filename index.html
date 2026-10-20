@@ -214006,6 +214006,24 @@ function _espSchedPaneHtml(row) {
 }
 
 function espHasPaceTab(row) {
+  // ROTOFIRSTNIGHT -- roto is not a season-points league, and this tab only
+  // ever appeared on one because espIsSeasonPts answers TRUE for ESPN's ROTO
+  // enum: it contains no "CATEGOR" and does not begin "H2H", so it lands in
+  // the season-points bucket. extFormatKey already carries that fix and a
+  // comment explaining it; espIsSeasonPts never got it.
+  //
+  // THE WIDER FIX IS DELIBERATELY NOT IN THIS BUILD. Seventeen places read
+  // that predicate, and six of them -- espMatchupOutlook, espMyMatchupPair,
+  // _espMatchupPaneHtml, espHasBracket, espHasProjection, espFlowSeries --
+  // use it to mean "has no weekly matchups", which roto also satisfies. They
+  // are correct today BY ACCIDENT. Correcting espIsSeasonPts on its own
+  // would set all six building matchup UI for a league with no matchups,
+  // and would also move the points snapshots, the league card total and the
+  // standings column layout. That is a predicate split with its own tests,
+  // not a one-line change, and not one to make at the end of a long day.
+  //
+  // So: contained here, where the symptom is, and recorded there.
+  if (typeof extFormatKey === 'function' && extFormatKey(row) === 'roto') return false;
   if (typeof espIsSeasonPts !== 'function' || !espIsSeasonPts(row)) return false;
   // ESPKO3 — a guillotine has no season-long pace worth tracking: the
   // question is surviving Sunday, not where the season total lands. The
@@ -214499,6 +214517,50 @@ function _espRotoLiveView(row) {
   };
 }
 
+// \u2500\u2500 ROTOFIRSTNIGHT \u2500\u2500 Opening night, ranked from today alone.
+//
+// Returns a board when the SEASON totals are all level but TODAY is not, or
+// null when there is genuinely nothing to show. The settled board's
+// reconciliation cannot apply here: ESPN publishes no roto total on day
+// one, so there is nothing to check against. Rather than relax that gate
+// silently, this says on its face what it is.
+function _espRotoProvisionalHtml(row) {
+  try {
+    var ls = (typeof _espRotoLiveStats === 'function') ? _espRotoLiveStats(row) : null;
+    if (!ls || !ls.vals) { return ''; }
+    var live = _espRotoAdapt(row, ls.vals);
+    // Nothing played anywhere yet is still a level league, and that is the
+    // honest message rather than a board of identical numbers.
+    if (!live || live.allTied || !live.myKey) { return ''; }
+
+    var fakeLeague = { league_key: String(row.key || 'espn'), scoring_type: 'roto' };
+    var fakeData = { allTeams: live.allTeams, team: { team_key: live.myKey } };
+    var board = '';
+    // No live-view argument: these ARE the live numbers, and with the season
+    // at zero there is no earlier ladder to have moved from.
+    try {
+      board = _skBuildRotoPressureHTML(fakeLeague, fakeData, live.meta, null) || '';
+    } catch (eB) { board = ''; }
+    if (!board) { return ''; }
+
+    // Returns the WHOLE pane, opening tag included, so this literal closes
+    // everything it opens. The caller used to add a trailing close for the
+    // wrapper that lives in h, which left the file's div tally one past
+    // where it belongs -- legal HTML, broken canary.
+    return '<div data-espstand>' + _espStandToggleHtml(row, 'press') +
+      '<div style="border:1px solid rgba(251,191,36,0.35);border-radius:8px;' +
+      'background:rgba(251,191,36,0.06);padding:7px 9px;margin:0 0 8px;">' +
+      '<div style="color:#fbbf24;font-size:10px;font-weight:700;' +
+      'letter-spacing:0.05em;">TODAY ONLY \u00b7 NOT YET VERIFIED</div>' +
+      '<div style="color:rgba(255,255,255,0.6);font-size:10.5px;line-height:1.45;' +
+      'margin-top:3px;">ESPN has not posted season totals yet, so this ranks ' +
+      'today\u2019s numbers on their own and cannot be checked against ESPN\u2019s ' +
+      'roto points the way the settled board is. Treat it as a first look.' +
+      '</div></div>' + board + '</div>';
+  } catch (e) {}
+  return '';
+}
+
 function _espRotoPressurePaneHtml(row) {
   var h = '<div data-espstand>';
   h += _espStandToggleHtml(row, 'press');
@@ -214514,7 +214576,17 @@ function _espRotoPressurePaneHtml(row) {
 
   if (!a) return shell('Waiting on league standings.');
   if (a.allTied) {
-    return shell('Every team is level in every category \u2014 this fills in once the season starts scoring.');
+    // ROTOFIRSTNIGHT -- level on the SEASON is not level on the night. Try
+    // today before giving up; the live view has always been able to do this.
+    var prov = '';
+    try { prov = _espRotoProvisionalHtml(row); } catch (eP) { prov = ''; }
+    if (prov) { return prov; }
+    // The old wording here said "this fills in once the season starts
+    // scoring", which on opening night is false and unfalsifiable from the
+    // outside -- the season HAS started, ESPN just has not rolled it up.
+    return shell('ESPN has not posted season totals for this league yet \u2014 they ' +
+      'roll up after games finalise. Today\u2019s numbers are on the DAILY tab, and ' +
+      'this board fills in once ESPN publishes.');
   }
   if (!a.myKey) return shell('Couldn\u2019t tell which team is yours in this league.');
   if (!a.checked) {
