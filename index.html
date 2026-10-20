@@ -170906,6 +170906,16 @@ function skSetRosterView(mode) {
     };
     setTimeout(_rgTry, 0);
     setTimeout(_rgTry, 400);
+    // WHYNOTABLE -- record what the grid had, after the retries have had
+    // their go, so the readout reflects the settled state rather than a
+    // half-finished one.
+    setTimeout(function () {
+      try {
+        var _lk = (typeof skState !== 'undefined') ? skState.activeLeagueKey : '';
+        var _lg = (fyLeagues || []).find(function (l) { return l.league_key === _lk; });
+        if (_lg) { _rgDiagnose(_lg); }
+      } catch (eD) {}
+    }, 700);
   }
   if (mode === 'table' && league) {
     try {
@@ -170935,6 +170945,219 @@ function _rgHasSeasonView(league) {
   if (!league) { return false; }
   var sp = String(league.sport || '').toLowerCase();
   return sp === 'nba' || sp === 'nhl';
+}
+
+// \u2500\u2500 WHYNOTABLE \u2500\u2500 What did the grid actually have to work with?
+//
+// _rgContext has six ways to answer null and the builder three more, and
+// from here I cannot see which fires on his phone. This walks the same
+// inputs in the same order and records the first thing that was missing,
+// along with everything else, so one screenshot settles it.
+//
+// Counts and flags only -- no names, no keys, nothing that is anybody's.
+var _rgWhy = null;
+function _rgDiagnose(league) {
+  var d = { at: Date.now(), mode: (typeof _rgMode === 'function') ? _rgMode() : '?' };
+  try {
+    d.sport = String((league && league.sport) || '').toLowerCase();
+    d.scoring = String((league && league.scoring_type) || '');
+    d.gridSport = (d.sport === 'nba' || d.sport === 'nhl');
+
+    var ld = (league && typeof skLeagueData !== 'undefined' &&
+      skLeagueData[league.league_key]) || {};
+    d.hasTeamKey = !!(ld.team && ld.team.team_key);
+    var teamKey = (ld.team && ld.team.team_key) || '';
+
+    var se = (league && typeof leagueSettingsCache !== 'undefined' &&
+      leagueSettingsCache[league.league_key]) || null;
+    d.hasSettings = !!se;
+    var st = (se && se.stats) || null;
+    d.statCount = st ? Object.keys(st).length : 0;
+    var enabled = 0, k;
+    if (st) {
+      for (k in st) {
+        if (st.hasOwnProperty(k) && st[k] && st[k].enabled && !st[k].isOnlyDisplayStat) {
+          enabled++;
+        }
+      }
+    }
+    d.enabledStats = enabled;
+
+    d.fpMode = (typeof skDetailFpMode !== 'undefined') ? String(skDetailFpMode) : '(none)';
+    d.date = String((typeof skDetailDate !== 'undefined' && skDetailDate) ||
+      (typeof _todayDateString === 'function' ? _todayDateString() : ''));
+    d.isToday = (typeof _todayDateString === 'function') && d.date === _todayDateString();
+
+    d.dayMap = (typeof skCurrentFpMap !== 'undefined' && skCurrentFpMap)
+      ? Object.keys(skCurrentFpMap).length : null;
+    var dc = (league && typeof skDailyCatStatsCache !== 'undefined')
+      ? skDailyCatStatsCache[league.league_key] : null;
+    d.catsCache = dc ? { date: String(dc.date || ''),
+                         n: dc.byKey ? Object.keys(dc.byKey).length : 0,
+                         dateMatches: String(dc.date || '') === d.date } : null;
+    d.seasonMap = (teamKey && typeof skSeasonTotalFpCache !== 'undefined' &&
+      skSeasonTotalFpCache[teamKey])
+      ? Object.keys(skSeasonTotalFpCache[teamKey]).length : null;
+
+    var ctx = (typeof _rgContext === 'function') ? _rgContext(league) : null;
+    d.ctx = !!ctx;
+    if (ctx) {
+      d.ctxByKey = ctx.byKey ? Object.keys(ctx.byKey).length : 0;
+      d.ctxShape = ctx.opts && ctx.opts.shapeBy
+        ? Object.keys(ctx.opts.shapeBy).length : 0;
+      d.ctxCols = -1;   // filled below, once the real roster is in hand
+    }
+
+    var cache = (league && typeof skDetailRosterCache !== 'undefined')
+      ? skDetailRosterCache[league.league_key] : null;
+    d.rosterCached = !!(cache && cache.players && cache.players.length);
+    if (cache && cache.players && typeof _rgBuildFor === 'function') {
+      var act = cache.players.filter(function (p) { return p && !p.isBench && !p.isIL; });
+      d.activeN = act.length;
+      // WHYNOTABLE -- columns have to be counted against the REAL roster.
+      // A placeholder row has no entry in the map and would always report
+      // zero, which is a readout that lies.
+      if (ctx && typeof _rgCols === 'function') {
+        try {
+          d.ctxCols = _rgCols(act, (ctx.opts && ctx.opts.shapeBy) || ctx.byKey,
+            ctx.meta, ctx.ord).length;
+        } catch (eC) { d.ctxCols = -1; }
+      }
+      try { d.buildLen = (_rgBuildFor(league, act) || '').length; }
+      catch (eB) { d.buildThrew = String((eB && eB.message) || eB); }
+    }
+
+    var el = document.getElementById('skDetailRoster');
+    d.dom = el ? { groups: el.querySelectorAll('.sk-roster-group').length,
+                   tables: el.querySelectorAll('table').length,
+                   cards: el.querySelectorAll('.sk-roster-row').length } : null;
+
+    // The first thing that was missing, in the order the code asks.
+    d.firstMissing =
+      !d.gridSport ? 'sport has no grid'
+      : !d.hasTeamKey ? 'no team key for this league'
+      : !d.hasSettings ? 'league settings not cached'
+      : !d.statCount ? 'settings cached but hold no stats'
+      : !d.enabledStats ? 'no stat is enabled in the settings'
+      : !d.ctx ? 'context null despite the above'
+      : (d.ctxCols === 0 && d.rosterCached) ? 'context built but no column has any value'
+      : (d.buildLen === 0) ? 'builder returned nothing'
+      : 'nothing missing';
+  } catch (e) { d.threw = String((e && e.message) || e); }
+  _rgWhy = d;
+  return d;
+}
+
+function _rgWhyBlock() {
+  try {
+    if (!_rgWhy) { return ''; }
+    var d = _rgWhy, rows = '', k;
+    var order = ['mode', 'sport', 'scoring', 'hasTeamKey', 'hasSettings', 'statCount',
+      'enabledStats', 'fpMode', 'date', 'isToday', 'dayMap', 'catsCache', 'seasonMap',
+      'ctx', 'ctxByKey', 'ctxShape', 'ctxCols', 'rosterCached', 'activeN', 'buildLen',
+      'buildThrew', 'dom', 'threw'];
+    for (var i = 0; i < order.length; i++) {
+      k = order[i];
+      if (d[k] === undefined) { continue; }
+      rows += '<div style="display:flex;gap:8px;font-size:10px;padding:2px 0">' +
+        '<span style="color:#64748b;flex:1">' + k + '</span>' +
+        '<span style="color:#e2e8f0;word-break:break-all">' +
+        skEscapeMaybe(typeof d[k] === 'object' ? JSON.stringify(d[k]) : String(d[k])) +
+        '</span></div>';
+    }
+    var ago = Math.round((Date.now() - d.at) / 1000);
+    return '<div style="color:#94a3b8;font-size:11px;margin:16px 0 4px">' +
+      'Last Table attempt \u2014 what the grid had</div>' +
+      '<div style="background:#0d1220;border:1px solid rgba(255,255,255,0.08);' +
+      'border-radius:8px;padding:8px;font-size:10px;line-height:1.5;color:#cbd5e1">' +
+      '<div style="color:#fbbf24;margin-bottom:4px">' +
+      skEscapeMaybe(String(d.firstMissing || '?')) + ' \u00b7 ' + ago + 's ago</div>' +
+      rows + '</div>';
+  } catch (e) { return ''; }
+}
+
+// \u2500\u2500 PAINTLOG \u2500\u2500 Who painted the roster, when, and what came out.
+//
+// "It does render, it just doesn't keep." That is not a guard refusing to
+// draw -- it is a second paint landing on a good one. Several things
+// repaint this roster after the first pass, and any of them that runs
+// while the day figures are briefly absent will rebuild as cards over a
+// table that was perfectly correct.
+//
+// A short log, newest last, so the overwrite can be seen happening
+// instead of reasoned about. Counts only.
+var _rgPaints = [];
+function _rgNotePaint(who) {
+  try {
+    var el = document.getElementById('skDetailRoster');
+    _rgPaints.push({
+      t: Date.now(),
+      who: String(who || '?'),
+      mode: (typeof _rgMode === 'function') ? _rgMode() : '?',
+      tables: el ? el.querySelectorAll('table').length : -1,
+      cards: el ? el.querySelectorAll('.sk-roster-row').length : -1,
+      day: (typeof skCurrentFpMap !== 'undefined' && skCurrentFpMap)
+        ? Object.keys(skCurrentFpMap).length : null
+    });
+    while (_rgPaints.length > 12) { _rgPaints.shift(); }
+  } catch (e) {}
+}
+
+// Wrap the two things that put rows on screen. Function declarations are
+// hoisted, so this can sit here and still find them.
+(function () {
+  try {
+    if (typeof skRenderDetailRoster === 'function' && !skRenderDetailRoster._logged) {
+      var _origRender = skRenderDetailRoster;
+      skRenderDetailRoster = function () {
+        var out = _origRender.apply(this, arguments);
+        setTimeout(function () { _rgNotePaint('render'); }, 0);
+        return out;
+      };
+      // PAINTLOG -- a wrapper replaces the function's SOURCE as well as
+      // its behaviour, and things that read the source for a living then
+      // see an empty shell. Hand the original back to anyone who asks.
+      skRenderDetailRoster.toString = function () { return String(_origRender); };
+      skRenderDetailRoster._logged = true;
+    }
+    if (typeof _rgRepaint === 'function' && !_rgRepaint._logged) {
+      var _origRepaint = _rgRepaint;
+      _rgRepaint = function () {
+        var out = _origRepaint.apply(this, arguments);
+        if (out) { setTimeout(function () { _rgNotePaint('repaint'); }, 0); }
+        return out;
+      };
+      _rgRepaint.toString = function () { return String(_origRepaint); };
+      _rgRepaint._logged = true;
+    }
+  } catch (e) {}
+})();
+
+function _rgPaintBlock() {
+  try {
+    if (!_rgPaints.length) { return ''; }
+    var rows = '', i, now = Date.now();
+    for (i = 0; i < _rgPaints.length; i++) {
+      var p = _rgPaints[i];
+      var ago = Math.round((now - p.t) / 100) / 10;
+      var tableWon = p.tables > 0;
+      rows += '<div style="display:flex;gap:8px;font-size:10px;padding:2px 0;' +
+        'border-bottom:1px solid rgba(255,255,255,0.04)">' +
+        '<span style="color:#64748b;width:58px">' + ago + 's</span>' +
+        '<span style="color:#94a3b8;width:52px">' + skEscapeMaybe(p.who) + '</span>' +
+        '<span style="color:#64748b;width:42px">' + skEscapeMaybe(p.mode) + '</span>' +
+        '<span style="color:' + (tableWon ? '#4ade80' : '#f59e0b') + ';flex:1">' +
+        (tableWon ? ('table \u00b7 ' + p.tables) : ('cards \u00b7 ' + p.cards)) +
+        '</span>' +
+        '<span style="color:#64748b">day ' + (p.day == null ? '\u2014' : p.day) +
+        '</span></div>';
+    }
+    return '<div style="color:#94a3b8;font-size:11px;margin:16px 0 4px">' +
+      'Roster paints \u2014 newest last</div>' +
+      '<div style="background:#0d1220;border:1px solid rgba(255,255,255,0.08);' +
+      'border-radius:8px;padding:8px;font-size:10px;line-height:1.5;color:#cbd5e1">' +
+      rows + '</div>';
+  } catch (e) { return ''; }
 }
 
 function _rgSyncToggle() {
@@ -198742,6 +198965,10 @@ function skShowApiHealth() {
       'font-weight:700;letter-spacing:0.06em">WALK THE FAILING LEAGUE</button>' +
       '<div id="_fyLadderOut" style="font-size:10px;margin-top:6px;line-height:1.5"></div>' +
     '</div>' +
+    // PAINTLOG -- who painted the roster and what came out, in order.
+    _rgPaintBlock() +
+    // WHYNOTABLE -- what the roster grid had to work with, last time.
+    _rgWhyBlock() +
     // BULKDIAG -- why a bulk call filled nothing, with the shape to prove it.
     _fyBulkDiagBlock() +
     // BLACKOUT -- the probe's answer, which must never go missing again.
