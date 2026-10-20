@@ -198277,36 +198277,65 @@ async function _fyProbeLeagueLadder() {
 function _fyRateBlock() {
   try {
     var r = _fyRate();
-    if (!r.window) { return ''; }
+    // BLACKOUT -- silence is itself a reading, and printing nothing made
+    // this block vanish at precisely the moment it was wanted.
+    var inner = r.window
+      ? ('<div><b>' + r.lastMin + '</b> calls in the last minute \u00b7 peak rate <b>' +
+         r.peakPerMin + '</b>/min</div>')
+      : ('<div style="color:#64748b">Nothing asked for in the last two minutes \u2014 the ' +
+         'app is idle, so there is no rate to show. Everything below is from whenever it ' +
+         'last ran.</div>');
     var h = '<div style="color:#94a3b8;font-size:11px;margin:16px 0 4px">' +
       'How hard the app is asking</div>' +
       '<div style="background:#0d1220;border:1px solid rgba(255,255,255,0.08);' +
-      'border-radius:8px;padding:8px;font-size:10px;line-height:1.5;color:#cbd5e1">' +
-      '<div><b>' + r.lastMin + '</b> calls in the last minute \u00b7 peak rate <b>' +
-      r.peakPerMin + '</b>/min</div>';
-    if (_fyEdgeProbe && _fyEdgeProbe.state !== 'running') {
-      var ago = Math.round((Date.now() - _fyEdgeProbe.at) / 1000);
-      if (_fyEdgeProbe.state === 'opaque') {
-        h += '<div style="margin-top:4px;color:#f59e0b">' + ago + 's ago, during a burst, ' +
-          'the same call answered in ' + _fyEdgeProbe.ms + 'ms with CORS switched off.</div>' +
-          '<div style="margin-top:3px;color:#94a3b8">So the server IS replying \u2014 the ' +
-          'reply simply arrives without the header that would let the app read it, which ' +
-          'a browser can only ever show as \u201cFailed to fetch\u201d. Something in front ' +
-          'of the Worker is turning calls away, and the honest suspect is the rate above. ' +
-          'This is why the rate-limited row keeps reading zero: CORS takes the status away ' +
-          'before the app can see it.</div>';
-      } else {
-        h += '<div style="margin-top:4px;color:#f59e0b">' + ago + 's ago, during a burst, ' +
-          'the same call failed in ' + _fyEdgeProbe.ms + 'ms even with CORS switched off.</div>' +
-          '<div style="margin-top:3px;color:#94a3b8">Nothing came back at all, so this is ' +
-          'not a header being withheld \u2014 it is the connection itself, between this ' +
-          'device and Cloudflare.</div>';
-      }
-    } else if (_fyEdgeProbe) {
-      h += '<div style="margin-top:4px;color:#64748b">checking whether anything answers at ' +
-        'all\u2026</div>';
-    }
+      'border-radius:8px;padding:8px;font-size:10px;line-height:1.5;color:#cbd5e1">' + inner;
     return h + '</div>';
+  } catch (e) { return ''; }
+}
+
+// \u2500\u2500 BLACKOUT \u2500\u2500 The probe's answer, on its own, kept.
+//
+// This used to print inside the rate block, and the rate block prints
+// nothing when there have been no calls for two minutes -- which is
+// exactly the state the app is in by the time anyone opens the panel to
+// read it. The one measurement worth having was being thrown away for
+// want of recent traffic. It keeps its answer now, however long ago it
+// asked, and says when.
+function _fyEdgeBlock() {
+  try {
+    if (!_fyEdgeProbe) { return ''; }
+    var ago = Math.round((Date.now() - _fyEdgeProbe.at) / 1000);
+    var when = (ago < 90) ? (ago + 's ago') : (Math.round(ago / 60) + ' min ago');
+    var p = String(_fyEdgeProbe.path || '');
+    var shortP = p.length > 46 ? ('\u2026' + p.slice(-44)) : p;
+    var pathLine = '<div style="color:#64748b;margin-top:3px;word-break:break-word">' +
+      skEscapeMaybe(shortP) + '</div>';
+    var body;
+    if (_fyEdgeProbe.state === 'running') {
+      body = '<div style="color:#64748b">asking\u2026</div>';
+    } else if (_fyEdgeProbe.state === 'opaque') {
+      body = '<div style="color:#f59e0b"><b>Yes.</b> ' + when + ', mid-failure, that same ' +
+        'call answered in ' + _fyEdgeProbe.ms + 'ms with CORS switched off.</div>' +
+        pathLine +
+        '<div style="margin-top:4px;color:#94a3b8">So the server is replying. The reply ' +
+        'simply arrives without the header that lets the app read it \u2014 and a browser ' +
+        'can only ever show that as \u201cFailed to fetch\u201d, with no status attached. ' +
+        'Something in front of the Worker is turning calls away. It also explains why the ' +
+        'rate-limited row has read zero through every one of these: CORS takes the status ' +
+        'away before the app can see it.</div>';
+    } else {
+      body = '<div style="color:#f59e0b"><b>No.</b> ' + when + ', mid-failure, that same ' +
+        'call failed in ' + _fyEdgeProbe.ms + 'ms even with CORS switched off.</div>' +
+        pathLine +
+        '<div style="margin-top:4px;color:#94a3b8">Nothing came back at all, so this is not ' +
+        'a header being withheld \u2014 it is the connection itself, between this device ' +
+        'and Cloudflare.</div>';
+    }
+    return '<div style="color:#94a3b8;font-size:11px;margin:16px 0 4px">' +
+      'Did anything answer at all?</div>' +
+      '<div style="background:#0d1220;border:1px solid rgba(255,255,255,0.08);' +
+      'border-radius:8px;padding:8px;font-size:10px;line-height:1.5;color:#cbd5e1">' +
+      body + '</div>';
   } catch (e) { return ''; }
 }
 
@@ -198346,28 +198375,58 @@ function _fyBurstBlock() {
     var alone = 0;
     for (i = 0; i < bursts.length; i++) { if (bursts[i].n === 1) { alone++; } }
 
+    // \u2500\u2500 BLACKOUT \u2500\u2500 A nine-second "burst" is not a burst.
+    //
+    // The 250ms cut was meant to catch calls dying TOGETHER. But the app
+    // fires about seven a second, so when everything is failing the gaps
+    // are ~140ms and the entire episode merges into one span nine seconds
+    // wide. That number then reads as confirmation of collateral when all
+    // it says is "it failed continuously" -- which was already known.
+    //
+    // Simultaneity, if it is there, shows at 60ms, not at 250. So count
+    // that separately, and call a long unbroken run what it is.
+    var tight = 1, run = 1;
+    for (i = 1; i < fails.length; i++) {
+      if ((fails[i].t - fails[i - 1].t) <= 60) { run++; if (run > tight) { tight = run; } }
+      else { run = 1; }
+    }
+    var span = best.last - best.first;
+    var blackout = (best.n >= 8 && span >= 2000);
+
     var verdict;
-    if (best.n >= 3 && nL >= 2) {
-      verdict = 'Failures arriving together on different leagues are not ' +
-        'separate failures \u2014 they are one connection dying and taking ' +
-        'everything riding on it. That is why one league can stop the rest.';
-    } else if (best.n >= 3) {
-      verdict = 'They arrive together but all within one league, so this ' +
-        'looks like that league\u2019s own calls rather than a shared connection.';
+    if (blackout && tight < 3) {
+      verdict = 'This is not several calls dying together \u2014 it is ' +
+        (span / 1000).toFixed(1) + ' seconds during which NOTHING got through, at the rate ' +
+        'the app was asking. A blackout that starts under load and clears on its own looks ' +
+        'far more like being turned away than like a broken connection. \u201cDid anything ' +
+        'answer at all?\u201d above is what settles that.';
+    } else if (tight >= 3 && nL >= 2) {
+      verdict = 'Several calls on different leagues died inside the same few milliseconds, ' +
+        'which is collateral \u2014 one connection going down and taking everything riding ' +
+        'on it with it.';
+    } else if (best.n >= 3 && nL === 1) {
+      verdict = 'They arrive together but all within one league, so this looks like that ' +
+        'league\u2019s own calls rather than anything shared.';
     } else {
-      verdict = 'They arrive one at a time, so each is its own failure \u2014 ' +
-        'not collateral from a shared connection.';
+      verdict = 'They arrive one at a time, so each is its own failure \u2014 not collateral ' +
+        'and not a blackout.';
     }
     return '<div style="color:#94a3b8;font-size:11px;margin:16px 0 4px">' +
       'How the failures arrived</div>' +
       '<div style="background:#0d1220;border:1px solid rgba(255,255,255,0.08);' +
       'border-radius:8px;padding:8px;font-size:10px;line-height:1.5;color:#cbd5e1">' +
-      '<div><b>' + fails.length + '</b> connection failures in <b>' + bursts.length +
-      '</b> burst' + (bursts.length === 1 ? '' : 's') + ' \u00b7 ' + alone +
-      ' arrived alone</div>' +
-      '<div style="margin-top:3px">biggest burst: <b>' + best.n + '</b> call' +
-      (best.n === 1 ? '' : 's') + ' inside <b>' + (best.last - best.first) +
-      'ms</b>, across <b>' + nL + '</b> league' + (nL === 1 ? '' : 's') + '</div>' +
+      '<div><b>' + fails.length + '</b> connection failures \u00b7 last one <b>' +
+      (function () {
+        var a = Math.round((Date.now() - fails[fails.length - 1].t) / 1000);
+        return (a < 90) ? (a + 's ago') : (Math.round(a / 60) + ' min ago');
+      })() + '</b></div>' +
+      '<div style="margin-top:3px">longest unbroken run: <b>' + best.n + '</b> call' +
+      (best.n === 1 ? '' : 's') + ' over <b>' + (span < 1000 ? span + 'ms' :
+        (span / 1000).toFixed(1) + 's') + '</b>, across <b>' + nL + '</b> league' +
+      (nL === 1 ? '' : 's') + '</div>' +
+      '<div style="margin-top:3px">tightest clump: <b>' + tight + '</b> call' +
+      (tight === 1 ? '' : 's') + ' inside 60ms' +
+      (tight < 3 ? ' \u2014 too few to be collateral' : '') + '</div>' +
       '<div style="margin-top:4px;color:#94a3b8">' + verdict + '</div>' +
       (_fyNarrowCount ? '<div style="margin-top:4px;color:#7dd3fc">Gate narrowed to one ' +
         'request at a time ' + _fyNarrowCount + ' time' + (_fyNarrowCount === 1 ? '' : 's') +
@@ -198502,7 +198561,9 @@ function skShowApiHealth() {
       'font-weight:700;letter-spacing:0.06em">WALK THE FAILING LEAGUE</button>' +
       '<div id="_fyLadderOut" style="font-size:10px;margin-top:6px;line-height:1.5"></div>' +
     '</div>' +
-    // EDGEPROBE -- the rate, and whether anything answers at all.
+    // BLACKOUT -- the probe's answer, which must never go missing again.
+    _fyEdgeBlock() +
+    // EDGEPROBE -- the rate the app was asking at.
     _fyRateBlock() +
     // BURSTKILL -- together or separately, which is the whole question.
     _fyBurstBlock() +
