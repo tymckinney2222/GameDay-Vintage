@@ -198369,10 +198369,20 @@ function _fyBulkDiagBlock() {
     for (var i = 0; i < kinds.length; i++) {
       var d = _fyBatchDiag[kinds[i]];
       var ago = Math.round((Date.now() - d.at) / 1000);
+      // BATCHVERIFY -- rejections belong next to the fills, not hidden.
+      var rej = 0;
+      try { rej = _fyBatchRejected[kinds[i]] || 0; } catch (eR) {}
       var head = '<div style="color:' + (d.found ? '#4ade80' : '#f59e0b') + '"><b>' +
         skEscapeMaybe(kinds[i]) + '</b> \u00b7 ' +
         (d.ok ? ('answered, ' + d.found + ' filled') : 'failed') +
-        ' \u00b7 ' + ago + 's ago</div>';
+        (rej ? (' \u00b7 ' + rej + ' turned away') : '') +
+        ' \u00b7 ' + ago + 's ago</div>' +
+        (rej && !d.found
+          ? '<div style="color:#fbbf24;margin-top:2px">Every answer came back without ' +
+            'the stats that were asked for \u2014 Yahoo is honouring the roster part of ' +
+            'the request and dropping the stats part. Nothing was cached, so each team ' +
+            'is asking on its own, correctly but at full price.</div>'
+          : '');
       var detail = d.ok
         ? (d.found ? '' :
            '<div style="color:#94a3b8;margin-top:2px">It answered and nothing was ' +
@@ -200834,6 +200844,49 @@ function _fyTeamCall(path) {
 }
 
 // Put each team's answer back in the shape its own call returns.
+// \u2500\u2500 BATCHVERIFY \u2500\u2500 Did the answer contain what was asked for?
+//
+// The chained call asks for a roster AND that roster's stats. A reply
+// carrying the roster but not the stats is shaped perfectly and worth
+// nothing: every consumer reads players with no points and renders
+// "awaiting stats" forever, while the counter reports a success.
+//
+// _skParsePlayerStatsResponse needs player_points or player_stats on the
+// player, so that is precisely what this looks for. One player carrying
+// them is enough -- on a quiet night most legitimately have none.
+function _fyPartCarriesStats(part) {
+  try {
+    var roster = part && part.roster;
+    if (!roster) { return false; }
+    var players = (roster['0'] && roster['0'].players) || roster.players;
+    if (!players) { return false; }
+    var n = parseInt(players.count, 10) || 0;
+    for (var i = 0; i < n; i++) {
+      var slot = players[String(i)] || players[i];
+      var p = slot && slot.player;
+      if (!p) { continue; }
+      for (var j = 1; j < p.length; j++) {
+        var bag = p[j];
+        if (bag && typeof bag === 'object' &&
+            (bag.player_points || bag.player_stats)) { return true; }
+      }
+    }
+  } catch (e) {}
+  return false;
+}
+
+// BATCHVERIFY -- how many answers were turned away for not carrying it.
+// A number that must be read next to the "filled" one: a batch filling
+// nothing AND rejecting plenty is Yahoo declining to honour the chain,
+// which is a different thing from a batch that failed.
+var _fyBatchRejected = {};
+function _fyBatchReject(kind, n) {
+  try {
+    if (!_fyBatchRejected[kind]) { _fyBatchRejected[kind] = 0; }
+    _fyBatchRejected[kind] += (n || 0);
+  } catch (e) {}
+}
+
 function _fyBatchTeamSplit(data, suffix) {
   var n = 0;
   try {
@@ -200848,6 +200901,13 @@ function _fyBatchTeamSplit(data, suffix) {
       // to depend on that.
       var tpart = _fyTeamPart(teams[i], want);
       if (!tpart) { continue; }
+      // BATCHVERIFY -- the chained form asked for stats. A roster without
+      // them is not the answer to that question, so it is not cached and
+      // the caller goes and asks properly.
+      if (want === 'roster' && !_fyPartCarriesStats(tpart)) {
+        _fyBatchReject('teamstats', 1);   // the kind the diag is keyed by
+        continue;
+      }
       fyDataCache['/team/' + tk + '/' + suffix] = {
         t: Date.now(), ttl: _fyBatchTtl('teamstats', suffix),
         d: { fantasy_content: { team: [teams[i][0], tpart] } }
