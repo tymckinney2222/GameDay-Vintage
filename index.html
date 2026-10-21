@@ -156559,9 +156559,15 @@ function _fxSeasonToTotals(SPORT, statMap) {
 // Build the whole board. One _skFetchEspnSeasonStats call per team (cached by
 // that function per sport+teamKey), so re-opening the tab is free. FXROTO2
 var _fxRotoPrior = false;   // FXROTOSEASON — stats came from a played season
+// FXROTOYEAR -- which season the stat lines actually came from, and which one
+// is running. Both are facts off the payload rather than inferences.
+var _fxRotoSeasonSeen = {};
+var _fxRotoNow = null;
 
 function _fxRotoBuild(row, onProgress) {
   _fxRotoPrior = false;
+  _fxRotoSeasonSeen = {};
+  _fxRotoNow = _skCurrentSeasonYear(row && row.sport);
   var SPORT = String(row.sport || '').toUpperCase();
   var sportKey = String(row.sport || '').toLowerCase();
   var cats = _fxRotoCats(row);
@@ -156627,11 +156633,24 @@ function _fxRotoBuild(row, onProgress) {
           if (fl) {
             maps.push(_fxSeasonToTotals(SPORT, fl));
             tm.resolved++;
-            // Any real production at all means these are played games, not an
-            // empty new season. FXROTOSEASON
+            // FXROTOYEAR -- which season these numbers are FROM, read off
+            // the row they came from. The old test was "any player has GP > 0",
+            // which says the games were played and not WHEN: from the first
+            // night of a new season it cannot tell last year from this one,
+            // which is exactly the night it needed to.
             try {
-              var _g = parseFloat(String(fl.GP == null ? '' : fl.GP));
-              if (!isNaN(_g) && _g > 0) _fxRotoPrior = true;
+              var _sy2 = fl.__season;
+              if (_sy2 != null) {
+                _fxRotoSeasonSeen[String(_sy2)] = 1;
+                if (_fxRotoNow != null && Number(_sy2) !== Number(_fxRotoNow)) {
+                  _fxRotoPrior = true;
+                }
+              } else {
+                // No season on the row: fall back to the old reading rather
+                // than claiming to know.
+                var _g = parseFloat(String(fl.GP == null ? '' : fl.GP));
+                if (!isNaN(_g) && _g > 0) { _fxRotoPrior = true; }
+              }
             } catch (eG2) {}
           }
         }
@@ -156675,7 +156694,8 @@ function _fxRotoBuild(row, onProgress) {
     // last year's production. Detected from GP: a played season has games.
     // FXROTOSEASON
     return { cats: cats, teams: teams, pts: pts, rank: rank, order: order,
-             actual: actual, sport: SPORT, priorSeason: !!_fxRotoPrior };
+             actual: actual, sport: SPORT, priorSeason: !!_fxRotoPrior,
+             seasonsSeen: Object.keys(_fxRotoSeasonSeen), seasonNow: _fxRotoNow };
   });
 }
 
@@ -156726,16 +156746,29 @@ function _fxRotoHtml(d) {
       'every category, so each takes an equal share of the rank points. ' +
       'The check against Fantrax\u2019s total starts meaning something once games ' +
       'have been played.</div>';
-  } else if (d.priorSeason && d.actual != null && Math.abs(d.actual) < 0.05) {
-    // Production exists but Fantrax reports nothing: these are LAST season's
-    // numbers, and the board is a preseason strength ranking rather than a
-    // standing. Calling that a "+56.1 discrepancy" compares two different
-    // quantities and reads as a bug in the arithmetic. FXROTOSEASON
+  } else if (d.priorSeason) {
+    // FXROTOYEAR -- these are not this season's numbers, so there is nothing
+    // here to check against Fantrax whatever Fantrax has published. This used
+    // to also require Fantrax to be reporting zero, which meant the honest
+    // label switched itself off on the exact night the data went stale: his
+    // board compared a full season of last year against one night of this
+    // one and called the difference "+36.6 off", as though the arithmetic
+    // had slipped. The seasons are named now so the mismatch is visible
+    // rather than deduced from how large the numbers look.
+    var _sw = (d.seasonsSeen && d.seasonsSeen.length)
+      ? d.seasonsSeen.sort().join(', ') : 'an earlier season';
     head = '<div class="fxr-check">' +
-      '<b>Preseason strength ranking</b> \u2014 built from last season\u2019s ' +
-      'totals for the players on each roster now. Fantrax has no standing yet, ' +
-      'so there is nothing to check against; these ranks show whose roster ' +
-      'produced most last year, not where anyone stands.</div>';
+      '<b>Strength ranking, not a standing</b> \u2014 built from <b>' +
+      skEscapeMaybe(_sw) + '</b> totals for the players on each roster now' +
+      (d.seasonNow ? (', while <b>' + skEscapeMaybe(String(d.seasonNow)) +
+        '</b> is the season running') : '') + '. ' +
+      (d.actual != null
+        ? ('Fantrax has this team on <b>' + d.actual.toFixed(1) + '</b> for the ' +
+           'season so far; that is a different quantity, so the two are not ' +
+           'compared. ')
+        : '') +
+      'These ranks show whose roster produced most, not where anyone stands.' +
+      '</div>';
   } else if (d.actual != null) {
     var diff = Math.round((est - d.actual) * 10) / 10;
     var ok = Math.abs(diff) < 0.05;
@@ -185651,6 +185684,24 @@ var _ESPN_NAME_CODE = {
 // misleading label, so nothing can read it by accident.
 var _ESPN_LABEL_TRAP = { nhl: { SOG: 'shootoutGoals' } };
 
+// \u2500\u2500 FXROTOYEAR \u2500\u2500 The season actually running, right now.
+//
+// Built on _espSeasonWindow so there is ONE definition of when a season
+// runs rather than a second one drifting beside it. Returns null between
+// seasons, which is a real answer: in August nothing is running, and a
+// board built then is a strength ranking whatever the stats say.
+function _skCurrentSeasonYear(sportKey) {
+  try {
+    if (typeof _espSeasonWindow !== 'function') { return null; }
+    var now = Date.now(), y = (new Date()).getFullYear(), d;
+    for (d = 0; d <= 1; d++) {
+      var w = _espSeasonWindow(String(sportKey || '').toLowerCase(), y + d);
+      if (w && now >= w.startMs && now <= w.endMs) { return y + d; }
+    }
+  } catch (e) {}
+  return null;
+}
+
 function _parseEspnSeasonTotals(sj, sportKey) {
   try {
     var cats = (typeof _skCareerCategories === 'function') ? _skCareerCategories(sj) : null;
@@ -185678,10 +185729,24 @@ function _parseEspnSeasonTotals(sj, sportKey) {
     if (!labels.length || !rows.length) return null;
     // Last row = most recent season. Before opening night that's last season,
     // which the board already labels as a preseason ranking.
+    //
+    // FXROTOYEAR -- and WHICH season that is gets recorded rather than
+    // inferred downstream from whether anybody has played. Every row here
+    // carries season:{year,displayName}; the career tab has always read it.
     var row = rows[rows.length - 1] || {};
     var vals = row.stats || row.values || [];
     if (!vals.length) return null;
     var out = {};
+    // FXROTOYEAR -- non-enumerable on purpose. _fxSeasonToTotals multiplies
+    // every enumerable key by games played, so a year carried as an ordinary
+    // field would be scaled into nonsense and then ranked as a category.
+    try {
+      var _sy = (row.season && (row.season.year || row.season.displayName)) || null;
+      if (_sy != null) {
+        Object.defineProperty(out, '__season', {
+          value: _sy, enumerable: false, writable: true, configurable: true });
+      }
+    } catch (eSY) {}
     // ESPNNAMES — labels first, then the name-derived codes on top, so an
     // unlisted column keeps working exactly as before while a named one is
     // filed under something that can't be confused with another stat.
