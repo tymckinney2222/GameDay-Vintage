@@ -156695,6 +156695,7 @@ function _fxRotoBuild(row, onProgress) {
     // FXROTOSEASON
     return { cats: cats, teams: teams, pts: pts, rank: rank, order: order,
              actual: actual, sport: SPORT, priorSeason: !!_fxRotoPrior,
+             key: String((row && row.key) || ''),
              seasonsSeen: Object.keys(_fxRotoSeasonSeen), seasonNow: _fxRotoNow };
   });
 }
@@ -156707,6 +156708,46 @@ function _fxRotoFmt(v, target) {
     return rates[target].strip0 ? txt.replace(/^0/, '') : txt;
   }
   return String(Math.round(Number(v) * 100) / 100);
+}
+
+// \u2500\u2500 FXSTRENGTH \u2500\u2500 Say when the board stopped being a strength ranking.
+//
+// ESPN publishes the new season the next day, so this board spends about
+// twenty-four hours ranking last year and then silently starts ranking this
+// one. A number that changes meaning without saying so is the thing that
+// cost us an afternoon today, so it says so: once, for two days, naming both
+// seasons.
+//
+// Per league, because leagues cross over on different nights, and in
+// localStorage because it has to survive the reload that brings the new
+// numbers in. Every read and write is wrapped -- a browser with storage
+// refused still gets the board, just without the announcement.
+function _fxRotoSeasonSwitch(key, seasonsSeen, seasonNow) {
+  try {
+    if (!key) { return ''; }
+    var cur = (seasonsSeen && seasonsSeen.length)
+      ? seasonsSeen.slice().sort().join(',') : '';
+    if (!cur) { return ''; }
+    var sk = 'fx_roto_season_' + key, rec = null, now = Date.now();
+    try { rec = JSON.parse(localStorage.getItem(sk) || 'null'); } catch (eR) { rec = null; }
+    if (!rec || rec.s !== cur) {
+      rec = { s: cur, t: now, from: (rec && rec.s) || null };
+      try { localStorage.setItem(sk, JSON.stringify(rec)); } catch (eW) {}
+    }
+    // Only worth saying when it MOVED, and only while the move is news.
+    if (!rec.from || rec.from === rec.s) { return ''; }
+    if ((now - rec.t) > 48 * 60 * 60 * 1000) { return ''; }
+    var onNow = (seasonNow != null && cur === String(seasonNow));
+    return '<div class="fxr-check ok"><b>Now on ' + skEscapeMaybe(cur) +
+      ' numbers</b> \u2014 ESPN has published the new season, so this board has ' +
+      'switched over from ' + skEscapeMaybe(String(rec.from)) + '. ' +
+      (onNow
+        ? 'It is a standing again, and the check against Fantrax\u2019s total means ' +
+          'something from here on.'
+        : 'The check against Fantrax resumes once the seasons line up.') +
+      '</div>';
+  } catch (e) {}
+  return '';
 }
 
 function _fxRotoHtml(d) {
@@ -156861,9 +156902,20 @@ function _fxRotoHtml(d) {
   }
   grid += '</tbody></table></div>';
 
-  return head +
+  // FXSTRENGTH -- above the board, where a change of meaning belongs.
+  var switched = '';
+  try { switched = _fxRotoSeasonSwitch(d.key, d.seasonsSeen, d.seasonNow); }
+  catch (eSw) { switched = ''; }
+
+  return head + switched +
     '<div class="fxr-head">' +
-      '<span class="fxr-cat">CAT</span><span class="fxr-val">TOTAL</span>' +
+      // FXSTRENGTH -- "TOTAL" above a column of fifteen-thousand-point numbers
+      // invites exactly the question he had to ask. Naming the season answers
+      // it before it is asked.
+      '<span class="fxr-cat">CAT</span><span class="fxr-val">' +
+      ((d.priorSeason && d.seasonsSeen && d.seasonsSeen.length)
+        ? (skEscapeMaybe(d.seasonsSeen.slice().sort().join('/')) + ' TOT')
+        : 'TOTAL') + '</span>' +
       '<span class="fxr-rank">RANK</span><span class="fxr-pts">PTS</span>' +
       '<span class="fxr-gap">GAP \u25b2 / \u25bc</span></div>' +
     rows +
@@ -156871,14 +156923,25 @@ function _fxRotoHtml(d) {
     grid +
     '<div class="fxr-note">' +
       (d.priorSeason
+        // FXSTRENGTH -- what this board is FOR while it is a strength ranking.
+        // Ranking current rosters by last season's production is a real read
+        // for trades and waivers; described only as "not a standing" it looks
+        // broken instead of useful. ESPN publishes the new season the next
+        // day, so this is a short window and worth naming as such.
         ? 'Season totals come from ESPN\u2019s per-season totals table \u2014 real ' +
           'cumulative numbers, including three-pointers and the makes and attempts ' +
-          'behind FG% and FT%. '
+          'behind FG% and FT%. Until ESPN publishes the new season \u2014 usually the ' +
+          'next day \u2014 this ranks each roster by what its players produced last ' +
+          'year, which is a fair read on roster strength for trades and waivers, and ' +
+          'is not where anyone stands. '
         : '') +
       'Category totals are rebuilt from every team\u2019s current roster and ESPN season ' +
       'stats \u2014 Fantrax publishes no per-category standings. Players count for whoever ' +
       'holds them NOW, so trades and waiver claims misattribute production, and bench days ' +
-      'are included. That is why the total above is checked against Fantrax\u2019s own.' +
+      'are included. ' +
+      (d.priorSeason
+        ? 'The check against Fantrax\u2019s own total is suspended until the seasons line up.'
+        : 'That is why the total above is checked against Fantrax\u2019s own.') +
       (unresolved ? (' ' + unresolved + ' of ' + totalP + ' rostered players had no ESPN season line.') : '') +
     '</div>';
 }
