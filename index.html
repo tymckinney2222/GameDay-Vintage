@@ -156355,21 +156355,38 @@ function _fxScoringIsPoints(scoring) {
 //
 // Same id expression the standings pane uses, deliberately -- two spellings
 // of the same key would read the wrong baseline and report a phantom gap.
-function _fxPublishedDay(row) {
+// FXCHECKWHY -- returns { v, why }. A bare null made the caller draw nothing
+// at all, which reads exactly like the feature is missing. Every absence now
+// carries its reason so the readout can print it.
+function _fxPublishedDayInfo(row) {
   try {
-    if (!row || !row.standingsAll || !row.standingsAll.length) { return null; }
-    if (typeof _fxDayBase !== 'function') { return null; }
+    if (!row || !row.standingsAll || !row.standingsAll.length) {
+      return { v: null, why: 'standings not loaded this session' };
+    }
+    if (typeof _fxDayBase !== 'function') {
+      return { v: null, why: 'no day baseline available' };
+    }
     var myIds = row.myTeamIds || {}, mine = null, i;
     for (i = 0; i < row.standingsAll.length; i++) {
       var r = row.standingsAll[i];
       if (r && r.teamId && myIds[r.teamId]) { mine = r; break; }
     }
-    if (!mine || mine.points == null) { return null; }
+    if (!mine) { return { v: null, why: 'my team not matched in the standings' }; }
+    if (mine.points == null) { return { v: null, why: 'Fantrax published no points' }; }
     var base = _fxDayBase(String(row.key || '').slice(4), row.standingsAll);
-    if (!base || base[mine.teamId] == null) { return null; }
-    return Math.round(((Number(mine.points) || 0) - base[mine.teamId]) * 100) / 100;
+    if (!base || base[mine.teamId] == null) {
+      return { v: null, why: 'no start-of-day baseline yet \u2014 it is set the first ' +
+        'time the Standings tab is opened on a given day' };
+    }
+    return { v: Math.round(((Number(mine.points) || 0) - base[mine.teamId]) * 100) / 100,
+             why: '' };
   } catch (e) {}
-  return null;
+  return { v: null, why: 'could not be read' };
+}
+
+function _fxPublishedDay(row) {
+  var o = _fxPublishedDayInfo(row);
+  return o ? o.v : null;
 }
 
 // Players with a line tonight who are sitting in a reserve slot -- the exact
@@ -219310,9 +219327,20 @@ function _fxLineupFill(row, bodyEl, headEl, _retried) {
         if (row.provider === 'fantrax' && _fpT && _slateIsToday) {
           var _cov = (typeof _fxLineupCoverage === 'function')
             ? _fxLineupCoverage(row.key) : { n: 0, late: 0 };
-          var _pub = _fxPublishedDay(row);
+          var _pubInfo = _fxPublishedDayInfo(row);
+          var _pub = _pubInfo.v;
           var _mineTot = Math.round(_fpT.total * 100) / 100;
           var _bits = '';
+          // FXCHECKWHY -- coverage always states itself. "All 11 recorded
+          // before their games began" is a result; drawing nothing is not.
+          if (!_cov.n) {
+            _bits += '<div style="color:rgba(255,255,255,0.45)">No lineup statuses ' +
+              'recorded for today yet \u2014 open this while a game is still to come ' +
+              'and the slots get frozen the way Fantrax freezes them.</div>';
+          } else if (!_cov.late) {
+            _bits += '<div style="color:#4ade80">All ' + _cov.n + ' lineup slots were ' +
+              'recorded before those players\u2019 games began.</div>';
+          }
           if (_cov.late) {
             // The warning that used to live four sentences into a grey
             // paragraph at the foot of the modal, now beside the number.
@@ -219320,6 +219348,12 @@ function _fxLineupFill(row, bodyEl, headEl, _retried) {
               ' lineup slots were first seen after that player\u2019s game had begun, ' +
               'so Fantrax may already have rolled them to tomorrow. This total ' +
               'can be understated.</div>';
+          }
+          if (_pub == null) {
+            _bits += '<div style="color:rgba(255,255,255,0.45);margin-top:3px">' +
+              '<span style="color:rgba(255,255,255,0.55)">Skipper</span> <b>' +
+              _mineTot.toFixed(2) + '</b> \u00b7 Fantrax\u2019s own day score ' +
+              'unavailable \u2014 ' + slEsc(_pubInfo.why || 'reason unknown') + '.</div>';
           }
           if (_pub != null) {
             var _gap = Math.round((_pub - _mineTot) * 100) / 100;
