@@ -156346,6 +156346,50 @@ function _fxScoringIsPoints(scoring) {
 // subtotals line up with how the roster is displayed. Rounded once at the
 // end: summing pre-rounded per-player figures drifts by a cent or two over a
 // full lineup, and this number is meant to be checkable against Fantrax.
+// \u2500\u2500 FXDAYCHECK \u2500\u2500 Fantrax's own number for tonight.
+//
+// The Standings tab already computes this: each team's published season
+// points, less a baseline stored at the first sighting of the day. The
+// difference is tonight's score by Fantrax's arithmetic, and until now
+// nothing compared it against ours.
+//
+// Same id expression the standings pane uses, deliberately -- two spellings
+// of the same key would read the wrong baseline and report a phantom gap.
+function _fxPublishedDay(row) {
+  try {
+    if (!row || !row.standingsAll || !row.standingsAll.length) { return null; }
+    if (typeof _fxDayBase !== 'function') { return null; }
+    var myIds = row.myTeamIds || {}, mine = null, i;
+    for (i = 0; i < row.standingsAll.length; i++) {
+      var r = row.standingsAll[i];
+      if (r && r.teamId && myIds[r.teamId]) { mine = r; break; }
+    }
+    if (!mine || mine.points == null) { return null; }
+    var base = _fxDayBase(String(row.key || '').slice(4), row.standingsAll);
+    if (!base || base[mine.teamId] == null) { return null; }
+    return Math.round(((Number(mine.points) || 0) - base[mine.teamId]) * 100) / 100;
+  } catch (e) {}
+  return null;
+}
+
+// Players with a line tonight who are sitting in a reserve slot -- the exact
+// shape of the rollover bug. Returned with their points so the gap can be
+// attributed by name instead of merely announced.
+function _fxBenchedWithLines(sport, scoring, entries) {
+  var out = [], i;
+  if (typeof _fxScoreStatMap !== 'function') { return out; }
+  for (i = 0; i < (entries || []).length; i++) {
+    var en = entries[i] || {};
+    if (!en.statMap || en.starter === true) { continue; }
+    var res = null;
+    try { res = _fxScoreStatMap(sport, scoring, en.statMap, en.pos, en.ctx); }
+    catch (e) { res = null; }
+    if (!res || res.fp == null) { continue; }
+    out.push({ name: String(en.name || '?'), fp: res.fp });
+  }
+  return out;
+}
+
 function _fxDayFpTotals(sport, scoring, entries, groupsHint) {
   // Gated on the SCORING, not on whether anyone played. A points league on an
   // off day still has a fantasy-points total — it's zero — and hiding the line
@@ -219136,6 +219180,8 @@ function _fxLineupFill(row, bodyEl, headEl, _retried) {
         if (_lv.statMap) {
           _dayEntries.push({ statMap: _lv.statMap, pos: _lv.pos || players[p].pos,
                              ctx: _lv.ctx, starter: players[p].starter,
+                             // FXDAYCHECK -- so a gap can name who is in it.
+                             name: players[p].name,
                              day: _lv.day || '',   // FTXSLATE
                              slot: players[p].slot,
                              // Fantrax's own F/D/G, not ESPN's C/LW/RW — the
@@ -219258,6 +219304,73 @@ function _fxLineupFill(row, bodyEl, headEl, _retried) {
           '<span class="fx-daytot-fptot">' + (_fpT.total >= 0 ? '+' : '') +
             _fpT.total.toFixed(2) + ' FP</span>' + _gBits + '</div>';
       }
+      // \u2500\u2500 FXDAYCHECK \u2500\u2500 Ours against Fantrax's, with the gap named.
+      var _ckHtml = '';
+      try {
+        if (row.provider === 'fantrax' && _fpT && _slateIsToday) {
+          var _cov = (typeof _fxLineupCoverage === 'function')
+            ? _fxLineupCoverage(row.key) : { n: 0, late: 0 };
+          var _pub = _fxPublishedDay(row);
+          var _mineTot = Math.round(_fpT.total * 100) / 100;
+          var _bits = '';
+          if (_cov.late) {
+            // The warning that used to live four sentences into a grey
+            // paragraph at the foot of the modal, now beside the number.
+            _bits += '<div style="color:#fbbf24">' + _cov.late + ' of ' + _cov.n +
+              ' lineup slots were first seen after that player\u2019s game had begun, ' +
+              'so Fantrax may already have rolled them to tomorrow. This total ' +
+              'can be understated.</div>';
+          }
+          if (_pub != null) {
+            var _gap = Math.round((_pub - _mineTot) * 100) / 100;
+            var _agree = Math.abs(_gap) < 0.05;
+            _bits += '<div style="margin-top:' + (_bits ? '3px' : '0') + '">' +
+              '<span style="color:rgba(255,255,255,0.55)">Skipper</span> <b>' +
+              _mineTot.toFixed(2) + '</b> \u00b7 ' +
+              '<span style="color:rgba(255,255,255,0.55)">Fantrax</span> <b>' +
+              _pub.toFixed(2) + '</b>' +
+              (_agree
+                ? ' \u00b7 <span style="color:#4ade80">agree</span>'
+                : ' \u00b7 <span style="color:#f59e0b">' + (_gap > 0 ? '+' : '') +
+                  _gap.toFixed(2) + ' unaccounted</span>') +
+              '</div>';
+            if (!_agree) {
+              // Attribute it where it can be attributed. A benched player
+              // with a line tonight is this bug's fingerprint.
+              var _bw = _fxBenchedWithLines(SPORT, row.scoring, _dayEntries);
+              var _bsum = 0, _bi;
+              for (_bi = 0; _bi < _bw.length; _bi++) { _bsum += _bw[_bi].fp; }
+              _bsum = Math.round(_bsum * 100) / 100;
+              if (_bw.length && Math.abs(_bsum - _gap) < 0.05) {
+                var _nm = [];
+                for (_bi = 0; _bi < _bw.length && _bi < 6; _bi++) {
+                  _nm.push(slEsc(_bw[_bi].name) + ' ' + _bw[_bi].fp.toFixed(2));
+                }
+                _bits += '<div style="color:rgba(255,255,255,0.6);margin-top:2px">' +
+                  'That is exactly ' + _nm.join(' + ') + ' \u2014 on the bench here, ' +
+                  'counted by Fantrax.</div>';
+              } else if (_bw.length) {
+                _bits += '<div style="color:rgba(255,255,255,0.45);margin-top:2px">' +
+                  _bw.length + ' benched player' + (_bw.length === 1 ? '' : 's') +
+                  ' played tonight (' + _bsum.toFixed(2) + ' FP), which does not ' +
+                  'account for the gap on its own.</div>';
+              } else {
+                _bits += '<div style="color:rgba(255,255,255,0.45);margin-top:2px">' +
+                  'Live feeds drift while games are on \u2014 worth re-checking once ' +
+                  'tonight\u2019s slate is final.</div>';
+              }
+            }
+          }
+          if (_bits) {
+            _ckHtml = '<div style="background:#0d1220;border:1px solid rgba(255,255,255,0.08);' +
+              'border-radius:8px;padding:6px 8px;margin:7px 0 0;font-size:10px;' +
+              'line-height:1.5;font-family:var(--sk-font-mono,monospace)">' +
+              '<div style="color:#94a3b8;margin-bottom:2px">LINEUP CHECK</div>' +
+              _bits + '</div>';
+          }
+        }
+      } catch (eCk) { _ckHtml = ''; }
+
       // Roto rank movement — what today did to the standings, not just what
       // it produced. Only when the Roto tab has been opened once, since the
       // board it needs is expensive to build. FXROTODELTA
@@ -219316,7 +219429,7 @@ function _fxLineupFill(row, bodyEl, headEl, _retried) {
                (_slateIsToday ? 'PLAYING' : 'PLAYED'))
             : (_starters.length + ' PLAYER' + (_starters.length === 1 ? '' : 'S'))) +
           (_anyFlag ? '' : '<span class="fx-daytot-note">all rostered \u2014 no lineup slots from Fantrax</span>') +
-        '</div><div class="fx-daytot-row">' + _cells + '</div>' + _fpHtml + _rkHtml + '</div>';
+        '</div><div class="fx-daytot-row">' + _cells + '</div>' + _fpHtml + _ckHtml + _rkHtml + '</div>';
     }
     bodyEl.innerHTML =
       '<div style="color:rgba(255,255,255,0.42);font-size:10px;letter-spacing:0.12em;margin-bottom:4px">ROSTER \u00b7 ' +
