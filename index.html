@@ -156719,11 +156719,24 @@ function _fxRotoBuild(row, onProgress) {
   _fxRotoBuild._retry = false;
 
   var doneN = 0;
-  return Promise.all(teams.map(function (tm) {
+  // \u2500\u2500 FXONESEASON \u2500\u2500 One season for the whole league, or none.
+  //
+  // The running season first. If not a single player in the league has a line
+  // for it, that is a real preseason and the board falls back to the last
+  // complete season for everyone -- coherent, and labelled as a ranking
+  // rather than a standing. What it never does again is mix the two.
+  function _fxPass(wantSeason) {
+    doneN = 0;
+    _fxRotoSeasonSeen = {};
+    for (var _z = 0; _z < teams.length; _z++) {
+      teams[_z].totals = null; teams[_z].resolved = 0;
+    }
+    return Promise.all(teams.map(function (tm) {
     // teamKey is the season-stat cache key, so each Fantrax team caches
     // separately and a repeat open costs nothing.
     // TOTALS, not the overview's averages. SEASONTOTALS
-    return _skFetchEspnSeasonStats(sportKey, row.key + '|' + tm.teamId, tm.players, true)
+    return _skFetchEspnSeasonStats(sportKey, row.key + '|' + tm.teamId, tm.players, true,
+                                   wantSeason)
       .then(function (entry) {
         var by = (entry && entry.byPlayerKey) || {};
         var maps = [];
@@ -156765,7 +156778,16 @@ function _fxRotoBuild(row, onProgress) {
         doneN++;
         if (onProgress) { try { onProgress(doneN, teams.length); } catch (e) {} }
       });
-  })).then(function () {
+    }));
+  }
+
+  return _fxPass(_fxRotoNow).then(function () {
+    var _got = 0, _gi;
+    for (_gi = 0; _gi < teams.length; _gi++) { _got += teams[_gi].resolved; }
+    if (_got || _fxRotoNow == null) { return null; }
+    // Nobody has played anywhere: fall back to the last complete season.
+    return _fxPass(Number(_fxRotoNow) - 1);
+  }).then(function () {
     // Rank every category, accumulate roto points.
     var pts = {}, rank = {}, order = {};
     for (var c = 0; c < cats.length; c++) {
@@ -185881,7 +185903,7 @@ function _skCurrentSeasonYear(sportKey) {
   return null;
 }
 
-function _parseEspnSeasonTotals(sj, sportKey) {
+function _parseEspnSeasonTotals(sj, sportKey, wantSeason) {
   try {
     var cats = (typeof _skCareerCategories === 'function') ? _skCareerCategories(sj) : null;
     if (!cats || !cats.length) return null;
@@ -185906,13 +185928,31 @@ function _parseEspnSeasonTotals(sj, sportKey) {
     var names = cat.names || [];
     var rows = cat.statistics || [];
     if (!labels.length || !rows.length) return null;
-    // Last row = most recent season. Before opening night that's last season,
-    // which the board already labels as a preseason ranking.
+    // \u2500\u2500 FXONESEASON \u2500\u2500 Pick the row by its season, not by its position.
     //
-    // FXROTOYEAR -- and WHICH season that is gets recorded rather than
-    // inferred downstream from whether anybody has played. Every row here
-    // carries season:{year,displayName}; the career tab has always read it.
-    var row = rows[rows.length - 1] || {};
+    // "Last row" meant three different things on the same morning: the new
+    // season for a player who had played, last season for one who had not,
+    // and CAREER for anyone whose table carries that row. Totalling those
+    // together is not a standing or a ranking, it is a mixture.
+    //
+    // wantSeason names the year required. Absent it, the highest season on
+    // file -- still by year, never by position. A row with no season node is
+    // the career line and is never eligible for either.
+    var row = null, _ri, _rs, _ry, _best = null;
+    for (_ri = 0; _ri < rows.length; _ri++) {
+      _rs = rows[_ri] && rows[_ri].season;
+      if (!_rs) { continue; }                       // career line
+      _ry = Number(_rs.year);
+      if (isNaN(_ry)) { continue; }
+      if (wantSeason != null) {
+        if (_ry === Number(wantSeason)) { row = rows[_ri]; break; }
+        continue;
+      }
+      if (_best === null || _ry > _best) { _best = _ry; row = rows[_ri]; }
+    }
+    // Asked for a season this player has no line for: he produced nothing,
+    // and saying so is the point. A neighbouring year would be a fabrication.
+    if (!row) { return null; }
     var vals = row.stats || row.values || [];
     if (!vals.length) return null;
     var out = {};
@@ -185952,11 +185992,15 @@ function _parseEspnSeasonTotals(sj, sportKey) {
   } catch (e) { return null; }
 }
 
-async function _skFetchEspnSeasonStats(sportKey, teamKey, players, useTotals) {
+async function _skFetchEspnSeasonStats(sportKey, teamKey, players, useTotals, wantSeason) {
   if (!teamKey || !_ESPN_SPORT_CFG[sportKey]) return null;
   // Totals live in their own cache slot — the two payloads are different
   // shapes and must never share an entry. SEASONTOTALS
-  var ck = sportKey + '|' + teamKey + (useTotals ? '|tot' : '');
+  // FXONESEASON -- and a season-scoped read is a different payload again, so
+  // it gets its own slot too. Sharing one would serve last season's numbers
+  // to a caller that asked for this one.
+  var ck = sportKey + '|' + teamKey + (useTotals ? '|tot' : '') +
+    (wantSeason != null ? ('|s' + wantSeason) : '');
   var cached = _espnSeasonCache[ck];
   if (cached && (Date.now() - cached.ts) < ESPN_SEASON_TTL) return cached;
   if (_espnSeasonInflight[ck]) return _espnSeasonInflight[ck];
@@ -186015,7 +186059,7 @@ async function _skFetchEspnSeasonStats(sportKey, teamKey, players, useTotals) {
         // receiving:{...}, defensive:{...}, kicking:{...} } from /stats so the
         // formatter reads each field from its own category (no label collisions).
         var flat = useTotals
-          ? _parseEspnSeasonTotals(sj, sportKey)
+          ? _parseEspnSeasonTotals(sj, sportKey, wantSeason)
           : (_espnUseStats ? _parseEspnNflCategories(sj) : _parseEspnSeasonStats(sj));
         if (flat && Object.keys(flat).length) {
           byPlayerKey[r.playerKey] = flat;
