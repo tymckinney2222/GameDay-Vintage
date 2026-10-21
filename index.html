@@ -156687,20 +156687,31 @@ function _fxRotoBuild(row, onProgress) {
     for (var i = 0; i < items.length; i++) {
       var res = _extRosterItemName(items[i] || {}, SPORT);
       if (!res.name || res.name === '?' || res.unresolved) continue;
-      // FXROTOACTIVE -- Fantrax scores the active lineup; this walked the
-      // whole roster. Bench production was being added to every team that
-      // had any, which is the whole of his Manderswang over-count.
+      // \u2500\u2500 FXNOFILTER \u2500\u2500 Do NOT filter by today's lineup. It cannot be right.
       //
-      // _fxActiveToday rather than the raw status, because the raw status is
-      // the one Fantrax rolls forward to tomorrow -- the thing FXLOCK and
-      // FXPERIODTRUST exist to see through. And only a definite false is
-      // excluded: a provider that sends no status must not end up with an
-      // empty board.
+      // bo106 skipped reserves, on the reasoning that Fantrax scores the
+      // active lineup. It does -- PER DAY. This total is CUMULATIVE, and
+      // carries production from every day a player was active, so filtering
+      // by today's status erases points already banked on a day he started.
+      //
+      // Measured against Fantrax: Manderswang, who fields the same lineup
+      // two days running, came out exact on all nine. Maxey Wiggins, whose
+      // Tuesday scorers are all benched today, came out EMPTY -- and he had
+      // been exact without the filter. rZEROd lost fifty points.
+      //
+      // The right answer needs each scoring day's lineup for all ten teams,
+      // and the fxea API publishes no such thing. So the whole roster is
+      // counted and the error stays one-directional: bench production
+      // inflates a team, which the footnote says and the Fantrax check
+      // measures. A wrong answer that is always wrong the same way beats one
+      // that is sometimes perfect and sometimes empty.
+      // FXROTODAY -- recorded, never used to filter THIS board. The season
+      // total needs everyone; the daily board needs only today's starters,
+      // and it reads this flag rather than walking the rosters again.
       var _act = (typeof _fxActiveToday === 'function')
         ? _fxActiveToday(row.key, items[i]) : undefined;
-      if (_act === false) { benched++; continue; }
       players.push({ playerKey: String(items[i].id || res.name), name: res.name,
-                     teamAbbr: res.team || '' });
+                     teamAbbr: res.team || '', active: _act });
     }
     teams.push({ teamId: tk, name: t.teamName || tk, mine: !!myIds[tk],
                  players: players, totals: null, resolved: 0,
@@ -156901,6 +156912,137 @@ function _fxRotoSeasonSwitch(key, seasonsSeen, seasonNow) {
   return '';
 }
 
+// \u2500\u2500 FXROTODAY \u2500\u2500 Today's roto points, from today's box lines.
+//
+// Correct where the season board cannot be: one day needs no lineup history,
+// suffers no trade misattribution, and knows exactly who started. The active
+// filter belongs HERE and only here.
+function _fxRotoDayBoard(row) {
+  try {
+    var board = row && row._rotoBoard;
+    if (!board || board.error || !board.teams || !board.cats) { return null; }
+    if (typeof _ftxLiveFor !== 'function') { return null; }
+    var SPORT = String(board.sport || row.sport || '').toUpperCase();
+    var cats = board.cats, src = board.teams;
+    var teams = [], anyLive = false, i, p, c;
+
+    for (i = 0; i < src.length; i++) {
+      var maps = [], played = 0, benched = 0;
+      for (p = 0; p < (src[i].players || []).length; p++) {
+        var pl = src[i].players[p];
+        // Only a definite reserve is dropped. A provider that says nothing
+        // must not have its whole lineup filtered away.
+        if (pl.active === false) { benched++; continue; }
+        var lv = null;
+        try { lv = _ftxLiveFor(SPORT, pl.name); } catch (eL) { lv = null; }
+        if (!lv || !lv.statMap) { continue; }
+        var sm = lv.statMap;
+        if (SPORT === 'NHL' && lv.ctx && typeof _fxNhlDerived === 'function') {
+          var dv = _fxNhlDerived(sm, lv.pos, lv.ctx), cp = {}, kk;
+          for (kk in sm) { if (sm.hasOwnProperty(kk)) { cp[kk] = sm[kk]; } }
+          for (kk in dv) { if (dv.hasOwnProperty(kk)) { cp[kk] = dv[kk]; } }
+          sm = cp;
+        }
+        maps.push(sm); played++; anyLive = true;
+      }
+      teams.push({ name: src[i].name, mine: !!src[i].mine,
+                   played: played, benched: benched,
+                   totals: maps.length ? _fxRotoTeamTotals(SPORT, cats, maps) : null });
+    }
+    if (!anyLive) { return { cats: cats, teams: teams, anyLive: false }; }
+
+    // Ranked and weighted exactly as the season board is, so a category worth
+    // 1.5 is worth 1.5 here too.
+    var pts = {}, rank = {};
+    for (c = 0; c < cats.length; c++) {
+      var r = _fxRotoRankOne(teams, cats[c].target, cats[c].lower);
+      pts[cats[c].target] = r.pts;
+      rank[cats[c].target] = r.rank;
+    }
+    for (i = 0; i < teams.length; i++) {
+      var tot = 0;
+      teams[i].rankOf = {};
+      for (c = 0; c < cats.length; c++) {
+        var tg = cats[c].target;
+        tot += (pts[tg][i] || 0) * (cats[c].weight != null ? Number(cats[c].weight) : 1);
+        teams[i].rankOf[tg] = rank[tg][i];
+      }
+      teams[i].roto = Math.round(tot * 10) / 10;
+    }
+    teams.sort(function (a, b) { return (b.roto || 0) - (a.roto || 0); });
+    return { cats: cats, teams: teams, anyLive: true };
+  } catch (e) {}
+  return null;
+}
+
+var _fxRotoMode = {};   // FXROTODAY -- league key -> 'season' | 'today'
+
+function fxSetRotoMode(key, mode) {
+  _fxRotoMode[String(key)] = (mode === 'today') ? 'today' : 'season';
+  try {
+    var list = (typeof extLeagues !== 'undefined' && extLeagues) ? extLeagues : [];
+    for (var i = 0; i < list.length; i++) {
+      if (list[i] && list[i].key === key && list[i]._rotoBoard) {
+        var pane = document.getElementById('skFxRotoPane');
+        if (pane) { pane.innerHTML = _fxRotoHtml(list[i]._rotoBoard); }
+        return;
+      }
+    }
+  } catch (e) {}
+}
+
+function _fxRotoModeHtml(key, mode) {
+  function btn(m, lbl) {
+    var on = (mode === m);
+    return '<button onclick="fxSetRotoMode(\'' + String(key).replace(/'/g, '') +
+      '\',\'' + m + '\')" style="flex:1;padding:5px 3px;border-radius:7px;' +
+      'border:1px solid ' + (on ? 'rgba(52,211,153,0.55)' : 'rgba(255,255,255,0.12)') +
+      ';background:' + (on ? 'rgba(52,211,153,0.14)' : 'transparent') +
+      ';color:' + (on ? '#34d399' : 'rgba(255,255,255,0.55)') +
+      ';font-size:9.5px;font-weight:700;letter-spacing:0.05em;">' + lbl + '</button>';
+  }
+  return '<div style="display:flex;gap:5px;margin:0 0 9px;">' +
+    btn('season', 'SEASON') + btn('today', 'TODAY') + '</div>';
+}
+
+function _fxRotoDayHtml(day) {
+  if (!day) {
+    return '<div class="fxr-check">Today\u2019s board needs the season board built ' +
+      'first \u2014 switch to SEASON once, then come back.</div>';
+  }
+  if (!day.anyLive) {
+    return '<div class="fxr-check">Nothing has been played yet today. This board ' +
+      'fills in as games go final.</div>';
+  }
+  var head = '<div class="fxr-check ok"><b>Today only</b> \u2014 ranked from today\u2019s ' +
+    'box lines for each team\u2019s active lineup. None of the season board\u2019s ' +
+    'guesswork applies here: no lineup history is needed, nobody has been traded ' +
+    'mid-day, and the bench is correctly left out.</div>';
+  var h = '<div class="fxr-gridhead">TODAY \u00b7 roto points from tonight\u2019s games</div>' +
+    '<div class="fxr-grid-wrap">' +
+    '<table class="fxr-grid"><thead><tr><th class="t">TEAM</th><th>PTS</th><th>GP</th>';
+  var c, i;
+  for (c = 0; c < day.cats.length; c++) {
+    h += '<th>' + slEsc(day.cats[c].label) + '</th>';
+  }
+  h += '</tr></thead><tbody>';
+  for (i = 0; i < day.teams.length; i++) {
+    var t = day.teams[i];
+    h += '<tr' + (t.mine ? ' class="mine"' : '') + '><td class="t">' +
+      slEsc(t.name) + '</td>' +
+      '<td class="p">' + (t.roto != null ? t.roto : '\u2014') + '</td>' +
+      '<td>' + t.played + '</td>';
+    for (c = 0; c < day.cats.length; c++) {
+      var v = (t.totals || {})[day.cats[c].target];
+      h += '<td>' + (v == null ? '\u2014'
+        : slEsc(_fxRotoFmt(v, day.cats[c].target))) + '</td>';
+    }
+    h += '</tr>';
+  }
+  h += '</tbody></table></div>';
+  return head + h;
+}
+
 function _fxRotoHtml(d) {
   if (!d) return '<div class="slb-empty">Couldn\u2019t build the board.</div>';
   if (d.error === 'no-cats') {
@@ -157065,7 +157207,22 @@ function _fxRotoHtml(d) {
   try { switched = _fxRotoSeasonSwitch(d.key, d.seasonsSeen, d.seasonNow); }
   catch (eSw) { switched = ''; }
 
-  return head + switched +
+  // FXROTODAY -- SEASON is the reconstruction, with every caveat it carries.
+  // TODAY is the board that can be exactly right.
+  var _mode = _fxRotoMode[String(d.key || '')] || 'season';
+  var _toggle = _fxRotoModeHtml(d.key || '', _mode);
+  if (_mode === 'today') {
+    var _dayRow = null;
+    try {
+      var _ll = (typeof extLeagues !== 'undefined' && extLeagues) ? extLeagues : [];
+      for (var _li = 0; _li < _ll.length; _li++) {
+        if (_ll[_li] && _ll[_li].key === d.key) { _dayRow = _ll[_li]; break; }
+      }
+    } catch (eD) {}
+    return _toggle + _fxRotoDayHtml(_dayRow ? _fxRotoDayBoard(_dayRow) : null);
+  }
+
+  return _toggle + head + switched +
     '<div class="fxr-head">' +
       // FXSTRENGTH -- "TOTAL" above a column of fifteen-thousand-point numbers
       // invites exactly the question he had to ask. Naming the season answers
