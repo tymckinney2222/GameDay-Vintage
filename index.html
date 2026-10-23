@@ -223755,11 +223755,20 @@ function _slpMyOpponentId(row, myIds) {
 // feature, if this league uses it, is a separate flag the API may or may not
 // expose; this highlights the game-state lock, which is true regardless.
 var _skUpcomingCache = {};   // league -> { games, t }
+// SKUPEMPTY -- an empty result is held only long enough to stop a burst of
+// readers during one paint becoming a burst of requests. A real result is
+// an answer and keeps the full window; an empty one may be a failure
+// wearing an answer's clothes, and must not be believed for ten minutes.
+var _SKUP_TTL = 10 * 60 * 1000;
+var _SKUP_TTL_EMPTY = 45 * 1000;
 
 function _skFetchUpcoming(league, days) {
   var key = String(league || 'NBA');
   var c = _skUpcomingCache[key];
-  if (c && c.t > Date.now() - 10 * 60 * 1000) return Promise.resolve(c.games);
+  if (c) {
+    var ttl = (c.games && c.games.length) ? _SKUP_TTL : _SKUP_TTL_EMPTY;
+    if (c.t > Date.now() - ttl) return Promise.resolve(c.games);
+  }
   var cfg = (typeof LEAGUES !== 'undefined' && LEAGUES) ? LEAGUES[key] : null;
   if (!cfg) return Promise.resolve([]);
   function ymd(d) {
@@ -223774,7 +223783,14 @@ function _skFetchUpcoming(league, days) {
       ? parseGames(data.events, key) : [];
     _skUpcomingCache[key] = { games: games, t: Date.now() };
     return games;
-  }).catch(function () { return []; });
+  }).catch(function () {
+    // SKUPEMPTY -- a thrown request never reached the line above, so it
+    // leaves no cache entry at all and the next call retries immediately.
+    // It returns [] to its caller, which is what "I do not know" looks
+    // like from here -- the readers are the ones that must not mistake
+    // that for "there are no games", and _slpGamesLeft is built to.
+    return [];
+  });
 }
 
 // First game on or after now involving this team abbreviation.
