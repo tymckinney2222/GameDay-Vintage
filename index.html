@@ -222506,6 +222506,71 @@ function _slLockInAuto(row) {
 // credited with ONE of his games rather than their sum, the league runs
 // lock-in. That verdict is remembered, so the mode stops being a guess
 // after the first week of play.
+// SLLOCKLIVE -- today, as the game log writes dates: local civil date, so
+// it lines up with a game log entry's own YYYY-MM-DD rather than with UTC,
+// which would roll over mid-evening in Denver.
+function _slLk2(n) { return (n < 10 ? '0' : '') + n; }
+function _slLkToday() {
+  var d = new Date();
+  return d.getFullYear() + '-' + _slLk2(d.getMonth() + 1) + '-' + _slLk2(d.getDate());
+}
+
+// SLLOCKLIVE -- IS THIS GAME FINISHED? Dated before today, yes. Dated today,
+// treat as unfinished: an NBA slate runs from early evening to late, so at
+// the moment anyone is looking at a live week, a game dated today is either
+// in progress or about to be.
+//
+// Deliberately coarse. The precise answer is in _skFetchUpcoming's state
+// field ('pre'/'in'/'post'), which this pane already fetches -- but reading
+// it here means matching Sleeper's team abbreviation to ESPN's, and getting
+// that wrong would reintroduce exactly the wrong verdicts this is removing.
+// The cost of the coarse rule is a lock on an early game not being credited
+// until the next day; the cost of the precise one being subtly wrong is a
+// confident lie about his score. The first is the better failure.
+function _slLkFinal(g, today) {
+  if (!g) { return false; }
+  var d = String(g.date || '');
+  if (!d) { return false; }          // undated proves nothing either
+  return d < today;
+}
+
+// SLLOCKLIVE -- THE MATCH, in one place. The badge and the mode-learner both
+// ask "does Sleeper's figure equal exactly one of his games", and each used
+// to ask it in its own words, so each carried its own copy of this bug. The
+// learner's answer is written to localStorage and sticks, which makes a
+// false witness there outlive the night it came from.
+//
+// Returns the index of the single FINISHED game matching ppv, or -1.
+function _slLkMatchIdx(games, ppv, sum) {
+  if (!games || isNaN(ppv)) { return -1; }
+  // A figure equal to the whole week is a sum, not a lock.
+  if (sum != null && Math.abs(ppv - sum) <= 0.1) { return -1; }
+  var today = _slLkToday(), i;
+  for (i = 0; i < games.length; i++) {
+    if (!games[i] || games[i].fp == null) { continue; }
+    if (!_slLkFinal(games[i], today)) { continue; }   // in progress proves nothing
+    if (Math.abs(games[i].fp - ppv) <= 0.05) { return i; }
+  }
+  return -1;
+}
+
+// How many of his played games are still going. Used only to say WHY a
+// verdict could not be reached, which is the difference between a panel
+// that teaches and a panel that just says no.
+function _slLkLiveCount(games) {
+  if (!games) { return 0; }
+  var today = _slLkToday(), n = 0, i, d;
+  for (i = 0; i < games.length; i++) {
+    if (!games[i] || games[i].fp == null) { continue; }
+    // Dated today or later. An UNDATED game is not evidence either, but it
+    // is not "in progress" -- it is unknown, and saying the wrong one of
+    // those is how a panel meant to explain itself starts misleading.
+    d = String(games[i].date || '');
+    if (d && d >= today) { n++; }
+  }
+  return n;
+}
+
 var SL_LOCKIN_AUTO_KEY = 'sk_slp_lockin_auto_v1';
 function _slLockInLearned(key) {
   try {
@@ -222526,10 +222591,11 @@ function _slLockInLearn(row, list, pp) {
     var v = parseFloat(pp[String(pl.playerId)]);
     if (isNaN(v)) continue;
     if (Math.abs(v - sum) <= 0.1) { sums++; continue; }
-    for (j = 0; j < gs.length; j++) {
-      if (gs[j].fp == null) continue;
-      if (Math.abs(gs[j].fp - v) <= 0.05) { ones++; break; }
-    }
+    // SLLOCKLIVE -- through the shared matcher, so a game in progress can no
+    // longer stand as a witness. It could before, and this verdict PERSISTS:
+    // two players in one live game were enough to write "this league runs
+    // lock-in" to storage and have it believed thereafter.
+    if (_slLkMatchIdx(gs, v, null) >= 0) { ones++; }
   }
   // Two clean witnesses and no contradiction, or nothing is written.
   var verdict = null;
@@ -222752,15 +222818,14 @@ function slWeekGamesHtml(list, week, isPreview, season, pp) {
     // _slLockInLearn has always held this line ("one game proves nothing");
     // the badge did not, and marked two of his players LOCKED while Sleeper
     // still offered him the button.
+    var _ppvNum = NaN;
     if (lockIn && pp && p.playerId != null && played > 1) {
-      var _ppv = parseFloat(pp[String(p.playerId)]);
-      // A figure equal to the whole week is a sum, not a lock.
-      if (!isNaN(_ppv) && !(played > 1 && Math.abs(_ppv - sum) <= 0.1)) {
-        for (var lg = 0; lg < p.games.length; lg++) {
-          if (p.games[lg].fp == null) continue;
-          if (Math.abs(p.games[lg].fp - _ppv) <= 0.05) { lockedIdx = lg; break; }
-        }
-      }
+      _ppvNum = parseFloat(pp[String(p.playerId)]);
+      // SLLOCKLIVE -- through the shared matcher, which refuses a game that
+      // is still being played. Sleeper's figure tracks a live game, so a
+      // match against it is guaranteed and therefore says nothing -- and
+      // worse, it used to WIN, overriding the game he actually locked.
+      lockedIdx = _slLkMatchIdx(p.games, _ppvNum, sum);
     }
     // SLLOCKPROOF -- recorded per player, decided nowhere.
     if (lockIn && played > 0) {
@@ -222770,16 +222835,27 @@ function slWeekGamesHtml(list, week, isPreview, season, pp) {
       }
       var _ppRaw = (pp && p.playerId != null) ? pp[String(p.playerId)] : null;
       var _ppNum = parseFloat(_ppRaw);
+      // SLLOCKLIVE -- a verdict of "cannot tell" is worth little without the
+      // reason, and the reasons are different: one game is a dead end, a
+      // game in progress is a "not yet".
+      var _liveN = _slLkLiveCount(p.games);
+      var _why;
+      if (lockedIdx >= 0) {
+        _why = 'locked: game ' + p.games[lockedIdx].fp.toFixed(1);
+      } else if (played < 2) {
+        _why = 'one game \u2014 cannot tell';
+      } else if (_liveN > 0) {
+        _why = 'game in progress \u2014 not yet';
+      } else {
+        _why = 'no finished game matches \u2014 not locked';
+      }
       _lkEv.push({
         name: String(p.name || p.playerId || '?'),
         fps: _fpsArr.join(' + '),
         pp: isNaN(_ppNum) ? '\u2014' : _ppNum.toFixed(1),
         proven: (lockedIdx >= 0),
-        verdict: (lockedIdx >= 0)
-          ? ('locked: game ' + p.games[lockedIdx].fp.toFixed(1))
-          : (played > 1
-              ? 'no single game matches \u2014 not locked'
-              : 'one game \u2014 cannot tell')
+        live: (_liveN > 0),
+        verdict: _why
       });
     }
     var counts = anyStarterFlag ? !!p.starter : true;   // SLWEEKSTART
@@ -222891,7 +222967,7 @@ function slWeekGamesHtml(list, week, isPreview, season, pp) {
         slEsc(_x.fps) + '</span>' +
         '<span style="color:rgba(255,255,255,0.45);flex:0 0 74px">pp ' +
         slEsc(_x.pp) + '</span>' +
-        '<span style="color:' + (_x.proven ? '#4ade80' : '#94a3b8') + ';flex:1">' +
+        '<span style="color:' + (_x.proven ? '#4ade80' : (_x.live ? '#fbbf24' : '#94a3b8')) + ';flex:1">' +
         slEsc(_x.verdict) + '</span></div>';
     }
     lkEvHtml = '<div style="background:#0d1220;border:1px solid rgba(255,255,255,0.08);' +
@@ -222901,9 +222977,11 @@ function slWeekGamesHtml(list, week, isPreview, season, pp) {
       'credits vs what was played</div>' + _ev +
       '<div style="color:rgba(255,255,255,0.4);margin-top:4px;white-space:normal">' +
       'A player with one game cannot be told apart: his game and his credited ' +
-      'figure are the same number either way. Lock ONE of two and compare here ' +
-      'once the other\u2019s window shuts \u2014 that settles whether an unlocked ' +
-      'game counts.</div></div>';
+      'figure are the same number either way. A game still BEING PLAYED is the ' +
+      'same dead end: Sleeper\u2019s figure follows it while it runs, so it ' +
+      'matches whether it is locked or not \u2014 those read \u201cnot yet\u201d ' +
+      'and are left undecided rather than claimed. Compare here once every ' +
+      'window has shut.</div></div>';
   }
 
   var head = '<div class="slp-w-head">' +
