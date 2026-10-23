@@ -1729,6 +1729,13 @@
               font-size: 14px; font-weight: 800; color: rgba(255,255,255,0.85);
               white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .slh-team.r { text-align: right; }
+  /* SLH2HBANK -- the banked figure, deliberately quieter than the total
+     it sits under: it is a reading of that number, not a rival to it. */
+  .slh-bank { display: block; font-family: var(--sk-font-mono, monospace);
+              font-size: 10px; font-weight: 700; letter-spacing: 0.02em;
+              color: #4ade80; margin-top: 1px; white-space: nowrap; }
+  .slh-bank .u { color: rgba(255,255,255,0.35); font-weight: 600; }
+  .slh-bank.none { color: rgba(255,255,255,0.3); }
   .slh-tot { display: block; font-family: var(--sk-font-mono, monospace);
              font-size: 20px; font-weight: 800; color: #fff; margin-top: 2px; }
   .slh-vs { flex: none; padding: 0 10px; font-size: 9px; font-weight: 800;
@@ -223793,6 +223800,61 @@ function _skNextGameFor(games, abbr) {
   return { opp: opp || '?', home: best.home, when: g2.statusDetail || '', state: state, locked: locked };
 }
 
+// SLH2HBANK -- the end of the fantasy week, local. Sleeper's NBA week runs
+// Monday to Sunday (see _SLWG_ORDER), so a game after this Sunday belongs
+// to next week and cannot move this week's number.
+function _slpWeekEndYmd() {
+  var d = new Date(), dow = d.getDay();            // 0 Sun .. 6 Sat
+  var toSun = (dow === 0) ? 0 : (7 - dow);
+  var e = new Date(d.getFullYear(), d.getMonth(), d.getDate() + toSun);
+  return e.getFullYear() + '-' + _slLk2(e.getMonth() + 1) + '-' + _slLk2(e.getDate());
+}
+
+// A scheduled game's LOCAL date, to compare against a local week end. The
+// feed timestamps are UTC, so a 7:30pm Denver tip is tomorrow in UTC and
+// comparing the raw string would push it out of the week.
+function _slpGmYmd(g) {
+  var t = new Date((g && g.date) || '');
+  if (isNaN(t.getTime())) { return ''; }
+  return t.getFullYear() + '-' + _slLk2(t.getMonth() + 1) + '-' + _slLk2(t.getDate());
+}
+
+// SLH2HBANK -- games this club still has inside the week, or NULL when the
+// club was not found in the window at all.
+//
+// The null is the important return. Every NBA club plays inside any seven
+// day window, so a club that appears nowhere was not matched -- Sleeper
+// and ESPN spell several clubs differently (GSW/GS, UTA/UTAH, NOP/NO) and
+// the lookup can also come back empty outright. Reporting that as zero
+// games left would mark the player banked on the strength of our own miss.
+function _slpGamesLeft(games, abbr, weekEnd) {
+  var A = String(abbr || '').toUpperCase();
+  if (!A || !games || !games.length) { return null; }
+  var seen = false, left = 0, i, g, h, w, d;
+  for (i = 0; i < games.length; i++) {
+    g = games[i];
+    h = String((g.home && g.home.abbr) || '').toUpperCase();
+    w = String((g.away && g.away.abbr) || '').toUpperCase();
+    if (h !== A && w !== A) { continue; }
+    seen = true;
+    d = _slpGmYmd(g);
+    if (!d || d > weekEnd) { continue; }                  // next week is not this week
+    if (String(g.state || 'pre') !== 'post') { left++; }   // pre or in: can still move
+  }
+  return seen ? left : null;
+}
+
+// SLH2HBANK -- true settled, false still live, NULL cannot tell.
+// Three answers, because two would force the unknown into one of the
+// others and both of those would be a lie.
+function _slpPlayerSettled(games, ppv, sum, left, lockIn) {
+  // A locked game is settled whatever else is still to come.
+  if (lockIn && _slLkMatchIdx(games, ppv, sum) >= 0) { return true; }
+  if (left === 0) { return true; }      // nothing left that could move it
+  if (left == null) { return null; }    // not found: not the same as idle
+  return false;
+}
+
 function _slpH2hGameLine(ng) {
   if (!ng) return '<div class="slh-game none">no game this week</div>';
   var txt = (ng.home ? 'vs ' : '@ ') + slEsc(ng.opp) + (ng.when ? ' \u00b7 ' + slEsc(ng.when) : '');
@@ -223875,10 +223937,12 @@ function _slpH2hHtml(row, myIds, accent) {
   return '<div class="slh" id="slpH2h" data-me="' + slEsc(myId) + '" data-opp="' + slEsc(oppId) + '">' +
     '<div class="slh-head">' +
       '<div class="slh-team mine" style="color:' + accent + '">' + slEsc(me.teamName || 'Me') +
-        '<b class="slh-tot" id="slhTotMe">\u2014</b></div>' +
+        '<b class="slh-tot" id="slhTotMe">\u2014</b>' +
+        '<span class="slh-bank" id="slhBankMe"></span></div>' +
       '<div class="slh-vs">VS</div>' +
       '<div class="slh-team r">' + slEsc(opp.teamName || 'Opponent') +
-        '<b class="slh-tot" id="slhTotOpp">\u2014</b></div>' +
+        '<b class="slh-tot" id="slhTotOpp">\u2014</b>' +
+        '<span class="slh-bank" id="slhBankOpp"></span></div>' +
     '</div>' + rows +
     '<div class="slh-note">Starters aligned by roster slot. Points are Sleeper\u2019s own week totals per player.</div>' +
   '</div>';
@@ -223919,6 +223983,119 @@ function _slpH2hFill(row) {
     paint(myId, 'slhTotMe');
     paint(oppId, 'slhTotOpp');
   }).catch(function () {});
+}
+
+// SLH2HBANK -- the deferred fill. The headline paints the moment the
+// matchup lands; this arrives behind it, because judging a player needs
+// his game log and that is a request each. Paced three at a time through
+// the same runner the week grid uses, and cached per session, so opening
+// the week grid first makes this nearly free.
+function _slpH2hBank(row) {
+  var host = document.getElementById('slpH2h');
+  if (!host || !row || row.provider !== 'sleeper') { return; }
+  var leagueId = String(row.key || '').slice(4);
+  var week = (row.liveScores && row.liveScores.period) ||
+             (row.rosters && row.rosters.period) || null;
+  var season = String(row.season || (row.raw && row.raw.season) || '');
+  if (!leagueId || !week || !season) { return; }
+  var sport = String(row.sport || 'nba').toLowerCase();
+  var league = sport.toUpperCase();
+  // The league's OWN scoring settings, where the week grid reads them from.
+  // Without them a game log cannot be turned into a figure, so no lock can
+  // be proven -- the banked number then rests on "no games left" alone,
+  // which is still true, just less generous. It never becomes wrong.
+  var scoring = (row.raw && row.raw.scoring_settings) || null;
+  var lockIn = false;
+  try { lockIn = _slLockIn(row); } catch (eL) {}
+
+  // Who is on screen, and which side each belongs to.
+  var sides = host.querySelectorAll('.slh-side');
+  var who = [], i, el, pidEl, tmEl;
+  for (i = 0; i < sides.length; i++) {
+    el = sides[i];
+    pidEl = el.querySelector('[data-slh-pid]');
+    tmEl = el.querySelector('[data-slh-team]');
+    if (!pidEl) { continue; }
+    who.push({
+      pid: String(pidEl.getAttribute('data-slh-pid') || ''),
+      team: tmEl ? String(tmEl.getAttribute('data-slh-team') || '') : '',
+      // The right-hand side is the class 'r' exactly. An indexOf(' r')
+      // would also fire on any future class beginning with r.
+      right: /(^|\s)r(\s|$)/.test(String(el.className || ''))
+    });
+  }
+  if (!who.length) { return; }
+
+  Promise.all([
+    slGetWeekMatchups(leagueId, week).catch(function () { return null; }),
+    _skFetchUpcoming(league, 7).catch(function () { return []; })
+  ]).then(function (both) {
+    if (!document.getElementById('slpH2h')) { return; }
+    var mus = both[0], sched = both[1] || [];
+    var myId = host.getAttribute('data-me'), oppId = host.getAttribute('data-opp');
+    var byRoster = {}, k;
+    for (k = 0; k < (mus || []).length; k++) {
+      if (mus[k] && mus[k].roster_id != null) { byRoster[String(mus[k].roster_id)] = mus[k]; }
+    }
+    var ppMe = (byRoster[myId] && byRoster[myId].players_points) || {};
+    var ppOpp = (byRoster[oppId] && byRoster[oppId].players_points) || {};
+    var weekEnd = _slpWeekEndYmd();
+
+    // NO SCHEDULE, NO CLAIM. An empty window is not a week with no games
+    // in it; it is a lookup that did not answer, and every player would
+    // read as banked on the strength of it.
+    if (!sched.length) {
+      _slpH2hBankPaint('slhBankMe', null, 0, who.length);
+      _slpH2hBankPaint('slhBankOpp', null, 0, who.length);
+      return;
+    }
+
+    return _slpPacedAll(who, function (w) {
+      return slGetPlayerWeekGames(sport, season, w.pid)
+        .then(function (d) { return { w: w, d: d }; })
+        .catch(function () { return { w: w, d: null }; });
+    }, 3).then(function (res) {
+      if (!document.getElementById('slpH2h')) { return; }
+      var tally = { me: { sum: 0, unknown: 0, any: false },
+                    opp: { sum: 0, unknown: 0, any: false } };
+      for (var r = 0; r < res.length; r++) {
+        if (!res[r]) { continue; }
+        var w = res[r].w, pp = w.right ? ppOpp : ppMe;
+        var bucket = w.right ? tally.opp : tally.me;
+        var ppv = parseFloat(pp[w.pid]);
+        if (isNaN(ppv)) { continue; }        // not scored: nothing to bank
+        bucket.any = true;
+        var ents = _slpGameEntries(res[r].d, week), gms = [], sum = 0, g;
+        for (g = 0; g < ents.length; g++) {
+          var fp = _slpGameFp(ents[g], scoring);
+          gms.push({ fp: fp, date: (ents[g] && (ents[g].date || ents[g].game_date)) || '' });
+          if (fp != null) { sum += fp; }
+        }
+        var left = _slpGamesLeft(sched, w.team, weekEnd);
+        var settled = _slpPlayerSettled(gms, ppv, sum, left, lockIn);
+        if (settled === true) { bucket.sum += ppv; }
+        else if (settled == null) { bucket.unknown++; }
+      }
+      _slpH2hBankPaint('slhBankMe', tally.me.any ? tally.me.sum : null, tally.me.unknown, 0);
+      _slpH2hBankPaint('slhBankOpp', tally.opp.any ? tally.opp.sum : null, tally.opp.unknown, 0);
+    });
+  }).catch(function () {});
+}
+
+// SLH2HBANK -- one painter, so the two sides cannot word it differently.
+// A null sum means nothing could be judged at all, and it says so rather
+// than printing a confident 0.0.
+function _slpH2hBankPaint(id, sum, unknown, allUnknown) {
+  var el = document.getElementById(id);
+  if (!el) { return; }
+  if (sum == null) {
+    el.className = 'slh-bank none';
+    el.textContent = (allUnknown ? 'banked — no schedule' : 'banked —');
+    return;
+  }
+  el.className = 'slh-bank';
+  el.innerHTML = (Math.round(sum * 10) / 10).toFixed(1) + ' banked' +
+    (unknown ? ('<span class="u"> · ' + unknown + ' unknown</span>') : '');
 }
 
 function _slpRosterRowsHtml(row, myTeam, sport) {
@@ -225177,6 +225354,7 @@ function extOpenLeague(key) {
           setTimeout(function () {
             try { _slpH2hFill(row); } catch (e) {}
             try { _slpH2hFillGames(row); } catch (e2) {}   // SLH2HGAME
+            try { _slpH2hBank(row); } catch (e3) {}          // SLH2HBANK
           }, 0);
         }
       } catch (e) { try { console.error('Sleeper H2H:', e); } catch (e2) {} }
