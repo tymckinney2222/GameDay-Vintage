@@ -16915,7 +16915,7 @@
   /* Local design tokens — scoped, not global */
   /* .nb-ov is moved to the body so its z-index is not trapped in
      #skOverlay's stacking context; it carries these with it. */
-  .sk-overlay, .nb-ov {
+  .sk-overlay, .nb-ov, .sk-wire-sheet {
     --sk-bg:           #0a0e1a;
     --sk-bg-elev:      #111726;
     --sk-bg-card:      rgba(255,255,255,0.03);
@@ -136804,12 +136804,36 @@ function _skTodayEnrichOpp() {
 // Renders the stashed body for the active side. The refresh branches
 // stash inputs here instead of writing innerHTML directly, so the
 // toggle can re-render either side without any network round trip.
+// TODAYGRID -- offered only where the grid can actually draw, so a tap
+// always changes something. The sports the grid refuses keep the cards
+// and are shown no switch at all.
+function _skTodayModeToggleHtml() {
+  try {
+    var sport = (typeof _skActiveSport === 'function') ? _skActiveSport() : '';
+    sport = String(sport || '').toLowerCase();
+    if (sport !== 'nba' && sport !== 'nhl') { return ''; }
+    if (typeof _rgMode !== 'function') { return ''; }
+    var t = (_rgMode() === 'table');
+    return '<div class="sk-today-side-toggle sk-today-rgmode">' +
+      '<button type="button" class="sk-side-btn' + (t ? ' active' : '') +
+        '" onclick="skSetRosterView(\'table\')">Table</button>' +
+      '<button type="button" class="sk-side-btn' + (t ? '' : ' active') +
+        '" onclick="skSetRosterView(\'cards\')">Cards</button>' +
+    '</div>';
+  } catch (e) { return ''; }
+}
+
 function _skTodayRenderBody(resetScroll) {
   var bodyEl = document.getElementById('skWireSheetBody');
   var bd = skTodayState.bodyData;
   if (!bodyEl || !bd) return;
   var side = skTodayState.viewSide === 'opp' ? 'opp' : 'my';
-  var html = _skTodaySideToggleHtml();
+  // TODAYGRID -- Table/Cards, on the roster tab's own preference. It lives
+  // here rather than inside _skTodaySideToggleHtml because that returns ''
+  // for a league with no opponent, which would take the control with it.
+  // Its own class, NOT rg-toggle: _rgSyncToggle looks for exactly two
+  // buttons under that class and would find four with this on screen.
+  var html = _skTodayModeToggleHtml() + _skTodaySideToggleHtml();
   if (bd.kind === 'cats') {
     if (side === 'opp' && !bd.oppRoster) {
       html += '<div class="sk-wire-sheet-empty">Loading opponent\u2019s lineup\u2026</div>';
@@ -137435,6 +137459,70 @@ function _skPreseasonEmptyHtml() {
   return '';
 }
 
+// TODAYGRID -- the sheet's rows, drawn by the roster tab's own grid.
+//
+// Returns '' whenever the grid cannot or should not draw -- cards mode, a
+// sport the grid refuses, no league settings, nothing to tabulate -- and
+// every caller falls back to the cards it already built.
+function _skTodayGridHtml(rows, statsMeta, isPts, label) {
+  try {
+    if (typeof _rgMode !== 'function' || _rgMode() !== 'table') { return ''; }
+    if (typeof _rgGroupHtml !== 'function') { return ''; }
+    if (!rows || !rows.length || !statsMeta) { return ''; }
+    var sport = (typeof _skActiveSport === 'function') ? _skActiveSport() : '';
+    sport = String(sport || '').toLowerCase();
+    // The grid is built for category sports and refuses the others in
+    // _rgContext; asking it here keeps the two answers the same.
+    if (sport !== 'nba' && sport !== 'nhl') { return ''; }
+
+    var players = [], byKey = {}, started = 0, i, r, st, hasAny;
+    for (i = 0; i < rows.length; i++) {
+      r = rows[i];
+      if (!r || !r.playerKey) { continue; }
+      players.push({
+        playerKey: r.playerKey, name: r.name, teamAbbr: r.teamAbbr,
+        selectedPos: r.selectedPos, pos: r.pos || r.displayPos || '',
+        imageUrl: r.imageUrl || r.headshot || ''
+      });
+      // HAS HIS NIGHT STARTED? A player with no stat line and no figure
+      // is waiting, not scoreless, and leaving him out of byKey is what
+      // makes the grid draw dashes for him instead of a row of noughts.
+      st = r.stats || {};
+      hasAny = false;
+      for (var k in st) {
+        if (st.hasOwnProperty(k) && st[k] != null && st[k] !== '') { hasAny = true; break; }
+      }
+      if (hasAny || (r.fp != null && Number(r.fp) !== 0)) {
+        byKey[r.playerKey] = { fp: r.fp, stats: st };
+        started++;
+      }
+    }
+    if (!players.length) { return ''; }
+
+    var ord = null;
+    try {
+      var lgk = (typeof skTodayState !== 'undefined' && skTodayState &&
+                 skTodayState.leagueKey) || null;
+      var set = (lgk && typeof leagueSettingsCache !== 'undefined')
+        ? leagueSettingsCache[lgk] : null;
+      if (set && typeof _skSeasonCatOrder === 'function') {
+        ord = _skSeasonCatOrder(set, statsMeta);
+      }
+    } catch (eO) { ord = null; }
+
+    // The footer says which figures these are AND how many are in yet, so
+    // a table full of dashes explains itself rather than looking broken.
+    var lbl = String(label || 'Today');
+    if (!started) { lbl += ' · nothing played yet'; }
+    else if (started < players.length) {
+      lbl += ' · ' + started + ' of ' + players.length + ' played';
+    }
+    return _rgGroupHtml(players, byKey, statsMeta, ord, sport,
+      { fp: !!isPts, scopeLabel: lbl, shapeBy: byKey,
+        tapFn: '_skTodayOpenPlayerSheet' }) || '';
+  } catch (e) { return ''; }
+}
+
 function _skTodayBuildCatsDailyBody(players, statsMeta) {
   // Reset lookup at the top of every render so a dropped/traded player
   // can't linger in the tap cache from a prior poll.
@@ -137539,6 +137627,19 @@ function _skTodayBuildCatsDailyBody(players, statsMeta) {
   var _isWeekViewC = (typeof skTodayState !== 'undefined' && skTodayState.mode === 'week');
   var dateLabel = _isWeekViewC ? _skTodayWeekRangeLabel() : _skTodayLabel();
   var _lineupTitleC = _isWeekViewC ? 'THIS WEEK' : 'TODAY\u2019S LINEUP';
+  // TODAYGRID -- the grid first; '' means it declined and the cards below
+  // run exactly as they always have.
+  var _gridC = _skTodayGridHtml(rows, statsMeta, false, dateLabel);
+  if (_gridC) {
+    return '<div class="sk-contributors" style="margin-top:0">' +
+      '<div class="sk-contributors-head">' +
+        '<div class="sk-contributors-title">' + _lineupTitleC + '</div>' +
+        '<div class="sk-contributors-total">' + skEscape(dateLabel) +
+          ' \u00b7 ' + active.length + ' active' +
+          (producing > 0 ? (' \u00b7 ' + producing + ' producing') : '') +
+        '</div>' +
+      '</div>' + _gridC + '</div>';
+  }
   var html = '' +
     '<div class="sk-contributors" style="margin-top:0">' +
     '  <div class="sk-contributors-head">' +
@@ -137688,6 +137789,18 @@ function _skTodayBuildPointsDailyBody(myFpMap, statsMeta) {
   var _isWeekView = (typeof skTodayState !== 'undefined' && skTodayState.mode === 'week');
   var dateLabel = _isWeekView ? _skTodayWeekRangeLabel() : _skTodayLabel();
   var _lineupTitle = _isWeekView ? 'THIS WEEK' : 'TODAY\u2019S LINEUP';
+  // TODAYGRID -- points leagues get the FP column; cats do not.
+  var _gridP = _skTodayGridHtml(rows, statsMeta, true, dateLabel);
+  if (_gridP) {
+    return '<div class="sk-contributors" style="margin-top:0">' +
+      '<div class="sk-contributors-head">' +
+        '<div class="sk-contributors-title">' + _lineupTitle + '</div>' +
+        '<div class="sk-contributors-total">' + skEscape(dateLabel) +
+          ' \u00b7 ' + rows.length + ' active' +
+          (producing > 0 ? (' \u00b7 ' + producing + ' producing') : '') +
+        '</div>' +
+      '</div>' + _gridP + '</div>';
+  }
   var html = '' +
     '<div class="sk-contributors" style="margin-top:0">' +
     '  <div class="sk-contributors-head">' +
@@ -173495,6 +173608,15 @@ function skSetRosterView(mode) {
   // element, so re-rendering the roster never repainted it and the gold
   // ring stayed on whichever button had been chosen BEFORE.
   _rgSyncToggle();
+  // TODAYGRID -- the Today sheet reads the same preference, so it repaints
+  // with it. Harmless when the sheet is closed: _skTodayRenderBody returns
+  // on a missing body element.
+  try {
+    if (typeof _skTodayRenderBody === 'function' &&
+        document.getElementById('skWireSheetBody')) {
+      _skTodayRenderBody(false);
+    }
+  } catch (eT) {}
   // ESPNGRID -- the same preference governs the external rosters, so the
   // pane showing one has to be repainted too. _extPaneFor answers null
   // unless an external league is the one on screen, so this costs nothing
@@ -173949,7 +174071,14 @@ function _rgTable(rows, byKey, meta, ord, sport, opts) {
       ? '<img class="rg-ph" src="' + p.imageUrl +
         '" alt="" onerror="this.style.visibility=\'hidden\'">'
       : '<div class="rg-ph"></div>';
-    body += '<tr>' +
+    // TODAYGRID -- opts.tapFn names a handler to open the player. The
+    // roster tab passes none and its rows stay inert exactly as before;
+    // the Today sheet passes one so tapping a player still reaches his
+    // sheet, which is a thing the cards could do and this must not lose.
+    body += '<tr' + ((opts && opts.tapFn)
+        ? (' style="cursor:pointer" onclick="' + opts.tapFn + '(\'' +
+           String(p.playerKey).replace(/[\\']/g, '') + '\')"')
+        : '') + '>' +
       '<td class="rg-p"><div class="rg-who">' + photo +
         '<div style="min-width:0">' +
           '<div class="rg-nm">' + skEscape(typeof _skAbbrevName === 'function'
