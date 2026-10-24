@@ -1770,6 +1770,19 @@
      the eye lands on it before the number does. SLH2HGAME */
   .slh-game.locked { color: #fbbf24; font-weight: 700; }
   .slh-lock { font-size: 9px; margin-right: 3px; }
+  /* ESPBOX -- the second line of figures: tonight, and the last seven
+     days. Quieter than the matchup total above it, because the matchup
+     total is the one the score is made of. */
+  .esph-meta { font-family: var(--sk-font-mono, monospace); font-size: 9px;
+               color: rgba(255,255,255,0.38); margin-top: 1px; white-space: nowrap; }
+  .esph-meta b { font-weight: 700; color: rgba(255,255,255,0.6); }
+  .slh-side.r .esph-meta { text-align: right; }
+  /* The working, so a parser written against a payload nobody here could
+     open can be checked in one glance instead of one round trip. */
+  .esph-eviden { font-family: var(--sk-font-mono, monospace); font-size: 9px;
+                 line-height: 1.5; color: rgba(255,255,255,0.33);
+                 padding: 6px 10px 0; }
+  .esph-eviden.bad { color: #fbbf24; }
   .slh-side.locked .slh-name { color: #fbbf24; }
   .slh-side.locked .slh-hs { box-shadow: 0 0 0 2px #fbbf24; }
   .slh-fp { font-family: var(--sk-font-mono, monospace); font-size: 12px; font-weight: 700;
@@ -211739,8 +211752,82 @@ function _espCatBreakdownHtml(row) {
 //
 // ESPN accepts repeated view params, so cats asks for both in the same
 // request. One fetch either way; no extra round trip.
+// ── ESPBOX ── per-player points for the MATCHUP period.
+//
+// ESPN hangs the roster off the same schedule entries espLiveScores walks,
+// so this navigates identically -- the matchup whose matchupPeriodId is the
+// league's current one, then the side whose teamId matches. Two readers of
+// one payload reaching it two different ways is how they come to disagree.
+//
+// EVERY FIELD NAME BELOW IS UNVERIFIED from here: this sandbox cannot reach
+// ESPN, so they are the documented shape rather than a response anyone has
+// opened. That is exactly why this returns its working -- which container
+// answered and how many players it matched -- instead of only a map. A
+// blind parser that finds nothing looks identical to a league with no data
+// until something says which it was.
+function _espBoxEntryPts(e) {
+  if (!e) { return null; }
+  var pool = e.playerPoolEntry || {};
+  var cands = [e.appliedStatTotal, pool.appliedStatTotal,
+               e.totalPoints, (pool.player || {}).appliedStatTotal];
+  var i, v;
+  for (i = 0; i < cands.length; i++) {
+    if (cands[i] == null) { continue; }
+    v = Number(cands[i]);
+    if (!isNaN(v)) { return v; }
+  }
+  return null;
+}
+
+function _espBoxEntryId(e) {
+  if (!e) { return ''; }
+  var pool = e.playerPoolEntry || {};
+  if (e.playerId != null) { return String(e.playerId); }
+  if ((pool.player || {}).id != null) { return String(pool.player.id); }
+  if (pool.id != null) { return String(pool.id); }
+  return '';
+}
+
+// { map, n, src } -- src names the container that answered, or '' for none.
+function _espBoxPtsFor(j, teamId) {
+  var out = { map: {}, n: 0, src: '' };
+  if (!j || !j.schedule || !j.schedule.length || teamId == null) { return out; }
+  var period = (j.status && j.status.currentMatchupPeriod);
+  if (period == null) { return out; }
+  var want = String(teamId), i, m, sides, k, sd;
+  for (i = 0; i < j.schedule.length; i++) {
+    m = j.schedule[i] || {};
+    if (Number(m.matchupPeriodId) !== Number(period)) { continue; }
+    sides = [m.away, m.home];
+    for (k = 0; k < sides.length; k++) {
+      sd = sides[k] || {};
+      if (sd.teamId == null || String(sd.teamId) !== want) { continue; }
+      // The matchup-period roster first. The current-period one is a
+      // narrower answer -- a single day -- and is only a fallback so the
+      // view degrades to something true rather than to nothing.
+      var tries = [['rosterForMatchupPeriod', sd.rosterForMatchupPeriod],
+                   ['rosterForCurrentScoringPeriod', sd.rosterForCurrentScoringPeriod]];
+      var t, ents, e, pid, pts;
+      for (t = 0; t < tries.length; t++) {
+        ents = (tries[t][1] && tries[t][1].entries) || null;
+        if (!ents || !ents.length) { continue; }
+        for (e = 0; e < ents.length; e++) {
+          pid = _espBoxEntryId(ents[e]);
+          pts = _espBoxEntryPts(ents[e]);
+          if (!pid || pts == null) { continue; }
+          out.map[pid] = pts;
+          out.n++;
+        }
+        if (out.n) { out.src = tries[t][0]; return out; }
+      }
+      return out;
+    }
+  }
+  return out;
+}
+
 // ── ESPH2H ── both lineups, side by side.
-function _espH2hSide(it, slug, right) {
+function _espH2hSide(it, slug, right, mPts) {
   var cls = 'slh-side' + (right ? ' r' : '');
   if (!it) {
     return '<div class="' + cls + '"><div class="slh-main">' +
@@ -211760,10 +211847,22 @@ function _espH2hSide(it, slug, right) {
   if (it.noGame) { note = 'no game tonight'; noteCls += ' none'; }
   else if (it.noLineup) { note = 'lineup not posted'; noteCls += ' none'; }
   else { note = ''; }
-  var v = (it.today == null) ? null : Number(it.today);
-  var fp = (v == null || isNaN(v)) ? '—' : v.toFixed(1);
-  var fpCls = 'slh-fp' + ((v != null && !isNaN(v))
-    ? (v > 0 ? ' pos' : (v < 0 ? ' neg' : '')) : '');
+  // ESPBOX -- the MATCHUP figure leads when there is one, because that is
+  // what the score above the pane is made of. Tonight and the last seven
+  // ride underneath as context rather than as rivals to it.
+  function num(x) {
+    if (x == null) { return null; }
+    var n = Number(x);
+    return isNaN(n) ? null : n;
+  }
+  var mv = num(mPts), tv = num(it.today), lv = num(it.last7);
+  var v = (mv != null) ? mv : tv;
+  var fp = (v == null) ? '—' : v.toFixed(1);
+  var fpCls = 'slh-fp' + ((v != null) ? (v > 0 ? ' pos' : (v < 0 ? ' neg' : '')) : '');
+  var meta = '';
+  // Tonight is only worth repeating when it is NOT already the headline.
+  if (mv != null && tv != null) { meta += '<b>tn</b> ' + tv.toFixed(1); }
+  if (lv != null) { meta += (meta ? ' \u00b7 ' : '') + '<b>L7</b> ' + lv.toFixed(1); }
   return '<div class="' + cls + '">' +
     (hs ? '<img class="slh-hs" src="' + hs + '" alt="" onerror="this.style.display=\'none\'">' : '') +
     '<div class="slh-main">' +
@@ -211773,6 +211872,7 @@ function _espH2hSide(it, slug, right) {
       '</div>' +
       (note ? ('<div class="' + noteCls + '">' + slEsc(note) + '</div>') : '') +
       '<div class="' + fpCls + '">' + fp + '</div>' +
+      (meta ? ('<div class="esph-meta">' + meta + '</div>') : '') +
     '</div>' +
   '</div>';
 }
@@ -211813,7 +211913,23 @@ function _espH2hLineupsHtml(row, ls) {
   var mine = starters(me), theirs = starters(opp);
   if (!mine.length && !theirs.length) { return ''; }
   var slug = String((row && row.sport) || '').toLowerCase();
-  var mSum = todaySum(mine), oSum = todaySum(theirs);
+  // ESPBOX -- the matchup-period figures, from the score payload already
+  // kept on the row. No fetch of its own: espRefreshScores parks the whole
+  // response at row._espScoreJson and this reads it where it sits.
+  var _j = (row && row._espScoreJson) || null;
+  var mBox = _espBoxPtsFor(_j, meId), oBox = _espBoxPtsFor(_j, oppId);
+  var haveBox = !!(mBox.n && oBox.n);
+  function boxSum(list, box) {
+    var n = null, k, v;
+    for (k = 0; k < list.length; k++) {
+      v = box.map[String(list[k].playerId)];
+      if (v == null || isNaN(Number(v))) { continue; }
+      n = (n == null ? 0 : n) + Number(v);
+    }
+    return n;
+  }
+  var mSum = haveBox ? boxSum(mine, mBox) : todaySum(mine);
+  var oSum = haveBox ? boxSum(theirs, oBox) : todaySum(theirs);
   function tot(n) {
     return (n == null) ? '—' : (Math.round(n * 10) / 10).toFixed(1);
   }
@@ -211825,10 +211941,10 @@ function _espH2hLineupsHtml(row, ls) {
     col = (typeof _slpSlotColor === 'function' && slot)
       ? _slpSlotColor(String(slot).toUpperCase()) : 'rgba(255,255,255,0.45)';
     rows += '<div class="slh-row">' +
-      _espH2hSide(a, slug, false) +
+      _espH2hSide(a, slug, false, a ? mBox.map[String(a.playerId)] : null) +
       '<span class="slh-slot" style="color:' + col + ';border-color:' + col +
         '55;background:' + col + '1f">' + slEsc(String(slot).toUpperCase()) + '</span>' +
-      _espH2hSide(b, slug, true) +
+      _espH2hSide(b, slug, true, b ? oBox.map[String(b.playerId)] : null) +
     '</div>';
   }
 
@@ -211837,21 +211953,51 @@ function _espH2hLineupsHtml(row, ls) {
       '<div class="slh-team mine" style="color:#ef4444">' +
         slEsc(String(me.teamName || 'My team')) +
         '<b class="slh-tot">' + tot(mSum) + '</b></div>' +
-      '<div class="slh-vs">TONIGHT</div>' +
+      '<div class="slh-vs">' + (haveBox ? 'MATCHUP' : 'TONIGHT') + '</div>' +
       '<div class="slh-team r">' + slEsc(String(opp.teamName || 'Opponent')) +
         '<b class="slh-tot">' + tot(oSum) + '</b></div>' +
     '</div>' + rows +
     // Said plainly, because the headline above this pane is the MATCHUP
     // total and these are a day's. Two numbers that differ for a good
     // reason have to say what the reason is or they read as a bug.
-    '<div class="slh-note">Starters only. Points are each player’s for the ' +
-    'CURRENT scoring period — tonight — not the whole matchup, so these ' +
-    'will not add up to the matchup score above.</div>' +
+    // ESPBOX -- the working. Every field this parser reads was written
+    // against ESPN's documented shape rather than a response anyone here
+    // could open, so it says what it found. A blind parser that finds
+    // nothing is indistinguishable from a league with no data until
+    // something names which of the two it was.
+    '<div class="esph-eviden' + (haveBox ? '' : ' bad') + '">' +
+      (haveBox
+        ? ('matchup totals \u00b7 ' + mBox.n + ' + ' + oBox.n + ' players from ' +
+           slEsc(mBox.src))
+        : ('matchup totals unavailable \u2014 mBoxscore returned ' +
+           (mBox.n + oBox.n) + ' usable entries' +
+           (mBox.src ? (' from ' + slEsc(mBox.src)) : '') +
+           '. Showing tonight instead.')) +
+    '</div>' +
+    '<div class="slh-note">Starters only. ' +
+    (haveBox
+      ? 'The big figure is each player\u2019s points for this MATCHUP, so the ' +
+        'two totals should match the matchup score above. Underneath: tn is ' +
+        'tonight, L7 the last seven days.'
+      : 'The big figure is each player\u2019s points for the CURRENT scoring ' +
+        'period \u2014 tonight \u2014 not the whole matchup, so these will not add ' +
+        'up to the matchup score above. L7 is the last seven days.') +
+    '</div>' +
   '</div>';
 }
 
 function espScoreView(row) {
-  return espIsCats(row) ? '?view=mBoxscore&view=mMatchupScore' : '?view=mMatchupScore';
+  // ESPBOX -- mBoxscore for every league now, not only category ones. It
+  // is what carries the per-player roster for the MATCHUP period, which is
+  // the only place a points league's per-player share of the score exists.
+  // A points league used to ask only for mMatchupScore and so could show a
+  // team total it could not break down.
+  //
+  // The cost is a larger payload on the thirty-second score refresh. The
+  // category path has carried exactly this cost since it was written, and
+  // ESPN takes both views in one request, so it is bytes rather than a
+  // round trip.
+  return '?view=mBoxscore&view=mMatchupScore';
 }
 
 // ESPN's whole matchup pane, so a refresh can re-render it in place. The
