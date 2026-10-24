@@ -201900,7 +201900,145 @@ function _fyBulkDiagBlock() {
   } catch (e) { return ''; }
 }
 
-// \u2500\u2500 BLACKOUT \u2500\u2500 The probe's answer, on its own, kept.
+// ROSTERFIELDS -- walk one cached roster answer and count the four
+// fields the Plan scan reads. Mirrors skLoadRosterForDate's own parse, so
+// what it counts is exactly what that function would find.
+function _fyRosterFieldCount(entry) {
+  var out = { n: 0, slot: 0, elig: 0, status: 0, starting: 0 };
+  try {
+    var d = entry && entry.d;
+    var teams = d && d.fantasy_content && d.fantasy_content.league &&
+      d.fantasy_content.league[1] && d.fantasy_content.league[1].teams;
+    if (!teams || !teams.count) { return out; }
+    var players = teams['0'] && teams['0'].team && teams['0'].team[1] &&
+      teams['0'].team[1].roster && teams['0'].team[1].roster['0'] &&
+      teams['0'].team[1].roster['0'].players;
+    if (!players || !players.count) { return out; }
+    for (var i = 0; i < players.count; i++) {
+      var rp = players[i] && players[i].player;
+      if (!rp) { continue; }
+      var rpArr = Array.isArray(rp[0]) ? rp[0] : [];
+      var sawName = false, sawElig = false, sawStatus = false;
+      for (var j = 0; j < rpArr.length; j++) {
+        var x = rpArr[j];
+        if (!x || typeof x !== 'object') { continue; }
+        if (x.name) { sawName = true; }
+        if (x.eligible_positions && Array.isArray(x.eligible_positions)) { sawElig = true; }
+        if (x.status) { sawStatus = true; }
+      }
+      if (!sawName) { continue; }
+      out.n++;
+      if (sawElig) { out.elig++; }
+      if (sawStatus) { out.status++; }
+      var sp = rp[1] && rp[1].selected_position;
+      if (Array.isArray(sp)) {
+        for (var k = 0; k < sp.length; k++) {
+          if (sp[k] && typeof sp[k] === 'object' && sp[k].position) { out.slot++; break; }
+        }
+      }
+      for (var bi = 1; bi < rp.length; bi++) {
+        var bag = rp[bi];
+        if (bag && typeof bag === 'object' && bag.starting_status) { out.starting++; break; }
+      }
+    }
+  } catch (e) {}
+  return out;
+}
+
+// Add b into a, so the two sides can be totalled separately.
+function _fyRfAdd(a, b) {
+  a.n += b.n; a.slot += b.slot; a.elig += b.elig;
+  a.status += b.status; a.starting += b.starting; a.lg += (b.n ? 1 : 0);
+  return a;
+}
+
+function _fyRosterFieldsBlock() {
+  try {
+    if (typeof fyDataCache !== 'object' || !fyDataCache) { return ''; }
+    var bulk = { n: 0, slot: 0, elig: 0, status: 0, starting: 0, lg: 0 };
+    var dated = { n: 0, slot: 0, elig: 0, status: 0, starting: 0, lg: 0 };
+    var solo = { n: 0, slot: 0, elig: 0, status: 0, starting: 0, lg: 0 };
+    var paths = Object.keys(fyDataCache), i;
+    for (i = 0; i < paths.length; i++) {
+      var p = paths[i];
+      if (p.indexOf('/teams;is_owned_by_current_login=1/roster') === -1) { continue; }
+      var e = fyDataCache[p];
+      if (!e || !e.d) { continue; }
+      var c = _fyRosterFieldCount(e);
+      if (!c.n) { continue; }
+      if (p.indexOf(';date=') > -1) { _fyRfAdd(dated, c); }
+      else if (e.b) { _fyRfAdd(bulk, c); }
+      else { _fyRfAdd(solo, c); }
+    }
+    if (!bulk.n && !dated.n && !solo.n) { return ''; }
+
+    function row(label, t, note) {
+      if (!t.n) {
+        return '<div style="padding:5px 0;color:#64748b">' + label +
+          ' · nothing cached</div>';
+      }
+      function cell(lbl, v) {
+        var col = v ? '#4ade80' : '#f59e0b';
+        return '<span style="color:#94a3b8">' + lbl + '</span> ' +
+          '<b style="color:' + col + '">' + v + '</b>';
+      }
+      return '<div style="padding:5px 0;border-bottom:1px solid rgba(255,255,255,0.06)">' +
+        '<div style="color:#cbd5e1"><b>' + label + '</b> · ' + t.lg +
+          ' league' + (t.lg === 1 ? '' : 's') + ' · ' + t.n + ' players</div>' +
+        '<div style="margin-top:2px">' +
+          cell('slot', t.slot) + ' · ' + cell('eligible', t.elig) + ' · ' +
+          cell('status', t.status) + ' · ' + cell('starting', t.starting) +
+        '</div>' +
+        (note ? ('<div style="color:#64748b;margin-top:2px">' + note + '</div>') : '') +
+        '</div>';
+    }
+
+    // THE VERDICT. Structural fields decide; situational ones are only
+    // evidence when the other side has them and this one does not.
+    var verdict, vcol;
+    if (!bulk.n) {
+      verdict = 'The bulk roster call has not filled anything this session, ' +
+        'so there is nothing to compare. Pull to refresh and look again.';
+      vcol = '#94a3b8';
+    } else if (!bulk.elig || !bulk.slot) {
+      verdict = 'THIN. The bulk answer is missing a field every rostered ' +
+        'player has, so it is not carrying the full player bag. The Plan ' +
+        'scan has to keep its own dated fetch.';
+      vcol = '#f87171';
+    } else if (dated.n && dated.starting && !bulk.starting) {
+      verdict = 'MOSTLY. Slots, eligibility and status are all there, but ' +
+        'the dated answer carries starting_status and the bulk one does ' +
+        'not — so dropping the date would lose the benched-starter flag ' +
+        'and keep everything else.';
+      vcol = '#fbbf24';
+    } else if (!bulk.starting && !dated.starting) {
+      verdict = 'RICH so far — slots, eligibility and status are all ' +
+        'present. starting_status is absent from BOTH, which means Yahoo ' +
+        'has not posted lineups yet rather than that the bulk form drops ' +
+        'it. Check again once today’s lineups are up.';
+      vcol = '#fbbf24';
+    } else {
+      verdict = 'RICH. The bulk answer carries everything the Plan scan ' +
+        'reads, so the scan can drop ;date= for today and cost nothing.';
+      vcol = '#4ade80';
+    }
+
+    return '<div style="color:#94a3b8;font-size:11px;margin:16px 0 4px">' +
+      'Roster payload — bulk vs per league</div>' +
+      '<div style="background:#0d1220;border:1px solid rgba(255,255,255,0.08);' +
+      'border-radius:8px;padding:8px;font-size:10px;line-height:1.5;color:#cbd5e1">' +
+      '<div style="color:#64748b;padding-bottom:4px">Counts are players ' +
+      'carrying each field. slot and eligible are structural — every ' +
+      'player has them. status and starting are situational.</div>' +
+      row('bulk (one call, undated)', bulk) +
+      row('plan scan (dated, one call each)', dated) +
+      row('per league (undated, not batched)', solo) +
+      '<div style="margin-top:6px;color:' + vcol + '">' + verdict + '</div>' +
+      '</div>';
+  } catch (e) { return ''; }
+}
+
+// ── BLACKOUT ── The probe's answer, on its own, kept.
 //
 // This used to print inside the rate block, and the rate block prints
 // nothing when there have been no calls for two minutes -- which is
@@ -202174,6 +202312,7 @@ function skShowApiHealth() {
     _rgWhyBlock() +
     // BULKDIAG -- why a bulk call filled nothing, with the shape to prove it.
     _fyBulkDiagBlock() +
+    _fyRosterFieldsBlock() +
     // BLACKOUT -- the probe's answer, which must never go missing again.
     _fyEdgeBlock() +
     // EDGEPROBE -- the rate the app was asking at.
@@ -204245,6 +204384,8 @@ function _fyBatchRosterSplit(data) {
       fyDataCache['/league/' + lk + '/teams;is_owned_by_current_login=1/roster'] = {
         t: Date.now(),
         ttl: _fyBatchTtl('rosters', ''),
+        b: 1,   // ROSTERFIELDS -- filled by the bulk call, not per league
+
         d: { fantasy_content: { league: [
           { league_key: lk },
           { teams: { count: 1, '0': { team: [teams[i][0], part] } } }
