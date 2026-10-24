@@ -1720,7 +1720,10 @@
   .slb-empty, .slb-note { font-size: 11px; line-height: 1.55; color: rgba(255,255,255,0.4); }
   .slb-note { margin-top: 10px; font-size: 9.5px; color: rgba(255,255,255,0.3); }
 
-  /* ── Sleeper head-to-head ── SLH2H ── */
+  /* ── Head-to-head ── SLH2H / ESPH2H ──
+     Shared by both providers on purpose: a head-to-head is the same thing
+     whoever is hosting the league, and two stylesheets for one layout is
+     how the two of them start looking like different apps. */
   .slh { margin: 0 0 14px; border-radius: 10px; background: rgba(255,255,255,0.03);
          border: 1px solid rgba(255,255,255,0.07); overflow: hidden; }
   .slh-head { display: flex; align-items: center; padding: 10px 12px;
@@ -211736,6 +211739,117 @@ function _espCatBreakdownHtml(row) {
 //
 // ESPN accepts repeated view params, so cats asks for both in the same
 // request. One fetch either way; no extra round trip.
+// ── ESPH2H ── both lineups, side by side.
+function _espH2hSide(it, slug, right) {
+  var cls = 'slh-side' + (right ? ' r' : '');
+  if (!it) {
+    return '<div class="' + cls + '"><div class="slh-main">' +
+      '<div class="slh-name dim">Empty</div></div></div>';
+  }
+  var hs = it.playerId
+    ? ('https://a.espncdn.com/combiner/i?img=/i/headshots/' + slug +
+       '/players/full/' + encodeURIComponent(it.playerId) + '.png&w=60&h=44')
+    : '';
+  var inj = it.injury
+    ? '<span class="slh-inj">' + slEsc(String(it.injury)) + '</span>' : '';
+  // WHY THERE IS NO NUMBER is worth as much as the number. A club that is
+  // idle tonight and a club whose lineup ESPN has not posted yet are
+  // different facts, and espRosters already tells them apart -- noGame is
+  // only ever set on a CONFIRMED idle club, never on a not-yet-known one.
+  var note, noteCls = 'slh-game';
+  if (it.noGame) { note = 'no game tonight'; noteCls += ' none'; }
+  else if (it.noLineup) { note = 'lineup not posted'; noteCls += ' none'; }
+  else { note = ''; }
+  var v = (it.today == null) ? null : Number(it.today);
+  var fp = (v == null || isNaN(v)) ? '—' : v.toFixed(1);
+  var fpCls = 'slh-fp' + ((v != null && !isNaN(v))
+    ? (v > 0 ? ' pos' : (v < 0 ? ' neg' : '')) : '');
+  return '<div class="' + cls + '">' +
+    (hs ? '<img class="slh-hs" src="' + hs + '" alt="" onerror="this.style.display=\'none\'">' : '') +
+    '<div class="slh-main">' +
+      '<div class="slh-name">' + slEsc(String(it.name || '')) + inj + '</div>' +
+      '<div class="slh-sub">' +
+        (it.slot ? '<span class="slh-pos">' + slEsc(String(it.slot)) + '</span>' : '') +
+      '</div>' +
+      (note ? ('<div class="' + noteCls + '">' + slEsc(note) + '</div>') : '') +
+      '<div class="' + fpCls + '">' + fp + '</div>' +
+    '</div>' +
+  '</div>';
+}
+
+function _espH2hLineupsHtml(row, ls) {
+  var byTeam = (row && row.rosters && row.rosters.byTeam) || null;
+  if (!byTeam || !ls || !ls.games || !ls.games.length) { return ''; }
+  var myIds = (row && row.myTeamIds) || {};
+  var g = null, i;
+  for (i = 0; i < ls.games.length; i++) {
+    if (myIds[ls.games[i].awayId] || myIds[ls.games[i].homeId]) { g = ls.games[i]; break; }
+  }
+  if (!g) { return ''; }                    // not playing this period
+  var meId = myIds[g.awayId] ? g.awayId : g.homeId;
+  var oppId = (String(meId) === String(g.awayId)) ? g.homeId : g.awayId;
+  var me = byTeam[String(meId)], opp = byTeam[String(oppId)];
+  // The rosters load in the background, so one side can genuinely be
+  // missing for a moment. Say so rather than drawing half a comparison.
+  if (!me || !opp) {
+    return '<div class="slh"><div class="slh-note">Both lineups appear once ' +
+      'the league’s rosters finish loading.</div></div>';
+  }
+
+  function starters(t) {
+    var out = [], k, its = (t && t.items) || [];
+    for (k = 0; k < its.length; k++) { if (its[k] && its[k].starter) { out.push(its[k]); } }
+    return out;
+  }
+  function todaySum(list) {
+    var n = null, k, v;
+    for (k = 0; k < list.length; k++) {
+      v = list[k].today;
+      if (v == null || isNaN(Number(v))) { continue; }
+      n = (n == null ? 0 : n) + Number(v);
+    }
+    return n;
+  }
+  var mine = starters(me), theirs = starters(opp);
+  if (!mine.length && !theirs.length) { return ''; }
+  var slug = String((row && row.sport) || '').toLowerCase();
+  var mSum = todaySum(mine), oSum = todaySum(theirs);
+  function tot(n) {
+    return (n == null) ? '—' : (Math.round(n * 10) / 10).toFixed(1);
+  }
+
+  var rows = '', n = Math.max(mine.length, theirs.length), a, b, slot, col;
+  for (i = 0; i < n; i++) {
+    a = mine[i] || null; b = theirs[i] || null;
+    slot = (a && a.slot) || (b && b.slot) || '';
+    col = (typeof _slpSlotColor === 'function' && slot)
+      ? _slpSlotColor(String(slot).toUpperCase()) : 'rgba(255,255,255,0.45)';
+    rows += '<div class="slh-row">' +
+      _espH2hSide(a, slug, false) +
+      '<span class="slh-slot" style="color:' + col + ';border-color:' + col +
+        '55;background:' + col + '1f">' + slEsc(String(slot).toUpperCase()) + '</span>' +
+      _espH2hSide(b, slug, true) +
+    '</div>';
+  }
+
+  return '<div class="slh">' +
+    '<div class="slh-head">' +
+      '<div class="slh-team mine" style="color:#ef4444">' +
+        slEsc(String(me.teamName || 'My team')) +
+        '<b class="slh-tot">' + tot(mSum) + '</b></div>' +
+      '<div class="slh-vs">TONIGHT</div>' +
+      '<div class="slh-team r">' + slEsc(String(opp.teamName || 'Opponent')) +
+        '<b class="slh-tot">' + tot(oSum) + '</b></div>' +
+    '</div>' + rows +
+    // Said plainly, because the headline above this pane is the MATCHUP
+    // total and these are a day's. Two numbers that differ for a good
+    // reason have to say what the reason is or they read as a bug.
+    '<div class="slh-note">Starters only. Points are each player’s for the ' +
+    'CURRENT scoring period — tonight — not the whole matchup, so these ' +
+    'will not add up to the matchup score above.</div>' +
+  '</div>';
+}
+
 function espScoreView(row) {
   return espIsCats(row) ? '?view=mBoxscore&view=mMatchupScore' : '?view=mMatchupScore';
 }
@@ -211835,6 +211949,10 @@ function _espMatchupPaneHtml(row) {
       'finished \u2014 it plots each side\u2019s running total day by day.</div>';
   }
   h += _espCatBreakdownHtml(row);
+
+  // ESPH2H -- last, under the flow: the scoreboard sets the league context,
+  // the flow is this matchup's shape, and the lineups are its detail.
+  try { h += _espH2hLineupsHtml(row, row && row.liveScores); } catch (eH) {}
 
   h += '</div>';
   return h;
