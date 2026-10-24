@@ -30194,6 +30194,29 @@
   table.rg td.rg-z { color: var(--sk-text-4); }
   table.rg td.rg-best { color: var(--sk-gold); font-weight: 800; }
   table.rg td.rg-neg { color: var(--sk-red); }
+  /* CATTOTALS -- the team's line. Gold and heavier than the rows under
+     it because it answers a different question: not who did it, but how
+     the side is doing. The pinned cells need their own opaque fill or the
+     scrolled figures show straight through them. */
+  table.rg tr.rg-tot td {
+    font-weight: 800; color: var(--sk-gold);
+    background: rgba(245,213,71,0.07);
+    border-bottom: 1px solid rgba(245,213,71,0.26);
+  }
+  table.rg tr.rg-tot td.rg-z { color: rgba(245,213,71,0.32); font-weight: 600; }
+  table.rg tr.rg-tot td.rg-p, table.rg tr.rg-tot td.rg-fp {
+    background: rgba(245,213,71,0.07);
+  }
+  table.rg tr.rg-tot td.rg-fp { color: var(--sk-gold); }
+  .rg-totlab {
+    font-family: var(--sk-font-mono); font-size: 9px; font-weight: 800;
+    letter-spacing: 0.2em; color: var(--sk-gold);
+  }
+  .rg-totsub {
+    font-family: var(--sk-font-mono); font-size: 7.5px; font-weight: 600;
+    letter-spacing: 0.08em; color: var(--sk-text-4);
+    margin-top: 1px; display: block;
+  }
   .rg-foot {
     font-size: 9px; letter-spacing: 0.08em; color: var(--sk-text-4);
     font-family: var(--sk-font-mono); padding: 6px 8px 2px;
@@ -30242,6 +30265,15 @@
   .rg-dark table.rg td.rg-best { color: var(--sk-gold); }
   .rg-dark table.rg td.rg-fp.rg-best { color: var(--sk-gold); }
   .rg-dark table.rg td.rg-neg { color: var(--sk-red); }
+  /* On black the 7% gold wash reads as grey, so the dark skin gives the
+     row a colour of its own rather than a tint of the surface. */
+  .rg-dark table.rg tr.rg-tot td,
+  .rg-dark table.rg tr.rg-tot td.rg-p,
+  .rg-dark table.rg tr.rg-tot td.rg-fp {
+    background: #15120a; color: var(--sk-gold);
+    border-bottom-color: rgba(245,213,71,0.3);
+  }
+  .rg-dark table.rg tr.rg-tot td.rg-z { color: rgba(245,213,71,0.34); }
   .rg-dark .rg-foot { color: rgba(255,255,255,0.34); }
   .rg-dark .rg-sect { color: rgba(255,255,255,0.50); }
   .rg-dark .rg-sect-lg { color: rgba(255,255,255,0.62); }
@@ -137631,7 +137663,7 @@ function _skTodayGridHtml(rows, statsMeta, isPts, label) {
       lbl += ' · ' + started + ' of ' + players.length + ' played';
     }
     var _tg = _rgGroupHtml(players, byKey, statsMeta, ord, sport,
-      { fp: !!isPts, scopeLabel: lbl, shapeBy: byKey,
+      { fp: !!isPts, scopeLabel: lbl, shapeBy: byKey, totals: true,
         tapFn: '_skTodayOpenPlayerSheet' }) || '';
     // TODAYDARK -- black surface, white figures, gold leaders.
     // TODAYBLEED -- and the table itself out to the sheet's own edge.
@@ -174257,6 +174289,29 @@ function _rgPhotoHtml(src, logos, abbr, wide) {
   return box + img + '</span>';
 }
 
+// CATTOTALS -- is this column a thing you can add up?
+//
+// The league's own metadata is the right answer where we have it:
+// _skIsCountingCatStat already excludes rates, display-only stats and
+// sortOrder-0 categories, and it is what the rest of the app aggregates
+// by. The name check behind it is for ESPN's grid, which carries a label
+// and no metadata, and for any league that spells a ratio in a way the
+// list has not seen. When in doubt this answers NO: a dash costs him
+// nothing, and a summed save percentage is a wrong number wearing a
+// right number's clothes.
+function _rgCatSummable(abbr, metaObj) {
+  if (metaObj && typeof _skIsCountingCatStat === 'function') {
+    return !!_skIsCountingCatStat(metaObj);
+  }
+  var a = String(abbr || '').toUpperCase().trim();
+  if (!a) { return false; }
+  if (typeof SK_KNOWN_RATE_STAT_ABBRS !== 'undefined' &&
+      SK_KNOWN_RATE_STAT_ABBRS[a]) { return false; }
+  if (a.indexOf('%') > -1 || a.indexOf('/') > -1) { return false; }
+  if (a === 'AVG' || a === 'PCT' || a === 'RATE') { return false; }
+  return true;
+}
+
 function _rgTable(rows, byKey, meta, ord, sport, opts) {
   // ROSTERGRID4 -- WHICH columns and WHAT is in them are two questions.
   // The season says which categories this roster plays; the map in hand
@@ -174308,7 +174363,62 @@ function _rgTable(rows, byKey, meta, ord, sport, opts) {
   }
   head += '</tr>';
 
-  var body = '';
+  // CATTOTALS -- the team's figure per column, on the row under the
+  // header. Built only when the caller asks: the Roster tab passes no
+  // flag and its tables are exactly as they were.
+  // A total of one row is that row again. The leader marking already
+  // declines below two for the same reason.
+  var totRow = '';
+  if (opts && opts.totals && rows.length > 1) {
+    var tCells = '', tAny = false, tN = 0, tv, tr2;
+    // How many men actually have a line in here -- it belongs beside the
+    // word TEAM, because a total of four is a different claim when
+    // eighteen are still waiting to play.
+    for (r = 0; r < rows.length; r++) {
+      tr2 = rows[r].playerKey ? byKey[rows[r].playerKey] : null;
+      if (tr2 && (tr2.stats || tr2.fp != null)) { tN++; }
+    }
+    if (wantFp) {
+      tv = null;
+      for (r = 0; r < rows.length; r++) {
+        tr2 = rows[r].playerKey ? byKey[rows[r].playerKey] : null;
+        var tfv = tr2 ? tr2.fp : null;
+        if (tfv == null || tfv === '' || isNaN(tfv)) { continue; }
+        tv = (tv == null ? 0 : tv) + Number(tfv);
+      }
+      tCells += '<td class="rg-fp' + (tv == null ? ' rg-z' : '') + '">' +
+        (tv == null ? '—' : skEscape(tv.toFixed(1))) + '</td>';
+      if (tv != null) { tAny = true; }
+    }
+    for (c = 0; c < cols.length; c++) {
+      if (!_rgCatSummable(cols[c].meta && (cols[c].meta.abbr || cols[c].meta.displayName),
+                          cols[c].meta)) {
+        tCells += '<td class="rg-z">—</td>';
+        continue;
+      }
+      tv = null;
+      for (r = 0; r < rows.length; r++) {
+        tr2 = rows[r].playerKey ? byKey[rows[r].playerKey] : null;
+        var tsv = (tr2 && tr2.stats) ? tr2.stats[cols[c].sid] : null;
+        if (tsv == null || tsv === '' || isNaN(tsv)) { continue; }
+        tv = (tv == null ? 0 : tv) + Number(tsv);
+      }
+      if (tv == null) { tCells += '<td class="rg-z">—</td>'; }
+      else {
+        tCells += '<td>' + skEscape(String(_rgFmt(tv, cols[c].meta))) + '</td>';
+        tAny = true;
+      }
+    }
+    // Nothing resolved: no row. A line of gold em-dashes reads as a fault.
+    if (tAny) {
+      totRow = '<tr class="rg-tot"><td class="rg-p">' +
+        '<span class="rg-totlab">TEAM</span>' +
+        '<span class="rg-totsub">' + tN + ' of ' + rows.length + ' in</span>' +
+        '</td>' + tCells + '</tr>';
+    }
+  }
+
+  var body = totRow;
   for (r = 0; r < rows.length; r++) {
     var p = rows[r];
     var rec = p.playerKey ? byKey[p.playerKey] : null;
@@ -209306,7 +209416,56 @@ function _erTable(items, winKey, game, sport, opts) {
   }
   head += '</tr>';
 
-  var body = '';
+  // CATTOTALS -- the same row, same rules. AVG is left blank on purpose:
+  // the mean of a set of means is not the team's average and there is no
+  // honest way to get one from what this table holds.
+  var totRow = '';
+  if (opts && opts.totals && items.length > 1) {
+    var tCells = '', tAny = false, tN = 0, tv, tw;
+    for (i = 0; i < items.length; i++) {
+      tw = (items[i].windows && items[i].windows[winKey]) || null;
+      if (tw && (tw.stats || tw.total != null)) { tN++; }
+    }
+    if (!cats) {
+      tv = null;
+      for (i = 0; i < items.length; i++) {
+        tw = (items[i].windows && items[i].windows[winKey]) || null;
+        var tt = tw ? tw.total : null;
+        if (tt == null || tt === '' || isNaN(tt)) { continue; }
+        tv = (tv == null ? 0 : tv) + Number(tt);
+      }
+      tCells += '<td class="rg-fp' + (tv == null ? ' rg-z' : '') + '">' +
+        (tv == null ? '—' : slEsc(tv.toFixed(1))) + '</td>' +
+        '<td class="rg-z">—</td>';
+      if (tv != null) { tAny = true; }
+    }
+    for (c = 0; c < cols.length; c++) {
+      if (!_rgCatSummable(cols[c].label, null)) {
+        tCells += '<td class="rg-z">—</td>';
+        continue;
+      }
+      tv = null;
+      for (i = 0; i < items.length; i++) {
+        tw = (items[i].windows && items[i].windows[winKey]) || null;
+        var tcv = (tw && tw.stats) ? tw.stats[cols[c].id] : null;
+        if (tcv == null || tcv === '' || isNaN(tcv)) { continue; }
+        tv = (tv == null ? 0 : tv) + Number(tcv);
+      }
+      if (tv == null) { tCells += '<td class="rg-z">—</td>'; }
+      else {
+        tCells += '<td>' + slEsc(String(espStatFmt(cols[c].id, tv, game))) + '</td>';
+        tAny = true;
+      }
+    }
+    if (tAny) {
+      totRow = '<tr class="rg-tot"><td class="rg-p">' +
+        '<span class="rg-totlab">TEAM</span>' +
+        '<span class="rg-totsub">' + tN + ' of ' + items.length + ' in</span>' +
+        '</td>' + tCells + '</tr>';
+    }
+  }
+
+  var body = totRow;
   for (i = 0; i < items.length; i++) {
     var it = items[i] || {};
     var wd = (it.windows && it.windows[winKey]) || null;
@@ -211673,7 +211832,7 @@ function _espLineupGridHtml(row, items, game, sport, ptMap, ptNames, cats) {
     if (typeof _erGroupHtml !== 'function') { return ''; }
     if (!items || !items.length) { return ''; }
     return _erGroupHtml(items, 'today', game, sport, {
-      cats: cats, row: row, ptMap: ptMap, ptNames: ptNames
+      cats: cats, row: row, ptMap: ptMap, ptNames: ptNames, totals: true
     }) || '';
   } catch (e) { return ''; }
 }
