@@ -133858,12 +133858,28 @@ function _mrEfficiencyHtml() {
     '<span style="flex:0 0 36px;text-align:right;">DAYS</span>' +
     '<span style="flex:0 0 54px;text-align:right;">EFF</span>' +
     '<span style="flex:0 0 52px;text-align:right;">LEFT</span>' +
-    '<span style="flex:0 0 36px;text-align:right;">IDLE</span></div>';
+    '<span style="flex:0 0 60px;text-align:right;">IDLE</span></div>';
   rows.sort(function (a, b) {
     if (a.capped !== b.capped) return a.capped ? 1 : -1;   // SKBANKCAP — capped last
-    var ea = a.s.opt > 0 ? a.s.actOpt / a.s.opt : 2, eb = b.s.opt > 0 ? b.s.actOpt / b.s.opt : 2;
-    return ea - eb;
+    // SKEFFUI -- "has a figure" is a flag, not a sentinel value. This used
+    // a bare 2 to push the figureless rows last, which holds only while
+    // real efficiencies stay under 2 -- and they did not: while the
+    // SKEFFDAYS bug had them above 200%, the dash rows sorted into the
+    // MIDDLE of the table. The cause is fixed; this removes the trap.
+    var ha = a.s.opt > 0, hb = b.s.opt > 0;
+    if (ha !== hb) { return ha ? -1 : 1; }
+    if (!ha) { return 0; }
+    return (a.s.actOpt / a.s.opt) - (b.s.actOpt / b.s.opt);
   });
+  // SKEFFUI -- the worst cost in the list that is actually being shown,
+  // so the bars scale to this table rather than to a league filtered out
+  // of it. Computed after the sport filter and the sort, before any row.
+  var maxLeft = 0;
+  for (i = 0; i < rows.length; i++) {
+    if (rows[i].s.opt > 0) {
+      maxLeft = Math.max(maxLeft, rows[i].s.opt - rows[i].s.actOpt);
+    }
+  }
   for (i = 0; i < rows.length; i++) {
     var r = rows[i], S = r.s, key = r.lg.league_key;
     var e2 = S.opt > 0 ? S.actOpt / S.opt : null;
@@ -133904,14 +133920,38 @@ function _mrEfficiencyHtml() {
           (e2 == null ? '\u2014' : (Math.round(e2 * 1000) / 10) + '%') + '</span>' +
         '<span style="flex:0 0 52px;text-align:right;' + mono + 'font-size:11px;color:rgba(255,255,255,0.7);">' +
           (S.opt > 0 ? (S.opt - S.actOpt).toFixed(1) : '\u2014') + '</span>' +
-        '<span style="flex:0 0 36px;text-align:right;' + mono + 'font-size:11px;color:' +
-          (S.idle ? '#fbbf24' : 'rgba(255,255,255,0.4)') + ';">' + S.idle + '</span>' +
+        // SKEFFUI -- the count AND the rate. A raw count cannot be ranked
+        // across leagues of different lengths, and every non-zero one was
+        // the same amber, so 608 and 130 read as equally bad.
+        '<span style="flex:0 0 60px;text-align:right;' + mono + 'font-size:11px;color:' +
+          _mrEffIdleCol(S) + ';">' + S.idle +
+          (S.days > 0
+            ? ('<span style="color:rgba(255,255,255,0.28);font-size:9px;">/d ' +
+               (Math.round(S.idle / S.days * 10) / 10) + '</span>')
+            : '') + '</span>' +
       '</div>' +
+      // SKEFFUI -- what it cost, as a length, against the worst in this
+      // list. Drawn under a row sorted by EFF, so a league that is set
+      // well and still bleeds points is visible rather than inferred.
+      _mrEffCostBar(S, maxLeft) +
       (sub ? '<div style="font-size:9.5px;color:rgba(255,255,255,0.38);padding:2px 0 0 12px;">' + slEsc(sub) + '</div>' : '') +
       (isOpen ? _mrEffDaysHtml(key, S.st, r.lg) : '') +
     '</div>';
   }
-  h += '<div style="font-size:9px;line-height:1.5;color:rgba(255,255,255,0.28);margin-top:9px;">' +
+  // SKEFFUI -- folded. The words are unchanged; they are simply no longer
+  // the largest thing on a card about a table.
+  h += '<div onclick="mrEffHelpToggle()" style="margin-top:9px;font-size:9.5px;' +
+    'letter-spacing:0.1em;color:rgba(255,255,255,0.3);cursor:pointer;">' +
+    (_mrEffHelpOpen ? '\u25be' : '\u25b8') + ' HOW THIS IS FIGURED</div>';
+  // GUARDED, not early-returned. An early return here would need a second
+  // closing-div literal for the card, and this file's tag counter reads
+  // literals rather than scopes -- the balance went to 17 over 16 the
+  // moment I tried it. (The first wording of this very comment SPELLED
+  // that tag out and pushed the count back to 17 on its own, which is as
+  // good a demonstration as the rule could ask for: the counter cannot
+  // tell a comment from markup, and neither should anyone editing here.)
+  if (_mrEffHelpOpen) {
+  h += '<div style="font-size:9px;line-height:1.5;color:rgba(255,255,255,0.28);margin-top:6px;">' +
     'EFF is points scored \u00f7 your lineup plus whatever your bench scored that could have ' +
     'fit into it, using each player\u2019s real position eligibility. LEFT is those bench points: ' +
     'only bench players who actually scored count, and your starters keep their real scores, ' +
@@ -133924,6 +133964,7 @@ function _mrEfficiencyHtml() {
     'Categories leagues have no single number to optimise, so they show what the bench produced ' +
     'instead. IDLE counts days an everyday player sat in your lineup without playing \u2014 pitchers ' +
     'and goalies excluded. Tracked from ' + _skBankShortDate(T.first) + '; each morning banks the day before.</div>';
+  }
   return h + '</div>';
 }
 
@@ -134048,6 +134089,38 @@ function _mrEffWhatIfStrip(rows) {
 var _mrEffOpen = {};
 var _mrEffWeekOpen = {};   // key|weekStart -> true/false (unset = default)
 var _mrEffAll = {};        // key -> show every week, not just the last four
+// SKEFFUI -- graded on the RATE, not the count, so leagues of different
+// lengths can be compared. Thresholds are per day of games.
+function _mrEffIdleCol(S) {
+  if (!S.idle) { return 'rgba(255,255,255,0.4)'; }
+  if (!(S.days > 0)) { return '#fbbf24'; }
+  var rate = S.idle / S.days;
+  if (rate >= 15) { return '#f87171'; }
+  if (rate >= 8) { return '#fbbf24'; }
+  return 'rgba(255,255,255,0.5)';
+}
+
+// SKEFFUI -- relative to the worst in the list that is being shown. An
+// absolute scale would need a number nobody has; this answers the question
+// actually being asked, which is "which of mine is worst".
+function _mrEffCostBar(S, maxLeft) {
+  if (!(S.opt > 0) || !(maxLeft > 0)) { return ''; }
+  var left = S.opt - S.actOpt;
+  if (!(left > 0)) { return ''; }
+  var pct = Math.max(2, Math.round(left / maxLeft * 88));
+  return '<div style="height:2px;border-radius:1px;margin:3px 0 0 12px;' +
+    'background:rgba(248,113,113,0.5);width:' + pct + '%;"></div>';
+}
+
+// SKEFFUI -- the explanation folds. It is thirteen lines and it was the
+// largest thing on the card; the words are unchanged, they are just no
+// longer the first thing met on the way past.
+var _mrEffHelpOpen = false;
+function mrEffHelpToggle() {
+  _mrEffHelpOpen = !_mrEffHelpOpen;
+  if (typeof mrRenderBody === 'function') { mrRenderBody(); }
+}
+
 function mrEffToggle(key) {
   _mrEffOpen[key] = !_mrEffOpen[key];
   if (typeof mrRenderBody === 'function') mrRenderBody();
@@ -134178,7 +134251,9 @@ function _mrEffDaysHtml(key, st, league) {
   for (i = 0; i < shownW.length; i++) {
     var wk = shownW[i];
     var id = key + '|' + wk.ws;
-    var open = (_mrEffWeekOpen[id] != null) ? _mrEffWeekOpen[id] : (i === 0);
+    // SKEFFUI -- closed unless asked for. Opening a league used to open
+    // its newest week too, so one tap expanded two things.
+    var open = (_mrEffWeekOpen[id] != null) ? _mrEffWeekOpen[id] : false;
     var endD = new Date(parseInt(wk.ws.slice(0, 4), 10), parseInt(wk.ws.slice(5, 7), 10) - 1, parseInt(wk.ws.slice(8, 10), 10) + 6);
     var endLbl = (endD.getMonth() === parseInt(wk.ws.slice(5, 7), 10) - 1) ? String(endD.getDate())
       : ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][endD.getMonth()] + ' ' + endD.getDate();
