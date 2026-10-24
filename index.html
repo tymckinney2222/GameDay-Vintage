@@ -133712,7 +133712,12 @@ function _skBankWeek(league, entry) {
 // Summary of a league's bank: totals across banked days.
 function _skBankSummary(key) {
   var bank = _skBankGet(key);
-  var o = { days: 0, first: null, last: null, act: 0, opt: 0, optDays: 0, bench: 0, idle: 0,
+  // SKEFFDAYS -- actOpt is the actual scored ON THE DAYS THAT HAVE AN
+  // OPTIMAL, and it is the only numerator an efficiency may use. act stays
+  // what it was, the whole total, because the points-share reader below
+  // wants exactly that and was never wrong.
+  var o = { days: 0, first: null, last: null, act: 0, actOpt: 0, opt: 0, optDays: 0,
+            bench: 0, idle: 0,
             benchStats: {}, bestDay: null, st: bank.st, sport: bank.sport };
   for (var d in bank.days) {
     if (!bank.days.hasOwnProperty(d)) continue;
@@ -133724,7 +133729,9 @@ function _skBankSummary(key) {
       o.act += r[0];
       if (!o.bestDay || r[0] > o.bestDay.fp) o.bestDay = { date: d, fp: r[0] };
     }
-    if (r[1] != null && r[0] != null) { o.opt += r[1]; o.optDays++; }
+    // One condition, both sums. Written on the same line as the thing it
+    // must agree with, because the whole bug was these drifting apart.
+    if (r[1] != null && r[0] != null) { o.opt += r[1]; o.actOpt += r[0]; o.optDays++; }
     if (r[2] != null) o.bench += r[2];
     o.idle += r[3] || 0;
     var bs = r[4] || {};
@@ -133763,7 +133770,7 @@ function _skBankWeekStart(d) {
 // didn't play — the closest thing to a direct measure of lineup setting.
 function _mrEfficiencyHtml() {
   var yl = (typeof _skYahooArchLeagues === 'function') ? _skYahooArchLeagues() : [];
-  var rows = [], T = { act: 0, opt: 0, idle: 0, days: 0, first: null }, i;
+  var rows = [], T = { actOpt: 0, opt: 0, optDays: 0, idle: 0, days: 0, first: null }, i;
   // SKEFFSPORT — which sports have tracked leagues, for the filter pills.
   var sportsHere = {}, sportOrder = [];
   for (i = 0; i < yl.length; i++) {
@@ -133788,7 +133795,7 @@ function _mrEfficiencyHtml() {
       (typeof _skCapWatchCache === 'object' && _skCapWatchCache[lg.league_key] &&
        _skCapWatchCache[lg.league_key].maxIp != null);
     rows.push({ lg: lg, s: s, capped: capped });
-    if (s.optDays && !capped) { T.act += s.act; T.opt += s.opt; }
+    if (s.optDays && !capped) { T.actOpt += s.actOpt; T.opt += s.opt; T.optDays += s.optDays; }
     if (capped) T.capped = (T.capped || 0) + 1;
     T.idle += s.idle; T.days += s.days;
     if (!T.first || s.first < T.first) T.first = s.first;
@@ -133824,7 +133831,7 @@ function _mrEfficiencyHtml() {
       'Tracking starts with your next day of games. Each morning Skipper banks the day before \u2014 ' +
       'who started, who sat, and what they scored \u2014 and this fills in from there.</div></div>';
   }
-  var eff = T.opt > 0 ? T.act / T.opt : null;
+  var eff = T.opt > 0 ? T.actOpt / T.opt : null;
   function tile(lbl, val, sub, col) {
     return '<div style="flex:1;min-width:0;text-align:center;padding:8px 2px;border-radius:9px;' +
       'background:rgba(255,255,255,0.025);border:1px solid rgba(255,255,255,0.05);">' +
@@ -133833,9 +133840,15 @@ function _mrEfficiencyHtml() {
       '<div style="' + mono + 'font-size:9px;color:rgba(255,255,255,0.35);">' + sub + '</div></div>';
   }
   h += '<div style="display:flex;gap:6px;margin:0 0 12px;">' +
-    tile('EFFICIENCY', eff == null ? '\u2014' : Math.round(eff * 1000) / 10 + '%', 'points leagues',
+    // SKEFFDAYS -- the headline says what it was measured on. This is the
+    // figure that read 228%, and the reason it could was that nothing here
+    // distinguished a complete run from a quarter of one.
+    tile('EFFICIENCY', eff == null ? '\u2014' : Math.round(eff * 1000) / 10 + '%',
+         (eff != null && T.optDays && T.optDays < T.days)
+           ? ('points leagues \u00b7 ' + T.optDays + '/' + T.days + ' days')
+           : 'points leagues',
          eff == null ? '#fff' : eff >= 0.9 ? '#4ade80' : eff >= 0.8 ? '#fbbf24' : '#f87171') +
-    tile('LEFT ON BENCH', T.opt > 0 ? (T.opt - T.act).toFixed(1) : '\u2014', 'fantasy points') +
+    tile('LEFT ON BENCH', T.opt > 0 ? (T.opt - T.actOpt).toFixed(1) : '\u2014', 'fantasy points') +
     tile('IDLE STARTS', String(T.idle), 'everyday players', T.idle ? '#fbbf24' : '#4ade80') +
   '</div>';
   h += _mrEffWhatIfStrip(rows);   // SKWHATIF
@@ -133848,12 +133861,12 @@ function _mrEfficiencyHtml() {
     '<span style="flex:0 0 36px;text-align:right;">IDLE</span></div>';
   rows.sort(function (a, b) {
     if (a.capped !== b.capped) return a.capped ? 1 : -1;   // SKBANKCAP — capped last
-    var ea = a.s.opt > 0 ? a.s.act / a.s.opt : 2, eb = b.s.opt > 0 ? b.s.act / b.s.opt : 2;
+    var ea = a.s.opt > 0 ? a.s.actOpt / a.s.opt : 2, eb = b.s.opt > 0 ? b.s.actOpt / b.s.opt : 2;
     return ea - eb;
   });
   for (i = 0; i < rows.length; i++) {
     var r = rows[i], S = r.s, key = r.lg.league_key;
-    var e2 = S.opt > 0 ? S.act / S.opt : null;
+    var e2 = S.opt > 0 ? S.actOpt / S.opt : null;
     var ecol = e2 == null ? 'rgba(255,255,255,0.3)' : e2 >= 0.9 ? '#4ade80' : e2 >= 0.8 ? '#fbbf24' : '#f87171';
     if (r.capped) ecol = 'rgba(255,255,255,0.4)';   // SKBANKCAP — informational, not graded
     var sub = '';
@@ -133881,11 +133894,16 @@ function _mrEfficiencyHtml() {
           (r.capped ? '<span style="font-size:8.5px;font-weight:800;letter-spacing:0.08em;margin-left:6px;' +
             'color:rgba(255,255,255,0.4);border:1px solid rgba(255,255,255,0.18);border-radius:4px;padding:0 4px;">CAP</span>' : '') +
           '</span>' +
-        '<span style="flex:0 0 36px;text-align:right;' + mono + 'font-size:11px;color:rgba(255,255,255,0.5);">' + S.days + '</span>' +
+        // SKEFFDAYS -- measured / banked whenever they differ. A row
+        // reading 4 while its efficiency rested on 1 is how this hid.
+        '<span style="flex:0 0 36px;text-align:right;' + mono + 'font-size:11px;color:rgba(255,255,255,0.5);">' +
+          ((S.optDays && S.optDays < S.days)
+            ? (S.optDays + '<span style="color:rgba(255,255,255,0.3);">/' + S.days + '</span>')
+            : S.days) + '</span>' +
         '<span style="flex:0 0 54px;text-align:right;' + mono + 'font-size:11.5px;color:' + ecol + ';">' +
           (e2 == null ? '\u2014' : (Math.round(e2 * 1000) / 10) + '%') + '</span>' +
         '<span style="flex:0 0 52px;text-align:right;' + mono + 'font-size:11px;color:rgba(255,255,255,0.7);">' +
-          (S.opt > 0 ? (S.opt - S.act).toFixed(1) : '\u2014') + '</span>' +
+          (S.opt > 0 ? (S.opt - S.actOpt).toFixed(1) : '\u2014') + '</span>' +
         '<span style="flex:0 0 36px;text-align:right;' + mono + 'font-size:11px;color:' +
           (S.idle ? '#fbbf24' : 'rgba(255,255,255,0.4)') + ';">' + S.idle + '</span>' +
       '</div>' +
@@ -135365,8 +135383,11 @@ function _skRecapHtml(league, drafted) {
   h += _skSheetSection('\ud83d\udccb', 'Lineup', '');
   var lines = [];
   if (S.optDays && S.opt > 0) {
-    lines.push(Math.round(S.act / S.opt * 1000) / 10 + '% efficiency \u2014 ' + (S.opt - S.act).toFixed(1) +
-      ' points left on the bench');
+    lines.push(Math.round(S.actOpt / S.opt * 1000) / 10 + '% efficiency \u2014 ' +
+      (S.opt - S.actOpt).toFixed(1) + ' points left on the bench' +
+      // SKEFFDAYS -- say so when the figure rests on fewer days than the
+      // league has banked, rather than letting it read as the whole run.
+      (S.optDays < S.days ? (' (measured on ' + S.optDays + ' of ' + S.days + ' days)') : ''));
   }
   lines.push(S.idle + ' idle start' + (S.idle === 1 ? '' : 's') + ' (everyday players in the lineup who didn\u2019t play)');
   if (S.bestDay) lines.push('Best ' + U + ': ' + S.bestDay.fp.toFixed(1) + ' FP ' + (fbU ? 'in ' : 'on ') + _skBankShortDate(S.bestDay.date));
