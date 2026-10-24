@@ -127741,9 +127741,27 @@ async function skLoadRosterForDate(leagueKey, dateStr) {
   // flag empty active slots.
   var _planLg = (typeof fyLeagues !== 'undefined' ? fyLeagues : []).find(function(l) { return l.league_key === leagueKey; });
   var _planIsNfl = _planLg && typeof _skIsNflLeague === 'function' && _skIsNflLeague(_planLg);
+  // PLANFREE -- today's roster is the roster, and the undated path is the
+  // one the bulk warm already filled. Asking for today BY DATE made it a
+  // different cache key and bought the same answer again, once per daily
+  // sport league, inside the global pacer where everything else was
+  // queued behind it.
+  //
+  // Measured on his account before changing it: the undated answer
+  // carries the slot and the eligible positions for all 909 players, a
+  // status for 124, and starting_status for 47 -- every field this scan
+  // reads. That last one is why this needed measuring rather than
+  // reasoning: it is the one Yahoo does not document and the one whose
+  // absence would have made the scan report "all rosters optimal".
+  //
+  // Tomorrow keeps its date. There is no undated answer for a day that
+  // has not happened yet.
+  var _planToday = (typeof skTodayDateString === 'function') &&
+                   (String(dateStr) === skTodayDateString());
+  var _planUndated = !!(_planIsNfl || _planToday);
   var path = '/league/' + leagueKey +
              '/teams;is_owned_by_current_login=1/roster' +
-             (_planIsNfl ? '' : (';date=' + dateStr));
+             (_planUndated ? '' : (';date=' + dateStr));
   // Use the multi-try wrapper: the Plan scan fans out every league at once, so
   // it's the most likely spot to catch Yahoo mid-hiccup (a transient 5xx / HTML
   // error page). fyApiRetry gives residual 5xx several spaced attempts, which
@@ -138947,7 +138965,22 @@ function skManualRefresh() {
       if (entry && entry.gameStatus !== 'final') delete _skPpStatsCache[k];
     });
   }
+  // BATCHREFRESH -- fyDataCache was emptied at the top of this function,
+  // and the only thing that refills it in bulk sits inside
+  // fyAutoLoadAllRosters behind the fyRostersLoaded guard, which refresh
+  // does not re-arm. So every refresh ran the whole app cold and league
+  // by league: standings, settings, rosters and scoreboards, one call
+  // each, where four calls buy the lot.
+  //
+  // Awaited deliberately. It has to land BEFORE skRenderShell kicks off
+  // the hydrate below, or the hydrate asks league by league first and
+  // the warm arrives to a queue that no longer needs it.
   loadFyLeagues().then(function() {
+    var _lgs = (typeof skSyncedLeagues === 'function') ? skSyncedLeagues()
+             : ((typeof fyLeagues !== 'undefined' && fyLeagues) ? fyLeagues : []);
+    if (typeof _fyBatchWarm !== 'function' || !_lgs || _lgs.length < 2) { return 0; }
+    return _fyBatchWarm(_lgs).catch(function() { return 0; });
+  }).then(function() {
     skState.freshnessTs = Date.now();
     skUpdateFreshness();
     skRenderShell(); // re-renders cards in placeholder state
