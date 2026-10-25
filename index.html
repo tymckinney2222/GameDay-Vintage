@@ -190888,7 +190888,8 @@ function _auctBoardHtml(b) {
     // AUCTROSTER -- both directions of the roster join, named. A large
     // "added" number would mean the join is wrong, not that the rosters
     // are unusual, and it should be visible either way.
-    (b.rosterClubs ? (' \u00b7 ' + b.rosterClubs + ' rosters read') : '') +
+    (b.rosterClubs ? (' \u00b7 ' + b.rosterClubs + ' rosters read') :
+      (' \u00b7 NO rosters read' + (b.rosterWhy ? (': ' + b.rosterWhy) : ''))) +
     (b.offRoster ? (' \u00b7 ' + b.offRoster + ' not on a roster') : '') +
     (b.added ? (' \u00b7 ' + b.added + ' added from rosters') : '') +
     // A board is always built by _auctBuildBoard and always carries
@@ -191198,6 +191199,25 @@ function _auctBarHtml() {
   // AUCTGRID -- a card migrated from the old format carries TONIGHT'S
   // tiers, not the ones he paid. Say so rather than presenting them as
   // his.
+  // AUCTROSTER2 -- THE STATUS BELONGS AT THE TOP. It was a line at the
+  // foot of a board hundreds of rows long, which is nowhere. A board
+  // built without membership checked is a different board.
+  var _bd = _auctState.board;
+  if (_bd && _bd.rows && _bd.rows.length) {
+    if (!_bd.rosterClubs) {
+      h += '<div class="rg-foot" style="color:#f59e0b;margin:6px 0 0">' +
+        'Club rosters did not answer' +
+        (_bd.rosterWhy ? (' (' + skEscape(_bd.rosterWhy) + ')') : '') +
+        ', so this board is the fantasy pool whole \u2014 it can carry men ' +
+        'who are no longer on a team.</div>';
+    } else if (_bd.offRoster || _bd.added) {
+      h += '<div class="rg-foot" style="margin:6px 0 0">' +
+        _bd.rosterClubs + ' club rosters checked \u00b7 ' +
+        (_bd.offRoster || 0) + ' dropped as not on a roster' +
+        (_bd.added ? (' \u00b7 ' + _bd.added + ' added from them') : '') +
+        '.</div>';
+    }
+  }
   // AUCTUTIL -- what UTIL is, said once, where the decision is made.
   if (!_auctState.locked) {
     var _os = _auctOpenSeats(_auctState.lineup), _hasU = false, _oi;
@@ -193220,47 +193240,89 @@ function _auctSlateTeamIds() {
 var _auctRosterCache = {};        // sport|teamId -> { at, ids, players }
 var AUCT_ROSTER_TTL = 30 * 60 * 1000;
 
+function _auctGetJson(url) {
+  return fetch(url).then(function (r) {
+    if (!r.ok) { return null; }
+    // Not every ESPN reply is JSON, and .json() throws on the ones that
+    // are not -- which took the whole chain down rather than moving on
+    // to the next call.
+    return r.text().then(function (t) {
+      try { return JSON.parse(t); } catch (e) { return null; }
+    });
+  })['catch'](function () { return null; });
+}
+
+// Players out of whichever shape came back, or [] .
+function _auctRosterPlayersOf(j, abbr) {
+  var out = [];
+  try {
+    var teamObj = (j && (j.team || j)) || null;
+    var ath = (teamObj && teamObj.athletes) || (j && j.athletes) || [];
+    var list = (typeof _espRosterPlayers === 'function')
+      ? _espRosterPlayers(ath) : [];
+    for (var i = 0; i < list.length; i++) {
+      var a = list[i] || {};
+      // A roster entry is sometimes a wrapper around the athlete.
+      if (a.athlete && !a.id && !a.displayName) { a = a.athlete; }
+      var id = (a.id != null) ? String(a.id) : '';
+      var nm = a.displayName || a.fullName || a.shortName || '';
+      if (!id && !nm) { continue; }
+      out.push({
+        id: id || ('r:' + _auctNameKey(nm)),
+        name: nm || id,
+        pos: String(((a.position || {}).abbreviation) ||
+                    ((a.position || {}).name) || '').toUpperCase(),
+        team: abbr,
+        inj: String(a.injuries && a.injuries.length
+          ? ((a.injuries[0] || {}).status || '') : '').toUpperCase()
+      });
+    }
+  } catch (e) {}
+  return out;
+}
+
+// AUCTROSTER2 -- THE SAME THREE CALLS THE APP ALREADY MAKES, in the
+// same order. fetchTeamPage asks the combined endpoint, then says "If
+// no athletes from team endpoint, fetch roster separately" and tries a
+// season-pinned /roster, then an unpinned one. Those fallbacks exist
+// because the combined call frequently answers WITHOUT athletes -- which
+// is what happened here, and why a board that had been checked against
+// nothing still carried a retired man.
 function _auctRosterFor(team) {
   var key = _auctSport() + '|' + team.id;
   var c = _auctRosterCache[key];
-  if (c && (Date.now() - c.at) < AUCT_ROSTER_TTL) { return Promise.resolve(c); }
-  var url = 'https://site.api.espn.com/apis/site/v2/sports/' + _auctCfg().box +
-    '/teams/' + encodeURIComponent(team.id) + '?enable=roster';
-  return fetch(url).then(function (r) {
-    return r.ok ? r.json() : null;
-  }).then(function (j) {
-    var out = { at: Date.now(), ids: {}, names: {}, players: [] };
-    try {
-      var teamObj = (j && (j.team || j)) || null;
-      var ath = (teamObj && teamObj.athletes) || [];
-      var list = (typeof _espRosterPlayers === 'function')
-        ? _espRosterPlayers(ath) : [];
-      for (var i = 0; i < list.length; i++) {
-        var a = list[i] || {};
-        var id = (a.id != null) ? String(a.id) : '';
-        var nm = a.displayName || a.fullName || a.shortName || '';
-        if (!id && !nm) { continue; }
-        if (id) { out.ids[id] = 1; }
-        if (nm) { out.names[_auctNameKey(nm)] = 1; }
-        out.players.push({
-          id: id || ('r:' + _auctNameKey(nm)),
-          name: nm || id,
-          pos: String(((a.position || {}).abbreviation) ||
-                      ((a.position || {}).name) || '').toUpperCase(),
-          team: team.abbr,
-          inj: String(a.injuries && a.injuries.length
-            ? ((a.injuries[0] || {}).status || '') : '').toUpperCase()
-        });
+  if (c && c.players.length && (Date.now() - c.at) < AUCT_ROSTER_TTL) {
+    return Promise.resolve(c);
+  }
+  var base = 'https://site.api.espn.com/apis/site/v2/sports/' + _auctCfg().box +
+    '/teams/' + encodeURIComponent(team.id);
+  var seas = '';
+  try { seas = (typeof dbpSeason === 'function') ? String(dbpSeason()) : ''; } catch (e) { seas = ''; }
+  var urls = [base + '?enable=roster'];
+  if (seas) { urls.push(base + '/roster?season=' + seas); }
+  urls.push(base + '/roster');
+
+  function step(i, why) {
+    if (i >= urls.length) {
+      var bad = { at: 0, ids: {}, names: {}, players: [], failed: true,
+                  why: why || 'no athletes in any response' };
+      _auctRosterCache[key] = bad;
+      return bad;
+    }
+    return _auctGetJson(urls[i]).then(function (j) {
+      if (!j) { return step(i + 1, 'no reply'); }
+      var ps = _auctRosterPlayersOf(j, team.abbr);
+      if (!ps.length) { return step(i + 1, 'no athletes in response'); }
+      var out = { at: Date.now(), ids: {}, names: {}, players: ps, src: i };
+      for (var k = 0; k < ps.length; k++) {
+        if (ps[k].id) { out.ids[String(ps[k].id)] = 1; }
+        if (ps[k].name) { out.names[_auctNameKey(ps[k].name)] = 1; }
       }
-    } catch (e) {}
-    _auctRosterCache[key] = out;
-    return out;
-  })['catch'](function () {
-    // A club that will not answer must not quietly empty the board, so
-    // a failure is remembered as "unknown", never as "nobody".
-    var bad = { at: 0, ids: {}, names: {}, players: [], failed: true };
-    return bad;
-  });
+      _auctRosterCache[key] = out;
+      return out;
+    });
+  }
+  return Promise.resolve(step(0, ''));
 }
 
 // Every club playing tonight, merged. `ok` is false when nothing came
@@ -193272,11 +193334,22 @@ function _auctRosters() {
   var jobs = [], i;
   for (i = 0; i < teams.length; i++) { jobs.push(_auctRosterFor(teams[i])); }
   return Promise.all(jobs).then(function (all) {
-    var out = { ids: {}, names: {}, players: [], clubs: 0, failed: 0 }, j, k;
+    var out = { ids: {}, names: {}, players: [], clubs: 0, failed: 0,
+                clubsOk: {} }, j, k;
     for (j = 0; j < all.length; j++) {
-      if (!all[j] || all[j].failed) { out.failed++; continue; }
-      if (!all[j].players.length) { continue; }
+      if (!all[j] || all[j].failed || !all[j].players.length) {
+        out.failed++;
+        if (all[j] && all[j].why) { out.why = all[j].why; }
+        continue;
+      }
       out.clubs++;
+      // AUCTROSTER2 -- WHICH CLUBS ANSWERED, by abbreviation. Without
+      // this, one club failing while another answers means every man on
+      // the failed club is dropped as "not on a roster" -- a silent,
+      // lopsided board that looks checked and is half guesswork.
+      if (all[j].players.length && all[j].players[0].team) {
+        out.clubsOk[String(all[j].players[0].team).toUpperCase()] = 1;
+      }
       for (k in all[j].ids) { if (all[j].ids.hasOwnProperty(k)) { out.ids[k] = 1; } }
       for (k in all[j].names) { if (all[j].names.hasOwnProperty(k)) { out.names[k] = 1; } }
       for (k = 0; k < all[j].players.length; k++) { out.players.push(all[j].players[k]); }
@@ -193290,7 +193363,8 @@ function _auctRosters() {
 function _auctBuildBoard(leagueKey, pool, rosters) {
   var out = { rows: [], note: '', pool: 0, onSlate: 0, hurt: 0, priced: 0,
               lot: 0, cats: [], missed: [], unpriced: {}, empty: [],
-              offRoster: 0, added: 0, rosterClubs: (rosters && rosters.clubs) || 0 };
+              offRoster: 0, added: 0, rosterClubs: (rosters && rosters.clubs) || 0,
+              rosterWhy: (rosters && rosters.why) || '' };
   var scoring = _auctScoring(leagueKey);
   out.cats = scoring.read;
   out.missed = scoring.missed;
@@ -193320,18 +193394,6 @@ function _auctBuildBoard(leagueKey, pool, rosters) {
     if (!p) { continue; }
     var slot = _auctSlotOf(p, _auctSport());
     if (!slot) { continue; }
-    // AUCTROSTER -- IS HE ACTUALLY ON A CLUB? The pool is ESPN's fantasy
-    // universe and carries men who have retired; the clubs' own rosters
-    // are the answer to membership. Only applied when at least one club
-    // answered, because a board of nobody is worse than a board with a
-    // retired man on it.
-    if (rosters && rosters.ok) {
-      var _rid = String(p.id);
-      if (!rosters.ids[_rid] && !rosters.names[_auctNameKey(p.name)]) {
-        out.offRoster = (out.offRoster || 0) + 1;
-        continue;
-      }
-    }
     var ab = '';
     try {
       var pm = proMap ? proMap[String(p.teamId)] : null;
@@ -193341,6 +193403,25 @@ function _auctBuildBoard(leagueKey, pool, rosters) {
     var canon = (typeof _allInCanon === 'function') ? _allInCanon(ab, _auctSport()) : String(ab).toUpperCase();
     if (!slate.byAbbr[canon]) { continue; }
     out.onSlate++;
+    // AUCTROSTER -- IS HE ACTUALLY ON A CLUB? The pool is ESPN's fantasy
+    // universe and carries men who have retired; the clubs' own rosters
+    // answer membership.
+    //
+    // PLACED AFTER canon, NOT BEFORE IT. Sitting above the club lookup
+    // this read an undefined abbreviation, matched nothing in clubsOk,
+    // and so never fired at all -- a filter that looked right in the
+    // source and did precisely nothing.
+    //
+    // And only a man whose OWN club answered is judged: a club that did
+    // not is unknown, and unknown must never read as "nobody plays for
+    // them".
+    if (rosters && rosters.ok && rosters.clubsOk &&
+        rosters.clubsOk[String(canon).toUpperCase()]) {
+      if (!rosters.ids[String(p.id)] && !rosters.names[_auctNameKey(p.name)]) {
+        out.offRoster = (out.offRoster || 0) + 1;
+        continue;
+      }
+    }
     // AUCTLOT -- THE SLATE JOIN ASKS WHETHER HIS CLUB PLAYS, NEVER
     // WHETHER HE DOES. Suzuki was out and priced second among centres;
     // Barkov sat on injured reserve at nine dollars. A man who is not
