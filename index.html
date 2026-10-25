@@ -125002,6 +125002,23 @@ async function skHydrateLeague(league) {
     return;
   }
   try {
+    // ASKCOUNT -- observation only, changing nothing: are these two
+    // already in hand from the bulk slow half, or is this league buying
+    // them again? Both paths below are exactly what _fyBatchPrefill
+    // writes, so a miss here is a duplicate request, and 39 leagues of
+    // misses is 78 of them on every boot.
+    try {
+      var _hp1 = '/league/' + key + '/standings';
+      var _hp2 = '/league/' + key + '/scoreboard;out=matchups';
+      var _hc = (typeof fyDataCache === 'object' && fyDataCache) ? fyDataCache : {};
+      var _hf = function (p) {
+        var e = _hc[p];
+        return !!(e && e.d && e.t > Date.now() - (e.ttl || 60000));
+      };
+      if (_hf(_hp1)) { _skHydHit++; } else { _skHydMiss++; }
+      if (_hf(_hp2)) { _skHydHit++; } else { _skHydMiss++; }
+    } catch (eHM) {}
+
     // Run standings + scoreboard in parallel for this single league
     var [standingsRes, scoreboardRes] = await Promise.all([
       fyApi('/league/' + key + '/standings').catch(function() { return null; }),
@@ -201932,11 +201949,46 @@ function _fyRateBlock() {
            ? ' \u2014 that is once per handful of calls, not once an hour.'
            : '.') + '</div>')
       : '';
+    // ASKCOUNT -- the count itself, which nothing has ever reported.
+    // Every other line in this block is about the GAP between calls.
+    var _askLine = '';
+    try {
+      var _kk = [], _kn;
+      for (_kn in _fyReqKind) {
+        if (_fyReqKind.hasOwnProperty(_kn)) { _kk.push([_kn, _fyReqKind[_kn]]); }
+      }
+      _kk.sort(function (a, b) { return b[1] - a[1]; });
+      var _ks = [];
+      for (var _ki = 0; _ki < _kk.length; _ki++) {
+        _ks.push(_kk[_ki][0] + ' ' + _kk[_ki][1]);
+      }
+      _askLine = '<div style="margin-top:6px;border-top:1px solid ' +
+        'rgba(255,255,255,0.08);padding-top:5px;color:' +
+        (_fyReqTotal > 120 ? '#f59e0b' : '#cbd5e1') + '">' +
+        _fyReqTotal + ' real request' + (_fyReqTotal === 1 ? '' : 's') +
+        ' this session' +
+        (_ks.length ? ('<div style="color:#94a3b8;margin-top:2px">' +
+          _ks.join(' \u00b7 ') + '</div>') : '') + '</div>';
+      // The hydrate's hit rate. A miss is a league buying standings and
+      // scoreboard that the bulk already bought, and it is the number I
+      // took a gate out without ever looking at.
+      if (_skHydHit || _skHydMiss) {
+        var _tot = _skHydHit + _skHydMiss;
+        var _pct = Math.round((_skHydHit / _tot) * 100);
+        _askLine += '<div style="margin-top:4px;color:' +
+          (_pct < 60 ? '#f59e0b' : '#4ade80') + '">Hydrate read the bulk ' +
+          _skHydHit + ' of ' + _tot + ' times (' + _pct + '%)' +
+          (_pct < 60
+            ? (' \u2014 the other ' + _skHydMiss + ' bought again what the ' +
+               'bulk had already paid for.')
+            : '.') + '</div>';
+      }
+    } catch (eAL) { _askLine = ''; }
     var h = '<div style="color:#94a3b8;font-size:11px;margin:16px 0 4px">' +
       'How hard the app is asking</div>' +
       '<div style="background:#0d1220;border:1px solid rgba(255,255,255,0.08);' +
       'border-radius:8px;padding:8px;font-size:10px;line-height:1.5;color:#cbd5e1">' +
-      inner + slowLine + mintLine;
+      inner + slowLine + mintLine + _askLine;
     return h + '</div>';
   } catch (e) { return ''; }
 }
@@ -203571,6 +203623,32 @@ var _skBootMarks = [];
 // takes 1.6s and makes no requests at all. One of those is wrong about
 // his phone and counting is the only way to find out which.
 var _fyLaneHit = 0, _fyLaneMiss = 0;
+
+// ASKCOUNT -- how many real requests this session has sent, and of what.
+// Every brake in here governs the gap between calls; nothing counts them,
+// so "rate limited from time to time" had no number to check against.
+// Incremented at the one chokepoint every real request passes and no
+// cache hit reaches.
+var _fyReqTotal = 0;
+var _fyReqKind = {};
+function _fyReqNote(path) {
+  try {
+    var p = String(path || '');
+    var k = 'other';
+    if (p.indexOf('/scoreboard') > -1) { k = 'scoreboard'; }
+    else if (p.indexOf('/standings') > -1) { k = 'standings'; }
+    else if (p.indexOf('/settings') > -1) { k = 'settings'; }
+    else if (p.indexOf('/stats') > -1) { k = 'teamstats'; }
+    else if (p.indexOf('/roster') > -1) { k = 'roster'; }
+    else if (p.indexOf('/leagues') > -1) { k = 'leaguelist'; }
+    _fyReqTotal++;
+    _fyReqKind[k] = (_fyReqKind[k] || 0) + 1;
+  } catch (e) {}
+}
+
+// ASKCOUNT -- and the one number I removed a gate without measuring:
+// does the hydrate read the bulk's answers, or re-buy them?
+var _skHydHit = 0, _skHydMiss = 0;
 function _skBootMark(name, note) {
   try {
     for (var _bm = 0; _bm < _skBootMarks.length; _bm++) {
@@ -203684,6 +203762,10 @@ async function _fyApiOnce(path, isRetry) {
       fyDataCache[path].t > Date.now() - (fyDataCache[path].ttl || 60000)) {
     return fyDataCache[path].d;
   }
+  // ASKCOUNT -- the chokepoint. Above this line is cache; below it is a
+  // request on the wire. Counted before the pace so a call still sitting
+  // in the queue is counted as asked.
+  try { _fyReqNote(path); } catch (eRN) {}
   await _fyPace();   // cache hits above are free; only real requests are paced
   var _fyT0 = Date.now();   // FYHMS
   try {
