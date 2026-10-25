@@ -191675,25 +191675,59 @@ function _auctPick(key) {
 // A real-world bar, climbing with the streak. Nothing here reads a
 // league's scoring settings, which is what lets one streak run across
 // every league he has.
-// SURVCAL -- flatter, and hockey starts on a bar it can clear.
+// SURVCAT -- THE CATEGORY ROTATES, and the rungs climb inside it.
 //
-// The old ladder asked a top-30 forward for a point (61%) on night one
-// and two points (25%) from night five. Average run: 2.6 nights, and
-// night ten unreachable. The no-repeat rule is the real escalator, so
-// the bar only has to climb twice, and late.
-var SV_BARS = {
+// `rungs` is the number needed on nights 1-5, 6-12 and 13+. Each one is
+// set so a man who genuinely does that thing clears the first rung
+// around 85%, which is what makes a night fair whatever gets drawn.
+//
+// `one` is how the bar reads when the number is 1, because "1 blocked
+// shots" is not English. `keeper` men are goalies, and nothing has to
+// know it: a skater has no save projection, so his rate is zero and he
+// sorts to the bottom on his own.
+var SV_CATS = {
   nhl: [
-    { from: 1,  stat: 'pts', need: 1, alt: { stat: 'sog', need: 3 },
-      label: 'a point, or three shots', short: '1 PT / 3 SOG' },
-    { from: 6,  stat: 'pts', need: 1, label: 'a point',    short: '1+ PTS' },
-    { from: 13, stat: 'pts', need: 2, label: 'two points', short: '2+ PTS' }
+    { k: 'pts', stat: 'pts', name: 'POINTS',   noun: 'points',
+      unit: 'PTS', rungs: [1, 1, 2], one: 'a point' },
+    { k: 'a',   stat: 'a',   name: 'ASSISTS',  noun: 'assists',
+      unit: 'A',   rungs: [1, 1, 2], one: 'an assist' },
+    { k: 'sog', stat: 'sog', name: 'SHOTS',    noun: 'shots on goal',
+      unit: 'SOG', rungs: [2, 3, 4], one: 'a shot on goal' },
+    { k: 'hit', stat: 'hit', name: 'HITS',     noun: 'hits',
+      unit: 'HIT', rungs: [2, 3, 4], one: 'a hit' },
+    { k: 'blk', stat: 'blk', name: 'BLOCKS',   noun: 'blocked shots',
+      unit: 'BLK', rungs: [1, 2, 3], one: 'a blocked shot' },
+    { k: 'fw',  stat: 'fw',  name: 'FACEOFFS', noun: 'faceoff wins',
+      unit: 'FW',  rungs: [8, 10, 12], one: 'a faceoff win' },
+    { k: 'sv',  stat: 'sv',  name: 'SAVES',    noun: 'saves',
+      unit: 'SV',  rungs: [20, 25, 30], one: 'a save', keeper: true },
+    { k: 'w',   stat: 'w',   name: 'THE WIN',  noun: 'the win',
+      unit: 'WIN', rungs: [1, 1, 1], one: 'the win',
+      keeper: true, binary: true }
   ],
   nba: [
-    { from: 1,  stat: 'pts', need: 20, label: '20 points', short: '20+ PTS' },
-    { from: 6,  stat: 'pts', need: 25, label: '25 points', short: '25+ PTS' },
-    { from: 13, stat: 'pts', need: 30, label: '30 points', short: '30+ PTS' }
+    { k: 'pts', stat: 'pts', name: 'POINTS',   noun: 'points',
+      unit: 'PTS', rungs: [20, 25, 30], normal: true },
+    { k: 'ast', stat: 'ast', name: 'ASSISTS',  noun: 'assists',
+      unit: 'AST', rungs: [5, 7, 9], one: 'an assist' },
+    { k: 'reb', stat: 'reb', name: 'REBOUNDS', noun: 'rebounds',
+      unit: 'REB', rungs: [6, 8, 10], one: 'a rebound' },
+    { k: 'stl', stat: 'stl', name: 'STEALS',   noun: 'steals',
+      unit: 'STL', rungs: [1, 2, 3], one: 'a steal' },
+    { k: 'blk', stat: 'blk', name: 'BLOCKS',   noun: 'blocks',
+      unit: 'BLK', rungs: [1, 2, 3], one: 'a block' },
+    { k: 'tpm', stat: 'tpm', name: 'THREES',   noun: 'threes',
+      unit: '3PM', rungs: [2, 3, 4], one: 'a three' }
   ]
 };
+// The night each rung starts on. The no-repeat rule is already an
+// escalator -- by night four the best men are spent -- so the number
+// itself only has to climb twice, and late.
+var SV_RUNGS = [1, 6, 13];
+// A CATEGORY IS NOT CALLED UNLESS SOMEBODY CAN CLEAR IT. Without this
+// the draw could hand him a faceoff night with four centres playing,
+// and the run would end on the schedule rather than on a pick.
+var SV_CAT_FLOOR = 0.70;
 var SV_SPORTS = ['nhl', 'nba'];
 var SV_KEY = 'skSurv_v1';
 var SV_NIGHT_MAX = 90;
@@ -191704,18 +191738,45 @@ var _svState = { loaded: false, store: null, pool: null, note: '',
 // The bar for a given streak length. Night one is the gentlest; the
 // streak length is the number ALREADY banked, so a run of five is
 // picking its sixth.
-function _svBarFor(sport, streak) {
-  var list = SV_BARS[sport] || SV_BARS.nhl, i, out = list[0];
-  var night = (Number(streak) || 0) + 1;
-  for (i = 0; i < list.length; i++) { if (night >= list[i].from) { out = list[i]; } }
+// Which rung the streak has reached: 0, 1 or 2.
+function _svRung(streak) {
+  var night = (Number(streak) || 0) + 1, i, out = 0;
+  for (i = 0; i < SV_RUNGS.length; i++) { if (night >= SV_RUNGS[i]) { out = i; } }
   return out;
 }
 
-// The next bar after this one, for "three more nights to the goal".
-function _svNextBar(sport, streak) {
-  var list = SV_BARS[sport] || SV_BARS.nhl, night = (Number(streak) || 0) + 1, i;
-  for (i = 0; i < list.length; i++) { if (list[i].from > night) { return list[i]; } }
+// The night the numbers next go up, or null at the top of the ladder.
+function _svNextRungAt(streak) {
+  var night = (Number(streak) || 0) + 1, i;
+  for (i = 0; i < SV_RUNGS.length; i++) {
+    if (SV_RUNGS[i] > night) { return SV_RUNGS[i]; }
+  }
   return null;
+}
+
+function _svCatByKey(sport, k) {
+  var list = SV_CATS[sport] || SV_CATS.nhl, i;
+  for (i = 0; i < list.length; i++) { if (list[i].k === k) { return list[i]; } }
+  return list[0];
+}
+
+// A category plus a rung is a bar. Everything downstream -- the board,
+// the saved night, settlement -- reads only this, so a night settles
+// against the bar it was PICKED under even if the rotation has moved
+// on by morning.
+function _svBar(cat, rung) {
+  var n = cat.rungs[Math.min(Math.max(rung, 0), cat.rungs.length - 1)];
+  return {
+    cat: cat.k, stat: cat.stat, need: n, unit: cat.unit, noun: cat.noun,
+    name: cat.name, binary: !!cat.binary, normal: !!cat.normal,
+    label: (n === 1 && cat.one) ? cat.one : (n + ' ' + cat.noun),
+    short: cat.binary ? cat.unit : (n + '+ ' + cat.unit)
+  };
+}
+
+// Kept for anything that wants a bar without the night's draw.
+function _svBarFor(sport, streak, catKey) {
+  return _svBar(_svCatByKey(sport, catKey || 'pts'), _svRung(streak));
 }
 
 function _svToday() {
@@ -191752,6 +191813,14 @@ function _svSave() {
     for (var i = 0; i < keys.length - SV_NIGHT_MAX; i++) { delete st.nights[keys[i]]; }
   }
   if (st.history.length > SV_NIGHT_MAX) { st.history = st.history.slice(0, SV_NIGHT_MAX); }
+  // SURVCAT -- the drawn categories age out with the nights they
+  // belong to, or they grow by one key a day forever.
+  var ck = [], c;
+  for (c in (st.cats || {})) { if (st.cats.hasOwnProperty(c)) { ck.push(c); } }
+  if (ck.length > SV_NIGHT_MAX) {
+    ck.sort();
+    for (c = 0; c < ck.length - SV_NIGHT_MAX; c++) { delete st.cats[ck[c]]; }
+  }
   try { localStorage.setItem(SV_KEY, JSON.stringify(st)); } catch (e) {}
 }
 
@@ -191779,24 +191848,28 @@ function _svNormAtLeast(mu, sd, x) {
   return Math.max(0, Math.min(1, 1 - cdf));
 }
 
-function _svOdds(rate, need, sport) {
+// SURVCAT -- three shapes, and the BAR says which, not the sport.
+// Basketball scoring is high and wide enough to want a normal; a win is
+// not a count at all but a coin that lands once; everything else is a
+// count on a rate, which is Poisson.
+//
+// Poisson slightly overstates reliability on the busiest categories --
+// a rebounder's real spread is wider than sqrt(mean) -- so a 96% on the
+// board is nearer the low 90s in life. The card says the odds are
+// modelled rather than counted, and that is the honest word for it.
+function _svOdds(rate, need, sport, bar) {
   if (!(rate > 0)) { return 0; }
-  if (sport === 'nba') {
+  if (bar && bar.binary) { return Math.max(0, Math.min(1, rate)); }
+  if ((bar && bar.normal) || (!bar && sport === 'nba')) {
     // Spread grows with the mean but never vanishes on a low scorer.
     return _svNormAtLeast(rate, Math.max(4, rate * 0.33), need);
   }
   return _svPoissonAtLeast(rate, need);
 }
 
-// SURVCAL -- a bar with two legs clears on EITHER. Treated as
-// independent, which they are not: a man who scores probably also shot,
-// so this reads a little high. The card says the odds are modelled
-// rather than counted, and that is the honest word for it.
 function _svOddsFor(p, bar, sport) {
-  var a = _svOdds(_svRateStat(p, bar.stat, sport), bar.need, sport);
-  if (!bar.alt) { return a; }
-  var b = _svOdds(_svRateStat(p, bar.alt.stat, sport), bar.alt.need, sport);
-  return 1 - (1 - a) * (1 - b);
+  if (!bar) { return 0; }
+  return _svOdds(_svRateStat(p, bar.stat, sport), bar.need, sport, bar);
 }
 
 // A man's projected rate for ONE stat, per game.
@@ -191817,10 +191890,93 @@ function _svRateStat(p, stat, sport) {
     if (perGame) { return n; }
     return gp > 0 ? (n / gp) : 0;
   }
-  if (sport === 'nba') { return v('pts'); }
-  if (stat === 'sog') { return v('sog'); }
-  if (stat === 'g') { return v('g'); }
-  return v('g') + v('a');          // hockey points
+  // SURVCAT -- every category is just its own key now, with one
+  // exception: a hockey points projection may arrive as goals and
+  // assists with no P of its own.
+  if (stat === 'pts' && sport !== 'nba') {
+    var pv = v('pts');
+    return (pv > 0) ? pv : (v('g') + v('a'));
+  }
+  return v(stat);
+}
+
+// SURVCAT -- the categories drawn on the last night before this one,
+// so the rotation does not hand him hits twice running.
+function _svCatsBefore(st, date) {
+  var out = {}, best = '', k;
+  for (k in (st.cats || {})) {
+    if (!st.cats.hasOwnProperty(k)) { continue; }
+    if (k < date && k > best) { best = k; }
+  }
+  return best ? (st.cats[best] || out) : out;
+}
+
+// DRAWN ONCE AND REMEMBERED. Qualification depends on who is still
+// pickable, and that shrinks all evening as games start -- so a draw
+// repeated at 7pm could hand him a different category than the one he
+// read at 5pm. The first draw of the night is the night's draw.
+function _svAssignBars(out, st) {
+  var date = _svToday(), rung = _svRung(st.streak);
+  var prev = _svCatsBefore(st, date);
+  var saved = (st.cats || {})[date] || null;
+  var fresh = {}, dirty = false, s, i, j;
+
+  for (s = 0; s < SV_SPORTS.length; s++) {
+    var sp = SV_SPORTS[s], cats = SV_CATS[sp] || [];
+    if (!out.has[sp]) { continue; }
+
+    var pick = null;
+    if (saved && saved[sp]) {
+      pick = _svCatByKey(sp, saved[sp]);
+    } else {
+      // What is the best anyone still pickable could do in each
+      // category? That, not the catalogue, decides what gets called.
+      var qual = [], fallback = cats[0], fbOdds = -1;
+      for (i = 0; i < cats.length; i++) {
+        var bar = _svBar(cats[i], rung), best = 0;
+        for (j = 0; j < out.rows.length; j++) {
+          var r = out.rows[j];
+          if (r.sport !== sp || r.used || r.started) { continue; }
+          var o = _svOddsFor(r.p, bar, sp);
+          if (o > best) { best = o; }
+        }
+        if (best > fbOdds) { fbOdds = best; fallback = cats[i]; }
+        if (best >= SV_CAT_FLOOR && cats[i].k !== prev[sp]) { qual.push(cats[i]); }
+      }
+      if (qual.length) {
+        var rnd = _auctRng('surv|cat|' + sp + '|' + date);
+        pick = qual[Math.floor(rnd() * qual.length)] || qual[0];
+      } else {
+        // NOTHING CLEARS THE FLOOR TONIGHT -- a thin slate, or a long
+        // run that has spent his best men. The night still happens, on
+        // whatever category gives him the best chance left.
+        pick = fallback;
+        out.thin = true;
+      }
+      dirty = true;
+    }
+    out.cat[sp] = pick;
+    fresh[sp] = pick.k;
+  }
+
+  if (dirty) {
+    if (!st.cats) { st.cats = {}; }
+    var keep = st.cats[date] || {};
+    for (var kk in fresh) {
+      if (fresh.hasOwnProperty(kk)) { keep[kk] = fresh[kk]; }
+    }
+    st.cats[date] = keep;
+    _svSave();
+  }
+
+  // Now every man gets tonight's bar and is priced against it.
+  for (j = 0; j < out.rows.length; j++) {
+    var rr = out.rows[j], c = out.cat[rr.sport];
+    if (!c) { continue; }
+    rr.bar = _svBar(c, rung);
+    rr.odds = _svOddsFor(rr.p, rr.bar, rr.sport);
+    rr.p = null;                   // the projection is not needed again
+  }
 }
 
 // \u2500\u2500 tonight's pool \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
@@ -191838,7 +191994,7 @@ function _svPoolIndex(pool) {
 function _svBuildPool(pools) {
   var st = _svStore();
   var out = { rows: [], mine: 0, eligible: 0, games: 0, fallback: false,
-              sports: [], note: '' };
+              sports: [], note: '', cat: {}, has: {}, thin: false };
   var scan = [];
   try { scan = (typeof _allInScan === 'function') ? (_allInScan() || []) : []; } catch (e) { scan = []; }
   var i, j, sp, idx, seen = {};
@@ -191846,9 +192002,9 @@ function _svBuildPool(pools) {
   function add(name, teamAbbr, pos, sport, gm, mine) {
     var k = _svKey(name);
     if (!k || seen[k]) { return; }
-    var bar = _svBarFor(sport, st.streak);
+    // SURVCAT -- no bar yet. The category is not drawn until the whole
+    // board is known, because what is on the board is what decides it.
     var p = (pools[sport] ? pools[sport][k] : null);
-    var odds = _svOddsFor(p, bar, sport);
     var usedNight = st.used[k];
     seen[k] = 1;
     // SURVCAL -- a man whose game has started is off the board. Picking
@@ -191865,9 +192021,10 @@ function _svBuildPool(pools) {
         }
       }
     } catch (eS) { started = false; }
+    out.has[sport] = true;
     out.rows.push({ key: k, name: name, team: String(teamAbbr || '').toUpperCase(),
-                    pos: pos || '', sport: sport, bar: bar,
-                    odds: odds,
+                    pos: pos || '', sport: sport, bar: null, p: p,
+                    odds: 0,
                     used: (usedNight != null) ? usedNight : 0, started: started,
                     known: !!p, mine: !!mine, gm: gm || null });
   }
@@ -191922,6 +192079,10 @@ function _svBuildPool(pools) {
       if (!out.rows[i].used && !out.rows[i].started) { out.eligible++; }
     }
   }
+
+  // THE CATEGORY IS DRAWN HERE, with the full board in hand and before
+  // anything is sorted -- the sort reads odds that do not exist yet.
+  _svAssignBars(out, st);
 
   // Pickable first, then started, then spent -- the order he can act in.
   out.rows.sort(function (a, b) {
@@ -192062,6 +192223,10 @@ function _svFetchBox(sport, gids) {
           .status || {}).type.completed) { fin++; }
       } catch (e3) {}
     }
+    // SURVCAT -- a goalie's win is DERIVED, never read: no box score
+    // column carries it. The auction fetcher has always done this;
+    // Survivor only needed it once "the win" became a category.
+    _auctDeriveWins(box);
     box.games = n; box.final = fin;
     box.allFinal = (n === gids.length) && (fin === n) && n > 0;
     return box;
@@ -192075,23 +192240,18 @@ function _svLineFor(side, boxes) {
   if (!box) { return null; }
   var ln = box.byName[_svKey(side.name)];
   if (!ln) { return null; }
-  // SURVCAL -- read whichever stat the bar is about, and the second leg
-  // when it has one. Either clears it.
-  function val(stat) {
-    if (side.sport === 'nba') { return Number(ln.pts) || 0; }
-    if (stat === 'sog') { return Number(ln.sog) || 0; }
-    if (stat === 'g') { return Number(ln.g) || 0; }
-    if (ln.pts != null && !isNaN(ln.pts)) { return Number(ln.pts) || 0; }
-    return (Number(ln.g) || 0) + (Number(ln.a) || 0);
+  // SURVCAT -- the bar names its own column, and the night was saved
+  // with the bar, so this settles against what he actually picked
+  // under even if the rotation has moved on by morning.
+  var stat = side.bar.stat, got;
+  if (stat === 'pts' && side.sport !== 'nba') {
+    got = (ln.pts != null && !isNaN(ln.pts))
+      ? (Number(ln.pts) || 0)
+      : ((Number(ln.g) || 0) + (Number(ln.a) || 0));
+  } else {
+    got = Number(ln[stat]) || 0;
   }
-  var got = val(side.bar.stat);
-  var cleared = got >= side.bar.need;
-  var altGot = null;
-  if (side.bar.alt) {
-    altGot = val(side.bar.alt.stat);
-    if (altGot >= side.bar.alt.need) { cleared = true; }
-  }
-  return { got: got, altGot: altGot, cleared: cleared, line: ln };
+  return { got: got, cleared: got >= side.bar.need, line: ln };
 }
 
 // A night is settled ONCE, when every game it saved is final. Half a
@@ -192124,7 +192284,6 @@ function _svSettle(date, boxes) {
   N.settled = true;
   N.result = mine.cleared ? 'W' : 'L';
   N.got = mine.got;
-  N.altGot = (mine.altGot == null) ? null : mine.altGot;
   N.dnp = !!mine.dnp;
   if (hers) { N.houseGot = hers.got; N.houseResult = hers.cleared ? 'W' : 'L'; }
   else if (N.house) { N.houseGot = 0; N.houseResult = 'L'; }
@@ -192256,7 +192415,10 @@ function _auctGamesHtml() {
 
 // \u2500\u2500 SURVIVOR \u00b7 the screen \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 function _svPctTxt(p) {
-  if (!(p > 0)) { return '\u2014'; }
+  // An em-dash reads as "unknown". These men are not unknown, they are
+  // hopeless, and the board should say which.
+  if (!(p > 0)) { return '0%'; }
+  if (p < 0.01) { return '<1%'; }
   return Math.round(p * 100) + '%';
 }
 
@@ -192282,37 +192444,57 @@ function _svStreakHtml(st, rec) {
     '<div style="margin-top:9px">' + pips + '</div></div>';
 }
 
-function _svBarHtml(st) {
-  var nhl = _svBarFor('nhl', st.streak), nba = _svBarFor('nba', st.streak);
-  var nx = _svNextBar('nhl', st.streak);
-  var night = (st.streak || 0) + 1;
-  var rose = (night === nhl.from && nhl.from > 1);
+function _svBarHtml(st, pool) {
+  function chip(lab, bar) {
+    if (!bar) { return ''; }
+    return '<div style="flex:1;border:1px solid rgba(255,255,255,0.07);' +
+      'border-radius:9px;padding:7px 9px">' +
+      '<div style="font-size:9px;letter-spacing:0.12em;color:rgba(255,255,255,0.35);' +
+      'font-weight:700">' + lab + ' \u00b7 ' + skEscape(bar.name) + '</div>' +
+      '<div style="font-family:var(--sk-font-mono,monospace);font-size:14px;' +
+      'margin-top:2px">' + skEscape(bar.short) + '</div></div>';
+  }
+  var rung = _svRung(st.streak), night = (st.streak || 0) + 1;
+  var nhl = (pool.cat.nhl) ? _svBar(pool.cat.nhl, rung) : null;
+  var nba = (pool.cat.nba) ? _svBar(pool.cat.nba, rung) : null;
+  var nx = _svNextRungAt(st.streak);
+  var rose = (SV_RUNGS.indexOf(night) > 0);
+  // SURVCAT -- the headline is the category, because the category is
+  // what changes who is worth picking. On a hits night the best play in
+  // hockey is a man who has never been near this board before.
+  var lead;
+  if (nhl && nba) {
+    lead = 'Tonight is <b style="color:#facc15">' + skEscape(nhl.name) +
+      '</b> on the ice, <b style="color:#facc15">' + skEscape(nba.name) +
+      '</b> on the floor.';
+  } else {
+    var only = nhl || nba;
+    lead = only
+      ? ('Your man needs <b style="color:#facc15">' +
+         skEscape(only.label) + '</b> tonight.')
+      : 'Reading tonight\u2019s categories\u2026';
+  }
   return '<div style="border:1px solid rgba(255,255,255,0.07);' +
     'background:rgba(255,255,255,0.03);border-radius:12px;padding:12px 14px;margin:0 0 12px">' +
     '<div style="font-size:9.5px;letter-spacing:0.14em;color:rgba(255,255,255,0.4);' +
-      'font-weight:700">NIGHT ' + night + (rose ? ' \u2014 THE BAR JUST ROSE' : '') + '</div>' +
-    '<div style="font:19px Georgia,serif;margin-top:4px">Your man needs ' +
-      '<b style="color:#facc15">' + skEscape(nhl.label) + '</b> tonight.</div>' +
+      'font-weight:700">NIGHT ' + night +
+      (rose ? ' \u2014 THE NUMBERS JUST WENT UP' : '') + '</div>' +
+    '<div style="font:19px Georgia,serif;margin-top:4px">' + lead + '</div>' +
     '<div style="display:flex;gap:8px;margin-top:9px">' +
-      '<div style="flex:1;border:1px solid rgba(255,255,255,0.07);border-radius:9px;padding:7px 9px">' +
-        '<div style="font-size:9px;letter-spacing:0.12em;color:rgba(255,255,255,0.35);' +
-        'font-weight:700">NHL</div><div style="font-family:var(--sk-font-mono,monospace);font-size:14px;margin-top:2px">' +
-        skEscape(nhl.short) + '</div></div>' +
-      '<div style="flex:1;border:1px solid rgba(255,255,255,0.07);border-radius:9px;padding:7px 9px">' +
-        '<div style="font-size:9px;letter-spacing:0.12em;color:rgba(255,255,255,0.35);' +
-        'font-weight:700">NBA</div><div style="font-family:var(--sk-font-mono,monospace);font-size:14px;margin-top:2px">' +
-        skEscape(nba.short) + '</div></div>' +
+      chip('NHL', nhl) + chip('NBA', nba) +
     '</div>' +
     '<div style="font-size:10.5px;color:rgba(255,255,255,0.38);margin-top:6px;line-height:1.5">' +
-      'One streak across both sports.' +
-      (nx ? (' From night ' + nx.from + ' it\u2019s ' + skEscape(nx.label) + '.') : '') +
+      'One streak across both sports. The category changes every night.' +
+      (nx ? (' From night ' + nx + ' the numbers go up.') : '') +
+      (pool.thin ? ' Thin slate tonight \u2014 this is the best category ' +
+        'anyone left could clear.' : '') +
     '</div></div>';
 }
 
 // Tonight once it is locked: what he took, what the house took, and how
 // each is doing while the games run.
 function _svCardHtml(N) {
-  function side(lab, sd, got, res, altGot) {
+  function side(lab, sd, got, res) {
     if (!sd) { return ''; }
     var cleared = (res === 'W');
     var col = (got == null) ? 'rgba(255,255,255,0.35)' : (cleared ? '#4ade80' : '#f87171');
@@ -192328,10 +192510,9 @@ function _svCardHtml(N) {
       '<div style="text-align:right">' +
         '<div style="font-family:var(--sk-font-mono,monospace);font-size:22px;color:' + col + '">' +
           ((got == null) ? '\u2014'
-            : (got + ((sd.bar.alt && altGot != null) ? (' / ' + altGot) : ''))) + '</div>' +
+            : (sd.bar.binary ? (got ? 'W' : 'L') : got)) + '</div>' +
         '<div style="font-size:8.5px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
-        'margin-top:2px">' + skEscape(sd.bar.alt ? 'PTS / SOG'
-          : (sd.bar.stat === 'g' ? 'GOALS' : 'PTS')) + '</div>' +
+        'margin-top:2px">' + skEscape(sd.bar.unit) + '</div>' +
       '</div></div>';
   }
   var head = '';
@@ -192345,15 +192526,13 @@ function _svCardHtml(N) {
       '<div style="font-size:11.5px;color:rgba(255,255,255,0.5);margin-top:5px">' +
         skEscape(N.me.name) + ' needed ' + skEscape(N.me.bar.label) + '. ' +
         (N.dnp ? 'He did not dress.'
-               : ('He got ' + N.got + ((N.me.bar.alt && N.altGot != null)
-                   ? (', on ' + N.altGot + ' shots') : '') + '.')) + '</div></div>';
+               : ('He got ' + N.got + ' ' + skEscape(N.me.bar.noun) + '.')) +
+      '</div></div>';
   }
   return '<div class="rg-dark rg-bleed">' + head +
     '<div class="rg-sect">Tonight\u2019s picks</div>' +
-    side('YOU TOOK', N.me, (N.settled || _svState.box) ? N.got : null, N.result,
-         N.altGot) +
-    side('THE HOUSE TOOK', N.house, (N.settled ? N.houseGot : null), N.houseResult,
-         null) +
+    side('YOU TOOK', N.me, (N.settled || _svState.box) ? N.got : null, N.result) +
+    side('THE HOUSE TOOK', N.house, (N.settled ? N.houseGot : null), N.houseResult) +
     '<div class="rg-foot">' +
       (N.settled ? 'Settled off the box score. Nothing to tap.'
                  : 'Settles itself off the box scores once the games are final.') +
@@ -192373,7 +192552,8 @@ function _svRender() {
     host.innerHTML = h;
     return;
   }
-  h += _svBarHtml(st);
+  // SURVCAT -- the bar card cannot be drawn before the pool, because
+  // the pool is what decides the category.
   if (_svState.note) {
     h += '<div class="sk-wire-sheet-empty">' + skEscape(_svState.note) + '</div>';
     host.innerHTML = h;
@@ -192391,6 +192571,7 @@ function _svRender() {
     host.innerHTML = h;
     return;
   }
+  h += _svBarHtml(st, pool);
   h += '<div class="rg-dark rg-bleed">' +
     '<div class="rg-sect">' + (pool.fallback ? 'Everyone playing tonight' : 'Your players tonight') +
       ' <span style="opacity:0.6">' + pool.eligible + ' eligible of ' + pool.rows.length +
@@ -192399,6 +192580,9 @@ function _svRender() {
   for (i = 0; i < pool.rows.length && i < 60; i++) {
     r = pool.rows[i];
     var gm = r.gm && r.gm.g ? r.gm.g : null;
+    var off = r.used || r.started;
+    var hopeless = !off && !(r.odds >= 0.05);
+    var slim = !off && !(r.odds >= 0.25);
     var vs = '';
     if (gm) {
       var home = (gm.home && gm.home.abbr) || '', away = (gm.away && gm.away.abbr) || '';
@@ -192407,9 +192591,9 @@ function _svRender() {
     }
     h += '<div style="display:flex;align-items:center;gap:11px;padding:9px 0;' +
       'border-bottom:1px solid rgba(255,255,255,0.045)' +
-      ((r.used || r.started) ? ';opacity:0.32' : ';cursor:pointer') + '"' +
-      ((r.used || r.started) ? ''
-        : (' onclick="_svPick(\'' + skEscape(r.key) + '\')"')) + '>' +
+      (off ? ';opacity:0.32' : (hopeless ? ';opacity:0.5;cursor:pointer'
+                                        : ';cursor:pointer')) + '"' +
+      (off ? '' : (' onclick="_svPick(\'' + skEscape(r.key) + '\')"')) + '>' +
       '<div style="flex:1;min-width:0">' +
         '<div style="font-size:14.5px;font-weight:600;line-height:1.2">' +
           skEscape(r.name) + '</div>' +
@@ -192433,8 +192617,12 @@ function _svRender() {
           ? '<span style="font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.4);' +
             'border:1px solid rgba(255,255,255,0.12);border-radius:999px;padding:3px 8px;' +
             'font-weight:700">STARTED</span>'
-          : '<span style="font-size:9.5px;letter-spacing:0.1em;color:#111;background:#facc15;' +
-            'border-radius:999px;padding:5px 12px;font-weight:700">PICK</span>')) +
+          : (slim
+            ? '<span style="font-size:9.5px;letter-spacing:0.1em;' +
+              'color:rgba(255,255,255,0.55);border:1px solid rgba(255,255,255,0.22);' +
+              'border-radius:999px;padding:4px 11px;font-weight:700">PICK</span>'
+            : '<span style="font-size:9.5px;letter-spacing:0.1em;color:#111;background:#facc15;' +
+              'border-radius:999px;padding:5px 12px;font-weight:700">PICK</span>'))) +
       '</div>';
   }
   h += '<div class="rg-foot">' +
@@ -192464,9 +192652,8 @@ function _svYesterdayHtml() {
   return '<div class="rg-dark rg-bleed"><div class="rg-sect">Last night ' +
     '<span style="opacity:0.6">' + skEscape(N.date) + '</span></div>' +
     '<div class="rg-foot" style="color:' + (won ? '#4ade80' : '#f87171') + '">' +
-      skEscape(N.me.name) + ' \u2014 ' + (N.dnp ? 'did not dress'
-        : (N.got + ' ' + (N.me.bar.stat === 'g' ? 'goals' : 'points') +
-           ((N.me.bar.alt && N.altGot != null) ? (', ' + N.altGot + ' shots') : ''))) +
+      skEscape(N.me.name) + ' \u2014 ' +
+      (N.dnp ? 'did not dress' : (N.got + ' ' + skEscape(N.me.bar.noun))) +
       ', needed ' +
       skEscape(N.me.bar.short) + '. ' + (won ? 'Survived.' : 'Run ended.') +
     '</div></div>';
