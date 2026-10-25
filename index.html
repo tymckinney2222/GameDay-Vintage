@@ -190886,8 +190886,10 @@ function _auctBoardHtml(b) {
     (b.hurt ? (b.hurt + ' not dressing \u00b7 ') : '') +
     b.priced + ' priced \u00b7 ' + (b.eligible || b.priced) +
     ' in range \u00b7 ' + (b.lot || b.rows.length) + ' drawn' +
-    (b.cats.length ? (' \u00b7 scoring: ' + skEscape(b.cats.slice(0, 14).join(' ')) ) : '') +
-    (b.missed.length ? (' \u00b7 unmapped: ' + skEscape(b.missed.slice(0, 8).join(' '))) : '') +
+    // A board is always built by _auctBuildBoard and always carries
+    // these, but it costs two characters to not depend on that.
+    (((b.cats || []).length) ? (' \u00b7 scoring: ' + skEscape(b.cats.slice(0, 14).join(' ')) ) : '') +
+    (((b.missed || []).length) ? (' \u00b7 unmapped: ' + skEscape(b.missed.slice(0, 8).join(' '))) : '') +
     '</div>';
   // AUCTNIGHT -- name the slots that came back empty and why. A board
   // with no goalies on it looks broken; a board that says the league
@@ -190959,6 +190961,8 @@ function _auctBoardHtml(b) {
       // decision. Hiding him would hide the game.
       var mine = _auctHas(_auctState.lineup, r.id);
       var why = _auctState.locked ? 'locked' : _auctWhyNot(_auctState.lineup, r);
+      _auctState.seatHint = (!mine && !why)
+        ? _auctSeatFor(_auctState.lineup, r) : '';
       var dim = (!mine && why);
       body += '<tr onclick="_auctTap(\'' + skEscape(String(r.id)) + '\')"' +
         ' style="cursor:pointer' +
@@ -190974,7 +190978,14 @@ function _auctBoardHtml(b) {
           // header, once. "not enough left" is the budget binding on
           // this particular man, which is the decision itself.
           ((dim && why === 'not enough left')
-            ? (' \u00b7 ' + skEscape(why)) : '') + '</div></td>' +
+            ? (' \u00b7 ' + skEscape(why)) : '') +
+          // AUCTUTIL -- where he would actually sit, when it is not his
+          // own position. The question "how do I fill utility" is
+          // answered on the row he is about to tap.
+          ((!mine && !why && _auctState.seatHint && _auctState.seatHint !== r.slot)
+            ? ('<span style="color:#facc15"> \u00b7 \u2192 ' +
+               skEscape(_auctState.seatHint) + '</span>') : '') +
+          '</div></td>' +
         '<td>' + skEscape(Number(r.fp).toFixed(1)) + '</td>' +
         '<td class="rg-best">$' + _auctPriceOf(r) + '</td>' +
       '</tr>';
@@ -190987,7 +190998,8 @@ function _auctBoardHtml(b) {
     var _full = _auctSlotUsed(_auctState.lineup, sl.k) >= sl.n;
     h += '<div class="rg-sect">' + skEscape(sl.label) +
       ' <span style="opacity:0.6">' +
-      (_full ? ('\u2713 filled \u00b7 tap to change')
+      (_full ? ('\u2713 filled \u00b7 tap to change' +
+                (_auctFlexOpen() ? (' \u00b7 or \u2192 ' + _auctFlexOpen()) : ''))
              : ('pick ' + sl.n + ' of ' + list.length +
                 ((list.length < nAll) ? (' shown, ' + nAll + ' playing') : ''))) +
       '</span></div>' +
@@ -191063,6 +191075,45 @@ function _auctSetPrice(p) {
   _auctRender();
 }
 
+// AUCTUTIL -- which seats are still empty, in roster order.
+// The flexible seat, if one is still empty. Named so a filled section
+// can point at it instead of presenting itself as a closed door.
+function _auctFlexOpen() {
+  if (_auctState.locked) { return ''; }
+  var sl = _auctSlots(), i;
+  for (i = 0; i < sl.length; i++) {
+    if (sl[i].any && _auctSlotUsed(_auctState.lineup, sl[i].k) < sl[i].n) {
+      return sl[i].k;
+    }
+  }
+  return '';
+}
+
+function _auctOpenSeats(rows) {
+  var sl = _auctSlots(), out = [], i, j, used;
+  for (i = 0; i < sl.length; i++) {
+    used = _auctSlotUsed(rows, sl[i].k);
+    for (j = used; j < sl[i].n; j++) { out.push(sl[i].k); }
+  }
+  return out;
+}
+
+// Can anything on the board actually be taken right now? With a dollar
+// left and a board of fives, the honest answer is no, and saying so
+// beats leaving him to scroll.
+function _auctAnyAffordable(board, rows) {
+  var r = (board && board.rows) || [], i;
+  for (i = 0; i < r.length; i++) {
+    // A man ALREADY PICKED has no reason against him -- tapping him
+    // takes him off. Counting him as something that fits would mean
+    // this could never report "nothing fits" once anyone was chosen,
+    // which is exactly when the question gets asked.
+    if (_auctHas(rows, r[i].id)) { continue; }
+    if (!_auctWhyNot(rows, r[i])) { return true; }
+  }
+  return false;
+}
+
 function _auctHas(rows, id) {
   var i;
   for (i = 0; i < rows.length; i++) { if (rows[i].id === id) { return true; } }
@@ -191125,7 +191176,7 @@ function _auctBarHtml() {
         'font-weight:700;cursor:pointer;' +
         (full ? 'background:#facc15;color:#111' :
                 'background:rgba(255,255,255,0.08);color:rgba(255,255,255,0.35)') +
-        '">' + (full ? 'Lock it in' : 'Pick ' + (seats - n) + ' more') + '</button>' +
+        '">' + (full ? 'Lock it in' : _auctPickLabel()) + '</button>' +
       (n ? ('<button onclick="_auctClear()" style="padding:9px 14px;border-radius:8px;' +
         'border:1px solid rgba(255,255,255,0.14);background:transparent;' +
         'color:rgba(255,255,255,0.6);font-size:13px;cursor:pointer">Clear</button>') : '') +
@@ -191134,6 +191185,31 @@ function _auctBarHtml() {
   // AUCTGRID -- a card migrated from the old format carries TONIGHT'S
   // tiers, not the ones he paid. Say so rather than presenting them as
   // his.
+  // AUCTUTIL -- what UTIL is, said once, where the decision is made.
+  if (!_auctState.locked) {
+    var _os = _auctOpenSeats(_auctState.lineup), _hasU = false, _oi;
+    for (_oi = 0; _oi < _os.length; _oi++) {
+      var _sl2 = _auctSlots(), _sj;
+      for (_sj = 0; _sj < _sl2.length; _sj++) {
+        if (_sl2[_sj].k === _os[_oi] && _sl2[_sj].any) { _hasU = true; }
+      }
+    }
+    if (_hasU) {
+      h += '<div class="rg-foot" style="margin:6px 0 0">' + _os[_os.length - 1] +
+        ' takes any position \u2014 tap anyone on the board and he sits there.</div>';
+    }
+    // And when nothing on the board can actually be taken, say so and
+    // put the filter one tap away rather than leaving him to scroll.
+    if (n < seats && _auctState.board &&
+        !_auctAnyAffordable(_auctState.board, _auctState.lineup)) {
+      h += '<div class="rg-foot" style="color:#f59e0b;margin:6px 0 0">' +
+        'Nothing on the board fits $' + _auctMaxAfford(_auctState.lineup) +
+        '. <button onclick="_auctSetPrice(1)" style="background:none;' +
+        'border:0;color:#facc15;font:inherit;text-decoration:underline;' +
+        'cursor:pointer;padding:0">Show the $1 men</button>, or clear and ' +
+        'spend it differently.</div>';
+    }
+  }
   if (_auctState.locked && _auctState.recomputed) {
     h += '<div class="rg-foot" style="margin:6px 0 0">These prices were ' +
       'recomputed when the board opened up to every man playing, so they ' +
@@ -191231,6 +191307,17 @@ function _auctGridFor(rows, box, leagueKey) {
   return h;
 }
 
+// AUCTUTIL -- "Pick 1 more" never said WHICH, and the seat that takes
+// anybody is the one you cannot find by looking for a section named
+// after it.
+function _auctPickLabel() {
+  var open = _auctOpenSeats(_auctState.lineup);
+  if (!open.length) { return 'Lock it in'; }
+  if (open.length === 1) { return 'Pick your ' + open[0]; }
+  if (open.length === 2) { return 'Pick a ' + open[0] + ' and a ' + open[1]; }
+  return 'Pick ' + open.length + ' more: ' + open.join(' ');
+}
+
 // Both sides, once the card is locked.
 function _auctCardHtml() {
   if (!_auctState.locked) { return ''; }
@@ -191245,8 +191332,14 @@ function _auctCardHtml() {
     for (i = 0; i < rows.length; i++) {
       var a = live ? _auctActualFor(rows[i], live, sc) : null;
       h += '<tr><td class="rg-p"><div class="rg-nm">' + skEscape(rows[i].name) +
-        '</div><div class="rg-sub">' + skEscape(rows[i].slot) + ' \u00b7 ' +
-        skEscape(rows[i].team) + '</div></td>' +
+        // AUCTUTIL -- the SEAT, with his own position beside it when they
+        // differ. A lineup holding two centres is not a mistake, it is a
+        // centre at utility, and the card should say which.
+        '</div><div class="rg-sub">' +
+        skEscape((rows[i].seat && rows[i].seat !== rows[i].slot)
+          ? (rows[i].seat + ' (' + rows[i].slot + ')')
+          : (rows[i].seat || rows[i].slot)) +
+        ' \u00b7 ' + skEscape(rows[i].team) + '</div></td>' +
         '<td>' + Number(rows[i].fp).toFixed(1) + '</td>' +
         // AUCTLIVE -- an em dash means NOT YET, and that is different
         // from a nought. A man who has not taken the ice reading 0.0
