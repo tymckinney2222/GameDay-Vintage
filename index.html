@@ -204344,7 +204344,7 @@ function _fyBatchSplit(data, suffix) {
 // Fetch one kind of thing for many leagues. A failure here is not an
 // error anybody needs to hear about: the callers simply go on to ask one
 // at a time, exactly as they did before this existed.
-async function _fyBatchPrefill(keys, suffix) {
+async function _fyBatchPrefill(keys, suffix, alsoSuffix) {
   if (!keys || !keys.length) { return 0; }
   var chunks = [], i;
   for (i = 0; i < keys.length; i += FY_BATCH_MAX) {
@@ -204361,6 +204361,16 @@ async function _fyBatchPrefill(keys, suffix) {
         got = _fyBatchSplit(res, suffix);
         filled += got;
         _fyBatchKind(suffix, got);   // TEAMCOALESCE
+        // SCOREBATCH2 -- the same reply, under the other key. _fyBatchSplit
+        // takes the suffix up to the semicolon and pulls that node out, so
+        // 'scoreboard;out=matchups' and 'scoreboard' extract the identical
+        // part; out=matchups is simply a superset of it. Asking twice
+        // bought a cache key and nothing else, for eight seconds and a
+        // second multi-megabyte download on a phone.
+        if (alsoSuffix) {
+          var _got2 = _fyBatchSplit(res, alsoSuffix);
+          if (_got2) { filled += _got2; _fyBatchKind(alsoSuffix, _got2); }
+        }
       }
       _fyBatchNote(suffix, _bp, res, got);   // BULKDIAG
     } catch (e) {}
@@ -204561,12 +204571,17 @@ async function _fyBatchWarm(leagues) {
     // because the app asks for it both ways and the cache key has to match
     // the caller exactly. Order between them never mattered: none of the
     // five reads what another one writes.
+    // Longest first, so the slow one starts in the first round instead of
+    // waiting for a lane to free up. The order is from his own clock --
+    // matchups 8.2s, standings 3.6s, rosters 2.1s, settings 1.6s -- and it
+    // is a heuristic, not a rule: being wrong about it costs the
+    // difference between two orderings of the same work.
     var tasks = [
+      { n: 'scoreboard', f: function () {
+          return _fyBatchPrefill(keys, 'scoreboard;out=matchups', 'scoreboard'); } },
       { n: 'standings',  f: function () { return _fyBatchPrefill(keys, 'standings'); } },
-      { n: 'settings',   f: function () { return _fyBatchPrefill(keys, 'settings'); } },
       { n: 'rosters',    f: function () { return _fyBatchRosters(leagues); } },
-      { n: 'matchups',   f: function () { return _fyBatchPrefill(keys, 'scoreboard;out=matchups'); } },
-      { n: 'scoreboard', f: function () { return _fyBatchPrefill(keys, 'scoreboard'); } }
+      { n: 'settings',   f: function () { return _fyBatchPrefill(keys, 'settings'); } }
     ];
     var total = 0, _qi = 0;
     async function _warmLane() {
@@ -204994,11 +205009,6 @@ async function fyAutoLoadAllRosters() {
       // LANECOUNT -- asked BEFORE the call, because afterwards a hit and a
       // miss look identical from here.
       var _rPath = '/league/' + lg.league_key + '/teams;is_owned_by_current_login=1/roster';
-      try {
-        var _rc = (typeof fyDataCache === 'object' && fyDataCache) ? fyDataCache[_rPath] : null;
-        if (_rc && _rc.d && _rc.t > Date.now() - (_rc.ttl || 60000)) { _fyLaneHit++; }
-        else { _fyLaneMiss++; }
-      } catch (eLC) {}
       var data = await fyApi(_rPath);
       if (!data) return;
       var teamsData = data.fantasy_content.league[1].teams;
@@ -205125,11 +205135,32 @@ async function fyAutoLoadAllRosters() {
   // together (the 57-error "Failed to fetch" storm in API health).
   // Same total work, gentler burst — nothing to throttle.
   var _rosterQueue = leaguesToLoad.slice();
+  var _laneWorkMs = 0;
+  // LANECOUNT -- a pure question with a local answer. The first version
+  // parked it on the function object, which three lanes then read back
+  // across an await: the same bug as the accumulator in the warm.
+  function _rosterCached(lg) {
+    try {
+      var p = '/league/' + lg.league_key + '/teams;is_owned_by_current_login=1/roster';
+      var e = (typeof fyDataCache === 'object' && fyDataCache) ? fyDataCache[p] : null;
+      return !!(e && e.d && e.t > Date.now() - (e.ttl || 60000));
+    } catch (er) { return false; }
+  }
   async function _rosterLane() {
     while (_rosterQueue.length) {
       var lg = _rosterQueue.shift();
+      var _lw0 = Date.now();
+      var _hit = _rosterCached(lg);
+      if (_hit) { _fyLaneHit++; } else { _fyLaneMiss++; }
       await _loadOneRoster(lg);
-      if (_rosterQueue.length) {
+      _laneWorkMs += (Date.now() - _lw0);
+      // LANESLEEP -- the 120ms is here to space out NETWORK calls, which
+      // is the whole point of a paced pump. When the answer came from the
+      // cache the warm just filled there is no call to space, and this
+      // setTimeout is not a 120ms wait on a busy event loop -- it is
+      // 120ms and then its turn behind everything the hydrate is doing.
+      // Thirty-nine of those, for nothing.
+      if (!_hit && _rosterQueue.length) {
         await new Promise(function(resolve) { setTimeout(resolve, 120); });
       }
     }
@@ -205137,8 +205168,11 @@ async function fyAutoLoadAllRosters() {
   var _lanes = [];
   for (var _ln = 0; _ln < 3 && _ln < leaguesToLoad.length; _ln++) _lanes.push(_rosterLane());
   await Promise.all(_lanes);
+  // Working time against the wall time the clock already shows: close
+  // together means the work is real, far apart means it was waiting.
   _skBootMark('rosters parsed', leaguesToLoad.length + ' leagues \u00b7 ' +
-    _fyLaneHit + ' cached, ' + _fyLaneMiss + ' fetched');
+    _fyLaneHit + ' cached, ' + _fyLaneMiss + ' fetched \u00b7 ' +
+    _laneWorkMs + 'ms working');
 
   // Write cache once after all fetches complete — no race condition
   fyRosterCache = allPlayers;
