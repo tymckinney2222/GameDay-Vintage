@@ -133222,7 +133222,14 @@ function _skRotoLedgerView(league) {
   if (!league) { return null; }
   try {
     if (league.provider === 'espn') {
-      return (typeof _espRotoLiveView === 'function') ? _espRotoLiveView(league) : null;
+      // ROTOWIRE2 -- the ROW, not the adapted league. _espRotoLiveView
+      // reads row.key, row.raw and row.rosters; the Wire's league object
+      // carries none of them and holds the row under _esp. Handing it
+      // the wrong object returned null every time, and the sheet said
+      // "building" -- an honest message about a bug, which is the worst
+      // kind to debug from.
+      var _r = league._esp || league;
+      return (typeof _espRotoLiveView === 'function') ? _espRotoLiveView(_r) : null;
     }
     var data = (typeof skLeagueData === 'object' && skLeagueData)
       ? skLeagueData[league.league_key] : null;
@@ -133315,6 +133322,87 @@ function _skRotoGapHtml(lv) {
   return '<div class="rg-wrap"><table class="rg">' + head + body + '</table></div>';
 }
 
+// \u2500\u2500 ROTOWIRE2 \u2500\u2500 Who actually took points off you, and who you took
+// them from.
+//
+// Roto is a race against the field, not one opponent: a point leaves you
+// when a team BEHIND you climbs over you in a category, whatever your own
+// roster did that night. No H2H card can show that, and it is the thing
+// about roto that most often reads as "my total dropped and I don't know
+// why".
+//
+// Built from _skRotoCrossings, the same rule the ledger and the Pressure
+// tab's day-move table use. Deriving it a second way would let two
+// surfaces disagree about who passed you.
+function _skRotoRivals(lv) {
+  if (!lv || !lv.myKey || !lv.order || !lv.seasonCat) { return null; }
+  var at = (lv.data && lv.data.allTeams) || {};
+  var sc = lv.seasonCat;
+  if (!sc[lv.myKey] || !at[lv.myKey]) { return null; }
+  var by = {}, i, j;
+  function slot(k) {
+    if (!by[k]) {
+      by[k] = { key: k, name: (at[k] && at[k].name) || k, took: [], gave: [] };
+    }
+    return by[k];
+  }
+  for (i = 0; i < lv.order.length; i++) {
+    var id = String(lv.order[i]);
+    var m = (lv.statsMeta || {})[id] || {};
+    if (m.isOnlyDisplayStat || m.enabled === false) { continue; }
+    var lab = m.abbr || m.displayName || ('#' + id);
+    var X = _skRotoCrossings(sc, at, lv.myKey, id);
+    for (j = 0; j < X.passedByK.length; j++) { slot(X.passedByK[j]).took.push(lab); }
+    for (j = 0; j < X.passedK.length; j++) { slot(X.passedK[j]).gave.push(lab); }
+  }
+  var rows = [], k;
+  for (k in by) {
+    if (!by.hasOwnProperty(k)) { continue; }
+    var r = by[k];
+    if (!r.took.length && !r.gave.length) { continue; }
+    r.net = r.gave.length - r.took.length;
+    rows.push(r);
+  }
+  if (!rows.length) { return null; }
+  // The ones who cost you most, first. A team you are level with on the
+  // night is not news.
+  rows.sort(function (a, b) {
+    return (a.net - b.net) || (b.took.length - a.took.length) ||
+           String(a.name).localeCompare(String(b.name));
+  });
+  return rows;
+}
+
+function _skRotoRivalsHtml(lv) {
+  var rows = null;
+  try { rows = _skRotoRivals(lv); } catch (e) { return ''; }
+  if (!rows) { return ''; }
+  var head = '<tr><th class="rg-p">Team</th><th>Took</th><th>Gave</th><th>Net</th></tr>';
+  var body = '', i;
+  for (i = 0; i < rows.length; i++) {
+    var r = rows[i];
+    var netTxt = (r.net > 0 ? '+' : '') + r.net;
+    var netCls = r.net > 0 ? 'rg-best' : (r.net < 0 ? 'rg-neg' : 'rg-z');
+    body += '<tr>' +
+      '<td class="rg-p"><div class="rg-nm">' + skEscape(r.name) + '</div>' +
+        '<div class="rg-sub">' +
+        skEscape(r.took.length ? ('past you in ' + r.took.join(', ')) :
+                 ('you passed them in ' + r.gave.join(', '))) + '</div></td>' +
+      '<td class="' + (r.took.length ? 'rg-neg' : 'rg-z') + '">' +
+        (r.took.length || '\u2014') + '</td>' +
+      '<td class="' + (r.gave.length ? 'rg-best' : 'rg-z') + '">' +
+        (r.gave.length || '\u2014') + '</td>' +
+      '<td class="' + netCls + '">' + netTxt + '</td>' +
+    '</tr>';
+  }
+  return '<div class="sk-wire-sheet-section"><span class="ic">\u2694\ufe0f</span>' +
+    'Who moved past you</div>' +
+    '<div class="rg-dark rg-bleed"><div class="rg-wrap"><table class="rg">' +
+    head + body + '</table></div>' +
+    '<div class="rg-foot">Today \u00b7 a point leaves you when a team behind ' +
+    'climbs over you in a category</div></div>';
+}
+
 // ROTOWIRE -- the sheet body for a roto league.
 function skBuildWireDetailRoto(entry) {
   var league = entry && entry.league;
@@ -133353,8 +133441,104 @@ function skBuildWireDetailRoto(entry) {
     ? ('<div class="rg-foot">Today \u00b7 gold is a category lead \u00b7 ' +
        '\u201cto next\u201d is the distance to the place above</div>')
     : '';
+  var rivals = '';
+  try { rivals = _skRotoRivalsHtml(lv) || ''; } catch (eR) { rivals = ''; }
   return head + ledger +
-    (gaps ? ('<div class="rg-dark rg-bleed">' + gaps + foot + '</div>') : '');
+    (gaps ? ('<div class="rg-dark rg-bleed">' + gaps + foot + '</div>') : '') +
+    rivals;
+}
+
+// \u2500\u2500 SEASONSPREAD \u2500\u2500 The team above, me, the team below.
+//
+// A season-points league has no opponent, so the only question its card
+// raises is how close the places either side are. Read from whatever
+// standings the provider already published rather than derived here: a
+// total of my own arithmetic could disagree with the league page he can
+// go and look at, and on a ladder that is the one thing it must not do.
+function _skWireSeasonRows(entry) {
+  var out = [], i;
+  var league = entry && entry.league;
+  if (!league) { return out; }
+  try {
+    if (league.provider === 'espn') {
+      var row = league._esp;
+      var sa = (row && row.standingsAll) || [];
+      var mineIds = (row && row.myTeamIds) || {};
+      for (i = 0; i < sa.length; i++) {
+        var e = sa[i];
+        if (!e || e.pf == null) { continue; }
+        out.push({ key: String(e.teamId), name: e.teamName || String(e.teamId),
+                   rank: e.rank, pts: Number(e.pf),
+                   me: !!mineIds[String(e.teamId)] });
+      }
+    } else {
+      var ld = (typeof skLeagueData === 'object' && skLeagueData)
+        ? skLeagueData[league.league_key] : null;
+      var all = (ld && ld.allTeams) || {};
+      var myKey = (ld && ld.team && ld.team.team_key) || '';
+      var k;
+      for (k in all) {
+        if (!all.hasOwnProperty(k)) { continue; }
+        var t = all[k];
+        var pv = t && t.points_for;
+        if (pv == null || isNaN(Number(pv))) { continue; }
+        out.push({ key: k, name: (t && t.name) || k,
+                   rank: parseInt(t && t.rank, 10) || null,
+                   pts: Number(pv), me: (k === myKey) });
+      }
+    }
+  } catch (e) { return []; }
+  // Rank by the published points, so the order and the gaps come from one
+  // source. Where the provider published a rank it will agree.
+  out.sort(function (a, b) { return b.pts - a.pts; });
+  for (i = 0; i < out.length; i++) { out[i].place = i + 1; }
+  return out;
+}
+
+function skBuildWireSeasonSpread(entry) {
+  var rows = _skWireSeasonRows(entry);
+  if (rows.length < 2) { return ''; }
+  var mine = -1, i;
+  for (i = 0; i < rows.length; i++) { if (rows[i].me) { mine = i; break; } }
+  if (mine < 0) { return ''; }
+  var lo = Math.max(0, mine - 1), hi = Math.min(rows.length - 1, mine + 1);
+  var head = '<tr><th class="rg-p">Team</th><th>Pts</th><th>Gap</th></tr>';
+  var body = '';
+  for (i = lo; i <= hi; i++) {
+    var r = rows[i];
+    var gap = (i === mine) ? null
+      : Math.round((rows[mine].pts - r.pts) * 10) / 10;
+    var gTxt = '\u2014', gCls = 'rg-z';
+    if (gap != null) {
+      // Signed from my side, so the colour reads the same way everywhere
+      // else in the app does: red is a deficit to the team above, gold is
+      // a cushion over the team below.
+      gTxt = (gap > 0 ? '+' : '') + gap.toFixed(1);
+      gCls = (gap > 0) ? 'rg-best' : 'rg-neg';
+    }
+    body += '<tr>' +
+      '<td class="rg-p"><div class="rg-nm">' +
+        (r.me ? '<b>' + skEscape(r.name) + '</b>' : skEscape(r.name)) + '</div>' +
+        '<div class="rg-sub">' + skEscape(_skWireOrdinal(r.place)) + '</div></td>' +
+      '<td class="' + (r.me ? 'rg-best' : '') + '">' +
+        skEscape(Number(r.pts).toFixed(1)) + '</td>' +
+      '<td class="' + gCls + '">' + gTxt + '</td>' +
+    '</tr>';
+  }
+  var meRow = rows[mine];
+  var bits = [_skWireOrdinal(meRow.place) + ' of ' + rows.length];
+  if (mine > 0) {
+    bits.push((rows[mine - 1].pts - meRow.pts).toFixed(1) + ' behind');
+  }
+  if (mine < rows.length - 1) {
+    bits.push((meRow.pts - rows[mine + 1].pts).toFixed(1) + ' clear');
+  }
+  return '<div class="sk-wire-sheet-section"><span class="ic">\ud83d\udcd0</span>' +
+    'The spread<span class="meta">' + skEscape(bits.join(' \u00b7 ')) + '</span></div>' +
+    '<div class="rg-dark rg-bleed"><div class="rg-wrap"><table class="rg">' +
+    head + body + '</table></div>' +
+    '<div class="rg-foot">Season points as the league publishes them \u00b7 ' +
+    'gap is measured from you</div></div>';
 }
 
 function _skWireMoveForLeague(league) {
@@ -133955,6 +134139,11 @@ function skOpenWireDetail(leagueKey) {
       bodyHtml = skBuildWireDetailCats(entry);
     } else if (entry.scoringType === 'headpoint' || entry.scoringType === 'point') {
       bodyHtml = skBuildWireDetailPoints(entry);
+      // SEASONSPREAD -- a season-points league has no opponent, so the
+      // places either side of it are the only comparison it has.
+      if (entry.scoringType === 'point') {
+        try { bodyHtml += skBuildWireSeasonSpread(entry) || ''; } catch (eSS) {}
+      }
     } else {
       bodyHtml = '<div class="sk-wire-sheet-empty">Detail view not supported for this scoring type yet.</div>';
     }
