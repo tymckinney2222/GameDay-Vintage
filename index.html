@@ -190845,7 +190845,8 @@ function _auctBoardHtml(b) {
   var diag = '<div class="rg-foot">' +
     b.pool + ' in pool \u00b7 ' + b.onSlate + ' on tonight\u2019s slate \u00b7 ' +
     (b.hurt ? (b.hurt + ' not dressing \u00b7 ') : '') +
-    b.priced + ' priced \u00b7 ' + (b.lot || b.rows.length) + ' drawn' +
+    b.priced + ' priced \u00b7 ' + (b.eligible || b.priced) +
+    ' in range \u00b7 ' + (b.lot || b.rows.length) + ' drawn' +
     (b.cats.length ? (' \u00b7 scoring: ' + skEscape(b.cats.slice(0, 14).join(' ')) ) : '') +
     (b.missed.length ? (' \u00b7 unmapped: ' + skEscape(b.missed.slice(0, 8).join(' '))) : '') +
     '</div>';
@@ -191002,36 +191003,119 @@ function _auctBarHtml() {
   return h + '</div>';
 }
 
+// AUCTLIVE -- a side's running total, and how much of it is real.
+function _auctSideTotals(rows) {
+  var o = { proj: 0, act: 0, played: 0, waiting: 0 }, i;
+  var sc = _auctScoring(_auctState.leagueKey);
+  for (i = 0; i < rows.length; i++) {
+    o.proj += Number(rows[i].fp) || 0;
+    var a = _auctActualFor(rows[i], _auctState.live, sc);
+    if (a) { o.act += a.fp; o.played++; } else { o.waiting++; }
+  }
+  return o;
+}
+
 // Both sides, once the card is locked.
 function _auctCardHtml() {
   if (!_auctState.locked) { return ''; }
   var st = _auctStratOf(_auctState.strategy);
-  function side(title, rows, sub) {
-    var t = 0, i, h = '';
+  var live = _auctState.live;
+  var sc = _auctScoring(_auctState.leagueKey);
+  var mine = _auctSideTotals(_auctState.lineup);
+  var hers = _auctSideTotals(_auctState.house);
+
+  function side(title, rows, sub, tot) {
+    var i, h = '';
     for (i = 0; i < rows.length; i++) {
-      t += Number(rows[i].fp) || 0;
+      var a = live ? _auctActualFor(rows[i], live, sc) : null;
       h += '<tr><td class="rg-p"><div class="rg-nm">' + skEscape(rows[i].name) +
         '</div><div class="rg-sub">' + skEscape(rows[i].slot) + ' \u00b7 ' +
         skEscape(rows[i].team) + '</div></td>' +
         '<td>' + Number(rows[i].fp).toFixed(1) + '</td>' +
-        '<td class="rg-best">$' + rows[i].price + '</td></tr>';
+        // AUCTLIVE -- an em dash means NOT YET, and that is different
+        // from a nought. A man who has not taken the ice reading 0.0
+        // would make a side look beaten when it is only waiting.
+        '<td class="' + (a ? 'rg-best' : 'rg-z') + '">' +
+          (a ? Number(a.fp).toFixed(1) : '\u2014') + '</td>' +
+        '<td class="rg-z">$' + rows[i].price + '</td></tr>';
     }
     return '<div class="rg-sect">' + skEscape(title) +
-      ' <span style="opacity:0.6">$' + _auctSumPrice(rows) + ' \u00b7 proj ' +
-      t.toFixed(1) + '</span></div>' +
+      ' <span style="opacity:0.6">$' + _auctSumPrice(rows) +
+      (live ? (' \u00b7 ' + tot.act.toFixed(1) + ' so far')
+            : (' \u00b7 proj ' + tot.proj.toFixed(1))) + '</span></div>' +
       (sub ? ('<div class="rg-foot" style="margin:0 0 4px">' + skEscape(sub) + '</div>') : '') +
       '<div class="rg-wrap"><table class="rg">' +
-      '<tr><th class="rg-p">' + skEscape(title) + '</th><th>Proj</th><th>$</th></tr>' +
-      h + '</table></div>';
+      '<tr><th class="rg-p">' + skEscape(title) + '</th><th>Proj</th>' +
+      '<th>Tonight</th><th>$</th></tr>' + h + '</table></div>';
   }
-  // AUCTPLAY -- projections are not the result. Saying so here stops the
-  // card reading as a verdict when the night has not been played yet.
-  return '<div class="rg-dark rg-bleed">' +
-    side('Your six', _auctState.lineup, '') +
-    side('The house \u2014 ' + st.label, _auctState.house, st.note) +
-    '<div class="rg-foot">Locked for tonight. These are projections, not ' +
-    'the result \u2014 the night is settled off the box scores.</div>' +
+
+  var head = '';
+  if (live) {
+    var lead = mine.act - hers.act;
+    var word = (Math.abs(lead) < 0.05) ? 'Level'
+      : (lead > 0 ? ('You lead by ' + lead.toFixed(1))
+                  : ('The house leads by ' + (-lead).toFixed(1)));
+    head = '<div style="display:flex;align-items:baseline;gap:8px;' +
+      'padding:10px 0 4px">' +
+      '<span style="font:700 22px Georgia,serif;color:#facc15">' +
+        mine.act.toFixed(1) + '</span>' +
+      '<span style="color:rgba(255,255,255,0.35);font-size:12px">vs</span>' +
+      '<span style="font:700 22px Georgia,serif;color:#fff">' +
+        hers.act.toFixed(1) + '</span>' +
+      '<span style="margin-left:auto;font-size:12px;color:' +
+        (lead > 0 ? '#4ade80' : (lead < 0 ? '#f87171' : 'rgba(255,255,255,0.5)')) +
+        '">' + skEscape(word) + '</span></div>' +
+      '<div class="rg-foot" style="margin:0 0 6px">' +
+        (mine.waiting + hers.waiting) + ' of 12 still to play \u00b7 ' +
+        (live.games || 0) + ' game' + ((live.games === 1) ? '' : 's') +
+        ' read \u00b7 updated ' + _auctAgo(_auctState.liveAt) +
+      '</div>';
+  }
+  var btn = '<div style="display:flex;gap:8px;margin:2px 0 8px">' +
+    '<button onclick="_auctRefreshLive(true)" style="flex:1;padding:8px;' +
+    'border-radius:8px;border:1px solid rgba(255,255,255,0.14);' +
+    'background:transparent;color:#facc15;font-size:12px;font-weight:700;' +
+    'cursor:pointer">' +
+    (_auctState.liveBusy ? 'Reading box scores\u2026' : 'Refresh now') +
+    '</button></div>';
+
+  return '<div class="rg-dark rg-bleed">' + head + btn +
+    side('Your six', _auctState.lineup, '', mine) +
+    side('The house \u2014 ' + st.label, _auctState.house, st.note, hers) +
+    (live ? _auctLiveDiagHtml(live)
+          : '<div class="rg-foot">Locked for tonight. Tonight\u2019s column ' +
+            'fills in as the games are played \u2014 tap Refresh now, or ' +
+            'leave this open and it updates itself.</div>') +
     '</div>';
+}
+
+function _auctAgo(ts) {
+  if (!ts) { return 'never'; }
+  var s2 = Math.max(0, Math.round((Date.now() - ts) / 1000));
+  if (s2 < 60) { return s2 + 's ago'; }
+  return Math.round(s2 / 60) + 'm ago';
+}
+
+// AUCTLIVE -- WHAT THE PARSER SAW. The label spellings in an NHL box
+// score could not be checked against a live payload from here, so this
+// prints every label the response carried and every one that could not
+// be placed. An unmapped label is a category somebody is being scored
+// short, and naming it is the difference between a bug found in one
+// night and a bug found never.
+function _auctLiveDiagHtml(live) {
+  var un = [], k, seen = 0;
+  for (k in live.labels) { if (live.labels.hasOwnProperty(k)) { seen++; } }
+  for (k in live.unmapped) { if (live.unmapped.hasOwnProperty(k)) { un.push(k); } }
+  var h = '<div class="rg-foot">Scored off ESPN box scores \u00b7 ' +
+    seen + ' labels read \u00b7 goalie wins are derived from the result, ' +
+    'not a box score column.</div>';
+  if (un.length) {
+    h += '<div class="rg-foot" style="color:#f59e0b">Unmapped: ' +
+      skEscape(un.sort().join(' ')) + ' \u2014 if your league scores any ' +
+      'of those, nobody is getting credit for them. Tell me and it is a ' +
+      'one-line fix.</div>';
+  }
+  return h;
 }
 
 function _auctRender() {
@@ -191084,6 +191168,7 @@ function _auctPick(key) {
       // AUCTPLAY -- after the board, never before: the saved card is a
       // list of ids and they have to be looked up in tonight's rows.
       _auctLoad();
+      if (_auctState.locked) { _auctRefreshLive(false); _auctStartClock(); }
     } catch (e) {
       _auctState.note = 'Board failed: ' + String((e && e.message) || e);
     }
@@ -191102,10 +191187,14 @@ function openAuctionNight() {
   if (!_auctState.leagueKey && lgs.length) { _auctState.leagueKey = lgs[0].league_key; }
   _auctRender();
   if (_auctState.leagueKey && !_auctState.board) { _auctPick(_auctState.leagueKey); }
+  if (_auctState.locked) { _auctRefreshLive(false); _auctStartClock(); }
 }
 function closeAuctionNight() {
   var ov = document.getElementById('skAuctOverlay');
   if (ov) { ov.classList.remove('open'); }
+  // AUCTLIVE -- the clock stops with the overlay. Polling ESPN once a
+  // minute behind a closed screen is spending requests on nobody.
+  _auctStopClock();
 }
 
 function dbpGameFor(sport) {
@@ -191415,7 +191504,19 @@ var AUCT_TEAMS = 2;          // him and the house
 // three got bought, so the only choice was which of two near-identical
 // men to overpay for. A light night draws whatever it can and the board
 // says so rather than pretending.
-var AUCT_LOT_N = 10;
+var AUCT_LOT_N = 15;
+// AUCTLIVE -- a club's real depth at each slot. Three scoring lines
+// means about three centres and three of each wing worth drafting;
+// three pairs is six defencemen; a keeper and his backup. The eligible
+// pool is capped at this times the number of clubs playing, and the lot
+// is drawn from THAT -- which is why no fourth-liner reaches the board.
+// Without the cap the bottom band reached into men nobody has heard of,
+// because the bottom band of an entire slate is exactly that.
+// G is ONE, not two. A club dresses a backup but starts a keeper, and a
+// backup both projects near nothing and is a name nobody knows -- the
+// exact complaint, in its worst form, since he would also be drafting a
+// man who will not take the ice. Twelve clubs is a twelve-goalie menu.
+var AUCT_TEAM_DEPTH = { C: 3, LW: 3, RW: 3, D: 6, G: 1 };
 // How sharply the draw favours the top of the slate. Each slot's list is
 // cut into bands at n*(i/want)^AUCT_LOT_CURVE and one man is taken from
 // each, so a curve of 1 is even bands and anything above it narrows the
@@ -191425,7 +191526,8 @@ var AUCT_LOT_N = 10;
 // gradient is the entire reason the dollars mean anything.
 var AUCT_LOT_CURVE = 1.6;
 var _auctState = { leagueKey: '', board: null, note: '',
-                   lineup: [], house: [], strategy: '', locked: false };
+                   lineup: [], house: [], strategy: '', locked: false,
+                   live: null, liveAt: 0, liveBusy: false, timer: null };
 
 // AUCTPLAY -- the four opponents. A single optimiser would build the
 // same side every night, and so would he off the same column, which is
@@ -191807,6 +191909,42 @@ function _auctTap(id) {
   _auctRender();
 }
 
+// AUCTLIVE -- pull the box scores and repaint.
+function _auctRefreshLive(force) {
+  if (!_auctState.locked || _auctState.liveBusy) { return; }
+  _auctState.liveBusy = true;
+  _auctRender();
+  _auctLiveFetch(!!force).then(function (box) {
+    _auctState.liveBusy = false;
+    if (box) { _auctState.live = box; _auctState.liveAt = Date.now(); }
+    _auctRender();
+  }, function () {
+    _auctState.liveBusy = false;
+    _auctRender();
+  });
+}
+
+// A minute is the right cadence: these are ESPN calls, one per game, and
+// a hockey box score does not change faster than a shift. The timer only
+// runs while the overlay is open -- a background poll would spend his
+// requests on a screen nobody is looking at.
+function _auctStartClock() {
+  _auctStopClock();
+  if (!_auctState.locked) { return; }
+  _auctState.timer = setInterval(function () {
+    var ov = document.getElementById('skAuctOverlay');
+    if (!ov || ov.className.indexOf('open') === -1) { _auctStopClock(); return; }
+    _auctRefreshLive(false);
+  }, 60000);
+}
+
+function _auctStopClock() {
+  if (_auctState.timer) {
+    try { clearInterval(_auctState.timer); } catch (e) {}
+    _auctState.timer = null;
+  }
+}
+
 function _auctClear() {
   if (_auctState.locked) { return; }
   _auctState.lineup = [];
@@ -191823,6 +191961,206 @@ function _auctLock() {
   _auctState.locked = true;
   _auctSave();
   _auctRender();
+  // Straight into the live read, so a card locked mid-evening shows what
+  // has already happened rather than a row of em dashes.
+  _auctRefreshLive(true);
+  _auctStartClock();
+}
+
+// \u2500\u2500 AUCTLIVE \u2500\u2500 tonight's actual line, out of the box score \u2500\u2500
+//
+// UNVERIFIED AGAINST A LIVE PAYLOAD. This sandbox cannot reach
+// site.api.espn.com, so these label spellings come from documentation
+// and from what _fbParse already assumes (G and A), not from a response.
+// Hence: map what is recognised, score what is mapped, and REPORT every
+// label seen and every one unplaced, on screen. The first real run says
+// exactly what to correct rather than quietly scoring a man short.
+var _AUCT_BOX_SKATER = {
+  'G': 'g', 'GOALS': 'g',
+  'A': 'a', 'AST': 'a', 'ASSISTS': 'a',
+  'P': 'pts', 'PTS': 'pts', 'POINTS': 'pts',
+  '+/-': 'plusminus', '+/': 'plusminus', 'PLUSMINUS': 'plusminus',
+  'S': 'sog', 'SOG': 'sog', 'SH': 'sog', 'SHOTS': 'sog',
+  'PIM': 'pim', 'PM': 'pim', 'PEN': 'pim',
+  'HIT': 'hit', 'HITS': 'hit', 'HT': 'hit',
+  'BS': 'blk', 'BLK': 'blk', 'BKS': 'blk', 'BLOCKS': 'blk',
+  'PPG': 'ppg', 'PPA': 'ppa', 'PPP': 'ppp',
+  'SHG': 'shg', 'SHA': 'sha', 'GWG': 'gwg',
+  'FW': 'fw', 'FO': 'fw', 'TOI': 'toi'
+};
+var _AUCT_BOX_GOALIE = {
+  'SA': 'sa', 'SHOTS AGAINST': 'sa',
+  'GA': 'ga', 'GOALS AGAINST': 'ga',
+  'SV': 'sv', 'SAVES': 'sv',
+  'SV%': 'svpct', 'SAVE%': 'svpct',
+  'SO': 'so', 'SHUTOUTS': 'so',
+  'TOI': 'toi', 'W': 'w', 'L': 'l'
+};
+
+function _auctBoxNum(v) {
+  if (v == null) { return 0; }
+  var t = String(v);
+  // "12:34" is ice time, not a count; "1-2" is a made-attempted pair.
+  if (t.indexOf(':') > -1) {
+    var mm = t.split(':');
+    return (Number(mm[0]) || 0) + ((Number(mm[1]) || 0) / 60);
+  }
+  var n = parseFloat(t.replace(/[^0-9.\-]/g, ''));
+  return isNaN(n) ? 0 : n;
+}
+
+function _auctNameKey(n) {
+  try {
+    if (typeof _pmNameKey === 'function') { return _pmNameKey(n); }
+  } catch (e) {}
+  return String(n || '').toLowerCase().replace(/[^a-z]/g, '');
+}
+
+// One game's summary -> { byId, byName, labels, unmapped }.
+function _auctParseBox(j, out) {
+  out = out || { byId: {}, byName: {}, labels: {}, unmapped: {} };
+  var blocks = ((j || {}).boxscore || {}).players || [];
+  var b, s2, a, L;
+  // Who won, for the derived goalie decision.
+  var comp = (((j || {}).header || {}).competitions || [])[0] || null;
+  var done = false, winAbbr = '';
+  try {
+    done = !!(comp && comp.status && comp.status.type && comp.status.type.completed);
+    var cs = (comp && comp.competitors) || [];
+    for (a = 0; a < cs.length; a++) {
+      if (cs[a].winner) { winAbbr = String((cs[a].team || {}).abbreviation || '').toUpperCase(); }
+    }
+  } catch (eW) {}
+  for (b = 0; b < blocks.length; b++) {
+    var blk = blocks[b] || {};
+    var tAb = String(((blk.team || {}).abbreviation) || '').toUpperCase();
+    var grps = blk.statistics || [];
+    for (s2 = 0; s2 < grps.length; s2++) {
+      var grp = grps[s2] || {};
+      var ty = String(grp.type || grp.name || '').toLowerCase();
+      var isG = (ty.indexOf('goalie') > -1 || ty.indexOf('goaltend') > -1);
+      var map = isG ? _AUCT_BOX_GOALIE : _AUCT_BOX_SKATER;
+      var labs = grp.labels || [];
+      var ath = grp.athletes || [];
+      for (L = 0; L < labs.length; L++) {
+        var up = String(labs[L]).toUpperCase();
+        out.labels[up] = 1;
+        if (!map[up]) { out.unmapped[up] = 1; }
+      }
+      for (a = 0; a < ath.length; a++) {
+        var row = ath[a] || {}, st = row.stats || [];
+        var line = { _g: isG, _team: tAb, _won: (done && tAb && tAb === winAbbr) };
+        for (L = 0; L < labs.length && L < st.length; L++) {
+          var k = map[String(labs[L]).toUpperCase()];
+          if (k) { line[k] = _auctBoxNum(st[L]); }
+        }
+        // A league that scores POINTS off a box score with no P column:
+        // goals plus assists is the definition, not an estimate.
+        if (!isG && line.pts == null && (line.g != null || line.a != null)) {
+          line.pts = (line.g || 0) + (line.a || 0);
+        }
+        var at = row.athlete || {};
+        var id = at.id != null ? String(at.id) : '';
+        var nm = at.displayName || at.shortName || at.fullName || '';
+        if (id) { out.byId[id] = line; }
+        if (nm) { out.byName[_auctNameKey(nm)] = line; }
+      }
+    }
+  }
+  return out;
+}
+
+// A GOALIE'S WIN IS DERIVED, never read: no box score column carries it.
+// Final, his club won, and he is the keeper with the most ice time on
+// that side. Marked so the diagnostic can say the figure is inferred.
+function _auctDeriveWins(box) {
+  var best = {}, k, ln;
+  for (k in box.byId) {
+    if (!box.byId.hasOwnProperty(k)) { continue; }
+    ln = box.byId[k];
+    if (!ln._g || !ln._won) { continue; }
+    var t = ln._team || '?';
+    if (!best[t] || (ln.toi || 0) > (best[t].toi || 0)) { best[t] = ln; }
+  }
+  for (k in best) {
+    if (best.hasOwnProperty(k) && best[k].w == null) {
+      best[k].w = 1;
+      best[k]._wDerived = true;
+    }
+  }
+}
+
+function _auctLineFp(line, scoring, isGoalie) {
+  if (!line) { return null; }
+  var map = isGoalie ? scoring.goalie : scoring.skater, k, tot = 0, any = false;
+  for (k in map) {
+    if (!map.hasOwnProperty(k)) { continue; }
+    var v = Number(line[k]);
+    if (isNaN(v)) { continue; }
+    tot += v * map[k];
+    any = true;
+  }
+  return any ? tot : 0;
+}
+
+// Tonight's games, each fetched once while live and no more once final.
+var _auctBoxCache = {};          // gameId -> { at, final, json }
+
+function _auctLiveFetch(force) {
+  var slate = null;
+  try { slate = (typeof _allInSlate === 'function') ? _allInSlate('nhl') : null; } catch (e) { slate = null; }
+  if (!slate || !slate.games) { return Promise.resolve(null); }
+  var ids = {}, k;
+  for (k in slate.byAbbr) {
+    if (!slate.byAbbr.hasOwnProperty(k)) { continue; }
+    var g = (slate.byAbbr[k] || {}).g;
+    if (g && g.id != null) { ids[String(g.id)] = 1; }
+  }
+  var list = [], id;
+  for (id in ids) { if (ids.hasOwnProperty(id)) { list.push(id); } }
+  var now = Date.now();
+  var jobs = [];
+  for (var i = 0; i < list.length; i++) {
+    (function (gid) {
+      var c = _auctBoxCache[gid];
+      // A final game never changes, so it is fetched once and kept.
+      if (c && c.final && !force) { jobs.push(Promise.resolve(c.json)); return; }
+      if (c && !force && (now - c.at) < 25000) { jobs.push(Promise.resolve(c.json)); return; }
+      jobs.push(fetch('https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/summary?event=' +
+        encodeURIComponent(gid)).then(function (r) {
+          return r.ok ? r.json() : null;
+        }).then(function (j) {
+          var fin = false;
+          try {
+            fin = !!(((((j || {}).header || {}).competitions || [])[0] || {})
+              .status || {}).type.completed;
+          } catch (eF) { fin = false; }
+          _auctBoxCache[gid] = { at: Date.now(), final: fin, json: j };
+          return j;
+        })['catch'](function () { return null; }));
+    })(list[i]);
+  }
+  return Promise.all(jobs).then(function (all) {
+    var box = { byId: {}, byName: {}, labels: {}, unmapped: {} }, n = 0;
+    for (var i2 = 0; i2 < all.length; i2++) {
+      if (all[i2]) { _auctParseBox(all[i2], box); n++; }
+    }
+    _auctDeriveWins(box);
+    box.games = n;
+    return box;
+  });
+}
+
+// A board row's actual line tonight, by id first and folded name second.
+// The pool's id and the box score's athlete id come from the same ESPN
+// universe and SHOULD match; the name is the key both sides always have,
+// which is the bargain _fbParse already makes.
+function _auctActualFor(row, box, scoring) {
+  if (!box) { return null; }
+  var ln = box.byId[String(row.id)];
+  if (!ln) { ln = box.byName[_auctNameKey(row.name)]; }
+  if (!ln) { return null; }
+  return { fp: _auctLineFp(ln, scoring, row.slot === 'G'), line: ln };
 }
 
 // Tonight's priced board, or a note saying which join came up empty.
@@ -191911,6 +192249,15 @@ function _auctBuildBoard(leagueKey, pool) {
     var sl2 = AUCT_SLOTS[si2];
     var cand = bySlot[sl2.k] || [];
     cand.sort(function (a, b) { return b.fp - a.fp; });
+    // AUCTLIVE -- cut to a club's real depth BEFORE drawing. Clubs, not
+    // players: six games is twelve clubs, so twelve times three is the
+    // thirty-six centres anyone would consider, and the fourth line
+    // never gets near the board.
+    var _clubs = Math.max(1, Math.round((slate.games || 1) * 2));
+    var _depth = AUCT_TEAM_DEPTH[sl2.k] || 3;
+    var _room = _clubs * _depth;
+    if (cand.length > _room) { cand = cand.slice(0, _room); }
+    out.eligible = (out.eligible || 0) + cand.length;
     // AUCTTEN -- ten where the night allows it, everything available
     // where it does not. Never fewer than the slot buys plus a spare,
     // so a thin position still has someone to fall back on if one is
