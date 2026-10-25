@@ -190844,7 +190844,8 @@ function _auctBoardHtml(b) {
   if (!b) { return ''; }
   var diag = '<div class="rg-foot">' +
     b.pool + ' in pool \u00b7 ' + b.onSlate + ' on tonight\u2019s slate \u00b7 ' +
-    b.priced + ' priced' +
+    (b.hurt ? (b.hurt + ' not dressing \u00b7 ') : '') +
+    b.priced + ' priced \u00b7 ' + (b.lot || b.rows.length) + ' drawn' +
     (b.cats.length ? (' \u00b7 scoring: ' + skEscape(b.cats.slice(0, 14).join(' ')) ) : '') +
     (b.missed.length ? (' \u00b7 unmapped: ' + skEscape(b.missed.slice(0, 8).join(' '))) : '') +
     '</div>';
@@ -190879,7 +190880,9 @@ function _auctBoardHtml(b) {
     var body = '';
     for (i = 0; i < list.length && i < 30; i++) {
       var r = list[i];
-      var vo = (r.vorp > 0) ? ('+' + (Math.round(r.vorp * 10) / 10)) : '\u2014';
+      // One decimal always: Math.round dropped the trailing zero, so a
+      // column of +5.1 / +3 / +2.5 did not line up as numbers.
+      var vo = (r.vorp > 0) ? ('+' + Number(r.vorp).toFixed(1)) : '\u2014';
       body += '<tr>' +
         '<td class="rg-p"><div class="rg-nm">' + skEscape(r.name) + '</div>' +
           '<div class="rg-sub">' + skEscape(r.team) +
@@ -190889,8 +190892,12 @@ function _auctBoardHtml(b) {
         '<td class="' + (r.price > 1 ? 'rg-best' : 'rg-z') + '">$' + r.price + '</td>' +
       '</tr>';
     }
+    // AUCTLOT -- say how many of these get bought, because the last man
+    // in each table is the one nobody takes and his price is the floor
+    // every other price on the board is measured from.
     h += '<div class="rg-sect">' + skEscape(sl.label) +
-      ' <span style="opacity:0.6">' + list.length + '</span></div>' +
+      ' <span style="opacity:0.6">' + (sl.n * AUCT_TEAMS) + ' of ' +
+      list.length + '</span></div>' +
       '<div class="rg-wrap"><table class="rg">' + head + body + '</table></div>';
   }
   return '<div class="rg-dark rg-bleed">' + h + diag + '</div>';
@@ -191278,8 +191285,70 @@ var AUCT_SLOTS = [
 ];
 var AUCT_BUDGET = 100;
 var AUCT_TEAMS = 2;          // him and the house
-var AUCT_DEPTH = 3;          // how far past the needed slots replacement sits
+// AUCTLOT -- one unsold man per slot. Twelve get bought, seventeen are
+// drawn, and the five left over ARE replacement. That is the whole
+// pricing model now: AUCT_DEPTH approximated a spare because the board
+// had none, and a board with a real one does not need the guess.
+var AUCT_LOT_SPARE = 1;
+// How sharply the draw favours the top of the slate. Each slot's list is
+// cut into bands at n*(i/want)^AUCT_LOT_CURVE and one man is taken from
+// each, so a curve of 1 is even thirds and anything above it narrows the
+// top band: at 2, the first of three bands is the top ninth. That keeps
+// a genuine star on the board most nights while the last band stays a
+// real drop-off, which is where the price gradient comes from.
+var AUCT_LOT_CURVE = 2;
 var _auctState = { leagueKey: '', board: null, note: '' };
+
+// AUCTLOT -- the same night draws the same lot.
+//
+// A board that reshuffled every time he opened the overlay would not be
+// an auction, it would be a slot machine: lose a bid, close, reopen,
+// draw again. Seeded from the date and the league, so it holds all
+// evening and is a different room tomorrow. FNV-1a into xorshift32 --
+// small, ES5, and no dependency on a Math.random anyone can reseed.
+function _auctRng(seedStr) {
+  var h = 2166136261, i;
+  seedStr = String(seedStr || '');
+  for (i = 0; i < seedStr.length; i++) {
+    h = (h ^ seedStr.charCodeAt(i)) >>> 0;
+    h = (h * 16777619) >>> 0;
+  }
+  if (!h) { h = 2463534242; }
+  return function () {
+    h = (h ^ (h << 13)) >>> 0;
+    h = (h ^ (h >>> 17)) >>> 0;
+    h = (h ^ (h << 5)) >>> 0;
+    return h / 4294967296;
+  };
+}
+
+// One man from each band of the slate, best first.
+//
+// Drawing the top `want` would put the spare a hair below the starters
+// and bring the flat board straight back; drawing uniformly at random
+// would leave most nights with no one worth paying for. Banding does
+// both jobs: the lot always spans the slate, and the man nobody buys is
+// always genuinely worse than the men who do.
+function _auctDrawLot(list, want, rnd) {
+  if (!list || list.length <= want) { return (list || []).slice(0); }
+  var n = list.length, out = [], used = {}, i;
+  for (i = 0; i < want; i++) {
+    var lo = Math.floor(n * Math.pow(i / want, AUCT_LOT_CURVE));
+    var hi = Math.floor(n * Math.pow((i + 1) / want, AUCT_LOT_CURVE));
+    if (hi <= lo) { hi = lo + 1; }
+    if (hi > n) { hi = n; }
+    var pick = lo + Math.floor(rnd() * (hi - lo));
+    if (pick >= n) { pick = n - 1; }
+    // A band can be one man wide at the top, so a collision walks
+    // forward rather than redrawing -- bounded, and never empty-handed.
+    var guard = 0;
+    while (used[pick] && guard < n) { pick = (pick + 1) % n; guard++; }
+    used[pick] = true;
+    out.push(list[pick]);
+  }
+  out.sort(function (a, b) { return b.fp - a.fp; });
+  return out;
+}
 
 // Which of our five slots a pool player can fill. ESPN's own position
 // string is the source; a player eligible at more than one is placed at
@@ -191388,23 +191457,19 @@ function _auctPrice(rows) {
     if (!bySlot[r.slot]) { bySlot[r.slot] = []; }
     bySlot[r.slot].push(r);
   }
-  var spots = 0, k;
-  for (i = 0; i < AUCT_SLOTS.length; i++) { spots += AUCT_SLOTS[i].n * AUCT_TEAMS; }
-  var pot = (AUCT_BUDGET * AUCT_TEAMS) - spots;      // a dollar each, minimum
-  // REPLACEMENT DEPTH. Strict replacement for a two-man league is the
-  // third best centre, which prices two players and leaves thirty-six at
-  // a dollar -- a cliff, not a market. Real auction values are built
-  // against a full field, so the line sits three deep per needed slot:
-  // the sixth centre, the twelfth defenceman. That gives the middle of
-  // the board a graded price, which is where the actual decisions are.
+  // AUCTLOT -- REPLACEMENT IS NOW A MAN ON THE BOARD, not a line drawn
+  // through a league. The lot holds one more than each slot buys, so the
+  // cheapest man at a position is precisely the one left over when the
+  // bidding stops: what he projects is what a dollar buys, and every
+  // dollar above that is paying for the difference. AUCT_DEPTH was an
+  // approximation of this against a board that had no spare on it.
   var surplus = 0, bought = 0;
   for (i = 0; i < AUCT_SLOTS.length; i++) {
     var sl = AUCT_SLOTS[i];
     var list = bySlot[sl.k] || [];
     list.sort(function (a, b) { return b.fp - a.fp; });
     var need = sl.n * AUCT_TEAMS;
-    var line = need * AUCT_DEPTH;
-    var repl = (list.length > line) ? list[line].fp
+    var repl = (list.length > need) ? list[need].fp
              : (list.length ? list[list.length - 1].fp : 0);
     for (var j = 0; j < list.length; j++) {
       list[j].repl = repl;
@@ -191429,8 +191494,8 @@ function _auctPrice(rows) {
 
 // Tonight's priced board, or a note saying which join came up empty.
 function _auctBuildBoard(leagueKey, pool) {
-  var out = { rows: [], note: '', pool: 0, onSlate: 0, priced: 0, cats: [],
-              missed: [], unpriced: {} };
+  var out = { rows: [], note: '', pool: 0, onSlate: 0, hurt: 0, priced: 0,
+              lot: 0, cats: [], missed: [], unpriced: {} };
   var scoring = _auctScoring(leagueKey);
   out.cats = scoring.read;
   out.missed = scoring.missed;
@@ -191469,6 +191534,14 @@ function _auctBuildBoard(leagueKey, pool) {
     var canon = (typeof _allInCanon === 'function') ? _allInCanon(ab, 'nhl') : String(ab).toUpperCase();
     if (!slate.byAbbr[canon]) { continue; }
     out.onSlate++;
+    // AUCTLOT -- THE SLATE JOIN ASKS WHETHER HIS CLUB PLAYS, NEVER
+    // WHETHER HE DOES. Suzuki was out and priced second among centres;
+    // Barkov sat on injured reserve at nine dollars. A man who is not
+    // dressing is a dead roster spot for the night, and day-to-day is
+    // the same gamble in a game that lasts one evening -- so anything
+    // ESPN does not call active comes off.
+    var st = String(p.inj || '').toUpperCase();
+    if (st && st !== 'ACTIVE' && st !== 'NORMAL') { out.hurt++; continue; }
     var fp = _auctFp(p, scoring);
     if (fp == null) {
       // AUCTNIGHT -- a slot whose categories the league does not score
@@ -191488,6 +191561,29 @@ function _auctBuildBoard(leagueKey, pool) {
       : 'No pool player matched a team on tonight\u2019s slate.';
     return out;
   }
+  // AUCTLOT -- cut the slate down to tonight's room before pricing. The
+  // board was showing forty-six centres in a game that buys two; now it
+  // shows the three that are actually for sale.
+  var bySlot = {}, bi;
+  for (bi = 0; bi < out.rows.length; bi++) {
+    var br = out.rows[bi];
+    if (!bySlot[br.slot]) { bySlot[br.slot] = []; }
+    bySlot[br.slot].push(br);
+  }
+  var dateSeed = '';
+  try { dateSeed = (typeof _todayDateString === 'function') ? _todayDateString() : ''; } catch (eD) { dateSeed = ''; }
+  var rnd = _auctRng('auct|' + dateSeed + '|' + String(leagueKey || ''));
+  var lot = [], si2;
+  for (si2 = 0; si2 < AUCT_SLOTS.length; si2++) {
+    var sl2 = AUCT_SLOTS[si2];
+    var cand = bySlot[sl2.k] || [];
+    cand.sort(function (a, b) { return b.fp - a.fp; });
+    var want = (sl2.n * AUCT_TEAMS) + AUCT_LOT_SPARE;
+    var drawn = _auctDrawLot(cand, want, rnd);
+    for (var di = 0; di < drawn.length; di++) { lot.push(drawn[di]); }
+  }
+  out.rows = lot;
+  out.lot = lot.length;
   _auctPrice(out.rows);
   return out;
 }
