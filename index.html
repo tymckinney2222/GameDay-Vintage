@@ -33705,6 +33705,15 @@
   <div class="pw-body" id="ppsBody"></div>
 </div>
 
+<!-- AUCTNIGHT -- Auction Night -->
+<div class="sk-overlay" id="skAuctOverlay">
+  <div class="sk-overlay-head">
+    <button class="sk-overlay-back" onclick="closeAuctionNight()">‹</button>
+    <div class="sk-overlay-title">Auction Night</div>
+  </div>
+  <div class="sk-overlay-body" id="skAuctBody"></div>
+</div>
+
 <!-- FP Projector (draft tool) -->
 <div class="fpp-pjc-bk" id="fppProjCardBk" onclick="_fppCloseProjCard()"></div>
 <div class="fpp-pjc" id="fppProjCard"></div>
@@ -44388,6 +44397,11 @@ function renderLeagueDrawerBody() {
   html += '<div class="ld-tool-item" onclick="openFpProjector(); closeLeagueDrawer();">' +
     '<div class="ld-tool-icon">\ud83e\uddee</div>' +
     '<div class="ld-tool-name">FP Projector</div>' +
+  '</div>';
+  // AUCTNIGHT
+  html += '<div class="ld-tool-item" onclick="openAuctionNight(); closeLeagueDrawer();">' +
+    '<div class="ld-tool-icon">\ud83d\udcb0</div>' +
+    '<div class="ld-tool-name">Auction Night</div>' +
   '</div>';
   // NBAROT
   html += '<div class="ld-tool-item" onclick="openNbaRotations(); closeLeagueDrawer();">' +
@@ -190814,6 +190828,144 @@ var DBP_POS = {
 // exactly what the stat-id probe reported. Anything that falls through to
 // 'fba' should do so because it IS basketball, not because of capitals.
 // ESPGAMECASE
+// AUCTNIGHT -- the board. The rg grid, because it is the table he reads
+// everything else in, and a diagnostic line because I cannot reach either
+// API from here and a blank board that says nothing is a wasted night.
+function _auctBoardHtml(b) {
+  if (!b) { return ''; }
+  var diag = '<div class="rg-foot">' +
+    b.pool + ' in pool \u00b7 ' + b.onSlate + ' on tonight\u2019s slate \u00b7 ' +
+    b.priced + ' priced' +
+    (b.cats.length ? (' \u00b7 scoring: ' + skEscape(b.cats.slice(0, 14).join(' ')) ) : '') +
+    (b.missed.length ? (' \u00b7 unmapped: ' + skEscape(b.missed.slice(0, 8).join(' '))) : '') +
+    '</div>';
+  // AUCTNIGHT -- name the slots that came back empty and why. A board
+  // with no goalies on it looks broken; a board that says the league
+  // scores no goalie categories is answering the question.
+  var up = '', uk, uany = false;
+  for (uk in (b.unpriced || {})) {
+    if (!b.unpriced.hasOwnProperty(uk) || !b.unpriced[uk]) { continue; }
+    up += (up ? ', ' : '') + uk + ' (' + b.unpriced[uk] + ')';
+    uany = true;
+  }
+  if (uany) {
+    diag += '<div class="rg-foot" style="color:#f59e0b">Not priced \u2014 ' +
+      skEscape(up) + '. That league scores none of the categories those ' +
+      'positions earn in.</div>';
+  }
+  if (!b.rows.length) {
+    return '<div class="sk-wire-sheet-empty">' + skEscape(b.note || 'Nothing to price.') +
+      '</div>' + diag;
+  }
+  var h = '', si;
+  for (si = 0; si < AUCT_SLOTS.length; si++) {
+    var sl = AUCT_SLOTS[si];
+    var list = [];
+    for (var i = 0; i < b.rows.length; i++) {
+      if (b.rows[i].slot === sl.k) { list.push(b.rows[i]); }
+    }
+    if (!list.length) { continue; }
+    var head = '<tr><th class="rg-p">' + skEscape(sl.label) +
+      '</th><th>Proj</th><th>Over repl</th><th>$</th></tr>';
+    var body = '';
+    for (i = 0; i < list.length && i < 30; i++) {
+      var r = list[i];
+      var vo = (r.vorp > 0) ? ('+' + (Math.round(r.vorp * 10) / 10)) : '\u2014';
+      body += '<tr>' +
+        '<td class="rg-p"><div class="rg-nm">' + skEscape(r.name) + '</div>' +
+          '<div class="rg-sub">' + skEscape(r.team) +
+          (r.inj ? (' \u00b7 ' + skEscape(r.inj)) : '') + '</div></td>' +
+        '<td>' + skEscape(String(Math.round(r.fp * 10) / 10)) + '</td>' +
+        '<td class="' + (r.vorp > 0 ? '' : 'rg-z') + '">' + vo + '</td>' +
+        '<td class="' + (r.price > 1 ? 'rg-best' : 'rg-z') + '">$' + r.price + '</td>' +
+      '</tr>';
+    }
+    h += '<div class="rg-sect">' + skEscape(sl.label) +
+      ' <span style="opacity:0.6">' + list.length + '</span></div>' +
+      '<div class="rg-wrap"><table class="rg">' + head + body + '</table></div>';
+  }
+  return '<div class="rg-dark rg-bleed">' + h + diag + '</div>';
+}
+
+// The synced Yahoo hockey leagues, which are the only scoring settings
+// this can read.
+function _auctLeagues() {
+  var out = [];
+  try {
+    var ls = (typeof skSyncedLeagues === 'function') ? (skSyncedLeagues() || []) : [];
+    for (var i = 0; i < ls.length; i++) {
+      if (String((ls[i] && ls[i].sport) || '').toLowerCase() === 'nhl') { out.push(ls[i]); }
+    }
+  } catch (e) {}
+  return out;
+}
+
+function _auctRender() {
+  var host = document.getElementById('skAuctBody');
+  if (!host) { return; }
+  var lgs = _auctLeagues();
+  if (!lgs.length) {
+    host.innerHTML = '<div class="sk-wire-sheet-empty">No synced Yahoo hockey ' +
+      'leagues \u2014 Auction Night reads its scoring from one.</div>';
+    return;
+  }
+  var sel = '<select id="skAuctLeague" onchange="_auctPick(this.value)" ' +
+    'style="width:100%;padding:9px 10px;border-radius:8px;background:#0d1220;' +
+    'color:#fff;border:1px solid rgba(255,255,255,0.12);font-size:13px;' +
+    'margin:0 0 12px">';
+  for (var i = 0; i < lgs.length; i++) {
+    sel += '<option value="' + skEscape(lgs[i].league_key) + '"' +
+      (lgs[i].league_key === _auctState.leagueKey ? ' selected' : '') + '>' +
+      skEscape(lgs[i].name || lgs[i].league_key) + '</option>';
+  }
+  sel += '</select>';
+  var sub = '<div class="sk-wire-sheet-section"><span class="ic">\ud83d\udcb0</span>' +
+    'Tonight\u2019s board<span class="meta">' +
+    skEscape('$' + AUCT_BUDGET + ' \u00b7 C LW RW D D G') + '</span></div>';
+  host.innerHTML = sel + sub +
+    (_auctState.note
+      ? ('<div class="sk-wire-sheet-empty">' + skEscape(_auctState.note) + '</div>')
+      : _auctBoardHtml(_auctState.board));
+}
+
+function _auctPick(key) {
+  _auctState.leagueKey = key || '';
+  _auctState.board = null;
+  _auctState.note = 'Building tonight\u2019s board\u2026';
+  _auctRender();
+  if (typeof dbpGetPool !== 'function') {
+    _auctState.note = 'The draft pool is not available in this build.';
+    _auctRender();
+    return;
+  }
+  dbpGetPool('nhl', false, null).then(function (pool) {
+    try {
+      _auctState.board = _auctBuildBoard(_auctState.leagueKey, pool);
+      _auctState.note = '';
+    } catch (e) {
+      _auctState.note = 'Board failed: ' + String((e && e.message) || e);
+    }
+    _auctRender();
+  }, function (err) {
+    _auctState.note = 'Could not load the player pool: ' + String((err && err.message) || err);
+    _auctRender();
+  });
+}
+
+function openAuctionNight() {
+  var ov = document.getElementById('skAuctOverlay');
+  if (!ov) { return; }
+  ov.classList.add('open');
+  var lgs = _auctLeagues();
+  if (!_auctState.leagueKey && lgs.length) { _auctState.leagueKey = lgs[0].league_key; }
+  _auctRender();
+  if (_auctState.leagueKey && !_auctState.board) { _auctPick(_auctState.leagueKey); }
+}
+function closeAuctionNight() {
+  var ov = document.getElementById('skAuctOverlay');
+  if (ov) { ov.classList.remove('open'); }
+}
+
 function dbpGameFor(sport) {
   return (String(sport || '').toLowerCase() === 'nhl') ? 'fhl' : 'fba';
 }
@@ -191094,6 +191246,215 @@ function dbpCacheLoad(sport) {
 }
 
 // Cache first, network only when missing or stale. force=1 always refetches.
+// \u2500\u2500 AUCTNIGHT \u2500\u2500 Auction Night.
+//
+// Step one is the price board and nothing else. The bidding and the house
+// are only worth building on prices that read as money.
+var AUCT_SLOTS = [
+  { k: 'C',  label: 'Centre',     n: 1 },
+  { k: 'LW', label: 'Left wing',  n: 1 },
+  { k: 'RW', label: 'Right wing', n: 1 },
+  { k: 'D',  label: 'Defence',    n: 2 },
+  { k: 'G',  label: 'Goalie',     n: 1 }
+];
+var AUCT_BUDGET = 100;
+var AUCT_TEAMS = 2;          // him and the house
+var AUCT_DEPTH = 3;          // how far past the needed slots replacement sits
+var _auctState = { leagueKey: '', board: null, note: '' };
+
+// Which of our five slots a pool player can fill. ESPN's own position
+// string is the source; a player eligible at more than one is placed at
+// the first that matches, which is how the board stays one row per man.
+function _auctSlotOf(p) {
+  var pos = String((p && p.pos) || '').toUpperCase();
+  if (!pos) { return ''; }
+  if (pos.indexOf('G') === 0) { return 'G'; }
+  if (pos.indexOf('D') === 0) { return 'D'; }
+  if (pos.indexOf('LW') > -1) { return 'LW'; }
+  if (pos.indexOf('RW') > -1) { return 'RW'; }
+  if (pos.indexOf('C') > -1) { return 'C'; }
+  if (pos.indexOf('W') > -1) { return 'LW'; }   // bare winger
+  return '';
+}
+
+// The chosen league's scoring, in the Projector's category keys. Yahoo
+// names its categories by abbreviation and _FPP_YAHOO_MAP already speaks
+// both; anything unmapped is reported rather than silently scored as
+// zero, because a missing category is the difference between a board and
+// a wrong board.
+function _auctScoring(leagueKey) {
+  var out = { skater: {}, goalie: {}, read: [], missed: [] };
+  var set = null;
+  try {
+    set = (typeof leagueSettingsCache === 'object' && leagueSettingsCache)
+      ? leagueSettingsCache[leagueKey] : null;
+  } catch (e) { set = null; }
+  var stats = (set && set.stats) || null;
+  if (!stats) { return out; }
+  var mapS = (typeof _FPP_YAHOO_MAP !== 'undefined' && _FPP_YAHOO_MAP.nhl_skater) || {};
+  var mapG = (typeof _FPP_YAHOO_MAP !== 'undefined' && _FPP_YAHOO_MAP.nhl_goalie) || {};
+  var sid;
+  for (sid in stats) {
+    if (!stats.hasOwnProperty(sid)) { continue; }
+    var m = stats[sid] || {};
+    if (m.isOnlyDisplayStat || m.enabled === false) { continue; }
+    var ab = String(m.abbr || m.displayName || m.name || '').toUpperCase();
+    if (!ab) { continue; }
+    // A categories league scores one point a category; a points league
+    // carries its own value. Either way the RELATIVE board is what
+    // prices players, so an absent value is worth one.
+    var val = (m.value != null && !isNaN(parseFloat(m.value))) ? parseFloat(m.value) : 1;
+    var kS = mapS[ab], kG = mapG[ab];
+    if (kS) { out.skater[kS] = val; out.read.push(ab); }
+    if (kG) { out.goalie[kG] = val; if (!kS) { out.read.push(ab); } }
+    if (!kS && !kG) { out.missed.push(ab); }
+  }
+  return out;
+}
+
+// One player's projected fantasy points for a night, under that scoring.
+function _auctFp(p, scoring) {
+  var line = null;
+  try {
+    line = (typeof dbpRate === 'function')
+      ? dbpRate((typeof dbpBasis === 'function') ? dbpBasis(p) : null, p.mode)
+      : null;
+  } catch (e) { line = null; }
+  if (!line) { return null; }
+  var map = (_auctSlotOf(p) === 'G') ? scoring.goalie : scoring.skater;
+  var tot = 0, any = false, k;
+  for (k in map) {
+    if (!map.hasOwnProperty(k)) { continue; }
+    var v = line[k];
+    if (v == null || v === '') { continue; }
+    var n = Number(v);
+    if (isNaN(n)) { continue; }
+    // GAA and its kind: more is worse, so the scoring value is negative
+    // and the arithmetic needs no special case -- but a board that read
+    // one the wrong way round would be silently backwards, so it goes
+    // through the same helper the draft board uses.
+    var sv = map[k];
+    try {
+      if (typeof dbpLowerBetter === 'function' && dbpLowerBetter(k, sv)) { sv = -Math.abs(sv); }
+    } catch (eL) {}
+    tot += n * sv;
+    any = true;
+  }
+  return any ? tot : null;
+}
+
+// Value over replacement, turned into dollars.
+function _auctPrice(rows) {
+  var bySlot = {}, i, r;
+  for (i = 0; i < rows.length; i++) {
+    r = rows[i];
+    if (!bySlot[r.slot]) { bySlot[r.slot] = []; }
+    bySlot[r.slot].push(r);
+  }
+  var spots = 0, k;
+  for (i = 0; i < AUCT_SLOTS.length; i++) { spots += AUCT_SLOTS[i].n * AUCT_TEAMS; }
+  var pot = (AUCT_BUDGET * AUCT_TEAMS) - spots;      // a dollar each, minimum
+  // REPLACEMENT DEPTH. Strict replacement for a two-man league is the
+  // third best centre, which prices two players and leaves thirty-six at
+  // a dollar -- a cliff, not a market. Real auction values are built
+  // against a full field, so the line sits three deep per needed slot:
+  // the sixth centre, the twelfth defenceman. That gives the middle of
+  // the board a graded price, which is where the actual decisions are.
+  var surplus = 0, bought = 0;
+  for (i = 0; i < AUCT_SLOTS.length; i++) {
+    var sl = AUCT_SLOTS[i];
+    var list = bySlot[sl.k] || [];
+    list.sort(function (a, b) { return b.fp - a.fp; });
+    var need = sl.n * AUCT_TEAMS;
+    var line = need * AUCT_DEPTH;
+    var repl = (list.length > line) ? list[line].fp
+             : (list.length ? list[list.length - 1].fp : 0);
+    for (var j = 0; j < list.length; j++) {
+      list[j].repl = repl;
+      list[j].vorp = list[j].fp - repl;
+      // THE BUDGET HAS TO BIND, or there is no game: if the best twelve
+      // cost less than the money in the room he buys six stars and the
+      // auction is a formality. The scale is set so the men who would
+      // ACTUALLY be rostered spend it all.
+      if (j < need && list[j].vorp > 0) { surplus += list[j].vorp; }
+    }
+    bought += Math.min(need, list.length);
+  }
+  var k = (surplus > 0) ? ((AUCT_BUDGET * AUCT_TEAMS) - bought) / surplus : 0;
+  for (i = 0; i < rows.length; i++) {
+    r = rows[i];
+    var extra = (r.vorp > 0) ? (r.vorp * k) : 0;
+    r.price = Math.max(1, Math.round(1 + extra));
+  }
+  rows.sort(function (a, b) { return b.price - a.price || b.fp - a.fp; });
+  return rows;
+}
+
+// Tonight's priced board, or a note saying which join came up empty.
+function _auctBuildBoard(leagueKey, pool) {
+  var out = { rows: [], note: '', pool: 0, onSlate: 0, priced: 0, cats: [],
+              missed: [], unpriced: {} };
+  var scoring = _auctScoring(leagueKey);
+  out.cats = scoring.read;
+  out.missed = scoring.missed;
+  var nCats = 0, kk;
+  for (kk in scoring.skater) { if (scoring.skater.hasOwnProperty(kk)) { nCats++; } }
+  if (!nCats) {
+    out.note = 'That league\u2019s scoring settings have not loaded yet \u2014 open it once and come back.';
+    return out;
+  }
+  var slate = null;
+  try { slate = (typeof _allInSlate === 'function') ? _allInSlate('nhl') : null; } catch (e) {}
+  if (!slate || !slate.games) {
+    out.note = 'No NHL games on tonight\u2019s slate.';
+    return out;
+  }
+  var proMap = null;
+  try {
+    var seas = (typeof dbpSeason === 'function') ? dbpSeason() : null;
+    proMap = (typeof _espProTeams !== 'undefined' && _espProTeams)
+      ? _espProTeams['fhl:' + seas] : null;
+  } catch (e2) { proMap = null; }
+  var list = (pool && pool.players) || pool || [];
+  out.pool = list.length;
+  var i;
+  for (i = 0; i < list.length; i++) {
+    var p = list[i];
+    if (!p) { continue; }
+    var slot = _auctSlotOf(p);
+    if (!slot) { continue; }
+    var ab = '';
+    try {
+      var pm = proMap ? proMap[String(p.teamId)] : null;
+      ab = (pm && (pm.abbrev || pm.abbr || pm.name)) || (typeof pm === 'string' ? pm : '');
+    } catch (e3) { ab = ''; }
+    if (!ab) { continue; }
+    var canon = (typeof _allInCanon === 'function') ? _allInCanon(ab, 'nhl') : String(ab).toUpperCase();
+    if (!slate.byAbbr[canon]) { continue; }
+    out.onSlate++;
+    var fp = _auctFp(p, scoring);
+    if (fp == null) {
+      // AUCTNIGHT -- a slot whose categories the league does not score
+      // (goalies, most often) produces no price and the whole section
+      // disappears. Counted, so the board can say so instead of simply
+      // not having goalies on it.
+      out.unpriced[slot] = (out.unpriced[slot] || 0) + 1;
+      continue;
+    }
+    out.rows.push({ id: p.id, name: p.name, slot: slot, team: String(ab).toUpperCase(),
+                    fp: Math.round(fp * 100) / 100, inj: p.inj || '' });
+  }
+  out.priced = out.rows.length;
+  if (!out.priced) {
+    out.note = out.onSlate
+      ? 'Players matched tonight\u2019s slate but none could be scored \u2014 the pool may be missing stat lines.'
+      : 'No pool player matched a team on tonight\u2019s slate.';
+    return out;
+  }
+  _auctPrice(out.rows);
+  return out;
+}
+
 function dbpGetPool(sport, force, onProgress) {
   if (!force) {
     var hit = dbpCacheLoad(sport);
