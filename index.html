@@ -191335,8 +191335,28 @@ function _auctLiveDiagHtml(live) {
   for (k in live.labels) { if (live.labels.hasOwnProperty(k)) { seen++; } }
   for (k in live.unmapped) { if (live.unmapped.hasOwnProperty(k)) { un.push(k); } }
   var h = '<div class="rg-foot">Scored off ESPN box scores \u00b7 ' +
-    seen + ' labels read \u00b7 goalie wins are derived from the result, ' +
-    'not a box score column.</div>';
+    seen + ' labels read' +
+    ((_auctSport() === 'nba') ? '' :
+      ' \u00b7 goalie wins are derived from the result, not a box score column') +
+    '.</div>';
+  // AUCTMERGE -- EVERY LABEL, NAMED. "30 labels read" could not tell him
+  // which thirty, and the one night that mattered came down to guessing
+  // what ESPN calls shots. Now it is on the screen.
+  var all = [], ak;
+  for (ak in live.labels) { if (live.labels.hasOwnProperty(ak)) { all.push(ak); } }
+  if (all.length) {
+    h += '<div class="rg-foot" style="opacity:0.6">Columns read: ' +
+      skEscape(all.sort().join(' ')) + '</div>';
+  }
+  var cl = [], ck2;
+  for (ck2 in (live.clash || {})) {
+    if (live.clash.hasOwnProperty(ck2)) { cl.push(ck2); }
+  }
+  if (cl.length) {
+    h += '<div class="rg-foot" style="color:#f59e0b">Two columns want the ' +
+      'same category: ' + skEscape(cl.sort().join(' ')) + '. The first is ' +
+      'being kept \u2014 tell me and I will say which is right.</div>';
+  }
   if (un.length) {
     h += '<div class="rg-foot" style="color:#f59e0b">Unmapped: ' +
       skEscape(un.sort().join(' ')) + ' \u2014 if your league scores any ' +
@@ -192767,7 +192787,12 @@ var _AUCT_BOX_SKATER = {
   'A': 'a', 'AST': 'a', 'ASSISTS': 'a',
   'P': 'pts', 'PTS': 'pts', 'POINTS': 'pts',
   '+/-': 'plusminus', '+/': 'plusminus', 'PLUSMINUS': 'plusminus',
-  'S': 'sog', 'SOG': 'sog', 'SH': 'sog', 'SHOTS': 'sog',
+  // AUCTMERGE -- 'SH' is NOT shots. In a hockey box score it is
+  // short-handed far more often, and mapping it here meant two labels
+  // writing one key, with the later one silently winning. If a payload
+  // really does use it for shots it will now show up in the unmapped
+  // line and say so.
+  'S': 'sog', 'SOG': 'sog', 'SHOTS': 'sog', 'SHOT': 'sog',
   'PIM': 'pim', 'PM': 'pim', 'PEN': 'pim',
   'HIT': 'hit', 'HITS': 'hit', 'HT': 'hit',
   'BS': 'blk', 'BLK': 'blk', 'BKS': 'blk', 'BLOCKS': 'blk',
@@ -192841,7 +192866,7 @@ function _auctNameKey(n) {
 
 // One game's summary -> { byId, byName, labels, unmapped }.
 function _auctParseBox(j, out) {
-  out = out || { byId: {}, byName: {}, labels: {}, unmapped: {} };
+  out = out || { byId: {}, byName: {}, labels: {}, unmapped: {}, clash: {} };
   var blocks = ((j || {}).boxscore || {}).players || [];
   var b, s2, a, L;
   // Who won, for the derived goalie decision.
@@ -192874,41 +192899,87 @@ function _auctParseBox(j, out) {
       }
       for (a = 0; a < ath.length; a++) {
         var row = ath[a] || {}, st = row.stats || [];
-        var line = { _g: isG, _team: tAb, _won: (done && tAb && tAb === winAbbr) };
+        var line = { _g: isG, _nba: _nba, _team: tAb,
+                     _won: (done && tAb && tAb === winAbbr) };
         for (L = 0; L < labs.length && L < st.length; L++) {
           var k = map[String(labs[L]).toUpperCase()];
-          if (k) { line[k] = _auctBoxNum(st[L]); }
-        }
-        // A league that scores POINTS off a box score with no P column:
-        // goals plus assists is the definition, not an estimate.
-        if (!_nba && !isG && line.pts == null && (line.g != null || line.a != null)) {
-          line.pts = (line.g || 0) + (line.a || 0);
-        }
-        // AUCTNBA -- a double-double is not a box score column either; it
-        // is a fact about the line, and plenty of points leagues pay for
-        // it. Counted the way everyone counts it: ten or more in two of
-        // points, rebounds, assists, steals and blocks.
-        if (_nba) {
-          var _tens = 0, _tk, _TT = ['pts', 'reb', 'ast', 'stl', 'blk'];
-          for (_tk = 0; _tk < _TT.length; _tk++) {
-            if (Number(line[_TT[_tk]]) >= 10) { _tens++; }
+          if (!k) { continue; }
+          // FIRST WINS, AND A CLASH IS RECORDED. Two labels mapping to
+          // one key is how shots became short-handed goals: silently,
+          // and only visible as a column of noughts.
+          if (line[k] != null) {
+            out.clash[String(labs[L]).toUpperCase() + '\u2192' + k] = 1;
+            continue;
           }
-          if (!line.reb && (line.oreb != null || line.dreb != null)) {
-            line.reb = (line.oreb || 0) + (line.dreb || 0);
-          }
-          line.dd = (_tens >= 2) ? 1 : 0;
-          line.td = (_tens >= 3) ? 1 : 0;
-          line._ddDerived = true;
+          line[k] = _auctBoxNum(st[L]);
         }
+        // AUCTMERGE -- the derivations wait for the whole line. Run per
+        // group they were deciding from a third of one.
         var at = row.athlete || {};
         var id = at.id != null ? String(at.id) : '';
         var nm = at.displayName || at.shortName || at.fullName || '';
+        var nk = nm ? _auctNameKey(nm) : '';
+        // MERGE, NEVER REPLACE. A man files under more than one group --
+        // goals and shots in the first, faceoffs and blocks in another --
+        // and assigning threw away everything the earlier groups had put
+        // there. _fbParse already says exactly this about footballers.
+        var prev = (id && out.byId[id]) || (nk && out.byName[nk]) || null;
+        if (prev) {
+          for (var mk in line) {
+            if (!line.hasOwnProperty(mk)) { continue; }
+            if (mk.charAt(0) === '_') { continue; }
+            if (prev[mk] == null) { prev[mk] = line[mk]; }
+          }
+          line = prev;
+        }
         if (id) { out.byId[id] = line; }
-        if (nm) { out.byName[_auctNameKey(nm)] = line; }
+        if (nk) { out.byName[nk] = line; }
       }
     }
   }
+  _auctFinalizeBox(out);
   return out;
+}
+
+// AUCTMERGE -- everything that has to read a COMPLETE line, once the
+// groups have all been merged into it.
+function _auctFinalizeBox(box) {
+  var seen = {}, k, line;
+  for (k in box.byId) {
+    if (!box.byId.hasOwnProperty(k)) { continue; }
+    line = box.byId[k];
+    if (!line || seen[line._uid]) { continue; }
+    _auctFinishLine(line);
+  }
+  for (k in box.byName) {
+    if (!box.byName.hasOwnProperty(k)) { continue; }
+    _auctFinishLine(box.byName[k]);
+  }
+}
+
+function _auctFinishLine(line) {
+  if (!line || line._done) { return; }
+  line._done = true;
+  if (line._nba) {
+    if (line.reb == null && (line.oreb != null || line.dreb != null)) {
+      line.reb = (line.oreb || 0) + (line.dreb || 0);
+    }
+    // A double-double is a fact about the line, not a box score column,
+    // and it can only be read once the whole line is in.
+    var tens = 0, i, TT = ['pts', 'reb', 'ast', 'stl', 'blk'];
+    for (i = 0; i < TT.length; i++) {
+      if (Number(line[TT[i]]) >= 10) { tens++; }
+    }
+    line.dd = (tens >= 2) ? 1 : 0;
+    line.td = (tens >= 3) ? 1 : 0;
+    line._ddDerived = true;
+    return;
+  }
+  // A league that scores POINTS off a box score with no P column: goals
+  // plus assists is the definition, not an estimate.
+  if (!line._g && line.pts == null && (line.g != null || line.a != null)) {
+    line.pts = (line.g || 0) + (line.a || 0);
+  }
 }
 
 // A GOALIE'S WIN IS DERIVED, never read: no box score column carries it.
@@ -192977,7 +193048,7 @@ function _auctLiveFetch(force, gids) {
     })(list[i]);
   }
   return Promise.all(jobs).then(function (all) {
-    var box = { byId: {}, byName: {}, labels: {}, unmapped: {} }, n = 0, fin = 0;
+    var box = { byId: {}, byName: {}, labels: {}, unmapped: {}, clash: {} }, n = 0, fin = 0;
     for (var i2 = 0; i2 < all.length; i2++) {
       if (!all[i2]) { continue; }
       _auctParseBox(all[i2], box);
