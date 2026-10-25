@@ -133325,6 +133325,126 @@ function _skRotoGapHtml(lv) {
   return '<div class="rg-wrap"><table class="rg">' + head + body + '</table></div>';
 }
 
+// \u2500\u2500 ROTOYEST \u2500\u2500 What each team did YESTERDAY, keyed the way the
+// ladder keys its teams.
+//
+// Yahoo: the dated team-stats call _skRotoDayLoad already makes and
+// caches by date. It answers null the first time and loads in the
+// background, same as the today path.
+// ESPN: the day rosters the Wire scan already fetched, summed over the
+// men who started. No second request either way.
+function _skRotoWireYVals(entry, lv) {
+  var day = (typeof skYesterdayDateString === 'function')
+    ? skYesterdayDateString() : '';
+  if (!day) { return null; }
+  var league = entry && entry.league;
+  if (!league) { return null; }
+
+  if (league.provider === 'espn') {
+    var ros = entry._espRos;
+    var byTeam = ros && ros.byTeam;
+    if (!byTeam) { return null; }
+    // ROTOYEST -- "nobody scored" and "not loaded yet" are different
+    // answers and must not share a return. seen tracks whether the day's
+    // windows are present at all; a league where every figure is zero is
+    // a real quiet night and files as one.
+    var out = {}, tk, seen = false;
+    for (tk in byTeam) {
+      if (!byTeam.hasOwnProperty(tk)) { continue; }
+      var items = (byTeam[tk] || {}).items || [], row = {}, i, k;
+      for (i = 0; i < items.length; i++) {
+        var it = items[i];
+        if (!it || !it.starter) { continue; }
+        var w = it.windows && it.windows.today;
+        if (!w || !w.stats) { continue; }
+        seen = true;
+        for (k in w.stats) {
+          if (!w.stats.hasOwnProperty(k)) { continue; }
+          var n = Number(w.stats[k]);
+          if (isNaN(n)) { continue; }
+          row[k] = (Number(row[k]) || 0) + n;
+        }
+      }
+      out[String(tk)] = row;
+    }
+    return seen ? out : null;
+  }
+
+  var key = league.league_key;
+  if (!key) { return null; }
+  var hit = _skRotoDayCache[key + '|' + day];
+  if (!hit) {
+    try { _skRotoDayLoad(key, day); } catch (e) {}
+    return null;                        // loads in the background
+  }
+  return hit.vals || null;
+}
+
+// \u2500\u2500 ROTOYEST \u2500\u2500 The ladder as it stands, and as it stood before
+// yesterday. Same shape _skRotoLiveView returns, so the ledger, the gaps
+// and the rivals all read it without knowing which day they are on.
+function _skRotoWireView(entry, lv) {
+  if (!lv || !lv.myKey || !lv.order || !lv.order.length) { return null; }
+  var yv = _skRotoWireYVals(entry, lv);
+  if (!yv) { return null; }
+  var all = (lv.data && lv.data.allTeams) || {};
+  var meta = lv.statsMeta || {};
+  var teams = [], tk;
+  for (tk in all) {
+    if (!all.hasOwnProperty(tk)) { continue; }
+    if (!all[tk] || !all[tk].catStats) { continue; }
+    teams.push({ key: tk, raw: all[tk].catStats });
+  }
+  if (teams.length < 2) { return null; }
+
+  // Where they stand now, minus what they did last night.
+  var back = _skRotoLiveTotals(teams, yv, lv.order, meta, -1);
+  var beforeTeams = [], i;
+  for (i = 0; i < teams.length; i++) {
+    beforeTeams.push({ key: teams[i].key, raw: back.vals[teams[i].key] });
+  }
+  if (typeof _skRotoDeriveCatPoints !== 'function') { return null; }
+  var beforeCat = _skRotoDeriveCatPoints(beforeTeams, lv.order, meta);
+  var nowCat = _skRotoDeriveCatPoints(teams, lv.order, meta);
+
+  function tot(cat) {
+    var out = {}, k, id;
+    for (k in cat) {
+      if (!cat.hasOwnProperty(k)) { continue; }
+      var sum = 0;
+      for (id in cat[k]) { if (cat[k].hasOwnProperty(id)) { sum += cat[k][id]; } }
+      out[k] = Math.round(sum * 10) / 10;
+    }
+    return out;
+  }
+  function rankOf(t) {
+    var ks = [], r = {}, k;
+    for (k in t) { if (t.hasOwnProperty(k)) { ks.push(k); } }
+    ks.sort(function (a, b) { return (t[b] - t[a]) || String(a).localeCompare(String(b)); });
+    for (var z = 0; z < ks.length; z++) {
+      r[ks[z]] = (z > 0 && t[ks[z]] === t[ks[z - 1]]) ? r[ks[z - 1]] : (z + 1);
+    }
+    return r;
+  }
+  var bT = tot(beforeCat), nT = tot(nowCat);
+  var bR = rankOf(bT), nR = rankOf(nT);
+  var liveAll = {}, moved = {};
+  for (i = 0; i < teams.length; i++) {
+    var k2 = teams[i].key;
+    liveAll[k2] = { name: (all[k2] && all[k2].name) || k2,
+                    rank: nR[k2], catStats: teams[i].raw, catPoints: nowCat[k2] };
+    moved[k2] = { ptsFrom: bT[k2], ptsTo: nT[k2], rankFrom: bR[k2], rankTo: nR[k2] };
+  }
+  return {
+    data: { allTeams: liveAll, team: (lv.data && lv.data.team) || null },
+    day: (typeof skYesterdayDateString === 'function') ? skYesterdayDateString() : '',
+    seasonCat: beforeCat, order: lv.order, statsMeta: meta,
+    rates: back.rates || [], touched: back.touched,
+    moved: moved, me: moved[lv.myKey] || null, myKey: lv.myKey,
+    teams: teams.length, src: (lv.src || '') + ' \u00b7 yesterday'
+  };
+}
+
 // \u2500\u2500 ROTOWIRE2 \u2500\u2500 Who actually took points off you, and who you took
 // them from.
 //
@@ -133444,9 +133564,15 @@ function skBuildWireDetailRoto(entry) {
     return '<div class="sk-wire-sheet-empty">Building today\u2019s roto board\u2026 ' +
            'reopen in a moment.</div>';
   }
-  // The app's own ledger, not a second one.
+  // ROTOYEST -- the ladder and the gaps are absolute standings and read
+  // the live view; the two MOVEMENT sections read yesterday's, because
+  // this sheet's own header says yesterday. Pointing them at today is
+  // why they rendered nothing all morning.
+  var yv = null;
+  try { yv = _skRotoWireView(entry, lv); } catch (eY) { yv = null; }
+  var mv = yv || lv;
   var ledger = '';
-  try { ledger = _skRotoLedgerHtml(lv) || ''; } catch (eL) { ledger = ''; }
+  try { ledger = _skRotoLedgerHtml(mv) || ''; } catch (eL) { ledger = ''; }
   var gaps = _skRotoGapHtml(lv);
   if (!ledger && !gaps) {
     return '<div class="sk-wire-sheet-empty">No category totals yet.</div>';
@@ -133473,7 +133599,17 @@ function skBuildWireDetailRoto(entry) {
        '\u201cto next\u201d is the distance to the place above</div>')
     : '';
   var rivals = '';
-  try { rivals = _skRotoRivalsHtml(lv) || ''; } catch (eR) { rivals = ''; }
+  try { rivals = _skRotoRivalsHtml(mv) || ''; } catch (eR) { rivals = ''; }
+  // ROTOYEST -- and when there is nothing to say, say that, rather than
+  // leaving two sections silently absent and no way to tell a quiet
+  // night from a broken one. That ambiguity is what cost him a question.
+  if (!ledger && !rivals) {
+    rivals = '<div class="sk-wire-sheet-section"><span class="ic">\u2694\ufe0f</span>' +
+      'Places traded</div><div class="sk-wire-sheet-empty">' +
+      (yv ? 'No category changed hands yesterday.'
+          : 'Yesterday\u2019s category totals are still loading \u2014 reopen in a moment.') +
+      '</div>';
+  }
   return head + ledger +
     (gaps ? ('<div class="rg-dark rg-bleed">' + gaps + foot + '</div>') : '') +
     rivals;
@@ -166084,7 +166220,13 @@ function _skRotoRateFmt(v, sample) {
   return out;
 }
 
-function _skRotoLiveTotals(teams, dayVals, order, statsMeta) {
+// ROTOYEST -- sign defaults to +1, which is every existing caller: add
+// the day onto the season. The Wire passes -1 to take a day back OUT of
+// it, and everything else here -- the rate rebuild from components, the
+// recipe verification, the rule that never invents a zero -- is
+// direction-agnostic and comes along untouched.
+function _skRotoLiveTotals(teams, dayVals, order, statsMeta, sign) {
+  var _sg = (sign === -1) ? -1 : 1;
   var out = {}, rates = [], touched = 0, i, c;
   for (i = 0; i < teams.length; i++) out[teams[i].key] = {};
   // Pass 1 - every additive category, which is also what the rate rebuild
@@ -166117,7 +166259,7 @@ function _skRotoLiveTotals(teams, dayVals, order, statsMeta) {
       // real result.
       if (isNaN(sn) && isNaN(dn)) { out[tk][id] = (sv == null ? null : sv); continue; }
       if (!isNaN(dn) && dn !== 0) touched++;
-      out[tk][id] = (isNaN(sn) ? 0 : sn) + (isNaN(dn) ? 0 : dn);
+      out[tk][id] = (isNaN(sn) ? 0 : sn) + _sg * (isNaN(dn) ? 0 : dn);
     }
   }
   // Pass 2 - held-back categories keep their season value verbatim.
