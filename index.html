@@ -127788,7 +127788,24 @@ async function skLoadRosterForDate(leagueKey, dateStr) {
   // is why tapping into a league a moment later already succeeds.
   // PREDRAFTQUIET - same before the draft, on every date.
   if (typeof _skLeagueNotStarted === 'function' && _skLeagueNotStarted(leagueKey)) return [];
-  var data = await fyApiRetry(path);
+  // PLANFAST -- the same answer the roster lanes read. Since the scan
+  // stopped asking by date, this is the exact path the bulk warm filled,
+  // so going back through fyApiRetry for it buys nothing and costs a
+  // coalesce check, two season guards and `await fyGetToken()` per
+  // league -- yields that queue behind whatever else is on the thread.
+  // Anything genuinely missing still goes the normal way, retries and all.
+  var data = null;
+  try {
+    var _pc = (typeof fyDataCache === 'object' && fyDataCache) ? fyDataCache[path] : null;
+    if (_pc && _pc.d && _pc.t > Date.now() - (_pc.ttl || 60000)) {
+      data = _pc.d;
+      _skPlanCacheHit++;
+    }
+  } catch (ePC) {}
+  if (!data) {
+    _skPlanCacheMiss++;
+    data = await fyApiRetry(path);
+  }
   if (!data || data.error) throw new Error((data && data.error) || 'no data');
   var teamsData = data.fantasy_content.league[1].teams;
   if (!teamsData || !teamsData.count) return [];
@@ -127882,6 +127899,9 @@ async function skLoadRosterForDate(leagueKey, dateStr) {
 // own cache + scan timestamp; skPlanCache always points at the ACTIVE
 // day's object (so all existing reads keep working unchanged). Switching
 // days swaps the reference and lazily scans the other day if needed.
+// PLANFAST -- cached against fetched, so a scan that does not get faster
+// says why rather than leaving it as unexplained seconds on the clock.
+var _skPlanCacheHit = 0, _skPlanCacheMiss = 0;
 var skPlanDay = 'today';      // 'today' | 'tomorrow'
 var skPlanCacheToday = {};
 var skPlanCacheTomorrow = {};
@@ -128092,6 +128112,7 @@ async function skScanPlan() {
   }
 
   skPlanScanning = true;
+  _skPlanCacheHit = 0; _skPlanCacheMiss = 0;
   // Drop stale entries so the UI shows a clean loading state.
   skPlanClearActiveCache();
   skUpdatePlanCounter();
@@ -128107,7 +128128,9 @@ async function skScanPlan() {
     });
   });
   await Promise.all(scans);
-  _skBootMark('plan scan', synced.length + ' leagues \u00b7 pill resolves here');
+  _skBootMark('plan scan', synced.length + ' leagues \u00b7 ' +
+    _skPlanCacheHit + ' cached, ' + _skPlanCacheMiss + ' fetched \u00b7 ' +
+    'pill resolves here');
   skPlanScanning = false;
   skPlanSetActiveTs(Date.now());
   if (scanDay === 'today') skPlanScannedToday = true;
