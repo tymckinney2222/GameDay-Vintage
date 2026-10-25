@@ -33705,13 +33705,22 @@
   <div class="pw-body" id="ppsBody"></div>
 </div>
 
-<!-- AUCTNIGHT -- Auction Night -->
-<div class="sk-overlay" id="skAuctOverlay">
-  <div class="sk-overlay-head">
-    <button class="sk-overlay-back" onclick="closeAuctionNight()">‹</button>
-    <div class="sk-overlay-title">Auction Night</div>
+<!-- AUCTNIGHT -- Auction Night.
+     pw-overlay / pp-header / pw-body, the shell Players of the Week uses:
+     pw-body is flex:1 with overflow-y:auto and already clears the bottom
+     nav. The first pass invented sk-overlay-body, which has no CSS
+     anywhere, so it neither padded nor scrolled. -->
+<div class="pw-overlay" id="skAuctOverlay">
+  <div class="pp-header">
+    <div>
+      <div class="pp-eyebrow">Nightly game</div>
+      <h2 class="pp-title">Auction Night</h2>
+    </div>
+    <button class="pp-close" onclick="closeAuctionNight()" aria-label="Close">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+    </button>
   </div>
-  <div class="sk-overlay-body" id="skAuctBody"></div>
+  <div class="pw-body" id="skAuctBody"></div>
 </div>
 
 <!-- FP Projector (draft tool) -->
@@ -190894,7 +190903,16 @@ function _auctLeagues() {
   try {
     var ls = (typeof skSyncedLeagues === 'function') ? (skSyncedLeagues() || []) : [];
     for (var i = 0; i < ls.length; i++) {
-      if (String((ls[i] && ls[i].sport) || '').toLowerCase() === 'nhl') { out.push(ls[i]); }
+      var l = ls[i];
+      if (String((l && l.sport) || '').toLowerCase() !== 'nhl') { continue; }
+      // AUCTFIX -- points leagues only. An auction needs ONE number per
+      // player and a categories league does not produce one. Decided by
+      // _skWireScoringType, which is the same answer the Wire's own
+      // format pill prints, so the two can never disagree.
+      var st = (typeof _skWireScoringType === 'function')
+        ? _skWireScoringType(l) : String((l && l.scoring_type) || '');
+      if (st !== 'headpoint') { continue; }
+      out.push(l);
     }
   } catch (e) {}
   return out;
@@ -190905,8 +190923,9 @@ function _auctRender() {
   if (!host) { return; }
   var lgs = _auctLeagues();
   if (!lgs.length) {
-    host.innerHTML = '<div class="sk-wire-sheet-empty">No synced Yahoo hockey ' +
-      'leagues \u2014 Auction Night reads its scoring from one.</div>';
+    host.innerHTML = '<div class="sk-wire-sheet-empty">No synced Yahoo ' +
+      'hockey POINTS league \u2014 Auction Night needs one number per ' +
+      'player, and a categories league does not have one.</div>';
     return;
   }
   var sel = '<select id="skAuctLeague" onchange="_auctPick(this.value)" ' +
@@ -191300,10 +191319,13 @@ function _auctScoring(leagueKey) {
     if (m.isOnlyDisplayStat || m.enabled === false) { continue; }
     var ab = String(m.abbr || m.displayName || m.name || '').toUpperCase();
     if (!ab) { continue; }
-    // A categories league scores one point a category; a points league
-    // carries its own value. Either way the RELATIVE board is what
-    // prices players, so an absent value is worth one.
-    var val = (m.value != null && !isNaN(parseFloat(m.value))) ? parseFloat(m.value) : 1;
+    // AUCTFIX -- pointModifier, which is where the Yahoo parse puts the
+    // weight. The first pass read m.value, which does not exist, so the
+    // fallback fired on every category and a points league was scored as
+    // though every stat were worth one. A stat worth nothing scores
+    // nothing and is skipped rather than counted as one.
+    var val = parseFloat(m.pointModifier);
+    if (isNaN(val) || val === 0) { continue; }
     var kS = mapS[ab], kG = mapG[ab];
     if (kS) { out.skater[kS] = val; out.read.push(ab); }
     if (kG) { out.goalie[kG] = val; if (!kS) { out.read.push(ab); } }
@@ -191316,8 +191338,11 @@ function _auctScoring(leagueKey) {
 function _auctFp(p, scoring) {
   var line = null;
   try {
+    // AUCTFIX -- 'esp' asks for ESPN's own projection first, which keeps
+    // the Marcel blend on the Draft Board where it belongs. One night
+    // does not need three seasons of history behind it.
     line = (typeof dbpRate === 'function')
-      ? dbpRate((typeof dbpBasis === 'function') ? dbpBasis(p) : null, p.mode)
+      ? dbpRate((typeof dbpBasis === 'function') ? dbpBasis(p, 'esp') : null, p.mode)
       : null;
   } catch (e) { line = null; }
   if (!line) { return null; }
@@ -191340,7 +191365,19 @@ function _auctFp(p, scoring) {
     tot += n * sv;
     any = true;
   }
-  return any ? tot : null;
+  if (!any) { return null; }
+  // AUCTFIX -- 649 was a season. DBP_PERGAME.nhl_skater is false, so
+  // dbpRate hands hockey back as season totals and only divides for
+  // basketball. FP is linear in the stats, so the season figure over
+  // games played is the per-game one.
+  var gp = Number(line.gp || 0);
+  var perGame = true;
+  try { perGame = !!(DBP_PERGAME && DBP_PERGAME[p.mode]); } catch (eG) { perGame = false; }
+  if (!perGame) {
+    if (!(gp > 0)) { return null; }      // a total with no games is not a rate
+    tot = tot / gp;
+  }
+  return tot;
 }
 
 // Value over replacement, turned into dollars.
