@@ -190926,8 +190926,8 @@ function _auctBoardHtml(b) {
       '</div>' + diag;
   }
   var h = '', si;
-  for (si = 0; si < AUCT_SLOTS.length; si++) {
-    var sl = AUCT_SLOTS[si];
+  for (si = 0; si < _auctSlots().length; si++) {
+    var sl = _auctSlots()[si];
     var list = [], nAll = 0;
     for (var i = 0; i < b.rows.length; i++) {
       if (b.rows[i].slot !== sl.k) { continue; }
@@ -191004,7 +191004,7 @@ function _auctLeagues() {
     var ls = (typeof skSyncedLeagues === 'function') ? (skSyncedLeagues() || []) : [];
     for (var i = 0; i < ls.length; i++) {
       var l = ls[i];
-      if (String((l && l.sport) || '').toLowerCase() !== 'nhl') { continue; }
+      if (String((l && l.sport) || '').toLowerCase() !== _auctSport()) { continue; }
       // AUCTFIX -- points leagues only. An auction needs ONE number per
       // player and a categories league does not produce one. Decided by
       // _skWireScoringType, which is the same answer the Wire's own
@@ -191027,6 +191027,30 @@ function _auctRowShown(r) {
   // when what he wants is everybody from one game.
   return (String(r.name || '').toLowerCase().indexOf(q) > -1) ||
          (String(r.team || '').toLowerCase().indexOf(q) > -1);
+}
+
+// AUCTNBA -- switching sport is a new room entirely: different leagues,
+// a different board, a different card for tonight. Everything that
+// described the old one is dropped rather than carried across.
+function _auctSetSport(sp) {
+  if (!AUCT_SPORTS[sp] || _auctSport() === sp) { return; }
+  _auctState.sport = sp;
+  _auctState.leagueKey = '';
+  _auctState.board = null;
+  _auctState.live = null;
+  _auctState.lastBox = null;
+  _auctState.last = null;
+  _auctState.nightIdx = 0;
+  _auctState.q = '';
+  _auctState.fPrice = 0;
+  _auctStopClock();
+  var lgs = _auctLeagues();
+  if (lgs.length) {
+    _auctPick(lgs[0].league_key);
+  } else {
+    _auctState.note = '';
+    _auctRender();
+  }
 }
 
 function _auctSetQ(v) {
@@ -191151,8 +191175,11 @@ function _auctGridFor(rows, box, leagueKey) {
   var meta = (set && set.stats) || null;
   if (!meta) { return ''; }
   var sc = _auctScoring(leagueKey);
-  var mapS = (typeof _FPP_YAHOO_MAP !== 'undefined' && _FPP_YAHOO_MAP.nhl_skater) || {};
-  var mapG = (typeof _FPP_YAHOO_MAP !== 'undefined' && _FPP_YAHOO_MAP.nhl_goalie) || {};
+  var _isN = (_auctSport() === 'nba');
+  var mapS = (typeof _FPP_YAHOO_MAP !== 'undefined'
+    && (_isN ? _FPP_YAHOO_MAP.nba : _FPP_YAHOO_MAP.nhl_skater)) || {};
+  var mapG = (typeof _FPP_YAHOO_MAP !== 'undefined'
+    && (_isN ? _FPP_YAHOO_MAP.nba : _FPP_YAHOO_MAP.nhl_goalie)) || {};
   var ord = [], sid;
   for (sid in meta) { if (meta.hasOwnProperty(sid)) { ord.push(String(sid)); } }
   ord.sort(function (a, b) { return Number(a) - Number(b); });
@@ -191160,7 +191187,7 @@ function _auctGridFor(rows, box, leagueKey) {
   var skaters = [], keepers = [], byKey = {}, i;
   for (i = 0; i < rows.length; i++) {
     var r = rows[i];
-    var isG = (r.slot === 'G');
+    var isG = (_auctSport() !== 'nba') && (r.slot === 'G');
     var a = _auctActualFor(r, box, sc);
     // A man who has not played yet still gets a row: the table prints a
     // line of em-dashes, which says "not yet" where no row at all says
@@ -191180,7 +191207,13 @@ function _auctGridFor(rows, box, leagueKey) {
         st[ord[j]] = Number(v);
       }
     }
-    byKey[key] = { stats: st, fp: a ? Math.round(a.fp * 10) / 10 : null };
+    // AUCTNBA -- THE RAW FIGURE. Pre-rounding here is what made one
+    // night read 0.8 on the card and 0.9 in the table: 0.85.toFixed(1)
+    // is "0.8" because the nearest double sits below it, while
+    // Math.round(0.85 * 10) is 9 because 0.85 * 10 is exactly 8.5.
+    // _rgTable formats with toFixed(1), the same as the card, so handing
+    // it the raw number makes the two agree by construction.
+    byKey[key] = { stats: st, fp: a ? a.fp : null };
     var row = { playerKey: key, name: r.name, teamAbbr: r.team,
                 selectedPos: r.slot, imageUrl: '' };
     (isG ? keepers : skaters).push(row);
@@ -191188,11 +191221,11 @@ function _auctGridFor(rows, box, leagueKey) {
   var h = '';
   var opt = { fp: true, totals: true, shapeBy: byKey };
   if (skaters.length) {
-    var t1 = _rgTable(skaters, byKey, meta, ord, 'nhl', opt);
+    var t1 = _rgTable(skaters, byKey, meta, ord, _auctSport(), opt);
     if (t1) { h += (keepers.length ? '<div class="rg-sect">Skaters</div>' : '') + t1; }
   }
   if (keepers.length) {
-    var t2 = _rgTable(keepers, byKey, meta, ord, 'nhl', opt);
+    var t2 = _rgTable(keepers, byKey, meta, ord, _auctSport(), opt);
     if (t2) { h += '<div class="rg-sect">Goaltenders</div>' + t2; }
   }
   return h;
@@ -191316,11 +191349,28 @@ function _auctLiveDiagHtml(live) {
 function _auctRender() {
   var host = document.getElementById('skAuctBody');
   if (!host) { return; }
+  // AUCTNBA -- the sport first, because it decides which leagues the
+  // select below can even offer.
+  var pills = '<div style="display:flex;gap:6px;margin:0 0 10px">';
+  var _sk, _sorder = ['nhl', 'nba'];
+  for (var _si = 0; _si < _sorder.length; _si++) {
+    _sk = _sorder[_si];
+    var _on = (_auctSport() === _sk);
+    pills += '<button onclick="_auctSetSport(\'' + _sk + '\')" ' +
+      'style="flex:1;padding:7px;border-radius:8px;font-size:12px;' +
+      'font-weight:700;cursor:pointer;' +
+      (_on ? 'background:#facc15;color:#111;border:0'
+           : 'background:transparent;color:rgba(255,255,255,0.55);' +
+             'border:1px solid rgba(255,255,255,0.14)') + '">' +
+      AUCT_SPORTS[_sk].label + '</button>';
+  }
+  pills += '</div>';
   var lgs = _auctLeagues();
   if (!lgs.length) {
-    host.innerHTML = '<div class="sk-wire-sheet-empty">No synced Yahoo ' +
-      'hockey POINTS league \u2014 Auction Night needs one number per ' +
-      'player, and a categories league does not have one.</div>';
+    host.innerHTML = pills + '<div class="sk-wire-sheet-empty">No synced ' +
+      'Yahoo ' + AUCT_SPORTS[_auctSport()].label + ' POINTS league \u2014 ' +
+      'Auction Night needs one number per player, and a categories league ' +
+      'does not have one.</div>';
     return;
   }
   var sel = '<select id="skAuctLeague" onchange="_auctPick(this.value)" ' +
@@ -191333,9 +191383,15 @@ function _auctRender() {
       skEscape(lgs[i].name || lgs[i].league_key) + '</option>';
   }
   sel += '</select>';
+  // AUCTNBA -- the roster, spelled out from the sport's own slots
+  // rather than a hard-coded string that would quietly stay hockey.
+  var _rl = '', _rs = _auctSlots(), _ri, _rj;
+  for (_ri = 0; _ri < _rs.length; _ri++) {
+    for (_rj = 0; _rj < _rs[_ri].n; _rj++) { _rl += (_rl ? ' ' : '') + _rs[_ri].k; }
+  }
   var sub = '<div class="sk-wire-sheet-section"><span class="ic">\ud83d\udcb0</span>' +
     'Tonight\u2019s board<span class="meta">' +
-    skEscape('$' + AUCT_BUDGET + ' \u00b7 C LW RW D D G') + '</span></div>';
+    skEscape('$' + AUCT_BUDGET + ' \u00b7 ' + _rl) + '</span></div>';
   var playable = !_auctState.note && _auctState.board &&
     _auctState.board.rows && _auctState.board.rows.length;
   // AUCTALL -- typing repaints the board, and a repaint replaces the
@@ -191349,7 +191405,7 @@ function _auctRender() {
       _caret = _ae.selectionStart;
     }
   } catch (eF) {}
-  host.innerHTML = sel +
+  host.innerHTML = pills + sel +
     (playable ? _auctBarHtml() : '') +
     (playable ? _auctCardHtml() : '') +
     _auctLastHtml() + sub +
@@ -191377,7 +191433,7 @@ function _auctPick(key) {
     _auctRender();
     return;
   }
-  dbpGetPool('nhl', false, null).then(function (pool) {
+  dbpGetPool(_auctSport(), false, null).then(function (pool) {
     try {
       _auctState.board = _auctBuildBoard(_auctState.leagueKey, pool);
       _auctState.note = '';
@@ -191409,7 +191465,7 @@ function _auctGamesHtml() {
         (rec.n === 1 ? '' : 's');
     }
   } catch (e) {}
-  if (!sub) { sub = 'Draft six men inside $18 against the house'; }
+  if (!sub) { sub = 'Draft six men inside $' + AUCT_BUDGET + ' against the house'; }
   h += '<div class="ld-tool-item" onclick="closeGames(); openAuctionNight();">' +
     '<div class="ld-tool-icon">\ud83d\udcb0</div>' +
     '<div class="ld-tool-name">Auction Night' +
@@ -191750,13 +191806,41 @@ function dbpCacheLoad(sport) {
 //
 // Step one is the price board and nothing else. The bidding and the house
 // are only worth building on prices that read as money.
-var AUCT_SLOTS = [
-  { k: 'C',  label: 'Centre',     n: 1 },
-  { k: 'LW', label: 'Left wing',  n: 1 },
-  { k: 'RW', label: 'Right wing', n: 1 },
-  { k: 'D',  label: 'Defence',    n: 2 },
-  { k: 'G',  label: 'Goalie',     n: 1 }
-];
+// AUCTNBA -- everything that used to be hockey, named per sport.
+var AUCT_SPORTS = {
+  nhl: {
+    label: 'NHL', pro: 'fhl', box: 'hockey/nhl', split: true,
+    slots: [
+      { k: 'C',  label: 'Centre',     n: 1 },
+      { k: 'LW', label: 'Left wing',  n: 1 },
+      { k: 'RW', label: 'Right wing', n: 1 },
+      { k: 'D',  label: 'Defence',    n: 2 },
+      { k: 'G',  label: 'Goalie',     n: 1 }
+    ]
+  },
+  nba: {
+    label: 'NBA', pro: 'fba', box: 'basketball/nba', split: false,
+    slots: [
+      { k: 'PG',   label: 'Point guard',  n: 1 },
+      { k: 'SG',   label: 'Shooting guard', n: 1 },
+      { k: 'SF',   label: 'Small forward', n: 1 },
+      { k: 'PF',   label: 'Power forward', n: 1 },
+      { k: 'C',    label: 'Centre',       n: 1 },
+      // UTIL takes anyone, so it has no section of its own on the board:
+      // one Jokic, who lands at centre or at utility depending on what
+      // is already filled. Duplicating him under a UTIL heading would
+      // make the same man look like two choices.
+      { k: 'UTIL', label: 'Utility',      n: 1, any: true }
+    ]
+  }
+};
+
+function _auctSport() {
+  var sp = String(_auctState.sport || 'nhl').toLowerCase();
+  return AUCT_SPORTS[sp] ? sp : 'nhl';
+}
+function _auctCfg() { return AUCT_SPORTS[_auctSport()]; }
+function _auctSlots() { return _auctCfg().slots; }
 // AUCTTIER -- Yahoo's ratio. Perfect 5 gives five men fifteen dollars,
 // three a man. Six slots at the same rate is eighteen, and the shape of
 // the decision falls straight out of it: six $5 men would cost thirty,
@@ -191806,7 +191890,7 @@ var _auctState = { leagueKey: '', board: null, note: '',
                    lineup: [], house: [], strategy: '', locked: false,
                    live: null, liveAt: 0, liveBusy: false, timer: null,
                    q: '', fPrice: 0, nightIdx: 0, lastBox: null,
-                   recomputed: false };
+                   recomputed: false, sport: 'nhl' };
 
 // AUCTPLAY -- the four opponents. A single optimiser would build the
 // same side every night, and so would he off the same column, which is
@@ -191874,20 +191958,29 @@ function _auctDrawLot(list, want, rnd) {
 }
 
 // AUCTTIER -- how many men a roster holds, which the budget line needs
-// and which must come from AUCT_SLOTS rather than a second constant
+// and which must come from _auctSlots() rather than a second constant
 // that could drift away from it.
 function _auctSeats() {
   var n = 0, i;
-  for (i = 0; i < AUCT_SLOTS.length; i++) { n += AUCT_SLOTS[i].n; }
+  for (i = 0; i < _auctSlots().length; i++) { n += _auctSlots()[i].n; }
   return n;
 }
 
 // Which of our five slots a pool player can fill. ESPN's own position
 // string is the source; a player eligible at more than one is placed at
 // the first that matches, which is how the board stays one row per man.
-function _auctSlotOf(p) {
+function _auctSlotOf(p, sport) {
   var pos = String((p && p.pos) || '').toUpperCase();
   if (!pos) { return ''; }
+  if ((sport || _auctSport()) === 'nba') {
+    if (pos === 'PG' || pos === 'SG' || pos === 'SF' || pos === 'PF' ||
+        pos === 'C') { return pos; }
+    // ESPN also files a man as a bare guard or forward. Put him at the
+    // nearer of the two rather than dropping him off the board.
+    if (pos.indexOf('G') > -1) { return 'SG'; }
+    if (pos.indexOf('F') > -1) { return 'SF'; }
+    return '';
+  }
   if (pos.indexOf('G') === 0) { return 'G'; }
   if (pos.indexOf('D') === 0) { return 'D'; }
   if (pos.indexOf('LW') > -1) { return 'LW'; }
@@ -191911,8 +192004,12 @@ function _auctScoring(leagueKey) {
   } catch (e) { set = null; }
   var stats = (set && set.stats) || null;
   if (!stats) { return out; }
-  var mapS = (typeof _FPP_YAHOO_MAP !== 'undefined' && _FPP_YAHOO_MAP.nhl_skater) || {};
-  var mapG = (typeof _FPP_YAHOO_MAP !== 'undefined' && _FPP_YAHOO_MAP.nhl_goalie) || {};
+  // AUCTNBA -- basketball has one map; hockey splits it by role.
+  var _isN = (_auctSport() === 'nba');
+  var mapS = (typeof _FPP_YAHOO_MAP !== 'undefined'
+    && (_isN ? _FPP_YAHOO_MAP.nba : _FPP_YAHOO_MAP.nhl_skater)) || {};
+  var mapG = (typeof _FPP_YAHOO_MAP !== 'undefined'
+    && (_isN ? _FPP_YAHOO_MAP.nba : _FPP_YAHOO_MAP.nhl_goalie)) || {};
   var sid;
   for (sid in stats) {
     if (!stats.hasOwnProperty(sid)) { continue; }
@@ -192047,16 +192144,37 @@ function _auctMaxAfford(rows) {
 
 function _auctSlotCap(slot) {
   var i;
-  for (i = 0; i < AUCT_SLOTS.length; i++) {
-    if (AUCT_SLOTS[i].k === slot) { return AUCT_SLOTS[i].n; }
+  for (i = 0; i < _auctSlots().length; i++) {
+    if (_auctSlots()[i].k === slot) { return _auctSlots()[i].n; }
   }
   return 0;
 }
 
+// AUCTNBA -- counted by the SEAT a man occupies, not his position. A
+// second centre is legal when he is sitting at utility.
 function _auctSlotUsed(rows, slot) {
   var n = 0, i;
-  for (i = 0; i < rows.length; i++) { if (rows[i].slot === slot) { n++; } }
+  for (i = 0; i < rows.length; i++) {
+    if ((rows[i].seat || rows[i].slot) === slot) { n++; }
+  }
   return n;
+}
+
+// Which seat this man would take, or '' if there is none for him. His
+// own position first; a flexible seat only when it is full.
+function _auctSeatFor(rows, row) {
+  var sl = _auctSlots(), i;
+  for (i = 0; i < sl.length; i++) {
+    if (sl[i].any) { continue; }
+    if (sl[i].k === row.slot && _auctSlotUsed(rows, sl[i].k) < sl[i].n) {
+      return sl[i].k;
+    }
+  }
+  for (i = 0; i < sl.length; i++) {
+    if (!sl[i].any) { continue; }
+    if (_auctSlotUsed(rows, sl[i].k) < sl[i].n) { return sl[i].k; }
+  }
+  return '';
 }
 
 // Why a man cannot be taken, in words, or '' if he can.
@@ -192064,8 +192182,10 @@ function _auctWhyNot(rows, row) {
   var i;
   for (i = 0; i < rows.length; i++) { if (rows[i].id === row.id) { return ''; } }
   if (rows.length >= _auctSeats()) { return 'roster full'; }
-  if (_auctSlotUsed(rows, row.slot) >= _auctSlotCap(row.slot)) {
-    return row.slot + ' already filled';
+  if (!_auctSeatFor(rows, row)) {
+    var _any = false, _sl = _auctSlots(), _i;
+    for (_i = 0; _i < _sl.length; _i++) { if (_sl[_i].any) { _any = true; } }
+    return _any ? (row.slot + ' and utility filled') : (row.slot + ' already filled');
   }
   if (row.price > _auctMaxAfford(rows)) { return 'not enough left'; }
   return '';
@@ -192085,30 +192205,43 @@ function _auctStratScore(r, strat) {
 
 // One legal six, built to a strategy.
 function _auctHouseDraft(rows, strat, rnd) {
-  var seats = [], i, j;
-  for (i = 0; i < AUCT_SLOTS.length; i++) {
-    for (j = 0; j < AUCT_SLOTS[i].n; j++) { seats.push(AUCT_SLOTS[i].k); }
+  var seats = [], i, j, _sl = _auctSlots();
+  for (i = 0; i < _sl.length; i++) {
+    for (j = 0; j < _sl[i].n; j++) {
+      seats.push({ k: _sl[i].k, any: !!_sl[i].any });
+    }
   }
-  // SHUFFLED, or a strategy always spends its money wherever AUCT_SLOTS
+  // SHUFFLED, or a strategy always spends its money wherever _auctSlots()
   // happens to begin -- every stars night would buy a $5 centre and punt
   // the goalie. Same night seed, so the house holds all evening.
   for (i = seats.length - 1; i > 0; i--) {
     var sw = Math.floor(rnd() * (i + 1));
     var tmp = seats[i]; seats[i] = seats[sw]; seats[sw] = tmp;
   }
+  // A flexible seat is filled LAST whatever the shuffle says, or it eats
+  // the best man available and the named seats are left with scraps --
+  // which is not how anyone fills a utility slot.
+  seats.sort(function (a, b) { return (a.any ? 1 : 0) - (b.any ? 1 : 0); });
   var picked = [], taken = {};
   for (i = 0; i < seats.length; i++) {
     var maxA = _auctMaxAfford(picked);
     var best = null, bestSc = -1e18;
     for (j = 0; j < rows.length; j++) {
       var r = rows[j];
-      if (r.slot !== seats[i] || taken[r.id] || r.price > maxA) { continue; }
+      if (!seats[i].any && r.slot !== seats[i].k) { continue; }
+      if (taken[r.id] || r.price > maxA) { continue; }
       var sc = _auctStratScore(r, strat);
       if (sc > bestSc) { bestSc = sc; best = r; }
     }
     // A slot the night could not fill leaves a seat empty rather than
     // stopping the draft -- his rule: score the men you did get.
-    if (best) { picked.push(best); taken[best.id] = true; }
+    if (best) {
+      var bc = {}, bk;
+      for (bk in best) { if (best.hasOwnProperty(bk)) { bc[bk] = best[bk]; } }
+      bc.seat = seats[i].k;
+      picked.push(bc);
+      taken[best.id] = true;
+    }
   }
   return picked;
 }
@@ -192164,7 +192297,7 @@ function _auctWriteCard(date, leagueKey, card) {
 // after the date has rolled past it.
 function _auctSlateGids() {
   var out = [], seen = {}, slate = null;
-  try { slate = (typeof _allInSlate === 'function') ? _allInSlate('nhl') : null; } catch (e) { return out; }
+  try { slate = (typeof _allInSlate === 'function') ? _allInSlate(_auctSport()) : null; } catch (e) { return out; }
   if (!slate) { return out; }
   for (var k in slate.byAbbr) {
     if (!slate.byAbbr.hasOwnProperty(k)) { continue; }
@@ -192186,7 +192319,8 @@ function _auctSnap(rows) {
   for (i = 0; i < rows.length; i++) {
     r = rows[i];
     out.push({ id: r.id, name: r.name, slot: r.slot, team: r.team,
-               price: r.price, fp: r.fp, inj: r.inj || '' });
+               price: r.price, fp: r.fp, inj: r.inj || '',
+               seat: r.seat || r.slot });
   }
   return out;
 }
@@ -192200,6 +192334,7 @@ function _auctSave() {
       strategy: _auctState.strategy,
       locked: !!_auctState.locked,
       gids: _auctState.gids || [],
+      sport: _auctSport(),
       recomputed: !!_auctState.recomputed,
       settled: !!_auctState.settled,
       my: _auctState.my, houseScore: _auctState.houseScore,
@@ -192444,7 +192579,8 @@ function _auctCheckLastNight() {
   _auctLiveFetch(false, ln.card.gids).then(function (box) {
     if (!box) { return; }
     _auctState.lastBox = box;
-    var row = _auctSettleNight(ln.date, _auctState.leagueKey, ln.card, box, 'nhl');
+    var row = _auctSettleNight(ln.date, _auctState.leagueKey, ln.card, box,
+      ln.card.sport || _auctSport());
     if (row) {
       _auctState.last = { date: ln.date, card: ln.card };
       _auctRender();
@@ -192544,7 +192680,14 @@ function _auctTap(id) {
     }
   }
   if (_auctWhyNot(_auctState.lineup, row)) { return; }
-  _auctState.lineup.push(row);
+  // AUCTNBA -- a COPY carrying the seat he took. The board row is shared
+  // with the board itself, and writing a seat onto it would make the
+  // same object mean different things in two places.
+  var seat = _auctSeatFor(_auctState.lineup, row);
+  var cp = {}, ck;
+  for (ck in row) { if (row.hasOwnProperty(ck)) { cp[ck] = row[ck]; } }
+  cp.seat = seat;
+  _auctState.lineup.push(cp);
   _auctSave();
   _auctRender();
 }
@@ -192643,6 +192786,21 @@ var _AUCT_BOX_IGNORE = {
   'GV': 1, 'TK': 1, 'SHFT': 1, 'PN': 1, 'SM': 1, 'YTDG': 1,
   'TOI': 1, 'GP': 1, 'G/A': 1, 'MIN': 1, 'SAVE%': 1
 };
+// AUCTNBA -- a basketball line. Field goals, threes and free throws
+// arrive as made-attempted pairs ("8-15") and the figure Yahoo scores is
+// the first of them.
+var _AUCT_BOX_NBA = {
+  'PTS': 'pts', 'POINTS': 'pts',
+  'REB': 'reb', 'TOT': 'reb', 'TREB': 'reb',
+  'OREB': 'oreb', 'DREB': 'dreb',
+  'AST': 'ast', 'STL': 'stl', 'BLK': 'blk',
+  'TO': 'to', 'TOV': 'to',
+  'FG': 'fgm', '3PT': 'tpm', 'FT': 'ftm'
+};
+var _AUCT_BOX_NBA_IGNORE = {
+  'MIN': 1, 'PF': 1, '+/-': 1, 'FG%': 1, '3P%': 1, 'FT%': 1, 'STARTER': 1
+};
+
 var _AUCT_BOX_GOALIE = {
   'SA': 'sa', 'SHOTS AGAINST': 'sa',
   'GA': 'ga', 'GOALS AGAINST': 'ga',
@@ -192659,6 +192817,12 @@ var _AUCT_BOX_GOALIE = {
 function _auctBoxNum(v) {
   if (v == null) { return 0; }
   var t = String(v);
+  // AUCTNBA -- "8-15" is eight made of fifteen, not eight hundred and
+  // fifteen. Stripping the dash the way the old parse did would have
+  // credited a man 815 field goals and scored the night in the
+  // thousands.
+  var mm = /^(-?\d+(?:\.\d+)?)\s*-\s*\d+(?:\.\d+)?$/.exec(t);
+  if (mm) { return Number(mm[1]) || 0; }
   // "12:34" is ice time, not a count; "1-2" is a made-attempted pair.
   if (t.indexOf(':') > -1) {
     var mm = t.split(':');
@@ -192697,14 +192861,16 @@ function _auctParseBox(j, out) {
     for (s2 = 0; s2 < grps.length; s2++) {
       var grp = grps[s2] || {};
       var ty = String(grp.type || grp.name || '').toLowerCase();
-      var isG = (ty.indexOf('goalie') > -1 || ty.indexOf('goaltend') > -1);
-      var map = isG ? _AUCT_BOX_GOALIE : _AUCT_BOX_SKATER;
+      var _nba = (_auctSport() === 'nba');
+      var isG = !_nba && (ty.indexOf('goalie') > -1 || ty.indexOf('goaltend') > -1);
+      var map = _nba ? _AUCT_BOX_NBA : (isG ? _AUCT_BOX_GOALIE : _AUCT_BOX_SKATER);
+      var ign = _nba ? _AUCT_BOX_NBA_IGNORE : _AUCT_BOX_IGNORE;
       var labs = grp.labels || [];
       var ath = grp.athletes || [];
       for (L = 0; L < labs.length; L++) {
         var up = String(labs[L]).toUpperCase();
         out.labels[up] = 1;
-        if (!map[up] && !_AUCT_BOX_IGNORE[up]) { out.unmapped[up] = 1; }
+        if (!map[up] && !ign[up]) { out.unmapped[up] = 1; }
       }
       for (a = 0; a < ath.length; a++) {
         var row = ath[a] || {}, st = row.stats || [];
@@ -192715,8 +192881,24 @@ function _auctParseBox(j, out) {
         }
         // A league that scores POINTS off a box score with no P column:
         // goals plus assists is the definition, not an estimate.
-        if (!isG && line.pts == null && (line.g != null || line.a != null)) {
+        if (!_nba && !isG && line.pts == null && (line.g != null || line.a != null)) {
           line.pts = (line.g || 0) + (line.a || 0);
+        }
+        // AUCTNBA -- a double-double is not a box score column either; it
+        // is a fact about the line, and plenty of points leagues pay for
+        // it. Counted the way everyone counts it: ten or more in two of
+        // points, rebounds, assists, steals and blocks.
+        if (_nba) {
+          var _tens = 0, _tk, _TT = ['pts', 'reb', 'ast', 'stl', 'blk'];
+          for (_tk = 0; _tk < _TT.length; _tk++) {
+            if (Number(line[_TT[_tk]]) >= 10) { _tens++; }
+          }
+          if (!line.reb && (line.oreb != null || line.dreb != null)) {
+            line.reb = (line.oreb || 0) + (line.dreb || 0);
+          }
+          line.dd = (_tens >= 2) ? 1 : 0;
+          line.td = (_tens >= 3) ? 1 : 0;
+          line._ddDerived = true;
         }
         var at = row.athlete || {};
         var id = at.id != null ? String(at.id) : '';
@@ -192779,7 +192961,8 @@ function _auctLiveFetch(force, gids) {
       // A final game never changes, so it is fetched once and kept.
       if (c && c.final && !force) { jobs.push(Promise.resolve(c.json)); return; }
       if (c && !force && (now - c.at) < 25000) { jobs.push(Promise.resolve(c.json)); return; }
-      jobs.push(fetch('https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/summary?event=' +
+      jobs.push(fetch('https://site.api.espn.com/apis/site/v2/sports/' +
+        _auctCfg().box + '/summary?event=' +
         encodeURIComponent(gid)).then(function (r) {
           return r.ok ? r.json() : null;
         }).then(function (j) {
@@ -192840,16 +193023,16 @@ function _auctBuildBoard(leagueKey, pool) {
     return out;
   }
   var slate = null;
-  try { slate = (typeof _allInSlate === 'function') ? _allInSlate('nhl') : null; } catch (e) {}
+  try { slate = (typeof _allInSlate === 'function') ? _allInSlate(_auctSport()) : null; } catch (e) {}
   if (!slate || !slate.games) {
-    out.note = 'No NHL games on tonight\u2019s slate.';
+    out.note = 'No ' + _auctCfg().label + ' games on tonight\u2019s slate.';
     return out;
   }
   var proMap = null;
   try {
     var seas = (typeof dbpSeason === 'function') ? dbpSeason() : null;
     proMap = (typeof _espProTeams !== 'undefined' && _espProTeams)
-      ? _espProTeams['fhl:' + seas] : null;
+      ? _espProTeams[_auctCfg().pro + ':' + seas] : null;
   } catch (e2) { proMap = null; }
   var list = (pool && pool.players) || pool || [];
   out.pool = list.length;
@@ -192857,7 +193040,7 @@ function _auctBuildBoard(leagueKey, pool) {
   for (i = 0; i < list.length; i++) {
     var p = list[i];
     if (!p) { continue; }
-    var slot = _auctSlotOf(p);
+    var slot = _auctSlotOf(p, _auctSport());
     if (!slot) { continue; }
     var ab = '';
     try {
@@ -192865,7 +193048,7 @@ function _auctBuildBoard(leagueKey, pool) {
       ab = (pm && (pm.abbrev || pm.abbr || pm.name)) || (typeof pm === 'string' ? pm : '');
     } catch (e3) { ab = ''; }
     if (!ab) { continue; }
-    var canon = (typeof _allInCanon === 'function') ? _allInCanon(ab, 'nhl') : String(ab).toUpperCase();
+    var canon = (typeof _allInCanon === 'function') ? _allInCanon(ab, _auctSport()) : String(ab).toUpperCase();
     if (!slate.byAbbr[canon]) { continue; }
     out.onSlate++;
     // AUCTLOT -- THE SLATE JOIN ASKS WHETHER HIS CLUB PLAYS, NEVER
@@ -192908,8 +193091,8 @@ function _auctBuildBoard(leagueKey, pool) {
   try { dateSeed = (typeof _todayDateString === 'function') ? _todayDateString() : ''; } catch (eD) { dateSeed = ''; }
   var rnd = _auctRng('auct|' + dateSeed + '|' + String(leagueKey || ''));
   var lot = [], si2;
-  for (si2 = 0; si2 < AUCT_SLOTS.length; si2++) {
-    var sl2 = AUCT_SLOTS[si2];
+  for (si2 = 0; si2 < _auctSlots().length; si2++) {
+    var sl2 = _auctSlots()[si2];
     var cand = bySlot[sl2.k] || [];
     cand.sort(function (a, b) { return b.fp - a.fp; });
     // AUCTALL -- no club-depth cap. The fourth-liner nobody has heard of
