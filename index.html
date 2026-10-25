@@ -190846,6 +190846,8 @@ function _auctBoardHtml(b) {
     b.pool + ' in pool \u00b7 ' + b.onSlate + ' on tonight\u2019s slate \u00b7 ' +
     (b.hurt ? (b.hurt + ' not dressing \u00b7 ') : '') +
     b.priced + ' priced \u00b7 ' + (b.lot || b.rows.length) + ' drawn' +
+    ' \u00b7 $ vs ' + (AUCT_PRICE_VS === 'floor'
+      ? 'worst drawn' : 'best unsold') +
     (b.cats.length ? (' \u00b7 scoring: ' + skEscape(b.cats.slice(0, 14).join(' ')) ) : '') +
     (b.missed.length ? (' \u00b7 unmapped: ' + skEscape(b.missed.slice(0, 8).join(' '))) : '') +
     '</div>';
@@ -190863,6 +190865,20 @@ function _auctBoardHtml(b) {
       skEscape(up) + '. That league scores none of the categories those ' +
       'positions earn in.</div>';
   }
+  // AUCTTEN -- what a dollar actually means, because ten deep at a slot
+  // the game buys two from, most of the board IS a dollar and that is
+  // information rather than a gap. A dollar man is not a bad player, he
+  // is a free one: nobody has a reason to bid against you for him.
+  diag += '<div class="rg-foot">A price is the most worth paying \u2014 ' +
+    'past it you are better off with the next man down. $1 means nobody ' +
+    'has a reason to outbid you, not that he cannot score.</div>';
+  // AUCTTEN -- a light night. Say which slots nobody is available for,
+  // because the game carries on and scores whoever did get drafted.
+  if (b.empty && b.empty.length) {
+    diag += '<div class="rg-foot" style="color:#f59e0b">Nobody available ' +
+      'tonight at ' + skEscape(b.empty.join(', ')) + ' \u2014 those slots ' +
+      'go unfilled and the night scores the men you did draft.</div>';
+  }
   if (!b.rows.length) {
     return '<div class="sk-wire-sheet-empty">' + skEscape(b.note || 'Nothing to price.') +
       '</div>' + diag;
@@ -190876,7 +190892,7 @@ function _auctBoardHtml(b) {
     }
     if (!list.length) { continue; }
     var head = '<tr><th class="rg-p">' + skEscape(sl.label) +
-      '</th><th>Proj</th><th>Over repl</th><th>$</th></tr>';
+      '</th><th>Proj</th><th>Over repl</th><th>Max $</th></tr>';
     var body = '';
     for (i = 0; i < list.length && i < 30; i++) {
       var r = list[i];
@@ -191285,18 +191301,33 @@ var AUCT_SLOTS = [
 ];
 var AUCT_BUDGET = 100;
 var AUCT_TEAMS = 2;          // him and the house
-// AUCTLOT -- one unsold man per slot. Twelve get bought, seventeen are
-// drawn, and the five left over ARE replacement. That is the whole
-// pricing model now: AUCT_DEPTH approximated a spare because the board
-// had none, and a board with a real one does not need the guess.
-var AUCT_LOT_SPARE = 1;
+// AUCTTEN -- ten a position, because three was not a menu: two of the
+// three got bought, so the only choice was which of two near-identical
+// men to overpay for. A light night draws whatever it can and the board
+// says so rather than pretending.
+var AUCT_LOT_N = 10;
 // How sharply the draw favours the top of the slate. Each slot's list is
 // cut into bands at n*(i/want)^AUCT_LOT_CURVE and one man is taken from
-// each, so a curve of 1 is even thirds and anything above it narrows the
-// top band: at 2, the first of three bands is the top ninth. That keeps
-// a genuine star on the board most nights while the last band stays a
-// real drop-off, which is where the price gradient comes from.
-var AUCT_LOT_CURVE = 2;
+// each, so a curve of 1 is even bands and anything above it narrows the
+// top. At 1.6, ten drawn from forty-six lands near ranks 1, 2, 5, 8, 12,
+// 17, 23, 29, 35 and 42 -- a genuine star at the top most nights, a
+// genuine scrub at the bottom, and a real gradient in between. That
+// gradient is the entire reason the dollars mean anything.
+var AUCT_LOT_CURVE = 1.6;
+// WHICH MAN A PRICE IS MEASURED AGAINST. Both are defensible and they
+// say different things, so the board prints which one it used.
+//
+//   'spare' -- the best man left UNSOLD, which in a two-team league is
+//              the third centre. This is the true clearing price: if
+//              you lose both centre bids, he is what you get, so no one
+//              should ever pay more than the gap. Honest, and it leaves
+//              seven of ten centres at a dollar -- which is correct,
+//              and is exactly the stars-and-scrubs tail.
+//   'floor' -- the WORST man drawn. Not a clearing price; the baseline
+//              a printed value sheet uses. Every row grades and only
+//              one man is a dollar, at the cost of overstating what the
+//              middle of the board can actually be bought for.
+var AUCT_PRICE_VS = 'spare';
 var _auctState = { leagueKey: '', board: null, note: '' };
 
 // AUCTLOT -- the same night draws the same lot.
@@ -191469,8 +191500,16 @@ function _auctPrice(rows) {
     var list = bySlot[sl.k] || [];
     list.sort(function (a, b) { return b.fp - a.fp; });
     var need = sl.n * AUCT_TEAMS;
-    var repl = (list.length > need) ? list[need].fp
-             : (list.length ? list[list.length - 1].fp : 0);
+    // AUCTTEN -- 'spare' is the best man nobody buys; 'floor' is the
+    // worst man drawn. With a short list both collapse to the last man,
+    // which is the right answer on a light night either way.
+    var repl;
+    if (AUCT_PRICE_VS === 'floor') {
+      repl = list.length ? list[list.length - 1].fp : 0;
+    } else {
+      repl = (list.length > need) ? list[need].fp
+           : (list.length ? list[list.length - 1].fp : 0);
+    }
     for (var j = 0; j < list.length; j++) {
       list[j].repl = repl;
       list[j].vorp = list[j].fp - repl;
@@ -191495,7 +191534,7 @@ function _auctPrice(rows) {
 // Tonight's priced board, or a note saying which join came up empty.
 function _auctBuildBoard(leagueKey, pool) {
   var out = { rows: [], note: '', pool: 0, onSlate: 0, hurt: 0, priced: 0,
-              lot: 0, cats: [], missed: [], unpriced: {} };
+              lot: 0, cats: [], missed: [], unpriced: {}, empty: [] };
   var scoring = _auctScoring(leagueKey);
   out.cats = scoring.read;
   out.missed = scoring.missed;
@@ -191578,8 +191617,19 @@ function _auctBuildBoard(leagueKey, pool) {
     var sl2 = AUCT_SLOTS[si2];
     var cand = bySlot[sl2.k] || [];
     cand.sort(function (a, b) { return b.fp - a.fp; });
-    var want = (sl2.n * AUCT_TEAMS) + AUCT_LOT_SPARE;
+    // AUCTTEN -- ten where the night allows it, everything available
+    // where it does not. Never fewer than the slot buys plus a spare,
+    // so a thin position still has someone to fall back on if one is
+    // there at all.
+    var want = Math.min(AUCT_LOT_N, cand.length);
+    if (want < cand.length && want < (sl2.n * AUCT_TEAMS) + 1) {
+      want = Math.min(cand.length, (sl2.n * AUCT_TEAMS) + 1);
+    }
     var drawn = _auctDrawLot(cand, want, rnd);
+    // A slot the night cannot fill at all is named rather than dropped:
+    // a board quietly missing right wing looks broken, and the game is
+    // meant to carry on and score whoever did get drafted.
+    if (!drawn.length) { out.empty.push(sl2.k); }
     for (var di = 0; di < drawn.length; di++) { lot.push(drawn[di]); }
   }
   out.rows = lot;
