@@ -132276,6 +132276,12 @@ async function skScanWireLeague(league) {
       }
       // Cats leagues don't have FP — MVP / bench burn are points-only
       // concepts. v2 could surface "best stat line" instead.
+    } else if (scoringType === 'roto') {
+      // ROTOWIRE -- roto has no daily matchup, which is not the same
+      // thing as an unsupported format. It files an entry like any
+      // other and the sheet draws its category ladder; the card's
+      // movement line was already reading the rank history.
+      entry.scoringType = 'roto';
     } else {
       entry.error = 'Scoring type not supported: ' + scoringType;
     }
@@ -133205,6 +133211,152 @@ function _skWireFmtRowHtml(counts, total) {
   return h + '</div>';
 }
 
+// \u2500\u2500 ROTOWIRE \u2500\u2500 The category ladder for a roto league.
+//
+// Reads _skRotoLiveView's output rather than deriving anything: that
+// function builds the season ladder and the live one from the SAME
+// derivation on purpose, and measuring a gap between a live figure and a
+// published one would report the distance between two measurements
+// instead of between two teams.
+function _skRotoLedgerView(league) {
+  if (!league) { return null; }
+  try {
+    if (league.provider === 'espn') {
+      return (typeof _espRotoLiveView === 'function') ? _espRotoLiveView(league) : null;
+    }
+    var data = (typeof skLeagueData === 'object' && skLeagueData)
+      ? skLeagueData[league.league_key] : null;
+    if (!data) { return null; }
+    return (typeof _skRotoLiveView === 'function') ? _skRotoLiveView(league, data) : null;
+  } catch (e) { return null; }
+}
+
+// Lower is better for GAA, ERA and their kind; sortOrder 0 is how the
+// rest of this file already says so.
+function _skRotoCatLow(meta) {
+  return !!(meta && Number(meta.sortOrder) === 0);
+}
+
+function _skRotoFmtNum(v) {
+  if (v == null || v === '' || isNaN(v)) { return '\u2014'; }
+  var n = Number(v);
+  if (n === Math.round(n)) { return String(n); }
+  return (Math.abs(n) < 10) ? n.toFixed(2) : n.toFixed(1);
+}
+
+// One category's neighbours on the live ladder: who is one place above
+// and one below, and by how much.
+function _skRotoCatGap(lv, sid, low) {
+  var all = (lv.data && lv.data.allTeams) || {}, rows = [], k;
+  for (k in all) {
+    if (!all.hasOwnProperty(k)) { continue; }
+    var cs = all[k] && all[k].catStats;
+    var v = cs ? cs[sid] : null;
+    if (v == null || v === '' || isNaN(v)) { continue; }
+    rows.push({ k: k, v: Number(v) });
+  }
+  if (rows.length < 2) { return null; }
+  rows.sort(function (a, b) { return low ? (a.v - b.v) : (b.v - a.v); });
+  var mine = -1, i;
+  for (i = 0; i < rows.length; i++) { if (rows[i].k === lv.myKey) { mine = i; break; } }
+  if (mine < 0) { return null; }
+  var up = (mine > 0) ? Math.abs(rows[mine - 1].v - rows[mine].v) : null;
+  var down = (mine < rows.length - 1) ? Math.abs(rows[mine].v - rows[mine + 1].v) : null;
+  return { place: mine + 1, of: rows.length, up: up, down: down };
+}
+
+// ROTOWIRE -- where a point is actually within reach.
+//
+// In roto a category you are two steals from gaining a place in is worth
+// more attention than one you are buried in, and nothing in the app says
+// which is which. Both figures come off the SAME live ladder -- measuring
+// against a published total instead would report the distance between two
+// measurements rather than between two teams.
+function _skRotoGapHtml(lv) {
+  if (!lv || !lv.myKey || !lv.order || !lv.order.length) { return ''; }
+  var all = (lv.data && lv.data.allTeams) || {};
+  var meRow = all[lv.myKey];
+  if (!meRow) { return ''; }
+  var meta = lv.statsMeta || {};
+  var liveStats = meRow.catStats || {};
+  var head = '<tr><th class="rg-p">Category</th><th>Total</th><th>Rank</th>' +
+             '<th>To next</th><th>Cushion</th></tr>';
+  var rows = [], i;
+  for (i = 0; i < lv.order.length; i++) {
+    var sid = String(lv.order[i]);
+    var m = meta[sid] || {};
+    if (m.isOnlyDisplayStat || m.enabled === false) { continue; }
+    var gap = _skRotoCatGap(lv, sid, _skRotoCatLow(m));
+    if (!gap) { continue; }
+    rows.push({ sid: sid, ab: m.abbr || m.displayName || ('#' + sid), gap: gap });
+  }
+  if (!rows.length) { return ''; }
+  // Closest first: the chase you could finish tonight belongs at the top,
+  // and a team already first in a category has nothing to chase at all.
+  rows.sort(function (a, b) {
+    var au = (a.gap.up == null) ? Infinity : a.gap.up;
+    var bu = (b.gap.up == null) ? Infinity : b.gap.up;
+    return au - bu;
+  });
+  var body = '';
+  for (i = 0; i < rows.length; i++) {
+    var r = rows[i], g = r.gap;
+    var upTxt = (g.up == null) ? '\u2014' : ('+' + _skRotoFmtNum(g.up));
+    var dnTxt = (g.down == null) ? '\u2014' : _skRotoFmtNum(g.down);
+    body += '<tr>' +
+      '<td class="rg-p"><div class="rg-nm">' + skEscape(r.ab) + '</div></td>' +
+      '<td>' + skEscape(_skRotoFmtNum(liveStats[r.sid])) + '</td>' +
+      '<td class="' + (g.place === 1 ? 'rg-best' : '') + '">' +
+        skEscape(_skWireOrdinal(g.place)) + '</td>' +
+      '<td class="' + (g.up == null ? 'rg-z' : 'rg-best') + '">' + upTxt + '</td>' +
+      '<td class="' + (g.down == null ? 'rg-z' : '') + '">' + dnTxt + '</td>' +
+    '</tr>';
+  }
+  return '<div class="rg-wrap"><table class="rg">' + head + body + '</table></div>';
+}
+
+// ROTOWIRE -- the sheet body for a roto league.
+function skBuildWireDetailRoto(entry) {
+  var league = entry && entry.league;
+  var lv = _skRotoLedgerView(league);
+  if (!lv) {
+    // _skRotoLiveView kicks off its own day load and answers null the
+    // first time. Saying so beats an empty panel.
+    return '<div class="sk-wire-sheet-empty">Building today\u2019s roto board\u2026 ' +
+           'reopen in a moment.</div>';
+  }
+  // The app's own ledger, not a second one.
+  var ledger = '';
+  try { ledger = _skRotoLedgerHtml(lv) || ''; } catch (eL) { ledger = ''; }
+  var gaps = _skRotoGapHtml(lv);
+  if (!ledger && !gaps) {
+    return '<div class="sk-wire-sheet-empty">No category totals yet.</div>';
+  }
+  var me = lv.me || null;
+  var head = '';
+  if (me && me.rankTo != null) {
+    var places = (me.rankFrom != null) ? (Number(me.rankFrom) - Number(me.rankTo)) : 0;
+    var gain = (me.ptsTo != null && me.ptsFrom != null)
+      ? Math.round((Number(me.ptsTo) - Number(me.ptsFrom)) * 10) / 10 : null;
+    var bits = [_skWireOrdinal(Number(me.rankTo)) + ' of ' + lv.teams];
+    if (places) {
+      bits.push((places > 0 ? 'up ' : 'down ') + Math.abs(places) + ' today');
+    }
+    if (gain) { bits.push((gain > 0 ? '+' : '') + gain + ' roto pts'); }
+    head = '<div class="sk-wire-sheet-section"><span class="ic">\ud83d\udcca</span>' +
+      'Category ladder<span class="meta">' + skEscape(bits.join(' \u00b7 ')) + '</span></div>';
+  } else {
+    head = '<div class="sk-wire-sheet-section"><span class="ic">\ud83d\udcca</span>' +
+      'Category ladder</div>';
+  }
+  var foot = gaps
+    ? ('<div class="rg-foot">Today \u00b7 gold is a category lead \u00b7 ' +
+       '\u201cto next\u201d is the distance to the place above</div>')
+    : '';
+  return head + ledger +
+    (gaps ? ('<div class="rg-dark rg-bleed">' + gaps + foot + '</div>') : '');
+}
+
 function _skWireMoveForLeague(league) {
   if (!league) return null;
   var st = String(league.scoring_type || '');
@@ -133751,6 +133903,18 @@ function skOpenWireDetail(leagueKey) {
     else if (entry.result === 'L') { rCls = 'loss'; rLabel = 'Loss'; }
     else if (entry.result === 'T') { rCls = 'tie';  rLabel = 'Tie'; }
     else if (entry.scoringType === 'point') { rCls = 'no'; rLabel = 'Solo'; }
+    // ROTOWIRE -- roto has no W/L, but it does have a direction. The
+    // badge carries the day's places rather than a dash.
+    else if (entry.scoringType === 'roto') {
+      var _rmv = (typeof _skWireMoveForLeague === 'function')
+        ? _skWireMoveForLeague(league) : null;
+      if (_rmv && _rmv.rankFrom != null && _rmv.rankTo != null &&
+          _rmv.rankFrom !== _rmv.rankTo) {
+        var _up = _rmv.rankFrom > _rmv.rankTo;
+        rCls = _up ? 'win' : 'loss';
+        rLabel = (_up ? '\u25b2' : '\u25bc') + Math.abs(_rmv.rankFrom - _rmv.rankTo);
+      } else { rCls = 'no'; rLabel = 'Roto'; }
+    }
     resultEl.className = 'sk-wire-sheet-result ' + rCls;
     resultEl.textContent = rLabel;
   }
@@ -133785,6 +133949,8 @@ function skOpenWireDetail(leagueKey) {
     var bodyHtml = '';
     if (entry.error) {
       bodyHtml = '<div class="sk-wire-sheet-empty">' + skEscape(entry.error) + '</div>';
+    } else if (entry.scoringType === 'roto') {
+      bodyHtml = skBuildWireDetailRoto(entry);
     } else if (entry.scoringType === 'head' || entry.scoringType === 'headone') {
       bodyHtml = skBuildWireDetailCats(entry);
     } else if (entry.scoringType === 'headpoint' || entry.scoringType === 'point') {
