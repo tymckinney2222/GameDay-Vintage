@@ -53700,6 +53700,23 @@ async function _skStadiumRefresh() {
     // 1) Re-pull all rosters (refreshes fyFullRosters + fyRosterCache + logos).
     if (typeof fyAutoLoadAllRosters === 'function') {
       try { fyRostersLoaded = false; } catch (e) {}
+      // STADREFRESH2 -- drop the cached roster answers BEFORE re-running
+      // the loader. The bulk split writes each league's roster with a
+      // five-minute life and the loader reads it straight back, so a tap
+      // inside that window re-ran the entire sweep against the same bytes
+      // and reported a refresh that had refreshed nothing.
+      //
+      // Roster paths only, and that includes the bulk one -- clearing the
+      // per-league copies while leaving the bulk answer cached would just
+      // refill them from it. Standings and settings are left alone; they
+      // are not what this button is for, and they are the expensive half.
+      try {
+        if (typeof fyDataCache === 'object' && fyDataCache) {
+          Object.keys(fyDataCache).forEach(function (_k) {
+            if (_k.indexOf('/roster') > -1) { delete fyDataCache[_k]; }
+          });
+        }
+      } catch (eRC) {}
       await fyAutoLoadAllRosters();
     }
     // 2) Bust today's FP cache and re-fetch for each of my teams.
@@ -125768,6 +125785,7 @@ async function skHydrateAll() {
     pump();
   });
   skHydrationInFlight = false;
+  _skBootMark('hydrate', queue.length ? '' : 'nothing to hydrate');
   skState.freshnessTs = Date.now();
   skUpdateFreshness();
   // After everything's loaded, refresh attention pill (it now has real data)
@@ -128087,6 +128105,7 @@ async function skScanPlan() {
     });
   });
   await Promise.all(scans);
+  _skBootMark('plan scan', synced.length + ' leagues \u00b7 pill resolves here');
   skPlanScanning = false;
   skPlanSetActiveTs(Date.now());
   if (scanDay === 'today') skPlanScannedToday = true;
@@ -201985,6 +202004,43 @@ function _fyRfAdd(a, b) {
   return a;
 }
 
+// BOOTCLOCK -- the readout. The gap column is the one that matters: a
+// step that took eleven seconds is the step to go and look at, and the
+// running total only says how far in it happened.
+function _skBootClockBlock() {
+  try {
+    if (!_skBootMarks || _skBootMarks.length < 2) { return ''; }
+    var t0 = _skBootMarks[0].t, prev = t0, rows = '', i;
+    function ms(v) {
+      return (v >= 1000) ? ((v / 1000).toFixed(1) + 's') : (v + 'ms');
+    }
+    for (i = 0; i < _skBootMarks.length; i++) {
+      var m = _skBootMarks[i];
+      var since = m.t - t0, gap = m.t - prev;
+      prev = m.t;
+      var col = (gap >= 8000) ? '#f87171' : (gap >= 3000 ? '#fbbf24' : '#4ade80');
+      rows += '<div style="display:flex;gap:8px;padding:3px 0;' +
+        (i ? 'border-top:1px solid rgba(255,255,255,0.06)' : '') + '">' +
+        '<span style="flex:1;color:#cbd5e1">' + skEscapeMaybe(m.n) +
+          (m.note ? ('<span style="color:#64748b"> · ' +
+            skEscapeMaybe(m.note) + '</span>') : '') + '</span>' +
+        '<span style="color:' + col + ';min-width:46px;text-align:right">+' +
+          ms(gap) + '</span>' +
+        '<span style="color:#64748b;min-width:46px;text-align:right">' +
+          ms(since) + '</span>' +
+        '</div>';
+    }
+    var total = _skBootMarks[_skBootMarks.length - 1].t - t0;
+    return '<div style="color:#94a3b8;font-size:11px;margin:16px 0 4px">' +
+      'Boot clock — ' + ms(total) + ' to the last mark</div>' +
+      '<div style="background:#0d1220;border:1px solid rgba(255,255,255,0.08);' +
+      'border-radius:8px;padding:8px;font-size:10px;line-height:1.5;color:#cbd5e1">' +
+      '<div style="color:#64748b;padding-bottom:4px">Middle column is the ' +
+      'gap from the step before — that is the one to read. Right is the ' +
+      'running total from the first Yahoo call.</div>' + rows + '</div>';
+  } catch (e) { return ''; }
+}
+
 function _fyRosterFieldsBlock() {
   try {
     if (typeof fyDataCache !== 'object' || !fyDataCache) { return ''; }
@@ -202345,6 +202401,7 @@ function skShowApiHealth() {
     _rgWhyBlock() +
     // BULKDIAG -- why a bulk call filled nothing, with the shape to prove it.
     _fyBulkDiagBlock() +
+    _skBootClockBlock() +
     _fyRosterFieldsBlock() +
     // BLACKOUT -- the probe's answer, which must never go missing again.
     _fyEdgeBlock() +
@@ -203443,6 +203500,25 @@ function _fyErrDetail(status, body) {
 // could fire a dozen calls in a few hundred milliseconds. Every request
 // now passes through one queue with a minimum gap, which caps the burst
 // rate without slowing normal single-call use perceptibly.
+// BOOTCLOCK -- the chain the roster pill waits on, timed.
+//
+// First one wins, so a mark laid in something that runs per league
+// records the first league and not the last. The zero point is the first
+// Yahoo call rather than page load, because everything before that is
+// parse and paint and is not what anyone means by "it took thirty
+// seconds to load".
+var _skBootMarks = [];
+function _skBootMark(name, note) {
+  try {
+    for (var _bm = 0; _bm < _skBootMarks.length; _bm++) {
+      if (_skBootMarks[_bm].n === name) { return; }
+    }
+    if (_skBootMarks.length > 24) { return; }
+    _skBootMarks.push({ n: String(name), t: Date.now(),
+      note: (note == null) ? '' : String(note) });
+  } catch (e) {}
+}
+
 var _fyPaceChain = Promise.resolve();
 var _fyLastCallTs = 0;
 var FY_MIN_GAP_MS = 120;
@@ -203520,6 +203596,7 @@ function _fyPace() {
 }
 
 async function _fyApiOnce(path, isRetry) {
+  _skBootMark('first Yahoo call');
   var token = await fyGetToken();
   if (!token) {
     // FYREFKEEP — two very different situations used to land here together.
@@ -204856,7 +204933,10 @@ async function fyAutoLoadAllRosters() {
   // LEAGUEBATCH -- and buy the standings and settings in bulk first, so
   // the fan-out below finds them already in hand. Thirty-eight leagues
   // cost four requests here instead of seventy-six down there.
-  try { await _fyBatchWarm(leaguesToLoad); } catch (eB) {}
+  try {
+    var _warmN = await _fyBatchWarm(leaguesToLoad);
+    _skBootMark('bulk warm', _warmN + ' answers filled');
+  } catch (eB) { _skBootMark('bulk warm', 'failed'); }
 
   // Fetch all leagues in parallel, collect into allPlayers array — no parallel cache writes
   var allPlayers = [];
@@ -205010,6 +205090,7 @@ async function fyAutoLoadAllRosters() {
   var _lanes = [];
   for (var _ln = 0; _ln < 3 && _ln < leaguesToLoad.length; _ln++) _lanes.push(_rosterLane());
   await Promise.all(_lanes);
+  _skBootMark('rosters parsed', leaguesToLoad.length + ' leagues');
 
   // Write cache once after all fetches complete — no race condition
   fyRosterCache = allPlayers;
@@ -205129,6 +205210,7 @@ async function loadFyLeagues() {
       }
     }
     fyLeagues = leagues;
+    _skBootMark('league list', leagues.length + ' leagues');
     if (!fyActiveLeague || !leagues.find(function(l){ return l.league_key === fyActiveLeague; })) {
       fyActiveLeague = leagues.length ? leagues[0].league_key : null;
     }
