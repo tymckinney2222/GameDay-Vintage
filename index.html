@@ -52513,6 +52513,25 @@ function _skPreseasonWhen(ymd) {
 //
 // Returns '' when genuinely unknown, and callers must treat that as "do
 // not know" rather than "has not started" -- silence is never inferred.
+// SEASONOVER -- Yahoo's own is_finished, reached from a team key.
+// _skLeagueIsFinal answers the same question from a league OBJECT, which
+// is what the hydrate holds; the FP path holds a team key and nothing
+// bridged the two, which is most of why this guard was never written.
+var _skFpSkipFinal = 0, _skFpSkipEarly = 0;
+function _skLeagueFinishedKey(leagueKeyOrTeamKey) {
+  var lgKey = String(leagueKeyOrTeamKey || '').split('.t.')[0];
+  if (!lgKey) { return false; }
+  try {
+    var lgs = (typeof fyLeagues !== 'undefined' && fyLeagues) ? fyLeagues : [];
+    for (var i = 0; i < lgs.length; i++) {
+      if (lgs[i] && lgs[i].league_key === lgKey) {
+        return !!(lgs[i].is_finished === true || lgs[i].is_finished == 1);
+      }
+    }
+  } catch (e) {}
+  return false;
+}
+
 function _skSeasonStartFor(leagueKeyOrTeamKey) {
   var lgKey = String(leagueKeyOrTeamKey || '').split('.t.')[0];
   if (!lgKey) { return ''; }
@@ -52717,6 +52736,26 @@ async function fetchTeamFpForDate(teamKey, date) {
   // PRESEASON6 -- a league already set aside is not asked again.
   var _lgK = String(teamKey).split('.t.')[0];
   if (isPastDate && _skLeagueIsCold(_lgK)) return null;
+  // SEASONOVER -- TODAY, in a league that is over or has not begun.
+  //
+  // The three guards around this one are all isPastDate, on the reasoning
+  // that today is still live and worth retrying. That is true of a league
+  // that is playing. Fifty-one leagues were each asked what their team
+  // scored today, including a wall of MLB that finished in the autumn,
+  // and that fan-out is eighty-six per cent of every request the app
+  // makes on a boot where nothing was even tapped.
+  //
+  // Yahoo's own is_finished; no inference. Past dates stay exactly as
+  // they were, because a finished season still has history worth
+  // fetching and the trend surfaces read it.
+  if (!isPastDate) {
+    if (_skLeagueFinishedKey(_lgK)) { _skFpSkipFinal++; return null; }
+    if (typeof _skLeagueNotStarted === 'function' && _skLeagueNotStarted(_lgK)) {
+      _skFpSkipEarly++; return null;
+    }
+    var _ssD = _skSeasonStartFor(_lgK);
+    if (_ssD && String(date) < _ssD) { _skFpSkipEarly++; return null; }
+  }
   // PRESEASON6 -- and if nobody knows when the season starts, find out
   // BEFORE asking for a day that may be before it. Past dates only.
   if (isPastDate && !_skSeasonStartFor(_lgK)) {
@@ -52821,6 +52860,13 @@ async function fetchTeamFpForWeek(teamKey, week, currentWeek) {
     if (entry._ts && (Date.now() - entry._ts) < SK_LIVE_FP_TTL) return entry;
   }
   if (teamFpWeekInflight[memKey]) return teamFpWeekInflight[memKey];
+  // SEASONOVER -- the same guard, and the same exemption. A PAST week in
+  // a finished league is real history; the CURRENT week of a league that
+  // has ended is nothing, and football leagues are in that fan-out too.
+  if (!isPastWeek) {
+    var _wkLgK = String(teamKey).split('.t.')[0];
+    if (_skLeagueFinishedKey(_wkLgK)) { _skFpSkipFinal++; return null; }
+  }
 
   var promise = (async function() {
     try {
@@ -201972,6 +202018,15 @@ function _fyRateBlock() {
       // The hydrate's hit rate. A miss is a league buying standings and
       // scoreboard that the bulk already bought, and it is the number I
       // took a gate out without ever looking at.
+      // SEASONOVER -- what the guard actually saved, so the next clock
+      // says whether this was the fan-out or only part of it.
+      if (_skFpSkipFinal || _skFpSkipEarly) {
+        _askLine += '<div style="margin-top:4px;color:#4ade80">Team FP not ' +
+          'asked for ' + (_skFpSkipFinal + _skFpSkipEarly) + ' team' +
+          ((_skFpSkipFinal + _skFpSkipEarly) === 1 ? '' : 's') + ' \u2014 ' +
+          _skFpSkipFinal + ' in a finished season, ' + _skFpSkipEarly +
+          ' before one started.</div>';
+      }
       if (_skHydHit || _skHydMiss) {
         var _tot = _skHydHit + _skHydMiss;
         var _pct = Math.round((_skHydHit / _tot) * 100);
