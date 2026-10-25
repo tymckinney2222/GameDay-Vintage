@@ -132270,10 +132270,151 @@ async function skScanWireLeague(league) {
   }
 }
 
+// \u2500\u2500 ESPWIRE \u2500\u2500 One ESPN league's yesterday, in the shape
+// skWireCache already holds. The flip fields are present and zero: they
+// are computed from Yahoo snapshot history that ESPN has none of, so the
+// card renders without the flip line rather than inventing one.
+async function skScanWireEspLeague(lg) {
+  var row = lg && lg._esp;
+  if (!row) { return; }
+  var key = lg.league_key;
+  var dateStr = skYesterdayDateString();
+  var entry = {
+    leagueKey: key, league: lg, provider: 'espn',
+    scoringType: null, dateStr: dateStr,
+    myTeamKey: null, oppTeamKey: null, oppName: null,
+    oppManagerGuid: null, oppManagerNickname: null,
+    myFp: null, oppFp: null,
+    myCatWins: 0, oppCatWins: 0, catTies: 0,
+    hasFlipData: false,
+    fullFlipsMe: 0, fullFlipsOpp: 0, halfFlipsMe: 0, halfFlipsOpp: 0,
+    myFlipScore: 0, oppFlipScore: 0, netFlipScore: 0,
+    flipMap: {}, cumCats: null, flipTraj: [],
+    result: null, starters: [], bench: [],
+    oppStarters: [], oppBench: [],
+    mvp: null, benchBurn: null, error: null, ts: Date.now()
+  };
+  try {
+    var today = (typeof _todayDateString === 'function') ? _todayDateString() : null;
+    var period = _espWirePeriodFor(row, dateStr, today);
+    if (period == null) { return; }
+    var pair = _espWireMatchup(row, period);
+    if (!pair) { return; }
+    // WEEKEDGE -- a day that provably belongs to the previous matchup is
+    // not reported against this one's opponent.
+    if (pair.inWeek === false) { _espWireSkipEdge++; return; }
+    if (pair.inWeek === null) { _espWireNoEdge++; }
+    var ros = await _espWireDayRosters(row, period);
+    if (!ros) { return; }
+    _espWireScanned++;
+
+    var sv = _espWireSaved(row);
+    var game = sv && sv.game;
+    var proMap = null;
+    try {
+      if (typeof _espProTeams !== 'undefined' && _espProTeams && game) {
+        proMap = _espProTeams[game + ':' + row.season] || null;
+      }
+    } catch (ePM) { proMap = null; }
+
+    var mine = _espWireSide(ros, pair.mineId, proMap);
+    var opp = _espWireSide(ros, pair.oppId, proMap);
+    entry.myTeamKey = pair.mineId;
+    entry.oppTeamKey = pair.oppId;
+    entry.oppName = opp.teamName || null;
+    // The villain rollup is keyed on a Yahoo manager GUID. ESPN has none,
+    // so the team name goes in the nickname and the existing TEAM: branch
+    // takes it from there.
+    entry.oppManagerNickname = opp.teamName || null;
+    entry.starters = mine.starters;
+    entry.bench = mine.bench;
+    entry.oppStarters = opp.starters;
+    entry.oppBench = opp.bench;
+    entry.mvp = _espWireTop(mine.starters);
+    entry.benchBurn = _espWireTop(mine.bench);
+
+    var isCats = (typeof espIsCats === 'function') && espIsCats(row);
+    entry.scoringType = isCats ? 'head' : 'headpoint';
+
+    if (isCats) {
+      // The same two calls the daily H2H card already draws with. Rate
+      // stats are excluded inside espDailyTeamStats, so what is left is
+      // countable -- and espIsLowerBetter says which way each one runs.
+      var aS = (typeof espDailyTeamStats === 'function')
+        ? (espDailyTeamStats(ros, pair.mineId, game) || {}) : {};
+      var bS = (typeof espDailyTeamStats === 'function')
+        ? (espDailyTeamStats(ros, pair.oppId, game) || {}) : {};
+      var seen = {}, sid, w = 0, l = 0, t = 0, anyCat = false;
+      for (sid in aS) { if (aS.hasOwnProperty(sid)) { seen[sid] = 1; } }
+      for (sid in bS) { if (bS.hasOwnProperty(sid)) { seen[sid] = 1; } }
+      for (sid in seen) {
+        if (!seen.hasOwnProperty(sid)) { continue; }
+        var av = Number(aS[sid] || 0), bv = Number(bS[sid] || 0);
+        if (isNaN(av) || isNaN(bv)) { continue; }
+        anyCat = true;
+        if (av === bv) { t++; continue; }
+        var lower = (typeof espIsLowerBetter === 'function')
+          ? espIsLowerBetter(game, sid) : false;
+        var iWin = lower ? (av < bv) : (av > bv);
+        if (iWin) { w++; } else { l++; }
+      }
+      entry.myCatWins = w; entry.oppCatWins = l; entry.catTies = t;
+      if (anyCat) {
+        if (w > l) { entry.result = 'W'; }
+        else if (l > w) { entry.result = 'L'; }
+        else { entry.result = 'T'; }
+      }
+    } else {
+      var aF = (typeof espDailyTeamFp === 'function')
+        ? espDailyTeamFp(ros, pair.mineId) : null;
+      var bF = (typeof espDailyTeamFp === 'function')
+        ? espDailyTeamFp(ros, pair.oppId) : null;
+      // espDailyTeamFp's own total where it has one, the summed starter
+      // totals otherwise -- never recomputed from stats.
+      entry.myFp = (aF && aF.total != null) ? aF.total
+                 : ((aF && aF.sum != null) ? aF.sum : mine.total);
+      entry.oppFp = (bF && bF.total != null) ? bF.total
+                  : ((bF && bF.sum != null) ? bF.sum : opp.total);
+      if (entry.myFp != null && entry.oppFp != null) {
+        if (Math.abs(entry.myFp - entry.oppFp) < 0.001) { entry.result = 'T'; }
+        else { entry.result = (entry.myFp > entry.oppFp) ? 'W' : 'L'; }
+      }
+    }
+    skWireCache[key] = entry;
+  } catch (e) {
+    entry.error = String((e && e.message) || e);
+    skWireCache[key] = entry;
+  }
+}
+
+// \u2500\u2500 ESPWIRE \u2500\u2500 Every league The Wire reports on, both providers.
+//
+// The renderer only ever asks a league for its key, its name and its
+// sport, so an ESPN row adapts into one rather than needing cards of its
+// own. _esp carries the row the scan works from.
+function skWireLeagueList() {
+  var out = [];
+  try {
+    var y = (typeof skSyncedLeagues === 'function') ? (skSyncedLeagues() || []) : [];
+    for (var i = 0; i < y.length; i++) { out.push(y[i]); }
+  } catch (eY) {}
+  try {
+    var e = (typeof extSyncedLeagues === 'function') ? (extSyncedLeagues() || []) : [];
+    for (var j = 0; j < e.length; j++) {
+      var r = e[j];
+      if (!r || r.provider !== 'espn' || !r.key) { continue; }
+      out.push({ league_key: r.key, name: r.name || '(unnamed league)',
+                 sport: r.sport || '', provider: 'espn', _esp: r });
+    }
+  } catch (eE) {}
+  return out;
+}
+
 async function skScanWire() {
   if (skWireScanning) return;
-  if (!fyTokens || !fyLeagues || !fyLeagues.length) return;
-  var synced = skSyncedLeagues();
+  // ESPWIRE -- Yahoo's tokens are no longer the gate: an ESPN league
+  // needs none of them. The Yahoo side still checks for itself below.
+  var synced = skWireLeagueList();
   if (!synced.length) {
     skWireCache = {};
     skWireScanTs = Date.now();
@@ -132286,8 +132427,15 @@ async function skScanWire() {
   skUpdateWireCounter();
   if (skState.mode === 'wire') skRenderWireCards();
 
+  _espWireNoEdge = 0; _espWireSkipEdge = 0; _espWireScanned = 0;
   var scans = synced.map(function(lg) {
-    return skScanWireLeague(lg).then(function() {
+    // ESPWIRE -- by provider. A Yahoo league with no tokens still has
+    // nothing to say, which is what the guard inside its scan is for.
+    var _p = (lg && lg.provider === 'espn')
+      ? skScanWireEspLeague(lg)
+      : ((fyTokens && fyLeagues && fyLeagues.length)
+          ? skScanWireLeague(lg) : Promise.resolve());
+    return _p.then(function() {
       skUpdateWireCounter();
       if (skState.mode === 'wire') skRenderWireCards();
     });
@@ -132309,7 +132457,7 @@ function skUpdateWireCounter() {
     el.textContent = '·…';
     return;
   }
-  var synced = skSyncedLeagues();
+  var synced = skWireLeagueList();
   var withResults = synced.filter(function(l) {
     var c = skWireCache[l.league_key];
     return c && !c.error;
@@ -132325,7 +132473,7 @@ function skUpdateWireCounter() {
 function skWireAggregate(leagueList) {
   // Accepts an optional league list so callers can scope the aggregate to a
   // sport filter. Defaults to all synced leagues for backward compatibility.
-  var synced = leagueList || skSyncedLeagues();
+  var synced = leagueList || skWireLeagueList();
   var w = 0, l = 0, t = 0;
   var totalMyFp = 0, fpLeagues = 0;
   var mvpCandidate = null;
@@ -132436,7 +132584,7 @@ function skRenderWireCards() {
   if (!listEl) return;
   var ctEl = document.getElementById('sk-section-ct');
 
-  var synced = skSyncedLeagues();
+  var synced = skWireLeagueList();
   // Respect the active sport pill (All / MLB / NFL / NBA / NHL), matching how
   // Today and Plan filter. 'all' shows every sport; otherwise narrow to the
   // selected one. Everything below uses `synced` as the working set.
@@ -214236,6 +214384,135 @@ function espDailyTeamFpDerived(row, teamId) {
 
 // Who I'm playing this matchup period, read off the schedule already in
 // memory. Null for a season-long league (no opponent) and for a bye.
+// \u2500\u2500 ESPWIRE \u2500\u2500 Yesterday, for an ESPN league.
+//
+// One request per league per day, and the whole league comes back inside
+// it -- the economics ESPWEEK already found. Cached per league+period,
+// including the misses, so a league that cannot answer is asked once.
+var _espWireRos = {};
+var _espWireNoEdge = 0, _espWireSkipEdge = 0, _espWireScanned = 0;
+
+function _espWireSaved(row) {
+  try {
+    return (typeof espFindSaved === 'function')
+      ? espFindSaved(String((row && row.key) || '').slice(4)) : null;
+  } catch (e) { return null; }
+}
+
+// The period for a date: today's, read off the synced payload, plus the
+// difference in days. Today itself never goes through it.
+function _espWirePeriodFor(row, dateStr, todayStr) {
+  var cur = (typeof _espScoringPeriod === 'function') ? _espScoringPeriod(row) : null;
+  if (cur == null) { return null; }
+  var dd = (typeof _espDayDiff === 'function') ? _espDayDiff(dateStr, todayStr) : null;
+  if (dd == null) { return null; }
+  var n = cur + dd;
+  return (n > 0) ? n : null;
+}
+
+function _espWireDayRosters(row, period) {
+  var ck = String((row && row.key) || '') + '|' + period;
+  if (_espWireRos.hasOwnProperty(ck)) { return Promise.resolve(_espWireRos[ck]); }
+  var sv = _espWireSaved(row);
+  if (!sv || typeof espCurrentSeason !== 'function' ||
+      typeof espFetchLeague !== 'function' || typeof espRosters !== 'function') {
+    return Promise.resolve(null);
+  }
+  var pr = espCurrentSeason(sv.game).then(function (season) {
+    return espFetchLeague(sv.game, sv.id, season,
+      '?view=mRoster&scoringPeriodId=' + period);
+  }).then(function (j) {
+    var ros = espRosters(j, sv.game,
+      (typeof espSliceIds === 'function') ? espSliceIds(row) : [], row.sport);
+    // ESPN echoes the period it ACTUALLY answered for. A request for a
+    // period the season has not reached comes back as the current one,
+    // and filing that under the day asked for would invent a day that
+    // never happened. Trust the echo, never the number asked for.
+    if (!ros || ros.period == null || Number(ros.period) !== Number(period)) {
+      _espWireRos[ck] = null; return null;
+    }
+    _espWireRos[ck] = ros;
+    return ros;
+  }, function () { _espWireRos[ck] = null; return null; });
+  return pr;
+}
+
+// WEEKEDGE -- the matchup, and whether the day actually belongs to it.
+//
+// inWeek true  -- the period is a key on this matchup's own points map.
+// inWeek false -- it is not: yesterday belongs to the PREVIOUS matchup,
+//                 and this league sits out rather than reporting a
+//                 result against the wrong opponent.
+// inWeek null  -- the payload does not carry the map, so the question
+//                 cannot be asked. Proceeds, which is what the daily H2H
+//                 card already does with the same pair.
+function _espWireMatchup(row, period) {
+  if (typeof espIsSeasonPts === 'function' && espIsSeasonPts(row)) { return null; }
+  var j = row && row._espScoreJson;
+  var sch = (j && j.schedule) || [];
+  var mp = (j && j.status && j.status.currentMatchupPeriod);
+  if (!sch.length || mp == null) { return null; }
+  var myIds = row.myTeamIds || {}, i;
+  for (i = 0; i < sch.length; i++) {
+    var m = sch[i] || {};
+    if (Number(m.matchupPeriodId) !== Number(mp)) { continue; }
+    var a = m.away || {}, h = m.home || {};
+    var meAway = !!(a.teamId != null && myIds[String(a.teamId)]);
+    var meHome = !!(h.teamId != null && myIds[String(h.teamId)]);
+    if (!meAway && !meHome) { continue; }
+    var mine = meAway ? a : h, opp = meAway ? h : a;
+    if (mine.teamId == null || opp.teamId == null) { return null; }   // bye
+    var pb = mine.pointsByScoringPeriod || opp.pointsByScoringPeriod || null;
+    var inWeek = null;
+    if (pb && typeof pb === 'object') {
+      inWeek = Object.prototype.hasOwnProperty.call(pb, String(period));
+    }
+    return { mineId: String(mine.teamId), oppId: String(opp.teamId),
+             matchupPeriod: Number(mp), inWeek: inWeek };
+  }
+  return null;
+}
+
+// A side's men for the day, in the shape the Wire's cards already read.
+function _espWireSide(ros, teamId, proMap) {
+  var t = ros && ros.byTeam && ros.byTeam[String(teamId)];
+  var out = { teamName: (t && t.teamName) || '', starters: [], bench: [], total: null };
+  if (!t || !t.items) { return out; }
+  var any = false, sum = 0, i;
+  for (i = 0; i < t.items.length; i++) {
+    var it = t.items[i] || {};
+    var w = it.windows && it.windows.today;
+    var fp = (w && w.total != null && !isNaN(w.total)) ? Number(w.total) : null;
+    var ab = '';
+    try {
+      if (proMap && it.teamId != null) {
+        var pm = proMap[String(it.teamId)];
+        ab = (pm && (pm.abbrev || pm.abbr || pm.name)) || (typeof pm === 'string' ? pm : '');
+      }
+    } catch (eA) { ab = ''; }
+    var rec = { playerKey: String(it.playerId || ''), name: it.name || '',
+                teamAbbr: String(ab || '').toUpperCase(),
+                selectedPos: it.slot || '', fp: fp };
+    if (it.starter) {
+      out.starters.push(rec);
+      if (fp != null) { sum += fp; any = true; }
+    } else {
+      out.bench.push(rec);
+    }
+  }
+  out.total = any ? Math.round(sum * 10) / 10 : null;
+  return out;
+}
+
+function _espWireTop(list) {
+  var best = null, i;
+  for (i = 0; i < list.length; i++) {
+    if (list[i].fp == null) { continue; }
+    if (!best || list[i].fp > best.fp) { best = list[i]; }
+  }
+  return best;
+}
+
 function espMyMatchupPair(row) {
   if (typeof espIsSeasonPts === 'function' && espIsSeasonPts(row)) return null;
   var j = row && row._espScoreJson;
