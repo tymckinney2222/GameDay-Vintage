@@ -53717,7 +53717,13 @@ async function _skStadiumRefresh() {
           });
         }
       } catch (eRC) {}
-      await fyAutoLoadAllRosters();
+      // FPFAST -- rosters and settings, then straight to the fantasy
+      // points this button exists for. Standings and scoreboard are not
+      // read anywhere on this path: the stadium's live feed is ESPN, and
+      // the Today cards read skLeagueData, which skHydrateAll fills on
+      // its own schedule and this button never calls. Waiting for that
+      // download was most of the tap.
+      await fyAutoLoadAllRosters({ fpOnly: true });
     }
     // 2) Bust today's FP cache and re-fetch for each of my teams.
     _clearTodayFpCache();
@@ -204680,6 +204686,21 @@ async function _fyBatchWarm(leagues, opts) {
       await Promise.all(_wl);
     }
 
+    if (opts && opts.skipSlow) {
+      // FPFAST -- the fast half only, and the slow half not even
+      // started. For a caller that reads neither standings nor
+      // scoreboard, starting them would put a multi-megabyte download
+      // alongside the calls that caller is actually waiting for, which
+      // is exactly what doubled warm: scoreboard two builds ago.
+      //
+      // _fyWarmSlow is cleared rather than left holding a settled
+      // promise from an earlier sweep, so nothing downstream awaits a
+      // handle to work that is already done.
+      _fyWarmSlow = null;
+      await _runGroup(fastTasks, 2);
+      return total;
+    }
+
     if (!(opts && opts.split)) {
       // Unsplit: everything, awaited. This is what the manual refresh
       // asks for, where there is no pill chain to unblock and the whole
@@ -205067,9 +205088,13 @@ async function fyApiRetry(path, tries) {
   return result;
 }
 
-async function fyAutoLoadAllRosters() {
+async function fyAutoLoadAllRosters(opts) {
   if (fyRostersLoaded || !fyLeagues.length || !fyTokens) return;
   fyRostersLoaded = true;
+  // FPFAST -- set by the stadium FP button, which needs the rosters and
+  // the settings and reads neither standings nor scoreboard. Every other
+  // caller omits it and gets exactly what it got before.
+  var _fpOnly = !!(opts && opts.fpOnly);
 
   // Honor the user's sync set if available — no point loading rosters for
   // leagues they explicitly hid from Skipper. Falls back to all leagues
@@ -205086,7 +205111,8 @@ async function fyAutoLoadAllRosters() {
   try {
     // WARMSPLIT -- rosters and settings now; standings and scoreboard in
     // the background, with the hydrate gated on them.
-    var _warmN = await _fyBatchWarm(leaguesToLoad, { split: true });
+    var _warmN = await _fyBatchWarm(leaguesToLoad,
+      { split: true, skipSlow: _fpOnly });
     _skBootMark('bulk warm', _warmN + ' answers filled \u00b7 fast half');
   } catch (eB) { _skBootMark('bulk warm', 'failed'); }
 
@@ -205326,7 +205352,9 @@ async function fyAutoLoadAllRosters() {
   // Nothing waits on this. It fills teamFpCache for the Stadium FP
   // overlay, which is not on the boot path. The pill stopped depending on
   // any of it two builds ago, so holding it costs nothing anyone sees.
-  if (_fyWarmSlow) { try { await _fyWarmSlow; } catch (eWS2) {} }
+  // FPFAST -- and on the FP path there is nothing to wait for, because
+  // the slow half was never started. The prefetch goes straight out.
+  if (!_fpOnly && _fyWarmSlow) { try { await _fyWarmSlow; } catch (eWS2) {} }
 
   // Pre-fetch today's stats for every league so the Stadium Skipper FP
   // overlay has data for ALL leagues (not just the one currently active).
