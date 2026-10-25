@@ -123863,6 +123863,7 @@ async function fysilentInit() {
       }
     }
     fyLeagues = leagues;
+    _skBootMark('league list', leagues.length + ' leagues');
     // FYBOOTCAP — we're in. Whatever went wrong before is over, so the next
     // bad patch gets a full set of retries rather than inheriting these.
     _skBootstrapTries = 0;
@@ -125769,6 +125770,7 @@ async function skHydrateAll() {
   if (skHydrationInFlight) return;
   skHydrationInFlight = true;
   var queue = skSyncedLeaguesAll().slice();
+  var _hydN = queue.length;   // BOOTCLOCK -- before the pump empties it
   var inflight = 0;
   await new Promise(function(resolve) {
     function pump() {
@@ -125785,7 +125787,7 @@ async function skHydrateAll() {
     pump();
   });
   skHydrationInFlight = false;
-  _skBootMark('hydrate', queue.length ? '' : 'nothing to hydrate');
+  _skBootMark('hydrate', _hydN + ' leagues');
   skState.freshnessTs = Date.now();
   skUpdateFreshness();
   // After everything's loaded, refresh attention pill (it now has real data)
@@ -203508,6 +203510,12 @@ function _fyErrDetail(status, body) {
 // parse and paint and is not what anyone means by "it took thirty
 // seconds to load".
 var _skBootMarks = [];
+// LANECOUNT -- how many of the roster lanes were answered from the cache
+// the bulk warm had just filled, and how many went to the network. The
+// clock said this step took 24.3s; offline, against a warm cache, it
+// takes 1.6s and makes no requests at all. One of those is wrong about
+// his phone and counting is the only way to find out which.
+var _fyLaneHit = 0, _fyLaneMiss = 0;
 function _skBootMark(name, note) {
   try {
     for (var _bm = 0; _bm < _skBootMarks.length; _bm++) {
@@ -204539,16 +204547,46 @@ async function _fyBatchWarm(leagues) {
       if (k) { keys.push(String(k)); }
     }
     if (keys.length < 2) { return 0; }   // one league is already one call
-    var a = await _fyBatchPrefill(keys, 'standings');
-    var b = await _fyBatchPrefill(keys, 'settings');
-    // ROSTERBATCH -- and every roster in the account, in one more request.
-    var c = await _fyBatchRosters(leagues);
-    // SCOREBATCH -- the last per-league call in the sweep. Both shapes,
-    // because the app asks for it both ways and the cache key has to
-    // match the caller exactly.
-    var d = await _fyBatchPrefill(keys, 'scoreboard;out=matchups');
-    var e = await _fyBatchPrefill(keys, 'scoreboard');
-    return a + b + c + d + e;
+    // BULKPARALLEL -- these five are independent of one another, and each
+    // is up to two chunked requests of twenty-five leagues. Awaited end to
+    // end they were the longest step on the boot clock: thirty-six seconds
+    // before a single roster had been parsed.
+    //
+    // Three at a time, not five. The pacer staggers the STARTS either way,
+    // so the saving here is in overlapping the responses -- and these are
+    // multi-megabyte answers arriving on a phone. Three takes most of the
+    // win without asking the device to hold five of them at once.
+    //
+    // ROSTERBATCH is one of them; SCOREBATCH is the last two, both shapes,
+    // because the app asks for it both ways and the cache key has to match
+    // the caller exactly. Order between them never mattered: none of the
+    // five reads what another one writes.
+    var tasks = [
+      { n: 'standings',  f: function () { return _fyBatchPrefill(keys, 'standings'); } },
+      { n: 'settings',   f: function () { return _fyBatchPrefill(keys, 'settings'); } },
+      { n: 'rosters',    f: function () { return _fyBatchRosters(leagues); } },
+      { n: 'matchups',   f: function () { return _fyBatchPrefill(keys, 'scoreboard;out=matchups'); } },
+      { n: 'scoreboard', f: function () { return _fyBatchPrefill(keys, 'scoreboard'); } }
+    ];
+    var total = 0, _qi = 0;
+    async function _warmLane() {
+      while (_qi < tasks.length) {
+        var t = tasks[_qi++];
+        var _t0 = Date.now(), _got = 0;
+        // total += (await ...) READS total before the await and assigns
+        // after it, so three lanes overwrote each other's additions and
+        // the count came back at two fifths. Land the value first.
+        try { _got = (await t.f()) || 0; } catch (eT) { _got = 0; }
+        total += _got;
+        // Each kind times itself, so the next clock says WHICH of the five
+        // is expensive instead of leaving it as one opaque block.
+        _skBootMark('warm: ' + t.n, (Date.now() - _t0) + 'ms');
+      }
+    }
+    var _wl = [];
+    for (var _w = 0; _w < 3 && _w < tasks.length; _w++) { _wl.push(_warmLane()); }
+    await Promise.all(_wl);
+    return total;
   } catch (e) { return 0; }
 }
 
@@ -204927,6 +204965,7 @@ async function fyAutoLoadAllRosters() {
   // when no selection is saved (first-run default).
   var leaguesToLoad = (typeof skSyncedLeagues === 'function') ? skSyncedLeagues() : fyLeagues;
   if (!leaguesToLoad.length) return;
+  _fyLaneHit = 0; _fyLaneMiss = 0;
   // COLDSYNC -- this is the fan-out that has broken twice, at two season
   // starts. Tell the pacer how big it is before a single call goes out.
   try { _fyColdSyncNote(leaguesToLoad.length); } catch (eC) {}
@@ -204952,7 +204991,15 @@ async function fyAutoLoadAllRosters() {
       // PREDRAFTQUIET - this fan-out hits every league at once, so one
       // undrafted league here is one guaranteed failure per sweep.
       if (typeof _skLeagueNotStarted === 'function' && _skLeagueNotStarted(lg)) return;
-      var data = await fyApi('/league/' + lg.league_key + '/teams;is_owned_by_current_login=1/roster');
+      // LANECOUNT -- asked BEFORE the call, because afterwards a hit and a
+      // miss look identical from here.
+      var _rPath = '/league/' + lg.league_key + '/teams;is_owned_by_current_login=1/roster';
+      try {
+        var _rc = (typeof fyDataCache === 'object' && fyDataCache) ? fyDataCache[_rPath] : null;
+        if (_rc && _rc.d && _rc.t > Date.now() - (_rc.ttl || 60000)) { _fyLaneHit++; }
+        else { _fyLaneMiss++; }
+      } catch (eLC) {}
+      var data = await fyApi(_rPath);
       if (!data) return;
       var teamsData = data.fantasy_content.league[1].teams;
       if (!teamsData || teamsData.count === 0) return;
@@ -205090,7 +205137,8 @@ async function fyAutoLoadAllRosters() {
   var _lanes = [];
   for (var _ln = 0; _ln < 3 && _ln < leaguesToLoad.length; _ln++) _lanes.push(_rosterLane());
   await Promise.all(_lanes);
-  _skBootMark('rosters parsed', leaguesToLoad.length + ' leagues');
+  _skBootMark('rosters parsed', leaguesToLoad.length + ' leagues \u00b7 ' +
+    _fyLaneHit + ' cached, ' + _fyLaneMiss + ' fetched');
 
   // Write cache once after all fetches complete — no race condition
   fyRosterCache = allPlayers;
