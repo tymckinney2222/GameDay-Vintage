@@ -201233,6 +201233,7 @@ function disconnectYahoo() { skSignOut(); }
 //
 // So: one refresh in flight at a time, and everybody waits on that one.
 var _fyRefreshInflight = null;
+var _fyTokenMints = 0;
 
 async function fyGetToken() {
   if (!fyTokens) return null;
@@ -201287,6 +201288,7 @@ async function _fyRefreshTokens() {
     return null;   // network blip — likewise, the grant survives
   } finally {
     _fyRefreshInflight = null;
+    _fyTokenMints++;
   }
 }
 
@@ -201877,11 +201879,21 @@ function _fyRateBlock() {
             's \u2014 leagues are hydrating from nothing, which is the only thing ' +
             'that runs the app flat out.</div>')
          : '');
+    // A healthy session mints once an hour. Anything near the call count
+    // means the expiry is not being read and every call is paying for a
+    // token round trip before it reaches the cache.
+    var mintLine = _fyTokenMints
+      ? ('<div style="margin-top:4px;color:' + (_fyTokenMints > 3 ? '#f59e0b' : '#94a3b8') +
+         '">Token minted ' + _fyTokenMints + ' time' + (_fyTokenMints === 1 ? '' : 's') +
+         ' this session' + (_fyTokenMints > 3
+           ? ' \u2014 that is once per handful of calls, not once an hour.'
+           : '.') + '</div>')
+      : '';
     var h = '<div style="color:#94a3b8;font-size:11px;margin:16px 0 4px">' +
       'How hard the app is asking</div>' +
       '<div style="background:#0d1220;border:1px solid rgba(255,255,255,0.08);' +
       'border-radius:8px;padding:8px;font-size:10px;line-height:1.5;color:#cbd5e1">' +
-      inner + slowLine;
+      inner + slowLine + mintLine;
     return h + '</div>';
   } catch (e) { return ''; }
 }
@@ -205009,7 +205021,24 @@ async function fyAutoLoadAllRosters() {
       // LANECOUNT -- asked BEFORE the call, because afterwards a hit and a
       // miss look identical from here.
       var _rPath = '/league/' + lg.league_key + '/teams;is_owned_by_current_login=1/roster';
-      var data = await fyApi(_rPath);
+      // LANEFAST -- the bulk warm has usually already answered this. Going
+      // back through fyApi for it costs several microtask ticks per league
+      // -- a coalesce check, two season guards and `await fyGetToken()` --
+      // and on a phone those ticks queue behind the hydrate parsing
+      // multi-megabyte JSON on the same thread. Thirty-nine leagues of
+      // yielding into a saturated event loop was most of this step.
+      //
+      // Every guard fyApi applies decides whether to CALL. With a valid
+      // answer already in hand there is no call for them to rule on, so
+      // taking it directly skips nothing that was protecting anything.
+      var data, _syncT0 = Date.now();
+      var _ce = (typeof fyDataCache === 'object' && fyDataCache) ? fyDataCache[_rPath] : null;
+      if (_ce && _ce.d && _ce.t > Date.now() - (_ce.ttl || 60000)) {
+        data = _ce.d;
+      } else {
+        data = await fyApi(_rPath);
+        _syncT0 = Date.now();   // the parse below is what we are timing
+      }
       if (!data) return;
       var teamsData = data.fantasy_content.league[1].teams;
       if (!teamsData || teamsData.count === 0) return;
@@ -205125,6 +205154,7 @@ async function fyAutoLoadAllRosters() {
           try { console.warn('[fy] auto-load player parse error in', lg.league_key, perr.message); } catch(e) {}
         }
       }
+      return Date.now() - _syncT0;   // LANEFAST -- the parse, in isolation
     } catch(e) { /* silent fail per league */ }
   }
 
@@ -205135,7 +205165,12 @@ async function fyAutoLoadAllRosters() {
   // together (the 57-error "Failed to fetch" storm in API health).
   // Same total work, gentler burst — nothing to throttle.
   var _rosterQueue = leaguesToLoad.slice();
-  var _laneWorkMs = 0;
+  // LANEFAST -- synchronous parse time only. The number this replaces
+  // wrapped the await as well, which is wall time, and summed it across
+  // three concurrent lanes -- so it reported the same fifty seconds three
+  // times over and could not tell working from waiting, which was the
+  // entire point of having it.
+  var _laneParseMs = 0;
   // LANECOUNT -- a pure question with a local answer. The first version
   // parked it on the function object, which three lanes then read back
   // across an await: the same bug as the accumulator in the warm.
@@ -205149,11 +205184,9 @@ async function fyAutoLoadAllRosters() {
   async function _rosterLane() {
     while (_rosterQueue.length) {
       var lg = _rosterQueue.shift();
-      var _lw0 = Date.now();
       var _hit = _rosterCached(lg);
       if (_hit) { _fyLaneHit++; } else { _fyLaneMiss++; }
-      await _loadOneRoster(lg);
-      _laneWorkMs += (Date.now() - _lw0);
+      _laneParseMs += (await _loadOneRoster(lg)) || 0;
       // LANESLEEP -- the 120ms is here to space out NETWORK calls, which
       // is the whole point of a paced pump. When the answer came from the
       // cache the warm just filled there is no call to space, and this
@@ -205172,7 +205205,7 @@ async function fyAutoLoadAllRosters() {
   // together means the work is real, far apart means it was waiting.
   _skBootMark('rosters parsed', leaguesToLoad.length + ' leagues \u00b7 ' +
     _fyLaneHit + ' cached, ' + _fyLaneMiss + ' fetched \u00b7 ' +
-    _laneWorkMs + 'ms working');
+    _laneParseMs + 'ms parsing');
 
   // Write cache once after all fetches complete — no race condition
   fyRosterCache = allPlayers;
