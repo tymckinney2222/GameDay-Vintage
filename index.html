@@ -52518,19 +52518,72 @@ function _skPreseasonWhen(ymd) {
 // is what the hydrate holds; the FP path holds a team key and nothing
 // bridged the two, which is most of why this guard was never written.
 var _skFpSkipFinal = 0, _skFpSkipEarly = 0;
-function _skLeagueFinishedKey(leagueKeyOrTeamKey) {
+// SEASONENDED -- and the two the last build missed, counted apart so a
+// second build that changes nothing says so instead of going quiet.
+var _skFpSkipEnded = 0, _skFpNoEndDate = 0;
+
+function _skFpLeagueOf(leagueKeyOrTeamKey) {
   var lgKey = String(leagueKeyOrTeamKey || '').split('.t.')[0];
-  if (!lgKey) { return false; }
+  if (!lgKey) { return null; }
   try {
     var lgs = (typeof fyLeagues !== 'undefined' && fyLeagues) ? fyLeagues : [];
     for (var i = 0; i < lgs.length; i++) {
-      if (lgs[i] && lgs[i].league_key === lgKey) {
-        return !!(lgs[i].is_finished === true || lgs[i].is_finished == 1);
-      }
+      if (lgs[i] && lgs[i].league_key === lgKey) { return lgs[i]; }
     }
+  } catch (e) {}
+  return null;
+}
+
+function _skLeagueFinishedKey(leagueKeyOrTeamKey) {
+  var lg = _skFpLeagueOf(leagueKeyOrTeamKey);
+  return !!(lg && (lg.is_finished === true || lg.is_finished == 1));
+}
+
+// SEASONENDED -- the league's last day, from whichever source has it.
+function _skLeagueEndFor(leagueKeyOrTeamKey) {
+  var lg = _skFpLeagueOf(leagueKeyOrTeamKey);
+  var end = (lg && lg.end_date) || null;
+  if (!end) {
+    try {
+      var k = String(leagueKeyOrTeamKey || '').split('.t.')[0];
+      if (typeof _skLeagueDates !== 'undefined' && _skLeagueDates && _skLeagueDates[k]) {
+        end = _skLeagueDates[k].end || null;
+      }
+    } catch (e0) {}
+  }
+  return end ? String(end) : '';
+}
+
+// SEASONENDED -- IS THIS DATE OUTSIDE THE SEASON? Not "is this date in
+// the past", which is the question bo150 asked and the reason it fired
+// zero times: his fan-out is dated 2026-10-23, so isPastDate was true
+// and the whole guard was unreachable.
+//
+// A date after the league's last day has no games on it. That is a fact
+// about the calendar, true whether the date is yesterday or today, and
+// it does NOT touch history inside the season -- a past date between
+// start and end still fetches exactly as before.
+function _skDateAfterLeagueEnd(leagueKeyOrTeamKey, dateStr) {
+  var end = _skLeagueEndFor(leagueKeyOrTeamKey);
+  if (!end) { _skFpNoEndDate++; return false; }
+  return String(dateStr || '') > end;
+}
+
+// The same question for the weekly call, which has a week and no date:
+// three days past the last day, matching skYahooSeasonIsOver's grace for
+// the stat corrections that trickle in after the final game.
+var SK_FP_END_GRACE_MS = 3 * 24 * 3600 * 1000;
+function _skLeagueEndedNow(leagueKeyOrTeamKey) {
+  var end = _skLeagueEndFor(leagueKeyOrTeamKey);
+  if (!end) { _skFpNoEndDate++; return false; }
+  try {
+    var em = new Date(end + 'T23:59:59').getTime();
+    if (isNaN(em)) { return false; }
+    return Date.now() > em + SK_FP_END_GRACE_MS;
   } catch (e) {}
   return false;
 }
+
 
 function _skSeasonStartFor(leagueKeyOrTeamKey) {
   var lgKey = String(leagueKeyOrTeamKey || '').split('.t.')[0];
@@ -52753,9 +52806,31 @@ async function fetchTeamFpForDate(teamKey, date) {
     if (typeof _skLeagueNotStarted === 'function' && _skLeagueNotStarted(_lgK)) {
       _skFpSkipEarly++; return null;
     }
-    var _ssD = _skSeasonStartFor(_lgK);
-    if (_ssD && String(date) < _ssD) { _skFpSkipEarly++; return null; }
   }
+  // SEASONENDED -- THE SEASON WINDOW, NOT THE TENSE.
+  //
+  // bo150 put these inside the isPastDate check and fired zero times in
+  // fifty-one leagues. His fan-out is dated 2026-10-23 -- yesterday --
+  // so isPastDate was true and none of it was ever reached. The question
+  // was wrong: it is not whether the date is in the past, it is whether
+  // the date falls outside the league's season at all.
+  //
+  // Before the first day or after the last, there are no games, so there
+  // is no number. SKPRESEASON made this argument for the start: "dates
+  // on which, by definition, not a single fantasy point can exist."
+  // After the end is the same sentence. A past date INSIDE the season is
+  // untouched and still fetches -- that is real history and his trend
+  // surfaces read it.
+  var _ssD = _skSeasonStartFor(_lgK);
+  if (_ssD && String(date) < _ssD) { _skFpSkipEarly++; return null; }
+  if (_skDateAfterLeagueEnd(_lgK, date)) { _skFpSkipEnded++; return null; }
+  // NOT GUARDED, and nearly was: football on the dated path. The
+  // request LOOKS wrong -- an NFL team asked with type=date -- but
+  // _skRosterStatsPath already maps the date to its containing week and
+  // asks type=week. Blocking nfl here would have cut a working path and
+  // put his football teams on 0.0, which is the failure this whole file
+  // exists to avoid. The sport breakdown below is how that gets settled
+  // with a measurement instead of a hunch.
   // PRESEASON6 -- and if nobody knows when the season starts, find out
   // BEFORE asking for a day that may be before it. Past dates only.
   if (isPastDate && !_skSeasonStartFor(_lgK)) {
@@ -52866,6 +52941,7 @@ async function fetchTeamFpForWeek(teamKey, week, currentWeek) {
   if (!isPastWeek) {
     var _wkLgK = String(teamKey).split('.t.')[0];
     if (_skLeagueFinishedKey(_wkLgK)) { _skFpSkipFinal++; return null; }
+    if (_skLeagueEndedNow(_wkLgK)) { _skFpSkipEnded++; return null; }
   }
 
   var promise = (async function() {
@@ -202020,12 +202096,38 @@ function _fyRateBlock() {
       // took a gate out without ever looking at.
       // SEASONOVER -- what the guard actually saved, so the next clock
       // says whether this was the fan-out or only part of it.
-      if (_skFpSkipFinal || _skFpSkipEarly) {
+      // SEASONENDED -- which sports are spending the fan-out.
+      var _spk = [], _spn;
+      for (_spn in _fyReqTeamSport) {
+        if (_fyReqTeamSport.hasOwnProperty(_spn)) {
+          _spk.push([_spn, _fyReqTeamSport[_spn]]);
+        }
+      }
+      if (_spk.length) {
+        _spk.sort(function (a, b) { return b[1] - a[1]; });
+        var _sps = [];
+        for (var _spi = 0; _spi < _spk.length; _spi++) {
+          _sps.push(_spk[_spi][0] + ' ' + _spk[_spi][1]);
+        }
+        _askLine += '<div style="margin-top:4px;color:#94a3b8">Team FP by ' +
+          'sport: ' + _sps.join(' \u00b7 ') + '</div>';
+      }
+      var _skTot = _skFpSkipFinal + _skFpSkipEarly + _skFpSkipEnded;
+      if (_skTot) {
         _askLine += '<div style="margin-top:4px;color:#4ade80">Team FP not ' +
-          'asked for ' + (_skFpSkipFinal + _skFpSkipEarly) + ' team' +
-          ((_skFpSkipFinal + _skFpSkipEarly) === 1 ? '' : 's') + ' \u2014 ' +
-          _skFpSkipFinal + ' in a finished season, ' + _skFpSkipEarly +
-          ' before one started.</div>';
+          'asked ' + _skTot + ' time' + (_skTot === 1 ? '' : 's') + ' \u2014 ' +
+          _skFpSkipEnded + ' season ended \u00b7 ' + _skFpSkipFinal +
+          ' flagged finished \u00b7 ' + _skFpSkipEarly + ' before the start.</div>';
+      } else {
+        _askLine += '<div style="margin-top:4px;color:#f59e0b">Team FP guards ' +
+          'never fired \u2014 nothing was skipped.</div>';
+      }
+      // The guard cannot work on a league with no end date recorded, and
+      // a silent no-op is what the last build looked like.
+      if (_skFpNoEndDate) {
+        _askLine += '<div style="margin-top:2px;color:#94a3b8">' +
+          _skFpNoEndDate + ' check' + (_skFpNoEndDate === 1 ? '' : 's') +
+          ' found no end date on the league, so it was asked anyway.</div>';
       }
       if (_skHydHit || _skHydMiss) {
         var _tot = _skHydHit + _skHydMiss;
@@ -203686,6 +203788,7 @@ var _fyLaneHit = 0, _fyLaneMiss = 0;
 // cache hit reaches.
 var _fyReqTotal = 0;
 var _fyReqKind = {};
+var _fyReqTeamSport = {};
 function _fyReqNote(path) {
   try {
     var p = String(path || '');
@@ -203698,6 +203801,24 @@ function _fyReqNote(path) {
     else if (p.indexOf('/leagues') > -1) { k = 'leaguelist'; }
     _fyReqTotal++;
     _fyReqKind[k] = (_fyReqKind[k] || 0) + 1;
+    // SEASONENDED -- name the remainder. Two builds have now been aimed
+    // at this fan-out by reasoning about which leagues are in it; this
+    // asks the requests themselves.
+    if (k === 'teamstats') {
+      try {
+        var _tk = '';
+        var _m1 = p.indexOf('/team/');
+        if (_m1 > -1) { _tk = p.slice(_m1 + 6); }
+        else {
+          var _m2 = p.indexOf('team_keys=');
+          if (_m2 > -1) { _tk = p.slice(_m2 + 10); }
+        }
+        _tk = _tk.split(',')[0].split('/')[0];
+        var _slg = (typeof _skFpLeagueOf === 'function') ? _skFpLeagueOf(_tk) : null;
+        var _sp = String((_slg && _slg.sport) || 'unknown').toLowerCase();
+        _fyReqTeamSport[_sp] = (_fyReqTeamSport[_sp] || 0) + 1;
+      } catch (eS) {}
+    }
   } catch (e) {}
 }
 
