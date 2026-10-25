@@ -223109,6 +223109,11 @@ function slEnrichLeagues() {
                   try {
                     var _mine = _slpMyMatchup(mus, row.myTeamIds || {});
                     if (_mine && _mine.players_points) row._slPP = _mine.players_points;
+                    // SLLOCKPROBE -- the whole object, so the lock panel can
+                    // print what fields Sleeper actually sends. players_points
+                    // was the only one ever read, and the one being read is
+                    // demonstrably not the locked figure.
+                    if (_mine) { row._slRawMatchup = _mine; }
                   } catch (_e) {}
                 });
             }).catch(function() { /* best-effort */ });
@@ -225567,6 +225572,64 @@ function _slLkFinal(g, today) {
 // false witness there outlive the night it came from.
 //
 // Returns the index of the single FINISHED game matching ppv, or -1.
+// \u2500\u2500 SLLOCKPROBE \u2500\u2500 Every field name Sleeper actually sends.
+//
+// The matchup object has only ever been read for players_points, and his
+// own screenshots show that figure is not the locked one -- Duren is
+// credited 17.0 while Sleeper counts his 36.5. So either the lock is in
+// this payload under a name nobody has looked at, or it is not in the
+// API at all. Printing the names settles which, and costs no request:
+// the object is already in hand from the matchups call.
+//
+// Values are deliberately NOT printed. Rosters are long and the question
+// is which fields exist, not what is in them.
+function _slLockFieldsHtml(row) {
+  try {
+    var m = row && row._slRawMatchup;
+    var st = null;
+    try { st = (row && row.raw && row.raw.settings) || null; } catch (eS) { st = null; }
+    if (!m && !st) { return ''; }
+    function keysOf(o) {
+      var out = [], k;
+      for (k in o) { if (Object.prototype.hasOwnProperty.call(o, k)) { out.push(k); } }
+      out.sort();
+      return out;
+    }
+    var h = '<div style="color:#94a3b8;margin-top:6px;border-top:1px solid ' +
+      'rgba(255,255,255,0.08);padding-top:5px">PAYLOAD FIELDS \u00b7 names only</div>';
+    if (m) {
+      h += '<div style="color:rgba(255,255,255,0.55);white-space:normal">matchup: ' +
+        slEsc(keysOf(m).join(', ')) + '</div>';
+      // A nested object is where a per-player lock would most plausibly
+      // live, so those get named too.
+      var sub = '', kk = keysOf(m), i;
+      for (i = 0; i < kk.length; i++) {
+        var v = m[kk[i]];
+        if (v && typeof v === 'object' && !(v instanceof Array)) {
+          var inner = keysOf(v);
+          if (inner.length && inner.length <= 40) {
+            sub += '<div style="color:rgba(255,255,255,0.4);white-space:normal">\u00b7 ' +
+              slEsc(kk[i]) + ': ' + slEsc(inner.slice(0, 40).join(', ')) + '</div>';
+          } else if (inner.length) {
+            sub += '<div style="color:rgba(255,255,255,0.4)">\u00b7 ' + slEsc(kk[i]) +
+              ': ' + inner.length + ' keys</div>';
+          }
+        }
+      }
+      h += sub;
+    }
+    if (st) {
+      h += '<div style="color:rgba(255,255,255,0.55);white-space:normal">settings: ' +
+        slEsc(keysOf(st).join(', ')) + '</div>';
+    }
+    h += '<div style="color:rgba(255,255,255,0.4);margin-top:3px;white-space:normal">' +
+      'If none of these names the locked game, Sleeper does not publish it ' +
+      'and the lock cannot be read \u2014 which is worth knowing for certain ' +
+      'rather than approximating for another week.</div>';
+    return h;
+  } catch (e) { return ''; }
+}
+
 function _slLkMatchIdx(games, ppv, sum) {
   if (!games || isNaN(ppv)) { return -1; }
   // A figure equal to the whole week is a sum, not a lock.
@@ -225875,10 +225938,16 @@ function slWeekGamesHtml(list, week, isPreview, season, pp) {
       } else {
         _why = 'no finished game matches \u2014 not locked';
       }
+      // SLLOCKPROBE -- what the app ends up using, which is the number
+      // on his card and the one he can set against Sleeper's own. Without
+      // it the panel showed the inputs and hid the output.
+      var _choseN = (lockedIdx >= 0) ? p.games[lockedIdx].fp : best;
       _lkEv.push({
         name: String(p.name || p.playerId || '?'),
         fps: _fpsArr.join(' + '),
         pp: isNaN(_ppNum) ? '\u2014' : _ppNum.toFixed(1),
+        chose: (_choseN == null) ? '\u2014' : Number(_choseN).toFixed(1),
+        how: (lockedIdx >= 0) ? 'matched pp' : 'fell back to best',
         proven: (lockedIdx >= 0),
         live: (_liveN > 0),
         verdict: _why
@@ -225991,8 +226060,10 @@ function slWeekGamesHtml(list, week, isPreview, season, pp) {
         'text-overflow:ellipsis">' + slEsc(_x.name) + '</span>' +
         '<span style="color:rgba(255,255,255,0.45);flex:0 0 96px">played ' +
         slEsc(_x.fps) + '</span>' +
-        '<span style="color:rgba(255,255,255,0.45);flex:0 0 74px">pp ' +
+        '<span style="color:rgba(255,255,255,0.45);flex:0 0 62px">pp ' +
         slEsc(_x.pp) + '</span>' +
+        '<span style="color:#fbbf24;flex:0 0 108px">used ' + slEsc(_x.chose) +
+        ' (' + slEsc(_x.how) + ')</span>' +
         '<span style="color:' + (_x.proven ? '#4ade80' : (_x.live ? '#fbbf24' : '#94a3b8')) + ';flex:1">' +
         slEsc(_x.verdict) + '</span></div>';
     }
@@ -226000,7 +226071,8 @@ function slWeekGamesHtml(list, week, isPreview, season, pp) {
       'border-radius:8px;padding:7px 9px;margin:8px 0 0;font-size:10px;line-height:1.5;' +
       'font-family:var(--sk-font-mono,monospace)">' +
       '<div style="color:#94a3b8;margin-bottom:3px">LOCK EVIDENCE \u00b7 what Sleeper ' +
-      'credits vs what was played</div>' + _ev +
+      'credits vs what was played vs what this app used</div>' + _ev +
+      _slLockFieldsHtml(row) +
       '<div style="color:rgba(255,255,255,0.4);margin-top:4px;white-space:normal">' +
       'A player with one game cannot be told apart: his game and his credited ' +
       'figure are the same number either way. A game still BEING PLAYED is the ' +
