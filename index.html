@@ -191054,11 +191054,19 @@ function _auctBarHtml() {
   var proj = 0, i;
   for (i = 0; i < _auctState.lineup.length; i++) { proj += Number(_auctState.lineup[i].fp) || 0; }
   var full = (n >= seats);
+  // AUCTGRID -- A LOCKED CARD HAS SPENT, IT HAS NOTHING LEFT. Showing a
+  // budget remaining on a night already committed is how "$-7 left"
+  // appeared: his prices were recomputed when the board opened up to
+  // every man playing, and a negative balance reads like he cheated.
+  var spent = _auctSumPrice(_auctState.lineup);
+  var money = _auctState.locked
+    ? ('$' + spent + ' spent')
+    : ('$' + left + ' left');
   var h = '<div style="position:sticky;top:0;z-index:5;background:#0b0f1a;' +
     'border-bottom:1px solid rgba(255,255,255,0.10);padding:9px 0 10px;' +
     'margin:0 0 8px">' +
     '<div style="display:flex;align-items:baseline;gap:10px;font-size:13px">' +
-      '<span style="color:#facc15;font-weight:700">$' + left + ' left</span>' +
+      '<span style="color:#facc15;font-weight:700">' + money + '</span>' +
       '<span style="color:rgba(255,255,255,0.5)">' + n + ' of ' + seats + '</span>' +
       (proj > 0 ? ('<span style="color:rgba(255,255,255,0.5);margin-left:auto">proj ' +
         proj.toFixed(1) + '</span>') : '') +
@@ -191099,6 +191107,15 @@ function _auctBarHtml() {
         'color:rgba(255,255,255,0.6);font-size:13px;cursor:pointer">Clear</button>') : '') +
       '</div>';
   }
+  // AUCTGRID -- a card migrated from the old format carries TONIGHT'S
+  // tiers, not the ones he paid. Say so rather than presenting them as
+  // his.
+  if (_auctState.locked && _auctState.recomputed) {
+    h += '<div class="rg-foot" style="margin:6px 0 0">These prices were ' +
+      'recomputed when the board opened up to every man playing, so they ' +
+      'are not quite what you paid. The six men are right, and the night ' +
+      'is scored on them, not on the money.</div>';
+  }
   return h + '</div>';
 }
 
@@ -191117,6 +191134,68 @@ function _auctTotalsWith(rows, box, sc) {
 
 function _auctSideTotals(rows) {
   return _auctTotalsWith(rows, _auctState.live, _auctScoring(_auctState.leagueKey));
+}
+
+// \u2500\u2500 AUCTGRID \u2500\u2500 the same category tables the Wire uses \u2500\u2500\u2500\u2500
+//
+// _rgTable wants rows carrying a playerKey and a map of
+// playerKey -> { stats: { <yahoo stat id>: value }, fp }. The box score
+// gives a line keyed by CATEGORY ('g', 'sog', 'sv'), and the league
+// settings give stat id -> abbreviation, so _FPP_YAHOO_MAP joins the
+// two. Nothing new is invented: the same table, fed from tonight.
+function _auctGridFor(rows, box, leagueKey) {
+  if (!rows || !rows.length || !box) { return ''; }
+  if (typeof _rgTable !== 'function') { return ''; }
+  var set = null;
+  try { set = leagueSettingsCache ? leagueSettingsCache[leagueKey] : null; } catch (e) { set = null; }
+  var meta = (set && set.stats) || null;
+  if (!meta) { return ''; }
+  var sc = _auctScoring(leagueKey);
+  var mapS = (typeof _FPP_YAHOO_MAP !== 'undefined' && _FPP_YAHOO_MAP.nhl_skater) || {};
+  var mapG = (typeof _FPP_YAHOO_MAP !== 'undefined' && _FPP_YAHOO_MAP.nhl_goalie) || {};
+  var ord = [], sid;
+  for (sid in meta) { if (meta.hasOwnProperty(sid)) { ord.push(String(sid)); } }
+  ord.sort(function (a, b) { return Number(a) - Number(b); });
+
+  var skaters = [], keepers = [], byKey = {}, i;
+  for (i = 0; i < rows.length; i++) {
+    var r = rows[i];
+    var isG = (r.slot === 'G');
+    var a = _auctActualFor(r, box, sc);
+    // A man who has not played yet still gets a row: the table prints a
+    // line of em-dashes, which says "not yet" where no row at all says
+    // "not picked".
+    var key = 'auct:' + String(r.id);
+    var st = {}, j;
+    if (a && a.line) {
+      var m = isG ? mapG : mapS;
+      for (j = 0; j < ord.length; j++) {
+        var mm = meta[ord[j]];
+        if (!mm || !mm.enabled || mm.isOnlyDisplayStat) { continue; }
+        var ab = String(mm.abbr || mm.displayName || mm.name || '').toUpperCase();
+        var ck = m[ab];
+        if (!ck) { continue; }
+        var v = a.line[ck];
+        if (v == null || isNaN(v)) { continue; }
+        st[ord[j]] = Number(v);
+      }
+    }
+    byKey[key] = { stats: st, fp: a ? Math.round(a.fp * 10) / 10 : null };
+    var row = { playerKey: key, name: r.name, teamAbbr: r.team,
+                selectedPos: r.slot, imageUrl: '' };
+    (isG ? keepers : skaters).push(row);
+  }
+  var h = '';
+  var opt = { fp: true, totals: true, shapeBy: byKey };
+  if (skaters.length) {
+    var t1 = _rgTable(skaters, byKey, meta, ord, 'nhl', opt);
+    if (t1) { h += (keepers.length ? '<div class="rg-sect">Skaters</div>' : '') + t1; }
+  }
+  if (keepers.length) {
+    var t2 = _rgTable(keepers, byKey, meta, ord, 'nhl', opt);
+    if (t2) { h += '<div class="rg-sect">Goaltenders</div>' + t2; }
+  }
+  return h;
 }
 
 // Both sides, once the card is locked.
@@ -191183,9 +191262,21 @@ function _auctCardHtml() {
     (_auctState.liveBusy ? 'Reading box scores\u2026' : 'Refresh now') +
     '</button></div>';
 
+  // AUCTGRID -- the stat lines, once there is something to show. Above
+  // the big board, below the totals, which is where he asked for them.
+  var grids = '';
+  if (live) {
+    var g1 = _auctGridFor(_auctState.lineup, live, _auctState.leagueKey);
+    var g2 = _auctGridFor(_auctState.house, live, _auctState.leagueKey);
+    if (g1 || g2) {
+      grids = '<div class="rg-sect">Your stat lines</div>' + g1 +
+        '<div class="rg-sect">The house\u2019s stat lines</div>' + g2;
+    }
+  }
   return '<div class="rg-dark rg-bleed">' + head + btn +
     side('Your six', _auctState.lineup, '', mine) +
     side('The house \u2014 ' + st.label, _auctState.house, st.note, hers) +
+    grids +
     (live ? _auctLiveDiagHtml(live)
           : '<div class="rg-foot">Locked for tonight. Tonight\u2019s column ' +
             'fills in as the games are played \u2014 tap Refresh now, or ' +
@@ -191714,7 +191805,8 @@ var AUCT_LOT_CURVE = 1.6;
 var _auctState = { leagueKey: '', board: null, note: '',
                    lineup: [], house: [], strategy: '', locked: false,
                    live: null, liveAt: 0, liveBusy: false, timer: null,
-                   q: '', fPrice: 0 };
+                   q: '', fPrice: 0, nightIdx: 0, lastBox: null,
+                   recomputed: false };
 
 // AUCTPLAY -- the four opponents. A single optimiser would build the
 // same side every night, and so would he off the same column, which is
@@ -192108,6 +192200,7 @@ function _auctSave() {
       strategy: _auctState.strategy,
       locked: !!_auctState.locked,
       gids: _auctState.gids || [],
+      recomputed: !!_auctState.recomputed,
       settled: !!_auctState.settled,
       my: _auctState.my, houseScore: _auctState.houseScore,
       result: _auctState.result
@@ -192189,7 +192282,15 @@ function _auctLoad() {
     // RECOMPUTED against tonight's board, and a tier is a rank, so a
     // longer board moves one. Re-save it in the new shape the moment it
     // loads, so tonight is the last time it can drift.
-    if (_auctState.locked && sv.v !== 2) { _auctSave(); }
+    if (_auctState.locked && sv.v !== 2) {
+      // AUCTGRID -- flag it. The prices being written here are tonight's
+      // tiers, not the ones he actually paid, and the card should say so
+      // rather than quietly presenting them as his.
+      _auctState.recomputed = true;
+      _auctSave();
+    } else {
+      _auctState.recomputed = !!sv.recomputed;
+    }
   }
   if (!_auctState.strategy) {
     var rnd = _auctRng(_auctDayKey() + '|house');
@@ -192276,26 +192377,60 @@ function _auctRecStr(t) {
   return t.w + '-' + t.l + (t.t ? ('-' + t.t) : '');
 }
 
-// AUCTSETTLE -- the most recent locked night before today, settled or
-// not. Looked back a week, because he may not open this every day.
-function _auctLastNight() {
-  var today = _auctToday(), i;
-  for (i = 1; i <= 7; i++) {
+// AUCTGRID -- every night he actually played, newest first. Not an
+// arbitrary date stepper: walking back through empty days to find the
+// one with a card on it is not navigation, it is searching.
+var AUCT_LOOKBACK = 60;
+
+function _auctNights() {
+  var today = _auctToday(), out = [], i;
+  for (i = 1; i <= AUCT_LOOKBACK; i++) {
     var d = _auctDateShift(today, -i);
     if (!d) { break; }
     var c = _auctReadCard(d, _auctState.leagueKey);
-    if (c && c.locked) { return { date: d, card: c }; }
+    if (c && c.locked) { out.push({ date: d, card: c }); }
   }
-  return null;
+  return out;
+}
+
+// AUCTSETTLE -- the most recent locked night before today, settled or
+// not, or whichever one he has stepped back to.
+function _auctLastNight() {
+  var list = _auctNights();
+  if (!list.length) { return null; }
+  var i = _auctState.nightIdx || 0;
+  if (i >= list.length) { i = list.length - 1; _auctState.nightIdx = i; }
+  if (i < 0) { i = 0; _auctState.nightIdx = 0; }
+  return list[i];
+}
+
+function _auctStepNight(delta) {
+  var list = _auctNights();
+  var i = (_auctState.nightIdx || 0) + delta;
+  if (i < 0) { i = 0; }
+  if (i > list.length - 1) { i = list.length - 1; }
+  _auctState.nightIdx = i;
+  _auctState.lastNote = '';
+  _auctCheckLastNight();
+  _auctRender();
 }
 
 // Settle it if it can be settled, then show it either way. Runs once per
 // open: a settled night is already written and needs no request at all.
 function _auctCheckLastNight() {
   var ln = _auctLastNight();
+  _auctState.lastBox = null;
   if (!ln) { _auctState.last = null; return; }
   if (ln.card.settled) {
     _auctState.last = ln;
+    // Already scored, so nothing has to be fetched for the RESULT -- but
+    // the stat lines need the lines, so read them once if they are not
+    // in hand. Final games are cached and cost nothing after the first.
+    if (!_auctState.lastBox && ln.card.gids && ln.card.gids.length) {
+      _auctLiveFetch(false, ln.card.gids).then(function (box) {
+        if (box) { _auctState.lastBox = box; _auctRender(); }
+      }, function () {});
+    }
     return;
   }
   if (!(ln.card.gids && ln.card.gids.length)) {
@@ -192308,6 +192443,7 @@ function _auctCheckLastNight() {
   _auctState.last = ln;
   _auctLiveFetch(false, ln.card.gids).then(function (box) {
     if (!box) { return; }
+    _auctState.lastBox = box;
     var row = _auctSettleNight(ln.date, _auctState.leagueKey, ln.card, box, 'nhl');
     if (row) {
       _auctState.last = { date: ln.date, card: ln.card };
@@ -192336,8 +192472,25 @@ function _auctLastHtml() {
     var col = done
       ? (c.result === 'W' ? '#4ade80' : (c.result === 'L' ? '#f87171' : 'rgba(255,255,255,0.6)'))
       : 'rgba(255,255,255,0.5)';
-    h += '<div class="rg-sect">Last night <span style="opacity:0.6">' +
-      skEscape(ln.date) + '</span></div>';
+    // AUCTGRID -- arrows between the nights he played, with his place in
+    // them, so "how do I get back a day" has an answer on screen.
+    var _n = _auctNights().length, _ix = _auctState.nightIdx || 0;
+    function _nb(d, lbl, on) {
+      return '<button onclick="_auctStepNight(' + d + ')" ' +
+        'style="padding:2px 9px;border-radius:7px;font-size:13px;' +
+        'line-height:1.4;cursor:pointer;background:transparent;border:1px ' +
+        'solid rgba(255,255,255,' + (on ? '0.22' : '0.07') + ');color:' +
+        (on ? '#facc15' : 'rgba(255,255,255,0.22)') + '">' + lbl + '</button>';
+    }
+    h += '<div class="rg-sect" style="display:flex;align-items:center;gap:8px">' +
+      '<span>' + (_ix === 0 ? 'Last night' : 'Earlier night') + '</span>' +
+      '<span style="opacity:0.6;font-weight:400">' + skEscape(ln.date) + '</span>' +
+      '<span style="margin-left:auto;display:flex;gap:6px">' +
+        _nb(1, '\u2039', _ix < _n - 1) +
+        '<span style="opacity:0.45;font-size:11px;align-self:center">' +
+          (_ix + 1) + ' / ' + _n + '</span>' +
+        _nb(-1, '\u203a', _ix > 0) +
+      '</span></div>';
     if (done) {
       h += '<div style="display:flex;align-items:baseline;gap:8px;padding:2px 0 6px">' +
         '<span style="font:700 20px Georgia,serif;color:#facc15">' +
@@ -192357,6 +192510,14 @@ function _auctLastHtml() {
       if (b) {
         h += '<div class="rg-wrap"><table class="rg">' +
           '<tr><th class="rg-p">Your six</th><th>$</th></tr>' + b + '</table></div>';
+      }
+      // AUCTGRID -- the stat lines for a past night too, when its box
+      // score is still in hand from settling it this session.
+      if (_auctState.lastBox) {
+        var _lg1 = _auctGridFor(c.lineup || [], _auctState.lastBox, _auctState.leagueKey);
+        var _lg2 = _auctGridFor(c.house || [], _auctState.lastBox, _auctState.leagueKey);
+        if (_lg1) { h += '<div class="rg-sect">Your stat lines</div>' + _lg1; }
+        if (_lg2) { h += '<div class="rg-sect">The house\u2019s stat lines</div>' + _lg2; }
       }
     } else {
       h += '<div class="rg-foot">' + skEscape(_auctState.lastNote ||
@@ -192469,7 +192630,18 @@ var _AUCT_BOX_SKATER = {
   'BS': 'blk', 'BLK': 'blk', 'BKS': 'blk', 'BLOCKS': 'blk',
   'PPG': 'ppg', 'PPA': 'ppa', 'PPP': 'ppp',
   'SHG': 'shg', 'SHA': 'sha', 'GWG': 'gwg',
-  'FW': 'fw', 'FO': 'fw', 'TOI': 'toi'
+  'FW': 'fw', 'FO': 'fw', 'FL': 'fl', 'TOI': 'toi'
+};
+// AUCTGRID -- REAL ESPN COLUMNS THAT NO YAHOO CATEGORY USES. Naming
+// them keeps the amber warning meaning "a category is being scored
+// short" rather than listing every column ESPN happens to print. His
+// first live night printed seventeen of these and two real misses were
+// buried in them.
+var _AUCT_BOX_IGNORE = {
+  'ESSV': 1, 'ESTOI': 1, 'PPSV': 1, 'PPTOI': 1, 'SHSV': 1, 'SHTOI': 1,
+  'SOS': 1, 'SOSA': 1, 'SOSV': 1, 'SO%': 1, 'SV%': 1, 'FO%': 1,
+  'GV': 1, 'TK': 1, 'SHFT': 1, 'PN': 1, 'SM': 1, 'YTDG': 1,
+  'TOI': 1, 'GP': 1, 'G/A': 1, 'MIN': 1, 'SAVE%': 1
 };
 var _AUCT_BOX_GOALIE = {
   'SA': 'sa', 'SHOTS AGAINST': 'sa',
@@ -192477,7 +192649,11 @@ var _AUCT_BOX_GOALIE = {
   'SV': 'sv', 'SAVES': 'sv',
   'SV%': 'svpct', 'SAVE%': 'svpct',
   'SO': 'so', 'SHUTOUTS': 'so',
-  'TOI': 'toi', 'W': 'w', 'L': 'l'
+  // AUCTGRID -- goalies take penalties, and PIM arrived in THIS group,
+  // which is why it came back unmapped from a map that has had PIM for
+  // skaters all along. A league scoring PIM was crediting keepers none.
+  'PIM': 'pim', 'PM': 'pim',
+  'GA': 'ga', 'TOI': 'toi', 'W': 'w', 'L': 'l', 'OTL': 'otl'
 };
 
 function _auctBoxNum(v) {
@@ -192528,7 +192704,7 @@ function _auctParseBox(j, out) {
       for (L = 0; L < labs.length; L++) {
         var up = String(labs[L]).toUpperCase();
         out.labels[up] = 1;
-        if (!map[up]) { out.unmapped[up] = 1; }
+        if (!map[up] && !_AUCT_BOX_IGNORE[up]) { out.unmapped[up] = 1; }
       }
       for (a = 0; a < ath.length; a++) {
         var row = ath[a] || {}, st = row.stats || [];
