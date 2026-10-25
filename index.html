@@ -132294,18 +132294,30 @@ async function skScanWireEspLeague(lg) {
     oppStarters: [], oppBench: [],
     mvp: null, benchBurn: null, error: null, ts: Date.now()
   };
+  // ESPWIRE2 -- EVERY exit files an entry. The row shows "Loading..."
+  // when there is none, so a league with nothing to report -- a roto or
+  // a season-points league, which has no daily matchup at all -- hung
+  // there forever instead of rendering as a league with no opponent,
+  // which is what the Yahoo side does with the same situation.
+  //
+  // error stays null for those: an absent opponent is not a failure, and
+  // the row's error branch says "No data", which would be a lie.
+  function _fin(reason) {
+    entry.reason = reason || null;
+    skWireCache[key] = entry;
+  }
   try {
     var today = (typeof _todayDateString === 'function') ? _todayDateString() : null;
     var period = _espWirePeriodFor(row, dateStr, today);
-    if (period == null) { return; }
+    if (period == null) { _fin('no scoring period'); return; }
     var pair = _espWireMatchup(row, period);
-    if (!pair) { return; }
+    if (!pair) { _fin('no daily matchup'); return; }
     // WEEKEDGE -- a day that provably belongs to the previous matchup is
     // not reported against this one's opponent.
-    if (pair.inWeek === false) { _espWireSkipEdge++; return; }
+    if (pair.inWeek === false) { _espWireSkipEdge++; _fin('previous matchup week'); return; }
     if (pair.inWeek === null) { _espWireNoEdge++; }
     var ros = await _espWireDayRosters(row, period);
-    if (!ros) { return; }
+    if (!ros) { _fin('no roster for that day'); return; }
     _espWireScanned++;
 
     var sv = _espWireSaved(row);
@@ -132380,7 +132392,20 @@ async function skScanWireEspLeague(lg) {
         else { entry.result = (entry.myFp > entry.oppFp) ? 'W' : 'L'; }
       }
     }
-    skWireCache[key] = entry;
+    // ESPWIRE2 -- the day's rosters stay on the entry: the detail
+    // sheet's player lines are built from them rather than asking Yahoo
+    // for an ESPN team id, which is what left that table empty.
+    entry._espRos = ros;
+    entry._espGame = game;
+    // ESPWIRE2 -- the club map travels with the entry, so the player
+    // lines can put a crest in the photo circle the way every other
+    // grid does. Without it they render as empty discs.
+    entry._espProMap = proMap;
+    entry._espMineId = pair.mineId;
+    entry._espOppId = pair.oppId;
+    _espWireSeedIdentity(row, key, pair.mineId);
+    _espWireSeedStats(row, key, game, ros, null);
+    _fin(null);
   } catch (e) {
     entry.error = String((e && e.message) || e);
     skWireCache[key] = entry;
@@ -132403,8 +132428,21 @@ function skWireLeagueList() {
     for (var j = 0; j < e.length; j++) {
       var r = e[j];
       if (!r || r.provider !== 'espn' || !r.key) { continue; }
+      // ESPWIRE2 -- _skWireScoringType reads league.scoring_type, and
+      // the adapted row carried none, so every ESPN card's format pill
+      // was a dash. ESPN's own string, mapped onto the codes the Wire
+      // already speaks.
+      var _st = '';
+      try {
+        var _raw = String((((r.raw || {}).settings || {}).scoringSettings || {}).scoringType || '');
+        if (/ROTO/i.test(_raw)) { _st = 'roto'; }
+        else if (/H2H_CATEGOR|CATEGOR/i.test(_raw)) { _st = 'head'; }
+        else if (/H2H_POINT/i.test(_raw)) { _st = 'headpoint'; }
+        else if (/TOTAL_POINT|SEASON/i.test(_raw)) { _st = 'point'; }
+      } catch (eS) { _st = ''; }
       out.push({ league_key: r.key, name: r.name || '(unnamed league)',
-                 sport: r.sport || '', provider: 'espn', _esp: r });
+                 sport: r.sport || '', provider: 'espn',
+                 scoring_type: _st, _esp: r });
     }
   } catch (eE) {}
   return out;
@@ -133662,9 +133700,60 @@ function skOpenWireDetail(leagueKey) {
 // compactly at the end instead of getting a blank row.
 var _skWirePL = { key: null, side: 'me', entry: null, my: null, opp: null };
 
+// ESPWIRE2 -- one side of an ESPN day, in the map shape the player
+// lines read: keyed by player, carrying his slot, his stats and his
+// fantasy total. The same fields _parseTeamFpResponse produces for
+// Yahoo, which is why the grid needs no second code path.
+function _espWirePLMap(ros, teamId, sport, proMap) {
+  var out = {};
+  var t = ros && ros.byTeam && ros.byTeam[String(teamId)];
+  if (!t || !t.items) { return out; }
+  var sp = String(sport || '').toLowerCase();
+  for (var i = 0; i < t.items.length; i++) {
+    var it = t.items[i] || {};
+    var w = it.windows && it.windows.today;
+    var slot = String(it.slot || '');
+    // The grid groups by position type. ESPN gives a slot label, which
+    // answers the only split each sport needs: goalies in hockey,
+    // pitchers in baseball, nothing at all in basketball.
+    var pt = '';
+    if (sp === 'nhl') { pt = (slot === 'G') ? 'G' : 'P'; }
+    else if (sp === 'mlb') { pt = (slot === 'SP' || slot === 'RP' || slot === 'P') ? 'P' : 'B'; }
+    var ab = '';
+    try {
+      if (proMap && it.teamId != null) {
+        var pm = proMap[String(it.teamId)];
+        ab = (pm && (pm.abbrev || pm.abbr || pm.name)) ||
+             (typeof pm === 'string' ? pm : '');
+      }
+    } catch (eA) { ab = ''; }
+    out[String(it.playerId || ('_e' + i))] = {
+      name: it.name || '', teamAbbr: String(ab || '').toUpperCase(),
+      selectedPos: slot,
+      positionType: pt,
+      stats: (w && w.stats) ? w.stats : {},
+      fp: (w && w.total != null && !isNaN(w.total)) ? Number(w.total) : null
+    };
+  }
+  return out;
+}
+
 function _skWirePLLoad(entry) {
   _skWirePL = { key: entry.leagueKey, side: 'me', entry: entry, my: null, opp: null };
   var want = entry.leagueKey;
+  // ESPWIRE2 -- ESPN's day is already in hand from the scan. It used to
+  // fall through to fetchTeamFpForDate, a Yahoo call handed an ESPN team
+  // id, which answered nothing and left the table blank.
+  if (entry.provider === 'espn') {
+    var _sp = (entry.league && entry.league.sport) || '';
+    _skWirePL.my = _espWirePLMap(entry._espRos, entry._espMineId, _sp,
+                                 entry._espProMap);
+    _skWirePL.opp = entry._espOppId
+      ? _espWirePLMap(entry._espRos, entry._espOppId, _sp, entry._espProMap) : null;
+    _skWirePLPaint();
+    try { _skWireOppGapPaint(); } catch (eOG) {}
+    return;
+  }
   var pMy = fetchTeamFpForDate(entry.myTeamKey, entry.dateStr)['catch'](function () { return null; });
   var hasOpp = entry.oppTeamKey && entry.scoringType !== 'point';
   var pOpp = hasOpp
@@ -133735,7 +133824,13 @@ function _skWirePLPaint() {
   try {
     var lg = (typeof fyLeagues !== 'undefined' && fyLeagues)
       ? fyLeagues.find(function (l) { return l.league_key === entry.leagueKey; }) : null;
-    if (lg && lg.sport) sport = String(lg.sport).toLowerCase();
+    if (lg && lg.sport) { sport = String(lg.sport).toLowerCase(); }
+    // ESPWIRE2 -- fyLeagues holds no ESPN keys, so every ESPN league fell
+    // through to the baseball default and would have been split into
+    // Hitters and Pitchers. The entry carries its own league.
+    else if (entry.league && entry.league.sport) {
+      sport = String(entry.league.sport).toLowerCase();
+    }
   } catch (e0) {}
   var GROUPS = (sport === 'nhl') ? [['P', 'Skaters'], ['G', 'Goalies']]
              : (sport === 'nba') ? [['*', 'Players']]
@@ -214511,6 +214606,70 @@ function _espWireTop(list) {
     if (!best || list[i].fp > best.fp) { best = list[i]; }
   }
   return best;
+}
+
+// ESPWIRE2 -- what the Wire row reads for its title, its badge and its
+// format pill. Yahoo's hydration fills skLeagueData; nothing filled it
+// for ESPN, so the card showed the league name twice and no logo.
+function _espWireSeedIdentity(row, key, mineId) {
+  try {
+    if (typeof skLeagueData !== 'object' || !skLeagueData) { return; }
+    var cur = skLeagueData[key];
+    if (cur && cur.team && cur.team.name) { return; }    // never clobber
+    var j = row && row.raw;
+    var nm = '', lg = '';
+    try {
+      var ts = (j && j.teams) || [], i;
+      for (i = 0; i < ts.length; i++) {
+        if (String(ts[i].id) !== String(mineId)) { continue; }
+        nm = (typeof espTeamName === 'function')
+          ? espTeamName(ts[i], (j && j.id) || null) : (ts[i].name || '');
+        break;
+      }
+      lg = (typeof espTeamLogo === 'function') ? espTeamLogo(j, mineId) : '';
+    } catch (eT) {}
+    skLeagueData[key] = cur || {};
+    skLeagueData[key].team = { name: nm || '', logoUrl: lg || '' };
+  } catch (e) {}
+}
+
+// ESPWIRE2 -- the columns for the Wire's player-lines grid. ESPN's own
+// short labels, in id order, with the lower-is-better ones flagged the
+// way _rgTable reads that flag (sortOrder 0).
+function _espWireSeedStats(row, key, game, ros, ids) {
+  try {
+    if (typeof leagueSettingsCache !== 'object' || !leagueSettingsCache) { return; }
+    if (leagueSettingsCache[key] && leagueSettingsCache[key].stats) { return; }
+    var meta = {}, order = [], seen = {}, i, k;
+    var tids = Object.keys((ros && ros.byTeam) || {});
+    for (i = 0; i < tids.length; i++) {
+      var items = ((ros.byTeam[tids[i]] || {}).items) || [];
+      for (var q = 0; q < items.length; q++) {
+        var w = items[q] && items[q].windows && items[q].windows.today;
+        if (!w || !w.stats) { continue; }
+        for (k in w.stats) { if (w.stats.hasOwnProperty(k)) { seen[k] = 1; } }
+      }
+    }
+    if (ids) { for (i = 0; i < ids.length; i++) { seen[ids[i]] = 1; } }
+    var all = Object.keys(seen).sort(function (a, b) {
+      var na = parseInt(a, 10), nb = parseInt(b, 10);
+      if (!isNaN(na) && !isNaN(nb)) { return na - nb; }
+      return String(a) < String(b) ? -1 : 1;
+    });
+    for (i = 0; i < all.length; i++) {
+      var sid = all[i];
+      var ab = (typeof espStatName === 'function') ? espStatName(game, sid) : '';
+      if (!ab) { ab = (typeof espStatName === 'function')
+        ? espStatName(game, parseInt(sid, 10)) : ''; }
+      if (!ab) { ab = String(sid); }
+      var low = (typeof espIsLowerBetter === 'function')
+        ? !!espIsLowerBetter(game, sid) : false;
+      meta[sid] = { abbr: ab, displayName: ab, enabled: 1, sortOrder: low ? 0 : 1 };
+      order.push(String(sid));
+    }
+    if (!order.length) { return; }
+    leagueSettingsCache[key] = { stats: meta, statOrder: order };
+  } catch (e) {}
 }
 
 function espMyMatchupPair(row) {
