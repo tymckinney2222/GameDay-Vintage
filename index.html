@@ -132275,6 +132275,8 @@ async function skScanWireLeague(league) {
 // are computed from Yahoo snapshot history that ESPN has none of, so the
 // card renders without the flip line rather than inventing one.
 async function skScanWireEspLeague(lg) {
+  // ESPWIRE3 -- lg is the adapted league, and its scoring_type is what
+  // decides how much of the day is worth fetching below.
   var row = lg && lg._esp;
   if (!row) { return; }
   var key = lg.league_key;
@@ -132307,15 +132309,44 @@ async function skScanWireEspLeague(lg) {
     skWireCache[key] = entry;
   }
   try {
+    // ESPWIRE3 -- identity FIRST, for every league whatever its format.
+    // This used to sit on the success path, so the two formats that leave
+    // before it -- roto and season points -- were exactly the two still
+    // showing a blank badge and their league name twice.
+    var _myId0 = _espWireMyTeamId(row, null);
+    if (_myId0 != null) { _espWireSeedIdentity(row, key, _myId0); }
+    // ESPWIRE3 -- and the daily snapshot hook, which is already
+    // provider-aware: espMaybeSnapshot upserts one useful record per
+    // league per day and _skRankHistRecordEsp is the first thing it
+    // calls. Running it here means a league he has not opened still has
+    // its rank captured, which is the whole point of the hook.
+    try {
+      if (typeof espMaybeSnapshot === 'function') { espMaybeSnapshot(row); }
+    } catch (eSn) {}
+
+    var _fmt = String((lg && lg.scoring_type) || '');
     var today = (typeof _todayDateString === 'function') ? _todayDateString() : null;
     var period = _espWirePeriodFor(row, dateStr, today);
     if (period == null) { _fin('no scoring period'); return; }
+
+    // ESPWIRE3 -- roto scores no fantasy points on a day, so there is no
+    // day's figure to fetch a roster for. What the Yahoo roto card shows
+    // is the rank move, and that is already in the history.
+    if (_fmt === 'roto') {
+      entry.scoringType = 'roto';
+      entry.myTeamKey = _myId0;
+      _fin('roto \u2014 movement only');
+      return;
+    }
+
     var pair = _espWireMatchup(row, period);
-    if (!pair) { _fin('no daily matchup'); return; }
     // WEEKEDGE -- a day that provably belongs to the previous matchup is
     // not reported against this one's opponent.
-    if (pair.inWeek === false) { _espWireSkipEdge++; _fin('previous matchup week'); return; }
-    if (pair.inWeek === null) { _espWireNoEdge++; }
+    if (pair && pair.inWeek === false) { _espWireSkipEdge++; _fin('previous matchup week'); return; }
+    if (pair && pair.inWeek === null) { _espWireNoEdge++; }
+    // ESPWIRE3 -- season points has no opponent and never will; it still
+    // has a day's total, which is what Yahoo's card leads with.
+    if (!pair && _fmt !== 'point') { _fin('no daily matchup'); return; }
     var ros = await _espWireDayRosters(row, period);
     if (!ros) { _fin('no roster for that day'); return; }
     _espWireScanned++;
@@ -132329,10 +132360,12 @@ async function skScanWireEspLeague(lg) {
       }
     } catch (ePM) { proMap = null; }
 
-    var mine = _espWireSide(ros, pair.mineId, proMap);
-    var opp = _espWireSide(ros, pair.oppId, proMap);
-    entry.myTeamKey = pair.mineId;
-    entry.oppTeamKey = pair.oppId;
+    var _mineId = pair ? pair.mineId : _myId0;
+    var mine = _espWireSide(ros, _mineId, proMap);
+    var opp = pair ? _espWireSide(ros, pair.oppId, proMap)
+                   : { teamName: '', starters: [], bench: [], total: null };
+    entry.myTeamKey = _mineId;
+    entry.oppTeamKey = pair ? pair.oppId : null;
     entry.oppName = opp.teamName || null;
     // The villain rollup is keyed on a Yahoo manager GUID. ESPN has none,
     // so the team name goes in the nickname and the existing TEAM: branch
@@ -132344,6 +132377,25 @@ async function skScanWireEspLeague(lg) {
     entry.oppBench = opp.bench;
     entry.mvp = _espWireTop(mine.starters);
     entry.benchBurn = _espWireTop(mine.bench);
+
+    // ESPWIRE3 -- season points: his own figure for the day, no
+    // opponent and so no result. The same shape Yahoo's SEASON card
+    // carries, which leads with "246.0 FP today" above the rank move.
+    if (!pair) {
+      entry.scoringType = 'point';
+      var _sF = (typeof espDailyTeamFp === 'function')
+        ? espDailyTeamFp(ros, _mineId) : null;
+      entry.myFp = (_sF && _sF.total != null) ? _sF.total
+                 : ((_sF && _sF.sum != null) ? _sF.sum : mine.total);
+      entry._espRos = ros;
+      entry._espGame = game;
+      entry._espProMap = proMap;
+      entry._espMineId = _mineId;
+      entry._espOppId = null;
+      _espWireSeedStats(row, key, game, ros, null);
+      _fin('season points \u2014 no opponent');
+      return;
+    }
 
     var isCats = (typeof espIsCats === 'function') && espIsCats(row);
     entry.scoringType = isCats ? 'head' : 'headpoint';
@@ -214611,6 +214663,20 @@ function _espWireTop(list) {
 // ESPWIRE2 -- what the Wire row reads for its title, its badge and its
 // format pill. Yahoo's hydration fills skLeagueData; nothing filled it
 // for ESPN, so the card showed the league name twice and no logo.
+// ESPWIRE3 -- which team is his. The matchup knows when there is one;
+// a roto or season-points league has none, and myTeamIds has said so all
+// along.
+function _espWireMyTeamId(row, pairMineId) {
+  if (pairMineId != null) { return String(pairMineId); }
+  try {
+    var ids = row && row.myTeamIds;
+    for (var k in ids) {
+      if (ids.hasOwnProperty(k) && ids[k]) { return String(k); }
+    }
+  } catch (e) {}
+  return null;
+}
+
 function _espWireSeedIdentity(row, key, mineId) {
   try {
     if (typeof skLeagueData !== 'object' || !skLeagueData) { return; }
@@ -214629,7 +214695,13 @@ function _espWireSeedIdentity(row, key, mineId) {
       lg = (typeof espTeamLogo === 'function') ? espTeamLogo(j, mineId) : '';
     } catch (eT) {}
     skLeagueData[key] = cur || {};
-    skLeagueData[key].team = { name: nm || '', logoUrl: lg || '' };
+    // ESPWIRE3 -- team_key as well. _skWireMoveForLeague reads it to know
+    // whose rank to look up in sk_rank_hist_v1_<key>, which
+    // _skRankHistRecordEsp has been filling under this same numeric id;
+    // without it the movement line had nothing to resolve and the roto
+    // and season cards stayed blank.
+    skLeagueData[key].team = { name: nm || '', logoUrl: lg || '',
+                               team_key: (mineId != null) ? String(mineId) : '' };
   } catch (e) {}
 }
 
