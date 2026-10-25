@@ -33733,6 +33733,21 @@
   <div class="pw-body" id="ppsBody"></div>
 </div>
 
+<!-- SURVIVOR -- one player a night, nobody twice. Same shell as
+     Auction Night and Players of the Week; no new CSS. -->
+<div class="pw-overlay" id="skSurvOverlay">
+  <div class="pp-header">
+    <div>
+      <div class="pp-eyebrow">Nightly game</div>
+      <h2 class="pp-title">Survivor</h2>
+    </div>
+    <button class="pp-close" onclick="closeSurvivor()" aria-label="Close">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+    </button>
+  </div>
+  <div class="pw-body" id="skSurvBody"></div>
+</div>
+
 <!-- AUCTGAMES -- Games. The two things he built, out of the utility
      drawer and into a place of their own. Same shell as Players of the
      Week and Auction Night; no new CSS. -->
@@ -191655,6 +191670,478 @@ function _auctPick(key) {
   });
 }
 
+// \u2500\u2500 SURVIVOR \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+//
+// A real-world bar, climbing with the streak. Nothing here reads a
+// league's scoring settings, which is what lets one streak run across
+// every league he has.
+var SV_BARS = {
+  nhl: [
+    { from: 1,  stat: 'pts', need: 1, label: 'a point',    short: '1+ PTS' },
+    { from: 5,  stat: 'pts', need: 2, label: 'two points', short: '2+ PTS' },
+    { from: 10, stat: 'g',   need: 1, label: 'a goal',     short: '1+ G' }
+  ],
+  nba: [
+    { from: 1,  stat: 'pts', need: 20, label: '20 points', short: '20+ PTS' },
+    { from: 5,  stat: 'pts', need: 25, label: '25 points', short: '25+ PTS' },
+    { from: 10, stat: 'pts', need: 30, label: '30 points', short: '30+ PTS' }
+  ]
+};
+var SV_SPORTS = ['nhl', 'nba'];
+var SV_KEY = 'skSurv_v1';
+var SV_NIGHT_MAX = 90;
+
+var _svState = { loaded: false, store: null, pool: null, note: '',
+                 busy: false, box: null, timer: null };
+
+// The bar for a given streak length. Night one is the gentlest; the
+// streak length is the number ALREADY banked, so a run of five is
+// picking its sixth.
+function _svBarFor(sport, streak) {
+  var list = SV_BARS[sport] || SV_BARS.nhl, i, out = list[0];
+  var night = (Number(streak) || 0) + 1;
+  for (i = 0; i < list.length; i++) { if (night >= list[i].from) { out = list[i]; } }
+  return out;
+}
+
+// The next bar after this one, for "three more nights to the goal".
+function _svNextBar(sport, streak) {
+  var list = SV_BARS[sport] || SV_BARS.nhl, night = (Number(streak) || 0) + 1, i;
+  for (i = 0; i < list.length; i++) { if (list[i].from > night) { return list[i]; } }
+  return null;
+}
+
+function _svToday() {
+  try { return (typeof _todayDateString === 'function') ? _todayDateString() : ''; }
+  catch (e) { return ''; }
+}
+
+function _svKey(n) {
+  try { return (typeof _pmNameKey === 'function') ? _pmNameKey(n) : String(n || '').toLowerCase(); }
+  catch (e) { return String(n || '').toLowerCase(); }
+}
+
+function _svStore() {
+  if (_svState.store) { return _svState.store; }
+  var o = null;
+  try { o = JSON.parse(localStorage.getItem(SV_KEY) || 'null'); } catch (e) {}
+  if (!o || typeof o !== 'object') { o = null; }
+  if (!o) { o = { streak: 0, best: 0, used: {}, nights: {}, history: [] }; }
+  if (!o.used) { o.used = {}; }
+  if (!o.nights) { o.nights = {}; }
+  if (!o.history) { o.history = []; }
+  _svState.store = o;
+  return o;
+}
+
+function _svSave() {
+  var st = _svStore();
+  // Keep the book from growing without end; a streak only ever reads
+  // the run it is in.
+  var keys = [], k;
+  for (k in st.nights) { if (st.nights.hasOwnProperty(k)) { keys.push(k); } }
+  if (keys.length > SV_NIGHT_MAX) {
+    keys.sort();
+    for (var i = 0; i < keys.length - SV_NIGHT_MAX; i++) { delete st.nights[keys[i]]; }
+  }
+  if (st.history.length > SV_NIGHT_MAX) { st.history = st.history.slice(0, SV_NIGHT_MAX); }
+  try { localStorage.setItem(SV_KEY, JSON.stringify(st)); } catch (e) {}
+}
+
+// \u2500\u2500 the odds \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+//
+// MODELLED, NOT MEASURED, and the card says so. Real per-game logs for
+// every rostered man would be hundreds of requests. Points are counts,
+// so hockey is Poisson on a projected rate; basketball scoring is near
+// enough normal to use that.
+function _svPoissonAtLeast(lam, n) {
+  if (!(lam > 0)) { return 0; }
+  var p = Math.exp(-lam), cum = p, i;
+  for (i = 1; i < n; i++) { p = p * lam / i; cum += p; }
+  return Math.max(0, Math.min(1, 1 - cum));
+}
+
+function _svNormAtLeast(mu, sd, x) {
+  if (!(sd > 0)) { return mu >= x ? 1 : 0; }
+  var z = (x - 0.5 - mu) / sd;              // half-point continuity
+  // Abramowitz & Stegun 7.1.26 on the error function.
+  var t = 1 / (1 + 0.3275911 * Math.abs(z) / Math.SQRT2);
+  var y = 1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t
+    - 0.284496736) * t + 0.254829592) * t * Math.exp(-z * z / 2);
+  var cdf = (z >= 0) ? (0.5 * (1 + y)) : (0.5 * (1 - y));
+  return Math.max(0, Math.min(1, 1 - cdf));
+}
+
+function _svOdds(rate, bar, sport) {
+  if (!(rate > 0)) { return 0; }
+  if (sport === 'nba') {
+    // Spread grows with the mean but never vanishes on a low scorer.
+    return _svNormAtLeast(rate, Math.max(4, rate * 0.33), bar.need);
+  }
+  return _svPoissonAtLeast(rate, bar.need);
+}
+
+// A man's projected rate for the stat a bar is about, per game.
+function _svRate(p, bar, sport) {
+  if (!p) { return 0; }
+  var line = null;
+  try {
+    line = (typeof dbpBasis === 'function') ? dbpBasis(p, 'esp') : null;
+    if (line && typeof dbpRate === 'function') { line = dbpRate(line, p.mode); }
+  } catch (e) { line = null; }
+  if (!line) { return 0; }
+  var perGame = false;
+  try { perGame = !!(DBP_PERGAME && DBP_PERGAME[p.mode]); } catch (e2) { perGame = false; }
+  var gp = Number(line.gp || 0);
+  function v(k) {
+    var n = Number(line[k]);
+    if (isNaN(n)) { return 0; }
+    if (perGame) { return n; }
+    return gp > 0 ? (n / gp) : 0;
+  }
+  if (sport === 'nba') { return v('pts'); }
+  if (bar.stat === 'g') { return v('g'); }
+  return v('g') + v('a');          // hockey points
+}
+
+// \u2500\u2500 tonight's pool \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+function _svPoolIndex(pool) {
+  var byName = {}, i;
+  var list = (pool && pool.players) || [];
+  for (i = 0; i < list.length; i++) {
+    if (list[i] && list[i].name) { byName[_svKey(list[i].name)] = list[i]; }
+  }
+  return byName;
+}
+
+// His own rostered men who are playing tonight, with tonight's odds.
+// Falls back to every man on the slate when his own leave nothing legal.
+function _svBuildPool(pools) {
+  var st = _svStore();
+  var out = { rows: [], mine: 0, eligible: 0, games: 0, fallback: false,
+              sports: [], note: '' };
+  var scan = [];
+  try { scan = (typeof _allInScan === 'function') ? (_allInScan() || []) : []; } catch (e) { scan = []; }
+  var i, j, sp, idx, seen = {};
+
+  function add(name, teamAbbr, pos, sport, gm, mine) {
+    var k = _svKey(name);
+    if (!k || seen[k]) { return; }
+    var bar = _svBarFor(sport, st.streak);
+    var p = (pools[sport] ? pools[sport][k] : null);
+    var rate = _svRate(p, bar, sport);
+    var usedNight = st.used[k];
+    seen[k] = 1;
+    out.rows.push({ key: k, name: name, team: String(teamAbbr || '').toUpperCase(),
+                    pos: pos || '', sport: sport, bar: bar,
+                    odds: _svOdds(rate, bar, sport), rate: rate,
+                    used: (usedNight != null) ? usedNight : 0,
+                    known: !!p, mine: !!mine, gm: gm || null });
+  }
+
+  for (i = 0; i < scan.length; i++) {
+    sp = String(scan[i].sport || '').toLowerCase();
+    if (SV_SPORTS.indexOf(sp) === -1) { continue; }
+    out.sports.push(sp);
+    out.games += (scan[i].games || 0);
+    var hits = scan[i].hits || [];
+    for (j = 0; j < hits.length; j++) {
+      add(hits[j].name, hits[j].teamAbbr, hits[j].pos, sp, hits[j].gm, true);
+    }
+  }
+  out.mine = out.rows.length;
+  for (i = 0; i < out.rows.length; i++) { if (!out.rows[i].used) { out.eligible++; } }
+
+  // NOTHING LEGAL LEFT. The run does not end on a technicality: the
+  // pool opens to every man on tonight's slate instead.
+  if (!out.eligible) {
+    out.fallback = true;
+    for (i = 0; i < SV_SPORTS.length; i++) {
+      sp = SV_SPORTS[i];
+      idx = pools[sp];
+      if (!idx) { continue; }
+      var slate = null;
+      try { slate = _allInSlate(sp); } catch (e2) { slate = null; }
+      if (!slate || !slate.games) { continue; }
+      var proMap = null;
+      try {
+        var seas = (typeof dbpSeason === 'function') ? dbpSeason() : null;
+        proMap = _espProTeams[(sp === 'nhl' ? 'fhl:' : 'fba:') + seas];
+      } catch (e3) { proMap = null; }
+      for (var nk in idx) {
+        if (!idx.hasOwnProperty(nk) || seen[nk]) { continue; }
+        var pp = idx[nk], ab = '';
+        try {
+          var pm = proMap ? proMap[String(pp.teamId)] : null;
+          ab = (pm && (pm.abbrev || pm.abbr)) || '';
+        } catch (e4) { ab = ''; }
+        if (!ab) { continue; }
+        var canon = (typeof _allInCanon === 'function') ? _allInCanon(ab, sp) : ab.toUpperCase();
+        if (!slate.byAbbr[canon]) { continue; }
+        add(pp.name, ab, pp.pos, sp, slate.byAbbr[canon], false);
+      }
+    }
+    for (i = 0; i < out.rows.length; i++) { if (!out.rows[i].used) { out.eligible++; } }
+  }
+
+  out.rows.sort(function (a, b) {
+    if (a.used !== b.used) { return a.used ? 1 : -1; }
+    return b.odds - a.odds;
+  });
+  return out;
+}
+
+// ── SURVIVOR · the night ─────────────────────────
+function _svNight(date) {
+  var st = _svStore();
+  return st.nights[date || _svToday()] || null;
+}
+
+// THE HOUSE PLAYS BY THE SAME RULES -- its own used list, the same pool,
+// the same bar. A house that took the best man available every night
+// would never degrade, and the whole point of the no-repeat rule is
+// that a long run gets harder.
+// SURVIVOR -- `mineKey` is the man HE has just taken. Without it the
+// house could pick the same player, which is not an opponent, it is a
+// mirror: both sides clear or both sides miss, every night.
+function _svHousePick(pool, st, mineKey) {
+  var rows = pool.rows, i, best = null;
+  var hu = st.houseUsed || {};
+  // Not always the favourite: it takes one of the best three, drawn from
+  // the night, so he is not simply racing a deterministic list.
+  var cand = [];
+  for (i = 0; i < rows.length; i++) {
+    if (rows[i].used || hu[rows[i].key] || rows[i].key === mineKey) { continue; }
+    cand.push(rows[i]);
+    if (cand.length >= 3) { break; }
+  }
+  if (!cand.length) {
+    // Its own used list has run dry: it may reuse one of its old men,
+    // because the house going out on a technicality is not a game
+    // either. It still may not take the one he just took.
+    for (i = 0; i < rows.length; i++) {
+      if (!rows[i].used && rows[i].key !== mineKey) { cand.push(rows[i]); break; }
+    }
+  }
+  if (!cand.length) { return null; }
+  var rnd = _auctRng('surv|house|' + (_svToday()) + '|' + st.streak);
+  best = cand[Math.floor(rnd() * cand.length)] || cand[0];
+  return best;
+}
+
+function _svPick(key) {
+  var st = _svStore(), date = _svToday();
+  if (st.nights[date] && st.nights[date].locked) { return; }
+  var pool = _svState.pool;
+  if (!pool) { return; }
+  var row = null, i;
+  for (i = 0; i < pool.rows.length; i++) { if (pool.rows[i].key === key) { row = pool.rows[i]; } }
+  if (!row || row.used) { return; }
+  var hp = _svHousePick(pool, st, row.key);
+  st.nights[date] = {
+    date: date, night: (st.streak || 0) + 1, locked: true, settled: false,
+    me: { key: row.key, name: row.name, team: row.team, sport: row.sport,
+          pos: row.pos, bar: row.bar, odds: row.odds },
+    house: hp ? { key: hp.key, name: hp.name, team: hp.team, sport: hp.sport,
+                  bar: hp.bar, odds: hp.odds } : null,
+    gids: _svGidsTonight()
+  };
+  st.used[row.key] = st.nights[date].night;
+  if (hp) {
+    if (!st.houseUsed) { st.houseUsed = {}; }
+    st.houseUsed[hp.key] = st.nights[date].night;
+  }
+  _svSave();
+  _svRender();
+  _svRefresh(true);
+}
+
+// Both slates' fixtures, saved with the card so the night can still be
+// settled tomorrow -- the same lesson Auction Night learned.
+function _svGidsTonight() {
+  var out = {}, i, k;
+  for (i = 0; i < SV_SPORTS.length; i++) {
+    var sp = SV_SPORTS[i], slate = null, ids = [], seen = {};
+    try { slate = _allInSlate(sp); } catch (e) { slate = null; }
+    if (!slate) { continue; }
+    for (k in slate.byAbbr) {
+      if (!slate.byAbbr.hasOwnProperty(k)) { continue; }
+      var g = (slate.byAbbr[k] || {}).g;
+      if (g && g.id != null && !seen[String(g.id)]) {
+        seen[String(g.id)] = 1; ids.push(String(g.id));
+      }
+    }
+    if (ids.length) { out[sp] = ids; }
+  }
+  return out;
+}
+
+// ── the morning after ───────────────────────────
+var _svBoxCache = {};
+
+function _svFetchBox(sport, gids) {
+  if (!gids || !gids.length) { return Promise.resolve(null); }
+  var cfg = AUCT_SPORTS[sport] || AUCT_SPORTS.nhl;
+  var jobs = [], i;
+  for (i = 0; i < gids.length; i++) {
+    (function (gid) {
+      var ck = sport + '|' + gid;
+      var c = _svBoxCache[ck];
+      if (c && c.final) { jobs.push(Promise.resolve(c.json)); return; }
+      if (c && (Date.now() - c.at) < 25000) { jobs.push(Promise.resolve(c.json)); return; }
+      jobs.push(fetch('https://site.api.espn.com/apis/site/v2/sports/' + cfg.box +
+        '/summary?event=' + encodeURIComponent(gid)).then(function (r) {
+          return r.ok ? r.text() : null;
+        }).then(function (t) {
+          var j = null;
+          try { j = t ? JSON.parse(t) : null; } catch (e) { j = null; }
+          var fin = false;
+          try {
+            fin = !!(((((j || {}).header || {}).competitions || [])[0] || {})
+              .status || {}).type.completed;
+          } catch (e2) { fin = false; }
+          _svBoxCache[ck] = { at: Date.now(), final: fin, json: j };
+          return j;
+        })['catch'](function () { return null; }));
+    })(gids[i]);
+  }
+  return Promise.all(jobs).then(function (all) {
+    var box = { byId: {}, byName: {}, labels: {}, unmapped: {}, clash: {} };
+    var n = 0, fin = 0;
+    for (var i2 = 0; i2 < all.length; i2++) {
+      if (!all[i2]) { continue; }
+      _auctParseBox(all[i2], box, sport);
+      n++;
+      try {
+        if (((((all[i2].header || {}).competitions || [])[0] || {})
+          .status || {}).type.completed) { fin++; }
+      } catch (e3) {}
+    }
+    box.games = n; box.final = fin;
+    box.allFinal = (n === gids.length) && (fin === n) && n > 0;
+    return box;
+  });
+}
+
+// What a man did against his bar, or null if his game has not been read.
+function _svLineFor(side, boxes) {
+  if (!side) { return null; }
+  var box = boxes[side.sport];
+  if (!box) { return null; }
+  var ln = box.byName[_svKey(side.name)];
+  if (!ln) { return null; }
+  var got;
+  if (side.sport === 'nba') { got = Number(ln.pts) || 0; }
+  else if (side.bar.stat === 'g') { got = Number(ln.g) || 0; }
+  else { got = (Number(ln.g) || 0) + (Number(ln.a) || 0); }
+  return { got: got, cleared: got >= side.bar.need, line: ln };
+}
+
+// A night is settled ONCE, when every game it saved is final. Half a
+// night scored as a whole one would end a streak that was still alive.
+function _svSettle(date, boxes) {
+  var st = _svStore(), N = st.nights[date];
+  if (!N || !N.locked || N.settled) { return false; }
+  // SURVIVOR -- ONLY THE SPORTS THE PICKS ARE ACTUALLY IN. Waiting on
+  // every sport with fixtures meant a quiet basketball night that failed
+  // to fetch could freeze a hockey streak indefinitely. A night is over
+  // when the games its two men played in are over.
+  var want = {}, sp, allFinal = true, any = false;
+  if (N.me && N.me.sport) { want[N.me.sport] = 1; }
+  if (N.house && N.house.sport) { want[N.house.sport] = 1; }
+  for (sp in want) {
+    if (!want.hasOwnProperty(sp)) { continue; }
+    if (!(N.gids || {})[sp]) { continue; }       // nothing saved for it
+    any = true;
+    if (!boxes[sp] || !boxes[sp].allFinal) { allFinal = false; }
+  }
+  if (!any || !allFinal) { return false; }
+  var mine = _svLineFor(N.me, boxes);
+  if (!mine) {
+    // Every game final and still no line: he did not dress. That is a
+    // miss, not a mystery -- but it is recorded as such so the card can
+    // say which it was.
+    mine = { got: 0, cleared: false, line: null, dnp: true };
+  }
+  var hers = _svLineFor(N.house, boxes);
+  N.settled = true;
+  N.result = mine.cleared ? 'W' : 'L';
+  N.got = mine.got;
+  N.dnp = !!mine.dnp;
+  if (hers) { N.houseGot = hers.got; N.houseResult = hers.cleared ? 'W' : 'L'; }
+  else if (N.house) { N.houseGot = 0; N.houseResult = 'L'; }
+
+  if (mine.cleared) {
+    st.streak = (st.streak || 0) + 1;
+    if (st.streak > (st.best || 0)) { st.best = st.streak; }
+  } else {
+    // NO MULLIGAN. The run ends, the used list clears, and the next
+    // night starts at the gentlest bar again.
+    st.history.unshift({ ended: date, length: st.streak || 0 });
+    st.streak = 0;
+    st.used = {};
+    st.houseUsed = {};
+  }
+  if (N.houseResult === 'L') { st.houseStreak = 0; st.houseUsed = {}; }
+  else if (N.houseResult === 'W') {
+    st.houseStreak = (st.houseStreak || 0) + 1;
+    if (st.houseStreak > (st.houseBest || 0)) { st.houseBest = st.houseStreak; }
+  }
+  _svSave();
+  return true;
+}
+
+// Read tonight's games, and settle any earlier night still open.
+function _svRefresh(force) {
+  if (_svState.busy) { return; }
+  var st = _svStore(), dates = [], k;
+  for (k in st.nights) {
+    if (st.nights.hasOwnProperty(k) && st.nights[k].locked && !st.nights[k].settled) {
+      dates.push(k);
+    }
+  }
+  dates.sort();
+  if (!dates.length) { return; }
+  _svState.busy = true;
+  _svRender();
+  var jobs = [], i;
+  for (i = 0; i < dates.length; i++) {
+    (function (d) {
+      var N = st.nights[d], gids = N.gids || {}, per = [], sps = [];
+      for (var sp in gids) {
+        if (!gids.hasOwnProperty(sp)) { continue; }
+        sps.push(sp);
+        per.push(_svFetchBox(sp, gids[sp]));
+      }
+      jobs.push(Promise.all(per).then(function (res) {
+        var boxes = {}, z;
+        for (z = 0; z < sps.length; z++) { boxes[sps[z]] = res[z]; }
+        if (d === _svToday()) { _svState.box = boxes; }
+        _svSettle(d, boxes);
+      }));
+    })(dates[i]);
+  }
+  Promise.all(jobs).then(function () {
+    _svState.busy = false;
+    _svRender();
+  }, function () {
+    _svState.busy = false;
+    _svRender();
+  });
+}
+
+// ── the record ─────────────────────────────────
+function _svRecord() {
+  var st = _svStore(), w = 0, l = 0, k;
+  for (k in st.nights) {
+    if (!st.nights.hasOwnProperty(k) || !st.nights[k].settled) { continue; }
+    if (st.nights[k].result === 'W') { w++; } else { l++; }
+  }
+  return { w: w, l: l, n: w + l, streak: st.streak || 0, best: st.best || 0,
+           houseStreak: st.houseStreak || 0, houseBest: st.houseBest || 0,
+           runs: (st.history || []).length };
+}
+
 // \u2500\u2500 AUCTGAMES \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 // Each game says where it stands, because a menu that only lists names
 // makes him open both to find out whether there is anything to do.
@@ -191676,6 +192163,22 @@ function _auctGamesHtml() {
       'font-weight:400;margin-top:2px">' + skEscape(sub) + '</div>' +
     '</div>' +
   '</div>';
+  // SURVIVOR -- its own row, saying where the streak stands.
+  var ssub = 'One player a night, nobody twice';
+  try {
+    var sr = _svRecord();
+    if (sr.n) {
+      ssub = (sr.streak ? ('Streak ' + sr.streak) : 'Streak over') +
+        ' \u00b7 best ' + sr.best + ' \u00b7 ' + sr.w + '-' + sr.l;
+    }
+  } catch (eS) {}
+  h += '<div class="ld-tool-item" onclick="closeGames(); openSurvivor();">' +
+    '<div class="ld-tool-icon">\ud83c\udfaf</div>' +
+    '<div class="ld-tool-name">Survivor' +
+      '<div style="font-size:11px;color:rgba(255,255,255,0.45);' +
+      'font-weight:400;margin-top:2px">' + skEscape(ssub) + '</div>' +
+    '</div>' +
+  '</div>';
   var psub = 'Two buttons a game, every night';
   try {
     var t = _peTally(_peLoad());
@@ -191691,6 +192194,237 @@ function _auctGamesHtml() {
     '</div>' +
   '</div>';
   return h;
+}
+
+// \u2500\u2500 SURVIVOR \u00b7 the screen \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+function _svPctTxt(p) {
+  if (!(p > 0)) { return '\u2014'; }
+  return Math.round(p * 100) + '%';
+}
+
+function _svStreakHtml(st, rec) {
+  var pips = '', i, n = Math.min(st.streak || 0, 14);
+  for (i = 0; i < n; i++) {
+    pips += '<i style="display:inline-block;width:20px;height:5px;border-radius:3px;' +
+      'background:#facc15;margin-right:5px"></i>';
+  }
+  pips += '<i style="display:inline-block;width:20px;height:5px;border-radius:3px;' +
+    'background:rgba(255,255,255,0.18)"></i>';
+  return '<div style="border:1px solid rgba(250,204,21,0.35);' +
+    'background:rgba(250,204,21,0.05);border-radius:12px;padding:12px 14px;margin:0 0 12px">' +
+    '<div style="font-size:9.5px;letter-spacing:0.14em;color:#facc15;font-weight:700">' +
+      (st.streak ? 'STREAK ALIVE' : 'NEW RUN') + '</div>' +
+    '<div style="display:flex;align-items:baseline;gap:9px;margin-top:5px">' +
+      '<span style="font:700 32px Georgia,serif;line-height:1">' + (st.streak || 0) + '</span>' +
+      '<span style="font-size:11.5px;color:rgba(255,255,255,0.5)">night' +
+        ((st.streak === 1) ? '' : 's') +
+        (rec.best ? (' \u00b7 best ' + rec.best) : '') +
+        (rec.n ? (' \u00b7 ' + rec.w + '-' + rec.l + ' all time') : '') +
+      '</span></div>' +
+    '<div style="margin-top:9px">' + pips + '</div></div>';
+}
+
+function _svBarHtml(st) {
+  var nhl = _svBarFor('nhl', st.streak), nba = _svBarFor('nba', st.streak);
+  var nx = _svNextBar('nhl', st.streak);
+  var night = (st.streak || 0) + 1;
+  var rose = (night === nhl.from);
+  return '<div style="border:1px solid rgba(255,255,255,0.07);' +
+    'background:rgba(255,255,255,0.03);border-radius:12px;padding:12px 14px;margin:0 0 12px">' +
+    '<div style="font-size:9.5px;letter-spacing:0.14em;color:rgba(255,255,255,0.4);' +
+      'font-weight:700">NIGHT ' + night + (rose ? ' \u2014 THE BAR JUST ROSE' : '') + '</div>' +
+    '<div style="font:19px Georgia,serif;margin-top:4px">Your man needs ' +
+      '<b style="color:#facc15">' + skEscape(nhl.label) + '</b> tonight.</div>' +
+    '<div style="display:flex;gap:8px;margin-top:9px">' +
+      '<div style="flex:1;border:1px solid rgba(255,255,255,0.07);border-radius:9px;padding:7px 9px">' +
+        '<div style="font-size:9px;letter-spacing:0.12em;color:rgba(255,255,255,0.35);' +
+        'font-weight:700">NHL</div><div style="font-family:var(--sk-font-mono,monospace);font-size:14px;margin-top:2px">' +
+        skEscape(nhl.short) + '</div></div>' +
+      '<div style="flex:1;border:1px solid rgba(255,255,255,0.07);border-radius:9px;padding:7px 9px">' +
+        '<div style="font-size:9px;letter-spacing:0.12em;color:rgba(255,255,255,0.35);' +
+        'font-weight:700">NBA</div><div style="font-family:var(--sk-font-mono,monospace);font-size:14px;margin-top:2px">' +
+        skEscape(nba.short) + '</div></div>' +
+    '</div>' +
+    '<div style="font-size:10.5px;color:rgba(255,255,255,0.38);margin-top:6px;line-height:1.5">' +
+      'One streak across both sports.' +
+      (nx ? (' From night ' + nx.from + ' it\u2019s ' + skEscape(nx.label) + '.') : '') +
+    '</div></div>';
+}
+
+// Tonight once it is locked: what he took, what the house took, and how
+// each is doing while the games run.
+function _svCardHtml(N) {
+  function side(lab, sd, got, res) {
+    if (!sd) { return ''; }
+    var cleared = (res === 'W');
+    var col = (got == null) ? 'rgba(255,255,255,0.35)' : (cleared ? '#4ade80' : '#f87171');
+    return '<div style="display:flex;align-items:center;gap:10px;padding:9px 0;' +
+      'border-bottom:1px solid rgba(255,255,255,0.045)">' +
+      '<div style="flex:1;min-width:0">' +
+        '<div style="font-size:9px;letter-spacing:0.13em;color:rgba(255,255,255,0.35);' +
+        'font-weight:700">' + lab + '</div>' +
+        '<div style="font-size:14.5px;font-weight:600;margin-top:2px">' + skEscape(sd.name) + '</div>' +
+        '<div style="font-family:var(--sk-font-mono,monospace);font-size:10px;color:rgba(255,255,255,0.42);margin-top:2px">' +
+          skEscape(sd.team) + ' \u00b7 needs ' + skEscape(sd.bar.short) + '</div>' +
+      '</div>' +
+      '<div style="text-align:right">' +
+        '<div style="font-family:var(--sk-font-mono,monospace);font-size:22px;color:' + col + '">' +
+          ((got == null) ? '\u2014' : got) + '</div>' +
+        '<div style="font-size:8.5px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
+        'margin-top:2px">' + skEscape(sd.bar.stat === 'g' ? 'GOALS' : 'PTS') + '</div>' +
+      '</div></div>';
+  }
+  var head = '';
+  if (N.settled) {
+    var won = (N.result === 'W');
+    head = '<div style="border:1px solid ' + (won ? 'rgba(74,222,128,0.4)' : 'rgba(248,113,113,0.4)') +
+      ';background:' + (won ? 'rgba(74,222,128,0.07)' : 'rgba(248,113,113,0.07)') +
+      ';border-radius:12px;padding:14px;text-align:center;margin:0 0 12px">' +
+      '<div style="font:27px Georgia,serif;color:' + (won ? '#4ade80' : '#f87171') + '">' +
+        'Night ' + N.night + (won ? ' \u2014 survived' : ' \u2014 out') + '</div>' +
+      '<div style="font-size:11.5px;color:rgba(255,255,255,0.5);margin-top:5px">' +
+        skEscape(N.me.name) + ' needed ' + skEscape(N.me.bar.label) + '. ' +
+        (N.dnp ? 'He did not dress.' : ('He got ' + N.got + '.')) + '</div></div>';
+  }
+  return '<div class="rg-dark rg-bleed">' + head +
+    '<div class="rg-sect">Tonight\u2019s picks</div>' +
+    side('YOU TOOK', N.me, (N.settled || _svState.box) ? N.got : null, N.result) +
+    side('THE HOUSE TOOK', N.house, (N.settled ? N.houseGot : null), N.houseResult) +
+    '<div class="rg-foot">' +
+      (N.settled ? 'Settled off the box score. Nothing to tap.'
+                 : 'Settles itself off the box scores once the games are final.') +
+    '</div></div>';
+}
+
+function _svRender() {
+  var host = document.getElementById('skSurvBody');
+  if (!host) { return; }
+  var st = _svStore(), rec = _svRecord();
+  var N = _svNight();
+  var h = _svStreakHtml(st, rec);
+  if (N && N.locked) {
+    h += _svCardHtml(N);
+    var y = _svYesterdayHtml();
+    if (y) { h += y; }
+    host.innerHTML = h;
+    return;
+  }
+  h += _svBarHtml(st);
+  if (_svState.note) {
+    h += '<div class="sk-wire-sheet-empty">' + skEscape(_svState.note) + '</div>';
+    host.innerHTML = h;
+    return;
+  }
+  var pool = _svState.pool;
+  if (!pool) {
+    h += '<div class="sk-wire-sheet-empty">Reading tonight\u2019s slate\u2026</div>';
+    host.innerHTML = h;
+    return;
+  }
+  if (!pool.rows.length) {
+    h += '<div class="sk-wire-sheet-empty">Nothing on tonight \u2014 no hockey or ' +
+      'basketball for your players. The streak keeps.</div>';
+    host.innerHTML = h;
+    return;
+  }
+  h += '<div class="rg-dark rg-bleed">' +
+    '<div class="rg-sect">' + (pool.fallback ? 'Everyone playing tonight' : 'Your players tonight') +
+      ' <span style="opacity:0.6">' + pool.eligible + ' eligible of ' + pool.rows.length +
+      '</span></div>';
+  var i, r;
+  for (i = 0; i < pool.rows.length && i < 60; i++) {
+    r = pool.rows[i];
+    var gm = r.gm && r.gm.g ? r.gm.g : null;
+    var vs = '';
+    if (gm) {
+      var home = (gm.home && gm.home.abbr) || '', away = (gm.away && gm.away.abbr) || '';
+      vs = (r.team === String(home).toUpperCase())
+        ? ('vs ' + away) : ('@ ' + home);
+    }
+    h += '<div style="display:flex;align-items:center;gap:11px;padding:9px 0;' +
+      'border-bottom:1px solid rgba(255,255,255,0.045)' +
+      (r.used ? ';opacity:0.32' : ';cursor:pointer') + '"' +
+      (r.used ? '' : (' onclick="_svPick(\'' + skEscape(r.key) + '\')"')) + '>' +
+      '<div style="flex:1;min-width:0">' +
+        '<div style="font-size:14.5px;font-weight:600;line-height:1.2">' +
+          skEscape(r.name) + '</div>' +
+        '<div style="font-family:var(--sk-font-mono,monospace);font-size:10px;color:rgba(255,255,255,0.42);margin-top:2px">' +
+          skEscape((r.pos ? (r.pos + ' \u00b7 ') : '') + r.team + (vs ? (' ' + vs) : '')) +
+          ' \u00b7 ' + r.sport.toUpperCase() + '</div>' +
+      '</div>' +
+      '<div style="text-align:right;flex:0 0 58px">' +
+        '<div style="font-family:var(--sk-font-mono,monospace);font-size:13px">' +
+          (r.used ? '\u2014' : _svPctTxt(r.odds)) + '</div>' +
+        '<div style="font-size:8.5px;letter-spacing:0.06em;color:rgba(255,255,255,0.3);' +
+        'margin-top:2px">' + skEscape(r.used ? ('NIGHT ' + r.used) : r.bar.short) + '</div>' +
+      '</div>' +
+      (r.used
+        ? '<span style="font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.4);' +
+          'border:1px solid rgba(255,255,255,0.12);border-radius:999px;padding:3px 8px;' +
+          'font-weight:700">USED</span>'
+        : '<span style="font-size:9.5px;letter-spacing:0.1em;color:#111;background:#facc15;' +
+          'border-radius:999px;padding:5px 12px;font-weight:700">PICK</span>') +
+      '</div>';
+  }
+  h += '<div class="rg-foot">' +
+    (pool.fallback
+      ? 'Your own players left nothing legal tonight, so the pool is the whole slate.'
+      : ('<b>' + pool.mine + '</b> of your players are on tonight\u2019s slate, <b>' +
+         pool.eligible + '</b> you haven\u2019t used.')) +
+    ' Odds are modelled from each man\u2019s projection against tonight\u2019s bar, ' +
+    'not counted from his game log.</div></div>';
+  host.innerHTML = h;
+}
+
+function _svYesterdayHtml() {
+  var st = _svStore(), today = _svToday(), keys = [], k;
+  for (k in st.nights) {
+    if (st.nights.hasOwnProperty(k) && k < today && st.nights[k].settled) { keys.push(k); }
+  }
+  if (!keys.length) { return ''; }
+  keys.sort();
+  var N = st.nights[keys[keys.length - 1]];
+  var won = (N.result === 'W');
+  return '<div class="rg-dark rg-bleed"><div class="rg-sect">Last night ' +
+    '<span style="opacity:0.6">' + skEscape(N.date) + '</span></div>' +
+    '<div class="rg-foot" style="color:' + (won ? '#4ade80' : '#f87171') + '">' +
+      skEscape(N.me.name) + ' \u2014 ' + (N.dnp ? 'did not dress' : (N.got + ' ' +
+      (N.me.bar.stat === 'g' ? 'goals' : 'points'))) + ', needed ' +
+      skEscape(N.me.bar.short) + '. ' + (won ? 'Survived.' : 'Run ended.') +
+    '</div></div>';
+}
+
+function openSurvivor() {
+  var ov = document.getElementById('skSurvOverlay');
+  if (!ov) { return; }
+  ov.classList.add('open');
+  _svState.note = '';
+  _svRender();
+  _svRefresh(false);
+  var N = _svNight();
+  if (N && N.locked) { return; }
+  // The pool needs both sports' projection pools.
+  if (typeof dbpGetPool !== 'function') {
+    _svState.note = 'The player pool is not available in this build.';
+    _svRender();
+    return;
+  }
+  Promise.all([
+    dbpGetPool('nhl', false, null)['catch'](function () { return null; }),
+    dbpGetPool('nba', false, null)['catch'](function () { return null; })
+  ]).then(function (both) {
+    var pools = {};
+    if (both[0]) { pools.nhl = _svPoolIndex(both[0]); }
+    if (both[1]) { pools.nba = _svPoolIndex(both[1]); }
+    try { _svState.pool = _svBuildPool(pools); }
+    catch (e) { _svState.note = 'Could not build tonight\u2019s pool: ' + String(e && e.message || e); }
+    _svRender();
+  });
+}
+
+function closeSurvivor() {
+  var ov = document.getElementById('skSurvOverlay');
+  if (ov) { ov.classList.remove('open'); }
 }
 
 function openGames() {
@@ -193078,7 +193812,10 @@ function _auctNameKey(n) {
 }
 
 // One game's summary -> { byId, byName, labels, unmapped }.
-function _auctParseBox(j, out) {
+// SURVIVOR -- the sport can be passed in. Survivor settles a single
+// night across BOTH slates, so it cannot rely on _auctSport(), which
+// describes whichever board the auction happens to be showing.
+function _auctParseBox(j, out, sportArg) {
   out = out || { byId: {}, byName: {}, labels: {}, unmapped: {}, clash: {} };
   var blocks = ((j || {}).boxscore || {}).players || [];
   var b, s2, a, L;
@@ -193099,7 +193836,7 @@ function _auctParseBox(j, out) {
     for (s2 = 0; s2 < grps.length; s2++) {
       var grp = grps[s2] || {};
       var ty = String(grp.type || grp.name || '').toLowerCase();
-      var _nba = (_auctSport() === 'nba');
+      var _nba = (String(sportArg || _auctSport()) === 'nba');
       var isG = !_nba && (ty.indexOf('goalie') > -1 || ty.indexOf('goaltend') > -1);
       var map = _nba ? _AUCT_BOX_NBA : (isG ? _AUCT_BOX_GOALIE : _AUCT_BOX_SKATER);
       var ign = _nba ? _AUCT_BOX_NBA_IGNORE : _AUCT_BOX_IGNORE;
@@ -202166,6 +202903,7 @@ function mrRenderBody() {
     // AUCTSETTLE -- Auction Night rides along with Pick 'Em so it reaches
     // both injection points below without a second pair of edits.
     try { h += _auctMgrHtml(); } catch (eAu) {}
+    try { h += _svMgrHtml(); } catch (eSv) {}
     return h;
   }
   var data = mrCollect();
@@ -204020,6 +204758,37 @@ function _peExport() {
 // Pick 'Em block's classes rather than inventing a parallel set: they
 // already exist, already theme, and a second near-identical stylesheet
 // is how two panels drift apart.
+// SURVIVOR -- his block in Manager Record, beside Pick 'Em and Auction
+// Night, in the same classes.
+function _svMgrHtml() {
+  var rec;
+  try { rec = _svRecord(); } catch (e) { return ''; }
+  if (!rec || (!rec.n && !rec.streak)) { return ''; }
+  var st = _svStore();
+  var h = '<div class="pe-mgr">' +
+    '<div class="pe-mgr-head">SURVIVOR' +
+      '<button class="pe-mgr-go" onclick="closeManagerRecord();openSurvivor()">OPEN</button>' +
+    '</div>' +
+    '<div class="pe-mgr-top">' +
+      '<div><span>STREAK</span><b>' + rec.streak + '</b></div>' +
+      '<div><span>BEST</span><b>' + rec.best + '</b></div>' +
+      '<div><span>NIGHTS</span><b>' + rec.w + '-' + rec.l + '</b></div>' +
+    '</div>';
+  if (rec.houseBest || rec.houseStreak) {
+    h += '<div class="pe-mgr-row">' +
+      '<span class="pe-mgr-lg">THE HOUSE</span>' +
+      '<span class="pe-mgr-rec">streak ' + rec.houseStreak + '</span>' +
+      '<span class="pe-mgr-pct">best ' + rec.houseBest + '</span></div>';
+  }
+  var runs = st.history || [];
+  if (runs.length) {
+    h += '<div class="pe-mgr-note">Last run ended ' + skEscape(runs[0].ended) +
+      ' at ' + runs[0].length + ' night' + ((runs[0].length === 1) ? '' : 's') +
+      ' \u00b7 ' + runs.length + ' run' + ((runs.length === 1) ? '' : 's') + ' so far.</div>';
+  }
+  return h + '</div>';
+}
+
 function _auctMgrHtml() {
   var rec;
   try { rec = _auctRecord(); } catch (e) { return ''; }
