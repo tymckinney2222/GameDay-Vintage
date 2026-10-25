@@ -190884,13 +190884,26 @@ function _auctBoardHtml(b) {
   var diag = '<div class="rg-foot">' +
     b.pool + ' in pool \u00b7 ' + b.onSlate + ' on tonight\u2019s slate \u00b7 ' +
     (b.hurt ? (b.hurt + ' not dressing \u00b7 ') : '') +
-    b.priced + ' priced \u00b7 ' + (b.eligible || b.priced) +
-    ' in range \u00b7 ' + (b.lot || b.rows.length) + ' drawn' +
+    b.priced + ' priced \u00b7 ' + (b.lot || b.rows.length) + ' drawn' +
+    // AUCTROSTER -- both directions of the roster join, named. A large
+    // "added" number would mean the join is wrong, not that the rosters
+    // are unusual, and it should be visible either way.
+    (b.rosterClubs ? (' \u00b7 ' + b.rosterClubs + ' rosters read') : '') +
+    (b.offRoster ? (' \u00b7 ' + b.offRoster + ' not on a roster') : '') +
+    (b.added ? (' \u00b7 ' + b.added + ' added from rosters') : '') +
     // A board is always built by _auctBuildBoard and always carries
     // these, but it costs two characters to not depend on that.
     (((b.cats || []).length) ? (' \u00b7 scoring: ' + skEscape(b.cats.slice(0, 14).join(' ')) ) : '') +
     (((b.missed || []).length) ? (' \u00b7 unmapped: ' + skEscape(b.missed.slice(0, 8).join(' '))) : '') +
     '</div>';
+  // AUCTROSTER -- and when membership could not be checked at all, say
+  // so: the board is then the fantasy pool whole, which can carry men
+  // who are no longer on a team.
+  if (!b.rosterClubs && b.rows.length) {
+    diag += '<div class="rg-foot" style="color:#f59e0b">No club rosters ' +
+      'answered, so the board is the fantasy pool whole \u2014 it can ' +
+      'carry men who are no longer on a team.</div>';
+  }
   // AUCTNIGHT -- name the slots that came back empty and why. A board
   // with no goalies on it looks broken; a board that says the league
   // scores no goalie categories is answering the question.
@@ -191546,9 +191559,15 @@ function _auctPick(key) {
     _auctRender();
     return;
   }
-  dbpGetPool(_auctSport(), false, null).then(function (pool) {
+  // AUCTROSTER -- the pool and the rosters together: one gives the
+  // numbers, the other gives the membership.
+  Promise.all([
+    dbpGetPool(_auctSport(), false, null),
+    _auctRosters()['catch'](function () { return null; })
+  ]).then(function (both) {
+    var pool = both[0], rosters = both[1];
     try {
-      _auctState.board = _auctBuildBoard(_auctState.leagueKey, pool);
+      _auctState.board = _auctBuildBoard(_auctState.leagueKey, pool, rosters);
       _auctState.note = '';
       // AUCTPLAY -- after the board, never before: the saved card is a
       // list of ids and they have to be looked up in tonight's rows.
@@ -193173,10 +193192,105 @@ function _auctActualFor(row, box, scoring) {
   return { fp: _auctLineFp(ln, scoring, row.slot === 'G'), line: ln };
 }
 
+// \u2500\u2500 AUCTROSTER \u2500\u2500 who is actually on a club tonight \u2500\u2500\u2500\u2500\u2500
+//
+// The clubs playing tonight, by ESPN team id. The slate's game objects
+// carry them, which is the same id the Teams browser fetches a roster
+// with.
+function _auctSlateTeamIds() {
+  var out = [], seen = {}, slate = null;
+  try { slate = (typeof _allInSlate === 'function') ? _allInSlate(_auctSport()) : null; } catch (e) { return out; }
+  if (!slate) { return out; }
+  for (var k in slate.byAbbr) {
+    if (!slate.byAbbr.hasOwnProperty(k)) { continue; }
+    var g = (slate.byAbbr[k] || {}).g;
+    if (!g) { continue; }
+    var sides = [g.home, g.away], i;
+    for (i = 0; i < sides.length; i++) {
+      var t = sides[i];
+      if (t && t.id != null && !seen[String(t.id)]) {
+        seen[String(t.id)] = 1;
+        out.push({ id: String(t.id), abbr: String(t.abbr || '').toUpperCase() });
+      }
+    }
+  }
+  return out;
+}
+
+var _auctRosterCache = {};        // sport|teamId -> { at, ids, players }
+var AUCT_ROSTER_TTL = 30 * 60 * 1000;
+
+function _auctRosterFor(team) {
+  var key = _auctSport() + '|' + team.id;
+  var c = _auctRosterCache[key];
+  if (c && (Date.now() - c.at) < AUCT_ROSTER_TTL) { return Promise.resolve(c); }
+  var url = 'https://site.api.espn.com/apis/site/v2/sports/' + _auctCfg().box +
+    '/teams/' + encodeURIComponent(team.id) + '?enable=roster';
+  return fetch(url).then(function (r) {
+    return r.ok ? r.json() : null;
+  }).then(function (j) {
+    var out = { at: Date.now(), ids: {}, names: {}, players: [] };
+    try {
+      var teamObj = (j && (j.team || j)) || null;
+      var ath = (teamObj && teamObj.athletes) || [];
+      var list = (typeof _espRosterPlayers === 'function')
+        ? _espRosterPlayers(ath) : [];
+      for (var i = 0; i < list.length; i++) {
+        var a = list[i] || {};
+        var id = (a.id != null) ? String(a.id) : '';
+        var nm = a.displayName || a.fullName || a.shortName || '';
+        if (!id && !nm) { continue; }
+        if (id) { out.ids[id] = 1; }
+        if (nm) { out.names[_auctNameKey(nm)] = 1; }
+        out.players.push({
+          id: id || ('r:' + _auctNameKey(nm)),
+          name: nm || id,
+          pos: String(((a.position || {}).abbreviation) ||
+                      ((a.position || {}).name) || '').toUpperCase(),
+          team: team.abbr,
+          inj: String(a.injuries && a.injuries.length
+            ? ((a.injuries[0] || {}).status || '') : '').toUpperCase()
+        });
+      }
+    } catch (e) {}
+    _auctRosterCache[key] = out;
+    return out;
+  })['catch'](function () {
+    // A club that will not answer must not quietly empty the board, so
+    // a failure is remembered as "unknown", never as "nobody".
+    var bad = { at: 0, ids: {}, names: {}, players: [], failed: true };
+    return bad;
+  });
+}
+
+// Every club playing tonight, merged. `ok` is false when nothing came
+// back at all -- in which case the board falls back to the pool whole,
+// because a board of nobody is worse than a board with a retired man on it.
+function _auctRosters() {
+  var teams = _auctSlateTeamIds();
+  if (!teams.length) { return Promise.resolve(null); }
+  var jobs = [], i;
+  for (i = 0; i < teams.length; i++) { jobs.push(_auctRosterFor(teams[i])); }
+  return Promise.all(jobs).then(function (all) {
+    var out = { ids: {}, names: {}, players: [], clubs: 0, failed: 0 }, j, k;
+    for (j = 0; j < all.length; j++) {
+      if (!all[j] || all[j].failed) { out.failed++; continue; }
+      if (!all[j].players.length) { continue; }
+      out.clubs++;
+      for (k in all[j].ids) { if (all[j].ids.hasOwnProperty(k)) { out.ids[k] = 1; } }
+      for (k in all[j].names) { if (all[j].names.hasOwnProperty(k)) { out.names[k] = 1; } }
+      for (k = 0; k < all[j].players.length; k++) { out.players.push(all[j].players[k]); }
+    }
+    out.ok = (out.clubs > 0);
+    return out;
+  });
+}
+
 // Tonight's priced board, or a note saying which join came up empty.
-function _auctBuildBoard(leagueKey, pool) {
+function _auctBuildBoard(leagueKey, pool, rosters) {
   var out = { rows: [], note: '', pool: 0, onSlate: 0, hurt: 0, priced: 0,
-              lot: 0, cats: [], missed: [], unpriced: {}, empty: [] };
+              lot: 0, cats: [], missed: [], unpriced: {}, empty: [],
+              offRoster: 0, added: 0, rosterClubs: (rosters && rosters.clubs) || 0 };
   var scoring = _auctScoring(leagueKey);
   out.cats = scoring.read;
   out.missed = scoring.missed;
@@ -193206,6 +193320,18 @@ function _auctBuildBoard(leagueKey, pool) {
     if (!p) { continue; }
     var slot = _auctSlotOf(p, _auctSport());
     if (!slot) { continue; }
+    // AUCTROSTER -- IS HE ACTUALLY ON A CLUB? The pool is ESPN's fantasy
+    // universe and carries men who have retired; the clubs' own rosters
+    // are the answer to membership. Only applied when at least one club
+    // answered, because a board of nobody is worse than a board with a
+    // retired man on it.
+    if (rosters && rosters.ok) {
+      var _rid = String(p.id);
+      if (!rosters.ids[_rid] && !rosters.names[_auctNameKey(p.name)]) {
+        out.offRoster = (out.offRoster || 0) + 1;
+        continue;
+      }
+    }
     var ab = '';
     try {
       var pm = proMap ? proMap[String(p.teamId)] : null;
@@ -193234,6 +193360,29 @@ function _auctBuildBoard(leagueKey, pool) {
     }
     out.rows.push({ id: p.id, name: p.name, slot: slot, team: String(ab).toUpperCase(),
                     fp: Math.round(fp * 100) / 100, inj: p.inj || '' });
+  }
+  // AUCTROSTER -- and the other direction: a man ON a roster whom the
+  // fantasy pool does not carry. He gets a row so that "every player"
+  // means every player, with no projection, because projections live in
+  // the pool. The count is on the board: if it is ever large, the join
+  // is wrong rather than the rosters being unusual.
+  if (rosters && rosters.ok) {
+    var _have = {}, _hi;
+    for (_hi = 0; _hi < out.rows.length; _hi++) {
+      _have[String(out.rows[_hi].id)] = 1;
+      _have['n:' + _auctNameKey(out.rows[_hi].name)] = 1;
+    }
+    for (_hi = 0; _hi < rosters.players.length; _hi++) {
+      var _rp = rosters.players[_hi];
+      if (_have[String(_rp.id)] || _have['n:' + _auctNameKey(_rp.name)]) { continue; }
+      var _rs = _auctSlotOf(_rp, _auctSport());
+      if (!_rs) { continue; }
+      var _rst = String(_rp.inj || '').toUpperCase();
+      if (_rst && _rst !== 'ACTIVE' && _rst !== 'NORMAL') { continue; }
+      out.rows.push({ id: _rp.id, name: _rp.name, slot: _rs,
+                      team: _rp.team, fp: 0, inj: '' });
+      out.added = (out.added || 0) + 1;
+    }
   }
   out.priced = out.rows.length;
   if (!out.priced) {
