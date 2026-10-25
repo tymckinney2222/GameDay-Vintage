@@ -132355,24 +132355,21 @@ async function skScanWireEspLeague(lg) {
     var period = _espWirePeriodFor(row, dateStr, today);
     if (period == null) { _fin('no scoring period'); return; }
 
-    // ESPWIRE3 -- roto scores no fantasy points on a day, so there is no
-    // day's figure to fetch a roster for. What the Yahoo roto card shows
-    // is the rank move, and that is already in the history.
-    if (_fmt === 'roto') {
-      entry.scoringType = 'roto';
-      entry.myTeamKey = _myId0;
-      _fin('roto \u2014 movement only');
-      return;
-    }
+    // ROTOLINES -- roto has no daily fantasy TOTAL, which is not the
+    // same as having nothing on the day. Its players put up the category
+    // lines the sheet draws, exactly as Yahoo's roto card does, so it
+    // takes the same path as season points and differs only in not
+    // computing a figure it does not have.
+    var _isRoto = (_fmt === 'roto');
 
-    var pair = _espWireMatchup(row, period);
+    var pair = _isRoto ? null : _espWireMatchup(row, period);
     // WEEKEDGE -- a day that provably belongs to the previous matchup is
     // not reported against this one's opponent.
     if (pair && pair.inWeek === false) { _espWireSkipEdge++; _fin('previous matchup week'); return; }
     if (pair && pair.inWeek === null) { _espWireNoEdge++; }
     // ESPWIRE3 -- season points has no opponent and never will; it still
     // has a day's total, which is what Yahoo's card leads with.
-    if (!pair && _fmt !== 'point') { _fin('no daily matchup'); return; }
+    if (!pair && _fmt !== 'point' && !_isRoto) { _fin('no daily matchup'); return; }
     var ros = await _espWireDayRosters(row, period);
     if (!ros) { _fin('no roster for that day'); return; }
     _espWireScanned++;
@@ -132408,18 +132405,24 @@ async function skScanWireEspLeague(lg) {
     // opponent and so no result. The same shape Yahoo's SEASON card
     // carries, which leads with "246.0 FP today" above the rank move.
     if (!pair) {
-      entry.scoringType = 'point';
-      var _sF = (typeof espDailyTeamFp === 'function')
-        ? espDailyTeamFp(ros, _mineId) : null;
-      entry.myFp = (_sF && _sF.total != null) ? _sF.total
-                 : ((_sF && _sF.sum != null) ? _sF.sum : mine.total);
+      entry.scoringType = _isRoto ? 'roto' : 'point';
+      // ROTOLINES -- the one real difference. A roto league publishes no
+      // fantasy total for a day, and putting the summed starter totals
+      // there would invent a number its league page does not have.
+      if (!_isRoto) {
+        var _sF = (typeof espDailyTeamFp === 'function')
+          ? espDailyTeamFp(ros, _mineId) : null;
+        entry.myFp = (_sF && _sF.total != null) ? _sF.total
+                   : ((_sF && _sF.sum != null) ? _sF.sum : mine.total);
+      }
       entry._espRos = ros;
       entry._espGame = game;
       entry._espProMap = proMap;
       entry._espMineId = _mineId;
       entry._espOppId = null;
       _espWireSeedStats(row, key, game, ros, null);
-      _fin('season points \u2014 no opponent');
+      _fin(_isRoto ? 'roto \u2014 no daily matchup'
+                   : 'season points \u2014 no opponent');
       return;
     }
 
@@ -133373,6 +133376,31 @@ function _skRotoRivals(lv) {
   return rows;
 }
 
+// ROTOSWAP -- both halves. This used to print only the "past you" side
+// whenever a team had taken anything, so a rival who took one category
+// and gave back two had the two dropped from its line while the Gave
+// column beside it still said 2 -- one row saying two different things.
+function _skRotoRivalLine(r) {
+  var parts = [];
+  if (r.took.length) { parts.push('past you in ' + r.took.join(', ')); }
+  if (r.gave.length) { parts.push('you passed them in ' + r.gave.join(', ')); }
+  return parts.join(' \u00b7 ');
+}
+
+// ROTOSWAP -- the shape of the night in one line, so the heading is
+// honest before a single row is read.
+function _skRotoRivalsSummary(rows) {
+  var took = 0, gave = 0, i;
+  for (i = 0; i < rows.length; i++) {
+    if (rows[i].took.length) { took++; }
+    if (rows[i].gave.length) { gave++; }
+  }
+  var bits = [];
+  if (gave) { bits.push('you passed ' + gave); }
+  if (took) { bits.push(took + ' passed you'); }
+  return bits.join(' \u00b7 ');
+}
+
 function _skRotoRivalsHtml(lv) {
   var rows = null;
   try { rows = _skRotoRivals(lv); } catch (e) { return ''; }
@@ -133385,9 +133413,7 @@ function _skRotoRivalsHtml(lv) {
     var netCls = r.net > 0 ? 'rg-best' : (r.net < 0 ? 'rg-neg' : 'rg-z');
     body += '<tr>' +
       '<td class="rg-p"><div class="rg-nm">' + skEscape(r.name) + '</div>' +
-        '<div class="rg-sub">' +
-        skEscape(r.took.length ? ('past you in ' + r.took.join(', ')) :
-                 ('you passed them in ' + r.gave.join(', '))) + '</div></td>' +
+        '<div class="rg-sub">' + skEscape(_skRotoRivalLine(r)) + '</div></td>' +
       '<td class="' + (r.took.length ? 'rg-neg' : 'rg-z') + '">' +
         (r.took.length || '\u2014') + '</td>' +
       '<td class="' + (r.gave.length ? 'rg-best' : 'rg-z') + '">' +
@@ -133395,12 +133421,17 @@ function _skRotoRivalsHtml(lv) {
       '<td class="' + netCls + '">' + netTxt + '</td>' +
     '</tr>';
   }
+  // ROTOSWAP -- the table carries BOTH directions and always has. The
+  // old heading named one of them, which is why it read as a feature
+  // that only fires on a bad night.
   return '<div class="sk-wire-sheet-section"><span class="ic">\u2694\ufe0f</span>' +
-    'Who moved past you</div>' +
+    'Places traded today<span class="meta">' +
+    skEscape(_skRotoRivalsSummary(rows)) + '</span></div>' +
     '<div class="rg-dark rg-bleed"><div class="rg-wrap"><table class="rg">' +
     head + body + '</table></div>' +
-    '<div class="rg-foot">Today \u00b7 a point leaves you when a team behind ' +
-    'climbs over you in a category</div></div>';
+    '<div class="rg-foot">Today \u00b7 both directions \u00b7 a point leaves you ' +
+    'when a team behind climbs over you in a category, and arrives when ' +
+    'you climb over one</div></div>';
 }
 
 // ROTOWIRE -- the sheet body for a roto league.
