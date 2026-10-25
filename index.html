@@ -191285,13 +191285,27 @@ function _auctGridFor(rows, box, leagueKey) {
   if (!meta) { return ''; }
   var sc = _auctScoring(leagueKey);
   var _isN = (_auctSport() === 'nba');
-  var mapS = (typeof _FPP_YAHOO_MAP !== 'undefined'
-    && (_isN ? _FPP_YAHOO_MAP.nba : _FPP_YAHOO_MAP.nhl_skater)) || {};
-  var mapG = (typeof _FPP_YAHOO_MAP !== 'undefined'
-    && (_isN ? _FPP_YAHOO_MAP.nba : _FPP_YAHOO_MAP.nhl_goalie)) || {};
-  var ord = [], sid;
-  for (sid in meta) { if (meta.hasOwnProperty(sid)) { ord.push(String(sid)); } }
+  var _mm2 = _auctMapsFor(_isN);
+  var mapS = _mm2.skater, mapG = _mm2.goalie;
+  // AUCTSCORE -- ONLY THE CATEGORIES THE LEAGUE SCORES. Yahoo marks
+  // plenty of stats ENABLED that a points league does not pay for --
+  // FGM, FTM, OREB and DREB all turned up as columns beside the ones
+  // that count, which reads as "these are being added up" when they are
+  // not. The figures were right; the table was implying otherwise.
+  var ord = [], sid, scored = {};
+  for (sid in meta) {
+    if (!meta.hasOwnProperty(sid)) { continue; }
+    var _m = meta[sid] || {};
+    if (!_m.enabled || _m.isOnlyDisplayStat) { continue; }
+    var _w = parseFloat(_m.pointModifier);
+    if (isNaN(_w) || _w === 0) { continue; }
+    var _a = String(_m.abbr || _m.displayName || _m.name || '').toUpperCase();
+    if (!mapS[_a] && !mapG[_a]) { continue; }
+    ord.push(String(sid));
+    scored[String(sid)] = 1;
+  }
   ord.sort(function (a, b) { return Number(a) - Number(b); });
+  if (!ord.length) { return ''; }
 
   var skaters = [], keepers = [], byKey = {}, i;
   for (i = 0; i < rows.length; i++) {
@@ -191307,7 +191321,7 @@ function _auctGridFor(rows, box, leagueKey) {
       var m = isG ? mapG : mapS;
       for (j = 0; j < ord.length; j++) {
         var mm = meta[ord[j]];
-        if (!mm || !mm.enabled || mm.isOnlyDisplayStat) { continue; }
+        if (!mm) { continue; }
         var ab = String(mm.abbr || mm.displayName || mm.name || '').toUpperCase();
         var ck = m[ab];
         if (!ck) { continue; }
@@ -191456,11 +191470,45 @@ function _auctAgo(ts) {
 // be placed. An unmapped label is a category somebody is being scored
 // short, and naming it is the difference between a bug found in one
 // night and a bug found never.
+// AUCTSCORE -- WHAT THIS BOARD IS SCORING, in the league's own
+// abbreviations with its own weights, so it can be set against the
+// league's settings page without taking my word for anything.
+function _auctScoringAuditHtml() {
+  var sc, lgName = '';
+  try { sc = _auctScoring(_auctState.leagueKey); } catch (e) { return ''; }
+  if (!sc) { return ''; }
+  try {
+    var ls = _auctLeagues(), i;
+    for (i = 0; i < ls.length; i++) {
+      if (ls[i].league_key === _auctState.leagueKey) {
+        lgName = ls[i].name || ls[i].league_key;
+      }
+    }
+  } catch (e2) {}
+  var w = sc.weights || [], parts = [], j;
+  for (j = 0; j < w.length; j++) {
+    parts.push(skEscape(w[j].ab) + '\u00d7' + w[j].v);
+  }
+  if (!parts.length) { return ''; }
+  var h = '<div class="rg-foot">Scoring ' +
+    (lgName ? ('\u2014 ' + skEscape(lgName) + ' \u2014 ') : '') +
+    parts.join('  ') + '</div>';
+  if (sc.missed && sc.missed.length) {
+    h += '<div class="rg-foot" style="color:#f59e0b">Your league also ' +
+      'scores ' + skEscape(sc.missed.join(' ')) + ', which nothing here ' +
+      'maps to \u2014 nobody is getting credit for ' +
+      ((sc.missed.length === 1) ? 'it' : 'them') + '. Tell me and it is a ' +
+      'one-line fix.</div>';
+  }
+  return h;
+}
+
 function _auctLiveDiagHtml(live) {
   var un = [], k, seen = 0;
   for (k in live.labels) { if (live.labels.hasOwnProperty(k)) { seen++; } }
   for (k in live.unmapped) { if (live.unmapped.hasOwnProperty(k)) { un.push(k); } }
-  var h = '<div class="rg-foot">Scored off ESPN box scores \u00b7 ' +
+  var h = _auctScoringAuditHtml() +
+    '<div class="rg-foot">Scored off ESPN box scores \u00b7 ' +
     seen + ' labels read' +
     ((_auctSport() === 'nba') ? '' :
       ' \u00b7 goalie wins are derived from the result, not a box score column') +
@@ -191537,7 +191585,10 @@ function _auctRender() {
   }
   var sub = '<div class="sk-wire-sheet-section"><span class="ic">\ud83d\udcb0</span>' +
     'Tonight\u2019s board<span class="meta">' +
-    skEscape('$' + AUCT_BUDGET + ' \u00b7 ' + _rl) + '</span></div>';
+    skEscape('$' + AUCT_BUDGET + ' \u00b7 ' + _rl) + '</span></div>' +
+    // AUCTSCORE -- before the board, not only on the locked card: what
+    // the projections were built from is the first thing worth knowing.
+    '<div class="rg-dark rg-bleed">' + _auctScoringAuditHtml() + '</div>';
   var playable = !_auctState.note && _auctState.board &&
     _auctState.board.rows && _auctState.board.rows.length;
   // AUCTALL -- typing repaints the board, and a repaint replaces the
@@ -192147,8 +192198,33 @@ function _auctSlotOf(p, sport) {
 // both; anything unmapped is reported rather than silently scored as
 // zero, because a missing category is the difference between a board and
 // a wrong board.
+// AUCTSCORE -- categories the shared Yahoo map does not carry, added
+// here rather than there: _FPP_YAHOO_MAP is also the Fantrax Player
+// Projector's and a change to it is a change to that tool.
+var _AUCT_MAP_EXTRA = {
+  nba: { 'PF': 'pf', 'PERSONAL FOULS': 'pf', 'FOULS': 'pf' },
+  nhl: {}
+};
+
+// AUCTSCORE -- ONE SOURCE FOR THE CATEGORY MAPS. The scoring built its
+// map with the auction's extras and the stat table built its own
+// without them, so a category could be scored and still have no column
+// -- which is exactly what happened to personal fouls.
+function _auctMapsFor(isNba) {
+  var base = (typeof _FPP_YAHOO_MAP !== 'undefined') ? _FPP_YAHOO_MAP : {};
+  var ex = _AUCT_MAP_EXTRA[isNba ? 'nba' : 'nhl'] || {};
+  function w(m) {
+    var o = {}, k;
+    for (k in (m || {})) { if (m.hasOwnProperty(k)) { o[k] = m[k]; } }
+    for (k in ex) { if (ex.hasOwnProperty(k)) { o[k] = ex[k]; } }
+    return o;
+  }
+  return { skater: w(isNba ? base.nba : base.nhl_skater),
+           goalie: w(isNba ? base.nba : base.nhl_goalie) };
+}
+
 function _auctScoring(leagueKey) {
-  var out = { skater: {}, goalie: {}, read: [], missed: [] };
+  var out = { skater: {}, goalie: {}, read: [], missed: [], weights: [] };
   var set = null;
   try {
     set = (typeof leagueSettingsCache === 'object' && leagueSettingsCache)
@@ -192158,10 +192234,8 @@ function _auctScoring(leagueKey) {
   if (!stats) { return out; }
   // AUCTNBA -- basketball has one map; hockey splits it by role.
   var _isN = (_auctSport() === 'nba');
-  var mapS = (typeof _FPP_YAHOO_MAP !== 'undefined'
-    && (_isN ? _FPP_YAHOO_MAP.nba : _FPP_YAHOO_MAP.nhl_skater)) || {};
-  var mapG = (typeof _FPP_YAHOO_MAP !== 'undefined'
-    && (_isN ? _FPP_YAHOO_MAP.nba : _FPP_YAHOO_MAP.nhl_goalie)) || {};
+  var _mm = _auctMapsFor(_isN);
+  var mapS = _mm.skater, mapG = _mm.goalie;
   var sid;
   for (sid in stats) {
     if (!stats.hasOwnProperty(sid)) { continue; }
@@ -192177,6 +192251,9 @@ function _auctScoring(leagueKey) {
     var val = parseFloat(m.pointModifier);
     if (isNaN(val) || val === 0) { continue; }
     var kS = mapS[ab], kG = mapG[ab];
+    // AUCTSCORE -- the weight beside the abbreviation, so the card can
+    // print what it is actually using and he can set it against Yahoo.
+    if (kS || kG) { out.weights = out.weights || []; out.weights.push({ ab: ab, v: val }); }
     if (kS) { out.skater[kS] = val; out.read.push(ab); }
     if (kG) { out.goalie[kG] = val; if (!kS) { out.read.push(ab); } }
     if (!kS && !kG) { out.missed.push(ab); }
@@ -192952,10 +193029,14 @@ var _AUCT_BOX_NBA = {
   'OREB': 'oreb', 'DREB': 'dreb',
   'AST': 'ast', 'STL': 'stl', 'BLK': 'blk',
   'TO': 'to', 'TOV': 'to',
-  'FG': 'fgm', '3PT': 'tpm', 'FT': 'ftm'
+  'FG': 'fgm', '3PT': 'tpm', 'FT': 'ftm',
+  'PF': 'pf'
 };
+// AUCTSCORE -- PF comes OFF the ignore list. It is a real category in
+// plenty of points leagues, and throwing the column away as noise meant
+// a league that scores it credited nobody.
 var _AUCT_BOX_NBA_IGNORE = {
-  'MIN': 1, 'PF': 1, '+/-': 1, 'FG%': 1, '3P%': 1, 'FT%': 1, 'STARTER': 1
+  'MIN': 1, '+/-': 1, 'FG%': 1, '3P%': 1, 'FT%': 1, 'STARTER': 1
 };
 
 var _AUCT_BOX_GOALIE = {
