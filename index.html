@@ -191504,7 +191504,9 @@ var AUCT_TEAMS = 2;          // him and the house
 // three got bought, so the only choice was which of two near-identical
 // men to overpay for. A light night draws whatever it can and the board
 // says so rather than pretending.
-var AUCT_LOT_N = 15;
+// AUCTDEEP -- his numbers. Defence runs deeper than the forward slots
+// because the game starts two of them and a club dresses three pairs.
+var AUCT_LOT_N = { C: 15, LW: 15, RW: 15, D: 20, G: 15 };
 // AUCTLIVE -- a club's real depth at each slot. Three scoring lines
 // means about three centres and three of each wing worth drafting;
 // three pairs is six defencemen; a keeper and his backup. The eligible
@@ -191841,35 +191843,71 @@ function _auctDayKey() {
   return 'skAuct|' + d + '|' + String(_auctState.leagueKey || '');
 }
 
+// AUCTDEEP -- THE MEN THEMSELVES, not a list of ids to look up later.
+// A locked card is a commitment, and ids were re-resolved against
+// whatever board the next build happened to draw -- so a change to the
+// lot could quietly trim a locked lineup, mid-game, to five men.
+function _auctSnap(rows) {
+  var out = [], i, r;
+  for (i = 0; i < rows.length; i++) {
+    r = rows[i];
+    out.push({ id: r.id, name: r.name, slot: r.slot, team: r.team,
+               price: r.price, fp: r.fp, inj: r.inj || '' });
+  }
+  return out;
+}
+
 function _auctSave() {
   try {
     localStorage.setItem(_auctDayKey(), JSON.stringify({
-      lineup: _auctIds(_auctState.lineup),
-      house: _auctIds(_auctState.house),
+      v: 2,
+      lineup: _auctSnap(_auctState.lineup),
+      house: _auctSnap(_auctState.house),
       strategy: _auctState.strategy,
       locked: !!_auctState.locked
     }));
   } catch (e) {}
 }
 
-function _auctIds(rows) {
-  var out = [], i;
-  for (i = 0; i < rows.length; i++) { out.push(rows[i].id); }
+// Ids back to the rows of TONIGHT'S board. A man who is no longer on it
+// is dropped rather than resurrected: before you commit, the board is
+// the truth, and a lineup holding someone who is not playing would
+// quietly score nothing.
+//
+// AUCTDEEP -- searched against every PRICED man, not only the fifteen
+// drawn. A card saved by an earlier build holds bare ids, and a man who
+// was on last build's lot but not this one is still playing tonight --
+// dropping him would be the trim this change exists to prevent.
+function _auctRowsByIds(ids) {
+  var out = [], i, j, bd = _auctState.board || {};
+  var pools = [bd.rows || [], bd.all || []];
+  for (i = 0; i < ids.length; i++) {
+    var hit = null;
+    for (var p = 0; p < pools.length && !hit; p++) {
+      for (j = 0; j < pools[p].length; j++) {
+        if (pools[p][j].id === ids[i]) { hit = pools[p][j]; break; }
+      }
+    }
+    if (hit) { out.push(hit); }
+  }
   return out;
 }
 
-// Ids back to the rows of TONIGHT'S board. A man who is no longer on it
-// is dropped rather than resurrected from the saved copy: the board is
-// the truth, and a lineup holding someone who is not playing would
-// quietly score nothing.
-function _auctRowsByIds(ids) {
-  var out = [], i, j, rows = (_auctState.board && _auctState.board.rows) || [];
-  for (i = 0; i < ids.length; i++) {
-    for (j = 0; j < rows.length; j++) {
-      if (rows[j].id === ids[i]) { out.push(rows[j]); break; }
-    }
+// A saved side, in either format: v2 holds the men, v1 held bare ids.
+function _auctRestoreSide(saved, locked) {
+  if (!saved || !saved.length) { return []; }
+  if (typeof saved[0] === 'string') {
+    // v1. Resolve against the board -- every priced man, not just the lot.
+    return _auctRowsByIds(saved);
   }
-  return out;
+  // v2. A LOCKED side is restored verbatim: it is a commitment, and the
+  // price he paid is the price he paid whatever tonight's tiers now say.
+  if (locked) { return saved.slice(0); }
+  // Unlocked, the board still rules, so a man who has dropped off it
+  // falls out before the commitment rather than after.
+  var ids = [], i;
+  for (i = 0; i < saved.length; i++) { ids.push(saved[i].id); }
+  return _auctRowsByIds(ids);
 }
 
 function _auctLoad() {
@@ -191881,10 +191919,11 @@ function _auctLoad() {
   var sv = null;
   try { sv = raw ? JSON.parse(raw) : null; } catch (e2) { sv = null; }
   if (sv) {
-    _auctState.lineup = _auctRowsByIds(sv.lineup || []);
-    _auctState.house = _auctRowsByIds(sv.house || []);
+    var _lk = !!sv.locked;
+    _auctState.lineup = _auctRestoreSide(sv.lineup || [], _lk);
+    _auctState.house = _auctRestoreSide(sv.house || [], _lk);
     _auctState.strategy = sv.strategy || '';
-    _auctState.locked = !!sv.locked && _auctState.house.length > 0;
+    _auctState.locked = _lk && _auctState.house.length > 0;
   }
   if (!_auctState.strategy) {
     var rnd = _auctRng(_auctDayKey() + '|house');
@@ -192262,17 +192301,25 @@ function _auctBuildBoard(leagueKey, pool) {
     // where it does not. Never fewer than the slot buys plus a spare,
     // so a thin position still has someone to fall back on if one is
     // there at all.
-    var want = Math.min(AUCT_LOT_N, cand.length);
-    if (want < cand.length && want < (sl2.n * AUCT_TEAMS) + 1) {
-      want = Math.min(cand.length, (sl2.n * AUCT_TEAMS) + 1);
-    }
-    var drawn = _auctDrawLot(cand, want, rnd);
+    // AUCTDEEP -- THE TOP OF THE POOL, NOT A SAMPLE OF IT. The band
+    // draw took one man per band and so skipped the fourth, sixth,
+    // eighth and ninth best centres -- good players, gone for no
+    // visible reason. Banding was there to manufacture a projection
+    // spread when prices were DERIVED from value over replacement;
+    // prices are assigned bands now, so the spread holds whatever the
+    // lot contains and there is nothing left for a sample to buy.
+    var want = Math.min(AUCT_LOT_N[sl2.k] || 15, cand.length);
+    var drawn = cand.slice(0, want);
     // A slot the night cannot fill at all is named rather than dropped:
     // a board quietly missing right wing looks broken, and the game is
     // meant to carry on and score whoever did get drafted.
     if (!drawn.length) { out.empty.push(sl2.k); }
     for (var di = 0; di < drawn.length; di++) { lot.push(drawn[di]); }
   }
+  // AUCTDEEP -- the full priced set stays on the board so a card saved
+  // by an earlier build can still find its men. Cheap: these are the
+  // same row objects, held by reference.
+  out.all = out.rows;
   out.rows = lot;
   out.lot = lot.length;
   _auctPrice(out.rows);
