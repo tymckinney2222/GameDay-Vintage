@@ -125771,6 +125771,24 @@ async function skHydrateAll() {
   skHydrationInFlight = true;
   var queue = skSyncedLeaguesAll().slice();
   var _hydN = queue.length;   // BOOTCLOCK -- before the pump empties it
+  // WARMSPLIT -- this fetches /standings and /scoreboard;out=matchups for
+  // every league, which is exactly the half of the warm that is still in
+  // flight. Racing it means asking ninety-eight times for what two
+  // requests already bought. Waiting costs nothing it was not already
+  // waiting for: before the split, the whole warm finished first anyway.
+  //
+  // Capped, so a batch that never lands can only put this back to what it
+  // did before any of this existed, rather than freezing it.
+  if (typeof _fyWarmSlow !== 'undefined' && _fyWarmSlow) {
+    var _hw0 = Date.now();
+    try {
+      await Promise.race([
+        _fyWarmSlow,
+        new Promise(function (r) { setTimeout(r, 20000); })
+      ]);
+    } catch (eHW) {}
+    _skBootMark('hydrate waited', (Date.now() - _hw0) + 'ms for the slow half');
+  }
   var inflight = 0;
   await new Promise(function(resolve) {
     function pump() {
@@ -204584,7 +204602,11 @@ async function _fyBatchRosters(leagues) {
 }
 
 // Everything a cold sweep is about to ask for league by league.
-async function _fyBatchWarm(leagues) {
+// WARMSPLIT -- the deferred half, in flight. Null whenever there isn't
+// one, so anything that waits on it waits for nothing by default.
+var _fyWarmSlow = null;
+
+async function _fyBatchWarm(leagues, opts) {
   try {
     var keys = [];
     for (var i = 0; i < leagues.length; i++) {
@@ -204611,31 +204633,74 @@ async function _fyBatchWarm(leagues) {
     // matchups 8.2s, standings 3.6s, rosters 2.1s, settings 1.6s -- and it
     // is a heuristic, not a rule: being wrong about it costs the
     // difference between two orderings of the same work.
-    var tasks = [
-      { n: 'scoreboard', f: function () {
-          return _fyBatchPrefill(keys, 'scoreboard;out=matchups', 'scoreboard'); } },
-      { n: 'standings',  f: function () { return _fyBatchPrefill(keys, 'standings'); } },
+    // WARMSPLIT -- which half each kind belongs to.
+    //
+    // FAST is what the roster lanes and the plan scan read, and nothing
+    // else: the rosters themselves, and the settings the scan needs to
+    // know how many active slots a league has. Together they are about
+    // three seconds of his twelve.
+    //
+    // SLOW is what the hydrate and the Today cards read. It is the bulk
+    // of the bytes and it is why the boot is twelve seconds -- but
+    // nothing on the pill's path touches it.
+    var fastTasks = [
       { n: 'rosters',    f: function () { return _fyBatchRosters(leagues); } },
       { n: 'settings',   f: function () { return _fyBatchPrefill(keys, 'settings'); } }
     ];
-    var total = 0, _qi = 0;
-    async function _warmLane() {
-      while (_qi < tasks.length) {
-        var t = tasks[_qi++];
-        var _t0 = Date.now(), _got = 0;
-        // total += (await ...) READS total before the await and assigns
-        // after it, so three lanes overwrote each other's additions and
-        // the count came back at two fifths. Land the value first.
-        try { _got = (await t.f()) || 0; } catch (eT) { _got = 0; }
-        total += _got;
-        // Each kind times itself, so the next clock says WHICH of the five
-        // is expensive instead of leaving it as one opaque block.
-        _skBootMark('warm: ' + t.n, (Date.now() - _t0) + 'ms');
+    // Longest first within each half, so the slow one starts in the first
+    // round instead of waiting for a lane. The order is from his own
+    // clock and it is a heuristic: being wrong costs the difference
+    // between two orderings of the same work.
+    var slowTasks = [
+      { n: 'scoreboard', f: function () {
+          return _fyBatchPrefill(keys, 'scoreboard;out=matchups', 'scoreboard'); } },
+      { n: 'standings',  f: function () { return _fyBatchPrefill(keys, 'standings'); } }
+    ];
+    var total = 0;
+
+    // BULKPARALLEL -- lanes over a shared queue. Three at a time was for
+    // four tasks; each half is two, so each half runs both at once. The
+    // pacer staggers the starts either way, so the saving is in
+    // overlapping the responses, and these are multi-megabyte answers
+    // arriving on a phone.
+    async function _runGroup(list, lanes) {
+      var _qi = 0;
+      async function _warmLane() {
+        while (_qi < list.length) {
+          var t = list[_qi++];
+          var _t0 = Date.now(), _got = 0;
+          // total += (await ...) READS total before the await and assigns
+          // after it, so concurrent lanes overwrote each other's additions
+          // and the count came back short. Land the value first.
+          try { _got = (await t.f()) || 0; } catch (eT) { _got = 0; }
+          total += _got;
+          // Each kind times itself, so the clock says WHICH is expensive
+          // rather than leaving the warm as one opaque block.
+          _skBootMark('warm: ' + t.n, (Date.now() - _t0) + 'ms');
+        }
       }
+      var _wl = [];
+      for (var _w = 0; _w < lanes && _w < list.length; _w++) { _wl.push(_warmLane()); }
+      await Promise.all(_wl);
     }
-    var _wl = [];
-    for (var _w = 0; _w < 3 && _w < tasks.length; _w++) { _wl.push(_warmLane()); }
-    await Promise.all(_wl);
+
+    if (!(opts && opts.split)) {
+      // Unsplit: everything, awaited. This is what the manual refresh
+      // asks for, where there is no pill chain to unblock and the whole
+      // point is that the next thing finds a full cache.
+      _fyWarmSlow = null;
+      await _runGroup(fastTasks.concat(slowTasks), 3);
+      return total;
+    }
+
+    await _runGroup(fastTasks, 2);
+    // Started, deliberately not awaited. The caller gets on with the
+    // lanes; skHydrateAll waits on this handle rather than racing it,
+    // because the two kinds in here are exactly the two calls it would
+    // otherwise make per league.
+    _fyWarmSlow = _runGroup(slowTasks, 2).then(function () {
+      _skBootMark('warm: slow half done');
+    }).catch(function () {});
     return total;
   } catch (e) { return 0; }
 }
@@ -205023,8 +205088,10 @@ async function fyAutoLoadAllRosters() {
   // the fan-out below finds them already in hand. Thirty-eight leagues
   // cost four requests here instead of seventy-six down there.
   try {
-    var _warmN = await _fyBatchWarm(leaguesToLoad);
-    _skBootMark('bulk warm', _warmN + ' answers filled');
+    // WARMSPLIT -- rosters and settings now; standings and scoreboard in
+    // the background, with the hydrate gated on them.
+    var _warmN = await _fyBatchWarm(leaguesToLoad, { split: true });
+    _skBootMark('bulk warm', _warmN + ' answers filled \u00b7 fast half');
   } catch (eB) { _skBootMark('bulk warm', 'failed'); }
 
   // Fetch all leagues in parallel, collect into allPlayers array — no parallel cache writes
@@ -205229,6 +205296,8 @@ async function fyAutoLoadAllRosters() {
   _skBootMark('rosters parsed', leaguesToLoad.length + ' leagues \u00b7 ' +
     _fyLaneHit + ' cached, ' + _fyLaneMiss + ' fetched \u00b7 ' +
     _laneParseMs + 'ms parsing');
+  // WARMSPLIT -- everything the pill's chain needs is in hand right here.
+  if (typeof skScanPlan === 'function') { skScanPlan(); }
 
   // Write cache once after all fetches complete — no race condition
   fyRosterCache = allPlayers;
@@ -205276,11 +205345,12 @@ async function fyAutoLoadAllRosters() {
     });
   }
 
-  // Now that we know the synced set is hydrated, kick off the Plan
-  // mode scan in the background. This populates the attention pill
-  // and the Plan tab. Independent endpoint (settings + tomorrow's
-  // roster), so it doesn't block this auto-loader.
-  if (typeof skScanPlan === 'function') skScanPlan();
+  // WARMSPLIT -- the scan was fired here, at the tail, behind the
+  // team-FP prefetch and the whole warm. Its inputs -- the rosters and
+  // the settings -- are ready the moment the lanes finish, so it now
+  // goes there instead. What is left here is waiting for the half of
+  // the warm nothing on this path reads.
+  if (_fyWarmSlow) { try { await _fyWarmSlow; } catch (eWS) {} }
   // Note: Wire scan is NOT triggered here. It depends on matchup
   // identity (myTeamKey + oppTeamKey) which lives in skLeagueData,
   // populated by skHydrateAll(). Triggering Wire from the auto-loader
