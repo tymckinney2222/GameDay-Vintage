@@ -190898,13 +190898,29 @@ function _auctBoardHtml(b) {
     var body = '';
     for (i = 0; i < list.length && i < 30; i++) {
       var r = list[i];
-      body += '<tr>' +
-        '<td class="rg-p"><div class="rg-nm">' + skEscape(r.name) + '</div>' +
+      // AUCTPLAY -- picked, pickable, or priced out. The third state is
+      // the one worth showing: a man dimmed because he costs more than
+      // is left is telling you the budget is binding, which is the whole
+      // decision. Hiding him would hide the game.
+      var mine = _auctHas(_auctState.lineup, r.id);
+      var why = _auctState.locked ? 'locked' : _auctWhyNot(_auctState.lineup, r);
+      var dim = (!mine && why);
+      body += '<tr onclick="_auctTap(\'' + skEscape(String(r.id)) + '\')"' +
+        ' style="cursor:pointer' +
+        (mine ? ';background:rgba(250,204,21,0.10)' : '') +
+        (dim ? ';opacity:0.38' : '') + '">' +
+        '<td class="rg-p"><div class="rg-nm">' +
+          (mine ? '\u2713 ' : '') + skEscape(r.name) + '</div>' +
           '<div class="rg-sub">' + skEscape(r.team) +
-          (r.inj ? (' \u00b7 ' + skEscape(r.inj)) : '') + '</div></td>' +
+          (r.inj ? (' \u00b7 ' + skEscape(r.inj)) : '') +
+          // Only the reason that VARIES down the column. "already
+          // filled" is true of every row in a filled slot, so printing
+          // it nine times is noise -- that one belongs in the section
+          // header, once. "not enough left" is the budget binding on
+          // this particular man, which is the decision itself.
+          ((dim && why === 'not enough left')
+            ? (' \u00b7 ' + skEscape(why)) : '') + '</div></td>' +
         '<td>' + skEscape(Number(r.fp).toFixed(1)) + '</td>' +
-        // AUCTTIER -- every price is a real price now, so none of them
-        // is greyed out. A $1 man is a cheap pick, not an absent one.
         '<td class="rg-best">$' + r.price + '</td>' +
       '</tr>';
     }
@@ -190913,9 +190929,12 @@ function _auctBoardHtml(b) {
     // Perfect 5 does not work that way -- everyone picks independently
     // and Doncic was on 71% of lineups. The house drafting the same man
     // is fine, and the label should not imply otherwise.
+    var _full = _auctSlotUsed(_auctState.lineup, sl.k) >= sl.n;
     h += '<div class="rg-sect">' + skEscape(sl.label) +
-      ' <span style="opacity:0.6">pick ' + sl.n + ' of ' +
-      list.length + '</span></div>' +
+      ' <span style="opacity:0.6">' +
+      (_full ? ('\u2713 filled \u00b7 tap to change')
+             : ('pick ' + sl.n + ' of ' + list.length)) +
+      '</span></div>' +
       '<div class="rg-wrap"><table class="rg">' + head + body + '</table></div>';
   }
   return '<div class="rg-dark rg-bleed">' + h + diag + '</div>';
@@ -190943,6 +190962,78 @@ function _auctLeagues() {
   return out;
 }
 
+function _auctHas(rows, id) {
+  var i;
+  for (i = 0; i < rows.length; i++) { if (rows[i].id === id) { return true; } }
+  return false;
+}
+
+// AUCTPLAY -- the budget bar. Sticky, because on a phone the board runs
+// well past a screen and a budget you have to scroll back to is a budget
+// you spend wrong.
+function _auctBarHtml() {
+  var n = _auctState.lineup.length, seats = _auctSeats();
+  var left = AUCT_BUDGET - _auctSumPrice(_auctState.lineup);
+  var proj = 0, i;
+  for (i = 0; i < _auctState.lineup.length; i++) { proj += Number(_auctState.lineup[i].fp) || 0; }
+  var full = (n >= seats);
+  var h = '<div style="position:sticky;top:0;z-index:5;background:#0b0f1a;' +
+    'border-bottom:1px solid rgba(255,255,255,0.10);padding:9px 0 10px;' +
+    'margin:0 0 8px">' +
+    '<div style="display:flex;align-items:baseline;gap:10px;font-size:13px">' +
+      '<span style="color:#facc15;font-weight:700">$' + left + ' left</span>' +
+      '<span style="color:rgba(255,255,255,0.5)">' + n + ' of ' + seats + '</span>' +
+      (proj > 0 ? ('<span style="color:rgba(255,255,255,0.5);margin-left:auto">proj ' +
+        proj.toFixed(1) + '</span>') : '') +
+    '</div>';
+  if (!_auctState.locked) {
+    h += '<div style="display:flex;gap:8px;margin-top:8px">' +
+      '<button onclick="_auctLock()"' +
+        ' style="flex:1;padding:9px;border-radius:8px;border:0;font-size:13px;' +
+        'font-weight:700;cursor:pointer;' +
+        (full ? 'background:#facc15;color:#111' :
+                'background:rgba(255,255,255,0.08);color:rgba(255,255,255,0.35)') +
+        '">' + (full ? 'Lock it in' : 'Pick ' + (seats - n) + ' more') + '</button>' +
+      (n ? ('<button onclick="_auctClear()" style="padding:9px 14px;border-radius:8px;' +
+        'border:1px solid rgba(255,255,255,0.14);background:transparent;' +
+        'color:rgba(255,255,255,0.6);font-size:13px;cursor:pointer">Clear</button>') : '') +
+      '</div>';
+  }
+  return h + '</div>';
+}
+
+// Both sides, once the card is locked.
+function _auctCardHtml() {
+  if (!_auctState.locked) { return ''; }
+  var st = _auctStratOf(_auctState.strategy);
+  function side(title, rows, sub) {
+    var t = 0, i, h = '';
+    for (i = 0; i < rows.length; i++) {
+      t += Number(rows[i].fp) || 0;
+      h += '<tr><td class="rg-p"><div class="rg-nm">' + skEscape(rows[i].name) +
+        '</div><div class="rg-sub">' + skEscape(rows[i].slot) + ' \u00b7 ' +
+        skEscape(rows[i].team) + '</div></td>' +
+        '<td>' + Number(rows[i].fp).toFixed(1) + '</td>' +
+        '<td class="rg-best">$' + rows[i].price + '</td></tr>';
+    }
+    return '<div class="rg-sect">' + skEscape(title) +
+      ' <span style="opacity:0.6">$' + _auctSumPrice(rows) + ' \u00b7 proj ' +
+      t.toFixed(1) + '</span></div>' +
+      (sub ? ('<div class="rg-foot" style="margin:0 0 4px">' + skEscape(sub) + '</div>') : '') +
+      '<div class="rg-wrap"><table class="rg">' +
+      '<tr><th class="rg-p">' + skEscape(title) + '</th><th>Proj</th><th>$</th></tr>' +
+      h + '</table></div>';
+  }
+  // AUCTPLAY -- projections are not the result. Saying so here stops the
+  // card reading as a verdict when the night has not been played yet.
+  return '<div class="rg-dark rg-bleed">' +
+    side('Your six', _auctState.lineup, '') +
+    side('The house \u2014 ' + st.label, _auctState.house, st.note) +
+    '<div class="rg-foot">Locked for tonight. These are projections, not ' +
+    'the result \u2014 the night is settled off the box scores.</div>' +
+    '</div>';
+}
+
 function _auctRender() {
   var host = document.getElementById('skAuctBody');
   if (!host) { return; }
@@ -190966,7 +191057,11 @@ function _auctRender() {
   var sub = '<div class="sk-wire-sheet-section"><span class="ic">\ud83d\udcb0</span>' +
     'Tonight\u2019s board<span class="meta">' +
     skEscape('$' + AUCT_BUDGET + ' \u00b7 C LW RW D D G') + '</span></div>';
-  host.innerHTML = sel + sub +
+  var playable = !_auctState.note && _auctState.board &&
+    _auctState.board.rows && _auctState.board.rows.length;
+  host.innerHTML = sel +
+    (playable ? _auctBarHtml() : '') +
+    (playable ? _auctCardHtml() : '') + sub +
     (_auctState.note
       ? ('<div class="sk-wire-sheet-empty">' + skEscape(_auctState.note) + '</div>')
       : _auctBoardHtml(_auctState.board));
@@ -190986,6 +191081,9 @@ function _auctPick(key) {
     try {
       _auctState.board = _auctBuildBoard(_auctState.leagueKey, pool);
       _auctState.note = '';
+      // AUCTPLAY -- after the board, never before: the saved card is a
+      // list of ids and they have to be looked up in tonight's rows.
+      _auctLoad();
     } catch (e) {
       _auctState.note = 'Board failed: ' + String((e && e.message) || e);
     }
@@ -191326,7 +191424,22 @@ var AUCT_LOT_N = 10;
 // genuine scrub at the bottom, and a real gradient in between. That
 // gradient is the entire reason the dollars mean anything.
 var AUCT_LOT_CURVE = 1.6;
-var _auctState = { leagueKey: '', board: null, note: '' };
+var _auctState = { leagueKey: '', board: null, note: '',
+                   lineup: [], house: [], strategy: '', locked: false };
+
+// AUCTPLAY -- the four opponents. A single optimiser would build the
+// same side every night, and so would he off the same column, which is
+// two identical teams and a tie. These play differently on purpose.
+var AUCT_STRATS = [
+  { k: 'stars', label: 'Stars and scrubs',
+    note: 'spends to the cap on the top band and fills the rest with dollar men' },
+  { k: 'balanced', label: 'Balanced',
+    note: 'about three dollars a man, straight down the middle' },
+  { k: 'value', label: 'Value hunter',
+    note: 'the most projection per dollar, wherever on the board it sits' },
+  { k: 'chalk', label: 'Chalk',
+    note: 'the best man it can afford at every slot' }
+];
 
 // AUCTLOT -- the same night draws the same lot.
 //
@@ -191524,6 +191637,192 @@ function _auctPrice(rows) {
   }
   rows.sort(function (a, b) { return b.price - a.price || b.fp - a.fp; });
   return rows;
+}
+
+// \u2500\u2500 AUCTPLAY \u2500\u2500 the rules both sides play by \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+function _auctSumPrice(rows) {
+  var t = 0, i;
+  for (i = 0; i < rows.length; i++) { t += Number(rows[i].price) || 0; }
+  return t;
+}
+
+// THE DOLLAR-A-SEAT RESERVE. With five seats still to fill you may
+// commit at most BUDGET - spent - 4, because every remaining seat needs
+// a dollar of its own. Without it a first pick can strand you unable to
+// field a legal six, which is a dead end rather than a bad decision.
+function _auctMaxAfford(rows) {
+  var left = _auctSeats() - rows.length;
+  if (left <= 0) { return 0; }
+  return AUCT_BUDGET - _auctSumPrice(rows) - (left - 1);
+}
+
+function _auctSlotCap(slot) {
+  var i;
+  for (i = 0; i < AUCT_SLOTS.length; i++) {
+    if (AUCT_SLOTS[i].k === slot) { return AUCT_SLOTS[i].n; }
+  }
+  return 0;
+}
+
+function _auctSlotUsed(rows, slot) {
+  var n = 0, i;
+  for (i = 0; i < rows.length; i++) { if (rows[i].slot === slot) { n++; } }
+  return n;
+}
+
+// Why a man cannot be taken, in words, or '' if he can.
+function _auctWhyNot(rows, row) {
+  var i;
+  for (i = 0; i < rows.length; i++) { if (rows[i].id === row.id) { return ''; } }
+  if (rows.length >= _auctSeats()) { return 'roster full'; }
+  if (_auctSlotUsed(rows, row.slot) >= _auctSlotCap(row.slot)) {
+    return row.slot + ' already filled';
+  }
+  if (row.price > _auctMaxAfford(rows)) { return 'not enough left'; }
+  return '';
+}
+
+// \u2500\u2500 AUCTPLAY \u2500\u2500 the house \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+function _auctStratScore(r, strat) {
+  var fp = Number(r.fp) || 0, p = Number(r.price) || 1;
+  if (strat === 'stars') { return p * 1000 + fp; }
+  if (strat === 'value') { return fp / p; }
+  if (strat === 'balanced') {
+    var aim = AUCT_BUDGET / _auctSeats();
+    return (-Math.abs(p - aim) * 1000) + fp;
+  }
+  return fp;                       // chalk
+}
+
+// One legal six, built to a strategy.
+function _auctHouseDraft(rows, strat, rnd) {
+  var seats = [], i, j;
+  for (i = 0; i < AUCT_SLOTS.length; i++) {
+    for (j = 0; j < AUCT_SLOTS[i].n; j++) { seats.push(AUCT_SLOTS[i].k); }
+  }
+  // SHUFFLED, or a strategy always spends its money wherever AUCT_SLOTS
+  // happens to begin -- every stars night would buy a $5 centre and punt
+  // the goalie. Same night seed, so the house holds all evening.
+  for (i = seats.length - 1; i > 0; i--) {
+    var sw = Math.floor(rnd() * (i + 1));
+    var tmp = seats[i]; seats[i] = seats[sw]; seats[sw] = tmp;
+  }
+  var picked = [], taken = {};
+  for (i = 0; i < seats.length; i++) {
+    var maxA = _auctMaxAfford(picked);
+    var best = null, bestSc = -1e18;
+    for (j = 0; j < rows.length; j++) {
+      var r = rows[j];
+      if (r.slot !== seats[i] || taken[r.id] || r.price > maxA) { continue; }
+      var sc = _auctStratScore(r, strat);
+      if (sc > bestSc) { bestSc = sc; best = r; }
+    }
+    // A slot the night could not fill leaves a seat empty rather than
+    // stopping the draft -- his rule: score the men you did get.
+    if (best) { picked.push(best); taken[best.id] = true; }
+  }
+  return picked;
+}
+
+function _auctStratOf(k) {
+  var i;
+  for (i = 0; i < AUCT_STRATS.length; i++) {
+    if (AUCT_STRATS[i].k === k) { return AUCT_STRATS[i]; }
+  }
+  return AUCT_STRATS[AUCT_STRATS.length - 1];
+}
+
+// \u2500\u2500 AUCTPLAY \u2500\u2500 tonight's card, kept across opens \u2500\u2500\u2500\u2500\u2500
+function _auctDayKey() {
+  var d = '';
+  try { d = (typeof _todayDateString === 'function') ? _todayDateString() : ''; } catch (e) { d = ''; }
+  return 'skAuct|' + d + '|' + String(_auctState.leagueKey || '');
+}
+
+function _auctSave() {
+  try {
+    localStorage.setItem(_auctDayKey(), JSON.stringify({
+      lineup: _auctIds(_auctState.lineup),
+      house: _auctIds(_auctState.house),
+      strategy: _auctState.strategy,
+      locked: !!_auctState.locked
+    }));
+  } catch (e) {}
+}
+
+function _auctIds(rows) {
+  var out = [], i;
+  for (i = 0; i < rows.length; i++) { out.push(rows[i].id); }
+  return out;
+}
+
+// Ids back to the rows of TONIGHT'S board. A man who is no longer on it
+// is dropped rather than resurrected from the saved copy: the board is
+// the truth, and a lineup holding someone who is not playing would
+// quietly score nothing.
+function _auctRowsByIds(ids) {
+  var out = [], i, j, rows = (_auctState.board && _auctState.board.rows) || [];
+  for (i = 0; i < ids.length; i++) {
+    for (j = 0; j < rows.length; j++) {
+      if (rows[j].id === ids[i]) { out.push(rows[j]); break; }
+    }
+  }
+  return out;
+}
+
+function _auctLoad() {
+  _auctState.lineup = [];
+  _auctState.house = [];
+  _auctState.locked = false;
+  var raw = null;
+  try { raw = localStorage.getItem(_auctDayKey()); } catch (e) { raw = null; }
+  var sv = null;
+  try { sv = raw ? JSON.parse(raw) : null; } catch (e2) { sv = null; }
+  if (sv) {
+    _auctState.lineup = _auctRowsByIds(sv.lineup || []);
+    _auctState.house = _auctRowsByIds(sv.house || []);
+    _auctState.strategy = sv.strategy || '';
+    _auctState.locked = !!sv.locked && _auctState.house.length > 0;
+  }
+  if (!_auctState.strategy) {
+    var rnd = _auctRng(_auctDayKey() + '|house');
+    _auctState.strategy = AUCT_STRATS[Math.floor(rnd() * AUCT_STRATS.length)].k;
+  }
+}
+
+function _auctTap(id) {
+  if (_auctState.locked) { return; }
+  var rows = (_auctState.board && _auctState.board.rows) || [], i, row = null;
+  for (i = 0; i < rows.length; i++) { if (rows[i].id === id) { row = rows[i]; break; } }
+  if (!row) { return; }
+  for (i = 0; i < _auctState.lineup.length; i++) {
+    if (_auctState.lineup[i].id === id) {
+      _auctState.lineup.splice(i, 1);
+      _auctSave(); _auctRender(); return;
+    }
+  }
+  if (_auctWhyNot(_auctState.lineup, row)) { return; }
+  _auctState.lineup.push(row);
+  _auctSave();
+  _auctRender();
+}
+
+function _auctClear() {
+  if (_auctState.locked) { return; }
+  _auctState.lineup = [];
+  _auctSave();
+  _auctRender();
+}
+
+function _auctLock() {
+  if (_auctState.locked) { return; }
+  if (_auctState.lineup.length < _auctSeats()) { return; }
+  var rows = (_auctState.board && _auctState.board.rows) || [];
+  var rnd = _auctRng(_auctDayKey() + '|draft');
+  _auctState.house = _auctHouseDraft(rows, _auctState.strategy, rnd);
+  _auctState.locked = true;
+  _auctSave();
+  _auctRender();
 }
 
 // Tonight's priced board, or a note saying which join came up empty.
