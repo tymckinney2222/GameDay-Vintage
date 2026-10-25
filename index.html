@@ -200974,6 +200974,39 @@ function _mrCgCollect(kind) {
       if (SL.games.length) leagues.push(SL);
     }
   }
+  // MGRFXWK -- Fantrax, read out of the same store. Points leagues go
+  // through the pts pass and categories leagues through the cats one,
+  // the same split every other provider uses.
+  for (i = 0; i < rows.length; i++) {
+    var frow = rows[i];
+    if (!frow || frow.provider !== 'fantrax') { continue; }
+    if (typeof skMrCounts === 'function' && !skMrCounts(frow)) { continue; }
+    var fNeed = _mrFxNeeded(frow);
+    var fbw = _mrCgWeeks(frow.key);
+    if (!fbw) {
+      if (!fNeed.length) { continue; }
+      if (_mrCgFailed[frow.key]) {
+        failed.push({ name: _mrNm({ name: frow.name, team: _mrExtTeam(frow) }),
+                      why: _mrCgFailed[frow.key] });
+      } else { pending++; }
+      continue;
+    }
+    if (_mrCgInflight[frow.key]) { pending++; }
+    var FL = mkLeague(frow.key, frow.name || frow.key, _mrExtTeam(frow), 'fantrax');
+    for (k = 0; k < fbw.length; k++) {
+      var fe = fbw[k];
+      if (!fe) { continue; }
+      if (kind === 'pts') {
+        if (fe.myPts == null || fe.oppPts == null) { continue; }
+        addPts(FL, fe.week, fe.myPts, fe.oppPts, fe.oppName);
+      } else {
+        if (!fe.myCatsWon && !fe.oppCatsWon && !fe.catsTied) { continue; }
+        addCats(FL, fe.week, fe.myCatsWon, fe.oppCatsWon, fe.catsTied,
+                fe.oppName, fe.result);
+      }
+    }
+    if (FL.games.length) { leagues.push(FL); }
+  }
   return { leagues: leagues, pending: pending, failed: failed, rebuilt: rebuilt,
            pct: _mrClosePct(), kind: kind };
 }
@@ -201039,6 +201072,185 @@ function _mrSlLoadOne(row) {
     return errs ? (errs + ' week' + (errs === 1 ? '' : 's') + ' didn\u2019t load from Sleeper') : '';
   });
 }
+// \u2500\u2500 MGRFXWK \u2500\u2500 Fantrax weekly results \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+//
+// Which period the league is on. Fantrax's league info does not label
+// this consistently, so several plausible fields are tried in turn and
+// the highest known period is the floor. Everything strictly below it
+// is treated as played.
+function _mrFxCurrentPeriod(row) {
+  var cand = [], raw = (row && row.raw) || {}, i;
+  function take(v) {
+    var n = parseInt(v, 10);
+    if (!isNaN(n) && n > 0) { cand.push(n); }
+  }
+  take(row && row.scoresPeriod);
+  take(row && row.liveScores && row.liveScores.period);
+  take(raw.currentPeriod); take(raw.scoringPeriod); take(raw.period);
+  take(raw.currentScoringPeriod); take(raw.currentMatchupPeriod);
+  if (cand.length) { return cand[0]; }
+  var list = (typeof _fxPeriodList === 'function') ? _fxPeriodList(row) : [];
+  var mx = 0;
+  for (i = 0; i < list.length; i++) { if (list[i] > mx) { mx = list[i]; } }
+  return mx || 0;
+}
+
+// Periods that are over and not yet banked.
+function _mrFxNeeded(row) {
+  var cur = _mrFxCurrentPeriod(row);
+  if (!cur) { return []; }
+  var list = (typeof _fxPeriodList === 'function') ? _fxPeriodList(row) : [];
+  var out = [], i;
+  if (list.length) {
+    for (i = 0; i < list.length; i++) {
+      if (list[i] > 0 && list[i] < cur) { out.push(list[i]); }
+    }
+  } else {
+    for (i = 1; i < cur; i++) { out.push(i); }
+  }
+  out.sort(function (a, b) { return a - b; });
+  return out;
+}
+
+// One period, parsed, WITHOUT touching row.liveScores -- that is the
+// matchup pane he may have open, and a background hydrate must not move
+// it under him.
+function _mrFxFetchPeriod(row, period) {
+  if (typeof fxFetchJson !== 'function' || typeof _fxExtractMatchupScores !== 'function') {
+    return Promise.resolve(null);
+  }
+  var id = String((row && row.key) || '').slice(4);
+  if (!id) { return Promise.resolve(null); }
+  var url = 'https://www.fantrax.com/fxea/general/getMatchupScores?leagueId=' +
+    encodeURIComponent(id) + '&period=' + encodeURIComponent(period);
+  return fxFetchJson(url).then(function (data) {
+    // A roto or season-points league says so rather than returning games.
+    if (data && data.error && !data.matchups) {
+      row.noMatchupScores = (data.error.message || 'No matchup scores for this league.');
+      return null;
+    }
+    return _fxExtractMatchupScores(data);
+  })['catch'](function () { return null; });
+}
+
+// My side of a period's games, or null when I am not in any of them.
+// MGRFXWK -- awayRec is the STRING "4-6-1", not a tally object. The
+// extractor also publishes awayWins/homeWins as numbers, but the losses
+// and ties live only in that string, so it is parsed rather than
+// half-read. Assuming an object here meant a categories league banked a
+// row of noughts.
+function _mrFxRec(str) {
+  var m = /^\s*(\d+)\s*-\s*(\d+)(?:\s*-\s*(\d+))?\s*$/.exec(String(str || ''));
+  if (!m) { return null; }
+  return { w: Number(m[1]) || 0, l: Number(m[2]) || 0, t: Number(m[3]) || 0 };
+}
+
+function _mrFxMineIn(parsed, mine) {
+  var g = (parsed && parsed.games) || [], i;
+  for (i = 0; i < g.length; i++) {
+    var a = String(g[i].awayId || ''), h = String(g[i].homeId || '');
+    if (a && mine[a]) {
+      return { my: g[i].awayScore, opp: g[i].homeScore, oppName: g[i].home,
+               myRec: _mrFxRec(g[i].awayRec), oppRec: _mrFxRec(g[i].homeRec) };
+    }
+    if (h && mine[h]) {
+      return { my: g[i].homeScore, opp: g[i].awayScore, oppName: g[i].away,
+               myRec: _mrFxRec(g[i].homeRec), oppRec: _mrFxRec(g[i].awayRec) };
+    }
+  }
+  return null;
+}
+
+function _mrFxLoadOne(row) {
+  var key = row.key, mine = row.myTeamIds || {};
+  var need = _mrFxNeeded(row), st = _mrCgStore(key);
+  var todo = [], i;
+  for (i = 0; i < need.length; i++) {
+    if (!st.w.hasOwnProperty(String(need[i]))) { todo.push(need[i]); }
+  }
+  if (!todo.length) { return Promise.resolve(''); }
+  var got = 0, empty = 0;
+  function step(n) {
+    if (n >= todo.length) {
+      if (got) { _mrCgSave(key); }
+      if (!got && empty === todo.length) { return 'no matchup scores returned'; }
+      return '';
+    }
+    var p = todo[n];
+    return _mrFxFetchPeriod(row, p).then(function (parsed) {
+      if (row.noMatchupScores) { return 'not a head-to-head league'; }
+      if (!parsed || !parsed.games || !parsed.games.length) {
+        // NOTHING came back. Do NOT bank a 0 -- that would freeze a hole
+        // in the record for the season on what may be a wrong guess
+        // about the payload. Leave it to be asked again.
+        empty++;
+        return step(n + 1);
+      }
+      var side = _mrFxMineIn(parsed, mine);
+      if (!side) {
+        // Games came back and I am in none: a bye, or a playoff week I
+        // am out of. THAT is worth banking so it is never asked again.
+        _mrCgStore(key).w[String(p)] = 0;
+        got++;
+        return step(n + 1);
+      }
+      var e = { week: p, oppName: side.oppName || '' };
+      if (side.myRec && side.oppRec) {
+        e.myCatsWon = side.myRec.w; e.oppCatsWon = side.oppRec.w;
+        e.catsTied = side.myRec.t || 0;
+      } else {
+        e.myPts = side.my; e.oppPts = side.opp;
+      }
+      _mrCgPut(key, e);
+      got++;
+      return step(n + 1);
+    });
+  }
+  return Promise.resolve(step(0));
+}
+
+function _mrFxHydrate(force) {
+  if (typeof extSyncedLeaguesAll !== 'function') { return; }
+  var rows = extSyncedLeaguesAll().filter(function (r) {
+    return r && r.provider === 'fantrax' && r.myTeamIds && !r.noMatchupScores;
+  });
+  if (!rows.length) { return; }
+  var queue = rows.filter(function (r) {
+    if (_mrCgInflight[r.key]) { return false; }
+    if (_mrCgFailed[r.key] && !force) { return false; }
+    var st = _mrCgStore(r.key), need = _mrFxNeeded(r), i;
+    for (i = 0; i < need.length; i++) {
+      if (!st.w.hasOwnProperty(String(need[i]))) { return true; }
+    }
+    return false;
+  });
+  if (!queue.length) { return; }
+  var running = 0;
+  function repaint() {
+    var ov = document.getElementById('mrOverlay');
+    if (ov && ov.classList.contains('open')) { try { mrRenderBody(); } catch (e) {} }
+  }
+  function pump() {
+    while (running < 2 && queue.length) {
+      (function (row) {
+        running++;
+        _mrCgInflight[row.key] = 1;
+        delete _mrCgFailed[row.key];
+        _mrFxLoadOne(row).then(function (why) {
+          running--; delete _mrCgInflight[row.key];
+          if (why) { _mrCgFailed[row.key] = why; }
+          repaint(); pump();
+        }, function () {
+          running--; delete _mrCgInflight[row.key];
+          _mrCgFailed[row.key] = 'load error';
+          repaint(); pump();
+        });
+      })(queue.shift());
+    }
+  }
+  pump();
+}
+
 function _mrSlHydrate(force) {
   if (typeof slFetchJson !== 'function' || typeof extSyncedLeaguesAll !== 'function') return;
   var rows = extSyncedLeaguesAll().filter(function (r) { return r && r.provider === 'sleeper' && r.myTeamIds; });
@@ -201208,6 +201420,21 @@ function _mrWeekMid(L, w) {
     return _mrYmd(smon);
   }
   // ESPN ── MGRWEEKLY2 ──
+  // MGRFXWK -- Fantrax counts back from the league's own current period,
+  // the same fallback Yahoo uses when its week calendar has not loaded.
+  // It needs no season window, which is the part of the ESPN path below
+  // that a Fantrax row cannot satisfy.
+  if (L.plat === 'fantrax') {
+    var frows = (typeof extSyncedLeaguesAll === 'function') ? extSyncedLeaguesAll() : [];
+    var fr = null;
+    for (i = 0; i < frows.length; i++) { if (frows[i].key === L.key) { fr = frows[i]; } }
+    if (!fr) { return null; }
+    var fcur = _mrFxCurrentPeriod(fr);
+    if (!fcur) { return null; }
+    var fd = _mrParseYmd(_skBankWeekStart(_mrYmd(today)));
+    fd.setDate(fd.getDate() - 7 * (fcur - w) + 3);
+    return _mrYmd(fd);
+  }
   // The first version counted back from TODAY's scoring period, which put
   // ESPN baseball in April (all its weeks crowded into a few buckets) and,
   // on a Monday, slid ESPN football a week later than Yahoo's. Now every
@@ -201297,6 +201524,50 @@ function _mrWeeklyCollect() {
   return list;
 }
 
+// MGRWKSCOPE -- which platforms have weeks in hand, and which of his
+// platforms do not.
+function _mrWkPlats(list) {
+  var seen = {}, out = [], i, j;
+  for (i = 0; i < (list || []).length; i++) {
+    for (j = 0; j < list[i].items.length; j++) {
+      var p = String(list[i].items[j].plat || '').toLowerCase();
+      if (p && !seen[p]) { seen[p] = 1; out.push(p); }
+    }
+  }
+  return out;
+}
+
+function _mrWkScopeLabel(list) {
+  var p = _mrWkPlats(list);
+  if (!p.length) { return 'H2H LEAGUES'; }
+  var names = { yahoo: 'YAHOO', espn: 'ESPN', sleeper: 'SLEEPER', fantrax: 'FANTRAX' };
+  var out = [], i;
+  for (i = 0; i < p.length; i++) { out.push(names[p[i]] || p[i].toUpperCase()); }
+  return out.join(' \u00b7 ');
+}
+
+// The platforms he HAS that have no completed week here. Named, because
+// a record by week that silently leaves a platform out is a record he
+// will compare against the season total and find short.
+function _mrWkMissingPlats(data, list) {
+  var have = {}, p = _mrWkPlats(list), i;
+  for (i = 0; i < p.length; i++) { have[p[i]] = 1; }
+  var out = [];
+  try {
+    var bp = (data && data.byPlat) || {};
+    var names = { yahoo: 'Yahoo', espn: 'ESPN', sleeper: 'Sleeper', fantrax: 'Fantrax' };
+    for (var k in bp) {
+      if (!bp.hasOwnProperty(k) || have[k]) { continue; }
+      var st = bp[k] || {};
+      // Only worth naming if he has a RESULT there to be missing.
+      if (((st.w || 0) + (st.l || 0) + (st.t || 0)) > 0) {
+        out.push(names[k] || k);
+      }
+    }
+  } catch (e) {}
+  return out;
+}
+
 function _mrWeeklyHtml(data) {
   var list = _mrWeeklyCollect();
   var g = data && data.grand;
@@ -201315,11 +201586,30 @@ function _mrWeeklyHtml(data) {
     '<div style="display:flex;align-items:baseline;margin:0 0 10px;">' +
       '<span style="font-family:var(--sk-font-display,serif);font-size:18px;color:#fff;">Record by week</span>' +
       '<span style="flex:1;"></span>' +
-      '<span style="font-size:9.5px;letter-spacing:0.12em;color:rgba(255,255,255,0.4);">ALL H2H LEAGUES</span></div>' +
+      // MGRWKSCOPE -- NAME THE PLATFORMS THIS ACTUALLY COVERS. It said
+      // "ALL H2H LEAGUES", and the weekly collector has branches for
+      // Yahoo, ESPN and Sleeper and none for Fantrax -- so a Fantrax
+      // week was missing from the detail while the same week's games
+      // were counted in the season record above. Derived from the rows
+      // in hand, so the label can never drift from what is here.
+      '<span style="font-size:9.5px;letter-spacing:0.12em;color:rgba(255,255,255,0.4);">' +
+        _mrWkScopeLabel(list) + '</span></div>' +
     '<div style="display:flex;font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.3);' +
       'padding:0 0 4px;border-bottom:1px solid rgba(255,255,255,0.08);">' +
       '<span style="flex:1;">WEEK</span><span style="flex:0 0 40px;text-align:right;">GMS</span>' +
       '<span style="flex:0 0 50px;text-align:right;">WIN%</span><span style="flex:0 0 70px;text-align:right;">RECORD</span></div>';
+  // MGRWKSCOPE -- and say so in words, because the LIVE row below counts
+  // EVERY platform while the completed weeks under it count only the
+  // ones named above. Those two lines sitting together with different
+  // scopes is exactly what made the panel look like it had lost games.
+  var _miss = _mrWkMissingPlats(data, list);
+  if (_miss.length) {
+    h += '<div style="font-size:10px;line-height:1.5;color:#f59e0b;margin:0 0 8px;">' +
+      'Completed weeks here do not include ' + _miss.join(' or ') +
+      ' \u2014 those results are in the season record above, but this app ' +
+      'does not bank their week-by-week history yet. The live row below ' +
+      'does count them.</div>';
+  }
   if (liveN) {
     h += '<div style="display:flex;align-items:center;padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.04);">' +
       '<span style="flex:1;font-size:11.5px;color:#fff;">This week <span style="' + mono + 'font-size:8.5px;' +
@@ -201704,7 +201994,7 @@ function _mrCloseGamesHtml(kind) {
       h += '<div style="font-size:10px;line-height:1.45;color:#f59e0b;">' + slEsc(d.failed[i].name) +
         ' couldn\u2019t load: ' + slEsc(d.failed[i].why) + '</div>';
     }
-    h += '<button onclick="mrCgHydrate(true);_mrSlHydrate(true)" style="margin-top:6px;padding:4px 11px;border-radius:999px;' +
+    h += '<button onclick="mrCgHydrate(true);_mrSlHydrate(true);_mrFxHydrate(true)" style="margin-top:6px;padding:4px 11px;border-radius:999px;' +
         'border:1px solid rgba(255,255,255,0.16);background:none;color:rgba(255,255,255,0.6);' +
         'font-size:9.5px;font-weight:700;letter-spacing:0.06em;">RETRY</button></div>';
   }
@@ -203826,6 +204116,7 @@ function openManagerRecord() {
     // failures are marked so the section offers RETRY instead of spinning.
     mrCgHydrate(false);
     _mrSlHydrate(false);   // SLEEPERWK
+    _mrFxHydrate(false);   // MGRFXWK
     if (typeof _mrPollTallies === 'function') _mrPollTallies(0);
   } catch (e2) {}
 }
