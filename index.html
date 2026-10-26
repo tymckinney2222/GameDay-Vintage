@@ -33750,6 +33750,22 @@
 
 <!-- SURVTEAM -- Team Edition. Same shell, same classes; a second
      stylesheet for a second survivor is how two panels drift apart. -->
+<!-- GAPWEEK -- last week across every league. Same shell as the
+     nightly games; a second stylesheet for a second sheet is how two
+     panels drift apart. -->
+<div class="pw-overlay" id="gwOverlay">
+  <div class="pp-header">
+    <div>
+      <div class="pp-eyebrow">Week in review</div>
+      <h2 class="pp-title">Play or schedule</h2>
+    </div>
+    <button class="pp-close" onclick="closeGameGap()" aria-label="Close">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+    </button>
+  </div>
+  <div class="pw-body" id="gwBody"></div>
+</div>
+
 <div class="pw-overlay" id="skStvOverlay">
   <div class="pp-header">
     <div>
@@ -204401,6 +204417,7 @@ function mrRenderBody() {
     try { h += _auctMgrHtml(); } catch (eAu) {}
     try { h += _svMgrHtml(); } catch (eSv) {}
     try { h += _stvMgrHtml(); } catch (eSt) {}
+    try { h += _gwMgrHtml(); } catch (eGw) {}
     return h;
   }
   var data = mrCollect();
@@ -206303,6 +206320,32 @@ function _svMgrHtml() {
   return h + '</div>';
 }
 
+// GAPWEEK -- the way into last week's review. A headline worth reading
+// on its own, and a button when he wants the whole list.
+function _gwMgrHtml() {
+  var c;
+  try { c = _gwCollect(); } catch (e) { return ''; }
+  if (!c || !c.rows.length) { return ''; }
+  var losses = c.outgamed + c.beaten;
+  var h = '<div class="pe-mgr">' +
+    '<div class="pe-mgr-head">LAST WEEK \u00b7 PLAY OR SCHEDULE' +
+      '<button class="pe-mgr-go" onclick="closeManagerRecord();openGameGap()">OPEN</button>' +
+    '</div>' +
+    '<div class="pe-mgr-top">' +
+      '<div><span>OUT-GAMED</span><b>' + c.outgamed + '</b></div>' +
+      '<div><span>BEATEN</span><b>' + c.beaten + '</b></div>' +
+      '<div><span>WON ON STARTS</span><b>' + c.lucky + '</b></div>' +
+    '</div>';
+  if (losses) {
+    h += '<div class="pe-mgr-note">' + c.outgamed + ' of ' + losses +
+      ' loss' + (losses === 1 ? '' : 'es') + ' last week came with the better ' +
+      'side per start \u2014 beaten on starts, not on play.' +
+      (c.nodata ? (' ' + c.nodata + ' league' + (c.nodata === 1 ? '' : 's') +
+        ' had no starts recorded.') : '') + '</div>';
+  }
+  return h + '</div>';
+}
+
 // SURVTEAM -- its block, in the same classes as Pick 'Em's and the
 // player edition's. No contests get their own line: they are neither
 // wins nor losses and hiding them makes the night count disagree with
@@ -206418,6 +206461,236 @@ function _peMgrHtml() {
     h += '<div class="pe-mgr-note">' + a.n + ' postponed or tied, left out of it.</div>';
   }
   return h + '</div>';
+}
+
+// \u2500\u2500 GAPWEEK \u00b7 last week, every league \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+//
+// The seven days before this week's Monday. Yahoo runs NHL and NBA weeks
+// Monday to Sunday, so last completed week IS last calendar week -- and
+// where a league disagrees, the starts lookup below finds nothing for
+// those dates and the row says it has no data rather than inventing a
+// split from the wrong seven days.
+function _gwLastWeekDates(today) {
+  var t = today || _todayDateString();
+  var mon = _weekDaysForDate(t)[0];
+  var d = new Date(mon + 'T12:00:00');
+  d.setDate(d.getDate() - 7);
+  var start = d.getFullYear() + '-' +
+    String(d.getMonth() + 1).padStart(2, '0') + '-' +
+    String(d.getDate()).padStart(2, '0');
+  return _weekDaysForDate(start);
+}
+
+// The opponent is banked as a NAME. Resolve it against the league's own
+// team list, and refuse rather than guess when it is not unambiguous --
+// a split computed against the wrong club is worse than no split.
+function _gwTeamKeyByName(leagueKey, name) {
+  var want = String(name || '').trim().toLowerCase();
+  if (!want) { return ''; }
+  var all = null;
+  try { all = (skLeagueData[leagueKey] || {}).allTeams || null; } catch (e) { return ''; }
+  if (!all) { return ''; }
+  var hits = [], k;
+  for (k in all) {
+    if (!all.hasOwnProperty(k)) { continue; }
+    if (String((all[k] || {}).name || '').trim().toLowerCase() === want) { hits.push(k); }
+  }
+  return (hits.length === 1) ? hits[0] : '';
+}
+
+function _gwMyKey(leagueKey) {
+  try {
+    var d = skLeagueData[leagueKey] || {};
+    return (d.matchup && d.matchup.myTeamKey) || '';
+  } catch (e) { return ''; }
+}
+
+// One league's last completed week, split if the starts are there.
+function _gwRow(L, dates) {
+  var games = L.games || [];
+  if (!games.length) { return null; }
+  var g = games[0], i;
+  for (i = 1; i < games.length; i++) { if (games[i].week > g.week) { g = games[i]; } }
+  var row = { league: L.name, team: L.team, key: L.key, week: g.week,
+              oppName: g.oppName, my: g.my, opp: g.opp, res: g.res,
+              margin: g.my - g.opp, split: null, why: '' };
+  var myKey = _gwMyKey(L.key);
+  if (!myKey) { row.why = 'team not loaded'; return row; }
+  var oppKey = _gwTeamKeyByName(L.key, g.oppName);
+  if (!oppKey) { row.why = 'opponent not matched'; return row; }
+  var gm = _vslGpFor(myKey, dates), go = _vslGpFor(oppKey, dates);
+  if (!(gm.gp > 0) || !(go.gp > 0)) { row.why = 'no starts recorded'; return row; }
+  // Both sides have to be counted over the SAME days, or the comparison
+  // is between two different weeks.
+  var use = [], d;
+  for (i = 0; i < dates.length; i++) {
+    d = dates[i];
+    if (_skGpReadTally(myKey, d) && _skGpReadTally(oppKey, d)) { use.push(d); }
+  }
+  if (!use.length) { row.why = 'no shared days'; return row; }
+  var um = _vslGpFor(myKey, use), uo = _vslGpFor(oppKey, use);
+  if (!(um.gp > 0) || !(uo.gp > 0)) { row.why = 'no starts recorded'; return row; }
+  var Rm = g.my / um.gp, Ro = g.opp / uo.gp;
+  row.split = {
+    days: use.length, gm: um.gp, go: uo.gp, rm: Rm, ro: Ro,
+    rate: (Rm - Ro) * ((um.gp + uo.gp) / 2),
+    vol: (um.gp - uo.gp) * ((Rm + Ro) / 2)
+  };
+  // THE SCORES ARE THE WEEK'S, THE STARTS MAY BE FEWER DAYS. Scaling one
+  // to the other would be inventing a number, so the row says how many
+  // days the starts cover and the reader can weigh it.
+  row.partial = (use.length < dates.length);
+  return row;
+}
+
+function _gwCollect() {
+  var dates = _gwLastWeekDates();
+  var out = { dates: dates, rows: [], outgamed: 0, beaten: 0, lucky: 0,
+              clean: 0, nodata: 0 };
+  var c = null;
+  try { c = _mrCgCollect('pts'); } catch (e) { return out; }
+  var ls = (c && c.leagues) || [], i;
+  for (i = 0; i < ls.length; i++) {
+    if (ls[i].plat !== 'yahoo') { continue; }   // GPTALLY is keyed by Yahoo team keys
+    var r = _gwRow(ls[i], dates);
+    if (!r) { continue; }
+    if (!r.split) { out.nodata++; }
+    else if (r.margin < 0 && r.split.rate > 0) { out.outgamed++; }
+    else if (r.margin < 0) { out.beaten++; }
+    else if (r.split.rate <= 0) { out.lucky++; }
+    else { out.clean++; }
+    out.rows.push(r);
+  }
+  // Worst grievance first: the losses he should have won.
+  out.rows.sort(function (a, b) {
+    function rank(x) {
+      if (!x.split) { return 4; }
+      if (x.margin < 0 && x.split.rate > 0) { return 0; }
+      if (x.margin < 0) { return 2; }
+      if (x.split.rate <= 0) { return 1; }
+      return 3;
+    }
+    var ra = rank(a), rb = rank(b);
+    if (ra !== rb) { return ra - rb; }
+    var va = a.split ? a.split.rate : 0, vb = b.split ? b.split.rate : 0;
+    return vb - va;
+  });
+  return out;
+}
+
+function _gwHtml(c) {
+  function sg(n) { return (n >= 0 ? '+' : '\u2212') + Math.abs(n).toFixed(1); }
+  var d = c.dates, span = _vslDayLabel(d[0]) + ' ' + d[0].slice(5) +
+    ' \u2013 ' + _vslDayLabel(d[6]) + ' ' + d[6].slice(5);
+  var h = '';
+
+  // THE HEADLINE IS THE ANSWER TO HIS QUESTION, counted.
+  var losses = c.outgamed + c.beaten;
+  h += '<div style="border:1px solid rgba(250,204,21,0.35);' +
+    'background:rgba(250,204,21,0.05);border-radius:12px;padding:12px 14px;' +
+    'margin:0 0 12px">' +
+    '<div style="font-size:9.5px;letter-spacing:0.14em;color:#facc15;' +
+    'font-weight:700">LAST WEEK \u00b7 ' + skEscape(span) + '</div>';
+  if (!c.rows.length) {
+    h += '<div style="font:17px Georgia,serif;margin-top:5px">No completed ' +
+      'weeks banked yet.</div></div>' +
+      '<div class="sk-wire-sheet-empty">This reads the weekly scores Manager ' +
+      'Record already keeps. Open Manager Record once and let it fill in.</div>';
+    return h;
+  }
+  if (losses) {
+    h += '<div style="display:flex;align-items:baseline;gap:9px;margin-top:5px">' +
+      '<span style="font:700 32px Georgia,serif;line-height:1;color:' +
+      (c.outgamed ? '#f59e0b' : 'inherit') + '">' + c.outgamed + '</span>' +
+      '<span style="font-size:12px;color:rgba(255,255,255,0.55)">of ' + losses +
+      ' loss' + (losses === 1 ? '' : 'es') + ' came with the better side ' +
+      'per start</span></div>';
+  } else {
+    h += '<div style="font:19px Georgia,serif;margin-top:5px">No losses to ' +
+      'explain last week.</div>';
+  }
+  h += '<div style="font-size:10.5px;color:rgba(255,255,255,0.4);margin-top:7px;' +
+    'line-height:1.5">' + c.beaten + ' plainly beaten \u00b7 ' + c.lucky +
+    ' won on starts \u00b7 ' + c.clean + ' won on play' +
+    (c.nodata ? (' \u00b7 ' + c.nodata + ' without starts data') : '') +
+    '</div></div>';
+
+  var i, r;
+  h += '<div class="rg-dark rg-bleed"><div class="rg-sect">Every league</div>';
+  for (i = 0; i < c.rows.length; i++) {
+    r = c.rows[i];
+    var tag, tcol;
+    if (!r.split) { tag = 'NO DATA'; tcol = 'rgba(255,255,255,0.3)'; }
+    else if (r.margin < 0 && r.split.rate > 0) { tag = 'OUT-GAMED'; tcol = '#f59e0b'; }
+    else if (r.margin < 0) { tag = 'OUT-PLAYED'; tcol = '#f87171'; }
+    else if (r.split.rate <= 0) { tag = 'WON ON STARTS'; tcol = '#facc15'; }
+    else { tag = 'WON ON PLAY'; tcol = '#4ade80'; }
+    h += '<div style="padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.045)">' +
+      '<div style="display:flex;align-items:baseline;gap:9px">' +
+        '<div style="flex:1;min-width:0">' +
+          '<div style="font-size:13.5px;font-weight:600;overflow:hidden;' +
+          'text-overflow:ellipsis;white-space:nowrap">' + skEscape(r.league) + '</div>' +
+          '<div style="font-family:var(--sk-font-mono,monospace);font-size:10px;' +
+          'color:rgba(255,255,255,0.4);margin-top:2px">Wk ' + r.week +
+            (r.oppName ? (' \u00b7 vs ' + skEscape(r.oppName)) : '') + '</div>' +
+        '</div>' +
+        '<div style="text-align:right;flex:0 0 auto">' +
+          '<div style="font-family:var(--sk-font-mono,monospace);font-size:13px;' +
+          'color:' + (r.margin >= 0 ? '#4ade80' : '#f87171') + '">' +
+          sg(r.margin) + '</div>' +
+          '<div style="font-size:8.5px;letter-spacing:0.08em;font-weight:700;' +
+          'color:' + tcol + ';margin-top:2px">' + tag + '</div>' +
+        '</div></div>';
+    if (r.split) {
+      h += '<div style="font-family:var(--sk-font-mono,monospace);' +
+        'font-size:10px;color:rgba(255,255,255,0.5);margin-top:7px">' +
+          r.split.rm.toFixed(2) + ' vs ' + r.split.ro.toFixed(2) +
+          ' per start \u00b7 ' + r.split.gm + ' vs ' + r.split.go +
+          ' starts</div>' +
+        '<div style="display:flex;gap:12px;margin-top:3px;' +
+        'font-family:var(--sk-font-mono,monospace);font-size:10.5px">' +
+        '<span style="color:' + (r.split.rate >= 0 ? '#4ade80' : '#f87171') + '">' +
+          sg(r.split.rate) + ' play</span>' +
+        '<span style="color:' + (r.split.vol >= 0 ? '#4ade80' : '#f87171') + '">' +
+          sg(r.split.vol) + ' starts</span></div>' +
+        (r.partial ? ('<div style="font-size:9.5px;color:rgba(255,255,255,0.3);' +
+          'margin-top:3px">Starts cover ' + r.split.days + ' of 7 days; the ' +
+          'scores are the whole week.</div>') : '');
+    } else {
+      h += '<div style="font-size:9.5px;color:rgba(255,255,255,0.3);margin-top:5px">' +
+        skEscape(r.why) + ' \u2014 open that league\u2019s matchup during a ' +
+        'week and the starts are kept from then on.</div>';
+    }
+    h += '</div>';
+  }
+  h += '<div class="rg-foot">A total is a rate times a volume, so each ' +
+    'margin splits exactly into what playing better was worth and what ' +
+    'playing more was worth; the two add up to the margin with no ' +
+    'remainder. <b>Starts are a lower bound</b>: Yahoo sends a line of ' +
+    'zeros for a rostered man whose club did not play, so anyone who ' +
+    'dressed and produced nothing at all is not counted. Weekly ' +
+    'head-to-head points leagues only \u2014 a categories matchup is not ' +
+    'decided by this margin.</div></div>';
+  return h;
+}
+
+function openGameGap() {
+  var ov = document.getElementById('gwOverlay');
+  if (!ov) { return; }
+  ov.classList.add('open');
+  var body = document.getElementById('gwBody');
+  if (body) {
+    try { body.innerHTML = _gwHtml(_gwCollect()); }
+    catch (e) {
+      body.innerHTML = '<div class="sk-wire-sheet-empty">Could not read last week: ' +
+        skEscape(String((e && e.message) || e)) + '</div>';
+    }
+  }
+}
+
+function closeGameGap() {
+  var ov = document.getElementById('gwOverlay');
+  if (ov) { ov.classList.remove('open'); }
 }
 
 function openManagerRecord() {
