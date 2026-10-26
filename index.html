@@ -206498,6 +206498,26 @@ function _gwTeamKeyByName(leagueKey, name) {
   return (hits.length === 1) ? hits[0] : '';
 }
 
+// GAPDAYS -- WAS THIS DATE FETCHED AT ALL? GPTALLY is written for every
+// team the app reads, so one club's tally proves the day was seen. Then
+// a club without one genuinely had no starts, which is a nought rather
+// than a gap -- and that distinction is the whole difference between a
+// week that can be accounted for and one that cannot.
+function _gwDayFetched(leagueKey, dates) {
+  var all = null;
+  try { all = (skLeagueData[leagueKey] || {}).allTeams || null; } catch (e) { all = null; }
+  var keys = [], k;
+  for (k in (all || {})) { if (all.hasOwnProperty(k)) { keys.push(k); } }
+  var out = {}, i, t;
+  for (i = 0; i < dates.length; i++) {
+    out[dates[i]] = false;
+    for (t = 0; t < keys.length; t++) {
+      if (_skGpReadTally(keys[t], dates[i])) { out[dates[i]] = true; break; }
+    }
+  }
+  return out;
+}
+
 // GAPFIX -- which leagues this cannot speak for.
 function _gwIsFootball(leagueKey) {
   var sp = '';
@@ -206547,53 +206567,67 @@ function _gwRow(L, dates) {
   if (!myKey) { row.why = 'team not loaded'; return row; }
   var oppKey = _gwTeamKeyByName(L.key, g.oppName);
   if (!oppKey) { row.why = 'opponent not matched'; return row; }
-  // GAPFIX -- BOTH HALVES FROM THE SAME DAYS. A day counts only when
-  // both sides have a starts tally AND a points total for it, because a
-  // week's points over one day's starts is a rate seven times too big
-  // and every number downstream of it is furniture.
-  var use = [], d, Fm = 0, Fo = 0, a, b;
+  // GAPDAYS -- ACCOUNT FOR THE WHOLE WEEK FIRST. With the day-fetched
+  // test, a club with no tally on a day the league was read simply had
+  // no starts, so every day resolves and the BANKED week total is the
+  // right numerator -- same seven days on both sides of the division.
+  var fetched = _gwDayFetched(L.key, dates);
+  var blind = [], d, gm = 0, go = 0, tm, to;
   for (i = 0; i < dates.length; i++) {
     d = dates[i];
-    if (!_skGpReadTally(myKey, d) || !_skGpReadTally(oppKey, d)) { continue; }
+    if (!fetched[d]) { blind.push(d); continue; }
+    tm = _vslGpFor(myKey, [d]); to = _vslGpFor(oppKey, [d]);
+    gm += tm.gp; go += to.gp;
+  }
+  if (!blind.length) {
+    if (!(gm > 0) || !(go > 0)) { row.why = 'no starts recorded'; return row; }
+    var RmW = g.my / gm, RoW = g.opp / go;
+    row.split = {
+      days: dates.length, whole: true, gm: gm, go: go, rm: RmW, ro: RoW,
+      fm: g.my, fo: g.opp,
+      rate: (RmW - RoW) * ((gm + go) / 2),
+      vol: (gm - go) * ((RmW + RoW) / 2)
+    };
+    return row;
+  }
+
+  // A DAY NOBODY WAS READ ON CANNOT BE ACCOUNTED FOR, so the week is out
+  // of reach. The narrower question still has an answer though: over the
+  // days that carry BOTH points and starts, who was better and who
+  // played more? The points come from those same days, never from the
+  // week, because a week's points over part of a week's starts is the
+  // rate that was wrong on his screen.
+  var use = [], Fm = 0, Fo = 0, a, b;
+  for (i = 0; i < dates.length; i++) {
+    d = dates[i];
+    if (!fetched[d]) { continue; }
     a = _fptGet(myKey, d); b = _fptGet(oppKey, d);
     if (a === undefined || b === undefined) { continue; }
     use.push(d); Fm += a; Fo += b;
   }
-  if (!use.length) { row.why = 'no starts recorded'; return row; }
+  function gap() {
+    return (blind.length >= dates.length)
+      ? 'no starts recorded'
+      : ('no starts for ' + blind.length + ' of ' + dates.length + ' days');
+  }
+  if (!use.length) { row.why = gap(); return row; }
   var um = _vslGpFor(myKey, use), uo = _vslGpFor(oppKey, use);
-  if (!(um.gp > 0) || !(uo.gp > 0)) { row.why = 'no starts recorded'; return row; }
-
-  // AND RECONCILED AGAINST THE WEEK YAHOO BANKED. If the days we hold do
-  // not add up to the week, the split would describe some other stretch
-  // of time while sitting beside the week's result. Tolerance is a
-  // percent, because a daily total is stored to one decimal.
-  function off(sum, total) {
-    var t = Math.abs(Number(total) || 0);
-    return Math.abs(sum - (Number(total) || 0)) > Math.max(1, t * 0.01);
-  }
-  if (use.length < dates.length && (off(Fm, g.my) || off(Fo, g.opp))) {
-    row.why = 'starts cover ' + use.length + ' of ' + dates.length + ' days';
-    return row;
-  }
-
+  if (!(um.gp > 0) || !(uo.gp > 0)) { row.why = gap(); return row; }
   var Rm = Fm / um.gp, Ro = Fo / uo.gp;
   row.split = {
-    days: use.length, gm: um.gp, go: uo.gp, rm: Rm, ro: Ro,
+    days: use.length, whole: false, gm: um.gp, go: uo.gp, rm: Rm, ro: Ro,
     fm: Fm, fo: Fo,
     rate: (Rm - Ro) * ((um.gp + uo.gp) / 2),
     vol: (um.gp - uo.gp) * ((Rm + Ro) / 2)
   };
-  // Days with no fixtures leave no tally, so a complete week can legally
-  // hold fewer than seven. The reconcile above is what says it is whole;
-  // this only reports the shape.
-  row.restDays = (dates.length - use.length);
+  row.partialOf = dates.length;
   return row;
 }
 
 function _gwCollect() {
   var dates = _gwLastWeekDates();
   var out = { dates: dates, rows: [], outgamed: 0, beaten: 0, lucky: 0,
-              clean: 0, nodata: 0, football: 0, done: 0 };
+              clean: 0, nodata: 0, partial: 0, football: 0, done: 0 };
   var c = null;
   try { c = _mrCgCollect('pts'); } catch (e) { return out; }
   var ls = (c && c.leagues) || [], i;
@@ -206610,7 +206644,11 @@ function _gwCollect() {
     if (_gwIsDone(ls[i].key)) { out.done++; continue; }
     var r = _gwRow(ls[i], dates);
     if (!r) { continue; }
+    // GAPDAYS -- only a whole week earns a whole-week verdict. A split
+    // over five of seven days is a real answer to a narrower question,
+    // and labelling it "OUT-GAMED" would attach it to the wrong one.
     if (!r.split) { out.nodata++; }
+    else if (!r.split.whole) { out.partial++; }
     else if (r.margin < 0 && r.split.rate > 0) { out.outgamed++; }
     else if (r.margin < 0) { out.beaten++; }
     else if (r.split.rate <= 0) { out.lucky++; }
@@ -206620,7 +206658,8 @@ function _gwCollect() {
   // Worst grievance first: the losses he should have won.
   out.rows.sort(function (a, b) {
     function rank(x) {
-      if (!x.split) { return 4; }
+      if (!x.split) { return 5; }
+      if (!x.split.whole) { return 4; }
       if (x.margin < 0 && x.split.rate > 0) { return 0; }
       if (x.margin < 0) { return 2; }
       if (x.split.rate <= 0) { return 1; }
@@ -206668,6 +206707,7 @@ function _gwHtml(c) {
   h += '<div style="font-size:10.5px;color:rgba(255,255,255,0.4);margin-top:7px;' +
     'line-height:1.5">' + c.beaten + ' plainly beaten \u00b7 ' + c.lucky +
     ' won on starts \u00b7 ' + c.clean + ' won on play' +
+    (c.partial ? (' \u00b7 ' + c.partial + ' part-week only') : '') +
     (c.nodata ? (' \u00b7 ' + c.nodata + ' without starts data') : '') +
     ((c.football || c.done)
       ? ('<br>' +
@@ -206685,7 +206725,10 @@ function _gwHtml(c) {
     r = c.rows[i];
     var tag, tcol;
     if (!r.split) { tag = 'NO DATA'; tcol = 'rgba(255,255,255,0.3)'; }
-    else if (r.margin < 0 && r.split.rate > 0) { tag = 'OUT-GAMED'; tcol = '#f59e0b'; }
+    else if (!r.split.whole) {
+      tag = r.split.days + ' OF ' + r.partialOf + ' DAYS';
+      tcol = 'rgba(255,255,255,0.45)';
+    } else if (r.margin < 0 && r.split.rate > 0) { tag = 'OUT-GAMED'; tcol = '#f59e0b'; }
     else if (r.margin < 0) { tag = 'OUT-PLAYED'; tcol = '#f87171'; }
     else if (r.split.rate <= 0) { tag = 'WON ON STARTS'; tcol = '#facc15'; }
     else { tag = 'WON ON PLAY'; tcol = '#4ade80'; }
@@ -206717,9 +206760,12 @@ function _gwHtml(c) {
           sg(r.split.rate) + ' play</span>' +
         '<span style="color:' + (r.split.vol >= 0 ? '#4ade80' : '#f87171') + '">' +
           sg(r.split.vol) + ' starts</span></div>' +
-        (r.restDays ? ('<div style="font-size:9.5px;color:rgba(255,255,255,0.3);' +
-          'margin-top:3px">' + r.split.days + ' days with fixtures; the ' +
-          'other ' + r.restDays + ' were blank for both sides.</div>') : '');
+        (r.split.whole ? '' :
+          ('<div style="font-size:9.5px;color:rgba(255,255,255,0.3);' +
+           'margin-top:3px">Over those ' + r.split.days + ' days you were ' +
+           sg(r.split.fm - r.split.fo) + '. The other ' +
+           (r.partialOf - r.split.days) + ' were never read, so the ' +
+           'week itself cannot be split.</div>'));
     } else {
       h += '<div style="font-size:9.5px;color:rgba(255,255,255,0.3);margin-top:5px">' +
         skEscape(r.why) + ' \u2014 open that league\u2019s matchup during a ' +
