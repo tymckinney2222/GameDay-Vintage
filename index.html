@@ -192244,6 +192244,10 @@ function _svHousePick(pool, st, mineKey) {
 function _svPick(key) {
   var st = _svStore(), date = _svToday();
   if (st.nights[date] && st.nights[date].locked) { return; }
+  // SURVWAIT -- belt and braces. The board is not drawn while last
+  // night is being scored, but a stale button on screen is still a
+  // button, and this one would bank a pick at the wrong rung.
+  if (_svState.busy && _svPending()) { return; }
   var pool = _svState.pool;
   if (!pool) { return; }
   var row = null, i;
@@ -192439,6 +192443,7 @@ function _svRefresh(force) {
   dates.sort();
   if (!dates.length) { return; }
   _svState.busy = true;
+  var streakWas = st.streak || 0;
   _svRender();
   var jobs = [], i;
   for (i = 0; i < dates.length; i++) {
@@ -192457,16 +192462,31 @@ function _svRefresh(force) {
       }));
     })(dates[i]);
   }
-  Promise.all(jobs).then(function () {
+  function done() {
     _svState.busy = false;
+    // SURVWAIT -- the streak may have moved a rung just now, and every
+    // bar on a board built before that is one rung out. Drop it and
+    // build again against the number we now know.
+    if (_svState.pool && st.streak !== streakWas) { _svState.pool = null; }
     _svRender();
-  }, function () {
-    _svState.busy = false;
-    _svRender();
-  });
+    _svEnsurePool();
+  }
+  Promise.all(jobs).then(done, done);
 }
 
 // ── the record ─────────────────────────────────
+// SURVWAIT -- a night before today that is locked and not yet scored.
+// While one exists the streak is an unknown number, and every rung,
+// category and price downstream of it is a guess.
+function _svPending() {
+  var st = _svStore(), today = _svToday(), k;
+  for (k in st.nights) {
+    if (!st.nights.hasOwnProperty(k)) { continue; }
+    if (k < today && st.nights[k].locked && !st.nights[k].settled) { return k; }
+  }
+  return '';
+}
+
 function _svRecord() {
   var st = _svStore(), w = 0, l = 0, k;
   for (k in st.nights) {
@@ -192673,6 +192693,15 @@ function _svRender() {
     host.innerHTML = h;
     return;
   }
+  // SURVWAIT -- last night is still being scored, so tonight's rung is
+  // not known yet. Drawing a board now would price every man one rung
+  // too easy and number the night wrong.
+  if (_svState.busy && _svPending()) {
+    h += '<div class="sk-wire-sheet-empty">Scoring last night first\u2026 ' +
+      'tonight\u2019s bar depends on how it went.</div>';
+    host.innerHTML = h;
+    return;
+  }
   // SURVCAT -- the bar card cannot be drawn before the pool, because
   // the pool is what decides the category.
   if (_svState.note) {
@@ -192848,8 +192877,18 @@ function openSurvivor() {
   _svState.note = '';
   _svRender();
   _svRefresh(false);
+  _svEnsurePool();
+}
+
+// SURVWAIT -- built only once the streak is settled, because the rung
+// and therefore every price on the board comes from it. _svRefresh
+// calls this again the moment scoring finishes.
+function _svEnsurePool() {
+  var ov = document.getElementById('skSurvOverlay');
+  if (!ov || ov.className.indexOf('open') === -1) { return; }
   var N = _svNight();
   if (N && N.locked) { return; }
+  if (_svState.busy && _svPending()) { return; }
   // The pool needs both sports' projection pools.
   if (typeof dbpGetPool !== 'function') {
     _svState.note = 'The player pool is not available in this build.';
