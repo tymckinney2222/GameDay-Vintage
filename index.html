@@ -134425,7 +134425,11 @@ function skOpenWireDetail(leagueKey) {
         try { bodyHtml += skBuildWireSeasonSpread(entry) || ''; } catch (eSS) {}
       }
     } else {
-      bodyHtml = '<div class="sk-wire-sheet-empty">Detail view not supported for this scoring type yet.</div>';
+      // ESPMON -- the reason was recorded all along and never read, so a
+      // league with nothing to report for yesterday accused itself of
+      // being an unsupported format. Say which nothing it is.
+      bodyHtml = '<div class="sk-wire-sheet-empty">' +
+        skEscape(_skWireReasonText(entry)) + '</div>';
     }
     // WIREMOD - the day bank in full, from a store that was already written.
     if (!entry.error) {
@@ -134537,6 +134541,28 @@ function _skWirePLLoad(entry) {
     // best-on-best was waiting for.
     try { _skWireOppGapPaint(); } catch (eOG) {}
   });
+}
+
+// ESPMON -- a recorded reason in plain words. Unknown reasons are shown
+// as they are rather than flattened into one sentence: a reason nobody
+// wrote a line for is still better evidence than a guess about formats.
+var _SK_WIRE_REASONS = {
+  'no scoring period': 'ESPN has no scoring period for that day yet.',
+  'previous matchup week': 'That day belongs to the previous matchup week, ' +
+    'and this league has not published it against that opponent.',
+  'no daily matchup': 'No matchup covering that day.',
+  'no roster for that day': 'ESPN returned no roster for that day.',
+  'roto \u2014 no daily matchup': 'A roto league has no daily matchup \u2014 ' +
+    'there is a standing, but no opponent for a day.',
+  'season points \u2014 no daily matchup': 'A season-points league has no ' +
+    'opponent \u2014 only a running total.'
+};
+
+function _skWireReasonText(entry) {
+  var r = entry && entry.reason;
+  if (r && _SK_WIRE_REASONS[r]) { return _SK_WIRE_REASONS[r]; }
+  if (r) { return 'Nothing to show for that day: ' + r + '.'; }
+  return 'Nothing recorded for that day.';
 }
 
 function skWirePLSide(side) {
@@ -220922,25 +220948,39 @@ function _espWireMatchup(row, period) {
   var sch = (j && j.schedule) || [];
   var mp = (j && j.status && j.status.currentMatchupPeriod);
   if (!sch.length || mp == null) { return null; }
+  // WEEKEDGE2 -- EVERY MONDAY, yesterday belongs to the week just gone.
+  // currentMatchupPeriod has already rolled over, so looking only at it
+  // found a matchup whose points map does not contain Sunday, and the
+  // guard below then sat the league out of its own result. The day is
+  // not orphaned: it has an opponent, and it is last week's. So the
+  // schedule is read for the matchup that CLAIMS this scoring period,
+  // and the current one is kept as the fallback it always was.
   var myIds = row.myTeamIds || {}, i;
+  var current = null, owner = null;
   for (i = 0; i < sch.length; i++) {
     var m = sch[i] || {};
-    if (Number(m.matchupPeriodId) !== Number(mp)) { continue; }
     var a = m.away || {}, h = m.home || {};
     var meAway = !!(a.teamId != null && myIds[String(a.teamId)]);
     var meHome = !!(h.teamId != null && myIds[String(h.teamId)]);
     if (!meAway && !meHome) { continue; }
     var mine = meAway ? a : h, opp = meAway ? h : a;
-    if (mine.teamId == null || opp.teamId == null) { return null; }   // bye
+    var isCur = (Number(m.matchupPeriodId) === Number(mp));
+    if (mine.teamId == null || opp.teamId == null) {   // bye
+      if (isCur) { current = null; }
+      continue;
+    }
     var pb = mine.pointsByScoringPeriod || opp.pointsByScoringPeriod || null;
     var inWeek = null;
     if (pb && typeof pb === 'object') {
       inWeek = Object.prototype.hasOwnProperty.call(pb, String(period));
     }
-    return { mineId: String(mine.teamId), oppId: String(opp.teamId),
-             matchupPeriod: Number(mp), inWeek: inWeek };
+    var rec = { mineId: String(mine.teamId), oppId: String(opp.teamId),
+                matchupPeriod: Number(m.matchupPeriodId), inWeek: inWeek };
+    if (isCur && !current) { current = rec; }
+    // The first matchup of mine whose own points map holds this day.
+    if (inWeek === true && !owner) { owner = rec; }
   }
-  return null;
+  return owner || current;
 }
 
 // A side's men for the day, in the shape the Wire's cards already read.
