@@ -191503,7 +191503,45 @@ function _auctAgo(ts) {
 // AUCTSCORE -- WHAT THIS BOARD IS SCORING, in the league's own
 // abbreviations with its own weights, so it can be set against the
 // league's settings page without taking my word for anything.
-function _auctScoringAuditHtml() {
+// AUCTGS -- WHICH SCORED CATEGORIES NEVER REACH A LINE. The audit has
+// always checked box labels with no mapping; this is the other
+// direction, and it is the one that hid games started for a month: a
+// category Yahoo scores, this app maps, the card prints -- and no box
+// score ever produces, so every man is credited nought for it in
+// silence.
+//
+// The test is whether the KEY EXISTS on a line, not whether it is
+// non-zero. A column of noughts is a category being read; a missing key
+// is one that is not.
+function _auctScoredButUnread(sc, box) {
+  if (!sc || !box || !box.byId) { return []; }
+  var seen = { skater: {}, goalie: {} }, any = { skater: 0, goalie: 0 };
+  var k, ln, role, kk;
+  for (k in box.byId) {
+    if (!box.byId.hasOwnProperty(k)) { continue; }
+    ln = box.byId[k];
+    role = ln._g ? 'goalie' : 'skater';
+    any[role]++;
+    for (kk in ln) {
+      if (ln.hasOwnProperty(kk) && kk.charAt(0) !== '_' && ln[kk] != null) {
+        seen[role][kk] = 1;
+      }
+    }
+  }
+  var out = [], roles = ['skater', 'goalie'], ri;
+  for (ri = 0; ri < roles.length; ri++) {
+    role = roles[ri];
+    if (!any[role]) { continue; }          // nobody of that kind played
+    var map = sc[role] || {};
+    for (kk in map) {
+      if (!map.hasOwnProperty(kk)) { continue; }
+      if (!seen[role][kk] && out.indexOf(kk) === -1) { out.push(kk); }
+    }
+  }
+  return out;
+}
+
+function _auctScoringAuditHtml(live) {
   var sc, lgName = '';
   try { sc = _auctScoring(_auctState.leagueKey); } catch (e) { return ''; }
   if (!sc) { return ''; }
@@ -191530,6 +191568,16 @@ function _auctScoringAuditHtml() {
       ((sc.missed.length === 1) ? 'it' : 'them') + '. Tell me and it is a ' +
       'one-line fix.</div>';
   }
+  var unread = [];
+  try { unread = _auctScoredButUnread(sc, live); } catch (eU) { unread = []; }
+  if (unread.length) {
+    h += '<div class="rg-foot" style="color:#f59e0b">Mapped and scored, ' +
+      'but no box score tonight carries ' +
+      ((unread.length === 1) ? 'a column for ' : 'columns for ') +
+      skEscape(unread.join(' ').toUpperCase()) +
+      ' \u2014 so ' + ((unread.length === 1) ? 'it is' : 'they are') +
+      ' scoring nought for everyone. Tell me and it is a one-line fix.</div>';
+  }
   return h;
 }
 
@@ -191537,11 +191585,12 @@ function _auctLiveDiagHtml(live) {
   var un = [], k, seen = 0;
   for (k in live.labels) { if (live.labels.hasOwnProperty(k)) { seen++; } }
   for (k in live.unmapped) { if (live.unmapped.hasOwnProperty(k)) { un.push(k); } }
-  var h = _auctScoringAuditHtml() +
+  var h = _auctScoringAuditHtml(live) +
     '<div class="rg-foot">Scored off ESPN box scores \u00b7 ' +
     seen + ' labels read' +
     ((_auctSport() === 'nba') ? '' :
-      ' \u00b7 goalie wins are derived from the result, not a box score column') +
+      ' \u00b7 goalie wins and starts are derived from the result and ' +
+      'ice time, not box score columns') +
     '.</div>';
   // AUCTMERGE -- EVERY LABEL, NAMED. "30 labels read" could not tell him
   // which thirty, and the one night that mattered came down to guessing
@@ -192352,6 +192401,7 @@ function _svFetchBox(sport, gids) {
     // column carries it. The auction fetcher has always done this;
     // Survivor only needed it once "the win" became a category.
     _auctDeriveWins(box);
+    _auctDeriveStarts(box);
     box.games = n; box.final = fin;
     box.allFinal = (n === gids.length) && (fin === n) && n > 0;
     return box;
@@ -195059,6 +195109,10 @@ function _auctParseBox(j, out, sportArg) {
       for (a = 0; a < ath.length; a++) {
         var row = ath[a] || {}, st = row.stats || [];
         var line = { _g: isG, _nba: _nba, _team: tAb,
+                     // AUCTGS -- ESPN flags a starter on some payloads
+                     // and not others. Kept where it exists so the
+                     // derivation below only has to guess when it must.
+                     _st: !!(row.starter || row.started),
                      _won: (done && tAb && tAb === winAbbr) };
         for (L = 0; L < labs.length && L < st.length; L++) {
           var k = map[String(labs[L]).toUpperCase()];
@@ -195185,6 +195239,37 @@ function _auctDeriveWins(box) {
   }
 }
 
+// AUCTGS -- A START IS DERIVED, like a win: no box score column
+// carries it. The keeper with the most ice time on a side started it.
+// Where ESPN flagged a starter outright that is used instead, because a
+// guess should never override a fact -- and a club that pulls its
+// starter in the first period is exactly the night the ice-time rule
+// gets backwards.
+//
+// Every goalie who appears is given a figure, nought included. A
+// missing key reads as "no such category" to _auctLineFp and that is
+// how this went unnoticed; an explicit nought reads as "did not start".
+function _auctDeriveStarts(box) {
+  var best = {}, flagged = {}, k, ln, t;
+  for (k in box.byId) {
+    if (!box.byId.hasOwnProperty(k)) { continue; }
+    ln = box.byId[k];
+    if (!ln._g) { continue; }
+    t = ln._team || '?';
+    if (ln._st) { flagged[t] = ln; }
+    if (!best[t] || (ln.toi || 0) > (best[t].toi || 0)) { best[t] = ln; }
+  }
+  for (k in box.byId) {
+    if (!box.byId.hasOwnProperty(k)) { continue; }
+    ln = box.byId[k];
+    if (!ln._g || ln.gs != null) { continue; }
+    t = ln._team || '?';
+    var starter = flagged[t] || best[t] || null;
+    ln.gs = (starter === ln) ? 1 : 0;
+    ln._gsDerived = !flagged[t];
+  }
+}
+
 function _auctLineFp(line, scoring, isGoalie) {
   if (!line) { return null; }
   var map = isGoalie ? scoring.goalie : scoring.skater, k, tot = 0, any = false;
@@ -195242,6 +195327,7 @@ function _auctLiveFetch(force, gids) {
       } catch (eC) {}
     }
     _auctDeriveWins(box);
+    _auctDeriveStarts(box);
     box.games = n;
     box.final = fin;
     // Every game asked for has to be read AND final, or a night is not
