@@ -203373,14 +203373,86 @@ function _mrSlNeeded(row) {
   // SLMEDIAN -- in a league-average league every team also plays the
   // league median, so a week decides TWO of my results. Dividing by
   // that is what keeps 2-0-0 after one week from asking for week 2.
-  var _slPer = _mrSlPerWeek(row);
-  var _slDec = _mrSlDecided(row);
-  var _slWks = _slDec ? Math.ceil(_slDec / _slPer) : 0;
-  var _slFloor = first + _slWks - 1;
+  var _slFloor = first + _mrSlWeeksPlayed(row) - 1;
   if (_slFloor > last) { last = _slFloor; }
   var out = [];
   for (var w = first; w <= last; w++) out.push(w);
   return out;
+}
+
+// SLSNAP -- Sleeper's season points-for, snapshotted per completed
+// week, because matchups[].points is not the league's score.
+//
+// Short Rim week 1: the league says 207.00-132.00, the endpoint says
+// 152.5-136.5. In a lock-in league the API publishes the sum of each
+// player's latest game rather than the locked one, and the error runs
+// in both directions -- mine low by 54.5, the opponent's high by 4.5 --
+// so it cannot be corrected, only replaced.
+//
+// rosters[].settings.fpts IS the league's own number: it is what the
+// standings are built from, and the standings are the part he has
+// confirmed is right. A week's score is the difference between the
+// season total at the end of that week and at the end of the week
+// before, and that payload is already fetched on every standings load,
+// so this costs no requests at all.
+var SK_SLSNAP_PREFIX = 'slsnap_v1_';
+var _slSnapMem = {};
+function _slSnapStore(key) {
+  if (_slSnapMem[key]) { return _slSnapMem[key]; }
+  var o = null;
+  try { o = JSON.parse(localStorage.getItem(SK_SLSNAP_PREFIX + key) || 'null'); } catch (e) {}
+  if (!o || typeof o.w !== 'object' || !o.w) { o = { w: {} }; }
+  _slSnapMem[key] = o;
+  return o;
+}
+function _slSnapSave(key) {
+  try { localStorage.setItem(SK_SLSNAP_PREFIX + key, JSON.stringify(_slSnapStore(key))); } catch (e) {}
+}
+
+// Completed weeks. A league-average league decides two results a week,
+// which is why this is not simply w+l+t.
+function _mrSlWeeksPlayed(row) {
+  var d = _mrSlDecided(row);
+  return d ? Math.ceil(d / _mrSlPerWeek(row)) : 0;
+}
+
+// Take a reading. Called wherever the standings are assembled, so it
+// runs for every league on every sync without asking for anything.
+function _slSnapTake(row, rosters) {
+  if (!row || !row.key || !rosters || !rosters.length) { return; }
+  var st = _slSnapStore(row.key);
+  // SLSNAP -- every Sleeper week already in the weekly store came from
+  // matchups[].points and is therefore wrong. Cleared once per league,
+  // the first time this build reads it.
+  if (st.v !== 2) {
+    st.v = 2;
+    try { _mrCgStore(row.key).w = {}; _mrCgSave(row.key); } catch (eW) {}
+  }
+  var n = _mrSlWeeksPlayed(row);
+  if (!n) { _slSnapSave(row.key); return; }
+  var pf = {}, i, any = false;
+  for (i = 0; i < rosters.length; i++) {
+    var ro = rosters[i] || {}, se = ro.settings || {};
+    if (ro.roster_id == null || se.fpts == null) { continue; }
+    pf[String(ro.roster_id)] = (Number(se.fpts) || 0) +
+      ((se.fpts_decimal != null) ? ((Number(se.fpts_decimal) || 0) / 100) : 0);
+    any = true;
+  }
+  if (any) { st.w[String(n)] = pf; }
+  _slSnapSave(row.key);
+}
+
+// One roster's points in one week. Week 1 needs no earlier reading,
+// which is why the first week of a season always resolves. A missing
+// snapshot returns null rather than a sum spanning two weeks.
+function _slSnapWeekPts(key, wk, teamId) {
+  var st = _slSnapStore(key), id = String(teamId);
+  var now = st.w[String(wk)];
+  if (!now || now[id] == null) { return null; }
+  if (Number(wk) <= 1) { return Math.round(now[id] * 100) / 100; }
+  var prev = st.w[String(Number(wk) - 1)];
+  if (!prev || prev[id] == null) { return null; }
+  return Math.round((now[id] - prev[id]) * 100) / 100;
 }
 
 // SLMEDIAN -- results my record gains in a single week. Sleeper's
@@ -203452,7 +203524,18 @@ function _mrSlLoadOne(row) {
       var pair = byMu[me.matchup_id] || [], opp = null;
       for (j = 0; j < pair.length; j++) if (pair[j] !== me) opp = pair[j];
       if (!opp) { st.w[String(wk)] = 0; return; }
-      var a = Number(me.points) || 0, b = Number(opp.points) || 0;
+      // SLSNAP -- NOT me.points. That is the sum of each player's latest
+      // game in a lock-in league, not the game the league counted, and
+      // Short Rim week 1 reads 152.5-136.5 against a league that says
+      // 207.00-132.00. The matchup is still read from here, because
+      // this is the only place that says WHO I played; the score comes
+      // out of Sleeper's own season totals.
+      var a = _slSnapWeekPts(key, wk, me.roster_id);
+      var b = _slSnapWeekPts(key, wk, opp.roster_id);
+      // Bank nothing rather than something wrong: with a snapshot
+      // missing the subtraction would quietly span two weeks. An absent
+      // week is retried on the next open; a wrong one is permanent.
+      if (a == null || b == null) { return; }
       _mrCgPut(key, { week: wk, myPts: a, oppPts: b, result: a > b ? 'W' : a < b ? 'L' : 'T',
                       oppName: names[String(opp.roster_id)] || ('Team ' + opp.roster_id) });
     }, function () { errs++; });
@@ -203768,6 +203851,13 @@ function skProbeSleeperWeeks() {
     // stores one; an array of nulls or of zeroes counted the same as a
     // real score. That label is what hid the actual drop. Print the row
     // and run it through the collector's own three filters.
+    var _sn = _slSnapStore(row.key), _snk = [], _sk2;
+    for (_sk2 in _sn.w) { if (_sn.w.hasOwnProperty(_sk2)) { _snk.push(_sk2); } }
+    _snk.sort(function (x, y) { return Number(x) - Number(y); });
+    say('   season-total readings: ' + (_snk.length ? ('week ' + _snk.join(', ')) : 'NONE'));
+    var _myPf = _slSnapWeekPts(row.key, _snk.length ? Number(_snk[_snk.length - 1]) : 1,
+                               (row.myTeamIds ? Object.keys(row.myTeamIds)[0] : '0'));
+    say('   my points in the latest of those: ' + (_myPf == null ? 'n/a' : _myPf));
     say('   banked: ' + scored + ' row(s), ' + blank + ' known-empty (bye)');
     var sLast = need.length ? need[need.length - 1] : 0;
     var wks = [];
@@ -229055,6 +229145,10 @@ function slEnrichLeagues() {
             break;
           }
         }
+        // SLSNAP -- read the season points-for here, where it already
+        // is. After row.standings, because the week it belongs to is
+        // counted off that record.
+        try { _slSnapTake(row, rosters); } catch (eSS) {}
         // Roster structures for the detail view (player IDs resolve to
         // names lazily via the /players dictionary on Roster-tab open).
         // Slot spec: roster_positions lists every slot in order, with BN
