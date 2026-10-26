@@ -52294,7 +52294,12 @@ var FP_LS_MAX = 140;
 // detail (Week Contributors, lineup views) — but only for teams whose
 // detail is ever actually shown.
 var FPT_LS_PREFIX = 'fpt_v1_';
-var FPT_LS_MAX = 400;         // backstop only — the date purge below is the real limit
+// VSLBATCH -- 400 was five league-weeks. He has thirty-nine leagues, so
+// the backstop had quietly become the binding limit and _fptTrim was
+// evicting one league's settled days to make room for the next one he
+// opened. 4000 is about forty-four league-weeks at roughly 350 KB, and
+// FPT_KEEP_DAYS below goes back to being what actually bounds this.
+var FPT_LS_MAX = 4000;        // backstop only — the date purge below is the real limit
 var _fptMem = {};
 
 // Pipe separator on purpose: every dated cache in the app uses
@@ -143192,9 +143197,14 @@ function skRenderVsLeague() {
 
   // Kick fetches for anything not cached. fetchTeamFpForDate caches in
   // memory + localStorage, so repeated calls are free once landed.
+  // VSLBATCH -- DATE-MAJOR, and that order is the whole fix. The
+  // coalescer groups by suffix, and for a dated roster-stats call the
+  // suffix IS the date. Built team-major, the calls in flight at any
+  // moment were one team on several days -- a different suffix each, so
+  // every batch had one member in it.
   var need = [];
-  [myKey].concat(teamKeys).forEach(function (tk) {
-    dates.forEach(function (d) {
+  dates.forEach(function (d) {
+    [myKey].concat(teamKeys).forEach(function (tk) {
       var ck = tk + '|' + d;
       if (_vslState.cells[ck] !== undefined) return;
       // Compact totals cache first — one number, ~40 bytes, versus a 7 KB
@@ -143205,30 +143215,49 @@ function skRenderVsLeague() {
     });
   });
   if (need.length) {
+    // A DAY AT A TIME, ALL OF IT AT ONCE. The teams for one date are
+    // fired in the same tick so they reach _fyCoalesceJoin inside its
+    // 50ms window and leave as a single /teams;team_keys=... request.
+    // Firing more at once asks LESS: thirteen calls that coalesce are
+    // one call. The days still go one after another, so the spacing
+    // between requests is a round trip.
+    var byDate = {}, order = [], ni;
+    for (ni = 0; ni < need.length; ni++) {
+      if (!byDate[need[ni].d]) { byDate[need[ni].d] = []; order.push(need[ni].d); }
+      byDate[need[ni].d].push(need[ni]);
+    }
     _vslState.pending += need.length;
-    var idx = 0;
-    function pump() {
-      if (idx >= need.length) return;
-      var it = need[idx++];
-      fetchTeamFpForDate(it.tk, it.d).then(function (m) {
-        var tot = _vslSum(m);
-        _vslState.cells[it.ck] = tot;
-        _fptSet(it.tk, it.d, tot);   // FPTOTALS — keep the number, drop the roster
-        // The grid asked about somebody else's team. Their per-player detail
-        // is never rendered anywhere, so persisting 7 KB of it is pure cost:
-        // release the full roster and keep the 40-byte total. My own team
-        // stays cached — Week Contributors reads it.
-        if (it.tk !== myKey) _fpDropPersisted(it.tk, it.d);
-      }).catch(function () {
-        _vslState.cells[it.ck] = null;
-      }).then(function () {
-        _vslState.pending--;
-        // Repaint every few cells so the grid fills visibly, and once at the end.
-        if (_vslState.pending === 0 || (_vslState.pending % 6) === 0) _vslPaint(host, dates, myKey, oppKey, teamKeys, data);
-        pump();
+    var _vslRun = _vslState.key;        // a league or week change abandons this
+    var di = 0;
+    function pumpDay() {
+      if (di >= order.length || _vslState.key !== _vslRun) { return; }
+      var list = byDate[order[di++]], jobs = [], j;
+      for (j = 0; j < list.length; j++) {
+        jobs.push((function (it) {
+          return fetchTeamFpForDate(it.tk, it.d).then(function (m) {
+            var tot = _vslSum(m);
+            _vslState.cells[it.ck] = tot;
+            _fptSet(it.tk, it.d, tot);   // FPTOTALS — keep the number, drop the roster
+            // The grid asked about somebody else's team. Their per-player
+            // detail is never rendered anywhere, so persisting 7 KB of it is
+            // pure cost: release the full roster and keep the 40-byte total.
+            // My own team stays cached — Week Contributors reads it.
+            if (it.tk !== myKey) _fpDropPersisted(it.tk, it.d);
+          })['catch'](function () {
+            _vslState.cells[it.ck] = null;
+          }).then(function () { _vslState.pending--; });
+        })(list[j]));
+      }
+      Promise.all(jobs).then(function () {
+        // One repaint a day: the column fills in at once, which is also
+        // how it arrives.
+        if (_vslState.key === _vslRun) {
+          _vslPaint(host, dates, myKey, oppKey, teamKeys, data);
+        }
+        pumpDay();
       });
     }
-    for (var w = 0; w < 3; w++) pump();   // three in flight, like the Week tab
+    pumpDay();
   }
   _vslPaint(host, dates, myKey, oppKey, teamKeys, data);
 }
