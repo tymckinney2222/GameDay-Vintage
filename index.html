@@ -203416,9 +203416,13 @@ function _mrSlWeeksPlayed(row) {
   return d ? Math.ceil(d / _mrSlPerWeek(row)) : 0;
 }
 
-// Take a reading. Called wherever the standings are assembled, so it
-// runs for every league on every sync without asking for anything.
-function _slSnapTake(row, rosters) {
+// SLSNAPCLEAN -- OBSERVE, don't commit. fpts is a running season
+// total, so a reading is only the end-of-week-n figure if nothing from
+// week n+1 has scored yet. _mrSlWeeksPlayed counts weeks already in the
+// RECORD, and week n+1 puts points on the board long before it decides
+// a result -- so filing a reading under n on sight overwrites a good
+// one with a contaminated one. Held on the row until it is proven.
+function _slSnapObserve(row, rosters) {
   if (!row || !row.key || !rosters || !rosters.length) { return; }
   var st = _slSnapStore(row.key);
   // SLSNAP -- every Sleeper week already in the weekly store came from
@@ -203427,9 +203431,8 @@ function _slSnapTake(row, rosters) {
   if (st.v !== 2) {
     st.v = 2;
     try { _mrCgStore(row.key).w = {}; _mrCgSave(row.key); } catch (eW) {}
+    _slSnapSave(row.key);
   }
-  var n = _mrSlWeeksPlayed(row);
-  if (!n) { _slSnapSave(row.key); return; }
   var pf = {}, i, any = false;
   for (i = 0; i < rosters.length; i++) {
     var ro = rosters[i] || {}, se = ro.settings || {};
@@ -203438,8 +203441,37 @@ function _slSnapTake(row, rosters) {
       ((se.fpts_decimal != null) ? ((Number(se.fpts_decimal) || 0) / 100) : 0);
     any = true;
   }
-  if (any) { st.w[String(n)] = pf; }
-  _slSnapSave(row.key);
+  row._slFpts = any ? pf : null;
+}
+
+// SLSNAPCLEAN -- commit the held reading as the end of week n, but only
+// once week n+1 is confirmed to have scored nothing. Whatever
+// matchups[].points MEANS in a lock-in league, it is zero until a game
+// finalises, so the test is exact even where the magnitude is not.
+// A reading already on file is never replaced.
+function _slSnapCommit(row) {
+  var key = row && row.key;
+  if (!key || typeof slFetchJson !== 'function') { return Promise.resolve(''); }
+  var n = _mrSlWeeksPlayed(row);
+  if (!n || !row._slFpts) { return Promise.resolve(''); }
+  var st = _slSnapStore(key);
+  if (st.w[String(n)]) { return Promise.resolve(''); }   // already proven
+  var id = String(key).slice(4);
+  return slFetchJson(SLEEPER_BASE + '/league/' + id + '/matchups/' + (n + 1))
+    .then(function (mus) {
+      var i;
+      for (i = 0; mus && i < mus.length; i++) {
+        if (Number((mus[i] || {}).points) > 0) {
+          // Week n+1 is already scoring, so today's season total is not
+          // the total at the end of week n. Nothing is written: the
+          // week stays unbanked and is retried, which is recoverable.
+          return 'week ' + (n + 1) + ' already scoring';
+        }
+      }
+      st.w[String(n)] = row._slFpts;
+      _slSnapSave(key);
+      return '';
+    }, function () { return 'could not check week ' + (n + 1); });
 }
 
 // One roster's points in one week. Week 1 needs no earlier reading,
@@ -203497,7 +203529,14 @@ function _slWeekMissing(st, key, wk) {
   return !_slBlankRetried[key + ':' + k];
 }
 
+// SLSNAPCLEAN -- prove the reading first, then read the weeks off it.
 function _mrSlLoadOne(row) {
+  return _slSnapCommit(row).then(function (why) {
+    return _mrSlLoadWeeks(row).then(function (w2) { return w2 || why; });
+  });
+}
+
+function _mrSlLoadWeeks(row) {
   var key = row.key, id = String(key).slice(4);
   var mine = row.myTeamIds || {};
   var st = _mrCgStore(key), miss = [];
@@ -203749,6 +203788,11 @@ function _mrSlHydrate(force) {
       if (_mrCgInflight[r.key]) return false;
       if (_mrCgFailed[r.key] && !force) return false;
       var st = _mrCgStore(r.key), need = _mrSlNeeded(r);
+      // SLSNAPCLEAN -- an unproven reading is reason enough to queue the
+      // league: next week's subtraction needs this week's total, and
+      // the chance to prove it closes as soon as the next week scores.
+      var _n = _mrSlWeeksPlayed(r);
+      if (_n && r._slFpts && !_slSnapStore(r.key).w[String(_n)]) { return true; }
       // SLWKSTALE -- same test the loader uses, without its marking, so
       // the queue filter cannot consume the one retry it is checking for.
       for (var i = 0; i < need.length; i++) {
@@ -203855,6 +203899,13 @@ function skProbeSleeperWeeks() {
     for (_sk2 in _sn.w) { if (_sn.w.hasOwnProperty(_sk2)) { _snk.push(_sk2); } }
     _snk.sort(function (x, y) { return Number(x) - Number(y); });
     say('   season-total readings: ' + (_snk.length ? ('week ' + _snk.join(', ')) : 'NONE'));
+    var _wp = _mrSlWeeksPlayed(row);
+    say('   reading for week ' + _wp + ': ' +
+        (!_wp ? 'n/a \u2014 no completed week'
+          : _sn.w[String(_wp)] ? 'on file'
+          : (row._slFpts ? 'held, not yet proven \u2014 needs week ' +
+             (_wp + 1) + ' to have scored nothing'
+             : 'no season totals seen this session')));
     var _myPf = _slSnapWeekPts(row.key, _snk.length ? Number(_snk[_snk.length - 1]) : 1,
                                (row.myTeamIds ? Object.keys(row.myTeamIds)[0] : '0'));
     say('   my points in the latest of those: ' + (_myPf == null ? 'n/a' : _myPf));
@@ -229148,7 +229199,7 @@ function slEnrichLeagues() {
         // SLSNAP -- read the season points-for here, where it already
         // is. After row.standings, because the week it belongs to is
         // counted off that record.
-        try { _slSnapTake(row, rosters); } catch (eSS) {}
+        try { _slSnapObserve(row, rosters); } catch (eSS) {}
         // Roster structures for the detail view (player IDs resolve to
         // names lazily via the /players dictionary on Roster-tab open).
         // Slot spec: roster_positions lists every slot in order, with BN
