@@ -191733,7 +191733,74 @@ var SV_KEY = 'skSurv_v1';
 var SV_NIGHT_MAX = 90;
 
 var _svState = { loaded: false, store: null, pool: null, note: '',
-                 busy: false, box: null, timer: null };
+                 busy: false, box: null, timer: null,
+                 // SURVALL -- how he gets through a board of hundreds.
+                 scope: '', team: '', q: '' };
+
+// 'mine' is his own rostered men across both sports; 'nhl'/'nba' are
+// everyone playing tonight in that sport.
+function _svSetScope(sc) {
+  _svState.scope = sc;
+  _svState.team = '';
+  _svState.q = '';
+  _svRender();
+}
+
+function _svSetTeam(ab) {
+  _svState.team = (_svState.team === ab) ? '' : ab;
+  _svRender();
+}
+
+function _svSetQ(v) {
+  _svState.q = String(v || '');
+  _svRender();
+}
+
+// Which scope to open on. His own men first, because they are the ones
+// he cares about -- but not when the night's category leaves him three
+// of them, which is the whole reason the slate is here.
+function _svDefaultScope(pool) {
+  if (_svState.scope) { return _svState.scope; }
+  if (pool.mineOpen >= 6) { return 'mine'; }
+  var nhl = pool.openBy.nhl || 0, nba = pool.openBy.nba || 0;
+  if (!nhl && !nba) { return 'mine'; }
+  return (nba > nhl) ? 'nba' : 'nhl';
+}
+
+// The rows a scope, club and search leave standing.
+function _svVisible(pool) {
+  var sc = _svDefaultScope(pool), q = _svState.q.toLowerCase().replace(/\s+/g, ' ').trim();
+  var team = _svState.team, out = [], i, r;
+  for (i = 0; i < pool.rows.length; i++) {
+    r = pool.rows[i];
+    if (sc === 'mine') { if (!r.mine) { continue; } }
+    else if (r.sport !== sc) { continue; }
+    if (team && r.team !== team) { continue; }
+    if (q && (r.name + ' ' + r.team + ' ' + r.pos).toLowerCase().indexOf(q) === -1) { continue; }
+    out.push(r);
+  }
+  return out;
+}
+
+// How many of these rows he could actually take.
+function _svOpenIn(rows) {
+  var n = 0, i;
+  for (i = 0; i < rows.length; i++) {
+    if (!rows[i].used && !rows[i].started) { n++; }
+  }
+  return n;
+}
+
+// Tonight's clubs in a sport, for the strip he taps through.
+function _svClubs(pool, sport) {
+  var out = [], k;
+  for (k in pool.clubs) {
+    if (!pool.clubs.hasOwnProperty(k)) { continue; }
+    if (k.indexOf(sport + '|') === 0) { out.push(k.slice(sport.length + 1)); }
+  }
+  out.sort();
+  return out;
+}
 
 // The bar for a given streak length. Night one is the gentlest; the
 // streak length is the number ALREADY banked, so a run of five is
@@ -191872,18 +191939,36 @@ function _svOddsFor(p, bar, sport) {
   return _svOdds(_svRateStat(p, bar.stat, sport), bar.need, sport, bar);
 }
 
-// A man's projected rate for ONE stat, per game.
-function _svRateStat(p, stat, sport) {
-  if (!p) { return 0; }
+// SURVALL -- a man's per-game line, built ONCE. Pricing the whole
+// slate against every category is rows x categories, and rebuilding the
+// projection inside each odds call made that twenty-four hundred
+// rebuilds on a three-hundred-man night. The line is memoised on the
+// projection object itself, which lives as long as the pool does.
+function _svRateLine(p) {
+  if (!p) { return null; }
+  if (p.__svrl !== undefined) { return p.__svrl; }
   var line = null;
   try {
     line = (typeof dbpBasis === 'function') ? dbpBasis(p, 'esp') : null;
     if (line && typeof dbpRate === 'function') { line = dbpRate(line, p.mode); }
   } catch (e) { line = null; }
-  if (!line) { return 0; }
-  var perGame = false;
-  try { perGame = !!(DBP_PERGAME && DBP_PERGAME[p.mode]); } catch (e2) { perGame = false; }
-  var gp = Number(line.gp || 0);
+  var out = null;
+  if (line) {
+    var perGame = false;
+    try { perGame = !!(DBP_PERGAME && DBP_PERGAME[p.mode]); }
+    catch (e2) { perGame = false; }
+    out = { _line: line, _per: perGame, _gp: Number(line.gp || 0) };
+  }
+  try { p.__svrl = out; } catch (e3) {}
+  return out;
+}
+
+// A man's projected rate for ONE stat, per game.
+function _svRateStat(p, stat, sport) {
+  if (!p) { return 0; }
+  var rl = _svRateLine(p);
+  if (!rl) { return 0; }
+  var line = rl._line, perGame = rl._per, gp = rl._gp;
   function v(k) {
     var n = Number(line[k]);
     if (isNaN(n)) { return 0; }
@@ -191993,18 +192078,34 @@ function _svPoolIndex(pool) {
 // Falls back to every man on the slate when his own leave nothing legal.
 function _svBuildPool(pools) {
   var st = _svStore();
-  var out = { rows: [], mine: 0, eligible: 0, games: 0, fallback: false,
-              sports: [], note: '', cat: {}, has: {}, thin: false };
+  var out = { rows: [], mine: 0, mineOpen: 0, eligible: 0, games: 0,
+              sports: [], note: '', cat: {}, has: {},
+              thin: false, started: 0, openBy: {}, clubs: {} };
   var scan = [];
   try { scan = (typeof _allInScan === 'function') ? (_allInScan() || []) : []; } catch (e) { scan = []; }
-  var i, j, sp, idx, seen = {};
+  var i, j, sp, idx, seen = {}, seenId = {}, seenName = {}, seenBare = {};
 
-  function add(name, teamAbbr, pos, sport, gm, mine) {
-    var k = _svKey(name);
-    if (!k || seen[k]) { return; }
+  function add(name, teamAbbr, pos, sport, gm, mine, espnId) {
+    // SURVID -- two men with one folded name are two rows, not one. The
+    // id keeps them apart on the board and, more importantly, keeps
+    // `used` from spending both when he picks one.
+    var eid = (espnId == null) ? '' : String(espnId);
+    var nk = _svKey(name);
+    if (!nk) { return; }
+    var k = eid ? (nk + '#' + eid) : nk;
+    if (seen[k]) { return; }
+    if (eid) {
+      if (seenId[eid]) { return; }        // the same man, reached twice
+      if (seenBare[nk]) { return; }       // an id-less row already claimed him
+    } else if (seenName[nk]) {
+      return;                             // nothing to tell him apart by
+    }
+    seen[k] = 1;
+    seenName[nk] = 1;
+    if (eid) { seenId[eid] = 1; } else { seenBare[nk] = 1; }
     // SURVCAT -- no bar yet. The category is not drawn until the whole
     // board is known, because what is on the board is what decides it.
-    var p = (pools[sport] ? pools[sport][k] : null);
+    var p = (pools[sport] ? pools[sport][_svKey(name)] : null);
     var usedNight = st.used[k];
     seen[k] = 1;
     // SURVCAL -- a man whose game has started is off the board. Picking
@@ -192026,7 +192127,7 @@ function _svBuildPool(pools) {
                     pos: pos || '', sport: sport, bar: null, p: p,
                     odds: 0,
                     used: (usedNight != null) ? usedNight : 0, started: started,
-                    known: !!p, mine: !!mine, gm: gm || null });
+                    espnId: eid, known: !!p, mine: !!mine, gm: gm || null });
   }
 
   for (i = 0; i < scan.length; i++) {
@@ -192036,19 +192137,17 @@ function _svBuildPool(pools) {
     out.games += (scan[i].games || 0);
     var hits = scan[i].hits || [];
     for (j = 0; j < hits.length; j++) {
-      add(hits[j].name, hits[j].teamAbbr, hits[j].pos, sp, hits[j].gm, true);
+      add(hits[j].name, hits[j].teamAbbr, hits[j].pos, sp, hits[j].gm, true,
+          hits[j].espnId);
     }
   }
   out.mine = out.rows.length;
-  for (i = 0; i < out.rows.length; i++) {
-    if (!out.rows[i].used && !out.rows[i].started) { out.eligible++; }
-    else if (out.rows[i].started && !out.rows[i].used) { out.started = (out.started || 0) + 1; }
-  }
 
-  // NOTHING LEGAL LEFT. The run does not end on a technicality: the
-  // pool opens to every man on tonight's slate instead.
-  if (!out.eligible) {
-    out.fallback = true;
+  // SURVALL -- THE WHOLE SLATE, ALWAYS. This used to run only when his
+  // own men left nothing legal, which meant a rotating category could
+  // land on a night where he had two players in it. His fantasy rosters
+  // have nothing to do with who blocks shots.
+  {
     for (i = 0; i < SV_SPORTS.length; i++) {
       sp = SV_SPORTS[i];
       idx = pools[sp];
@@ -192062,7 +192161,7 @@ function _svBuildPool(pools) {
         proMap = _espProTeams[(sp === 'nhl' ? 'fhl:' : 'fba:') + seas];
       } catch (e3) { proMap = null; }
       for (var nk in idx) {
-        if (!idx.hasOwnProperty(nk) || seen[nk]) { continue; }
+        if (!idx.hasOwnProperty(nk)) { continue; }
         var pp = idx[nk], ab = '';
         try {
           var pm = proMap ? proMap[String(pp.teamId)] : null;
@@ -192071,13 +192170,20 @@ function _svBuildPool(pools) {
         if (!ab) { continue; }
         var canon = (typeof _allInCanon === 'function') ? _allInCanon(ab, sp) : ab.toUpperCase();
         if (!slate.byAbbr[canon]) { continue; }
-        add(pp.name, ab, pp.pos, sp, slate.byAbbr[canon], false);
+        add(pp.name, ab, pp.pos, sp, slate.byAbbr[canon], false, pp.id);
       }
     }
-    out.eligible = 0;
-    for (i = 0; i < out.rows.length; i++) {
-      if (!out.rows[i].used && !out.rows[i].started) { out.eligible++; }
+  }
+  for (i = 0; i < out.rows.length; i++) {
+    var rw = out.rows[i];
+    if (rw.mine) { out.mineOpen += (!rw.used && !rw.started) ? 1 : 0; }
+    if (!rw.used && !rw.started) {
+      out.eligible++;
+      out.openBy[rw.sport] = (out.openBy[rw.sport] || 0) + 1;
+    } else if (rw.started && !rw.used) {
+      out.started = (out.started || 0) + 1;
     }
+    if (rw.team) { out.clubs[rw.sport + '|' + rw.team] = 1; }
   }
 
   // THE CATEGORY IS DRAWN HERE, with the full board in hand and before
@@ -192147,9 +192253,9 @@ function _svPick(key) {
   st.nights[date] = {
     date: date, night: (st.streak || 0) + 1, locked: true, settled: false,
     me: { key: row.key, name: row.name, team: row.team, sport: row.sport,
-          pos: row.pos, bar: row.bar, odds: row.odds },
+          pos: row.pos, bar: row.bar, odds: row.odds, espnId: row.espnId || '' },
     house: hp ? { key: hp.key, name: hp.name, team: hp.team, sport: hp.sport,
-                  bar: hp.bar, odds: hp.odds } : null,
+                  bar: hp.bar, odds: hp.odds, espnId: hp.espnId || '' } : null,
     gids: _svGidsTonight()
   };
   st.used[row.key] = st.nights[date].night;
@@ -192238,7 +192344,16 @@ function _svLineFor(side, boxes) {
   if (!side) { return null; }
   var box = boxes[side.sport];
   if (!box) { return null; }
-  var ln = box.byName[_svKey(side.name)];
+  // SURVID -- BY ID FIRST. Auction Night has always joined on
+  // box.byId[String(row.id)]; Survivor read the name because one man a
+  // night seemed too simple to need an id, and a shared name is exactly
+  // where that costs a run.
+  var nk = _svKey(side.name), shared = false, ln = null;
+  if (side.espnId) { ln = box.byId[String(side.espnId)] || null; }
+  if (!ln) {
+    if ((box.dupName || {})[nk]) { shared = true; }
+    ln = box.byName[nk] || null;
+  }
   if (!ln) { return null; }
   // SURVCAT -- the bar names its own column, and the night was saved
   // with the bar, so this settles against what he actually picked
@@ -192251,7 +192366,8 @@ function _svLineFor(side, boxes) {
   } else {
     got = Number(ln[stat]) || 0;
   }
-  return { got: got, cleared: got >= side.bar.need, line: ln };
+  return { got: got, cleared: got >= side.bar.need, line: ln,
+           shared: shared };
 }
 
 // A night is settled ONCE, when every game it saved is final. Half a
@@ -192285,6 +192401,9 @@ function _svSettle(date, boxes) {
   N.result = mine.cleared ? 'W' : 'L';
   N.got = mine.got;
   N.dnp = !!mine.dnp;
+  // Scored off a line two men share, with no id to tell them apart.
+  // Rare, and never silent.
+  N.shared = !!mine.shared;
   if (hers) { N.houseGot = hers.got; N.houseResult = hers.cleared ? 'W' : 'L'; }
   else if (N.house) { N.houseGot = 0; N.houseResult = 'L'; }
 
@@ -192527,6 +192646,8 @@ function _svCardHtml(N) {
         skEscape(N.me.name) + ' needed ' + skEscape(N.me.bar.label) + '. ' +
         (N.dnp ? 'He did not dress.'
                : ('He got ' + N.got + ' ' + skEscape(N.me.bar.noun) + '.')) +
+        (N.shared ? ' Two players share that name tonight and no id came ' +
+          'with the pick \u2014 this line may be the other one\u2019s.' : '') +
       '</div></div>';
   }
   return '<div class="rg-dark rg-bleed">' + head +
@@ -192572,13 +192693,76 @@ function _svRender() {
     return;
   }
   h += _svBarHtml(st, pool);
+
+  // SURVALL -- the board is everyone playing tonight, so it needs a way
+  // through it: his own men, or a sport, then a club, then a name.
+  var sc = _svDefaultScope(pool);
+  var rows = _svVisible(pool);
+  var pills = [['mine', 'My players', pool.mineOpen],
+               ['nhl', 'NHL', pool.openBy.nhl || 0],
+               ['nba', 'NBA', pool.openBy.nba || 0]];
   h += '<div class="rg-dark rg-bleed">' +
-    '<div class="rg-sect">' + (pool.fallback ? 'Everyone playing tonight' : 'Your players tonight') +
-      ' <span style="opacity:0.6">' + pool.eligible + ' eligible of ' + pool.rows.length +
+    '<div style="display:flex;gap:6px;margin:0 0 8px;overflow-x:auto;' +
+    '-webkit-overflow-scrolling:touch">';
+  var pi;
+  for (pi = 0; pi < pills.length; pi++) {
+    if (pills[pi][0] !== 'mine' && !pills[pi][2]) { continue; }
+    var on = (sc === pills[pi][0]);
+    h += '<button onclick="_svSetScope(\'' + pills[pi][0] + '\')" ' +
+      'style="flex:0 0 auto;padding:6px 13px;border-radius:999px;font-size:12px;' +
+      'font-weight:700;cursor:pointer;' +
+      (on ? 'background:#facc15;color:#111;border:0'
+          : 'background:transparent;color:rgba(255,255,255,0.6);' +
+            'border:1px solid rgba(255,255,255,0.14)') + '">' +
+      skEscape(pills[pi][1]) + ' ' +
+      '<span style="opacity:0.65;font-weight:400">' + pills[pi][2] + '</span></button>';
+  }
+  h += '</div>';
+
+  if (sc !== 'mine') {
+    var clubs = _svClubs(pool, sc);
+    if (clubs.length > 1) {
+      h += '<div style="display:flex;gap:5px;margin:0 0 8px;overflow-x:auto;' +
+        '-webkit-overflow-scrolling:touch">';
+      h += '<button onclick="_svSetTeam(\'\')" style="flex:0 0 auto;padding:5px 11px;' +
+        'border-radius:999px;font-size:11px;font-weight:700;cursor:pointer;' +
+        'font-family:var(--sk-font-mono,monospace);' +
+        (!_svState.team ? 'background:rgba(250,204,21,0.9);color:#111;border:0'
+                        : 'background:transparent;color:rgba(255,255,255,0.5);' +
+                          'border:1px solid rgba(255,255,255,0.12)') + '">ALL</button>';
+      var ci;
+      for (ci = 0; ci < clubs.length; ci++) {
+        var ton = (_svState.team === clubs[ci]);
+        h += '<button onclick="_svSetTeam(\'' + skEscape(clubs[ci]) + '\')" ' +
+          'style="flex:0 0 auto;padding:5px 11px;border-radius:999px;font-size:11px;' +
+          'font-weight:700;cursor:pointer;font-family:var(--sk-font-mono,monospace);' +
+          (ton ? 'background:rgba(250,204,21,0.9);color:#111;border:0'
+               : 'background:transparent;color:rgba(255,255,255,0.5);' +
+                 'border:1px solid rgba(255,255,255,0.12)') + '">' +
+          skEscape(clubs[ci]) + '</button>';
+      }
+      h += '</div>';
+    }
+  }
+
+  h += '<input id="skSurvQ" type="search" placeholder="Search a player or club\u2026" ' +
+    'value="' + skEscape(_svState.q || '') + '" oninput="_svSetQ(this.value)" ' +
+    'style="width:100%;margin:0 0 8px;padding:8px 10px;border-radius:8px;' +
+    'background:#0d1220;color:#fff;border:1px solid rgba(255,255,255,0.12);' +
+    'font-size:13px;-webkit-appearance:none">';
+
+  h += '<div class="rg-sect">' +
+      (sc === 'mine' ? 'Your players tonight'
+                     : (sc.toUpperCase() + (_svState.team ? (' \u00b7 ' + skEscape(_svState.team)) : ''))) +
+      ' <span style="opacity:0.6">' + _svOpenIn(rows) + ' to pick' +
+      (rows.length > 60 ? (' \u00b7 showing 60 of ' + rows.length) : '') +
       '</span></div>';
+  if (!rows.length) {
+    h += '<div class="rg-foot">Nothing here. Try another sport, club or name.</div>';
+  }
   var i, r;
-  for (i = 0; i < pool.rows.length && i < 60; i++) {
-    r = pool.rows[i];
+  for (i = 0; i < rows.length && i < 60; i++) {
+    r = rows[i];
     var gm = r.gm && r.gm.g ? r.gm.g : null;
     var off = r.used || r.started;
     var hopeless = !off && !(r.odds >= 0.05);
@@ -192626,10 +192810,8 @@ function _svRender() {
       '</div>';
   }
   h += '<div class="rg-foot">' +
-    (pool.fallback
-      ? 'Your own players left nothing legal tonight, so the pool is the whole slate.'
-      : ('<b>' + pool.mine + '</b> of your players are on tonight\u2019s slate, <b>' +
-         pool.eligible + '</b> you haven\u2019t used.')) +
+    ('<b>' + pool.eligible + '</b> men are playing tonight and still open to you, ' +
+     '<b>' + pool.mineOpen + '</b> of them yours.') +
     ((pool.started > 0)
       ? (' <b>' + pool.started + '</b> already took the ice or the floor \u2014 ' +
          'the window closes at the first puck drop or tip-off. Miss it and no ' +
@@ -194138,7 +194320,20 @@ function _auctParseBox(j, out, sportArg) {
         // goals and shots in the first, faceoffs and blocks in another --
         // and assigning threw away everything the earlier groups had put
         // there. _fbParse already says exactly this about footballers.
-        var prev = (id && out.byId[id]) || (nk && out.byName[nk]) || null;
+        // SURVID -- THE ID IS THE MAN. Falling through to the name
+        // when byId has no entry is what merged Vancouver's two Elias
+        // Petterssons into one line: the second man's id was unseen, so
+        // the lookup found the first man's line under the shared name
+        // and poured him into it. A man who HAS an id merges only with
+        // his own; the name stays a fallback for id-less payloads, and
+        // only while nobody else has claimed it under a different id.
+        var prev = null;
+        if (id && out.byId[id]) {
+          prev = out.byId[id];
+        } else if (nk && out.byName[nk]) {
+          var cand = out.byName[nk];
+          if (!id || !cand._id || cand._id === id) { prev = cand; }
+        }
         if (prev) {
           for (var mk in line) {
             if (!line.hasOwnProperty(mk)) { continue; }
@@ -194147,8 +194342,19 @@ function _auctParseBox(j, out, sportArg) {
           }
           line = prev;
         }
-        if (id) { out.byId[id] = line; }
-        if (nk) { out.byName[nk] = line; }
+        if (id) { line._id = id; out.byId[id] = line; }
+        if (nk) {
+          var held = out.byName[nk];
+          if (held && held !== line && held._id && id && held._id !== id) {
+            // TWO MEN, ONE FOLDED NAME. The name can no longer resolve
+            // to one of them, and anything settling by name has to be
+            // told rather than handed whichever arrived first.
+            if (!out.dupName) { out.dupName = {}; }
+            out.dupName[nk] = (out.dupName[nk] || 1) + 1;
+          } else {
+            out.byName[nk] = line;
+          }
+        }
       }
     }
   }
