@@ -192970,7 +192970,7 @@ function _stvLgLabel(lg) {
 var STV_KEY = 'skSurvT_v1';
 var STV_NIGHT_MAX = 120;
 var _stvState = { store: null, pool: null, note: '', busy: false,
-                  day: '', league: '', q: '' };
+                  day: '', league: '', q: '', peeking: false };
 
 function _stvTeamKey(league, id) { return String(league) + '|' + String(id); }
 
@@ -193041,6 +193041,7 @@ function _stvBuildPool(games) {
     out.rows.push({
       key: k, teamId: String(t.id), abbr: t.abbr, name: t.name,
       logo: t.logo || '', color: t.color || '', league: g.league,
+      record: t.record || '', oppRecord: (opp && opp.record) || '',
       oppAbbr: (opp && opp.abbr) || '?', atHome: !!atHome,
       p: p, used: usedNight, started: !open, gameId: String(g.id),
       start: g.start || '', detail: g.detail || ''
@@ -193102,6 +193103,7 @@ function _stvSide(r) {
   if (!r) { return null; }
   return { key: r.key, teamId: r.teamId, abbr: r.abbr, name: r.name,
            logo: r.logo, league: r.league, oppAbbr: r.oppAbbr,
+           record: r.record || '', oppRecord: r.oppRecord || '',
            atHome: r.atHome, p: r.p, gameId: r.gameId };
 }
 
@@ -193221,6 +193223,83 @@ function _stvRefresh(force) {
   Promise.all(jobs).then(done, done);
 }
 
+// SURVPEEK -- open this fixture in whichever stadium mode its sport
+// uses, ON TOP of the board. openPastGame does the same fetch-and-route
+// but pushes a team-page return, tears down what it came from, and
+// jumps to the box score -- none of which is right from here, least of
+// all a box score for a game that has not been played.
+//
+// Survivor stays open underneath at z-index 400 against the stadium's
+// 8650, so closing the game drops him back on the board with his pick
+// still unmade.
+function _stvPeek(gameId, league) {
+  if (_stvState.peeking) { return; }
+  var cfg = null;
+  try { cfg = (typeof LEAGUES !== 'undefined') ? LEAGUES[league] : null; }
+  catch (e) { cfg = null; }
+  if (!cfg || typeof openModal !== 'function') { return; }
+  _stvState.peeking = true;
+  _stvRender();
+  function colorOf(t) {
+    try {
+      if (typeof getTeamColor === 'function') {
+        var c = getTeamColor(t, league);
+        if (c) { return c; }
+      }
+    } catch (e2) {}
+    return '#' + String((t && t.color) || '333333').replace('#', '');
+  }
+  function altOf(t) {
+    try { return (typeof _altColorOf === 'function') ? _altColorOf(t) : ''; }
+    catch (e3) { return ''; }
+  }
+  fetch('https://site.api.espn.com/apis/site/v2/sports/' + cfg.sport + '/' +
+    cfg.slug + '/summary?event=' + encodeURIComponent(gameId))
+    .then(function (r) { if (!r.ok) { throw new Error('HTTP ' + r.status); } return r.json(); })
+    .then(function (data) {
+      var hdr = (((data || {}).header || {}).competitions || [])[0];
+      if (!hdr) { throw new Error('no competition'); }
+      var cs = hdr.competitors || [], aw = null, hm = null, i;
+      for (i = 0; i < cs.length; i++) {
+        if (cs[i].homeAway === 'away') { aw = cs[i]; }
+        else if (cs[i].homeAway === 'home') { hm = cs[i]; }
+      }
+      if (!aw || !hm) { throw new Error('no sides'); }
+      function sideOf(c) {
+        var t = c.team || {};
+        return { id: t.id, abbr: t.abbreviation || '?',
+          name: t.displayName || '?', fullName: t.displayName || '?',
+          score: c.score || 0, winner: !!c.winner,
+          color: colorOf(t), altColor: altOf(t),
+          logo: t.logo || ((t.logos && t.logos[0]) ? t.logos[0].href : '') || '',
+          record: ((c.record || [])[0] || {}).summary || '' };
+      }
+      var game = {
+        id: String(gameId), league: league,
+        state: ((hdr.status || {}).type || {}).state || 'pre',
+        statusDetail: ((hdr.status || {}).type || {}).shortDetail || '',
+        period: (hdr.status || {}).period || 0,
+        away: sideOf(aw), home: sideOf(hm),
+        venue: ((hdr.venues || [])[0] || {}).fullName || '',
+        date: hdr.date || ''
+      };
+      try {
+        window._gameSummaries = window._gameSummaries || {};
+        window._gameSummaries[game.id] = data;
+      } catch (e4) {}
+      _stvState.peeking = false;
+      _stvRender();
+      openModal(game);
+    })['catch'](function () {
+      _stvState.peeking = false;
+      _stvState.note = '';
+      _stvRender();
+      try {
+        if (typeof skToast === 'function') { skToast('Could not open that game.'); }
+      } catch (e5) {}
+    });
+}
+
 function _stvSetLeague(lg) {
   _stvState.league = (_stvState.league === lg) ? '' : lg;
   _stvState.q = '';
@@ -193305,7 +193384,9 @@ function _stvCardHtml(N) {
         '<div style="font-family:var(--sk-font-mono,monospace);font-size:10px;' +
         'color:rgba(255,255,255,0.42);margin-top:2px">' +
           skEscape(_stvLgLabel(sd.league)) +
+          (sd.record ? (' ' + skEscape(sd.record)) : '') +
           ' \u00b7 ' + (sd.atHome ? 'vs ' : '@ ') + skEscape(sd.oppAbbr) +
+          (sd.oppRecord ? (' ' + skEscape(sd.oppRecord)) : '') +
           (sd.p != null ? (' \u00b7 ' + Math.round(sd.p * 100) + '%') : '') + '</div>' +
       '</div>' +
       '<div style="font-size:10px;letter-spacing:0.1em;font-weight:700;color:' + col + '">' +
@@ -193425,26 +193506,46 @@ function _stvRender() {
     var off = r.used || r.started;
     var hopeless = !off && r.p != null && r.p < 0.35;
     var slim = !off && (r.p == null || r.p < 0.55);
-    h += '<div style="display:flex;align-items:center;gap:11px;padding:9px 0;' +
-      'border-bottom:1px solid rgba(255,255,255,0.045)' +
+    h += '<div style="display:flex;align-items:center;padding:9px 0;' +
+      'border-bottom:1px solid rgba(255,255,255,0.045);gap:9px' +
       (off ? ';opacity:0.32' : (hopeless ? ';opacity:0.5;cursor:pointer'
                                          : ';cursor:pointer')) + '"' +
       (off ? '' : (' onclick="_stvPick(\'' + skEscape(r.key) + '\')"')) + '>' +
       _stvCrest(r, 28) +
       '<div style="flex:1;min-width:0">' +
         '<div style="font-size:14.5px;font-weight:600;line-height:1.2">' +
-          skEscape(r.name) + '</div>' +
+          skEscape(r.name) +
+          // SURVPEEK -- his club's record, right where the eye already is.
+          (r.record ? ('<span style="font-family:var(--sk-font-mono,monospace);' +
+            'font-size:10px;color:rgba(255,255,255,0.45);font-weight:400;' +
+            'margin-left:6px">' + skEscape(r.record) + '</span>') : '') + '</div>' +
         '<div style="font-family:var(--sk-font-mono,monospace);font-size:10px;' +
         'color:rgba(255,255,255,0.42);margin-top:2px">' +
           skEscape(_stvLgLabel(r.league)) +
-          ' \u00b7 ' + (r.atHome ? 'vs ' : '@ ') + skEscape(r.oppAbbr) + '</div>' +
+          ' \u00b7 ' + (r.atHome ? 'vs ' : '@ ') + skEscape(r.oppAbbr) +
+          // AND THE OTHER ONE. A record alone is half an answer: what
+          // makes a club a good pick tonight is its record next to the
+          // record of whoever it is playing.
+          (r.oppRecord ? (' ' + skEscape(r.oppRecord)) : '') + '</div>' +
       '</div>' +
-      '<div style="text-align:right;flex:0 0 58px">' +
+      '<div style="text-align:right;flex:0 0 50px">' +
         '<div style="font-family:var(--sk-font-mono,monospace);' +
-        (r.p == null ? 'font-size:10px;color:rgba(255,255,255,0.4)' : 'font-size:13px') +
+        (r.p == null ? 'font-size:9.5px;color:rgba(255,255,255,0.4)' : 'font-size:13px') +
         '">' + (off ? '\u2014'
                     : (r.p == null ? 'NO LINE' : (Math.round(r.p * 100) + '%'))) +
         '</div></div>' +
+      // THE WHOLE ROW IS THE PICK, so this stops the event dead. Without
+      // that, looking at a game would spend the night on it.
+      '<button onclick="event.stopPropagation();_stvPeek(\'' +
+        skEscape(r.gameId) + '\',\'' + skEscape(r.league) + '\')" ' +
+        'aria-label="Preview this game" ' +
+        'style="flex:0 0 30px;height:30px;border-radius:999px;cursor:pointer;' +
+        'background:transparent;border:1px solid rgba(255,255,255,0.18);' +
+        'color:rgba(255,255,255,0.55);padding:0;display:flex;' +
+        'align-items:center;justify-content:center">' +
+        '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" ' +
+        'stroke="currentColor" stroke-width="2" stroke-linecap="round">' +
+        '<path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg></button>' +
       (r.used
         ? '<span style="font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.4);' +
           'border:1px solid rgba(255,255,255,0.12);border-radius:999px;padding:3px 8px;' +
@@ -193468,6 +193569,9 @@ function _stvRender() {
     (pool.started ? (' <b>' + pool.started + '</b> already started \u2014 ' +
       'miss the window and no pick is recorded, and your streak keeps.')
                   : ' The window on a club closes when its game starts.') +
+    ' Tap a row to take that club, or the chart button to open the fixture ' +
+    'first \u2014 it opens over this board, so closing it brings you back ' +
+    'with the night still yours.' +
     (pool.noMarket
       ? (' ' + ((pool.noMarket > pool.rows.length / 2)
           ? 'Most college fixtures carry no moneyline, so they show NO LINE'
@@ -204469,9 +204573,20 @@ function _peParseEvent(ev, league, wantDay) {
   if (wantDay && _peDayKey(ev.date) !== wantDay) return null;
   function side(c) {
     var t = c.team || {};
+    // SURVPEEK -- the overall record, which ESPN hangs on the competitor
+    // and this parser was dropping. 'total' is what every league calls
+    // the season line; the rest ('home', 'road', 'vs. conf') are splits.
+    var rec = '', rs = c.records || [], ri, rt;
+    for (ri = 0; ri < rs.length; ri++) {
+      rt = String(rs[ri].type || rs[ri].name || '').toLowerCase();
+      if (rt === 'total' || rt === 'overall') {
+        rec = String(rs[ri].summary || ''); break;
+      }
+    }
+    if (!rec && rs.length) { rec = String(rs[0].summary || ''); }
     return { id: String(t.id || ''), abbr: String(t.abbreviation || ''),
       name: String(t.shortDisplayName || t.displayName || ''),
-      logo: t.logo || '', color: String(t.color || ''),
+      logo: t.logo || '', color: String(t.color || ''), record: rec,
       score: parseInt(c.score, 10) || 0, winner: !!c.winner };
   }
   var odds = (comp.odds && comp.odds[0]) || null;
