@@ -100710,7 +100710,10 @@ function _extFhubRowsFor(at, idx, sport) {
   for (var r = 0; r < refs.length; r++) {
     var row = refs[r].row, it = refs[r].item;
     var fp = null, calc = false, calcTitle = '', catLine = '', _sm = null;
-    if (row.provider === 'sleeper' && row._slPP) {
+    // SLMATCH -- only where the league's own total agrees with them.
+    // In a lock-in league _slPP credits each player's latest game, which
+    // SLLOCKPROBE caught putting 17.0 on a man his league scored 36.5.
+    if (row.provider === 'sleeper' && row._slPP && row._slPPTrust !== false) {
       // Sleeper only — its items really do carry playerId. FTXFHUBID
       var v = row._slPP[String(it.playerId || it.id || '')];
       if (v != null) fp = Math.round(Number(v) * 10) / 10;
@@ -203487,6 +203490,58 @@ function _slSnapWeekPts(key, wk, teamId) {
   return Math.round((now[id] - prev[id]) * 100) / 100;
 }
 
+// SLMATCH -- THIS WEEK, live: the movement in the season total since
+// the end of the last full week. Same arithmetic as a completed week,
+// with the near end of the subtraction being right now. Returns null
+// rather than a guess when the earlier reading has not been proven, so
+// a board that cannot be built is not built.
+function _slLiveWeekPts(row, rosterId) {
+  if (!row || !row._slFpts) { return null; }
+  var id = String(rosterId), now = row._slFpts[id];
+  if (now == null) { return null; }
+  var n = _mrSlWeeksPlayed(row);
+  if (!n) { return Math.round(now * 100) / 100; }
+  var prev = _slSnapStore(row.key).w[String(n)];
+  if (!prev || prev[id] == null) { return null; }
+  return Math.round((now - prev[id]) * 100) / 100;
+}
+
+// SLMATCH -- DO THIS LEAGUE'S PER-PLAYER FIGURES ADD UP TO ITS SCORE?
+// Until there was an authoritative total this could not be asked, so
+// lock-in was a switch set by hand and a guess everywhere else. Now the
+// week's real score is the season total's movement, and starters_points
+// is what the endpoint says the same week was worth. Agreement means
+// the per-player figures are the ones the league scores with.
+//
+// Disagreement HIDES them. Nothing on the payload carries the locked
+// value, so there is nothing to correct them with -- SLLOCKPROBE found
+// Duren credited 17.0 against the 36.5 his league counted.
+//
+// Not persisted: the two numbers are read moments apart and a live week
+// moves between them, so a verdict is only as good as this session. A
+// point of slack covers the gap, and an unproven league is treated as
+// untrusted rather than assumed fine.
+function _slReconcile(row, mus) {
+  if (!row || !mus || !mus.length) { return; }
+  var mine = row.myTeamIds || {}, me = null, i;
+  for (i = 0; i < mus.length; i++) {
+    if (mine[String((mus[i] || {}).roster_id)]) { me = mus[i]; break; }
+  }
+  if (!me) { return; }
+  var real = _slLiveWeekPts(row, me.roster_id);
+  if (real == null) { return; }
+  var sp = me.starters_points || [], sum = 0, any = false, j;
+  for (j = 0; j < sp.length; j++) {
+    if (sp[j] == null) { continue; }
+    sum += Number(sp[j]) || 0; any = true;
+  }
+  if (!any) { return; }
+  sum = Math.round(sum * 100) / 100;
+  row._slPPSum = sum;
+  row._slPPReal = real;
+  row._slPPTrust = (Math.abs(sum - real) <= 1);
+}
+
 // SLMEDIAN -- results my record gains in a single week. Sleeper's
 // league-average match plays everyone against the league median on top
 // of their opponent, so a week there is worth two. Nothing in this build
@@ -229272,15 +229327,27 @@ function slEnrichLeagues() {
                       awayId: String(a.roster_id), homeId: String(h.roster_id),
                       away: nameById[String(a.roster_id)] || 'Team ' + a.roster_id,
                       home: nameById[String(h.roster_id)] || 'Team ' + h.roster_id,
-                      awayScore: (a.points != null) ? a.points : null,
-                      homeScore: (h.points != null) ? h.points : null
+                      // SLMATCH -- not a.points/h.points. Those are the
+                      // unlocked sums; this is the league's own number.
+                      awayScore: _slLiveWeekPts(row, a.roster_id),
+                      homeScore: _slLiveWeekPts(row, h.roster_id)
                     });
                   }
-                  // SLTRUTH -- not for Sleeper. These scores are a.points
-                  // and h.points, the unlocked sums, and they drive the
-                  // Today card. A wrong score on a card he reads at a
-                  // glance is worse than no score at all.
-                  if (games.length && row.provider !== 'sleeper') {
+                  // SLMATCH -- Sleeper is back in, because the scores
+                  // above are no longer a.points. Still withheld when the
+                  // subtraction does not resolve: a board of dashes is
+                  // the same lie in a quieter voice.
+                  var _slOk = true;
+                  if (row.provider === 'sleeper') {
+                    _slOk = false;
+                    for (var _gi = 0; _gi < games.length; _gi++) {
+                      if (games[_gi].awayScore != null || games[_gi].homeScore != null) {
+                        _slOk = true; break;
+                      }
+                    }
+                    try { _slReconcile(row, mus); } catch (_eR) {}
+                  }
+                  if (games.length && _slOk) {
                     row.liveScores = { period: wk, games: games }; _extRepaintToday();
                   }
                   // Top weekly scorer for the Today card. Reuses the mus
@@ -234723,6 +234790,28 @@ function extOpenLeague(key) {
     matchupHtml = '<div style="color:rgba(255,255,255,0.4);font-size:12px;">No matchup data available yet.</div>';
   }
 
+  // SLMATCH -- the tab exists for Sleeper only once the board does.
+  var _slBoard = (row.provider === 'sleeper') &&
+    !!(row.liveScores && row.liveScores.games && row.liveScores.games.length);
+  var _showMatchup = isH2H && (row.provider !== 'sleeper' || _slBoard);
+  if (_slBoard) {
+    matchupHtml +=
+      '<div style="color:rgba(255,255,255,0.4);font-size:10px;line-height:1.5;' +
+      'margin-top:10px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.08)">' +
+      'Scores are this week\u2019s movement in Sleeper\u2019s own season ' +
+      'totals \u2014 the figure its standings are built from \u2014 rather ' +
+      'than its matchups feed, which credits each player\u2019s latest game.' +
+      ((row._slPPTrust === false)
+        ? (' Per-player figures are withheld in this league: that feed adds ' +
+           'up to ' + slEsc(String(row._slPPSum)) + ' against the ' +
+           slEsc(String(row._slPPReal)) + ' the league counted, so it runs ' +
+           'lock-in and nothing published says which game was locked.')
+        : (row._slPPTrust === true)
+          ? ' Per-player figures agree with the league total here, so they are shown.'
+          : '') +
+      '</div>';
+  }
+
   // ROSTER pane — pipeline is live; fills itself on draft day.
   var rosterHtml = _extRosterPaneHtml(row, myIds);
 
@@ -234752,11 +234841,11 @@ function extOpenLeague(key) {
     '  </div>' +
     '</div>' +
     '<div class="sk-detail-tabs">' +
-      // SLTRUTH -- not for Sleeper. Its matchups[].points is the sum of
-      // each player's LATEST game; the number Sleeper shows is the sum of
-      // the LOCKED ones, and the lock is not in the API. A matchup tab
-      // here can only ever print a figure his own league contradicts.
-      ((isH2H && row.provider !== 'sleeper')
+      // SLMATCH -- back for Sleeper, on this week's movement in its own
+      // season totals rather than on matchups[].points, which SLTRUTH
+      // caught crediting each player's latest game instead of the locked
+      // one. Shown only where that subtraction resolves.
+      (_showMatchup
         ? '<button class="sk-detail-tab" data-exttab="matchup" onclick="extSetDetailTab(\'matchup\')">Matchup</button>'
         : '') +
       '<button class="sk-detail-tab" data-exttab="standings" onclick="extSetDetailTab(\'standings\')">Standings</button>' +
@@ -234784,10 +234873,10 @@ function extOpenLeague(key) {
         ? '<button class="sk-detail-tab" data-exttab="bracket" onclick="extSetDetailTab(\'bracket\')">Bracket</button>'
         : '') +
     '</div>' +
-    ((isH2H && row.provider !== 'sleeper')
+    (_showMatchup
       ? '<div class="sk-detail-pane" data-extpane="matchup">' + matchupHtml + '</div>' : '') +
     '<div class="sk-detail-pane" data-extpane="standings"' +
-      ((row.provider === 'sleeper') ? '' : ' style="display:none"') + '>' +
+      (_showMatchup ? ' style="display:none"' : '') + '>' +
       standingsHtml +
       // SLTRUTH -- say why the rest is missing, where he will look for
       // it. A feature that quietly is not there reads as a bug, and this
@@ -234795,11 +234884,13 @@ function extOpenLeague(key) {
       ((row.provider === 'sleeper')
         ? ('<div style="color:rgba(255,255,255,0.4);font-size:10px;line-height:1.5;' +
            'margin-top:10px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.08)">' +
-           'Scores are not shown for Sleeper. In lock-in leagues Sleeper counts ' +
-           'one chosen game per player, and its API publishes the sum of each ' +
-           'player\u2019s latest game instead \u2014 so any figure derived here ' +
-           'disagrees with the league itself. These standings come from ' +
-           'Sleeper\u2019s own record and are unaffected.</div>')
+           // SLMATCH -- this said scores were not shown for Sleeper, which
+           // stopped being true the moment they came off the season
+           // totals. A note that contradicts the screen is worse than none.
+           'Records and points come from Sleeper\u2019s own season totals. ' +
+           'Weekly scores are the movement in those totals, not the matchups ' +
+           'feed, which credits each player\u2019s latest game rather than ' +
+           'the one a lock-in league counted.</div>')
         : '') +
       '</div>' +
     ((row.provider === 'fantrax' && typeof extFormatKey === 'function' && extFormatKey(row) === 'roto')
@@ -234822,8 +234913,11 @@ function extOpenLeague(key) {
       : '');
 
   skSwitchView('extdetail');
-  // SLTRUTH -- Sleeper opens on standings, which is the tab it has.
-  extSetDetailTab((hasGames && row.provider !== 'sleeper') ? 'matchup' : 'standings');
+  // SLMATCH -- Sleeper opened on standings because standings was the
+  // only tab it had. It has a matchup board again wherever the week
+  // resolves, and _showMatchup is the same test that drew the tab, so
+  // the two cannot drift apart.
+  extSetDetailTab((hasGames && _showMatchup) ? 'matchup' : 'standings');
   // Register on the nav stack so the hardware back gesture closes this
   // view the same way it closes the Yahoo detail view.
   if (typeof skNavPush === 'function') {
