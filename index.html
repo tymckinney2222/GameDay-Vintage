@@ -34239,6 +34239,11 @@
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M3 10h18M8 2v4M16 2v4"/></svg>
       <span>Probe ESPN weekly dates</span>
     </button>
+    <!-- SLWKPROBE — why a Sleeper league has no week-by-week history -->
+    <button class="sk-account-item" onclick="skProbeSleeperWeeks(); skCloseAccountMenu();">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M7 15l4-5 3 3 5-7"/></svg>
+      <span>Probe Sleeper weeks</span>
+    </button>
     <!-- GPPROBE — on-screen diagnostic, no devtools needed -->
     <button class="sk-account-item" onclick="skProbeGpCaps(); skCloseAccountMenu();">
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
@@ -203352,9 +203357,36 @@ function _mrSlNeeded(row) {
     var cw = _slStateWeek[String(row.sport || 'nfl')];
     last = cw ? cw - 1 : 0;
   }
+  // SLWKFLOOR -- both answers above are NFL-shaped. last_scored_leg is
+  // set on NFL leagues and /state/<sport>.week is the NFL week counter,
+  // so on an NBA league neither answers, last stays 0, and this returns
+  // an EMPTY list. Nothing is then ever fetched, nothing is banked, and
+  // the league is absent from Record by week and Close games while its
+  // season record sits right above them.
+  //
+  // My own W-L-T in the standings IS the count of matchup periods this
+  // league has decided, and the standings are the part that is known to
+  // be right. A bye or a playoff week I was out of is decided without
+  // adding to my record, so this is a LOWER bound: it can fall short by
+  // that many weeks, and it can never ask Sleeper for a leg that was
+  // never played. Whichever of the three reaches furthest wins.
+  var _slFloor = first + _mrSlDecided(row) - 1;
+  if (_slFloor > last) { last = _slFloor; }
   var out = [];
   for (var w = first; w <= last; w++) out.push(w);
   return out;
+}
+
+// SLWKFLOOR -- matchup periods decided, read off Sleeper's own record.
+// The shape _mrSlStandings writes is 'w-l-t'; anything else counts as
+// nothing known rather than as zero weeks played.
+function _mrSlDecided(row) {
+  var r = row && row.standings && row.standings.record;
+  if (!r) { return 0; }
+  var m = String(r).match(/^\s*(\d+)\s*-\s*(\d+)(?:\s*-\s*(\d+))?\s*$/);
+  if (!m) { return 0; }
+  return (parseInt(m[1], 10) || 0) + (parseInt(m[2], 10) || 0) +
+         (parseInt(m[3], 10) || 0);
 }
 function _mrSlLoadOne(row) {
   var key = row.key, id = String(key).slice(4);
@@ -203621,6 +203653,78 @@ function _mrSlHydrate(force) {
     }
     pump();
   });
+}
+
+// SLWKPROBE -- why a Sleeper league has no week-by-week history.
+// Record by week and Close games are built from banked weeks; a league
+// with nothing banked is invisible in both while its season record sits
+// directly above them, which reads as a bug in the panels rather than a
+// gap in what was ever fetched. Every link in that chain prints here.
+// On screen, not to the console -- this app is developed on a phone.
+function skProbeSleeperWeeks() {
+  var L = [];
+  function say(t) { L.push(t == null ? '' : String(t)); }
+  var rows = [], i, k;
+  try { rows = (typeof extSyncedLeaguesAll === 'function') ? extSyncedLeaguesAll() : []; } catch (e0) {}
+  var sl = [];
+  for (i = 0; i < rows.length; i++) {
+    if (rows[i] && rows[i].provider === 'sleeper') { sl.push(rows[i]); }
+  }
+  if (!sl.length) {
+    _skGpProbeShow('No Sleeper league is synced in this session.');
+    return;
+  }
+  say('SLEEPER WEEKLY PROBE');
+  say(sl.length + ' league(s)');
+  var _st = '{}';
+  try { _st = JSON.stringify(_slStateWeek); } catch (e1) {}
+  say('sport week from /state: ' + _st);
+  say('');
+
+  var inWeekly = {};
+  try {
+    var d = _mrCgCollect('pts');
+    for (i = 0; i < d.leagues.length; i++) {
+      if (d.leagues[i].plat === 'sleeper') {
+        inWeekly[d.leagues[i].key] = d.leagues[i].games.length;
+      }
+    }
+  } catch (e2) { say('collect failed: ' + (e2 && e2.message)); say(''); }
+
+  for (i = 0; i < sl.length; i++) {
+    var row = sl[i];
+    var se = (row.raw && row.raw.settings) || {};
+    var need = [];
+    try { need = _mrSlNeeded(row); } catch (e3) {}
+    var store = _mrCgStore(row.key), scored = 0, blank = 0;
+    for (k in store.w) {
+      if (!store.w.hasOwnProperty(k)) { continue; }
+      if (store.w[k] && store.w[k].length) { scored++; } else { blank++; }
+    }
+    say('-- ' + (row.name || row.key) +
+        '  [' + (row.sport || '?') + ' ' + (row.season || '?') + ']');
+    say('   key ' + row.key);
+    say('   my roster: ' + (row.myTeamIds
+          ? Object.keys(row.myTeamIds).join(',')
+          : 'NONE \u2014 standings not loaded yet'));
+    say('   record ' + ((row.standings && row.standings.record) || '(none)') +
+        '   \u2192 ' + _mrSlDecided(row) + ' matchup(s) decided');
+    say('   start_week=' + se.start_week +
+        '  last_scored_leg=' + se.last_scored_leg +
+        '  state=' + _slStateWeek[String(row.sport || 'nfl')]);
+    say('   WEEKS ASKED FOR: ' + (need.length
+          ? (need[0] + '\u2013' + need[need.length - 1] + ' (' + need.length + ')')
+          : 'NONE \u2014 nothing will ever be fetched'));
+    say('   banked: ' + scored + ' scored, ' + blank + ' known-empty (bye)');
+    say('   counts toward the record: ' + (skMrCounts(row)
+          ? 'yes' : 'NO \u2014 hidden, or season not started'));
+    say('   inflight=' + (_mrCgInflight[row.key] ? 'yes' : 'no') +
+        '  failed=' + (_mrCgFailed[row.key] || 'no'));
+    say('   IN RECORD BY WEEK: ' + (inWeekly[row.key] != null
+          ? (inWeekly[row.key] + ' game(s)') : 'NO'));
+    say('');
+  }
+  _skGpProbeShow(L.join('\n'));
 }
 
 // ── MGRWEEKLY ── Record by week, across every H2H league ──
@@ -204302,7 +204406,7 @@ function _mrCloseGamesHtml(kind) {
       : ('Scored on category wins, so 5-4-1 is a one-category margin. Counted apart from points ' +
          'leagues because the two margins can\u2019t be averaged. ')) +
     'Completed weeks only. A close-game record well away from .500 is mostly luck, and it tends ' +
-    'not to last. Yahoo, ESPN and Sleeper; Fantrax isn\u2019t in yet.' +
+    'not to last. Yahoo, ESPN, Sleeper and Fantrax.' +
     (d.pending ? (' Loading ' + d.pending + ' more league' + (d.pending === 1 ? '' : 's') + '\u2026') : '');
   if (d.rebuilt.length) {
     var rbn = [];
