@@ -143262,6 +143262,143 @@ function skRenderVsLeague() {
   _vslPaint(host, dates, myKey, oppKey, teamKeys, data);
 }
 
+// GAMEGAP -- one team's started-games across a set of dates, and how
+// many of those dates it actually has a count for.
+function _vslGpFor(teamKey, dates) {
+  var total = 0, have = 0, i, pos, m;
+  for (i = 0; i < dates.length; i++) {
+    m = (typeof _skGpReadTally === 'function') ? _skGpReadTally(teamKey, dates[i]) : null;
+    if (!m) { continue; }
+    have++;
+    for (pos in m) { if (m.hasOwnProperty(pos)) { total += (m[pos] || 0); } }
+  }
+  return { gp: total, days: have };
+}
+
+// The split. Returns null when there is not enough to say anything
+// honest, which is a better answer than a number built from half a week.
+function _vslGap(dates, myKey, oppKey, cells) {
+  if (!oppKey || !dates || dates.length < 2) { return null; }
+  var use = [], i, d, a, b;
+  for (i = 0; i < dates.length; i++) {
+    d = dates[i];
+    a = cells[myKey + '|' + d]; b = cells[oppKey + '|' + d];
+    if (a == null || b == null) { continue; }
+    // BOTH SIDES, BOTH THINGS. A margin built from seven of his days and
+    // five of theirs is not a margin.
+    if (!_skGpReadTally(myKey, d) || !_skGpReadTally(oppKey, d)) { continue; }
+    use.push(d);
+  }
+  if (!use.length) { return null; }
+  var Fm = 0, Fo = 0;
+  for (i = 0; i < use.length; i++) {
+    Fm += cells[myKey + '|' + use[i]];
+    Fo += cells[oppKey + '|' + use[i]];
+  }
+  var gm = _vslGpFor(myKey, use), go = _vslGpFor(oppKey, use);
+  if (!(gm.gp > 0) || !(go.gp > 0)) { return null; }
+  var Rm = Fm / gm.gp, Ro = Fo / go.gp;
+  var rate = (Rm - Ro) * ((gm.gp + go.gp) / 2);   // the margin at equal games
+  var vol = (gm.gp - go.gp) * ((Rm + Ro) / 2);    // what the games gap was worth
+  return { days: use.length, of: dates.length,
+           fm: Fm, fo: Fo, gm: gm.gp, go: go.gp, rm: Rm, ro: Ro,
+           margin: Fm - Fo, rate: rate, vol: vol };
+}
+
+function _vslGapHtml(g, data, oppKey, cats) {
+  if (!g) { return ''; }
+  var oppName = '';
+  try { oppName = (data.allTeams[oppKey] || {}).name || 'your opponent'; }
+  catch (e) { oppName = 'your opponent'; }
+  function sg(n) { return (n >= 0 ? '+' : '\u2212') + Math.abs(n).toFixed(1); }
+  var behind = (g.margin < 0);
+  var betterPerGame = (g.rate > 0);
+  var verdict, vcol, vsub;
+  if (behind && betterPerGame) {
+    verdict = cats ? 'OUT-SCHEDULED' : 'OUT-GAMED';
+    vcol = '#f59e0b';
+    vsub = cats
+      ? 'Your men scored more per start. You simply got fewer of them.'
+      : 'Your men scored more per start. The deficit is games, not play.';
+  } else if (behind) {
+    verdict = 'OUT-PLAYED';
+    vcol = '#f87171';
+    vsub = cats
+      ? 'Behind per start, not just on volume.'
+      : 'Behind per start as well as on the scoreboard.';
+  } else if (!betterPerGame) {
+    verdict = cats ? 'SCHEDULE AHEAD' : 'AHEAD ON VOLUME';
+    vcol = '#facc15';
+    vsub = 'Ahead on points, but scoring less per start \u2014 the extra ' +
+      'starts are carrying it.';
+  } else {
+    verdict = cats ? 'PLAYING AHEAD' : 'AHEAD ON PLAY';
+    vcol = '#4ade80';
+    vsub = 'Ahead per start, which is the half that holds up.';
+  }
+  // One caption over both columns, so a long club name is not competing
+  // with the words "per start" for the same fourteen characters.
+  function side(lab, f, gp, r, hi) {
+    return '<div style="flex:1;min-width:0">' +
+      '<div style="font-size:9px;font-weight:700;color:rgba(255,255,255,0.55);' +
+      'overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + lab + '</div>' +
+      '<div style="font-family:var(--sk-font-mono,monospace);font-size:16px;' +
+      'margin-top:3px' + (hi ? ';color:#facc15' : '') + '">' + r.toFixed(2) +
+      '</div>' +
+      '<div style="font-family:var(--sk-font-mono,monospace);font-size:9.5px;' +
+      'color:rgba(255,255,255,0.4);margin-top:1px">' + f.toFixed(1) + ' in ' +
+      gp + ' starts</div></div>';
+  }
+  return '<div style="border-top:1px solid rgba(255,255,255,0.07);' +
+    'padding:12px 14px 0;margin-top:2px">' +
+    '<div style="font-family:\'Barlow Condensed\',sans-serif;font-size:11px;' +
+    'font-weight:800;letter-spacing:0.14em;color:rgba(255,255,255,0.45)">' +
+      (cats ? 'PLAY OR SCHEDULE?' : 'BEATEN OR OUT-GAMED?') + '</div>' +
+    '<div style="font-family:\'Barlow Condensed\',sans-serif;font-size:21px;' +
+    'font-weight:900;letter-spacing:0.08em;color:' + vcol + ';margin-top:5px">' +
+      verdict + '</div>' +
+    '<div style="font-size:11px;color:rgba(255,255,255,0.5);margin-top:3px;' +
+    'line-height:1.45">' + skEscape(vsub) + '</div>' +
+    '<div style="font-size:8.5px;letter-spacing:0.12em;font-weight:700;' +
+    'color:rgba(255,255,255,0.3);margin-top:12px">POINTS PER START</div>' +
+    '<div style="display:flex;gap:14px;margin-top:5px">' +
+      side('You', g.fm, g.gm, g.rm, g.rm >= g.ro) +
+      side(skEscape(oppName), g.fo, g.go, g.ro, g.ro > g.rm) +
+    '</div>' +
+    '<div style="display:flex;gap:14px;margin-top:11px;padding-top:9px;' +
+    'border-top:1px solid rgba(255,255,255,0.055)">' +
+      '<div style="flex:1"><div style="font-size:8.5px;letter-spacing:0.12em;' +
+      'color:rgba(255,255,255,0.35);font-weight:700">AT EQUAL GAMES</div>' +
+      '<div style="font-family:var(--sk-font-mono,monospace);font-size:17px;' +
+      'margin-top:3px;color:' + (g.rate >= 0 ? '#4ade80' : '#f87171') + '">' +
+      sg(g.rate) + '</div></div>' +
+      '<div style="flex:1"><div style="font-size:8.5px;letter-spacing:0.12em;' +
+      'color:rgba(255,255,255,0.35);font-weight:700">THE GAMES GAP</div>' +
+      '<div style="font-family:var(--sk-font-mono,monospace);font-size:17px;' +
+      'margin-top:3px;color:' + (g.vol >= 0 ? '#4ade80' : '#f87171') + '">' +
+      sg(g.vol) + '</div></div>' +
+      '<div style="flex:1"><div style="font-size:8.5px;letter-spacing:0.12em;' +
+      'color:rgba(255,255,255,0.35);font-weight:700">ACTUAL</div>' +
+      '<div style="font-family:var(--sk-font-mono,monospace);font-size:17px;' +
+      'margin-top:3px;color:' + (g.margin >= 0 ? '#4ade80' : '#f87171') + '">' +
+      sg(g.margin) + '</div></div>' +
+    '</div></div>' +
+    '<div class="sk-vsl-note">A total is a rate times a volume, so the ' +
+    'margin splits exactly: ' + sg(g.rate) + ' from scoring better per ' +
+    'start, ' + sg(g.vol) + ' from the ' +
+    (g.gm === g.go ? 'games being level'
+                   : (Math.abs(g.gm - g.go) + '-start ' +
+                      (g.gm > g.go ? 'advantage' : 'deficit'))) +
+    '. The two add up to ' + sg(g.margin) + ' \u2014 no remainder. ' +
+    (cats ? '<b>This league is decided on categories, not this margin</b> ' +
+      '\u2014 read it as play against schedule, not as the result. The ' +
+      'start gap is what quietly moves the counting categories. ' : '') +
+    '<b>Starts are a lower bound</b>: Yahoo sends a line of zeros for a ' +
+    'rostered man whose club did not play, so anyone who dressed and ' +
+    'produced nothing at all is not counted. ' + g.days + ' of ' + g.of +
+    ' days have both sides loaded.</div>';
+}
+
 function _vslPaint(host, dates, myKey, oppKey, teamKeys, data) {
   if (!document.getElementById('skVslBody')) return;
   var cells = _vslState.cells;
@@ -143300,7 +143437,18 @@ function _vslPaint(host, dates, myKey, oppKey, teamKeys, data) {
     rows.map(function (r) { return r.html; }).join('') + '</table></div>' +
     '<div class="sk-vsl-note">Each cell is your daily total minus theirs \u2014 green ahead, red behind. ' +
       'TOT is the week margin. The record counts only teams with every day loaded.' +
-      (_vslState.pending > 0 ? ' Filling in\u2026' : '') + '</div>';
+      (_vslState.pending > 0 ? ' Filling in\u2026' : '') + '</div>' +
+    // GAMEGAP -- under the grid, because it answers the question the
+    // grid raises: the margin is there, this says what made it.
+    (function () {
+      try {
+        // The app's own test, used in two places already: a categories
+        // score reads "5-3-1", a points score reads "412.5".
+        var _sc = String((data.matchup && data.matchup.score) || '');
+        var _cats = _sc.indexOf('-') > 0;
+        return _vslGapHtml(_vslGap(dates, myKey, oppKey, cells), data, oppKey, _cats);
+      } catch (eG) { return ''; }
+    })();
 
   var rec = document.getElementById('skVslRec');
   if (rec) {
