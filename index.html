@@ -203370,11 +203370,26 @@ function _mrSlNeeded(row) {
   // adding to my record, so this is a LOWER bound: it can fall short by
   // that many weeks, and it can never ask Sleeper for a leg that was
   // never played. Whichever of the three reaches furthest wins.
-  var _slFloor = first + _mrSlDecided(row) - 1;
+  // SLMEDIAN -- in a league-average league every team also plays the
+  // league median, so a week decides TWO of my results. Dividing by
+  // that is what keeps 2-0-0 after one week from asking for week 2.
+  var _slPer = _mrSlPerWeek(row);
+  var _slDec = _mrSlDecided(row);
+  var _slWks = _slDec ? Math.ceil(_slDec / _slPer) : 0;
+  var _slFloor = first + _slWks - 1;
   if (_slFloor > last) { last = _slFloor; }
   var out = [];
   for (var w = first; w <= last; w++) out.push(w);
   return out;
+}
+
+// SLMEDIAN -- results my record gains in a single week. Sleeper's
+// league-average match plays everyone against the league median on top
+// of their opponent, so a week there is worth two. Nothing in this build
+// had ever read the flag.
+function _mrSlPerWeek(row) {
+  var st = (row && row.raw && row.raw.settings) || {};
+  return (Number(st.league_average_match) ? 2 : 1);
 }
 
 // SLWKFLOOR -- matchup periods decided, read off Sleeper's own record.
@@ -203388,12 +203403,38 @@ function _mrSlDecided(row) {
   return (parseInt(m[1], 10) || 0) + (parseInt(m[2], 10) || 0) +
          (parseInt(m[3], 10) || 0);
 }
+// SLWKSTALE -- a banked row with no score in it carries no information,
+// and the loader only ever asks for weeks that are ABSENT from the
+// store. So a week banked as 0-0 or as a pair of nulls by any earlier
+// build is never fetched again, and the league is pinned out of Record
+// by week for good. Retried instead -- once per session, so a week that
+// genuinely has no score cannot put the app in a loop.
+//
+// A BYE IS NOT BLANK. _mrSlLoadOne stores those as 0 rather than as a
+// row, which _mrCgWeeks already skips; left exactly as it is.
+var _slBlankRetried = {};
+function _slRowBlank(a) {
+  if (!a || !a.length) { return false; }
+  if (a[0] == null || a[1] == null) { return true; }
+  return Number(a[0]) === 0 && Number(a[1]) === 0;
+}
+function _slWeekMissing(st, key, wk) {
+  var k = String(wk);
+  if (!st.w.hasOwnProperty(k)) { return true; }
+  if (!_slRowBlank(st.w[k])) { return false; }
+  return !_slBlankRetried[key + ':' + k];
+}
+
 function _mrSlLoadOne(row) {
   var key = row.key, id = String(key).slice(4);
   var mine = row.myTeamIds || {};
   var st = _mrCgStore(key), miss = [];
   var need = _mrSlNeeded(row);
-  for (var i = 0; i < need.length; i++) if (!st.w.hasOwnProperty(String(need[i]))) miss.push(need[i]);
+  for (var i = 0; i < need.length; i++) {
+    if (!_slWeekMissing(st, key, need[i])) { continue; }
+    _slBlankRetried[key + ':' + String(need[i])] = 1;
+    miss.push(need[i]);
+  }
   if (!miss.length) return Promise.resolve('');
   var names = {};
   (row.standingsAll || []).forEach(function (r) { names[String(r.teamId)] = r.teamName; });
@@ -203625,7 +203666,11 @@ function _mrSlHydrate(force) {
       if (_mrCgInflight[r.key]) return false;
       if (_mrCgFailed[r.key] && !force) return false;
       var st = _mrCgStore(r.key), need = _mrSlNeeded(r);
-      for (var i = 0; i < need.length; i++) if (!st.w.hasOwnProperty(String(need[i]))) return true;
+      // SLWKSTALE -- same test the loader uses, without its marking, so
+      // the queue filter cannot consume the one retry it is checking for.
+      for (var i = 0; i < need.length; i++) {
+        if (_slWeekMissing(st, r.key, need[i])) { return true; }
+      }
       return false;
     });
     var running = 0;
@@ -203707,15 +203752,41 @@ function skProbeSleeperWeeks() {
     say('   my roster: ' + (row.myTeamIds
           ? Object.keys(row.myTeamIds).join(',')
           : 'NONE \u2014 standings not loaded yet'));
+    var _pp = _mrSlPerWeek(row), _pd = _mrSlDecided(row);
     say('   record ' + ((row.standings && row.standings.record) || '(none)') +
-        '   \u2192 ' + _mrSlDecided(row) + ' matchup(s) decided');
+        '   \u2192 ' + _pd + ' result(s) decided');
+    say('   league_average_match=' + se.league_average_match +
+        '  \u2192 ' + _pp + ' result(s) per week' +
+        '  \u2192 ' + (_pd ? Math.ceil(_pd / _pp) : 0) + ' week(s) played');
     say('   start_week=' + se.start_week +
         '  last_scored_leg=' + se.last_scored_leg +
         '  state=' + _slStateWeek[String(row.sport || 'nfl')]);
     say('   WEEKS ASKED FOR: ' + (need.length
           ? (need[0] + '\u2013' + need[need.length - 1] + ' (' + need.length + ')')
           : 'NONE \u2014 nothing will ever be fetched'));
-    say('   banked: ' + scored + ' scored, ' + blank + ' known-empty (bye)');
+    // SLWKWHY -- "scored" counted stored ARRAYS, and _mrCgPut always
+    // stores one; an array of nulls or of zeroes counted the same as a
+    // real score. That label is what hid the actual drop. Print the row
+    // and run it through the collector's own three filters.
+    say('   banked: ' + scored + ' row(s), ' + blank + ' known-empty (bye)');
+    var sLast = need.length ? need[need.length - 1] : 0;
+    var wks = [];
+    try { wks = _mrCgWeeks(row.key) || []; } catch (e4) {}
+    for (var wi = 0; wi < wks.length; wi++) {
+      var se = wks[wi], why;
+      if (se.week > sLast) {
+        why = 'DROPPED \u2014 after the last scored leg (' + sLast + ')';
+      } else if (se.myPts == null || se.oppPts == null) {
+        why = 'DROPPED \u2014 no score stored';
+      } else if (Number(se.myPts) === 0 && Number(se.oppPts) === 0) {
+        why = 'DROPPED \u2014 0-0, read as a week nobody played';
+      } else {
+        why = 'counted';
+      }
+      say('     wk' + se.week + '  my=' + se.myPts + '  opp=' + se.oppPts +
+          '  res=' + (se.result || '-') + '  vs ' + (se.oppName || '?'));
+      say('           ' + why);
+    }
     say('   counts toward the record: ' + (skMrCounts(row)
           ? 'yes' : 'NO \u2014 hidden, or season not started'));
     say('   inflight=' + (_mrCgInflight[row.key] ? 'yes' : 'no') +
@@ -203724,7 +203795,83 @@ function skProbeSleeperWeeks() {
           ? (inWeekly[row.key] + ' game(s)') : 'NO'));
     say('');
   }
+  say('\u2500\u2500 asking Sleeper directly \u2500\u2500');
+  say('(one matchups call per league)');
   _skGpProbeShow(L.join('\n'));
+  _slProbeLive(sl, L);
+}
+
+// SLWKWHY -- what /league/<id>/matchups/<week> actually answers with for
+// an NBA league. The banked rows come straight off matchups[].points, so
+// if those are zero or absent this is where it shows. Printed alongside
+// players_points, which is the only other number on the payload -- and
+// the one SLTRUTH says cannot be trusted in a lock-in league. Shown, not
+// used: this is a question being settled, not a fallback being wired in.
+function _slProbeLive(rows, L) {
+  if (typeof slFetchJson !== 'function') {
+    L.push('  slFetchJson is not available in this build.');
+    _skGpProbeShow(L.join('\n'));
+    return;
+  }
+  var at = 0;
+  function sumOf(o) {
+    var t = 0, k;
+    if (!o) { return null; }
+    for (k in o) { if (o.hasOwnProperty(k)) { t += Number(o[k]) || 0; } }
+    return Math.round(t * 10) / 10;
+  }
+  function side(tag, m) {
+    if (!m) { L.push('     ' + tag + ': (not found)'); return; }
+    L.push('     ' + tag + ' roster ' + m.roster_id +
+           '  matchup_id=' + m.matchup_id);
+    L.push('        points=' + JSON.stringify(m.points) +
+           '  custom_points=' + JSON.stringify(m.custom_points));
+    L.push('        starters_points sum=' + sumOf(m.starters_points) +
+           '  players_points sum=' + sumOf(m.players_points) +
+           '  starters=' + ((m.starters || []).length));
+  }
+  function next() {
+    if (at >= rows.length) { _skGpProbeShow(L.join('\n')); return; }
+    var row = rows[at++];
+    var id = String(row.key).slice(4);
+    var need = [];
+    try { need = _mrSlNeeded(row); } catch (e5) {}
+    var wk = need.length ? need[0] : 1;
+    L.push('-- ' + (row.name || row.key) + '  week ' + wk);
+    _skGpProbeShow(L.join('\n'));
+    slFetchJson(SLEEPER_BASE + '/league/' + id + '/matchups/' + wk)
+      .then(function (mus) {
+        if (!mus || !mus.length) {
+          L.push('     empty response');
+        } else {
+          var mine = row.myTeamIds || {}, me = null, opp = null, j;
+          for (j = 0; j < mus.length; j++) {
+            if (mine[String(mus[j].roster_id)]) { me = mus[j]; break; }
+          }
+          for (j = 0; j < mus.length; j++) {
+            if (me && mus[j] !== me && mus[j].matchup_id != null &&
+                mus[j].matchup_id === me.matchup_id) { opp = mus[j]; break; }
+          }
+          L.push('     ' + mus.length + ' roster(s) in the payload');
+          side('me ', me);
+          side('opp', opp);
+          if (me) {
+            var ks = [], k;
+            for (k in me) { if (me.hasOwnProperty(k)) { ks.push(k); } }
+            L.push('     keys: ' + ks.sort().join(' '));
+          }
+        }
+        L.push('');
+        _skGpProbeShow(L.join('\n'));
+        next();
+      }, function (err) {
+        L.push('     request failed: ' + (err && err.message ? err.message : err));
+        L.push('');
+        _skGpProbeShow(L.join('\n'));
+        next();
+      });
+  }
+  next();
 }
 
 // ── MGRWEEKLY ── Record by week, across every H2H league ──
