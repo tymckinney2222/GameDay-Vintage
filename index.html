@@ -143226,7 +143226,21 @@ function skRenderVsLeague() {
       // Compact totals cache first — one number, ~40 bytes, versus a 7 KB
       // roster we'd only sum anyway. FPTOTALS
       var t = _fptGet(tk, d);
-      if (t !== undefined) { _vslState.cells[ck] = t; return; }
+      // GAPHOLE -- BUT THE TALLY IS WRITTEN BY THE FETCH, so taking the
+      // cached total and stopping here left the starts store with a hole
+      // on exactly the days the cache was working. The total is forty
+      // bytes; the tally is the thing we have not got. If it is missing,
+      // the day is still worth asking for -- once, because the fetch
+      // writes the tally and a blank day now writes an empty one.
+      var haveTally = true;
+      try {
+        haveTally = !!(typeof _skGpReadTally === 'function'
+          ? _skGpReadTally(tk, d) : true);
+      } catch (eT) { haveTally = true; }
+      if (t !== undefined) {
+        _vslState.cells[ck] = t;
+        if (haveTally) { return; }
+      }
       need.push({ tk: tk, d: d, ck: ck });
     });
   });
@@ -158554,7 +158568,13 @@ var GP_LS_PREFIX = 'gptal_v1_';
 // nearly right beats a zero by the whole value of the feature.
 function _skGpWriteTally(teamKey, date, fpMap, isImmutable) {
   var day = _skGpCountDate(fpMap);
-  if (!Object.keys(day).length) return;     // nobody played - nothing to keep
+  // GAPHOLE -- A BLANK DAY IS WRITTEN DOWN. Returning here made "read,
+  // nobody played" indistinguishable from "never read", which is the
+  // ambiguity every reader downstream then had to guess its way around.
+  // Both existing readers already handle an empty map correctly: they
+  // count the day and add nought. And without this, the backfill below
+  // would ask for every blank day for ever, because the fetch it
+  // triggers writes nothing.
   var k = GP_LS_PREFIX + _fpKey(teamKey, date);
   var prev = null;
   try {
@@ -206612,6 +206632,9 @@ function _gwRow(L, dates) {
     tm = _vslGpFor(myKey, [d]); to = _vslGpFor(oppKey, [d]);
     gm += tm.gp; go += to.gp;
   }
+  row.blind = blind;
+  row.myKey = myKey;
+  row.oppKey = oppKey;
   if (!blind.length) {
     if (!(gm > 0) || !(go > 0)) { row.why = 'no starts recorded'; return row; }
     var RmW = g.my / gm, RoW = g.opp / go;
@@ -206867,8 +206890,22 @@ function _gwHtml(c) {
            'week itself cannot be split.</div>'));
     } else {
       h += '<div style="font-size:9.5px;color:rgba(255,255,255,0.3);margin-top:5px">' +
-        skEscape(r.why) + ' \u2014 open that league\u2019s matchup during a ' +
-        'week and the starts are kept from then on.</div>';
+        skEscape(r.why) +
+        ((r.blind && r.blind.length && r.myKey && r.oppKey)
+          ? ' \u2014 the starts for ' +
+            (r.blind.length === 1 ? 'that day' : 'those days') +
+            ' were never recorded. One request fetches them.'
+          : ' \u2014 open that league\u2019s matchup during a week and the ' +
+            'starts are kept from then on.') + '</div>';
+      if (r.blind && r.blind.length && r.myKey && r.oppKey) {
+        h += '<button onclick="_gwFill(\'' +
+          skEscape(String(r.key).replace(/'/g, '')) + '\')" ' +
+          'style="margin-top:6px;padding:4px 11px;border-radius:999px;' +
+          'border:1px solid rgba(255,255,255,0.18);background:none;' +
+          'color:rgba(255,255,255,0.6);font-size:9px;font-weight:700;' +
+          'letter-spacing:0.08em;cursor:pointer">' +
+          (_gwFilling[r.key] ? 'FETCHING\u2026' : 'FILL IN') + '</button>';
+      }
     }
     h += '</div>';
   }
@@ -206879,6 +206916,36 @@ function _gwHtml(c) {
     'not counted. Weekly head-to-head points leagues only \u2014 a ' +
     'categories matchup is not decided by this margin.</div>';
   return h;
+}
+
+// GAPHOLE -- fetch the days nobody was read on, for these two clubs
+// only, then redraw. Everything else on the sheet is already on the
+// device; this is the one thing that needs the network.
+var _gwFilling = {};
+
+function _gwFill(key) {
+  if (_gwFilling[key]) { return; }
+  var c = null;
+  try { c = _gwCollect(); } catch (e) { return; }
+  var row = null, i;
+  for (i = 0; i < c.rows.length; i++) { if (c.rows[i].key === key) { row = c.rows[i]; } }
+  if (!row || !row.blind || !row.blind.length || !row.myKey || !row.oppKey) { return; }
+  if (typeof fetchTeamFpForDate !== 'function') { return; }
+  _gwFilling[key] = 1;
+  _gwRender();
+  var jobs = [], d;
+  for (i = 0; i < row.blind.length; i++) {
+    d = row.blind[i];
+    jobs.push(fetchTeamFpForDate(row.myKey, d)['catch'](function () { return null; }));
+    jobs.push(fetchTeamFpForDate(row.oppKey, d)['catch'](function () { return null; }));
+  }
+  Promise.all(jobs).then(function () {
+    delete _gwFilling[key];
+    _gwRender();
+  }, function () {
+    delete _gwFilling[key];
+    _gwRender();
+  });
 }
 
 function _gwRender() {
