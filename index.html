@@ -33738,7 +33738,7 @@
 <div class="pw-overlay" id="skSurvOverlay">
   <div class="pp-header">
     <div>
-      <div class="pp-eyebrow">Nightly game</div>
+      <div class="pp-eyebrow">Nightly game · Player edition</div>
       <h2 class="pp-title">Survivor</h2>
     </div>
     <button class="pp-close" onclick="closeSurvivor()" aria-label="Close">
@@ -33746,6 +33746,21 @@
     </button>
   </div>
   <div class="pw-body" id="skSurvBody"></div>
+</div>
+
+<!-- SURVTEAM -- Team Edition. Same shell, same classes; a second
+     stylesheet for a second survivor is how two panels drift apart. -->
+<div class="pw-overlay" id="skStvOverlay">
+  <div class="pp-header">
+    <div>
+      <div class="pp-eyebrow">Nightly game · Team edition</div>
+      <h2 class="pp-title">Survivor</h2>
+    </div>
+    <button class="pp-close" onclick="closeSurvivorTeams()" aria-label="Close">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+    </button>
+  </div>
+  <div class="pw-body" id="skStvBody"></div>
 </div>
 
 <!-- AUCTGAMES -- Games. The two things he built, out of the utility
@@ -192530,9 +192545,25 @@ function _auctGamesHtml() {
   } catch (eS) {}
   h += '<div class="ld-tool-item" onclick="closeGames(); openSurvivor();">' +
     '<div class="ld-tool-icon">\ud83c\udfaf</div>' +
-    '<div class="ld-tool-name">Survivor' +
+    '<div class="ld-tool-name">Survivor: Player Edition' +
       '<div style="font-size:11px;color:rgba(255,255,255,0.45);' +
       'font-weight:400;margin-top:2px">' + skEscape(ssub) + '</div>' +
+    '</div>' +
+  '</div>';
+  // SURVTEAM -- the same idea one level up: clubs, not men.
+  var tsub = 'One team a night, none twice';
+  try {
+    var tr = _stvRecord();
+    if (tr.n) {
+      tsub = (tr.streak ? ('Streak ' + tr.streak) : 'Streak over') +
+        ' \u00b7 best ' + tr.best + ' \u00b7 ' + tr.w + '-' + tr.l;
+    }
+  } catch (eT) {}
+  h += '<div class="ld-tool-item" onclick="closeGames(); openSurvivorTeams();">' +
+    '<div class="ld-tool-icon">\ud83d\udee1\ufe0f</div>' +
+    '<div class="ld-tool-name">Survivor: Team Edition' +
+      '<div style="font-size:11px;color:rgba(255,255,255,0.45);' +
+      'font-weight:400;margin-top:2px">' + skEscape(tsub) + '</div>' +
     '</div>' +
   '</div>';
   var psub = 'Two buttons a game, every night';
@@ -192911,6 +192942,594 @@ function _svEnsurePool() {
 function closeSurvivor() {
   var ov = document.getElementById('skSurvOverlay');
   if (ov) { ov.classList.remove('open'); }
+}
+
+// \u2500\u2500 SURVIVOR \u00b7 TEAM EDITION \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+//
+// One club a night, they have to win, and none twice in a run. No rungs
+// and no categories: with thirty-two teams to a league the no-repeat
+// rule IS the difficulty, because burning Boston on a Tuesday is the
+// whole decision.
+//
+// Built on Pick 'Em's slate, odds and lock rather than beside them.
+// SURVCOLL -- every league he has coming into GameDay that fields two
+// sides and declares a winner. Pick 'Em's four, plus the college pair.
+var STV_LEAGUES = ['NFL', 'NBA', 'NHL', 'MLB', 'NCAAMB', 'NCAAWVB'];
+
+// NCAAMB on a board reads like a filing code. The app already keeps a
+// short label for every league it knows; use that rather than inventing
+// a second set that can drift from it.
+function _stvLgLabel(lg) {
+  try {
+    var cfg = (typeof LEAGUES !== 'undefined') ? LEAGUES[lg] : null;
+    if (cfg && cfg.label) { return cfg.label; }
+  } catch (e) {}
+  return String(lg || '');
+}
+
+var STV_KEY = 'skSurvT_v1';
+var STV_NIGHT_MAX = 120;
+var _stvState = { store: null, pool: null, note: '', busy: false,
+                  day: '', league: '', q: '' };
+
+function _stvTeamKey(league, id) { return String(league) + '|' + String(id); }
+
+function _stvStore() {
+  if (_stvState.store) { return _stvState.store; }
+  var st = null;
+  try { st = JSON.parse(localStorage.getItem(STV_KEY) || 'null'); } catch (e) { st = null; }
+  if (!st || typeof st !== 'object') { st = {}; }
+  if (!st.nights) { st.nights = {}; }
+  if (!st.used) { st.used = {}; }
+  if (!st.houseUsed) { st.houseUsed = {}; }
+  if (!st.history) { st.history = []; }
+  if (st.streak == null) { st.streak = 0; }
+  if (st.best == null) { st.best = 0; }
+  if (st.houseStreak == null) { st.houseStreak = 0; }
+  if (st.houseBest == null) { st.houseBest = 0; }
+  _stvState.store = st;
+  return st;
+}
+
+function _stvSave() {
+  var st = _stvState.store;
+  if (!st) { return; }
+  var keys = [], k, i;
+  for (k in st.nights) { if (st.nights.hasOwnProperty(k)) { keys.push(k); } }
+  if (keys.length > STV_NIGHT_MAX) {
+    keys.sort();
+    for (i = 0; i < keys.length - STV_NIGHT_MAX; i++) { delete st.nights[keys[i]]; }
+  }
+  if (st.history.length > STV_NIGHT_MAX) { st.history = st.history.slice(0, STV_NIGHT_MAX); }
+  try { localStorage.setItem(STV_KEY, JSON.stringify(st)); } catch (e2) {}
+}
+
+function _stvNight(date) {
+  var st = _stvStore();
+  return st.nights[date || _svToday()] || null;
+}
+
+// SURVWAIT, again -- a night before today still unscored means the used
+// list is a guess. If last night was a loss it should have CLEARED, and
+// picking against a stale one would refuse clubs he actually has back.
+function _stvPending() {
+  var st = _stvStore(), today = _svToday(), k;
+  for (k in st.nights) {
+    if (!st.nights.hasOwnProperty(k)) { continue; }
+    if (k < today && st.nights[k].locked && !st.nights[k].settled) { return k; }
+  }
+  return '';
+}
+
+// \u2500\u2500 tonight's clubs \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+// Two rows a game. The price is the market's, vig removed, via the same
+// _peOdds every Pick 'Em row is judged against -- so the two games can
+// never disagree about how hard a call was.
+function _stvBuildPool(games) {
+  var st = _stvStore();
+  var out = { rows: [], eligible: 0, started: 0, games: 0, leagues: {},
+              noMarket: 0 };
+  var now = Date.now(), i;
+
+  function add(g, t, opp, atHome, open) {
+    if (!t || !t.id) { return; }
+    var k = _stvTeamKey(g.league, t.id);
+    var p = null;
+    if (g.odds) { p = atHome ? g.odds.homeP : g.odds.awayP; }
+    if (p == null) { out.noMarket++; }
+    var usedNight = st.used[k] || 0;
+    out.rows.push({
+      key: k, teamId: String(t.id), abbr: t.abbr, name: t.name,
+      logo: t.logo || '', color: t.color || '', league: g.league,
+      oppAbbr: (opp && opp.abbr) || '?', atHome: !!atHome,
+      p: p, used: usedNight, started: !open, gameId: String(g.id),
+      start: g.start || '', detail: g.detail || ''
+    });
+    out.leagues[g.league] = (out.leagues[g.league] || 0) + (!usedNight && open ? 1 : 0);
+  }
+
+  for (i = 0; i < games.length; i++) {
+    var g = games[i];
+    if (!g || !g.home || !g.away) { continue; }
+    out.games++;
+    var open = _peIsOpen(g, now);
+    add(g, g.home, g.away, true, open);
+    add(g, g.away, g.home, false, open);
+  }
+  for (i = 0; i < out.rows.length; i++) {
+    var r = out.rows[i];
+    if (!r.used && !r.started) { out.eligible++; }
+    else if (r.started && !r.used) { out.started++; }
+  }
+  // Pickable first, then started, then spent; best price at the top.
+  out.rows.sort(function (a, b) {
+    var ra = a.used ? 2 : (a.started ? 1 : 0);
+    var rb = b.used ? 2 : (b.started ? 1 : 0);
+    if (ra !== rb) { return ra - rb; }
+    var pa = (a.p == null) ? -1 : a.p, pb = (b.p == null) ? -1 : b.p;
+    return pb - pa;
+  });
+  return out;
+}
+
+// THE HOUSE PLAYS THE SAME GAME -- its own used list, the same slate,
+// and never the club he just took.
+function _stvHousePick(pool, st, mineKey) {
+  var rows = pool.rows, i, cand = [];
+  var hu = st.houseUsed || {};
+  for (i = 0; i < rows.length; i++) {
+    if (rows[i].used || rows[i].started || hu[rows[i].key] ||
+        rows[i].key === mineKey) { continue; }
+    cand.push(rows[i]);
+    if (cand.length >= 3) { break; }
+  }
+  if (!cand.length) {
+    // Its own list has run dry. It may reuse one of its old clubs rather
+    // than go out on a technicality, but never a started one and never
+    // the one he just took.
+    for (i = 0; i < rows.length; i++) {
+      if (!rows[i].used && !rows[i].started && rows[i].key !== mineKey) {
+        cand.push(rows[i]); break;
+      }
+    }
+  }
+  if (!cand.length) { return null; }
+  var rnd = _auctRng('survt|house|' + _svToday() + '|' + st.streak);
+  return cand[Math.floor(rnd() * cand.length)] || cand[0];
+}
+
+function _stvSide(r) {
+  if (!r) { return null; }
+  return { key: r.key, teamId: r.teamId, abbr: r.abbr, name: r.name,
+           logo: r.logo, league: r.league, oppAbbr: r.oppAbbr,
+           atHome: r.atHome, p: r.p, gameId: r.gameId };
+}
+
+function _stvPick(key) {
+  var st = _stvStore(), date = _svToday();
+  if (st.nights[date] && st.nights[date].locked) { return; }
+  if (_stvState.busy && _stvPending()) { return; }
+  var pool = _stvState.pool;
+  if (!pool) { return; }
+  var row = null, i;
+  for (i = 0; i < pool.rows.length; i++) {
+    if (pool.rows[i].key === key) { row = pool.rows[i]; }
+  }
+  if (!row || row.used || row.started) { return; }
+  var hp = _stvHousePick(pool, st, row.key);
+  st.nights[date] = {
+    date: date, day: _stvState.day || date, night: (st.streak || 0) + 1,
+    locked: true, settled: false,
+    me: _stvSide(row), house: _stvSide(hp)
+  };
+  st.used[row.key] = st.nights[date].night;
+  if (hp) { st.houseUsed[hp.key] = st.nights[date].night; }
+  _stvSave();
+  _stvRender();
+  _stvRefresh(true);
+}
+
+// \u2500\u2500 the morning after \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+// What a finished game did to a side: 'W', 'L', 'N' for no contest, or
+// null when it is not decided yet.
+//
+// A POSTPONEMENT IS NOT A LOSS, and neither is a tie -- Pick 'Em learned
+// that the expensive way. Here it has teeth: a no contest leaves the
+// streak alone AND HANDS THE CLUB BACK, because a night he never got a
+// real shot at should not cost him a team for the rest of the run.
+function _stvGrade(side, byId) {
+  if (!side) { return null; }
+  var g = byId[String(side.gameId)];
+  if (!g) { return null; }
+  if (_peDead(g)) { return 'N'; }
+  if (!g.completed) { return null; }
+  var winner = g.home.winner ? g.home.id : (g.away.winner ? g.away.id : '');
+  if (!winner) { return 'N'; }
+  return (String(side.teamId) === String(winner)) ? 'W' : 'L';
+}
+
+function _stvSettle(date, games) {
+  var st = _stvStore(), N = st.nights[date];
+  if (!N || !N.locked || N.settled) { return false; }
+  var byId = {}, i;
+  for (i = 0; i < (games || []).length; i++) { byId[String(games[i].id)] = games[i]; }
+  var mine = _stvGrade(N.me, byId);
+  if (mine == null) { return false; }
+  var hers = _stvGrade(N.house, byId);
+  if (N.house && hers == null) { return false; }
+
+  N.settled = true;
+  N.result = mine;
+  N.houseResult = hers || '';
+  N.score = (function () {
+    var g = byId[String(N.me.gameId)];
+    if (!g) { return ''; }
+    return g.away.abbr + ' ' + g.away.score + ' \u2013 ' + g.home.score + ' ' + g.home.abbr;
+  })();
+
+  if (mine === 'N') {
+    // Never played, so never spent.
+    delete st.used[N.me.key];
+  } else if (mine === 'W') {
+    st.streak = (st.streak || 0) + 1;
+    if (st.streak > (st.best || 0)) { st.best = st.streak; }
+  } else {
+    st.history.unshift({ ended: date, length: st.streak || 0 });
+    st.streak = 0;
+    st.used = {};
+    st.houseUsed = {};
+  }
+  if (N.house) {
+    if (hers === 'N') { delete st.houseUsed[N.house.key]; }
+    else if (hers === 'W') {
+      st.houseStreak = (st.houseStreak || 0) + 1;
+      if (st.houseStreak > (st.houseBest || 0)) { st.houseBest = st.houseStreak; }
+    } else { st.houseStreak = 0; st.houseUsed = {}; }
+  }
+  _stvSave();
+  return true;
+}
+
+function _stvRefresh(force) {
+  if (_stvState.busy) { return; }
+  var st = _stvStore(), dates = [], k;
+  for (k in st.nights) {
+    if (st.nights.hasOwnProperty(k) && st.nights[k].locked && !st.nights[k].settled) {
+      dates.push(k);
+    }
+  }
+  dates.sort();
+  if (!dates.length) { return; }
+  _stvState.busy = true;
+  var streakWas = st.streak || 0;
+  _stvRender();
+  var jobs = [], i;
+  for (i = 0; i < dates.length; i++) {
+    (function (d) {
+      var N = st.nights[d];
+      jobs.push(_peFetchSlate(N.day || d, STV_LEAGUES).then(function (games) {
+        _stvSettle(d, games || []);
+      })['catch'](function () {}));
+    })(dates[i]);
+  }
+  function done() {
+    _stvState.busy = false;
+    if (_stvState.pool && st.streak !== streakWas) { _stvState.pool = null; }
+    _stvRender();
+    _stvEnsurePool();
+  }
+  Promise.all(jobs).then(done, done);
+}
+
+function _stvSetLeague(lg) {
+  _stvState.league = (_stvState.league === lg) ? '' : lg;
+  _stvState.q = '';
+  _stvRender();
+}
+
+function _stvSetQ(v) { _stvState.q = String(v || ''); _stvRender(); }
+
+function _stvVisible(pool) {
+  var q = _stvState.q.toLowerCase().replace(/\s+/g, ' ').trim();
+  var lg = _stvState.league, out = [], i, r;
+  for (i = 0; i < pool.rows.length; i++) {
+    r = pool.rows[i];
+    if (lg && r.league !== lg) { continue; }
+    if (q && (r.name + ' ' + r.abbr + ' ' + r.oppAbbr + ' ' + r.league +
+      ' ' + _stvLgLabel(r.league)).toLowerCase().indexOf(q) === -1) { continue; }
+    out.push(r);
+  }
+  return out;
+}
+
+function _stvOpenIn(rows) {
+  var n = 0, i;
+  for (i = 0; i < rows.length; i++) {
+    if (!rows[i].used && !rows[i].started) { n++; }
+  }
+  return n;
+}
+
+// A club's crest, from the league's own hosted file. Falls back to the
+// abbreviation, because a broken image is worse than no image.
+function _stvCrest(r, px) {
+  var sz = px || 26;
+  if (r.logo) {
+    return '<img src="' + skEscape(r.logo) + '" alt="" width="' + sz +
+      '" height="' + sz + '" style="flex:0 0 ' + sz + 'px;object-fit:contain" ' +
+      'onerror="this.style.display=\'none\'">';
+  }
+  return '<span style="flex:0 0 ' + sz + 'px;font-family:var(--sk-font-mono,monospace);' +
+    'font-size:10px;color:rgba(255,255,255,0.45);text-align:center">' +
+    skEscape(r.abbr) + '</span>';
+}
+
+function _stvStreakHtml(st, rec) {
+  var pips = '', i, n = Math.min(st.streak || 0, 14);
+  for (i = 0; i < n; i++) {
+    pips += '<i style="display:inline-block;width:20px;height:5px;border-radius:3px;' +
+      'background:#facc15;margin-right:5px"></i>';
+  }
+  pips += '<i style="display:inline-block;width:20px;height:5px;border-radius:3px;' +
+    'background:rgba(255,255,255,0.18)"></i>';
+  return '<div style="border:1px solid rgba(250,204,21,0.35);' +
+    'background:rgba(250,204,21,0.05);border-radius:12px;padding:12px 14px;margin:0 0 12px">' +
+    '<div style="font-size:9.5px;letter-spacing:0.14em;color:#facc15;font-weight:700">' +
+      (st.streak ? 'STREAK ALIVE' : 'NEW RUN') + '</div>' +
+    '<div style="display:flex;align-items:baseline;gap:9px;margin-top:5px">' +
+      '<span style="font:700 32px Georgia,serif;line-height:1">' + (st.streak || 0) + '</span>' +
+      '<span style="font-size:11.5px;color:rgba(255,255,255,0.5)">night' +
+        ((st.streak === 1) ? '' : 's') +
+        (rec.best ? (' \u00b7 best ' + rec.best) : '') +
+        (rec.n ? (' \u00b7 ' + rec.w + '-' + rec.l + ' all time') : '') +
+      '</span></div>' +
+    '<div style="margin-top:9px">' + pips + '</div></div>';
+}
+
+function _stvCardHtml(N) {
+  function side(lab, sd, res) {
+    if (!sd) { return ''; }
+    var col = (res === 'W') ? '#4ade80'
+      : ((res === 'L') ? '#f87171'
+        : ((res === 'N') ? 'rgba(255,255,255,0.55)' : 'rgba(255,255,255,0.35)'));
+    var mark = (res === 'W') ? 'WON' : ((res === 'L') ? 'LOST'
+      : ((res === 'N') ? 'NO CONTEST' : '\u2014'));
+    return '<div style="display:flex;align-items:center;gap:10px;padding:9px 0;' +
+      'border-bottom:1px solid rgba(255,255,255,0.045)">' +
+      _stvCrest(sd, 30) +
+      '<div style="flex:1;min-width:0">' +
+        '<div style="font-size:9px;letter-spacing:0.13em;color:rgba(255,255,255,0.35);' +
+        'font-weight:700">' + lab + '</div>' +
+        '<div style="font-size:14.5px;font-weight:600;margin-top:2px">' +
+          skEscape(sd.name) + '</div>' +
+        '<div style="font-family:var(--sk-font-mono,monospace);font-size:10px;' +
+        'color:rgba(255,255,255,0.42);margin-top:2px">' +
+          skEscape(_stvLgLabel(sd.league)) +
+          ' \u00b7 ' + (sd.atHome ? 'vs ' : '@ ') + skEscape(sd.oppAbbr) +
+          (sd.p != null ? (' \u00b7 ' + Math.round(sd.p * 100) + '%') : '') + '</div>' +
+      '</div>' +
+      '<div style="font-size:10px;letter-spacing:0.1em;font-weight:700;color:' + col + '">' +
+        mark + '</div></div>';
+  }
+  var head = '';
+  if (N.settled) {
+    var won = (N.result === 'W'), vd = (N.result === 'N');
+    var bc = vd ? 'rgba(255,255,255,0.18)' : (won ? 'rgba(74,222,128,0.4)' : 'rgba(248,113,113,0.4)');
+    var bg = vd ? 'rgba(255,255,255,0.03)' : (won ? 'rgba(74,222,128,0.07)' : 'rgba(248,113,113,0.07)');
+    var fg = vd ? 'rgba(255,255,255,0.75)' : (won ? '#4ade80' : '#f87171');
+    head = '<div style="border:1px solid ' + bc + ';background:' + bg +
+      ';border-radius:12px;padding:14px;text-align:center;margin:0 0 12px">' +
+      '<div style="font:27px Georgia,serif;color:' + fg + '">Night ' + N.night +
+        (vd ? ' \u2014 no contest' : (won ? ' \u2014 survived' : ' \u2014 out')) + '</div>' +
+      '<div style="font-size:11.5px;color:rgba(255,255,255,0.5);margin-top:5px">' +
+        skEscape(N.me.name) +
+        (vd ? ' never played. The streak keeps and you get them back.'
+            : (won ? ' got it done.' : ' lost.')) +
+        (N.score ? (' ' + skEscape(N.score) + '.') : '') + '</div></div>';
+  }
+  return '<div class="rg-dark rg-bleed">' + head +
+    '<div class="rg-sect">Tonight\u2019s picks</div>' +
+    side('YOU TOOK', N.me, N.settled ? N.result : '') +
+    side('THE HOUSE TOOK', N.house, N.settled ? N.houseResult : '') +
+    '<div class="rg-foot">' +
+      (N.settled ? 'Settled off the final score. Nothing to tap.'
+                 : 'Settles itself once the games are final.') +
+    '</div></div>';
+}
+
+function _stvRender() {
+  var host = document.getElementById('skStvBody');
+  if (!host) { return; }
+  var st = _stvStore(), rec = _stvRecord();
+  var N = _stvNight();
+  var h = _stvStreakHtml(st, rec);
+  if (N && N.locked) {
+    h += _stvCardHtml(N);
+    host.innerHTML = h;
+    return;
+  }
+  if (_stvState.busy && _stvPending()) {
+    h += '<div class="sk-wire-sheet-empty">Scoring last night first\u2026 ' +
+      'a loss hands every club back.</div>';
+    host.innerHTML = h;
+    return;
+  }
+  if (_stvState.note) {
+    h += '<div class="sk-wire-sheet-empty">' + skEscape(_stvState.note) + '</div>';
+    host.innerHTML = h;
+    return;
+  }
+  var pool = _stvState.pool;
+  if (!pool) {
+    h += '<div class="sk-wire-sheet-empty">Reading tonight\u2019s fixtures\u2026</div>';
+    host.innerHTML = h;
+    return;
+  }
+  if (!pool.rows.length) {
+    h += '<div class="sk-wire-sheet-empty">Nothing on tonight. The streak keeps.</div>';
+    host.innerHTML = h;
+    return;
+  }
+
+  h += '<div style="border:1px solid rgba(255,255,255,0.07);' +
+    'background:rgba(255,255,255,0.03);border-radius:12px;padding:12px 14px;margin:0 0 12px">' +
+    '<div style="font-size:9.5px;letter-spacing:0.14em;color:rgba(255,255,255,0.4);' +
+    'font-weight:700">NIGHT ' + ((st.streak || 0) + 1) + '</div>' +
+    '<div style="font:19px Georgia,serif;margin-top:4px">Take one club. ' +
+      '<b style="color:#facc15">They have to win.</b></div>' +
+    '<div style="font-size:10.5px;color:rgba(255,255,255,0.38);margin-top:6px;' +
+    'line-height:1.5">No club twice in a run, so spending a good one tonight ' +
+    'is the whole decision. Prices are the market\u2019s, with the ' +
+    'bookmaker\u2019s margin taken out.</div></div>';
+
+  var rows = _stvVisible(pool);
+  var lgs = STV_LEAGUES, li;
+  h += '<div class="rg-dark rg-bleed">' +
+    '<div style="display:flex;gap:6px;margin:0 0 8px;overflow-x:auto;' +
+    '-webkit-overflow-scrolling:touch">';
+  h += '<button onclick="_stvSetLeague(\'\')" style="flex:0 0 auto;padding:6px 13px;' +
+    'border-radius:999px;font-size:12px;font-weight:700;cursor:pointer;' +
+    (!_stvState.league ? 'background:#facc15;color:#111;border:0'
+                       : 'background:transparent;color:rgba(255,255,255,0.6);' +
+                         'border:1px solid rgba(255,255,255,0.14)') + '">All ' +
+    '<span style="opacity:0.65;font-weight:400">' + pool.eligible + '</span></button>';
+  for (li = 0; li < lgs.length; li++) {
+    if (!pool.leagues[lgs[li]]) { continue; }
+    var on = (_stvState.league === lgs[li]);
+    h += '<button onclick="_stvSetLeague(\'' + lgs[li] + '\')" ' +
+      'style="flex:0 0 auto;padding:6px 13px;border-radius:999px;font-size:12px;' +
+      'font-weight:700;cursor:pointer;' +
+      (on ? 'background:#facc15;color:#111;border:0'
+          : 'background:transparent;color:rgba(255,255,255,0.6);' +
+            'border:1px solid rgba(255,255,255,0.14)') + '">' +
+      skEscape(_stvLgLabel(lgs[li])) +
+      ' <span style="opacity:0.65;font-weight:400">' + pool.leagues[lgs[li]] +
+      '</span></button>';
+  }
+  h += '</div>';
+  h += '<input id="skStvQ" type="search" placeholder="Search a club\u2026" ' +
+    'value="' + skEscape(_stvState.q || '') + '" oninput="_stvSetQ(this.value)" ' +
+    'style="width:100%;margin:0 0 8px;padding:8px 10px;border-radius:8px;' +
+    'background:#0d1220;color:#fff;border:1px solid rgba(255,255,255,0.12);' +
+    'font-size:13px;-webkit-appearance:none">';
+  h += '<div class="rg-sect">Tonight\u2019s clubs <span style="opacity:0.6">' +
+    _stvOpenIn(rows) + ' to pick' +
+    (rows.length > 60 ? (' \u00b7 showing 60 of ' + rows.length) : '') +
+    '</span></div>';
+  if (!rows.length) {
+    h += '<div class="rg-foot">Nothing here. Try another league or name.</div>';
+  }
+  var i, r;
+  for (i = 0; i < rows.length && i < 60; i++) {
+    r = rows[i];
+    var off = r.used || r.started;
+    var hopeless = !off && r.p != null && r.p < 0.35;
+    var slim = !off && (r.p == null || r.p < 0.55);
+    h += '<div style="display:flex;align-items:center;gap:11px;padding:9px 0;' +
+      'border-bottom:1px solid rgba(255,255,255,0.045)' +
+      (off ? ';opacity:0.32' : (hopeless ? ';opacity:0.5;cursor:pointer'
+                                         : ';cursor:pointer')) + '"' +
+      (off ? '' : (' onclick="_stvPick(\'' + skEscape(r.key) + '\')"')) + '>' +
+      _stvCrest(r, 28) +
+      '<div style="flex:1;min-width:0">' +
+        '<div style="font-size:14.5px;font-weight:600;line-height:1.2">' +
+          skEscape(r.name) + '</div>' +
+        '<div style="font-family:var(--sk-font-mono,monospace);font-size:10px;' +
+        'color:rgba(255,255,255,0.42);margin-top:2px">' +
+          skEscape(_stvLgLabel(r.league)) +
+          ' \u00b7 ' + (r.atHome ? 'vs ' : '@ ') + skEscape(r.oppAbbr) + '</div>' +
+      '</div>' +
+      '<div style="text-align:right;flex:0 0 58px">' +
+        '<div style="font-family:var(--sk-font-mono,monospace);' +
+        (r.p == null ? 'font-size:10px;color:rgba(255,255,255,0.4)' : 'font-size:13px') +
+        '">' + (off ? '\u2014'
+                    : (r.p == null ? 'NO LINE' : (Math.round(r.p * 100) + '%'))) +
+        '</div></div>' +
+      (r.used
+        ? '<span style="font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.4);' +
+          'border:1px solid rgba(255,255,255,0.12);border-radius:999px;padding:3px 8px;' +
+          'font-weight:700">NIGHT ' + r.used + '</span>'
+        : (r.started
+          ? '<span style="font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.4);' +
+            'border:1px solid rgba(255,255,255,0.12);border-radius:999px;padding:3px 8px;' +
+            'font-weight:700">STARTED</span>'
+          : (slim
+            ? '<span style="font-size:9.5px;letter-spacing:0.1em;' +
+              'color:rgba(255,255,255,0.55);border:1px solid rgba(255,255,255,0.22);' +
+              'border-radius:999px;padding:4px 11px;font-weight:700">PICK</span>'
+            : '<span style="font-size:9.5px;letter-spacing:0.1em;color:#111;' +
+              'background:#facc15;border-radius:999px;padding:5px 12px;' +
+              'font-weight:700">PICK</span>'))) +
+      '</div>';
+  }
+  h += '<div class="rg-foot"><b>' + pool.games + '</b> game' +
+    (pool.games === 1 ? '' : 's') + ' tonight, <b>' + pool.eligible +
+    '</b> clubs still open to you.' +
+    (pool.started ? (' <b>' + pool.started + '</b> already started \u2014 ' +
+      'miss the window and no pick is recorded, and your streak keeps.')
+                  : ' The window on a club closes when its game starts.') +
+    (pool.noMarket
+      ? (' ' + ((pool.noMarket > pool.rows.length / 2)
+          ? 'Most college fixtures carry no moneyline, so they show NO LINE'
+          : (pool.noMarket + ' carry no line yet')) +
+         ' \u2014 still pickable, just unpriced.')
+      : '') +
+    '</div></div>';
+  host.innerHTML = h;
+}
+
+function openSurvivorTeams() {
+  var ov = document.getElementById('skStvOverlay');
+  if (!ov) { return; }
+  ov.classList.add('open');
+  _stvState.note = '';
+  _stvRender();
+  _stvRefresh(false);
+  _stvEnsurePool();
+}
+
+function _stvEnsurePool() {
+  var ov = document.getElementById('skStvOverlay');
+  if (!ov || ov.className.indexOf('open') === -1) { return; }
+  var N = _stvNight();
+  if (N && N.locked) { return; }
+  if (_stvState.busy && _stvPending()) { return; }
+  if (typeof _peFetchSlate !== 'function') {
+    _stvState.note = 'The fixture list is not available in this build.';
+    _stvRender();
+    return;
+  }
+  var day = _peToday();
+  _stvState.day = day;
+  _peFetchSlate(day, STV_LEAGUES).then(function (games) {
+    try { _stvState.pool = _stvBuildPool(games || []); }
+    catch (e) {
+      _stvState.note = 'Could not read tonight\u2019s fixtures: ' +
+        String((e && e.message) || e);
+    }
+    _stvRender();
+  }, function () {
+    _stvState.note = 'Could not reach the fixture list.';
+    _stvRender();
+  });
+}
+
+function closeSurvivorTeams() {
+  var ov = document.getElementById('skStvOverlay');
+  if (ov) { ov.classList.remove('open'); }
+}
+
+function _stvRecord() {
+  var st = _stvStore(), w = 0, l = 0, n = 0, k;
+  for (k in st.nights) {
+    if (!st.nights.hasOwnProperty(k) || !st.nights[k].settled) { continue; }
+    if (st.nights[k].result === 'W') { w++; }
+    else if (st.nights[k].result === 'L') { l++; }
+    else { n++; }        // no contests are not results
+  }
+  return { w: w, l: l, n: w + l, voids: n, streak: st.streak || 0,
+           best: st.best || 0, houseStreak: st.houseStreak || 0,
+           houseBest: st.houseBest || 0, runs: (st.history || []).length };
 }
 
 function openGames() {
@@ -203414,6 +204033,7 @@ function mrRenderBody() {
     // both injection points below without a second pair of edits.
     try { h += _auctMgrHtml(); } catch (eAu) {}
     try { h += _svMgrHtml(); } catch (eSv) {}
+    try { h += _stvMgrHtml(); } catch (eSt) {}
     return h;
   }
   var data = mrCollect();
@@ -203930,10 +204550,16 @@ function _peFairP(ho, ao) {
 }
 
 // A night's games across the four leagues. Returns a promise of a list.
-function _peFetchSlate(dayKey) {
+// SURVCOLL -- `leagues` is optional and defaults to Pick 'Em's own
+// four. Team Edition passes a longer list; nothing else should, because
+// _PE_LEAGUES is what Pick 'Em's grader and its fortnight of backfill
+// walk, and a college league in there is a fortnight of college
+// basketball fetched on every launch.
+function _peFetchSlate(dayKey, leagues) {
+  var list = (leagues && leagues.length) ? leagues : _PE_LEAGUES;
   var jobs = [], i;
-  for (i = 0; i < _PE_LEAGUES.length; i++) {
-    jobs.push(_peFetchLeagueDay(_PE_LEAGUES[i], dayKey));
+  for (i = 0; i < list.length; i++) {
+    jobs.push(_peFetchLeagueDay(list[i], dayKey));
   }
   return Promise.all(jobs).then(function (lists) {
     var out = [], j, k;
@@ -205276,7 +205902,7 @@ function _svMgrHtml() {
   if (!rec || (!rec.n && !rec.streak)) { return ''; }
   var st = _svStore();
   var h = '<div class="pe-mgr">' +
-    '<div class="pe-mgr-head">SURVIVOR' +
+    '<div class="pe-mgr-head">SURVIVOR \u00b7 PLAYERS' +
       '<button class="pe-mgr-go" onclick="closeManagerRecord();openSurvivor()">OPEN</button>' +
     '</div>' +
     '<div class="pe-mgr-top">' +
@@ -205295,6 +205921,47 @@ function _svMgrHtml() {
     h += '<div class="pe-mgr-note">Last run ended ' + skEscape(runs[0].ended) +
       ' at ' + runs[0].length + ' night' + ((runs[0].length === 1) ? '' : 's') +
       ' \u00b7 ' + runs.length + ' run' + ((runs.length === 1) ? '' : 's') + ' so far.</div>';
+  }
+  return h + '</div>';
+}
+
+// SURVTEAM -- its block, in the same classes as Pick 'Em's and the
+// player edition's. No contests get their own line: they are neither
+// wins nor losses and hiding them makes the night count disagree with
+// the record.
+function _stvMgrHtml() {
+  var rec;
+  try { rec = _stvRecord(); } catch (e) { return ''; }
+  if (!rec || (!rec.n && !rec.streak && !rec.voids)) { return ''; }
+  var st = _stvStore();
+  var h = '<div class="pe-mgr">' +
+    '<div class="pe-mgr-head">SURVIVOR \u00b7 TEAMS' +
+      '<button class="pe-mgr-go" onclick="closeManagerRecord();openSurvivorTeams()">OPEN</button>' +
+    '</div>' +
+    '<div class="pe-mgr-top">' +
+      '<div><span>STREAK</span><b>' + rec.streak + '</b></div>' +
+      '<div><span>BEST</span><b>' + rec.best + '</b></div>' +
+      '<div><span>NIGHTS</span><b>' + rec.w + '-' + rec.l + '</b></div>' +
+    '</div>';
+  if (rec.houseBest || rec.houseStreak) {
+    h += '<div class="pe-mgr-row">' +
+      '<span class="pe-mgr-lg">THE HOUSE</span>' +
+      '<span class="pe-mgr-rec">streak ' + rec.houseStreak + '</span>' +
+      '<span class="pe-mgr-pct">best ' + rec.houseBest + '</span></div>';
+  }
+  if (rec.voids) {
+    h += '<div class="pe-mgr-row">' +
+      '<span class="pe-mgr-lg">NO CONTEST</span>' +
+      '<span class="pe-mgr-rec">' + rec.voids + ' night' +
+        ((rec.voids === 1) ? '' : 's') + '</span>' +
+      '<span class="pe-mgr-pct">club returned</span></div>';
+  }
+  var runs = st.history || [];
+  if (runs.length) {
+    h += '<div class="pe-mgr-note">Last run ended ' + skEscape(runs[0].ended) +
+      ' at ' + runs[0].length + ' night' + ((runs[0].length === 1) ? '' : 's') +
+      ' \u00b7 ' + runs.length + ' run' + ((runs.length === 1) ? '' : 's') +
+      ' so far.</div>';
   }
   return h + '</div>';
 }
