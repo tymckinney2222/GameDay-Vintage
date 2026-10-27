@@ -34239,6 +34239,11 @@
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M3 10h18M8 2v4M16 2v4"/></svg>
       <span>Probe ESPN weekly dates</span>
     </button>
+    <!-- SKWIREID — which leagues the Wire has nothing to decorate with -->
+    <button class="sk-account-item" onclick="skProbeWireRows(); skCloseAccountMenu();">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19V5a2 2 0 0 1 2-2h11l3 3v13a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"/><path d="M8 8h8M8 12h8M8 16h5"/></svg>
+      <span>Probe the Wire</span>
+    </button>
     <!-- SLWKPROBE — why a Sleeper league has no week-by-week history -->
     <button class="sk-account-item" onclick="skProbeSleeperWeeks(); skCloseAccountMenu();">
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M7 15l4-5 3 3 5-7"/></svg>
@@ -126098,18 +126103,18 @@ async function skHydrateAll() {
   // skScanWireLeague reads it. skScanWire has its own in-flight guard
   // so this is idempotent across repeat hydrations.
   if (typeof skScanWire === 'function') skScanWire();
-  // SKWIREPAINT -- team names and crests are read out of skLeagueData at
-  // render time, and it is only full NOW. The Wire used to be slow
-  // enough that its own final render landed after this; a cached one
-  // paints in milliseconds and showed league names where team names go,
-  // over empty logo squares.
+  // SKBUMP — bank today's ranks for every season-points / roto league, so
+  // the rank movement chart fills in daily without opening each league.
+  if (typeof _skRankHistRecordYahoo === 'function') _skRankHistRecordYahoo();
+  // SKWIREID -- and NOW repaint the Wire. Names, crests and roto
+  // movement all come out of skLeagueData at render time, and the
+  // movement additionally needs the ranks SKBUMP has only just banked.
+  // My first cut put this above that line, so the repaint meant to
+  // restore the movement ran before the movement existed.
   if (typeof skState !== 'undefined' && skState.mode === 'wire' &&
       typeof skRenderWireCards === 'function') {
     try { skRenderWireCards(); } catch (eWP) {}
   }
-  // SKBUMP — bank today's ranks for every season-points / roto league, so
-  // the rank movement chart fills in daily without opening each league.
-  if (typeof _skRankHistRecordYahoo === 'function') _skRankHistRecordYahoo();
 }
 
 // Update a single card in place after its data lands. We re-build the
@@ -134002,13 +134007,18 @@ function skBuildWireSeasonSpread(entry) {
     'gap is measured from you</div></div>';
 }
 
-function _skWireMoveForLeague(league) {
+function _skWireMoveForLeague(league, entry) {
   if (!league) return null;
   var st = String(league.scoring_type || '');
   if (st !== 'point' && st !== 'roto') return null;
   var ld = (typeof skLeagueData === 'object' && skLeagueData)
     ? skLeagueData[league.league_key] : null;
-  var myId = ld && ld.team && ld.team.team_key;
+  // SKWIREID -- the ranks themselves are banked on the device and
+  // outlast any reload; only the team id to look them up with came from
+  // skLeagueData, so a league the live map has not reached yet lost its
+  // movement for no reason. The entry knows its own team.
+  var myId = (ld && ld.team && ld.team.team_key) ||
+             (entry && (entry._tk || entry.myTeamKey)) || null;
   if (!myId) return null;
   try { return _skRankMoveFor(league.league_key, myId); } catch (e) { return null; }
 }
@@ -134149,8 +134159,17 @@ function _skWireStubRowHTML(league, teamName, leagueName, logoUrl, fmtPill, mv, 
 function _skBuildWireLeagueRowHTML(league, entry) {
   var leagueData = skLeagueData[league.league_key] || {};
   var team = leagueData.team;
-  var teamName = (team && team.name) || league.name || '?';
-  var logoUrl = (team && team.logoUrl) || '';
+  // SKWIREID -- stamp the identity onto the entry whenever a render
+  // does find it, so a later one that does not still has it. The entry
+  // survives a reload; skLeagueData is rebuilt from scratch every time.
+  if (entry && team) {
+    if (team.name) { entry._tn = team.name; }
+    if (team.logoUrl) { entry._tl = team.logoUrl; }
+    if (team.team_key) { entry._tk = team.team_key; }
+  }
+  var teamName = (team && team.name) || (entry && entry._tn) ||
+                 league.name || '?';
+  var logoUrl = (team && team.logoUrl) || (entry && entry._tl) || '';
   var leagueName = league.name || '';
   var st = _skWireScoringType(league);   // WIREFMT — not the raw scoring_type
   var fmtPill = st === 'headpoint' ? 'H2H\u00b7PTS'
@@ -134164,7 +134183,7 @@ function _skBuildWireLeagueRowHTML(league, entry) {
   // bug: a roto league stops at the error guard below, and the movement code
   // used to live past it.
   var _mv0 = (typeof _skWireMoveForLeague === 'function')
-    ? _skWireMoveForLeague(league) : null;
+    ? _skWireMoveForLeague(league, entry) : null;
 
   if (!entry) {
     return _skWireStubRowHTML(league, teamName, leagueName, logoUrl, fmtPill,
@@ -204056,6 +204075,62 @@ function _mrSlHydrate(force) {
     }
     pump();
   });
+}
+
+// SKWIREID -- what each Wire row has to draw itself with.
+//
+// Name, crest and roto movement all come from skLeagueData[key].team,
+// so a row missing all three is one league whose hydration never
+// landed -- not three separate faults. This says which leagues those
+// are, and whether the entry behind each row was scanned or restored.
+function skProbeWireRows() {
+  var L = [];
+  function say(t) { L.push(t == null ? '' : String(t)); }
+  var synced = [];
+  try { synced = skWireLeagueList() || []; } catch (e0) {}
+  if (!synced.length) {
+    _skGpProbeShow('No leagues in the Wire list yet.');
+    return;
+  }
+  var bad = [], i;
+  say('WIRE ROW PROBE');
+  say(synced.length + ' league(s) in the list');
+  say('scanning=' + (skWireScanning ? 'yes' : 'no') +
+      '  entries=' + Object.keys(skWireCache).length);
+  var _stored = 0;
+  try {
+    var raw = localStorage.getItem(_skWireLsKey());
+    _stored = raw ? Object.keys((JSON.parse(raw) || {}).e || {}).length : 0;
+  } catch (e1) {}
+  say('saved for ' + skYesterdayDateString() + ': ' + _stored);
+  say('hydrated leagues: ' + Object.keys(skLeagueData || {}).length);
+  say('');
+  for (i = 0; i < synced.length; i++) {
+    var lg = synced[i], key = lg.league_key;
+    var ld = (skLeagueData || {})[key] || {};
+    var ent = skWireCache[key];
+    var hasTeam = !!(ld.team && ld.team.name);
+    var hasLogo = !!(ld.team && ld.team.logoUrl);
+    var mv = null;
+    try { mv = _skWireMoveForLeague(lg, ent); } catch (e2) {}
+    if (!hasTeam && !(ent && ent._tn)) { bad.push(lg); }
+    say((hasTeam ? '   ' : '!! ') + (lg.name || key));
+    say('     key ' + key + '  [' + (lg.provider || 'yahoo') + ' ' +
+        (lg.scoring_type || '?') + ']');
+    say('     skLeagueData: team=' + (hasTeam ? ld.team.name : 'NONE') +
+        '  logo=' + (hasLogo ? 'yes' : 'no'));
+    say('     entry: ' + (!ent ? 'NONE'
+          : ((ent._slim ? 'restored' : 'scanned') +
+             (ent.error ? ('  error=' + ent.error) : '') +
+             '  stamped=' + (ent._tn ? 'yes' : 'no'))));
+    say('     movement: ' + (mv ? JSON.stringify(mv) : 'none'));
+  }
+  say('');
+  say('\u2500\u2500 leagues with nothing to draw with: ' + bad.length + ' \u2500\u2500');
+  for (i = 0; i < bad.length; i++) {
+    say('  ' + (bad[i].name || bad[i].league_key) + '  (' + bad[i].league_key + ')');
+  }
+  _skGpProbeShow(L.join('\n'));
 }
 
 // SLWKPROBE -- why a Sleeper league has no week-by-week history.
