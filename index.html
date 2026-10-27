@@ -132789,6 +132789,41 @@ async function skScanWireEspLeague(lg) {
 // The renderer only ever asks a league for its key, its name and its
 // sport, so an ESPN row adapts into one rather than needing cards of its
 // own. _esp carries the row the scan works from.
+// ESPWIRESEED -- who he is in each ESPN league, without a scan.
+//
+// _espWireSeedIdentity is what writes skLeagueData for an esp: key --
+// skHydrateLeague only ever handles Yahoo -- and it was called from one
+// place: the bottom of skScanWireEspLeague. So the team name, the crest
+// and the team key that resolves the rank history were all side effects
+// of scanning, and a cached Wire that skips the scan lost all three.
+//
+// Everything it needs is already on the row: raw.teams for the name and
+// crest, myTeamId for which of them is his. Nothing is fetched here.
+function _espWireSeedAll(list) {
+  if (typeof _espWireSeedIdentity !== 'function') { return 0; }
+  var n = 0, i;
+  for (i = 0; list && i < list.length; i++) {
+    var lg = list[i];
+    if (!lg || lg.provider !== 'espn') { continue; }
+    var key = lg.league_key, row = lg._esp;
+    if (!key || !row) { continue; }
+    try {
+      var cur = (typeof skLeagueData === 'object' && skLeagueData)
+        ? skLeagueData[key] : null;
+      if (cur && cur.team && cur.team.name) { continue; }   // already known
+      var mine = row.myTeamId;
+      if (mine == null && row.myTeamIds) {
+        var ks = Object.keys(row.myTeamIds);
+        if (ks.length) { mine = ks[0]; }
+      }
+      if (mine == null) { continue; }
+      _espWireSeedIdentity(row, key, mine);
+      n++;
+    } catch (e) {}
+  }
+  return n;
+}
+
 function skWireLeagueList() {
   var out = [];
   try {
@@ -132838,6 +132873,10 @@ async function skScanWire() {
   // worked out and ask only about the rest. Stale leagues are pruned by
   // key elsewhere, which is what the wipe was really covering.
   _skWireLoad(synced);
+  // ESPWIRESEED -- a restored entry never runs the scan that used to do
+  // this, so seed here too rather than relying on a render having
+  // happened first.
+  try { _espWireSeedAll(synced); } catch (eSeed2) {}
   skUpdateWireCounter();
   if (skState.mode === 'wire') skRenderWireCards();
 
@@ -133003,6 +133042,11 @@ function skRenderWireCards() {
   var ctEl = document.getElementById('sk-section-ct');
 
   var synced = skWireLeagueList();
+  // ESPWIRESEED -- before a single row is built, because the name, the
+  // crest and the rank-history key all come from here and used to
+  // arrive only as a side effect of the scan. Idempotent: the seeder
+  // leaves an identity that is already there alone.
+  try { _espWireSeedAll(synced); } catch (eSeed) {}
   // Respect the active sport pill (All / MLB / NFL / NBA / NHL), matching how
   // Today and Plan filter. 'all' shows every sport; otherwise narrow to the
   // selected one. Everything below uses `synced` as the working set.
@@ -204118,7 +204162,12 @@ function skProbeWireRows() {
     say('     key ' + key + '  [' + (lg.provider || 'yahoo') + ' ' +
         (lg.scoring_type || '?') + ']');
     say('     skLeagueData: team=' + (hasTeam ? ld.team.name : 'NONE') +
-        '  logo=' + (hasLogo ? 'yes' : 'no'));
+        '  logo=' + (hasLogo ? 'yes' : 'no') +
+        (lg.provider === 'espn'
+          ? ('  seedable=' + ((lg._esp && (lg._esp.myTeamId != null ||
+              (lg._esp.myTeamIds && Object.keys(lg._esp.myTeamIds).length)))
+              ? 'yes' : 'NO'))
+          : ''));
     say('     entry: ' + (!ent ? 'NONE'
           : ((ent._slim ? 'restored' : 'scanned') +
              (ent.error ? ('  error=' + ent.error) : '') +
