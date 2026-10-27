@@ -194313,6 +194313,61 @@ function _csEnsurePool() {
   });
 }
 
+// \u2500\u2500 GMSETTLE \u00b7 the games settle while he watches \u2500\u2500\u2500\u2500\u2500\u2500
+// Every game in here grades off a slate it has to fetch, and each one
+// only fetched on the way in. One clock does it for all of them, which
+// is cheaper than four and easier to reason about than four.
+//
+// It runs only while a game is on screen and only while the screen is
+// being looked at -- polling behind a closed app is spending requests
+// on nobody, which is the rule Auction Night's clock already keeps.
+var GM_TICK_MS = 60000;
+var _gmTick = { id: 0, who: '' };
+
+function _gmOpen(id) {
+  var ov = document.getElementById(id);
+  return !!(ov && String(ov.className).indexOf('open') > -1);
+}
+
+function _gmTickStop() {
+  if (_gmTick.id) { clearInterval(_gmTick.id); }
+  _gmTick.id = 0;
+  _gmTick.who = '';
+}
+
+// Each of these returns immediately when it has nothing outstanding,
+// so a quiet tick costs one function call and no request.
+function _gmTickFire() {
+  if (document.hidden) { return; }
+  var w = _gmTick.who;
+  try {
+    if (w === 'stv' && _gmOpen('skStvOverlay')) { _stvRefresh(true); }
+    else if (w === 'sv' && _gmOpen('skSurvOverlay')) { _svRefresh(true); }
+    else if (w === 'cs' && _gmOpen('skCsOverlay')) { _csRefresh(true); }
+    else if (w === 'pe' && _gmOpen('peOverlay')) {
+      _peRunGrading().then(function (n) {
+        if (n) { _peRender(); }
+      }, function () {});
+    } else if (w) {
+      _gmTickStop();            // the screen went away another way
+    }
+  } catch (eGt) {}
+}
+
+function _gmTickStart(who) {
+  _gmTickStop();
+  _gmTick.who = who;
+  _gmTick.id = setInterval(_gmTickFire, GM_TICK_MS);
+}
+
+// GMSETTLE -- and the instant he comes back to the app, rather than up
+// to a minute afterwards. Coming back IS the moment he wants to know.
+try {
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden) { _gmTickFire(); }
+  });
+} catch (eGv) {}
+
 function openCallScore() {
   var ov = document.getElementById('skCsOverlay');
   if (!ov) { return; }
@@ -194321,11 +194376,13 @@ function openCallScore() {
   _csRender();
   _csRefresh(false);
   _csEnsurePool();
+  _gmTickStart('cs');
 }
 
 function closeCallScore() {
   var ov = document.getElementById('skCsOverlay');
   if (ov) { ov.classList.remove('open'); }
+  _gmTickStop();
 }
 
 // \u2500\u2500 AUCTGAMES \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
@@ -194740,6 +194797,7 @@ function openSurvivor() {
   _svRender();
   _svRefresh(false);
   _svEnsurePool();
+  _gmTickStart('sv');
 }
 
 // SURVWAIT -- built only once the streak is settled, because the rung
@@ -194773,6 +194831,7 @@ function _svEnsurePool() {
 function closeSurvivor() {
   var ov = document.getElementById('skSurvOverlay');
   if (ov) { ov.classList.remove('open'); }
+  _gmTickStop();
 }
 
 // \u2500\u2500 SURVIVOR \u00b7 TEAM EDITION \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
@@ -195148,10 +195207,19 @@ function _stvSettle(date, games) {
 
 function _stvRefresh(force) {
   if (_stvState.busy) { return; }
-  var st = _stvStore(), dates = [], k;
+  // GMSETTLE -- THE NIGHT-LEVEL locked/settled PAIR STOPPED BEING
+  // WRITTEN when STVSPORT moved the lock onto each sport's pick, so
+  // this collected nothing and Team Edition quietly stopped settling
+  // at all. _stvPending has had the per-sport shape since that change;
+  // the reader was updated and this, the writer's side, was not.
+  var st = _stvStore(), dates = [], k, sp;
   for (k in st.nights) {
-    if (st.nights.hasOwnProperty(k) && st.nights[k].locked && !st.nights[k].settled) {
-      dates.push(k);
+    if (!st.nights.hasOwnProperty(k)) { continue; }
+    var P0 = (st.nights[k] && st.nights[k].picks) || {};
+    for (sp in P0) {
+      if (P0.hasOwnProperty(sp) && P0[sp].locked && !P0[sp].settled) {
+        dates.push(k); break;
+      }
     }
   }
   dates.sort();
@@ -195624,6 +195692,7 @@ function openSurvivorTeams() {
   _stvRender();
   _stvRefresh(false);
   _stvEnsurePool();
+  _gmTickStart('stv');
 }
 
 function _stvEnsurePool() {
@@ -195655,6 +195724,7 @@ function _stvEnsurePool() {
 function closeSurvivorTeams() {
   var ov = document.getElementById('skStvOverlay');
   if (ov) { ov.classList.remove('open'); }
+  _gmTickStop();
 }
 
 // STVSPORT -- by sport, which is what a per-sport run makes meaningful.
@@ -207954,11 +208024,13 @@ function openPickEm() {
   if (!_peDay) _peDay = _peToday();
   _peRender();
   _peLoadDay(_peDay, true);
+  _gmTickStart('pe');
 }
 
 function closePickEm() {
   var ov = document.getElementById('peOverlay');
   if (ov) ov.classList.remove('open');
+  _gmTickStop();
 }
 
 // Fetch a night, and on the way in catch the record up on anything that has
