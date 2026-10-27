@@ -191662,13 +191662,17 @@ function _auctBoardHtml(b) {
 
 // The synced Yahoo hockey leagues, which are the only scoring settings
 // this can read.
-function _auctLeagues() {
+function _auctLeagues() { return _auctLeaguesFor(_auctSport()); }
+
+// AUCTDRAW -- by sport, because the draw has to look at a sport that is
+// not the one currently open.
+function _auctLeaguesFor(sport) {
   var out = [];
   try {
     var ls = (typeof skSyncedLeagues === 'function') ? (skSyncedLeagues() || []) : [];
     for (var i = 0; i < ls.length; i++) {
       var l = ls[i];
-      if (String((l && l.sport) || '').toLowerCase() !== _auctSport()) { continue; }
+      if (String((l && l.sport) || '').toLowerCase() !== String(sport)) { continue; }
       // AUCTFIX -- points leagues only. An auction needs ONE number per
       // player and a categories league does not produce one. Decided by
       // _skWireScoringType, which is the same answer the Wire's own
@@ -191710,7 +191714,8 @@ function _auctSetSport(sp) {
   _auctStopClock();
   var lgs = _auctLeagues();
   if (lgs.length) {
-    _auctPick(lgs[0].league_key);
+    // AUCTDRAW -- switching sports draws that sport's night too.
+    _auctPick(_auctTonight(sp) || lgs[0].league_key);
   } else {
     _auctState.note = '';
     _auctRender();
@@ -192254,7 +192259,7 @@ function _auctRender() {
       'does not have one.</div>';
     return;
   }
-  var sel = '<select id="skAuctLeague" onchange="_auctPick(this.value)" ' +
+  var sel = '<select id="skAuctLeague" onchange="_auctChooseLeague(this.value)" ' +
     'style="width:100%;padding:9px 10px;border-radius:8px;background:#0d1220;' +
     'color:#fff;border:1px solid rgba(255,255,255,0.12);font-size:13px;' +
     'margin:0 0 12px">';
@@ -192264,6 +192269,16 @@ function _auctRender() {
       skEscape(lgs[i].name || lgs[i].league_key) + '</option>';
   }
   sel += '</select>';
+  // AUCTDRAW2 -- so a league he did not choose does not read as one the
+  // app forgot to let him change. Says which state it is in: drawn for
+  // tonight, or his own override holding until tomorrow.
+  var _ovr = _auctOverrideFor(_auctSport(), _auctToday());
+  sel = '<div style="font-size:9px;letter-spacing:0.12em;' +
+    'color:rgba(255,255,255,0.35);margin:0 0 5px;">' +
+    (_ovr
+      ? 'YOUR PICK FOR TONIGHT \u00b7 DRAWN AGAIN TOMORROW'
+      : 'DRAWN FOR TONIGHT \u00b7 CHANGE IT IF YOU LIKE') +
+    '</div>' + sel;
   // AUCTNBA -- the roster, spelled out from the sport's own slots
   // rather than a hard-coded string that would quietly stay hockey.
   var _rl = '', _rs = _auctSlots(), _ri, _rj;
@@ -192305,6 +192320,14 @@ function _auctRender() {
       }
     } catch (eF2) {}
   }
+}
+
+// AUCTDRAW -- a league he picked HIMSELF, which holds for tonight only.
+// Separate from _auctPick because that is also how the overlay loads
+// the drawn league, and loading a draw must not record an override.
+function _auctChooseLeague(key) {
+  try { _auctSetOverride(_auctSport(), _auctToday(), key); } catch (e) {}
+  _auctPick(key);
 }
 
 function _auctPick(key) {
@@ -193632,21 +193655,108 @@ var _stvState = { store: null, pool: null, note: '', busy: false,
 
 function _stvTeamKey(league, id) { return String(league) + '|' + String(id); }
 
+// STVSPORT -- one run per sport. Each keeps its own streak, its own
+// best, its own no-repeat list and its own house, so a bad night in
+// one cannot end a run in another.
+function _stvSportSt(st, sp) {
+  if (!st.sports) { st.sports = {}; }
+  if (!st.sports[sp]) {
+    st.sports[sp] = { streak: 0, best: 0, used: {}, houseStreak: 0,
+                      houseBest: 0, houseUsed: {}, history: [] };
+  }
+  var S = st.sports[sp];
+  if (!S.used) { S.used = {}; }
+  if (!S.houseUsed) { S.houseUsed = {}; }
+  if (!S.history) { S.history = []; }
+  return S;
+}
+
+// STVSPORT -- rebuild the per-sport state from the nights themselves.
+//
+// Every stored night carries its sport on me.league and its outcome on
+// result, so replaying them in date order derives the streaks, bests
+// and used lists exactly. The alternative was guessing how to split one
+// streak four ways, which would have been a number he could not check.
+function _stvMigrate(st) {
+  if (st.v === 2) { return st; }
+  var dates = [], k, i;
+  for (k in st.nights) { if (st.nights.hasOwnProperty(k)) { dates.push(k); } }
+  dates.sort();
+  // Old shape -> picks keyed by sport.
+  for (i = 0; i < dates.length; i++) {
+    var N = st.nights[dates[i]];
+    if (!N || N.picks) { continue; }
+    var sp = (N.me && N.me.league) || '';
+    if (!sp) { delete st.nights[dates[i]]; continue; }
+    N.picks = {};
+    N.picks[sp] = { night: N.night || 0, locked: !!N.locked,
+                    settled: !!N.settled, me: N.me, house: N.house || null,
+                    result: N.result || '', houseResult: N.houseResult || '',
+                    score: N.score || '' };
+    delete N.me; delete N.house; delete N.result; delete N.houseResult;
+    delete N.score; delete N.locked; delete N.settled; delete N.night;
+  }
+  // Replay, oldest first.
+  st.sports = {};
+  for (i = 0; i < dates.length; i++) {
+    var M = st.nights[dates[i]];
+    if (!M || !M.picks) { continue; }
+    for (k in M.picks) {
+      if (!M.picks.hasOwnProperty(k)) { continue; }
+      var P = M.picks[k], S = _stvSportSt(st, k);
+      if (!P.locked) { continue; }
+      if (!P.settled) {
+        // Still open: the clubs are spent until it scores.
+        if (P.me) { S.used[P.me.key] = P.night || (S.streak + 1); }
+        if (P.house) { S.houseUsed[P.house.key] = P.night || (S.streak + 1); }
+        continue;
+      }
+      if (P.result === 'W') {
+        S.streak++;
+        if (S.streak > S.best) { S.best = S.streak; }
+        if (P.me) { S.used[P.me.key] = S.streak; }
+      } else if (P.result === 'L') {
+        S.history.unshift({ ended: dates[i], length: S.streak });
+        S.streak = 0; S.used = {}; S.houseUsed = {};
+      }
+      if (P.house) {
+        if (P.houseResult === 'W') {
+          S.houseStreak++;
+          if (S.houseStreak > S.houseBest) { S.houseBest = S.houseStreak; }
+          S.houseUsed[P.house.key] = S.houseStreak;
+        } else if (P.houseResult === 'L') {
+          S.houseStreak = 0; S.houseUsed = {};
+        }
+      }
+    }
+  }
+  delete st.used; delete st.houseUsed; delete st.streak; delete st.best;
+  delete st.houseStreak; delete st.houseBest; delete st.history;
+  st.v = 2;
+  return st;
+}
+
 function _stvStore() {
   if (_stvState.store) { return _stvState.store; }
   var st = null;
   try { st = JSON.parse(localStorage.getItem(STV_KEY) || 'null'); } catch (e) { st = null; }
   if (!st || typeof st !== 'object') { st = {}; }
   if (!st.nights) { st.nights = {}; }
-  if (!st.used) { st.used = {}; }
-  if (!st.houseUsed) { st.houseUsed = {}; }
-  if (!st.history) { st.history = []; }
-  if (st.streak == null) { st.streak = 0; }
-  if (st.best == null) { st.best = 0; }
-  if (st.houseStreak == null) { st.houseStreak = 0; }
-  if (st.houseBest == null) { st.houseBest = 0; }
+  if (!st.sports) { st.sports = {}; }
+  _stvMigrate(st);
   _stvState.store = st;
   return st;
+}
+
+// STVSPORT -- the sports with a pick in tonight, so the board knows
+// which are already answered.
+function _stvTaken(date) {
+  var N = _stvNight(date), out = {}, k;
+  if (!N || !N.picks) { return out; }
+  for (k in N.picks) {
+    if (N.picks.hasOwnProperty(k) && N.picks[k].locked) { out[k] = N.picks[k]; }
+  }
+  return out;
 }
 
 function _stvSave() {
@@ -193658,7 +193768,14 @@ function _stvSave() {
     keys.sort();
     for (i = 0; i < keys.length - STV_NIGHT_MAX; i++) { delete st.nights[keys[i]]; }
   }
-  if (st.history.length > STV_NIGHT_MAX) { st.history = st.history.slice(0, STV_NIGHT_MAX); }
+  var sp;
+  for (sp in (st.sports || {})) {
+    if (!st.sports.hasOwnProperty(sp)) { continue; }
+    var S = st.sports[sp];
+    if (S.history && S.history.length > STV_NIGHT_MAX) {
+      S.history = S.history.slice(0, STV_NIGHT_MAX);
+    }
+  }
   try { localStorage.setItem(STV_KEY, JSON.stringify(st)); } catch (e2) {}
 }
 
@@ -193674,7 +193791,12 @@ function _stvPending() {
   var st = _stvStore(), today = _svToday(), k;
   for (k in st.nights) {
     if (!st.nights.hasOwnProperty(k)) { continue; }
-    if (k < today && st.nights[k].locked && !st.nights[k].settled) { return k; }
+    if (k >= today) { continue; }
+    // STVSPORT -- any sport still unscored holds the night open.
+    var P = st.nights[k].picks || {}, sp;
+    for (sp in P) {
+      if (P.hasOwnProperty(sp) && P[sp].locked && !P[sp].settled) { return k; }
+    }
   }
   return '';
 }
@@ -193686,7 +193808,7 @@ function _stvPending() {
 function _stvBuildPool(games) {
   var st = _stvStore();
   var out = { rows: [], eligible: 0, started: 0, games: 0, leagues: {},
-              noMarket: 0 };
+              noMarket: 0, taken: _stvTaken(), open: {} };
   var now = Date.now(), i;
 
   function add(g, t, opp, atHome, open) {
@@ -193695,16 +193817,20 @@ function _stvBuildPool(games) {
     var p = null;
     if (g.odds) { p = atHome ? g.odds.homeP : g.odds.awayP; }
     if (p == null) { out.noMarket++; }
-    var usedNight = st.used[k] || 0;
+    // STVSPORT -- the no-repeat list belongs to the sport, not the run.
+    var usedNight = _stvSportSt(st, g.league).used[k] || 0;
     out.rows.push({
       key: k, teamId: String(t.id), abbr: t.abbr, name: t.name,
       logo: t.logo || '', color: t.color || '', league: g.league,
       record: t.record || '', oppRecord: (opp && opp.record) || '',
       oppAbbr: (opp && opp.abbr) || '?', atHome: !!atHome,
       p: p, used: usedNight, started: !open, gameId: String(g.id),
+      taken: !!out.taken[g.league],
       start: g.start || '', detail: g.detail || ''
     });
-    out.leagues[g.league] = (out.leagues[g.league] || 0) + (!usedNight && open ? 1 : 0);
+    if (!usedNight && open) { out.open[g.league] = 1; }
+    out.leagues[g.league] = (out.leagues[g.league] || 0) +
+      ((!usedNight && open && !out.taken[g.league]) ? 1 : 0);
   }
 
   for (i = 0; i < games.length; i++) {
@@ -193717,13 +193843,14 @@ function _stvBuildPool(games) {
   }
   for (i = 0; i < out.rows.length; i++) {
     var r = out.rows[i];
-    if (!r.used && !r.started) { out.eligible++; }
+    if (!r.used && !r.started && !r.taken) { out.eligible++; }
     else if (r.started && !r.used) { out.started++; }
   }
-  // Pickable first, then started, then spent; best price at the top.
+  // Pickable first, then started, then spent, then a sport already
+  // answered tonight; best price at the top. STVSPORT
   out.rows.sort(function (a, b) {
-    var ra = a.used ? 2 : (a.started ? 1 : 0);
-    var rb = b.used ? 2 : (b.started ? 1 : 0);
+    var ra = a.taken ? 3 : (a.used ? 2 : (a.started ? 1 : 0));
+    var rb = b.taken ? 3 : (b.used ? 2 : (b.started ? 1 : 0));
     if (ra !== rb) { return ra - rb; }
     var pa = (a.p == null) ? -1 : a.p, pb = (b.p == null) ? -1 : b.p;
     return pb - pa;
@@ -193733,10 +193860,12 @@ function _stvBuildPool(games) {
 
 // THE HOUSE PLAYS THE SAME GAME -- its own used list, the same slate,
 // and never the club he just took.
-function _stvHousePick(pool, st, mineKey) {
+// STVSPORT -- the house plays each sport, in that sport.
+function _stvHousePick(pool, st, sp, mineKey) {
   var rows = pool.rows, i, cand = [];
-  var hu = st.houseUsed || {};
+  var S = _stvSportSt(st, sp), hu = S.houseUsed || {};
   for (i = 0; i < rows.length; i++) {
+    if (rows[i].league !== sp) { continue; }
     if (rows[i].used || rows[i].started || hu[rows[i].key] ||
         rows[i].key === mineKey) { continue; }
     cand.push(rows[i]);
@@ -193747,13 +193876,14 @@ function _stvHousePick(pool, st, mineKey) {
     // than go out on a technicality, but never a started one and never
     // the one he just took.
     for (i = 0; i < rows.length; i++) {
+      if (rows[i].league !== sp) { continue; }
       if (!rows[i].used && !rows[i].started && rows[i].key !== mineKey) {
         cand.push(rows[i]); break;
       }
     }
   }
   if (!cand.length) { return null; }
-  var rnd = _auctRng('survt|house|' + _svToday() + '|' + st.streak);
+  var rnd = _auctRng('survt|house|' + _svToday() + '|' + sp + '|' + S.streak);
   return cand[Math.floor(rnd() * cand.length)] || cand[0];
 }
 
@@ -193767,7 +193897,6 @@ function _stvSide(r) {
 
 function _stvPick(key) {
   var st = _stvStore(), date = _svToday();
-  if (st.nights[date] && st.nights[date].locked) { return; }
   if (_stvState.busy && _stvPending()) { return; }
   var pool = _stvState.pool;
   if (!pool) { return; }
@@ -193776,14 +193905,25 @@ function _stvPick(key) {
     if (pool.rows[i].key === key) { row = pool.rows[i]; }
   }
   if (!row || row.used || row.started) { return; }
-  var hp = _stvHousePick(pool, st, row.key);
-  st.nights[date] = {
-    date: date, day: _stvState.day || date, night: (st.streak || 0) + 1,
-    locked: true, settled: false,
-    me: _stvSide(row), house: _stvSide(hp)
+  // STVSPORT -- ONE CLUB PER SPORT. A lock is the sport's, so taking a
+  // hockey club tonight leaves basketball open rather than closing the
+  // whole board.
+  var sp = row.league, S = _stvSportSt(st, sp);
+  if (!st.nights[date]) {
+    st.nights[date] = { date: date, day: _stvState.day || date, picks: {} };
+  }
+  if (!st.nights[date].picks) { st.nights[date].picks = {}; }
+  if (st.nights[date].picks[sp] && st.nights[date].picks[sp].locked) { return; }
+  var hp = _stvHousePick(pool, st, sp, row.key);
+  var nightNo = (S.streak || 0) + 1;
+  st.nights[date].picks[sp] = {
+    night: nightNo, locked: true, settled: false,
+    me: _stvSide(row), house: _stvSide(hp),
+    result: '', houseResult: '', score: ''
   };
-  st.used[row.key] = st.nights[date].night;
-  if (hp) { st.houseUsed[hp.key] = st.nights[date].night; }
+  S.used[row.key] = nightNo;
+  if (hp) { S.houseUsed[hp.key] = nightNo; }
+  _stvState.pool = null;
   _stvSave();
   _stvRender();
   _stvRefresh(true);
@@ -193808,46 +193948,52 @@ function _stvGrade(side, byId) {
   return (String(side.teamId) === String(winner)) ? 'W' : 'L';
 }
 
+// STVSPORT -- each sport settles on its own games and moves its own
+// run. A loss clears that sport's clubs and nobody else's.
 function _stvSettle(date, games) {
   var st = _stvStore(), N = st.nights[date];
-  if (!N || !N.locked || N.settled) { return false; }
-  var byId = {}, i;
+  if (!N || !N.picks) { return false; }
+  var byId = {}, i, sp, any = false;
   for (i = 0; i < (games || []).length; i++) { byId[String(games[i].id)] = games[i]; }
-  var mine = _stvGrade(N.me, byId);
-  if (mine == null) { return false; }
-  var hers = _stvGrade(N.house, byId);
-  if (N.house && hers == null) { return false; }
-
-  N.settled = true;
-  N.result = mine;
-  N.houseResult = hers || '';
-  N.score = (function () {
-    var g = byId[String(N.me.gameId)];
-    if (!g) { return ''; }
-    return g.away.abbr + ' ' + g.away.score + ' \u2013 ' + g.home.score + ' ' + g.home.abbr;
-  })();
-
-  if (mine === 'N') {
-    // Never played, so never spent.
-    delete st.used[N.me.key];
-  } else if (mine === 'W') {
-    st.streak = (st.streak || 0) + 1;
-    if (st.streak > (st.best || 0)) { st.best = st.streak; }
-  } else {
-    st.history.unshift({ ended: date, length: st.streak || 0 });
-    st.streak = 0;
-    st.used = {};
-    st.houseUsed = {};
+  for (sp in N.picks) {
+    if (!N.picks.hasOwnProperty(sp)) { continue; }
+    var P = N.picks[sp];
+    if (!P.locked || P.settled) { continue; }
+    var mine = _stvGrade(P.me, byId);
+    if (mine == null) { continue; }
+    var hers = _stvGrade(P.house, byId);
+    if (P.house && hers == null) { continue; }
+    var S = _stvSportSt(st, sp);
+    P.settled = true;
+    P.result = mine;
+    P.houseResult = hers || '';
+    P.score = (function () {
+      var g = byId[String(P.me.gameId)];
+      if (!g) { return ''; }
+      return g.away.abbr + ' ' + g.away.score + ' \u2013 ' + g.home.score + ' ' + g.home.abbr;
+    })();
+    if (mine === 'N') {
+      delete S.used[P.me.key];          // never played, so never spent
+    } else if (mine === 'W') {
+      S.streak = (S.streak || 0) + 1;
+      if (S.streak > (S.best || 0)) { S.best = S.streak; }
+    } else {
+      S.history.unshift({ ended: date, length: S.streak || 0 });
+      S.streak = 0;
+      S.used = {};
+      S.houseUsed = {};
+    }
+    if (P.house) {
+      if (hers === 'N') { delete S.houseUsed[P.house.key]; }
+      else if (hers === 'W') {
+        S.houseStreak = (S.houseStreak || 0) + 1;
+        if (S.houseStreak > (S.houseBest || 0)) { S.houseBest = S.houseStreak; }
+      } else { S.houseStreak = 0; S.houseUsed = {}; }
+    }
+    any = true;
   }
-  if (N.house) {
-    if (hers === 'N') { delete st.houseUsed[N.house.key]; }
-    else if (hers === 'W') {
-      st.houseStreak = (st.houseStreak || 0) + 1;
-      if (st.houseStreak > (st.houseBest || 0)) { st.houseBest = st.houseStreak; }
-    } else { st.houseStreak = 0; st.houseUsed = {}; }
-  }
-  _stvSave();
-  return true;
+  if (any) { _stvSave(); }
+  return any;
 }
 
 function _stvRefresh(force) {
@@ -193979,6 +194125,21 @@ function _stvVisible(pool) {
   return out;
 }
 
+// STVSPORT2 -- which sports are still waiting on a club tonight.
+function _stvLeftLabel(pool) {
+  var left = [], done = [], k;
+  for (k in pool.open) {
+    if (!pool.open.hasOwnProperty(k)) { continue; }
+    if (pool.taken[k]) { done.push(_stvLgLabel(k)); }
+    else { left.push(_stvLgLabel(k)); }
+  }
+  if (!left.length && !done.length) { return ''; }
+  var s1 = left.length
+    ? ('Still to pick: ' + left.join(', ') + '.')
+    : 'Every sport answered.';
+  return done.length ? (s1 + ' Taken: ' + done.join(', ') + '.') : s1;
+}
+
 function _stvOpenIn(rows) {
   var n = 0, i;
   for (i = 0; i < rows.length; i++) {
@@ -194001,29 +194162,69 @@ function _stvCrest(r, px) {
     skEscape(r.abbr) + '</span>';
 }
 
+// STVSPORT2 -- a run per sport, so the header is a row of them rather
+// than one number that could only ever describe one of them.
 function _stvStreakHtml(st, rec) {
-  var pips = '', i, n = Math.min(st.streak || 0, 14);
-  for (i = 0; i < n; i++) {
-    pips += '<i style="display:inline-block;width:20px;height:5px;border-radius:3px;' +
-      'background:#facc15;margin-right:5px"></i>';
+  var rows = (rec.by || []).slice(), i;
+  // Sports with a live run first, then by how much has been played in
+  // them -- a sport he started tonight should not sit under one he
+  // last touched in March.
+  rows.sort(function (a, b) {
+    return (b.streak - a.streak) || ((b.w + b.l) - (a.w + a.l));
+  });
+  var head = '<div style="border:1px solid rgba(250,204,21,0.35);' +
+    'background:rgba(250,204,21,0.05);border-radius:12px;padding:12px 14px;' +
+    'margin:0 0 12px">';
+  if (!rows.length) {
+    return head + '<div style="font-size:9.5px;letter-spacing:0.14em;' +
+      'color:#facc15;font-weight:700">NEW RUN</div>' +
+      '<div style="font-size:11.5px;color:rgba(255,255,255,0.5);margin-top:6px">' +
+      'One club per sport, every night. Each sport keeps its own run.' +
+      '</div>' + '</' + 'div>';
   }
-  pips += '<i style="display:inline-block;width:20px;height:5px;border-radius:3px;' +
-    'background:rgba(255,255,255,0.18)"></i>';
-  return '<div style="border:1px solid rgba(250,204,21,0.35);' +
-    'background:rgba(250,204,21,0.05);border-radius:12px;padding:12px 14px;margin:0 0 12px">' +
-    '<div style="font-size:9.5px;letter-spacing:0.14em;color:#facc15;font-weight:700">' +
-      (st.streak ? 'STREAK ALIVE' : 'NEW RUN') + '</div>' +
-    '<div style="display:flex;align-items:baseline;gap:9px;margin-top:5px">' +
-      '<span style="font:700 32px Georgia,serif;line-height:1">' + (st.streak || 0) + '</span>' +
-      '<span style="font-size:11.5px;color:rgba(255,255,255,0.5)">night' +
-        ((st.streak === 1) ? '' : 's') +
-        (rec.best ? (' \u00b7 best ' + rec.best) : '') +
-        (rec.n ? (' \u00b7 ' + rec.w + '-' + rec.l + ' all time') : '') +
-      '</span></div>' +
-    '<div style="margin-top:9px">' + pips + '</div></div>';
+  head += '<div style="font-size:9.5px;letter-spacing:0.14em;color:#facc15;' +
+    'font-weight:700">BY SPORT' +
+    (rec.n ? ('<span style="float:right;color:rgba(255,255,255,0.4);' +
+      'letter-spacing:0.06em">' + rec.w + '-' + rec.l + ' all time</span>') : '') +
+    '</div>';
+  for (i = 0; i < rows.length; i++) {
+    var R = rows[i], pips = '', p, np = Math.min(R.streak, 10);
+    for (p = 0; p < np; p++) {
+      pips += '<i style="display:inline-block;width:11px;height:4px;' +
+        'border-radius:3px;background:#facc15;margin-right:3px"></i>';
+    }
+    pips += '<i style="display:inline-block;width:11px;height:4px;' +
+      'border-radius:3px;background:rgba(255,255,255,0.18)"></i>';
+    head += '<div style="display:flex;align-items:center;gap:9px;margin-top:9px">' +
+      '<span style="flex:0 0 58px;font-size:10px;letter-spacing:0.1em;' +
+      'font-weight:700;color:rgba(255,255,255,0.75)">' +
+        skEscape(_stvLgLabel(R.sport).toUpperCase()) + '</span>' +
+      '<span style="font:700 22px Georgia,serif;line-height:1;flex:0 0 auto">' +
+        R.streak + '</span>' +
+      '<span style="flex:1;min-width:0;font-size:10.5px;' +
+      'color:rgba(255,255,255,0.45)">' +
+        (R.best ? ('best ' + R.best) : 'new run') +
+        ((R.w + R.l) ? (' \u00b7 ' + R.w + '-' + R.l) : '') + '</span>' +
+      '<span style="flex:0 0 auto">' + pips + '</span></div>';
+  }
+  return head + '</div>';
 }
 
 function _stvCardHtml(N) {
+  // STVSPORT2 -- one block per sport picked tonight.
+  var out = '', sp, keys = [], kk;
+  for (kk in (N.picks || {})) {
+    if (N.picks.hasOwnProperty(kk)) { keys.push(kk); }
+  }
+  keys.sort();
+  for (kk = 0; kk < keys.length; kk++) {
+    sp = keys[kk];
+    out += _stvPickHtml(sp, N.picks[sp]);
+  }
+  return out;
+}
+
+function _stvPickHtml(sp, P) {
   function side(lab, sd, res) {
     if (!sd) { return ''; }
     var col = (res === 'W') ? '#4ade80'
@@ -194050,6 +194251,7 @@ function _stvCardHtml(N) {
       '<div style="font-size:10px;letter-spacing:0.1em;font-weight:700;color:' + col + '">' +
         mark + '</div></div>';
   }
+  var N = P;
   var head = '';
   if (N.settled) {
     var won = (N.result === 'W'), vd = (N.result === 'N');
@@ -194058,7 +194260,8 @@ function _stvCardHtml(N) {
     var fg = vd ? 'rgba(255,255,255,0.75)' : (won ? '#4ade80' : '#f87171');
     head = '<div style="border:1px solid ' + bc + ';background:' + bg +
       ';border-radius:12px;padding:14px;text-align:center;margin:0 0 12px">' +
-      '<div style="font:27px Georgia,serif;color:' + fg + '">Night ' + N.night +
+      '<div style="font:27px Georgia,serif;color:' + fg + '">' +
+        skEscape(_stvLgLabel(sp)) + ' night ' + N.night +
         (vd ? ' \u2014 no contest' : (won ? ' \u2014 survived' : ' \u2014 out')) + '</div>' +
       '<div style="font-size:11.5px;color:rgba(255,255,255,0.5);margin-top:5px">' +
         skEscape(N.me.name) +
@@ -194067,12 +194270,12 @@ function _stvCardHtml(N) {
         (N.score ? (' ' + skEscape(N.score) + '.') : '') + '</div></div>';
   }
   return '<div class="rg-dark rg-bleed">' + head +
-    '<div class="rg-sect">Tonight\u2019s picks</div>' +
+    '<div class="rg-sect">' + skEscape(_stvLgLabel(sp)) + '</div>' +
     side('YOU TOOK', N.me, N.settled ? N.result : '') +
     side('THE HOUSE TOOK', N.house, N.settled ? N.houseResult : '') +
     '<div class="rg-foot">' +
       (N.settled ? 'Settled off the final score. Nothing to tap.'
-                 : 'Settles itself once the games are final.') +
+                 : 'Settles itself once these games are final.') +
     '</div></div>';
 }
 
@@ -194082,11 +194285,10 @@ function _stvRender() {
   var st = _stvStore(), rec = _stvRecord();
   var N = _stvNight();
   var h = _stvStreakHtml(st, rec);
-  if (N && N.locked) {
-    h += _stvCardHtml(N);
-    host.innerHTML = h;
-    return;
-  }
+  // STVSPORT2 -- a locked night used to end the screen, because a lock
+  // WAS the night. Now it locks one sport, so what has been taken goes
+  // on top and the board below stays live for the rest of the slate.
+  if (N && N.picks) { h += _stvCardHtml(N); }
   if (_stvState.busy && _stvPending()) {
     h += '<div class="sk-wire-sheet-empty">Scoring last night first\u2026 ' +
       'a loss hands every club back.</div>';
@@ -194105,7 +194307,23 @@ function _stvRender() {
     return;
   }
   if (!pool.rows.length) {
-    h += '<div class="sk-wire-sheet-empty">Nothing on tonight. The streak keeps.</div>';
+    h += '<div class="sk-wire-sheet-empty">Nothing on tonight. Every streak keeps.</div>';
+    host.innerHTML = h;
+    return;
+  }
+  // STVSPORT2 -- every sport on the slate answered, and nothing left to
+  // do but wait for the games.
+  var _openSp = [], _spk;
+  for (_spk in pool.open) {
+    if (pool.open.hasOwnProperty(_spk) && !pool.taken[_spk]) { _openSp.push(_spk); }
+  }
+  if (!_openSp.length) {
+    var _tookN = 0;
+    for (_spk in pool.taken) { if (pool.taken.hasOwnProperty(_spk)) { _tookN++; } }
+    h += '<div class="sk-wire-sheet-empty">' +
+      (_tookN ? ('That is every sport on tonight\u2019s slate \u2014 ' + _tookN +
+                 ' club' + (_tookN === 1 ? '' : 's') + ' taken. They settle themselves.')
+              : 'Nothing left open tonight.') + '</div>';
     host.innerHTML = h;
     return;
   }
@@ -194113,13 +194331,15 @@ function _stvRender() {
   h += '<div style="border:1px solid rgba(255,255,255,0.07);' +
     'background:rgba(255,255,255,0.03);border-radius:12px;padding:12px 14px;margin:0 0 12px">' +
     '<div style="font-size:9.5px;letter-spacing:0.14em;color:rgba(255,255,255,0.4);' +
-    'font-weight:700">NIGHT ' + ((st.streak || 0) + 1) + '</div>' +
-    '<div style="font:19px Georgia,serif;margin-top:4px">Take one club. ' +
-      '<b style="color:#facc15">They have to win.</b></div>' +
+    'font-weight:700">TONIGHT</div>' +
+    '<div style="font:19px Georgia,serif;margin-top:4px">One club in each sport. ' +
+      '<b style="color:#facc15">They all have to win.</b></div>' +
     '<div style="font-size:10.5px;color:rgba(255,255,255,0.38);margin-top:6px;' +
-    'line-height:1.5">No club twice in a run, so spending a good one tonight ' +
-    'is the whole decision. Prices are the market\u2019s, with the ' +
-    'bookmaker\u2019s margin taken out.</div></div>';
+    'line-height:1.5">Every sport runs its own streak, so a bad night in one ' +
+    'leaves the others alone. No club twice in that sport\u2019s run. Prices ' +
+    'are the market\u2019s, with the bookmaker\u2019s margin taken out.</div>' +
+    '<div style="font-size:10.5px;color:rgba(255,255,255,0.6);margin-top:7px">' +
+    skEscape(_stvLeftLabel(pool)) + '</div></div>';
 
   var rows = _stvVisible(pool);
   var lgs = STV_LEAGUES, li;
@@ -194161,7 +194381,9 @@ function _stvRender() {
   var i, r;
   for (i = 0; i < rows.length && i < 60; i++) {
     r = rows[i];
-    var off = r.used || r.started;
+    // STVSPORT2 -- a sport already answered tonight is spent, the same
+    // as a club already used or a game already started.
+    var off = r.used || r.started || r.taken;
     var hopeless = !off && r.p != null && r.p < 0.35;
     var slim = !off && (r.p == null || r.p < 0.55);
     h += '<div style="display:flex;align-items:center;padding:9px 0;' +
@@ -194204,7 +194426,11 @@ function _stvRender() {
         '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" ' +
         'stroke="currentColor" stroke-width="2" stroke-linecap="round">' +
         '<path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg></button>' +
-      (r.used
+      (r.taken
+        ? '<span style="font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.4);' +
+          'border:1px solid rgba(255,255,255,0.12);border-radius:999px;padding:3px 8px;' +
+          'font-weight:700">PICKED</span>'
+        : (r.used
         ? '<span style="font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.4);' +
           'border:1px solid rgba(255,255,255,0.12);border-radius:999px;padding:3px 8px;' +
           'font-weight:700">NIGHT ' + r.used + '</span>'
@@ -194218,7 +194444,7 @@ function _stvRender() {
               'border-radius:999px;padding:4px 11px;font-weight:700">PICK</span>'
             : '<span style="font-size:9.5px;letter-spacing:0.1em;color:#111;' +
               'background:#facc15;border-radius:999px;padding:5px 12px;' +
-              'font-weight:700">PICK</span>'))) +
+              'font-weight:700">PICK</span>')))) +
       '</div>';
   }
   h += '<div class="rg-foot"><b>' + pool.games + '</b> game' +
@@ -194281,17 +194507,49 @@ function closeSurvivorTeams() {
   if (ov) { ov.classList.remove('open'); }
 }
 
+// STVSPORT -- by sport, which is what a per-sport run makes meaningful.
+// The totals stay, because they are still the honest headline: picks
+// made and picks won, across everything.
 function _stvRecord() {
-  var st = _stvStore(), w = 0, l = 0, n = 0, k;
-  for (k in st.nights) {
-    if (!st.nights.hasOwnProperty(k) || !st.nights[k].settled) { continue; }
-    if (st.nights[k].result === 'W') { w++; }
-    else if (st.nights[k].result === 'L') { l++; }
-    else { n++; }        // no contests are not results
+  var st = _stvStore(), w = 0, l = 0, n = 0, k, sp;
+  var by = {}, order = [];
+  function slot(x) {
+    if (!by[x]) {
+      var S = _stvSportSt(st, x);
+      by[x] = { sport: x, w: 0, l: 0, voids: 0, streak: S.streak || 0,
+                best: S.best || 0, houseStreak: S.houseStreak || 0,
+                houseBest: S.houseBest || 0, runs: (S.history || []).length };
+      order.push(x);
+    }
+    return by[x];
   }
-  return { w: w, l: l, n: w + l, voids: n, streak: st.streak || 0,
-           best: st.best || 0, houseStreak: st.houseStreak || 0,
-           houseBest: st.houseBest || 0, runs: (st.history || []).length };
+  for (sp in (st.sports || {})) {
+    if (st.sports.hasOwnProperty(sp)) { slot(sp); }
+  }
+  for (k in st.nights) {
+    if (!st.nights.hasOwnProperty(k)) { continue; }
+    var P = st.nights[k].picks || {};
+    for (sp in P) {
+      if (!P.hasOwnProperty(sp) || !P[sp].settled) { continue; }
+      var B = slot(sp);
+      if (P[sp].result === 'W') { w++; B.w++; }
+      else if (P[sp].result === 'L') { l++; B.l++; }
+      else { n++; B.voids++; }     // no contests are not results
+    }
+  }
+  var rows = [], best = 0, streak = 0, hb = 0, hs = 0, runs = 0;
+  for (k = 0; k < order.length; k++) {
+    var R = by[order[k]];
+    rows.push(R);
+    if (R.best > best) { best = R.best; }
+    if (R.streak > streak) { streak = R.streak; }
+    if (R.houseBest > hb) { hb = R.houseBest; }
+    if (R.houseStreak > hs) { hs = R.houseStreak; }
+    runs += R.runs;
+  }
+  rows.sort(function (a, b) { return (b.w + b.l) - (a.w + a.l); });
+  return { w: w, l: l, n: w + l, voids: n, streak: streak, best: best,
+           houseStreak: hs, houseBest: hb, runs: runs, by: rows };
 }
 
 function openGames() {
@@ -194312,7 +194570,10 @@ function openAuctionNight() {
   if (!ov) { return; }
   ov.classList.add('open');
   var lgs = _auctLeagues();
-  if (!_auctState.leagueKey && lgs.length) { _auctState.leagueKey = lgs[0].league_key; }
+  // AUCTDRAW -- tonight's league, not "the first one synced".
+  if (!_auctState.leagueKey && lgs.length) {
+    _auctState.leagueKey = _auctTonight(_auctSport()) || lgs[0].league_key;
+  }
   _auctRender();
   if (_auctState.leagueKey && !_auctState.board) { _auctPick(_auctState.leagueKey); }
   if (_auctState.locked) { _auctRefreshLive(false); _auctStartClock(); }
@@ -194709,6 +194970,108 @@ var AUCT_STRATS = [
   { k: 'chalk', label: 'Chalk',
     note: 'the best man it can afford at every slot' }
 ];
+
+// ── AUCTDRAW ── tonight's league, drawn and written down ─────
+//
+// He plays one league per sport per night and does not want to pick it.
+// Seeded from the date so the same night always draws the same league,
+// and held off the ones it has just used so it works through them.
+//
+// WRITTEN DOWN RATHER THAN RECOMPUTED: _auctNights reads a card by date
+// AND league, so a past night whose league cannot be recovered is a
+// night "last night" looks straight past. Recomputing drifts as the
+// rotation moves on; a date-keyed record does not.
+var AUCT_DRAW_KEY = 'skAuctDraw_v1';
+var AUCT_DRAW_DATES = 150;   // dates remembered per sport
+var AUCT_DRAW_RECENT = 20;   // how far back the no-repeat list reaches
+
+function _auctDrawStore() {
+  var o = null;
+  try { o = JSON.parse(localStorage.getItem(AUCT_DRAW_KEY) || 'null'); } catch (e) {}
+  if (!o || typeof o !== 'object') { o = {}; }
+  return o;
+}
+
+function _auctDrawSave(o) {
+  try { localStorage.setItem(AUCT_DRAW_KEY, JSON.stringify(o)); } catch (e) {}
+}
+
+function _auctDrawSlot(o, sport) {
+  var k = String(sport);
+  if (!o[k] || typeof o[k] !== 'object') { o[k] = {}; }
+  if (!o[k].byDate || typeof o[k].byDate !== 'object') { o[k].byDate = {}; }
+  if (!(o[k].recent instanceof Array)) { o[k].recent = []; }
+  return o[k];
+}
+
+// The league drawn for one sport on one date. Stable: the first call
+// for a date decides it and every later call reads that back.
+function _auctDrawFor(sport, date) {
+  var o = _auctDrawStore(), sl = _auctDrawSlot(o, sport);
+  if (sl.byDate[date]) { return sl.byDate[date]; }
+  var lgs = _auctLeaguesFor(sport);
+  if (!lgs.length) { return ''; }
+  // Hold it off what it has just used, but never off everything: with
+  // two leagues the list would empty the pool on the second night.
+  var avoid = {}, i, n = Math.min(sl.recent.length, lgs.length - 1);
+  for (i = 0; i < n; i++) { avoid[sl.recent[i]] = 1; }
+  var pool = [];
+  for (i = 0; i < lgs.length; i++) {
+    if (!avoid[lgs[i].league_key]) { pool.push(lgs[i]); }
+  }
+  if (!pool.length) { pool = lgs; }
+  var rnd = _auctRng('auctlg|' + sport + '|' + date);
+  var pickIdx = Math.floor(rnd() * pool.length);
+  if (pickIdx >= pool.length) { pickIdx = pool.length - 1; }
+  var key = pool[pickIdx].league_key;
+  sl.byDate[date] = key;
+  sl.recent.unshift(key);
+  if (sl.recent.length > AUCT_DRAW_RECENT) {
+    sl.recent = sl.recent.slice(0, AUCT_DRAW_RECENT);
+  }
+  var ds = [], d;
+  for (d in sl.byDate) { if (sl.byDate.hasOwnProperty(d)) { ds.push(d); } }
+  if (ds.length > AUCT_DRAW_DATES) {
+    ds.sort();
+    for (i = 0; i < ds.length - AUCT_DRAW_DATES; i++) { delete sl.byDate[ds[i]]; }
+  }
+  _auctDrawSave(o);
+  return key;
+}
+
+// What was actually played on a past date, for "last night" to find.
+// The draw if one was recorded, nothing if not -- the caller falls back
+// to the open league, which is what every night before this behaved as.
+function _auctDrawOn(sport, date) {
+  var o = _auctDrawStore(), sl = _auctDrawSlot(o, sport);
+  return sl.byDate[date] || '';
+}
+
+// AUCTDRAW -- the dropdown still works. An override holds for tonight
+// only; tomorrow draws again, which is the point of not choosing.
+function _auctOverrideFor(sport, date) {
+  var o = _auctDrawStore(), sl = _auctDrawSlot(o, sport);
+  return (sl.over && sl.over.date === date) ? (sl.over.key || '') : '';
+}
+
+function _auctSetOverride(sport, date, key) {
+  var o = _auctDrawStore(), sl = _auctDrawSlot(o, sport);
+  sl.over = { date: date, key: String(key || '') };
+  _auctDrawSave(o);
+}
+
+// Tonight's league for a sport: his own choice if he made one today,
+// otherwise the draw. Falls back to the first synced league so a build
+// with no draw yet behaves exactly as it always did.
+function _auctTonight(sport) {
+  var date = _auctToday();
+  var ov = _auctOverrideFor(sport, date);
+  if (ov) { return ov; }
+  var drew = _auctDrawFor(sport, date);
+  if (drew) { return drew; }
+  var lgs = _auctLeaguesFor(sport);
+  return lgs.length ? lgs[0].league_key : '';
+}
 
 // AUCTLOT -- the same night draws the same lot.
 //
@@ -195338,6 +195701,35 @@ function _auctRecord() {
   return { all: all, by: by, order: order, n: list.length, rows: list };
 }
 
+// AUCTDRAW -- and by league. The book of finished nights already
+// stores r.league on every row, so this is one more grouping of the
+// same list rather than one more store. Names resolve from the synced
+// list; a league no longer synced keeps its key, because dropping the
+// row would quietly shrink a record he is reading as a total.
+function _auctRecordByLeague(sport) {
+  var list = _auctHist(), i, by = {}, order = [];
+  for (i = 0; i < list.length; i++) {
+    var r = list[i];
+    if (sport && String(r.sport || 'nhl').toLowerCase() !== String(sport)) { continue; }
+    var k = String(r.league || '');
+    if (!k) { continue; }
+    if (!by[k]) { by[k] = { w: 0, l: 0, t: 0, key: k, name: '' }; order.push(k); }
+    by[k][(r.result === 'W') ? 'w' : ((r.result === 'L') ? 'l' : 't')]++;
+  }
+  var lgs = [];
+  try { lgs = (typeof skSyncedLeagues === 'function') ? (skSyncedLeagues() || []) : []; } catch (e) {}
+  for (i = 0; i < lgs.length; i++) {
+    if (by[lgs[i].league_key]) { by[lgs[i].league_key].name = lgs[i].name || ''; }
+  }
+  var out = [];
+  for (i = 0; i < order.length; i++) { out.push(by[order[i]]); }
+  out.sort(function (a, c) {
+    return ((c.w + c.l + c.t) - (a.w + a.l + a.t)) ||
+           (String(a.name || a.key) < String(c.name || c.key) ? -1 : 1);
+  });
+  return out;
+}
+
 function _auctRecStr(t) {
   return t.w + '-' + t.l + (t.t ? ('-' + t.t) : '');
 }
@@ -195348,12 +195740,21 @@ function _auctRecStr(t) {
 var AUCT_LOOKBACK = 60;
 
 function _auctNights() {
-  var today = _auctToday(), out = [], i;
+  var today = _auctToday(), out = [], i, sp = _auctSport();
   for (i = 1; i <= AUCT_LOOKBACK; i++) {
     var d = _auctDateShift(today, -i);
     if (!d) { break; }
-    var c = _auctReadCard(d, _auctState.leagueKey);
-    if (c && c.locked) { out.push({ date: d, card: c }); }
+    // AUCTDRAW -- the league is no longer the same every night, so a
+    // card is looked for in the league that night was actually drawn
+    // in. The open league stays as the fallback, which is every night
+    // played before the draw existed.
+    var lk = _auctDrawOn(sp, d), c = null;
+    if (lk) { c = _auctReadCard(d, lk); }
+    if (!c && lk !== _auctState.leagueKey) {
+      c = _auctReadCard(d, _auctState.leagueKey);
+      if (c) { lk = _auctState.leagueKey; }
+    }
+    if (c && c.locked) { out.push({ date: d, card: c, league: lk }); }
   }
   return out;
 }
@@ -195409,8 +195810,8 @@ function _auctCheckLastNight() {
   _auctLiveFetch(false, ln.card.gids).then(function (box) {
     if (!box) { return; }
     _auctState.lastBox = box;
-    var row = _auctSettleNight(ln.date, _auctState.leagueKey, ln.card, box,
-      ln.card.sport || _auctSport());
+    var row = _auctSettleNight(ln.date, ln.league || _auctState.leagueKey,
+      ln.card, box, ln.card.sport || _auctSport());
     if (row) {
       _auctState.last = { date: ln.date, card: ln.card };
       _auctRender();
@@ -195494,6 +195895,28 @@ function _auctLastHtml() {
     h += '<div class="rg-foot" style="color:rgba(255,255,255,0.75)">Record ' +
       skEscape(_auctRecStr(rec.all)) + ' over ' + rec.n + ' night' +
       (rec.n === 1 ? '' : 's') + '.</div>';
+  }
+  // AUCTDRAW2 -- and by league, now that the league changes nightly.
+  // An overall record across a rotation says less than it used to.
+  var _bl = _auctRecordByLeague(_auctSport());
+  if (_bl.length > 1) {
+    h += '<div class="rg-sect">BY LEAGUE</div>';
+    for (var _bi = 0; _bi < _bl.length; _bi++) {
+      var _b = _bl[_bi], _bn = _b.w + _b.l + _b.t;
+      var _bc = (_b.w > _b.l) ? '#4ade80' : ((_b.w < _b.l) ? '#f87171' : 'rgba(255,255,255,0.7)');
+      h += '<div style="display:flex;align-items:baseline;gap:8px;padding:5px 0;' +
+        'border-bottom:1px solid rgba(255,255,255,0.05);font-size:12px;">' +
+        '<span style="flex:1;color:#fff;overflow:hidden;text-overflow:ellipsis;' +
+        'white-space:nowrap;' +
+        (_b.key === _auctState.leagueKey ? 'font-weight:800;' : '') + '">' +
+        skEscape(_b.name || _b.key) +
+        (_b.key === _auctState.leagueKey ? ' \u00b7 tonight' : '') + '</span>' +
+        '<span style="font-family:var(--sk-font-mono,monospace);font-weight:800;' +
+        'color:' + _bc + ';">' + skEscape(_auctRecStr(_b)) + '</span>' +
+        '<span style="font-size:9px;color:rgba(255,255,255,0.3);flex:0 0 46px;' +
+        'text-align:right;">' + _bn + ' night' + (_bn === 1 ? '' : 's') + '</span>' +
+        '</div>';
+    }
   }
   return h ? ('<div class="rg-dark rg-bleed">' + h + '</div>') : '';
 }
@@ -207292,11 +207715,35 @@ function _stvMgrHtml() {
         ((rec.voids === 1) ? '' : 's') + '</span>' +
       '<span class="pe-mgr-pct">club returned</span></div>';
   }
-  var runs = st.history || [];
-  if (runs.length) {
-    h += '<div class="pe-mgr-note">Last run ended ' + skEscape(runs[0].ended) +
-      ' at ' + runs[0].length + ' night' + ((runs[0].length === 1) ? '' : 's') +
-      ' \u00b7 ' + runs.length + ' run' + ((runs.length === 1) ? '' : 's') +
+  // STVSPORT3 -- a row per sport, which is the thing he asked to see.
+  // The streak, the best and the record belong to the sport now, so a
+  // single line underneath could only ever have been one of them.
+  var _by = rec.by || [], _bi;
+  for (_bi = 0; _bi < _by.length; _bi++) {
+    var _B = _by[_bi];
+    if (!(_B.w + _B.l + _B.voids) && !_B.streak) { continue; }
+    h += '<div class="pe-mgr-row">' +
+      '<span class="pe-mgr-lg">' + skEscape(_stvLgLabel(_B.sport).toUpperCase()) + '</span>' +
+      '<span class="pe-mgr-rec">' + _B.w + '-' + _B.l + '</span>' +
+      '<span class="pe-mgr-pct">' +
+        (_B.streak ? ('streak ' + _B.streak) : 'new run') +
+        (_B.best ? (' \u00b7 best ' + _B.best) : '') + '</span></div>';
+  }
+  // The most recent run to end, whichever sport ended it.
+  var _last = null, _runs = 0, _sp2;
+  for (_sp2 in (st.sports || {})) {
+    if (!st.sports.hasOwnProperty(_sp2)) { continue; }
+    var _hh = st.sports[_sp2].history || [];
+    _runs += _hh.length;
+    if (_hh.length && (!_last || _hh[0].ended > _last.ended)) {
+      _last = { ended: _hh[0].ended, length: _hh[0].length, sport: _sp2 };
+    }
+  }
+  if (_last) {
+    h += '<div class="pe-mgr-note">Last run ended ' + skEscape(_last.ended) +
+      ' in ' + skEscape(_stvLgLabel(_last.sport)) +
+      ' at ' + _last.length + ' night' + ((_last.length === 1) ? '' : 's') +
+      ' \u00b7 ' + _runs + ' run' + ((_runs === 1) ? '' : 's') +
       ' so far.</div>';
   }
   return h + '</div>';
