@@ -131711,6 +131711,136 @@ function _skCatWinner(myVal, oppVal, statMeta) {
   return (a < b) ? 'me' : 'opp';
 }
 
+// SKWIRECACHE -- the Wire's results, kept for the day they describe.
+//
+// Dropped from the saved copy: the day's rosters and everything built
+// out of them. _espRos alone is a whole mRoster payload, and both
+// sides' starters and benches hang off every entry -- eighteen ESPN
+// leagues of that would blow the quota by itself. The cards do not read
+// any of it; the detail sheet does, and it rescans that one league when
+// it is actually opened.
+//
+// `league` goes too, because an ESPN league carries its entire adapted
+// row on _esp. It is re-attached on load from the live list, which is
+// where it came from.
+var SK_WIRE_LS = 'skwire_v1_';
+// Only the genuinely huge ones. Starters, benches and the flip maps
+// stay: the cards read them, and so does the Lab, which builds straight
+// out of this cache rather than out of a sheet. Dropping those to save
+// a couple of KB would have quietly emptied it.
+var SK_WIRE_DROP = { league: 1, _espRos: 1, _espGame: 1, _espProMap: 1 };
+// Setting _slim means "a tap has to rescan this league first", so it is
+// set only where something a sheet needs was actually removed. A Yahoo
+// entry loses nothing but its league object, which is re-attached on
+// load, so it is saved whole and taps straight through.
+var SK_WIRE_HEAVY = ['_espRos', '_espGame', '_espProMap'];
+var SK_WIRE_ENTRY_MAX = 12000;     // characters, one league
+var SK_WIRE_TOTAL_MAX = 600000;    // characters, all of them
+
+function _skWireLsKey() { return SK_WIRE_LS + skYesterdayDateString(); }
+
+function _skWireSlim(entry) {
+  var out = {}, k, i;
+  for (k in entry) {
+    if (!entry.hasOwnProperty(k) || SK_WIRE_DROP[k]) { continue; }
+    out[k] = entry[k];
+  }
+  for (i = 0; i < SK_WIRE_HEAVY.length; i++) {
+    if (entry[SK_WIRE_HEAVY[i]] != null) { out._slim = 1; break; }
+  }
+  return out;
+}
+
+// Nothing is written before 5am: just after midnight "yesterday" is the
+// night that has only just ended, and a late finish or a stat
+// correction can still move it. Freezing that for the rest of the day
+// is the one way this could be worse than rescanning.
+function _skWireSave() {
+  try {
+    if (new Date().getHours() < 5) { return 0; }
+    var out = {}, total = 0, n = 0, k, str;
+    for (k in skWireCache) {
+      if (!skWireCache.hasOwnProperty(k)) { continue; }
+      var e = skWireCache[k];
+      if (!e || e.error) { continue; }
+      str = JSON.stringify(_skWireSlim(e));
+      if (!str || str.length > SK_WIRE_ENTRY_MAX) { continue; }
+      if (total + str.length > SK_WIRE_TOTAL_MAX) { break; }
+      total += str.length;
+      out[k] = JSON.parse(str);
+      n++;
+    }
+    if (!n) { return 0; }
+    localStorage.setItem(_skWireLsKey(), JSON.stringify({ ts: Date.now(), e: out }));
+    _skWirePurgeOldDays();
+    return n;
+  } catch (e) { return 0; }
+}
+
+// One day at a time. Tomorrow's key does not exist, so the sweep runs
+// once when the date rolls and yesterday's copy is dropped here.
+function _skWirePurgeOldDays() {
+  try {
+    var keep = _skWireLsKey(), kill = [], i, k;
+    for (i = 0; i < localStorage.length; i++) {
+      k = localStorage.key(i);
+      if (k && k.indexOf(SK_WIRE_LS) === 0 && k !== keep) { kill.push(k); }
+    }
+    for (i = 0; i < kill.length; i++) { localStorage.removeItem(kill[i]); }
+  } catch (e) {}
+}
+
+function _skWireClear() {
+  try { localStorage.removeItem(_skWireLsKey()); } catch (e) {}
+}
+
+// Load the day's results back, re-attaching each league object from the
+// live list. An entry already in memory always wins: it is the full one.
+function _skWireLoad(synced) {
+  try {
+    var raw = localStorage.getItem(_skWireLsKey());
+    if (!raw) { return 0; }
+    var o = JSON.parse(raw);
+    if (!o || !o.e) { return 0; }
+    var byKey = {}, i;
+    for (i = 0; synced && i < synced.length; i++) {
+      if (synced[i]) { byKey[synced[i].league_key] = synced[i]; }
+    }
+    var n = 0, k;
+    for (k in o.e) {
+      if (!o.e.hasOwnProperty(k) || skWireCache[k] || !byKey[k]) { continue; }
+      var ent = o.e[k];
+      ent.league = byKey[k];
+      skWireCache[k] = ent;
+      n++;
+    }
+    return n;
+  } catch (e) { return 0; }
+}
+
+// SKWIRECACHE -- a saved entry carries no rosters, so a sheet that
+// needs them scans that one league first and then opens normally. The
+// slim copy is dropped so the full one replaces it for the session.
+function _skWireRehydrate(leagueKey, then) {
+  var entry = skWireCache[leagueKey];
+  if (!entry || !entry._slim) { return false; }
+  var lg = entry.league;
+  if (!lg) { return false; }
+  delete skWireCache[leagueKey];
+  var p = (lg.provider === 'espn' && typeof skScanWireEspLeague === 'function')
+    ? skScanWireEspLeague(lg)
+    : ((typeof skScanWireLeague === 'function')
+        ? skScanWireLeague(lg) : Promise.resolve());
+  Promise.resolve(p).then(function () {
+    if (!skWireCache[leagueKey]) { skWireCache[leagueKey] = entry; }
+    then();
+  }, function () {
+    skWireCache[leagueKey] = entry;
+    then();
+  });
+  return true;
+}
+
 // Wire scan state — one entry per synced league.
 var skWireCache = {};
 var skWireScanning = false;
@@ -132670,12 +132800,19 @@ async function skScanWire() {
     return;
   }
   skWireScanning = true;
-  skWireCache = {};
+  // SKWIRECACHE -- this used to wipe the cache and sweep all of them.
+  // Yesterday does not change during the day, so load what was already
+  // worked out and ask only about the rest. Stale leagues are pruned by
+  // key elsewhere, which is what the wipe was really covering.
+  _skWireLoad(synced);
   skUpdateWireCounter();
   if (skState.mode === 'wire') skRenderWireCards();
 
   _espWireNoEdge = 0; _espWireSkipEdge = 0; _espWireScanned = 0;
   var scans = synced.map(function(lg) {
+    // SKWIRECACHE -- already answered today, so do not ask again.
+    var _have = lg && skWireCache[lg.league_key];
+    if (_have && !_have.error) { return Promise.resolve(); }
     // ESPWIRE -- by provider. A Yahoo league with no tokens still has
     // nothing to say, which is what the guard inside its scan is for.
     var _p = (lg && lg.provider === 'espn')
@@ -132690,6 +132827,7 @@ async function skScanWire() {
   await Promise.all(scans);
   skWireScanning = false;
   skWireScanTs = Date.now();
+  _skWireSave();
   skUpdateWireCounter();
   if (skState.mode === 'wire') skRenderWireCards();
 }
@@ -134257,6 +134395,8 @@ function skOpenWeekMatchup(leagueKey) {
 function skOpenWireNflSheet(leagueKey) {
   var entry = skWireCache[leagueKey];
   if (!entry) return;
+  // SKWIRECACHE -- same for Who's left, which is built from the roster.
+  if (_skWireRehydrate(leagueKey, function () { skOpenWireNflSheet(leagueKey); })) { return; }
   var league = entry.league || { league_key: leagueKey, name: leagueKey };
   var lv = _skWireNflLive(entry);
 
@@ -134362,6 +134502,9 @@ function _skWireNflSideHtml(label, side, isMine) {
 function skOpenWireDetail(leagueKey) {
   var entry = skWireCache[leagueKey];
   if (!entry) return; // shouldn't happen — cards only render when entry exists
+  // SKWIRECACHE -- the saved copy has no rosters on it, so fetch this
+  // one league's day before building a sheet out of them.
+  if (_skWireRehydrate(leagueKey, function () { skOpenWireDetail(leagueKey); })) { return; }
   var league = entry.league || { league_key: leagueKey, name: leagueKey, sport: '' };
 
   // --- HEADER ---------------------------------------------------
@@ -140297,6 +140440,11 @@ function skManualRefresh() {
   // settled late or a player's stat correction landed.
   skWireCache = {};
   skWireScanTs = null;
+  // SKWIRECACHE -- and the stored copy with it. The comment above is
+  // the reason this exists: he may have hit refresh precisely because
+  // cats settled late or a correction landed, and a cache that
+  // outlived that would make the button do nothing.
+  _skWireClear();
   // Bust TODAY's and YESTERDAY's entries in the per-day FP/cats roster
   // caches so live and late-settling stats actually refresh. Also clears
   // any remaining stale entries from previous sessions (midnight-rollover
