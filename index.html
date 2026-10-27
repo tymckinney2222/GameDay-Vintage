@@ -193214,7 +193214,11 @@ function _svRecord() {
 // against the one the market is implying. Closer wins the night.
 var CS_KEY = 'skCall_v1';
 var CS_NIGHT_MAX = 150;
+// CSPOOLFLAG -- busy is the SETTLE in flight; poolBusy is the slate
+// load. They were one flag, so scoring last night's calls blocked
+// tonight's board from ever loading.
 var _csState = { store: null, pool: null, note: '', busy: false,
+                 poolBusy: false, pastIdx: 0,
                  league: '', q: '', sel: null, h: '', a: '', stake: 0 };
 
 // CSSPORT -- a night holds one call per sport. The flat shape shipped
@@ -193582,7 +193586,11 @@ function _csRefresh(force) {
     }
     _csState.busy = false;
     if (changed) { _csRender(); }
-  }, function () { _csState.busy = false; });
+    // CSPOOLFLAG -- and ask for the slate again, the way Survivor's
+    // refresh does. Belt and braces now that the flags are separate,
+    // but it is the line whose absence let this sit there.
+    _csEnsurePool();
+  }, function () { _csState.busy = false; _csEnsurePool(); });
 }
 
 // CALLSCORE -- the record, overall and by sport. Solo nights are
@@ -193712,6 +193720,58 @@ function _csLineNote(h) {
   return 'The book has ' + _csNum(h.total) + ' total and ' +
     _csNum(h.spread) + ' of spread \u2014 that is ' +
     _csNum(Math.max(h.home, h.away)) + '\u2013' + _csNum(Math.min(h.home, h.away)) + '.';
+}
+
+// CSPAST -- the nights already played, newest first. Tonight is not
+// one of them; it is already on screen above.
+function _csNights() {
+  var st = _csStore(), k, out = [], today = _svToday(), sp;
+  for (k in st.nights) {
+    if (!st.nights.hasOwnProperty(k)) { continue; }
+    if (k === today) { continue; }
+    var P = (st.nights[k] && st.nights[k].picks) || {}, any = false;
+    for (sp in P) { if (P.hasOwnProperty(sp)) { any = true; break; } }
+    if (any) { out.push(k); }
+  }
+  out.sort();
+  out.reverse();
+  return out;
+}
+
+function _csStepNight(d) {
+  var ns = _csNights(), i = (_csState.pastIdx || 0) + d;
+  if (i < 0) { i = 0; }
+  if (i > ns.length - 1) { i = ns.length - 1; }
+  _csState.pastIdx = i;
+  _csRender();
+}
+
+// CSPAST -- one night at a time, drawn with the same card tonight uses.
+// A second renderer for the same thing is how last night slowly stops
+// matching the night it was.
+function _csPastHtml() {
+  var ns = _csNights();
+  if (!ns.length) { return ''; }
+  var ix = _csState.pastIdx || 0;
+  if (ix > ns.length - 1) { ix = ns.length - 1; _csState.pastIdx = ix; }
+  var N = _csStore().nights[ns[ix]];
+  if (!N) { return ''; }
+  function nb(d, lbl, on) {
+    return '<button onclick="_csStepNight(' + d + ')" ' +
+      'style="padding:2px 9px;border-radius:7px;font-size:13px;' +
+      'line-height:1.4;cursor:pointer;background:transparent;border:1px ' +
+      'solid rgba(255,255,255,' + (on ? '0.22' : '0.07') + ');color:' +
+      (on ? '#facc15' : 'rgba(255,255,255,0.22)') + '">' + lbl + '</button>';
+  }
+  return '<div class="rg-sect" style="display:flex;align-items:center;gap:8px">' +
+    '<span>' + (ix === 0 ? 'Last night' : 'Earlier night') + '</span>' +
+    '<span style="opacity:0.6;font-weight:400">' + skEscape(ns[ix]) + '</span>' +
+    '<span style="margin-left:auto;display:flex;gap:6px">' +
+      nb(1, '\u2039', ix < ns.length - 1) +
+      '<span style="opacity:0.45;font-size:11px;align-self:center">' +
+        (ix + 1) + ' / ' + ns.length + '</span>' +
+      nb(-1, '\u203a', ix > 0) +
+    '</span></div>' + _csCardHtml(N);
 }
 
 function _csCardHtml(N) {
@@ -193945,6 +194005,9 @@ function _csRender() {
   // sport now, so the calls already made go on top and the board below
   // stays live for whatever is left on the slate.
   if (N && N.picks) { h += _csTonightHtml(st) + _csCardHtml(N); }
+  // CSPAST -- above the board, because scrolling the whole slate to
+  // reach last night is the same as not having it.
+  h += _csPastHtml();
   if (_csState.note) {
     h += '<div class="sk-wire-sheet-empty">' + skEscape(_csState.note) + '</div>';
     host.innerHTML = h;
@@ -194215,7 +194278,10 @@ function _csBox(which, abbr) {
 }
 
 function _csEnsurePool() {
-  if (_csState.pool || _csState.busy) { return; }
+  // CSPOOLFLAG -- its own flag. A settle running is no reason not to
+  // read tonight's fixtures; they are different requests.
+  if (_csState.pool || _csState.poolBusy) { return; }
+  _csState.poolBusy = true;
   // CALLSCORE5 -- _peToday(), not _svToday(). The first is the slate
   // key the feed speaks, '20261027'; the second is the ledger date a
   // night is filed under, '2026-10-27'. Asking the feed for the second
@@ -194237,9 +194303,11 @@ function _csEnsurePool() {
       var ha = _csHouse(a) ? 0 : 1, hb = _csHouse(b) ? 0 : 1;
       return ha - hb;
     });
+    _csState.poolBusy = false;
     _csState.pool = { rows: rows, open: open, leagues: lgs };
     _csRender();
   }, function () {
+    _csState.poolBusy = false;
     _csState.note = 'Could not read tonight\u2019s fixtures.';
     _csRender();
   });
@@ -206837,6 +206905,7 @@ function mrRenderBody() {
     try { h += _auctMgrHtml(); } catch (eAu) {}
     try { h += _svMgrHtml(); } catch (eSv) {}
     try { h += _stvMgrHtml(); } catch (eSt) {}
+    try { h += _csMgrHtml(); } catch (eCs) {}
     try { h += _gwMgrHtml(); } catch (eGw) {}
     return h;
   }
@@ -208839,6 +208908,83 @@ function _stvMgrHtml() {
       ' at ' + _last.length + ' night' + ((_last.length === 1) ? '' : 's') +
       ' \u00b7 ' + _runs + ' run' + ((_runs === 1) ? '' : 's') +
       ' so far.</div>';
+  }
+  return h + '</div>';
+}
+
+// CSPAST -- Call the Score in Manager Record, led by the money. That
+// screen is the one he opens to see where he stands, and the kitty was
+// the one number that meant opening the game instead.
+function _csMgrHtml() {
+  var rec, st;
+  try { rec = _csRecord(); st = _csStore(); } catch (e) { return ''; }
+  if (!rec || !st) { return ''; }
+  // Nothing played and the kitty untouched is nothing to report.
+  if (!rec.n && !rec.voids && !rec.solo &&
+      st.bank === CS_BANK_START && !st.resets) { return ''; }
+  var up = st.bank - CS_BANK_START - (st.resets * CS_BANK_START);
+  var h = '<div class="pe-mgr">' +
+    '<div class="pe-mgr-head">CALL THE SCORE' +
+      '<button class="pe-mgr-go" onclick="closeManagerRecord();openCallScore()">OPEN</button>' +
+    '</div>' +
+    '<div class="pe-mgr-top">' +
+      '<div><span>KITTY</span><b>' + skEscape(_csMoney(st.bank)) + '</b></div>' +
+      '<div><span>VS THE BOOK</span><b>' + _csRecStr(rec) + '</b></div>' +
+      '<div><span>CALLS</span><b>' + rec.n + '</b></div>' +
+    '</div>' +
+    '<div class="pe-mgr-row">' +
+      '<span class="pe-mgr-lg">MONEY</span>' +
+      '<span class="pe-mgr-rec" style="color:' +
+        (up > 0 ? '#4ade80' : (up < 0 ? '#f87171' : '#eef2f8')) + '">' +
+        (up === 0 ? 'level' : (up > 0 ? ('up ' + skEscape(_csMoney(up)))
+                                      : ('down ' + skEscape(_csMoney(-up))))) +
+      '</span>' +
+      // The band mix belongs here only when there is no per-sport
+      // breakdown below to carry it; otherwise it is the same numbers
+      // twice, sitting next to a row about money.
+      '<span class="pe-mgr-pct">' +
+        skEscape(((rec.by || []).length < 2 && _csBandStr(rec)) || '\u2014') +
+      '</span>' +
+    '</div>';
+  var i, B;
+  for (i = 0; i < (rec.by || []).length; i++) {
+    if (rec.by.length < 2) { break; }   // one sport needs no breakdown
+    B = rec.by[i];
+    h += '<div class="pe-mgr-row">' +
+      '<span class="pe-mgr-lg">' + skEscape(_stvLgLabel(B.sport)) + '</span>' +
+      '<span class="pe-mgr-rec">' + _csRecStr(B) + '</span>' +
+      '<span class="pe-mgr-pct">' + skEscape(_csBandStr(B) || '\u2014') +
+      '</span></div>';
+  }
+  // CSPAST -- what is still out there, since the kitty above has
+  // already had it taken out of it and he will wonder where it went.
+  var NT = _csNight(), k, ride = 0, open = 0;
+  if (NT && NT.picks) {
+    for (k in NT.picks) {
+      if (!NT.picks.hasOwnProperty(k)) { continue; }
+      if (NT.picks[k].settled) { continue; }
+      open++;
+      ride += Number(NT.picks[k].stake) || 0;
+    }
+  }
+  if (open) {
+    h += '<div class="pe-mgr-note">' + open + ' call' +
+      (open === 1 ? '' : 's') + ' still open tonight' +
+      (ride > 0 ? (', with ' + skEscape(_csMoney(Math.round(ride * 100) / 100)) +
+                   ' staked and already out of the kitty') : '') + '.</div>';
+  }
+  if (st.won || st.lost) {
+    h += '<div class="pe-mgr-note">Won ' + skEscape(_csMoney(st.won)) +
+      ', lost ' + skEscape(_csMoney(st.lost)) +
+      (st.resets ? (', topped up ' + st.resets + ' time' +
+                    (st.resets === 1 ? '' : 's')) : '') +
+      '. Play money.</div>';
+  }
+  if (rec.setsN) {
+    h += '<div class="pe-mgr-note">' + rec.setsN + ' ' +
+      skEscape(_csSetSportsLabel(rec)) + ' call' +
+      (rec.setsN === 1 ? '' : 's') + ' kept out of the band mix up top, ' +
+      'where set scores would flatter it.</div>';
   }
   return h + '</div>';
 }
