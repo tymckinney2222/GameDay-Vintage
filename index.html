@@ -193215,7 +193215,7 @@ function _svRecord() {
 var CS_KEY = 'skCall_v1';
 var CS_NIGHT_MAX = 150;
 var _csState = { store: null, pool: null, note: '', busy: false,
-                 league: '', q: '', sel: null, h: '', a: '' };
+                 league: '', q: '', sel: null, h: '', a: '', stake: 0 };
 
 // CSSPORT -- a night holds one call per sport. The flat shape shipped
 // this afternoon, so there may be nothing here to convert; a night that
@@ -193245,6 +193245,48 @@ function _csMigrate(st) {
   return st;
 }
 
+// CSBANK -- a hundred imaginary dollars, and what has happened to it.
+var CS_BANK_START = 100;
+var CS_EXACT_MULT = 10;        // profit on an exact call, times the stake
+var CS_CHIPS = [5, 10, 25];
+
+function _csBank(st) {
+  st = st || _csStore();
+  if (typeof st.bank !== 'number' || isNaN(st.bank)) { st.bank = CS_BANK_START; }
+  if (typeof st.won !== 'number' || isNaN(st.won)) { st.won = 0; }
+  if (typeof st.lost !== 'number' || isNaN(st.lost)) { st.lost = 0; }
+  if (typeof st.resets !== 'number' || isNaN(st.resets)) { st.resets = 0; }
+  return st;
+}
+
+function _csMoney(n) {
+  var v = Math.round(Number(n) * 100) / 100;
+  var neg = v < 0;
+  if (neg) { v = -v; }
+  var str = (Math.abs(v - Math.round(v)) < 0.005)
+    ? String(Math.round(v)) : v.toFixed(2);
+  return (neg ? '-$' : '$') + str;
+}
+
+// CSBANK -- top the bankroll back up. Counted, because a hundred
+// dollars that has been reset four times is not the same hundred.
+function _csReset() {
+  var st = _csBank();
+  st.bank = CS_BANK_START;
+  st.resets++;
+  _csSave();
+  _csRender();
+}
+
+function _csSetStake(v) {
+  var st = _csBank();
+  var n = Math.floor(Number(v) || 0);
+  if (n < 0) { n = 0; }
+  if (n > st.bank) { n = Math.floor(st.bank); }
+  _csState.stake = n;
+  _csRender();
+}
+
 function _csStore() {
   if (_csState.store) { return _csState.store; }
   var st = null;
@@ -193252,6 +193294,7 @@ function _csStore() {
   if (!st || typeof st !== 'object') { st = {}; }
   if (!st.nights) { st.nights = {}; }
   _csMigrate(st);
+  _csBank(st);
   _csState.store = st;
   return st;
 }
@@ -193300,15 +193343,59 @@ function _csHouse(g) {
   if (!o || o.overUnder == null) { return null; }
   var T = Number(o.overUnder);
   if (!(T > 0)) { return null; }
-  var S = 0, m = String(o.spread || '').match(/([+-]?\d+(?:\.\d+)?)/);
-  if (m) { S = Math.abs(parseFloat(m[1])); }
+  // CSLINE -- the numeric field first; the display string only as a
+  // fallback, and even then on probation.
+  var S = 0;
+  if (o.line != null) {
+    S = Math.abs(Number(o.line));
+  } else {
+    var m = String(o.spread || '').match(/([+-]?\d+(?:\.\d+)?)/);
+    if (m) { S = Math.abs(parseFloat(m[1])); }
+  }
   if (isNaN(S)) { S = 0; }
   // No favourite named is no spread to apply, whatever the string said.
   if (!o.favId) { S = 0; }
+  // CSLINE -- AND A SPREAD CANNOT BE LARGER THAN THE TOTAL. Nobody is
+  // favoured by more goals than will be scored. True in every sport, so
+  // it catches a moneyline sitting in the spread field (120 against a
+  // total of 5.5) without knowing anything about hockey, and catches
+  // whatever else turns up in there on a sport I have not seen.
+  var bogus = (S >= T);
+  if (bogus) { S = 0; }
   var hi = (T + S) / 2, lo = (T - S) / 2;
   var favHome = !!(o.favId && g.home && String(o.favId) === String(g.home.id));
   return { home: favHome ? hi : lo, away: favHome ? lo : hi,
-           total: T, spread: S, even: !(S > 0) };
+           total: T, spread: S, even: !(S > 0),
+           // Kept apart from a plain "no favourite": one is the book
+           // declining to pick, the other is the book's own field
+           // holding something that is not a spread.
+           bogus: !!bogus, fav: o.fav || '' };
+}
+
+// CSBANK -- what a settled call returns to the bankroll.
+//
+//   exact     stake back and ten times it in profit
+//   beat it   stake back and the same again
+//   level     stake back
+//   no contest stake back -- it was never really played
+//   missed    nothing; the stake already left at lock
+//
+// Written once onto the pick, so a second settle cannot pay it twice.
+function _csPay(st, P) {
+  if (!P || P.payout != null) { return 0; }
+  var stake = Number(P.stake) || 0;
+  var back = 0;
+  if (!stake) { P.payout = 0; return 0; }
+  if (P.band === 'bullseye') { back = stake * (CS_EXACT_MULT + 1); }
+  else if (P.result === 'W') { back = stake * 2; }
+  else if (P.result === 'T' || P.result === 'N' || P.result === 'S') { back = stake; }
+  else { back = 0; }
+  P.payout = Math.round(back * 100) / 100;
+  st.bank = Math.round((st.bank + P.payout) * 100) / 100;
+  var net = P.payout - stake;
+  if (net > 0) { st.won = Math.round((st.won + net) * 100) / 100; }
+  else if (net < 0) { st.lost = Math.round((st.lost - net) * 100) / 100; }
+  return P.payout;
 }
 
 // CSSETS -- sports whose published score is SETS WON, not points.
@@ -193378,6 +193465,10 @@ function _csLock() {
   var hv = parseInt(_csState.h, 10), av = parseInt(_csState.a, 10);
   if (isNaN(hv) || isNaN(av) || hv < 0 || av < 0) { return; }
   var house = _csHouse(g);
+  // CSBANK -- no line, no bet. There is nothing to settle it against.
+  var stake = house ? Math.floor(Number(_csState.stake) || 0) : 0;
+  if (stake < 0) { stake = 0; }
+  if (stake > st.bank) { stake = Math.floor(st.bank); }
   if (!st.nights[date]) {
     // CALLSCORE5 -- the ledger date AND the slate day it was played on.
     // The morning-after refetch needs the second; filing under the
@@ -193392,8 +193483,14 @@ function _csLock() {
     home: _csSide(g, 'home'), away: _csSide(g, 'away'),
     my: { home: hv, away: av },
     house: house, locked: true, settled: false,
+    // CSBANK -- out of the bankroll now, the way a slip works. It also
+    // stops the same dollar being staked twice in one night across two
+    // sports, which is the only way this could quietly cheat.
+    stake: stake, payout: null,
     result: '', myErr: null, houseErr: null, band: '', final: null
   };
+  st.bank = Math.round((st.bank - stake) * 100) / 100;
+  _csState.stake = 0;
   _csSave();
   _csState.sel = null;
   _csRender();
@@ -193416,7 +193513,11 @@ function _csSettle(date, games) {
       if (String(games[i].id) === String(P.gameId)) { g = games[i]; }
     }
     if (!g) { continue; }
-    if (_peDead(g)) { P.settled = true; P.result = 'N'; any = true; continue; }
+    if (_peDead(g)) {
+      P.settled = true; P.result = 'N';
+      _csPay(st, P);                 // never played, so the stake comes back
+      any = true; continue;
+    }
     if (!g.completed) { continue; }
     var fh = Number(g.home.score), fa = Number(g.away.score);
     if (isNaN(fh) || isNaN(fa)) { continue; }
@@ -193429,6 +193530,7 @@ function _csSettle(date, games) {
     else if (P.myErr < P.houseErr) { P.result = 'W'; }
     else if (P.myErr > P.houseErr) { P.result = 'L'; }
     else { P.result = 'T'; }
+    _csPay(st, P);
     any = true;
   }
   if (any) { _csSave(); }
@@ -193585,6 +193687,12 @@ function _csLineNote(h) {
     return 'No line on this one \u2014 you will be graded on how close ' +
       'you get, and the night stays out of the win-loss.';
   }
+  if (h.even && h.bogus) {
+    return 'The book has a total of ' + _csNum(h.total) +
+      (h.fav ? (' and makes ' + h.fav + ' the favourite') : '') +
+      ', but publishes no usable spread for this one \u2014 so it splits ' +
+      'the total evenly rather than guessing at a margin.';
+  }
   if (h.even) {
     return 'The book has a total of ' + _csNum(h.total) + ' but no ' +
       'favourite, so it splits it evenly.';
@@ -193638,7 +193746,19 @@ function _csCallHtml(N) {
         ? 'Exact. On the nose.'
         : ('Out by ' + _csNum(N.myErr) + ' across the two sides' +
            (N.houseErr != null ? (', the book by ' + _csNum(N.houseErr)) : '') +
-           '.')) + '</div></div>';
+           '.')) +
+      // CSBANK2 -- and what the money did, in the same breath.
+      (N.stake
+        ? ('<div style="font-family:var(--sk-font-mono,monospace);font-size:12px;' +
+           'margin-top:7px;color:' +
+           ((N.payout > N.stake) ? '#4ade80'
+             : ((N.payout === N.stake) ? 'rgba(255,255,255,0.7)' : '#f87171')) + '">' +
+           skEscape(_csMoney(N.stake)) + ' staked \u2192 ' +
+           ((N.payout > N.stake)
+             ? ('back ' + _csMoney(N.payout) + ' (+' + _csMoney(N.payout - N.stake) + ')')
+             : ((N.payout === N.stake) ? 'returned' : 'gone')) + '</div>')
+        : '') +
+      '</div></div>';
   }
   function row(lab, p, err, col) {
     return '<div style="display:flex;align-items:center;gap:10px;padding:9px 0;' +
@@ -193668,7 +193788,9 @@ function _csCallHtml(N) {
         ? (N.result === 'S'
             ? 'No line on this one, so it is graded on closeness only and stays out of the win-loss.'
             : 'Settled off the final score. Nothing to tap.')
-        : _csLineNote(hs) + ' Settles itself once the game is final.') +
+        : (_csLineNote(hs) +
+           (N.stake ? (' ' + skEscape(_csMoney(N.stake)) + ' riding on it.') : '') +
+           ' Settles itself once the game is final.')) +
     '</div></div>';
 }
 
@@ -193678,6 +193800,39 @@ function _csRender() {
   var st = _csStore(), rec = _csRecord();
   var N = _csNight();
   var h = '';
+
+  // CSBANK2 -- the money first, because it is the thing he will look
+  // at. Imaginary, and the line under it says so once.
+  var up = st.bank - CS_BANK_START - (st.resets * CS_BANK_START);
+  h += '<div style="border:1px solid rgba(250,204,21,0.35);' +
+    'background:rgba(250,204,21,0.05);border-radius:12px;padding:12px 14px;' +
+    'margin:0 0 12px">' +
+    '<div style="font-size:9.5px;letter-spacing:0.14em;color:#facc15;' +
+    'font-weight:700">THE KITTY</div>' +
+    '<div style="display:flex;align-items:baseline;gap:9px;margin-top:5px">' +
+      '<span style="font:700 32px Georgia,serif;line-height:1">' +
+        skEscape(_csMoney(st.bank)) + '</span>' +
+      '<span style="font-size:11.5px;color:' +
+        (up > 0 ? '#4ade80' : (up < 0 ? '#f87171' : 'rgba(255,255,255,0.5)')) + '">' +
+        (up === 0 ? 'level' : (up > 0 ? ('up ' + _csMoney(up))
+                                      : ('down ' + _csMoney(-up)))) +
+      '</span></div>' +
+    ((st.won || st.lost)
+      ? ('<div style="font-size:10.5px;color:rgba(255,255,255,0.4);margin-top:6px">' +
+         'Won ' + skEscape(_csMoney(st.won)) + ' \u00b7 lost ' +
+         skEscape(_csMoney(st.lost)) +
+         (st.resets ? (' \u00b7 topped up ' + st.resets + 'x') : '') + '</div>')
+      : ('<div style="font-size:10.5px;color:rgba(255,255,255,0.4);margin-top:6px">' +
+         'Imaginary money. Beat the book and you double, an exact call pays ' +
+         (CS_EXACT_MULT + 1) + 'x.</div>')) +
+    ((st.bank < 1)
+      ? ('<button onclick="_csReset()" style="margin-top:9px;padding:6px 14px;' +
+         'border-radius:999px;border:1px solid rgba(255,255,255,0.2);' +
+         'background:none;color:rgba(255,255,255,0.7);font-size:10px;' +
+         'font-weight:700;letter-spacing:0.08em;cursor:pointer">' +
+         'TOP BACK UP TO ' + skEscape(_csMoney(CS_BANK_START)) + '</button>')
+      : '') +
+    '</div>';
 
   // The record, up top, because it is the reason to keep playing.
   h += '<div style="border:1px solid rgba(250,204,21,0.35);' +
@@ -193759,9 +193914,13 @@ function _csRender() {
         '<span style="font-size:16px;color:rgba(255,255,255,0.3);padding-bottom:9px">\u2013</span>' +
         _csBox('home', g.home.abbr) +
       '</div>' +
+      _csStakeHtml(hs, st) +
       '<button onclick="_csLock()" style="width:100%;padding:11px;border-radius:9px;' +
       'border:0;background:#facc15;color:#111;font-weight:800;font-size:13px;' +
-      'letter-spacing:0.06em;cursor:pointer">LOCK IT IN</button>' +
+      'letter-spacing:0.06em;cursor:pointer">' +
+      ((hs && _csState.stake > 0)
+        ? ('LOCK IT IN \u00b7 ' + skEscape(_csMoney(_csState.stake)))
+        : 'LOCK IT IN') + '</button>' +
       '<div class="rg-foot">' + skEscape(_csLineNote(hs)) +
         ' One game in ' + skEscape(_stvLgLabel(g.league)) +
         ', and it locks when you tap.</div>' +
@@ -193867,6 +194026,50 @@ function _csRender() {
     'on closeness, kept out of the win-loss because there was nothing to ' +
     'beat.</div></div>';
   host.innerHTML = h;
+}
+
+// CSBANK2 -- the chips. Nothing is staked unless he says so, and a
+// game with no line says why it cannot be bet rather than showing a
+// row of chips that would do nothing.
+function _csStakeHtml(house, st) {
+  if (!house) {
+    return '<div style="font-size:10.5px;color:rgba(255,255,255,0.38);' +
+      'padding:2px 0 10px">No line on this one, so there is nothing to ' +
+      'bet against \u2014 the call still counts.</div>';
+  }
+  if (st.bank < 1) {
+    return '<div style="font-size:10.5px;color:rgba(255,255,255,0.38);' +
+      'padding:2px 0 10px">The kitty is empty. The call still counts; ' +
+      'top it back up above to bet again.</div>';
+  }
+  var cur = Math.floor(Number(_csState.stake) || 0), i, h = '';
+  h += '<div style="display:flex;align-items:center;gap:6px;padding:2px 0 10px;' +
+    'flex-wrap:wrap">' +
+    '<span style="font-size:9px;letter-spacing:0.12em;' +
+    'color:rgba(255,255,255,0.4);font-weight:700;flex:0 0 100%">STAKE</span>';
+  function chip(v, label) {
+    var on = (cur === v);
+    return '<button onclick="_csSetStake(' + v + ')" ' +
+      'style="flex:0 0 auto;padding:6px 13px;border-radius:999px;font-size:12px;' +
+      'font-weight:700;cursor:pointer;' +
+      (on ? 'background:#facc15;color:#111;border:0'
+          : 'background:transparent;color:rgba(255,255,255,0.6);' +
+            'border:1px solid rgba(255,255,255,0.14)') + '">' +
+      skEscape(label) + '</button>';
+  }
+  h += chip(0, 'No bet');
+  for (i = 0; i < CS_CHIPS.length; i++) {
+    if (CS_CHIPS[i] > st.bank) { continue; }
+    h += chip(CS_CHIPS[i], _csMoney(CS_CHIPS[i]));
+  }
+  h += chip(Math.floor(st.bank), 'All in');
+  if (cur > 0) {
+    h += '<span style="flex:0 0 100%;font-size:10.5px;' +
+      'color:rgba(255,255,255,0.4);margin-top:4px">Beat the book and it ' +
+      'comes back as ' + skEscape(_csMoney(cur * 2)) + '. An exact call ' +
+      'pays ' + skEscape(_csMoney(cur * (CS_EXACT_MULT + 1))) + '.</span>';
+  }
+  return h + '</div>';
 }
 
 function _csBox(which, abbr) {
@@ -207014,7 +207217,12 @@ function _peOdds(odds, home, away) {
   // object is untouched.
   var ou = (odds.overUnder != null) ? parseFloat(odds.overUnder) : null;
   if (ou != null && (isNaN(ou) || ou <= 0)) { ou = null; }
-  return { spread: spread, favId: favId, fav: favAbbr, overUnder: ou,
+  // CSLINE -- the NUMBER, not the display string. details is a line of
+  // text and on the NHL board it holds the moneyline, so parsing it for
+  // a spread read "CBJ -120" as a hundred and twenty goals.
+  var ln = (odds.spread != null) ? Math.abs(parseFloat(odds.spread)) : null;
+  if (ln != null && isNaN(ln)) { ln = null; }
+  return { spread: spread, line: ln, favId: favId, fav: favAbbr, overUnder: ou,
     homeP: p ? p.home : null, awayP: p ? p.away : null,
     favP: (favId && p) ? ((favId === home.id) ? p.home : p.away) : null };
 }
