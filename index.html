@@ -53954,6 +53954,14 @@ function _clearTodayFpCache(teamKey) {
 var _skStadiumRefreshing = false;
 async function _skStadiumRefresh() {
   if (_skStadiumRefreshing) return;
+  // SKREADY -- its own wording, and it supersedes whatever was running,
+  // because this is the thing he just asked for. The enrichers it fires
+  // at the end are not awaited, so finishing the function is not the
+  // same as finishing the work -- which is the whole reason this is a
+  // watcher rather than a line at the bottom of the try block.
+  if (typeof _skReadyWatch === 'function') {
+    _skReadyWatch('Fantasy points updated');
+  }
   _skStadiumRefreshing = true;
   // Spin the button if present.
   // Every stadium's button shares the class, so all of them spin. Ids stay
@@ -126058,6 +126066,13 @@ function skParseScoreboardForAllWeekRecords(data, scoringType, currentWeek, spor
 // sees progress instead of a single "Loading…" wall. Unsynced leagues
 // are skipped — that's the point of the picker.
 async function skHydrateAll() {
+  // SKREADY -- the boot and the refresh button both come through here,
+  // so one hook covers both. Not restarted when a watch is already
+  // running: a second hydrate inside one boot is the same wait, and a
+  // stadium refresh that started its own should keep its wording.
+  if (!_skReadyTimer && typeof _skReadyWatch === 'function') {
+    _skReadyWatch('All data loaded');
+  }
   if (skHydrationInFlight) return;
   skHydrationInFlight = true;
   var queue = skSyncedLeaguesAll().slice();
@@ -184631,6 +184646,84 @@ function skCloseAccountMenu() {
 // toast is yanked if a new one fires before it dismisses).
 var _skToastEl = null;
 var _skToastTimer = null;
+// SKREADY -- is anything still working? Returns what, or '' for quiet.
+// Every phase of a boot or a refresh already keeps an in-flight flag;
+// this only has to read them in one place. Each is guarded on its own
+// because a build where one of them does not exist should still get an
+// answer out of the rest.
+var SK_READY_POLL = 300;      // ms between checks
+var SK_READY_QUIET = 4;       // consecutive quiet checks before it fires
+var SK_READY_MAX = 150000;    // give up and say what is still running
+
+function _skReadyBusy() {
+  try {
+    if (typeof skHydrationInFlight !== 'undefined' && skHydrationInFlight) {
+      return 'leagues';
+    }
+  } catch (e1) {}
+  try {
+    if (typeof skWireScanning !== 'undefined' && skWireScanning) {
+      return 'the Wire';
+    }
+  } catch (e2) {}
+  try {
+    if (typeof skPlanScanning !== 'undefined' && skPlanScanning) {
+      return 'tomorrow\u2019s rosters';
+    }
+  } catch (e3) {}
+  try {
+    if (typeof _skStadiumRefreshing !== 'undefined' && _skStadiumRefreshing) {
+      return 'fantasy points';
+    }
+  } catch (e4) {}
+  try {
+    if (typeof _fyInflight !== 'undefined' && _fyInflight > 0) { return 'Yahoo'; }
+    if (typeof _fyWaitQ !== 'undefined' && _fyWaitQ && _fyWaitQ.length) {
+      return 'Yahoo';
+    }
+  } catch (e5) {}
+  return '';
+}
+
+function _skReadyCount() {
+  var n = 0;
+  try { n = (skWireLeagueList() || []).length; } catch (e) {}
+  return n ? (n + ' league' + (n === 1 ? '' : 's')) : '';
+}
+
+var _skReadyTimer = null, _skReadySeq = 0;
+
+// Starting a watch supersedes any watch already running, so the most
+// recent thing he asked for is the thing the line talks about.
+function _skReadyWatch(label) {
+  var seq = ++_skReadySeq;
+  var t0 = Date.now(), quiet = 0, last = '';
+  if (_skReadyTimer) { clearInterval(_skReadyTimer); _skReadyTimer = null; }
+  _skReadyTimer = setInterval(function () {
+    if (seq !== _skReadySeq) { return; }
+    var b = _skReadyBusy();
+    if (b) { quiet = 0; last = b; } else { quiet++; }
+    var done = (quiet >= SK_READY_QUIET);
+    var over = ((Date.now() - t0) > SK_READY_MAX);
+    if (!done && !over) { return; }
+    clearInterval(_skReadyTimer);
+    _skReadyTimer = null;
+    if (typeof skToast !== 'function') { return; }
+    if (!done) {
+      // Never claim everything is in while something is still running.
+      skToast('Still loading ' + (last || _skReadyBusy() || 'data') + '\u2026');
+      return;
+    }
+    // The quiet window is watching, not working. Subtracting it means a
+    // boot that took twelve seconds reports twelve.
+    var ms = (Date.now() - t0) - (SK_READY_QUIET * SK_READY_POLL);
+    if (ms < 0) { ms = 0; }
+    var cnt = _skReadyCount();
+    skToast(label + (cnt ? (' \u00b7 ' + cnt) : '') +
+            ' \u00b7 ' + (ms / 1000).toFixed(1) + 's');
+  }, SK_READY_POLL);
+}
+
 function skToast(message) {
   // Tear down any existing toast so a rapid double-tap doesn't pile up
   if (_skToastEl) {
