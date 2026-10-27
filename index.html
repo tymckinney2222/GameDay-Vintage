@@ -126098,6 +126098,15 @@ async function skHydrateAll() {
   // skScanWireLeague reads it. skScanWire has its own in-flight guard
   // so this is idempotent across repeat hydrations.
   if (typeof skScanWire === 'function') skScanWire();
+  // SKWIREPAINT -- team names and crests are read out of skLeagueData at
+  // render time, and it is only full NOW. The Wire used to be slow
+  // enough that its own final render landed after this; a cached one
+  // paints in milliseconds and showed league names where team names go,
+  // over empty logo squares.
+  if (typeof skState !== 'undefined' && skState.mode === 'wire' &&
+      typeof skRenderWireCards === 'function') {
+    try { skRenderWireCards(); } catch (eWP) {}
+  }
   // SKBUMP — bank today's ranks for every season-points / roto league, so
   // the rank movement chart fills in daily without opening each league.
   if (typeof _skRankHistRecordYahoo === 'function') _skRankHistRecordYahoo();
@@ -131794,23 +131803,40 @@ function _skWireClear() {
   try { localStorage.removeItem(_skWireLsKey()); } catch (e) {}
 }
 
+// SKWIREPAINT -- the live league object for a key, whenever it turns
+// up. ESPN's half of the list arrives on its own schedule, so a lookup
+// that fails at load time can succeed later.
+function _skWireLeagueFor(key, synced) {
+  var list = synced, i;
+  if (!list) {
+    try { list = skWireLeagueList(); } catch (e) { list = []; }
+  }
+  for (i = 0; list && i < list.length; i++) {
+    if (list[i] && list[i].league_key === key) { return list[i]; }
+  }
+  return null;
+}
+
 // Load the day's results back, re-attaching each league object from the
 // live list. An entry already in memory always wins: it is the full one.
+//
+// SKWIREPAINT -- an entry whose league has NOT arrived yet is kept, not
+// dropped. This used to require the key to be in the synced list, so a
+// load that ran before extSyncedLeagues() answered threw away every
+// ESPN result it had saved and fetched them all again -- the exact
+// thing the cache exists to stop. The row builder is handed its league
+// separately, so a missing one costs nothing until a sheet needs it.
 function _skWireLoad(synced) {
   try {
     var raw = localStorage.getItem(_skWireLsKey());
     if (!raw) { return 0; }
     var o = JSON.parse(raw);
     if (!o || !o.e) { return 0; }
-    var byKey = {}, i;
-    for (i = 0; synced && i < synced.length; i++) {
-      if (synced[i]) { byKey[synced[i].league_key] = synced[i]; }
-    }
     var n = 0, k;
     for (k in o.e) {
-      if (!o.e.hasOwnProperty(k) || skWireCache[k] || !byKey[k]) { continue; }
+      if (!o.e.hasOwnProperty(k) || skWireCache[k]) { continue; }
       var ent = o.e[k];
-      ent.league = byKey[k];
+      ent.league = _skWireLeagueFor(k, synced) || null;
       skWireCache[k] = ent;
       n++;
     }
@@ -131824,8 +131850,10 @@ function _skWireLoad(synced) {
 function _skWireRehydrate(leagueKey, then) {
   var entry = skWireCache[leagueKey];
   if (!entry || !entry._slim) { return false; }
-  var lg = entry.league;
+  // SKWIREPAINT -- the league may have arrived since the entry loaded.
+  var lg = entry.league || _skWireLeagueFor(leagueKey, null);
   if (!lg) { return false; }
+  entry.league = lg;
   delete skWireCache[leagueKey];
   var p = (lg.provider === 'espn' && typeof skScanWireEspLeague === 'function')
     ? skScanWireEspLeague(lg)
@@ -228023,7 +228051,17 @@ function _extRepaintToday() {
     if (_fmOv && _fmOv.classList.contains('open') && typeof _fmRender === 'function') _fmRender();
   } catch (e) {}
   try {
+    // SKWIREPAINT -- in Wire mode this called skRenderTodayCards, which
+    // draws a different list entirely. It also meant the arrival of the
+    // ESPN leagues -- the thing that takes the Wire's count from 51 to
+    // 57 -- never repainted the Wire that was missing them.
     if (typeof skState !== 'undefined' && skState.view === 'today' &&
+        skState.mode === 'wire' && typeof skRenderWireCards === 'function') {
+      skRenderWireCards();
+      // Today is a different list and has NOT been repainted, so it is
+      // still owed one. Clearing the flag here would have dropped it.
+      _extRepaintPending = true;
+    } else if (typeof skState !== 'undefined' && skState.view === 'today' &&
         typeof skRenderTodayCards === 'function') {
       skRenderTodayCards();
       _extRepaintPending = false;
