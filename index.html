@@ -193372,6 +193372,17 @@ function _csHouse(g) {
            bogus: !!bogus, fav: o.fav || '' };
 }
 
+// CSWHATIF -- what a stake comes back as, by outcome. The settlement
+// reads the same table, so a preview cannot drift away from the payout
+// it is previewing.
+function _csReturns(stake) {
+  stake = Number(stake) || 0;
+  return { exact: Math.round(stake * (CS_EXACT_MULT + 1) * 100) / 100,
+           beat: Math.round(stake * 2 * 100) / 100,
+           level: stake,
+           miss: 0 };
+}
+
 // CSBANK -- what a settled call returns to the bankroll.
 //
 //   exact     stake back and ten times it in profit
@@ -193386,10 +193397,11 @@ function _csPay(st, P) {
   var stake = Number(P.stake) || 0;
   var back = 0;
   if (!stake) { P.payout = 0; return 0; }
-  if (P.band === 'bullseye') { back = stake * (CS_EXACT_MULT + 1); }
-  else if (P.result === 'W') { back = stake * 2; }
-  else if (P.result === 'T' || P.result === 'N' || P.result === 'S') { back = stake; }
-  else { back = 0; }
+  var R = _csReturns(stake);
+  if (P.band === 'bullseye') { back = R.exact; }
+  else if (P.result === 'W') { back = R.beat; }
+  else if (P.result === 'T' || P.result === 'N' || P.result === 'S') { back = R.level; }
+  else { back = R.miss; }
   P.payout = Math.round(back * 100) / 100;
   st.bank = Math.round((st.bank + P.payout) * 100) / 100;
   var net = P.payout - stake;
@@ -193713,6 +193725,58 @@ function _csCardHtml(N) {
   return out;
 }
 
+// CSWHATIF -- what this one pays, while it is still open.
+function _csLadderHtml(N) {
+  if (!N || N.settled || !N.stake) { return ''; }
+  var R = _csReturns(N.stake);
+  function line(lab, val, note, col) {
+    return '<div style="display:flex;align-items:baseline;gap:8px;' +
+      'padding:3px 0;font-size:11.5px">' +
+      '<span style="flex:1;color:rgba(255,255,255,0.55)">' + lab + '</span>' +
+      '<span style="font-family:var(--sk-font-mono,monospace);font-weight:800;' +
+      'color:' + col + '">' + skEscape(_csMoney(val)) + '</span>' +
+      '<span style="flex:0 0 76px;text-align:right;font-size:10px;' +
+      'color:rgba(255,255,255,0.3)">' + note + '</span></div>';
+  }
+  return '<div style="padding:6px 0 2px">' +
+    '<div style="font-size:9px;letter-spacing:0.12em;font-weight:700;' +
+    'color:rgba(255,255,255,0.35);margin-bottom:3px">IF IT LANDS \u00b7 ' +
+      skEscape(_csMoney(N.stake)) + ' STAKED</div>' +
+    line('Call it exactly', R.exact, '+' + _csMoney(R.exact - N.stake), '#facc15') +
+    line('Beat the book', R.beat, '+' + _csMoney(R.beat - N.stake), '#4ade80') +
+    line('Dead level', R.level, 'stake back', 'rgba(255,255,255,0.75)') +
+    line('Miss', R.miss, '\u2212' + _csMoney(N.stake), '#f87171') +
+    '</div>';
+}
+
+// CSWHATIF -- and the same for the night, across every open call.
+function _csTonightHtml(st) {
+  var N = _csNight(), k, staked = 0, beat = 0, exact = 0, n = 0;
+  if (!N || !N.picks) { return ''; }
+  for (k in N.picks) {
+    if (!N.picks.hasOwnProperty(k)) { continue; }
+    var P = N.picks[k];
+    if (P.settled || !P.stake) { continue; }
+    var R = _csReturns(P.stake);
+    staked += P.stake; beat += R.beat; exact += R.exact; n++;
+  }
+  if (n < 2) { return ''; }      // one open call already has its own ladder
+  staked = Math.round(staked * 100) / 100;
+  return '<div class="rg-dark rg-bleed">' +
+    '<div class="rg-sect">Riding tonight</div>' +
+    '<div style="font-size:11.5px;line-height:1.7;' +
+    'color:rgba(255,255,255,0.62);padding:4px 0">' +
+      '<b>' + skEscape(_csMoney(staked)) + '</b> across ' + n + ' calls. ' +
+      'Beat the book on all of them and ' +
+      '<b style="color:#4ade80">' + skEscape(_csMoney(beat)) + '</b> comes ' +
+      'back, leaving the kitty at ' +
+      skEscape(_csMoney(st.bank + beat)) + '. Call every one exactly and ' +
+      'it is <b style="color:#facc15">' + skEscape(_csMoney(exact)) + '</b>, ' +
+      'leaving ' + skEscape(_csMoney(st.bank + exact)) + '. Miss the lot and ' +
+      'the kitty stays where it is, at ' + skEscape(_csMoney(st.bank)) + '.' +
+    '</div></div>';
+}
+
 function _csCallHtml(N) {
   var mine = N.my, hs = N.house;
   var fin = N.final;
@@ -193788,10 +193852,8 @@ function _csCallHtml(N) {
         ? (N.result === 'S'
             ? 'No line on this one, so it is graded on closeness only and stays out of the win-loss.'
             : 'Settled off the final score. Nothing to tap.')
-        : (_csLineNote(hs) +
-           (N.stake ? (' ' + skEscape(_csMoney(N.stake)) + ' riding on it.') : '') +
-           ' Settles itself once the game is final.')) +
-    '</div></div>';
+        : (_csLineNote(hs) + ' Settles itself once the game is final.')) +
+    '</div>' + _csLadderHtml(N) + '</div>';
 }
 
 function _csRender() {
@@ -193882,7 +193944,7 @@ function _csRender() {
   // CSSPORT2 -- a locked night used to end the screen. It locks one
   // sport now, so the calls already made go on top and the board below
   // stays live for whatever is left on the slate.
-  if (N && N.picks) { h += _csCardHtml(N); }
+  if (N && N.picks) { h += _csTonightHtml(st) + _csCardHtml(N); }
   if (_csState.note) {
     h += '<div class="sk-wire-sheet-empty">' + skEscape(_csState.note) + '</div>';
     host.innerHTML = h;
