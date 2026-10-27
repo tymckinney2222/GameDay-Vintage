@@ -33766,6 +33766,20 @@
   <div class="pw-body" id="gwBody"></div>
 </div>
 
+<!-- CALLSCORE -- one game a night, any sport, against the book. -->
+<div class="pw-overlay" id="skCsOverlay">
+  <div class="pp-header">
+    <div>
+      <div class="pp-eyebrow">Nightly game</div>
+      <h2 class="pp-title">Call the Score</h2>
+    </div>
+    <button class="pp-close" onclick="closeCallScore()" aria-label="Close">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+    </button>
+  </div>
+  <div class="pw-body" id="skCsBody"></div>
+</div>
+
 <div class="pw-overlay" id="skStvOverlay">
   <div class="pp-header">
     <div>
@@ -193194,6 +193208,570 @@ function _svRecord() {
            runs: (st.history || []).length };
 }
 
+// \u2500\u2500 CALLSCORE \u2500\u2500 Call the Score \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+//
+// One game a night, any sport on the board, and you post a score
+// against the one the market is implying. Closer wins the night.
+var CS_KEY = 'skCall_v1';
+var CS_NIGHT_MAX = 150;
+var _csState = { store: null, pool: null, note: '', busy: false,
+                 league: '', q: '', sel: null, h: '', a: '' };
+
+function _csStore() {
+  if (_csState.store) { return _csState.store; }
+  var st = null;
+  try { st = JSON.parse(localStorage.getItem(CS_KEY) || 'null'); } catch (e) { st = null; }
+  if (!st || typeof st !== 'object') { st = {}; }
+  if (!st.nights) { st.nights = {}; }
+  _csState.store = st;
+  return st;
+}
+
+function _csSave() {
+  var st = _csState.store;
+  if (!st) { return; }
+  var keys = [], k, i;
+  for (k in st.nights) { if (st.nights.hasOwnProperty(k)) { keys.push(k); } }
+  if (keys.length > CS_NIGHT_MAX) {
+    keys.sort();
+    for (i = 0; i < keys.length - CS_NIGHT_MAX; i++) { delete st.nights[keys[i]]; }
+  }
+  try { localStorage.setItem(CS_KEY, JSON.stringify(st)); } catch (e) {}
+}
+
+function _csNight(date) {
+  var st = _csStore();
+  return st.nights[date || _svToday()] || null;
+}
+
+// CALLSCORE -- THE MARKET'S OWN SCORE.
+//
+// Half the total to each side, then half the spread moved from the dog
+// to the favourite: O/U 228.5 with LAL -2.5 is 115.5-113. Decimals are
+// kept rather than rounded, because the line is a line and rounding it
+// would hand out ties that the numbers did not earn.
+//
+// Degrades in three steps, which is the whole reason this works on a
+// slate where half the sports carry nothing:
+//   total + spread -> a real line
+//   total only     -> an even split, flagged as such
+//   no total       -> null, and the night is played solo
+function _csHouse(g) {
+  var o = (g && g.odds) || null;
+  if (!o || o.overUnder == null) { return null; }
+  var T = Number(o.overUnder);
+  if (!(T > 0)) { return null; }
+  var S = 0, m = String(o.spread || '').match(/([+-]?\d+(?:\.\d+)?)/);
+  if (m) { S = Math.abs(parseFloat(m[1])); }
+  if (isNaN(S)) { S = 0; }
+  // No favourite named is no spread to apply, whatever the string said.
+  if (!o.favId) { S = 0; }
+  var hi = (T + S) / 2, lo = (T - S) / 2;
+  var favHome = !!(o.favId && g.home && String(o.favId) === String(g.home.id));
+  return { home: favHome ? hi : lo, away: favHome ? lo : hi,
+           total: T, spread: S, even: !(S > 0) };
+}
+
+function _csErr(p, fh, fa) {
+  if (!p) { return null; }
+  return Math.abs(Number(p.home) - fh) + Math.abs(Number(p.away) - fa);
+}
+
+// CALLSCORE -- how good a guess was, in a unit that means the same
+// thing in every sport. Two goals out on a 6-goal game is a different
+// animal from two points out on a 228-point one, and the game's own
+// total is the only honest yardstick for that.
+function _csBand(err, total) {
+  if (err == null) { return ''; }
+  if (err === 0) { return 'bullseye'; }
+  // CALLSCORE3 -- the SQUARE ROOT of the total, not the total. Scoring
+  // spread grows with the root, so a share of the total reads a
+  // one-goal miss in hockey as worse than a twenty-point miss in
+  // basketball. On this unit 1 goal (0.39) sits beside 5 points (0.33),
+  // and 2 goals (0.78) beside 10 points (0.66) -- which is the pairing
+  // that actually feels equivalent, and it falls out rather than being
+  // matched by hand.
+  var t = Math.max(Number(total) || 0, 1);
+  var z = err / Math.sqrt(t);
+  if (z <= 0.5) { return 'sharp'; }
+  if (z <= 1.0) { return 'close'; }
+  return 'wide';
+}
+
+function _csSide(g, which) {
+  var t = g[which] || {};
+  return { id: String(t.id || ''), abbr: t.abbr || '?', name: t.name || '',
+           logo: t.logo || '' };
+}
+
+function _csPick(gameId) {
+  var st = _csStore(), date = _svToday();
+  if (st.nights[date] && st.nights[date].locked) { return; }
+  var pool = _csState.pool, g = null, i;
+  for (i = 0; pool && i < pool.rows.length; i++) {
+    if (String(pool.rows[i].id) === String(gameId)) { g = pool.rows[i]; }
+  }
+  if (!g || g.started) { return; }
+  _csState.sel = g;
+  _csState.h = ''; _csState.a = '';
+  _csRender();
+}
+
+function _csLock() {
+  var st = _csStore(), date = _svToday();
+  if (st.nights[date] && st.nights[date].locked) { return; }
+  var g = _csState.sel;
+  if (!g) { return; }
+  var hv = parseInt(_csState.h, 10), av = parseInt(_csState.a, 10);
+  if (isNaN(hv) || isNaN(av) || hv < 0 || av < 0) { return; }
+  var house = _csHouse(g);
+  st.nights[date] = {
+    date: date, gameId: String(g.id), league: g.league,
+    home: _csSide(g, 'home'), away: _csSide(g, 'away'),
+    my: { home: hv, away: av },
+    house: house, locked: true, settled: false,
+    result: '', myErr: null, houseErr: null, band: '', final: null
+  };
+  _csSave();
+  _csState.sel = null;
+  _csRender();
+  _csRefresh(true);
+}
+
+// CALLSCORE -- the morning after. A postponement is not a loss here
+// either: it grades as a no contest and stays out of the record.
+function _csSettle(date, games) {
+  var st = _csStore(), N = st.nights[date];
+  if (!N || !N.locked || N.settled) { return false; }
+  var g = null, i;
+  for (i = 0; i < (games || []).length; i++) {
+    if (String(games[i].id) === String(N.gameId)) { g = games[i]; }
+  }
+  if (!g) { return false; }
+  if (_peDead(g)) {
+    N.settled = true; N.result = 'N';
+    _csSave();
+    return true;
+  }
+  if (!g.completed) { return false; }
+  var fh = Number(g.home.score), fa = Number(g.away.score);
+  if (isNaN(fh) || isNaN(fa)) { return false; }
+  N.final = { home: fh, away: fa };
+  N.myErr = _csErr(N.my, fh, fa);
+  N.houseErr = _csErr(N.house, fh, fa);
+  N.band = _csBand(N.myErr, fh + fa);
+  N.settled = true;
+  if (N.houseErr == null) { N.result = 'S'; }   // solo: no line to beat
+  else if (N.myErr < N.houseErr) { N.result = 'W'; }
+  else if (N.myErr > N.houseErr) { N.result = 'L'; }
+  else { N.result = 'T'; }
+  _csSave();
+  return true;
+}
+
+function _csRefresh(force) {
+  if (_csState.busy) { return; }
+  var st = _csStore(), dates = [], k;
+  for (k in st.nights) {
+    if (st.nights.hasOwnProperty(k) && st.nights[k].locked && !st.nights[k].settled) {
+      dates.push(k);
+    }
+  }
+  if (!dates.length && !force) { return; }
+  if (!dates.length) { return; }
+  _csState.busy = true;
+  var jobs = dates.map(function (d) {
+    return _peFetchSlate(d, STV_LEAGUES).then(function (games) {
+      return { d: d, games: games || [] };
+    }, function () { return null; });
+  });
+  Promise.all(jobs).then(function (res) {
+    var changed = false, i;
+    for (i = 0; i < res.length; i++) {
+      if (res[i] && _csSettle(res[i].d, res[i].games)) { changed = true; }
+    }
+    _csState.busy = false;
+    if (changed) { _csRender(); }
+  }, function () { _csState.busy = false; });
+}
+
+// CALLSCORE -- the record, overall and by sport. Solo nights are
+// counted and shown, but kept out of the W-L: there was nothing to beat.
+function _csRecord() {
+  var st = _csStore(), k, by = {}, order = [];
+  var all = { w: 0, l: 0, t: 0, solo: 0, voids: 0, bull: 0,
+              sharp: 0, close: 0, wide: 0, n: 0 };
+  function slot(sp) {
+    if (!by[sp]) {
+      by[sp] = { sport: sp, w: 0, l: 0, t: 0, solo: 0, voids: 0, bull: 0,
+                 sharp: 0, close: 0, wide: 0, n: 0 };
+      order.push(sp);
+    }
+    return by[sp];
+  }
+  for (k in st.nights) {
+    if (!st.nights.hasOwnProperty(k)) { continue; }
+    var N = st.nights[k];
+    if (!N.settled) { continue; }
+    var B = slot(String(N.league || '?'));
+    if (N.result === 'N') { all.voids++; B.voids++; continue; }
+    all.n++; B.n++;
+    // CALLSCORE3 -- the band mix, which is one unit rather than two
+    // that disagree with each other on the same screen.
+    if (N.band) {
+      var bk = (N.band === 'bullseye') ? 'bull' : N.band;
+      all[bk] = (all[bk] || 0) + 1;
+      B[bk] = (B[bk] || 0) + 1;
+    }
+    if (N.result === 'W') { all.w++; B.w++; }
+    else if (N.result === 'L') { all.l++; B.l++; }
+    else if (N.result === 'T') { all.t++; B.t++; }
+    else { all.solo++; B.solo++; }
+  }
+  var rows = [], i;
+  for (i = 0; i < order.length; i++) { rows.push(by[order[i]]); }
+  rows.sort(function (a, b) { return b.n - a.n; });
+  all.by = rows;
+  return all;
+}
+
+function _csRecStr(t) {
+  return t.w + '-' + t.l + (t.t ? ('-' + t.t) : '');
+}
+
+// CALLSCORE3 -- how the calls landed, in the same words the night card
+// uses. Empty when nothing has been graded, rather than four zeroes.
+function _csBandStr(t) {
+  var p = [];
+  if (t.bull) { p.push(t.bull + ' exact'); }
+  if (t.sharp) { p.push(t.sharp + ' sharp'); }
+  if (t.close) { p.push(t.close + ' close'); }
+  if (t.wide) { p.push(t.wide + ' wide'); }
+  return p.join(' \u00b7 ');
+}
+
+function _csSetLeague(lg) {
+  _csState.league = (_csState.league === lg) ? '' : lg;
+  _csState.q = '';
+  _csRender();
+}
+function _csSetQ(v) { _csState.q = String(v || ''); _csRender(); }
+function _csSetH(v) { _csState.h = String(v || ''); }
+function _csSetA(v) { _csState.a = String(v || ''); }
+
+function _csVisible(pool) {
+  var q = String(_csState.q || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  var lg = _csState.league, out = [], i, r;
+  for (i = 0; pool && i < pool.rows.length; i++) {
+    r = pool.rows[i];
+    if (lg && r.league !== lg) { continue; }
+    if (q && ((r.home.name || '') + ' ' + (r.home.abbr || '') + ' ' +
+      (r.away.name || '') + ' ' + (r.away.abbr || '') + ' ' +
+      _stvLgLabel(r.league)).toLowerCase().indexOf(q) === -1) { continue; }
+    out.push(r);
+  }
+  return out;
+}
+
+function _csNum(n) {
+  var v = Math.round(Number(n) * 10) / 10;
+  return (Math.abs(v - Math.round(v)) < 0.05) ? String(Math.round(v)) : v.toFixed(1);
+}
+
+// CALLSCORE2 -- what the book is saying, in words, including the two
+// ways it can be saying less than usual.
+function _csLineNote(h) {
+  if (!h) {
+    return 'No line on this one \u2014 you will be graded on how close ' +
+      'you get, and the night stays out of the win-loss.';
+  }
+  if (h.even) {
+    return 'The book has a total of ' + _csNum(h.total) + ' but no ' +
+      'favourite, so it splits it evenly.';
+  }
+  return 'The book has ' + _csNum(h.total) + ' total and ' +
+    _csNum(h.spread) + ' of spread \u2014 that is ' +
+    _csNum(Math.max(h.home, h.away)) + '\u2013' + _csNum(Math.min(h.home, h.away)) + '.';
+}
+
+function _csCardHtml(N) {
+  var mine = N.my, hs = N.house;
+  var fin = N.final;
+  var head = '';
+  if (N.settled && N.result === 'N') {
+    head = '<div style="border:1px solid rgba(255,255,255,0.18);' +
+      'background:rgba(255,255,255,0.03);border-radius:12px;padding:14px;' +
+      'text-align:center;margin:0 0 12px">' +
+      '<div style="font:24px Georgia,serif;color:rgba(255,255,255,0.75)">' +
+      'No contest</div><div style="font-size:11.5px;' +
+      'color:rgba(255,255,255,0.5);margin-top:5px">That game never ' +
+      'happened, so the night does not count.</div></div>';
+  } else if (N.settled && fin) {
+    var won = (N.result === 'W'), solo = (N.result === 'S'), tie = (N.result === 'T');
+    var bc = solo ? 'rgba(255,255,255,0.18)'
+      : (tie ? 'rgba(255,255,255,0.22)'
+        : (won ? 'rgba(74,222,128,0.4)' : 'rgba(248,113,113,0.4)'));
+    var fg = solo ? 'rgba(255,255,255,0.8)'
+      : (tie ? 'rgba(255,255,255,0.8)' : (won ? '#4ade80' : '#f87171'));
+    var word = solo ? 'Called it solo'
+      : (tie ? 'Dead level with the book'
+        : (won ? 'You beat the book' : 'The book beat you'));
+    head = '<div style="border:1px solid ' + bc + ';background:rgba(255,255,255,0.03);' +
+      'border-radius:12px;padding:14px;text-align:center;margin:0 0 12px">' +
+      '<div style="font:25px Georgia,serif;color:' + fg + '">' + word + '</div>' +
+      '<div style="font-family:var(--sk-font-mono,monospace);font-size:13px;' +
+      'color:#fff;margin-top:7px">' + skEscape(N.away.abbr) + ' ' + fin.away +
+      ' \u2013 ' + fin.home + ' ' + skEscape(N.home.abbr) + '</div>' +
+      '<div style="font-size:11.5px;color:rgba(255,255,255,0.5);margin-top:5px">' +
+      (N.band === 'bullseye'
+        ? 'Exact. On the nose.'
+        : ('Out by ' + _csNum(N.myErr) + ' across the two sides' +
+           (N.houseErr != null ? (', the book by ' + _csNum(N.houseErr)) : '') +
+           '.')) + '</div></div>';
+  }
+  function row(lab, p, err, col) {
+    return '<div style="display:flex;align-items:center;gap:10px;padding:9px 0;' +
+      'border-bottom:1px solid rgba(255,255,255,0.045)">' +
+      '<div style="flex:1;min-width:0">' +
+        '<div style="font-size:9px;letter-spacing:0.13em;' +
+        'color:rgba(255,255,255,0.35);font-weight:700">' + lab + '</div>' +
+        '<div style="font-family:var(--sk-font-mono,monospace);font-size:15px;' +
+        'font-weight:700;margin-top:3px;color:' + (col || '#fff') + '">' +
+          (p ? (skEscape(N.away.abbr) + ' ' + _csNum(p.away) + ' \u2013 ' +
+                _csNum(p.home) + ' ' + skEscape(N.home.abbr))
+             : 'no line') + '</div>' +
+      '</div>' +
+      (err != null
+        ? ('<div style="font-family:var(--sk-font-mono,monospace);font-size:11px;' +
+           'color:rgba(255,255,255,0.45)">off by ' + _csNum(err) + '</div>')
+        : '') + '</div>';
+  }
+  return '<div class="rg-dark rg-bleed">' + head +
+    '<div class="rg-sect">' + skEscape(_stvLgLabel(N.league)) + ' \u00b7 ' +
+      skEscape(N.away.name || N.away.abbr) + ' at ' +
+      skEscape(N.home.name || N.home.abbr) + '</div>' +
+    row('YOU CALLED', mine, N.settled ? N.myErr : null, '#facc15') +
+    row('THE BOOK CALLED', hs, N.settled ? N.houseErr : null) +
+    '<div class="rg-foot">' +
+      (N.settled
+        ? (N.result === 'S'
+            ? 'No line on this one, so it is graded on closeness only and stays out of the win-loss.'
+            : 'Settled off the final score. Nothing to tap.')
+        : _csLineNote(hs) + ' Settles itself once the game is final.') +
+    '</div></div>';
+}
+
+function _csRender() {
+  var host = document.getElementById('skCsBody');
+  if (!host) { return; }
+  var st = _csStore(), rec = _csRecord();
+  var N = _csNight();
+  var h = '';
+
+  // The record, up top, because it is the reason to keep playing.
+  h += '<div style="border:1px solid rgba(250,204,21,0.35);' +
+    'background:rgba(250,204,21,0.05);border-radius:12px;padding:12px 14px;' +
+    'margin:0 0 12px">' +
+    '<div style="font-size:9.5px;letter-spacing:0.14em;color:#facc15;' +
+    'font-weight:700">AGAINST THE BOOK</div>' +
+    '<div style="display:flex;align-items:baseline;gap:9px;margin-top:5px">' +
+      '<span style="font:700 30px Georgia,serif;line-height:1">' +
+        _csRecStr(rec) + '</span>' +
+      '<span style="font-size:11.5px;color:rgba(255,255,255,0.5)">' +
+        (rec.n ? (rec.n + ' graded night' + (rec.n === 1 ? '' : 's')) : 'no nights yet') +
+        (rec.solo ? (' \u00b7 ' + rec.solo + ' solo') : '') +
+        (rec.voids ? (' \u00b7 ' + rec.voids + ' no contest') : '') +
+      '</span></div>' +
+    (_csBandStr(rec)
+      ? ('<div style="font-size:10.5px;color:rgba(255,255,255,0.4);margin-top:6px">' +
+         skEscape(_csBandStr(rec)) + '</div>')
+      : '') + '</div>';
+
+  if (rec.by && rec.by.length > 1) {
+    h += '<div class="rg-dark rg-bleed"><div class="rg-sect">BY SPORT</div>';
+    for (var bi = 0; bi < rec.by.length; bi++) {
+      var B = rec.by[bi];
+      h += '<div style="display:flex;align-items:baseline;gap:8px;padding:5px 0;' +
+        'border-bottom:1px solid rgba(255,255,255,0.05);font-size:12px">' +
+        '<span style="flex:1;color:#fff">' +
+          skEscape(_stvLgLabel(B.sport)) + '</span>' +
+        '<span style="font-family:var(--sk-font-mono,monospace);font-weight:800">' +
+          _csRecStr(B) + '</span>' +
+        '<span style="font-size:9px;color:rgba(255,255,255,0.3);flex:0 0 74px;' +
+        'text-align:right">' +
+          skEscape(_csBandStr(B) || '\u2014') +
+        '</span></div>';
+    }
+    h += '</div>';
+  }
+
+  if (N && N.locked) {
+    h += _csCardHtml(N);
+    host.innerHTML = h;
+    return;
+  }
+  if (_csState.note) {
+    h += '<div class="sk-wire-sheet-empty">' + skEscape(_csState.note) + '</div>';
+    host.innerHTML = h;
+    return;
+  }
+  var pool = _csState.pool;
+  if (!pool) {
+    h += '<div class="sk-wire-sheet-empty">Reading tonight\u2019s fixtures\u2026</div>';
+    host.innerHTML = h;
+    return;
+  }
+  if (!pool.rows.length) {
+    h += '<div class="sk-wire-sheet-empty">Nothing on tonight.</div>';
+    host.innerHTML = h;
+    return;
+  }
+
+  // The chosen game and the two boxes.
+  if (_csState.sel) {
+    var g = _csState.sel, hs = _csHouse(g);
+    h += '<div class="rg-dark rg-bleed">' +
+      '<div class="rg-sect">' + skEscape(_stvLgLabel(g.league)) + ' \u00b7 ' +
+        skEscape(g.away.name || g.away.abbr) + ' at ' +
+        skEscape(g.home.name || g.home.abbr) + '</div>' +
+      '<div style="display:flex;align-items:flex-end;gap:10px;padding:6px 0 10px">' +
+        _csBox('away', g.away.abbr) +
+        '<span style="font-size:16px;color:rgba(255,255,255,0.3);padding-bottom:9px">\u2013</span>' +
+        _csBox('home', g.home.abbr) +
+      '</div>' +
+      '<button onclick="_csLock()" style="width:100%;padding:11px;border-radius:9px;' +
+      'border:0;background:#facc15;color:#111;font-weight:800;font-size:13px;' +
+      'letter-spacing:0.06em;cursor:pointer">LOCK IT IN</button>' +
+      '<div class="rg-foot">' + skEscape(_csLineNote(hs)) +
+        ' One game a night, and it locks when you tap.</div>' +
+      '</div>';
+  }
+
+  var rows = _csVisible(pool), lgs = STV_LEAGUES, li;
+  h += '<div class="rg-dark rg-bleed">' +
+    '<div style="display:flex;gap:6px;margin:0 0 8px;overflow-x:auto;' +
+    '-webkit-overflow-scrolling:touch">';
+  h += '<button onclick="_csSetLeague(\'\')" style="flex:0 0 auto;padding:6px 13px;' +
+    'border-radius:999px;font-size:12px;font-weight:700;cursor:pointer;' +
+    (!_csState.league ? 'background:#facc15;color:#111;border:0'
+                      : 'background:transparent;color:rgba(255,255,255,0.6);' +
+                        'border:1px solid rgba(255,255,255,0.14)') + '">All ' +
+    '<span style="opacity:0.65;font-weight:400">' + pool.open + '</span></button>';
+  for (li = 0; li < lgs.length; li++) {
+    if (!pool.leagues[lgs[li]]) { continue; }
+    var on = (_csState.league === lgs[li]);
+    h += '<button onclick="_csSetLeague(\'' + lgs[li] + '\')" ' +
+      'style="flex:0 0 auto;padding:6px 13px;border-radius:999px;font-size:12px;' +
+      'font-weight:700;cursor:pointer;' +
+      (on ? 'background:#facc15;color:#111;border:0'
+          : 'background:transparent;color:rgba(255,255,255,0.6);' +
+            'border:1px solid rgba(255,255,255,0.14)') + '">' +
+      skEscape(_stvLgLabel(lgs[li])) +
+      ' <span style="opacity:0.65;font-weight:400">' + pool.leagues[lgs[li]] +
+      '</span></button>';
+  }
+  h += '</div>';
+  h += '<input id="skCsQ" type="search" placeholder="Search a club\u2026" ' +
+    'value="' + skEscape(_csState.q || '') + '" oninput="_csSetQ(this.value)" ' +
+    'style="width:100%;margin:0 0 8px;padding:8px 10px;border-radius:8px;' +
+    'background:#0d1220;color:#fff;border:1px solid rgba(255,255,255,0.12);' +
+    'font-size:13px;-webkit-appearance:none">';
+  h += '<div class="rg-sect">Tonight\u2019s games <span style="opacity:0.6">' +
+    pool.open + ' open' +
+    (rows.length > 60 ? (' \u00b7 showing 60 of ' + rows.length) : '') +
+    '</span></div>';
+  var i;
+  for (i = 0; i < rows.length && i < 60; i++) {
+    var r = rows[i], hh = _csHouse(r);
+    var picked = _csState.sel && String(_csState.sel.id) === String(r.id);
+    h += '<div style="display:flex;align-items:center;padding:9px 0;gap:9px;' +
+      'border-bottom:1px solid rgba(255,255,255,0.045)' +
+      (r.started ? ';opacity:0.32' : ';cursor:pointer') +
+      (picked ? ';background:rgba(250,204,21,0.07)' : '') + '"' +
+      (r.started ? '' : (' onclick="_csPick(\'' + skEscape(String(r.id)) + '\')"')) + '>' +
+      '<div style="flex:1;min-width:0">' +
+        '<div style="font-size:13.5px;font-weight:600;line-height:1.25">' +
+          skEscape(r.away.abbr) + ' at ' + skEscape(r.home.abbr) + '</div>' +
+        '<div style="font-family:var(--sk-font-mono,monospace);font-size:10px;' +
+        'color:rgba(255,255,255,0.42);margin-top:2px">' +
+          skEscape(_stvLgLabel(r.league)) +
+          (hh ? (' \u00b7 O/U ' + _csNum(hh.total) +
+                 (hh.even ? '' : (' \u00b7 ' + skEscape(String((r.odds && r.odds.spread) || '')))))
+              : ' \u00b7 no line') + '</div>' +
+      '</div>' +
+      (r.started
+        ? '<span style="font-size:9px;letter-spacing:0.1em;color:rgba(255,255,255,0.4);' +
+          'border:1px solid rgba(255,255,255,0.12);border-radius:999px;padding:3px 8px;' +
+          'font-weight:700">STARTED</span>'
+        : (hh
+          ? '<span style="font-size:9.5px;letter-spacing:0.1em;color:#111;' +
+            'background:#facc15;border-radius:999px;padding:5px 12px;' +
+            'font-weight:700">CALL IT</span>'
+          : '<span style="font-size:9.5px;letter-spacing:0.1em;' +
+            'color:rgba(255,255,255,0.55);border:1px solid rgba(255,255,255,0.22);' +
+            'border-radius:999px;padding:4px 11px;font-weight:700">SOLO</span>')) +
+      '</div>';
+  }
+  h += '<div class="rg-foot">Pick one game, call the final score, and the ' +
+    'book calls it too \u2014 closer wins the night. Games with no total ' +
+    'are marked SOLO: still playable, graded on closeness, kept out of the ' +
+    'win-loss because there was nothing to beat.</div></div>';
+  host.innerHTML = h;
+}
+
+function _csBox(which, abbr) {
+  var v = (which === 'home') ? _csState.h : _csState.a;
+  return '<label style="flex:1;min-width:0">' +
+    '<div style="font-size:9px;letter-spacing:0.12em;color:rgba(255,255,255,0.45);' +
+    'font-weight:700;margin-bottom:4px">' + skEscape(abbr) + '</div>' +
+    '<input type="number" inputmode="numeric" min="0" value="' + skEscape(v) + '" ' +
+    'oninput="' + (which === 'home' ? '_csSetH' : '_csSetA') + '(this.value)" ' +
+    'style="width:100%;padding:10px;border-radius:9px;background:#0d1220;' +
+    'color:#fff;border:1px solid rgba(255,255,255,0.16);font-size:19px;' +
+    'font-family:var(--sk-font-mono,monospace);font-weight:700;text-align:center;' +
+    '-webkit-appearance:none"></label>';
+}
+
+function _csEnsurePool() {
+  if (_csState.pool || _csState.busy) { return; }
+  _peFetchSlate(_svToday(), STV_LEAGUES).then(function (games) {
+    var rows = [], now = Date.now(), i, open = 0, lgs = {};
+    for (i = 0; i < (games || []).length; i++) {
+      var g = games[i];
+      if (!g || !g.home || !g.away) { continue; }
+      g.started = !_peIsOpen(g, now);
+      rows.push(g);
+      if (!g.started) { open++; lgs[g.league] = (lgs[g.league] || 0) + 1; }
+    }
+    // Open games first, then by whether the book has an opinion.
+    rows.sort(function (a, b) {
+      if (!a.started !== !b.started) { return a.started ? 1 : -1; }
+      var ha = _csHouse(a) ? 0 : 1, hb = _csHouse(b) ? 0 : 1;
+      return ha - hb;
+    });
+    _csState.pool = { rows: rows, open: open, leagues: lgs };
+    _csRender();
+  }, function () {
+    _csState.note = 'Could not read tonight\u2019s fixtures.';
+    _csRender();
+  });
+}
+
+function openCallScore() {
+  var ov = document.getElementById('skCsOverlay');
+  if (!ov) { return; }
+  ov.classList.add('open');
+  _csState.note = '';
+  _csRender();
+  _csRefresh(false);
+  _csEnsurePool();
+}
+
+function closeCallScore() {
+  var ov = document.getElementById('skCsOverlay');
+  if (ov) { ov.classList.remove('open'); }
+}
+
 // \u2500\u2500 AUCTGAMES \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 // Each game says where it stands, because a menu that only lists names
 // makes him open both to find out whether there is anything to do.
@@ -193229,6 +193807,22 @@ function _auctGamesHtml() {
     '<div class="ld-tool-name">Survivor: Player Edition' +
       '<div style="font-size:11px;color:rgba(255,255,255,0.45);' +
       'font-weight:400;margin-top:2px">' + skEscape(ssub) + '</div>' +
+    '</div>' +
+  '</div>';
+  // CALLSCORE -- one game, any sport, against the book's own number.
+  var csub = 'One game a night, any sport, against the book';
+  try {
+    var cr = _csRecord();
+    if (cr.n) {
+      csub = _csRecStr(cr) + ' against the book \u00b7 ' + cr.n + ' night' +
+        (cr.n === 1 ? '' : 's') + (cr.bull ? (' \u00b7 ' + cr.bull + ' exact') : '');
+    }
+  } catch (eC) {}
+  h += '<div class="ld-tool-item" onclick="closeGames(); openCallScore();">' +
+    '<div class="ld-tool-icon">\ud83c\udfaf</div>' +
+    '<div class="ld-tool-name">Call the Score' +
+      '<div style="font-size:11px;color:rgba(255,255,255,0.45);' +
+      'font-weight:400;margin-top:2px">' + skEscape(csub) + '</div>' +
     '</div>' +
   '</div>';
   // SURVTEAM -- the same idea one level up: clubs, not men.
@@ -206257,7 +206851,14 @@ function _peOdds(odds, home, away) {
   // and no favourite at all, and keeping just the favourite's half meant
   // those games carried no probability for either team -- so a pick on one
   // could never be scored for difficulty.
-  return { spread: spread, favId: favId, fav: favAbbr,
+  // CALLSCORE -- the over/under was on the payload all along and
+  // thrown away here, because nothing used to need it. The implied
+  // score is the total and the spread together, so Call the Score
+  // cannot be built without it. Additive: every existing reader of this
+  // object is untouched.
+  var ou = (odds.overUnder != null) ? parseFloat(odds.overUnder) : null;
+  if (ou != null && (isNaN(ou) || ou <= 0)) { ou = null; }
+  return { spread: spread, favId: favId, fav: favAbbr, overUnder: ou,
     homeP: p ? p.home : null, awayP: p ? p.away : null,
     favP: (favId && p) ? ((favId === home.id) ? p.home : p.away) : null };
 }
