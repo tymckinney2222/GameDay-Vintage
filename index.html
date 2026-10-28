@@ -33766,6 +33766,20 @@
   <div class="pw-body" id="gwBody"></div>
 </div>
 
+<!-- GAMEDASH -- tonight, across every game. Same pw-overlay shell. -->
+<div class="pw-overlay" id="skGdOverlay">
+  <div class="pp-header">
+    <div>
+      <div class="pp-eyebrow">Tonight</div>
+      <h2 class="pp-title">On the Line</h2>
+    </div>
+    <button class="pp-close" onclick="closeGameDash()" aria-label="Close">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+    </button>
+  </div>
+  <div class="pw-body" id="skGdBody"></div>
+</div>
+
 <!-- CALLSCORE -- one game a night, any sport, against the book. -->
 <div class="pw-overlay" id="skCsOverlay">
   <div class="pp-header">
@@ -194341,7 +194355,10 @@ function _gmTickFire() {
   if (document.hidden) { return; }
   var w = _gmTick.who;
   try {
-    if (w === 'stv' && _gmOpen('skStvOverlay')) { _stvRefresh(true); }
+    if (w === 'gd' && _gmOpen('skGdOverlay')) {
+      _gdLoad(true); _gdSvLoad(true); _gdAuctLoad(true);
+    }
+    else if (w === 'stv' && _gmOpen('skStvOverlay')) { _stvRefresh(true); }
     else if (w === 'sv' && _gmOpen('skSurvOverlay')) { _svRefresh(true); }
     else if (w === 'cs' && _gmOpen('skCsOverlay')) { _csRefresh(true); }
     else if (w === 'pe' && _gmOpen('peOverlay')) {
@@ -194367,6 +194384,478 @@ try {
     if (!document.hidden) { _gmTickFire(); }
   });
 } catch (eGv) {}
+
+// \u2500\u2500 GAMEDASH \u00b7 everything riding tonight \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+//
+// One slate fetch feeds every game in here that grades off a
+// scoreboard, so this screen costs ONE request where opening the three
+// of them costs three. And since it has the games in hand it banks the
+// results too -- _csSettle, _stvSettle and _peGradeDay all take a list
+// of games, so settling is free from here.
+var _gdState = { slate: null, day: '', busy: false, at: 0, note: '' };
+
+function _gdScore(g) {
+  if (!g || !g.home || !g.away) { return ''; }
+  return g.away.abbr + ' ' + (Number(g.away.score) || 0) + ' \u2013 ' +
+    (Number(g.home.score) || 0) + ' ' + g.home.abbr;
+}
+
+// Where the game is, in its own words. ESPN puts the tip-off time in
+// detail before the game starts, which is exactly what he wants to see.
+function _gdWhen(g) {
+  if (!g) { return 'not on tonight\u2019s slate'; }
+  if (_peDead(g)) { return 'postponed'; }
+  if (g.completed) { return 'Final'; }
+  return g.detail || (g.state === 'pre' ? 'not started' : 'in progress');
+}
+
+// GAMEDASH -- an em dash is NOT NOUGHT. A game that has not started
+// reading "behind" would be a lie about a game nobody has played.
+function _gdStanding(g, teamId) {
+  var out = { word: '', col: 'rgba(255,255,255,0.4)' };
+  if (!g || !teamId || !g.home || !g.away) { return out; }
+  var home = String(g.home.id) === String(teamId);
+  var mine = home ? g.home : g.away, them = home ? g.away : g.home;
+  if (_peDead(g)) { out.word = 'no contest'; return out; }
+  if (g.completed) {
+    if (mine.winner) { out.word = 'won'; out.col = '#4ade80'; }
+    else if (them.winner) { out.word = 'lost'; out.col = '#f87171'; }
+    else { out.word = 'no result'; }
+    return out;
+  }
+  if (g.state === 'pre') { out.word = 'not started'; return out; }
+  var a = Number(mine.score) || 0, b = Number(them.score) || 0;
+  if (a > b) { out.word = 'ahead'; out.col = '#4ade80'; }
+  else if (a < b) { out.word = 'behind'; out.col = '#f87171'; }
+  else { out.word = 'level'; out.col = 'rgba(255,255,255,0.7)'; }
+  return out;
+}
+
+// One row shape for all of them, so three games read as one screen
+// rather than three screens stacked.
+function _gdRow(tag, what, sub, right, note, col) {
+  return '<div style="display:flex;align-items:flex-start;gap:10px;' +
+    'padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.045)">' +
+    '<span style="flex:0 0 42px;font-size:9px;letter-spacing:0.1em;' +
+    'font-weight:800;color:rgba(255,255,255,0.35);padding-top:3px">' +
+      skEscape(tag) + '</span>' +
+    '<span style="flex:1;min-width:0">' +
+      '<span style="display:block;font-size:13.5px;font-weight:600;' +
+      'color:#fff">' + what + '</span>' +
+      (sub ? ('<span style="display:block;font-family:' +
+        'var(--sk-font-mono,monospace);font-size:10.5px;' +
+        'color:rgba(255,255,255,0.42);margin-top:2px">' + sub +
+        '</span>') : '') +
+    '</span>' +
+    '<span style="flex:0 0 auto;text-align:right">' +
+      '<span style="display:block;font-family:var(--sk-font-mono,monospace);' +
+      'font-size:13px;color:#eef2f8">' + right + '</span>' +
+      (note ? ('<span style="display:block;font-size:10px;margin-top:2px;' +
+        'color:' + (col || 'rgba(255,255,255,0.4)') + '">' + note +
+        '</span>') : '') +
+    '</span></div>';
+}
+
+// GAMEDASH -- in play, then yet to start, then done. A dashboard is a
+// thing he glances at mid-evening, so what is happening now goes at the
+// top rather than whichever sport sorts first alphabetically.
+function _gdOrder(items) {
+  items.sort(function (a, b) {
+    function rank(x) {
+      if (x.P && x.P.settled) { return 2; }
+      if (!x.g) { return 3; }
+      if (x.g.completed || _peDead(x.g)) { return 2; }
+      if (x.g.state === 'pre') { return 1; }
+      return 0;                       // in progress
+    }
+    var ra = rank(a), rb = rank(b);
+    if (ra !== rb) { return ra - rb; }
+    return (a.key < b.key) ? -1 : 1;
+  });
+  return items;
+}
+
+// \u2500\u2500 Call the Score \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+function _gdCsHtml() {
+  var N = null, by = (_gdState.slate && _gdState.slate.byId) || {};
+  try { N = _csNight(); } catch (eN) { return ''; }
+  if (!N || !N.picks) { return ''; }
+  var items = [], k, i;
+  for (k in N.picks) {
+    if (N.picks.hasOwnProperty(k)) {
+      items.push({ key: k, P: N.picks[k], g: by[String(N.picks[k].gameId)] });
+    }
+  }
+  if (!items.length) { return ''; }
+  _gdOrder(items);
+  var h = '<div class="rg-dark rg-bleed">' +
+    '<div class="rg-sect" style="display:flex;align-items:center">' +
+      '<span style="flex:1">Call the Score</span>' +
+      '<span onclick="closeGameDash();openCallScore()" ' +
+      'style="font-weight:400;opacity:0.5;cursor:pointer;font-size:10px">' +
+      'OPEN</span></div>';
+  for (i = 0; i < items.length; i++) {
+    var P = items[i].P, g = items[i].g;
+    var word = '', col = 'rgba(255,255,255,0.4)';
+    if (P.settled) {
+      if (P.result === 'W') { word = 'beat the book'; col = '#4ade80'; }
+      else if (P.result === 'L') { word = 'book won'; col = '#f87171'; }
+      else if (P.result === 'T') { word = 'dead level'; col = 'rgba(255,255,255,0.7)'; }
+      else if (P.result === 'N') { word = 'no contest'; }
+      else { word = 'called it solo'; }
+    } else {
+      // The stake belongs over here with the state of the game, not on
+      // the call underneath, which was already running past the edge.
+      word = _gdWhen(g) + (P.stake ? (' \u00b7 ' + _csMoney(P.stake)) : '');
+    }
+    var mine = P.my ? (_csNum(P.my.away) + '\u2013' + _csNum(P.my.home)) : '?';
+    var book = P.house ? (_csNum(P.house.away) + '\u2013' + _csNum(P.house.home))
+                       : 'no line';
+    h += _gdRow(_stvLgLabel(P.league),
+      skEscape(P.away.abbr) + ' at ' + skEscape(P.home.abbr),
+      'you ' + skEscape(mine) + ' \u00b7 book ' + skEscape(book),
+      skEscape(g ? _gdScore(g) : '\u2014'), skEscape(word), col);
+  }
+  return h + '</div>';
+}
+
+// \u2500\u2500 Survivor \u00b7 Team Edition \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+function _gdStvHtml() {
+  var N = null, by = (_gdState.slate && _gdState.slate.byId) || {};
+  try { N = _stvNight(); } catch (eT) { return ''; }
+  if (!N || !N.picks) { return ''; }
+  var items = [], k, i;
+  for (k in N.picks) {
+    if (N.picks.hasOwnProperty(k)) {
+      var me0 = N.picks[k].me;
+      items.push({ key: k, P: N.picks[k],
+                   g: me0 ? by[String(me0.gameId)] : null });
+    }
+  }
+  if (!items.length) { return ''; }
+  _gdOrder(items);
+  var h = '<div class="rg-dark rg-bleed">' +
+    '<div class="rg-sect" style="display:flex;align-items:center">' +
+      '<span style="flex:1">Survivor \u00b7 Teams</span>' +
+      '<span onclick="closeGameDash();openSurvivorTeams()" ' +
+      'style="font-weight:400;opacity:0.5;cursor:pointer;font-size:10px">' +
+      'OPEN</span></div>';
+  for (i = 0; i < items.length; i++) {
+    var P = items[i].P, gm = items[i].g;
+    var sd = _gdStanding(gm, P.me && P.me.teamId);
+    var word = sd.word, col = sd.col;
+    if (P.settled) {
+      word = (P.result === 'W') ? 'survived'
+        : ((P.result === 'L') ? 'out' : 'no contest');
+      col = (P.result === 'W') ? '#4ade80'
+        : ((P.result === 'L') ? '#f87171' : 'rgba(255,255,255,0.5)');
+    }
+    // The house on the same row, because the whole game is the two of
+    // them and a club on its own says nothing about the night.
+    var gh = P.house ? by[String(P.house.gameId)] : null;
+    var hs = _gdStanding(gh, P.house && P.house.teamId);
+    h += _gdRow(_stvLgLabel(items[i].key),
+      skEscape((P.me && P.me.name) || '\u2014'),
+      // How the house is doing, not the full line of its game: the
+      // second score ran past the edge and was never the question.
+      'house ' + skEscape((P.house && P.house.abbr) || '\u2014') +
+        (hs.word ? (' \u00b7 ' + skEscape(hs.word)) : ''),
+      skEscape(gm ? _gdScore(gm) : '\u2014'),
+      skEscape(word + (gm && !P.settled && !gm.completed && gm.detail
+        ? (' \u00b7 ' + gm.detail) : '')), col);
+  }
+  return h + '</div>';
+}
+
+// \u2500\u2500 Pick 'Em \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+// A whole slate of picks would swamp a dashboard, so the night is a
+// tally and only the games still being played get a row.
+var GD_PE_MAX = 6;
+
+function _gdPeHtml() {
+  var sl = _gdState.slate;
+  if (!sl) { return ''; }
+  var store = null;
+  try { store = _peLoad(); } catch (eP) { return ''; }
+  var picks = (store && store.picks) || {};
+  var i, w = 0, l = 0, open = [], n = 0;
+  for (i = 0; i < sl.games.length; i++) {
+    var g = sl.games[i], row = picks[String(g.id)];
+    if (!row || !row.pick) { continue; }
+    n++;
+    if (row.res === 'W') { w++; }
+    else if (row.res === 'L') { l++; }
+    else if (!row.res) { open.push({ g: g, row: row }); }
+  }
+  if (!n) { return ''; }
+  var h = '<div class="rg-dark rg-bleed">' +
+    '<div class="rg-sect" style="display:flex;align-items:center">' +
+      '<span style="flex:1">Pick \u2019Em</span>' +
+      '<span onclick="closeGameDash();openPickEm()" ' +
+      'style="font-weight:400;opacity:0.5;cursor:pointer;font-size:10px">' +
+      'OPEN</span></div>' +
+    '<div style="font-size:11.5px;color:rgba(255,255,255,0.55);' +
+    'padding:4px 0 6px">' + n + ' pick' + (n === 1 ? '' : 's') +
+      ' tonight \u00b7 <b>' + w + '-' + l + '</b> in' +
+      (open.length ? (' \u00b7 ' + open.length + ' still playing') : '') +
+    '</div>';
+  for (i = 0; i < open.length && i < GD_PE_MAX; i++) {
+    var o = open[i], sd2 = _gdStanding(o.g, o.row.pid);
+    h += _gdRow(_stvLgLabel(o.g.league),
+      skEscape(o.row.pick || ''),
+      skEscape(o.g.away.abbr + ' at ' + o.g.home.abbr),
+      skEscape(_gdScore(o.g)),
+      skEscape(sd2.word || _gdWhen(o.g)), sd2.col);
+  }
+  if (open.length > GD_PE_MAX) {
+    h += '<div class="rg-foot">and ' + (open.length - GD_PE_MAX) +
+      ' more still to play.</div>';
+  }
+  return h + '</div>';
+}
+
+// \u2500\u2500 GAMEDASH2 \u00b7 Survivor Players \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+// A scoreboard says who is winning. It does not say what a man did, so
+// this one pays for its own box score -- kept off the slate load so a
+// slow summary cannot hold up the live scores above it.
+var _gdSv = { boxes: null, busy: false, at: 0 };
+
+function _gdSvLoad(force) {
+  var N = null;
+  try { N = _svNight(); } catch (eL) { return; }
+  if (!N || !N.locked || N.settled) { return; }
+  if (_gdSv.busy) { return; }
+  var gids = N.gids || {}, sps = [], jobs = [], sp;
+  for (sp in gids) {
+    if (!gids.hasOwnProperty(sp)) { continue; }
+    sps.push(sp);
+    jobs.push(_svFetchBox(sp, gids[sp]));
+  }
+  if (!jobs.length) { return; }
+  _gdSv.busy = true;
+  Promise.all(jobs).then(function (res) {
+    var boxes = {}, z;
+    for (z = 0; z < sps.length; z++) { boxes[sps[z]] = res[z]; }
+    _gdSv.boxes = boxes;
+    _gdSv.at = Date.now();
+    _gdSv.busy = false;
+    // It has the box scores in hand, so it banks the night too.
+    try { _svSettle(_svToday(), boxes); } catch (eS) {}
+    _gdRender();
+  }, function () { _gdSv.busy = false; });
+}
+
+function _gdSvSide(lab, sd, got, settledRes) {
+  if (!sd) { return ''; }
+  var word = '', col = 'rgba(255,255,255,0.4)';
+  if (settledRes) {
+    word = (settledRes === 'W') ? 'cleared' : 'missed';
+    col = (settledRes === 'W') ? '#4ade80' : '#f87171';
+  } else if (got == null) {
+    word = 'not read yet';
+  } else if (got >= sd.bar.need) {
+    word = 'cleared'; col = '#4ade80';
+  } else {
+    word = 'needs ' + _csNum(sd.bar.need - got) + ' more';
+    col = '#f87171';
+  }
+  var big = (got == null) ? '\u2014'
+    : (sd.bar.binary ? (got ? 'W' : 'L') : String(got));
+  return _gdRow(lab, skEscape(sd.name),
+    skEscape(sd.team) + ' \u00b7 needs ' + skEscape(sd.bar.short),
+    skEscape(big), skEscape(word), col);
+}
+
+function _gdSvHtml() {
+  var N = null;
+  try { N = _svNight(); } catch (eH) { return ''; }
+  if (!N || !N.locked) { return ''; }
+  var boxes = _gdSv.boxes, mine = null, hers = null;
+  if (boxes) {
+    try { mine = _svLineFor(N.me, boxes); } catch (e1) { mine = null; }
+    try { hers = _svLineFor(N.house, boxes); } catch (e2) { hers = null; }
+  }
+  var myGot = N.settled ? N.got : (mine ? mine.got : null);
+  var hrGot = N.settled ? N.houseGot : (hers ? hers.got : null);
+  return '<div class="rg-dark rg-bleed">' +
+    '<div class="rg-sect" style="display:flex;align-items:center">' +
+      '<span style="flex:1">Survivor \u00b7 Players</span>' +
+      '<span onclick="closeGameDash();openSurvivor()" ' +
+      'style="font-weight:400;opacity:0.5;cursor:pointer;font-size:10px">' +
+      'OPEN</span></div>' +
+    _gdSvSide('YOU', N.me, myGot, N.settled ? N.result : '') +
+    _gdSvSide('HOUSE', N.house, hrGot, N.settled ? N.houseResult : '') +
+    '</div>';
+}
+
+// \u2500\u2500 GAMEDASH2 \u00b7 Auction Night, the score and nothing else \u2500\u2500
+// Read, never written. _auctReadCard takes the card out of storage and
+// _auctTotalsWith takes its box and scoring as arguments, so none of
+// this can change which league Auction Night thinks it is on.
+var _gdAuct = { live: {}, busy: {}, at: {} };
+
+function _gdAuctCards() {
+  var out = [], sp, today;
+  try { today = _auctToday(); } catch (eT) { return out; }
+  for (sp in AUCT_SPORTS) {
+    if (!AUCT_SPORTS.hasOwnProperty(sp)) { continue; }
+    var lk = '';
+    try { lk = _auctTonight(sp); } catch (eK) { lk = ''; }
+    if (!lk) { continue; }
+    var card = null;
+    try { card = _auctReadCard(today, lk); } catch (eC) { card = null; }
+    if (!card || !card.locked) { continue; }
+    out.push({ sport: sp, leagueKey: lk, card: card });
+  }
+  return out;
+}
+
+function _gdAuctLoad(force) {
+  var cards = _gdAuctCards(), i;
+  for (i = 0; i < cards.length; i++) {
+    (function (c) {
+      if (c.card.settled) { return; }     // its totals are already stored
+      var key = c.leagueKey, gids = c.card.gids || [];
+      if (!gids.length || _gdAuct.busy[key]) { return; }
+      _gdAuct.busy[key] = 1;
+      _auctLiveFetch(!!force, gids, c.sport).then(function (box) {
+        _gdAuct.busy[key] = 0;
+        if (box) { _gdAuct.live[key] = box; _gdAuct.at[key] = Date.now(); }
+        _gdRender();
+      }, function () { _gdAuct.busy[key] = 0; });
+    })(cards[i]);
+  }
+}
+
+function _gdAuctHtml() {
+  var cards = _gdAuctCards(), i;
+  if (!cards.length) { return ''; }
+  var h = '<div class="rg-dark rg-bleed">' +
+    '<div class="rg-sect" style="display:flex;align-items:center">' +
+      '<span style="flex:1">Auction Night</span>' +
+      '<span onclick="closeGameDash();openAuctionNight()" ' +
+      'style="font-weight:400;opacity:0.5;cursor:pointer;font-size:10px">' +
+      'OPEN</span></div>';
+  for (i = 0; i < cards.length; i++) {
+    var c = cards[i], my, th, word = '', col = 'rgba(255,255,255,0.4)';
+    var live = false;
+    if (c.card.settled && c.card.my != null) {
+      my = Number(c.card.my); th = Number(c.card.houseScore) || 0;
+      live = true;
+      word = (c.card.result === 'W') ? 'won'
+        : ((c.card.result === 'L') ? 'lost' : 'level');
+      col = (c.card.result === 'W') ? '#4ade80'
+        : ((c.card.result === 'L') ? '#f87171' : 'rgba(255,255,255,0.7)');
+    } else {
+      var sc = null, box = _gdAuct.live[c.leagueKey] || null;
+      try { sc = _auctScoring(c.leagueKey); } catch (eSc) { sc = null; }
+      var a = _auctTotalsWith(c.card.lineup || [], box, sc);
+      var b = _auctTotalsWith(c.card.house || [], box, sc);
+      live = !!box;
+      // AUCTLIVE's rule, kept: a side nobody has played yet reads as a
+      // projection, not as nought against nought.
+      my = live ? a.act : a.proj;
+      th = live ? b.act : b.proj;
+      if (!live) {
+        word = 'projected';
+      } else if (a.waiting || b.waiting) {
+        word = (a.waiting + b.waiting) + ' still to play';
+        col = 'rgba(255,255,255,0.5)';
+      } else {
+        word = 'all in';
+      }
+      if (live && my !== th) {
+        col = (my > th) ? '#4ade80' : '#f87171';
+        word = (my > th ? 'ahead' : 'behind') +
+          (word === 'all in' ? '' : (' \u00b7 ' + word));
+      }
+    }
+    h += _gdRow(String(c.sport).toUpperCase(),
+      skEscape(Number(my).toFixed(1)) + ' \u2013 ' +
+        skEscape(Number(th).toFixed(1)),
+      'your six against the house',
+      skEscape((my > th ? '+' : '') + (Number(my) - Number(th)).toFixed(1)),
+      skEscape(word), col);
+  }
+  return h + '</div>';
+}
+
+function _gdRender() {
+  var host = document.getElementById('skGdBody');
+  if (!host) { return; }
+  var h = '', body = '';
+  try { body += _gdCsHtml(); } catch (e1) {}
+  try { body += _gdStvHtml(); } catch (e2) {}
+  try { body += _gdSvHtml(); } catch (e4) {}
+  try { body += _gdAuctHtml(); } catch (e5) {}
+  try { body += _gdPeHtml(); } catch (e3) {}
+  h += '<div style="font-size:10.5px;color:rgba(255,255,255,0.35);' +
+    'padding:0 0 10px">' +
+    (_gdState.busy ? 'Reading tonight\u2019s scores\u2026'
+      : (_gdState.at
+          ? ('Live \u00b7 updated ' + skEscape(_auctAgo(_gdState.at)) +
+             ' \u00b7 refreshes itself every minute')
+          : 'Reading tonight\u2019s scores\u2026')) + '</div>';
+  if (!body) {
+    body = '<div class="sk-wire-sheet-empty">' +
+      (_gdState.note ? skEscape(_gdState.note)
+        : (_gdState.at
+            ? 'Nothing riding tonight yet. Take a club, call a score, ' +
+              'make a pick and it all turns up here.'
+            : 'Reading tonight\u2019s scores\u2026')) + '</div>';
+  }
+  host.innerHTML = h + body;
+}
+
+// GAMEDASH -- one fetch, and then it banks what it can off it. The
+// ledger date and the slate key are different strings and have bitten
+// me before: _peToday() asks the feed, _svToday() files the night.
+function _gdLoad(force) {
+  if (_gdState.busy) { return; }
+  _gdState.busy = true;
+  _gdState.note = '';
+  _gdRender();
+  var day = _peToday();
+  _gdState.day = day;
+  _peFetchSlate(day, STV_LEAGUES).then(function (games) {
+    var list = games || [], byId = {}, i;
+    for (i = 0; i < list.length; i++) { byId[String(list[i].id)] = list[i]; }
+    _gdState.slate = { games: list, byId: byId };
+    _gdState.at = Date.now();
+    _gdState.busy = false;
+    var led = _svToday();
+    try { _csSettle(led, list); } catch (e1) {}
+    try { _stvSettle(led, list); } catch (e2) {}
+    try {
+      if (list.length) {
+        var store = _peLoad(), r = _peGradeDay(store, day, list, Date.now());
+        if (r && r.changed) { _peSave(store); }
+      }
+    } catch (e3) {}
+    _gdRender();
+  }, function () {
+    _gdState.busy = false;
+    _gdState.note = 'Could not read tonight\u2019s scores.';
+    _gdRender();
+  });
+}
+
+function openGameDash() {
+  var ov = document.getElementById('skGdOverlay');
+  if (!ov) { return; }
+  ov.classList.add('open');
+  _gdRender();
+  _gdLoad(false);
+  _gdSvLoad(false);
+  _gdAuctLoad(false);
+  _gmTickStart('gd');
+}
+
+function closeGameDash() {
+  var ov = document.getElementById('skGdOverlay');
+  if (ov) { ov.classList.remove('open'); }
+  _gmTickStop();
+}
 
 function openCallScore() {
   var ov = document.getElementById('skCsOverlay');
@@ -194399,6 +194888,29 @@ function _auctGamesHtml() {
     }
   } catch (e) {}
   if (!sub) { sub = 'Draft six men inside $' + AUCT_BUDGET + ' against the house'; }
+  // GAMEDASH -- top of the list, because it is now the way into all of
+  // them: what is riding, how it is going, and a way through to each.
+  var gsub = 'Everything riding tonight, in one place';
+  try {
+    var gn = 0, gk, gN = _csNight();
+    if (gN && gN.picks) {
+      for (gk in gN.picks) { if (gN.picks.hasOwnProperty(gk)) { gn++; } }
+    }
+    var gT = _stvNight();
+    if (gT && gT.picks) {
+      for (gk in gT.picks) { if (gT.picks.hasOwnProperty(gk)) { gn++; } }
+    }
+    if (gn) {
+      gsub = gn + ' call' + (gn === 1 ? '' : 's') + ' riding tonight';
+    }
+  } catch (eG) {}
+  h += '<div class="ld-tool-item" onclick="closeGames(); openGameDash();">' +
+    '<div class="ld-tool-icon">\ud83d\udcc0</div>' +
+    '<div class="ld-tool-name">On the Line' +
+      '<div style="font-size:11px;color:rgba(255,255,255,0.45);' +
+      'font-weight:400;margin-top:2px">' + skEscape(gsub) + '</div>' +
+    '</div>' +
+  '</div>';
   h += '<div class="ld-tool-item" onclick="closeGames(); openAuctionNight();">' +
     '<div class="ld-tool-icon">\ud83d\udcb0</div>' +
     '<div class="ld-tool-name">Auction Night' +
@@ -197540,19 +198052,28 @@ var _auctBoxCache = {};          // gameId -> { at, final, json }
 // AUCTSETTLE -- gids optional. Given, it reads THOSE games, which is how
 // last night gets scored after the slate has moved on; omitted, it reads
 // tonight's.
-function _auctLiveFetch(force, gids) {
+// GAMEDASH2 -- `sport` so the dashboard can read a hockey card while
+// this state is on basketball. Omitted, it is the sport it always was.
+function _auctLiveFetch(force, gids, sport) {
   var list = (gids && gids.length) ? gids.slice(0) : _auctSlateGids();
   if (!list.length) { return Promise.resolve(null); }
+  var _sp = String(sport || _auctSport()).toLowerCase();
+  if (!AUCT_SPORTS[_sp]) { _sp = _auctSport(); }
+  var _boxSlug = AUCT_SPORTS[_sp].box;
   var now = Date.now();
   var jobs = [];
   for (var i = 0; i < list.length; i++) {
     (function (gid) {
-      var c = _auctBoxCache[gid];
+      // The cache is keyed by sport too now. Event ids do not collide
+      // across sports, but a cache key that cannot say what it holds is
+      // a trap waiting for the first league that reuses one.
+      var ck = _sp + '|' + gid;
+      var c = _auctBoxCache[ck];
       // A final game never changes, so it is fetched once and kept.
       if (c && c.final && !force) { jobs.push(Promise.resolve(c.json)); return; }
       if (c && !force && (now - c.at) < 25000) { jobs.push(Promise.resolve(c.json)); return; }
       jobs.push(fetch('https://site.api.espn.com/apis/site/v2/sports/' +
-        _auctCfg().box + '/summary?event=' +
+        _boxSlug + '/summary?event=' +
         encodeURIComponent(gid)).then(function (r) {
           return r.ok ? r.json() : null;
         }).then(function (j) {
@@ -197561,7 +198082,7 @@ function _auctLiveFetch(force, gids) {
             fin = !!(((((j || {}).header || {}).competitions || [])[0] || {})
               .status || {}).type.completed;
           } catch (eF) { fin = false; }
-          _auctBoxCache[gid] = { at: Date.now(), final: fin, json: j };
+          _auctBoxCache[ck] = { at: Date.now(), final: fin, json: j };
           return j;
         })['catch'](function () { return null; }));
     })(list[i]);
@@ -197570,7 +198091,7 @@ function _auctLiveFetch(force, gids) {
     var box = { byId: {}, byName: {}, labels: {}, unmapped: {}, clash: {} }, n = 0, fin = 0;
     for (var i2 = 0; i2 < all.length; i2++) {
       if (!all[i2]) { continue; }
-      _auctParseBox(all[i2], box);
+      _auctParseBox(all[i2], box, _sp);
       n++;
       try {
         if (((((all[i2].header || {}).competitions || [])[0] || {})
