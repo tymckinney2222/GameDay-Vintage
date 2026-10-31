@@ -2435,6 +2435,72 @@
     color: rgba(255,255,255,0.35);
   }
 
+  /* ── GPFINISH ── MY SLOTS, as rows rather than a table. */
+  .gps {
+    margin: 12px 0 0; padding: 12px 13px 10px; border-radius: 12px;
+    background: rgba(255,255,255,0.025);
+    border: 1px solid rgba(255,255,255,0.07);
+  }
+  .gps-head {
+    display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+    margin: 0 0 10px;
+  }
+  .gps-h1 {
+    font-family: 'Barlow Condensed', sans-serif; font-size: 11px;
+    font-weight: 800; letter-spacing: 0.18em; color: rgba(255,255,255,0.75);
+  }
+  .gps-h2 {
+    font-size: 10px; color: rgba(255,255,255,0.33);
+    font-family: var(--sk-font-mono, monospace);
+  }
+  .gps-row {
+    display: flex; align-items: center; gap: 9px; padding: 8px 0;
+    border-top: 1px solid rgba(255,255,255,0.05);
+  }
+  .gps-pos {
+    flex: 0 0 34px; font-family: var(--sk-font-mono, monospace);
+    font-size: 11px; font-weight: 700; color: rgba(255,255,255,0.65);
+  }
+  .gps-bar {
+    flex: 1 1 auto; min-width: 46px; position: relative; height: 8px;
+    border-radius: 5px; background: rgba(255,255,255,0.08); overflow: hidden;
+  }
+  .gps-bar i {
+    position: absolute; left: 0; top: 0; bottom: 0; border-radius: 5px;
+    background: rgba(255,255,255,0.4);
+  }
+  /* where the pace lands, on the same track as what is spent */
+  /* the ceiling on the track; everything right of it is overshoot */
+  .gps-bar u {
+    position: absolute; top: -3px; bottom: -3px; width: 2px;
+    background: rgba(255,255,255,0.85); text-decoration: none;
+  }
+  .gps-row.dry .gps-bar i { background: #f08a7a; }
+  .gps-row.spare .gps-bar i { background: #7bd88f; }
+  .gps-n {
+    flex: 0 0 56px; text-align: right;
+    font-family: var(--sk-font-mono, monospace);
+    font-size: 13px; font-weight: 800; color: #fff;
+  }
+  .gps-n small { font-size: 9.5px; font-weight: 600; color: rgba(255,255,255,0.3); }
+  .gps-v { flex: 0 0 86px; text-align: right; line-height: 1.25; }
+  .gps-v b {
+    display: block; font-size: 11.5px; font-weight: 700;
+    color: rgba(255,255,255,0.8);
+  }
+  .gps-row.dry .gps-v b { color: #f08a7a; }
+  .gps-row.spare .gps-v b { color: #7bd88f; }
+  .gps-v i {
+    display: block; font-style: normal; font-size: 9px;
+    color: rgba(255,255,255,0.32); margin-top: 1px;
+  }
+  .gps-note {
+    font-size: 10.5px; line-height: 1.6; color: rgba(255,255,255,0.38);
+    margin: 9px 0 0; padding-top: 9px;
+    border-top: 1px solid rgba(255,255,255,0.05);
+  }
+  .gps-note b { color: rgba(255,255,255,0.6); font-weight: 700; }
+
   /* ── GPTRUTH ── how far short the estimate runs, and the way to fix
      the half of it that is fixable. */
   .sk-gpb-grade {
@@ -160746,13 +160812,28 @@ function _skGpProjectSlots(league, usage, maxByPos, positions) {
     if (!mx) continue;
     var used = (usage.byPos[pos] || 0);
     var rate = days > 0 ? (used / days) : null;
-    var proj = canProject ? Math.round(rate * seasonDays) : null;
+    // GPFINISH -- DEMAND is what this pace wants over the whole season.
+    // It is allowed to exceed the cap; that excess is the warning.
+    var demand = canProject ? Math.round(rate * seasonDays) : null;
+    // FINISH is what the slot will actually record, which cannot pass
+    // the ceiling however hard the pace pushes at it. This is the
+    // number Yahoo prints as Projected.
+    var proj = (demand == null) ? null : Math.min(demand, mx);
+    // Days until the ceiling, at the measured rate. Only meaningful for
+    // a slot whose demand actually reaches it.
+    var dtc = (rate > 0 && demand != null && demand > mx)
+      ? Math.round((mx - used) / rate) : null;
     out.push({
       pos: pos, used: used, max: mx,
       left: Math.max(0, mx - used),
       rate: (rate == null) ? null : Math.round(rate * 100) / 100,
       proj: proj,
-      over: (proj == null) ? null : (proj - mx)
+      demand: demand,
+      dryDays: dtc,
+      // Unused allowance when the pace never reaches the cap -- Yahoo's
+      // (-1) and (-2). Negative is impossible by construction now.
+      spare: (proj == null) ? null : (mx - proj),
+      over: (demand == null) ? null : (demand - mx)
     });
   }
   return { rows: out, days: days, seasonDays: seasonDays, daysLeft: leftDays,
@@ -161310,7 +161391,7 @@ function _skGpPaceBoard(league, rows, maxByPos, positions) {
           ? ('<small>+' + (t.pace.overCount - 1) + '</small>') : '') +
       '</span>' +
       '<span class="sk-gpb-mine-n' + (out ? ' over' : '') + '">' +
-        (w.proj == null ? '\u2014' : ('\u2192' + w.proj)) +
+        (w.demand == null ? '\u2014' : ('\u2192' + w.demand)) +
         '<small>/' + w.max + '</small></span>' +
       '<span class="sk-gpb-pace-out' + (out ? ' over' : '') + '">' +
         (out ? (w.days + 'd') : 'lasts') + '</span>' +
@@ -161345,39 +161426,69 @@ function _skGpMinePanel(league, rows, maxByPos, positions, myKey, win) {
   var gaps = [];
   try { gaps = _skGpUnsettledDates(league, teamKeys, SK_GP_CATCH_DAYS) || []; } catch (e) {}
 
-  var h = '<div class="sk-gpb-mine">' +
-    '<div class="sk-gpb-mine-h">MY SLOTS \u00b7 ' +
-      (pr.days ? (pr.days + ' counted day' + (pr.days === 1 ? '' : 's')) : 'nothing counted yet') +
-      (pr.daysLeft != null ? (' \u00b7 ' + pr.daysLeft + ' days left in the season') : '') +
-    '</div>' +
-    '<div class="sk-gpb-mine-row head">' +
-      '<span class="sk-gpb-mine-pos"></span>' +
-      '<span class="sk-gpb-mine-n">USED / MAX</span>' +
-      '<span class="sk-gpb-mine-n">LEFT</span>' +
-      '<span class="sk-gpb-mine-n">FINISH</span>' +
+  // GPFINISH -- one row per slot, built round the only two things that
+  // decide a slot's season: how full it is, and whether the pace gets
+  // there before the season does. The old table printed four numbers
+  // side by side and left the reading to him.
+  var _mh = '<div class="gps">' +
+    '<div class="gps-head">' +
+      '<span class="gps-h1">MY SLOTS</span>' +
+      '<span class="gps-h2">' +
+        (pr.days ? (pr.days + ' counted day' + (pr.days === 1 ? '' : 's')) : 'nothing counted') +
+        (pr.daysLeft != null ? (' \u00b7 ' + pr.daysLeft + ' days left') : '') +
+      '</span>' +
     '</div>';
 
   for (i = 0; i < pr.rows.length; i++) {
     var r = pr.rows[i];
-    var over = (r.over != null && r.over > 0);
-    h += '<div class="sk-gpb-mine-row">' +
-      '<span class="sk-gpb-mine-pos">' + skEscape(_skGpPosLabel(lk, r.pos)) + '</span>' +
-      '<span class="sk-gpb-mine-n">' + r.used + '<small>/' + r.max + '</small></span>' +
-      '<span class="sk-gpb-mine-n">' + r.left + '</span>' +
-      '<span class="sk-gpb-mine-n' + (over ? ' over' : '') + '">' +
-        (r.proj == null ? '\u2014' : ('\u2192' + r.proj)) + '</span>' +
+    // GPFINISH -- the TRACK is the larger of the cap and where the pace
+    // is heading, so a slot overshooting has somewhere to overshoot TO.
+    // Scaled to the cap alone, every over-pace slot pinned its marker to
+    // the right edge and six rows looked identical.
+    var track = Math.max(r.max, (r.demand == null ? 0 : r.demand)) || 1;
+    var pct = (r.used / track) * 100;
+    // The ceiling's place on that track. Before the end means the pace
+    // runs past the cap, and the gap after it is the overshoot.
+    var cpct = (r.max / track) * 100;
+    var dry = (r.dryDays != null && pr.daysLeft != null && r.dryDays < pr.daysLeft);
+    var cls = dry ? ' dry' : ((r.spare != null && r.spare > 0) ? ' spare' : '');
+    var verdict;
+    // Short enough to sit on one line each: the old wording wrapped to
+    // three and made six rows unreadable.
+    if (dry) {
+      verdict = '<b>dry in ' + r.dryDays + 'd</b><i>' +
+        (r.over > 0 ? ('+' + r.over + ' over') : 'at this pace') + '</i>';
+    } else if (r.proj == null) {
+      verdict = '<b>\u2014</b><i>needs 2 days</i>';
+    } else if (r.spare > 0) {
+      verdict = '<b>' + r.spare + ' spare</b><i>ends on ' + r.proj + '</i>';
+    } else {
+      verdict = '<b>on the cap</b><i>ends on ' + r.proj + '</i>';
+    }
+    _mh += '<div class="gps-row' + cls + '">' +
+      '<span class="gps-pos">' + skEscape(_skGpPosLabel(lk, r.pos)) + '</span>' +
+      '<span class="gps-bar">' +
+        '<i style="width:' + pct.toFixed(1) + '%"></i>' +
+        (cpct < 99.5 ? ('<u style="left:' + cpct.toFixed(1) + '%"></u>') : '') +
+      '</span>' +
+      '<span class="gps-n">' + r.used + '<small>/' + r.max + '</small></span>' +
+      '<span class="gps-v">' + verdict + '</span>' +
     '</div>';
   }
+  var h = _mh;
 
-  h += '<div class="sk-gpb-mine-note">' +
+  h += '<div class="gps-note">' +
     (pr.projects
-      ? ('FINISH is the whole season\u2019s total, not games left: this team\u2019s ' +
-         'games per counted day carried across all ' + pr.seasonDays + '. Red ' +
-         'finishes past the cap, which means that slot stops scoring early. ' +
-         'LEFT is measured against counted days only, so it reads HIGH by ' +
-         'whatever the coverage above is missing.')
-      : 'A projection needs two counted days. LEFT is games remaining against ' +
-        'what has been counted so far, which reads high until coverage fills in.') +
+      ? ('The track runs to where this pace is heading; the bar is games ' +
+         'spent and the tick is the cap. Anything past the tick is a ' +
+         'slot asking for more than it can score. ' +
+         '<b>Dry</b> means the pace reaches the ceiling with ' +
+         'season still to play \u2014 that slot then scores nothing until ' +
+         'the end. <b>Spare</b> means it never gets there and the ' +
+         'allowance goes unused. Counted usage is a floor, so a slot runs ' +
+         'dry sooner than it says, never later.')
+      : 'A projection needs two counted days. Fill in a couple and the ' +
+        'pace appears with them.') +
     '</div>' +
     (gaps.length
       ? ('<button class="sk-gpb-fill" onclick="skGpCatchUp(\'' + lk + '\')">FILL IN ' +
