@@ -160660,6 +160660,30 @@ function _skGpRecMap(rec) {
   return (rec.d === undefined) ? rec : rec.d;
 }
 
+// GPFIRM -- is there a tally for this day, and is it FINAL?
+//
+// _skGpHasCachedMap answers the first half only, which is all the board
+// needed to decide whether a day could be counted. The backfill needs
+// the second half: a provisional zero written before tip-off looks
+// exactly like a real zero, and only its settled flag tells them apart.
+function _skGpTallyIsFinal(teamKey, date) {
+  try {
+    var raw = localStorage.getItem(GP_LS_PREFIX + _fpKey(teamKey, date));
+    if (!raw) { return false; }
+    return _skGpRecSettled(JSON.parse(raw));
+  } catch (e) { return false; }
+}
+
+// A day is worth asking for when nothing has been written, or when what
+// was written is still provisional AND the date has aged past the point
+// where a fresh read would settle it. Asking again inside the two-day
+// window would only write another provisional record.
+function _skGpNeedsFetch(teamKey, date, settleBefore) {
+  if (!_skGpHasCachedMap(teamKey, date)) { return true; }
+  if (_skGpTallyIsFinal(teamKey, date)) { return false; }
+  return date < settleBefore;
+}
+
 // Is this team's count for this date final, or still open to revision?
 function _skGpDateSettled(teamKey, date) {
   try {
@@ -161135,10 +161159,17 @@ function _skGpBackfill(leagueKey) {
     return;
   }
 
-  var jobs = [], di, ti;
+  // GPFIRM -- the same boundary fetchTeamFpForDate uses to decide a date
+  // is final: anything before YESTERDAY can be settled by a fresh read.
+  var _d = new Date(Date.now() - 86400000);
+  var settleBefore = _d.getFullYear() + '-' +
+    ('0' + (_d.getMonth() + 1)).slice(-2) + '-' + ('0' + _d.getDate()).slice(-2);
+
+  var jobs = [], di, ti, firmed = 0;
   for (di = 0; di < dates.length; di++) {
     for (ti = 0; ti < teamKeys.length; ti++) {
-      if (!_skGpHasCachedMap(teamKeys[ti], dates[di])) {
+      if (_skGpNeedsFetch(teamKeys[ti], dates[di], settleBefore)) {
+        if (_skGpHasCachedMap(teamKeys[ti], dates[di])) { firmed++; }
         jobs.push([teamKeys[ti], dates[di]]);
       }
     }
@@ -161167,7 +161198,11 @@ function _skGpBackfill(leagueKey) {
   chain.then(function () {
     _skGpFilling = false;
     if (typeof skToast === 'function') {
-      skToast('Filled ' + done + ' of ' + jobs.length + ' days.');
+      // GPFIRM -- say which were blank and which were provisional, since
+      // "filled 40 days" on a board that already showed full coverage
+      // reads as a bug rather than a repair.
+      skToast('Filled ' + done + ' of ' + jobs.length + ' day-reads' +
+        (firmed ? (' \u00b7 ' + firmed + ' firmed up') : '') + '.');
     }
     try { _skRenderGpBoardRefresh(leagueKey); } catch (e) {}
   });
@@ -161322,12 +161357,33 @@ function _skRenderGpBoard(league, host) {
   // GPTRUTH -- and the way to shrink the gap. Days never fetched are the
   // bigger half of it and the half that CAN be recovered; a zero-line
   // appearance cannot be, at any number of requests.
-  var _missing = Math.max(0, maxElapsed - minCoverage);
-  var _fillHtml = _missing
+  // GPFIRM -- count what the backfill will actually ask for, which is
+  // blank days PLUS days still carrying a provisional count. Counting
+  // only the blanks hid the repairs entirely: a board at full coverage
+  // offered no button at all while holding zeroes written before tip-off.
+  var _need = 0, _needFirm = 0;
+  try {
+    var _dd = new Date(Date.now() - 86400000);
+    var _sb = _dd.getFullYear() + '-' +
+      ('0' + (_dd.getMonth() + 1)).slice(-2) + '-' + ('0' + _dd.getDate()).slice(-2);
+    var _all = _skGpDateRange(league), _qi, _qj;
+    for (_qi = 0; _qi < _all.length; _qi++) {
+      for (_qj = 0; _qj < teamKeys.length; _qj++) {
+        if (_skGpNeedsFetch(teamKeys[_qj], _all[_qi], _sb)) {
+          _need++;
+          if (_skGpHasCachedMap(teamKeys[_qj], _all[_qi])) { _needFirm++; }
+        }
+      }
+    }
+  } catch (eN) { _need = 0; }
+  var _fillHtml = _need
     ? ('<button class="sk-gpb-fill" onclick="_skGpBackfill(\'' + lk + '\')">' +
-       'FETCH THE ' + _missing + ' MISSING DAY' + (_missing === 1 ? '' : 'S') +
-       '<i>' + (_missing * teamKeys.length) + ' requests \u00b7 cached once, ' +
-       'so it only ever runs for days it has not already got</i></button>')
+       'FETCH ' + _need + ' DAY-READ' + (_need === 1 ? '' : 'S') +
+       '<i>' + (_needFirm
+         ? (_needFirm + ' of them firming up a day counted before its games ' +
+            'had been played')
+         : 'days never read at all') +
+       '</i></button>')
     : '';
 
   host.innerHTML =
