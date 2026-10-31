@@ -2435,6 +2435,35 @@
     color: rgba(255,255,255,0.35);
   }
 
+  /* ── GPTRUTH ── how far short the estimate runs, and the way to fix
+     the half of it that is fixable. */
+  .sk-gpb-grade {
+    margin: 10px 0 0; padding: 10px 12px; border-radius: 10px;
+    font-size: 11.5px; line-height: 1.6;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.1);
+    color: rgba(255,255,255,0.72);
+  }
+  .sk-gpb-grade.off { border-color: rgba(250,204,21,0.35); }
+  .sk-gpb-grade.ok { border-color: rgba(74,222,128,0.3); }
+  .sk-gpb-grade b { color: #fff; }
+  .sk-gpb-grade i {
+    display: block; font-style: normal; font-size: 10.5px;
+    color: rgba(255,255,255,0.4); margin-top: 5px;
+  }
+  .sk-gpb-fill {
+    display: block; width: 100%; margin: 8px 0 0; padding: 11px 14px;
+    border-radius: 10px; cursor: pointer; text-align: center;
+    background: rgba(250,204,21,0.1); border: 1px solid rgba(250,204,21,0.4);
+    color: #facc15; font-family: 'Outfit', sans-serif;
+    font-size: 12px; font-weight: 700; letter-spacing: 0.06em;
+  }
+  .sk-gpb-fill i {
+    display: block; font-style: normal; font-weight: 500;
+    font-size: 10px; letter-spacing: 0; color: rgba(250,204,21,0.55);
+    margin-top: 4px;
+  }
+
   /* ── GP cap entry sheet ── GPCAP ── */
   .sk-gpcap-body { flex: 1; overflow: auto; padding: 16px 16px 48px; }
   .sk-gpcap-lg {
@@ -160770,6 +160799,79 @@ function _skGpTeamPace(league, usage, maxByPos, positions) {
   };
 }
 
+// GPTRUTH -- which stat id is games played, per SPORT.
+//
+// It is 0 on NBA. Writing that into the source would be guessing with
+// extra steps: a league does not declare the stat (it scores none of
+// it), the GAME does, and the game dictionary is one call per sport.
+// Cached in memory; a miss returns null and every consumer treats that
+// as "no published total", never as zero.
+var _skGpStatIdCache = {};
+
+function _skGpStatId(leagueKey) {
+  var gk = String(leagueKey || '').split('.')[0];
+  if (!gk) { return Promise.resolve(null); }
+  if (_skGpStatIdCache[gk] !== undefined) {
+    return Promise.resolve(_skGpStatIdCache[gk]);
+  }
+  return fyApi('/game/' + gk + '/stat_categories').then(function (r) {
+    var found = null;
+    (function walk(node, depth) {
+      if (found != null || !node || typeof node !== 'object' || depth > 9) { return; }
+      if (node.stat_id != null) {
+        var nm = String(node.abbr || node.display_name || node.name || '');
+        if (/^(gp|games)$/i.test(nm) || /games?\s*played/i.test(nm)) {
+          found = String(node.stat_id);
+          return;
+        }
+      }
+      for (var k in node) {
+        if (node.hasOwnProperty(k) && node[k] && typeof node[k] === 'object') {
+          walk(node[k], depth + 1);
+        }
+      }
+    })(r, 0);
+    _skGpStatIdCache[gk] = found;
+    return found;
+  }).catch(function () {
+    _skGpStatIdCache[gk] = null;
+    return null;
+  });
+}
+
+// GPTRUTH -- every team's PUBLISHED games-played total, in one call.
+// Returns { teamKey: n }. An empty object means Yahoo did not give one,
+// which must read differently from everybody being on nought.
+function _skGpPublishedTotals(leagueKey) {
+  return _skGpStatId(leagueKey).then(function (sid) {
+    if (sid == null) { return {}; }
+    return fyApi('/league/' + leagueKey + '/teams/stats;type=season')
+      .then(function (r) {
+        var out = {};
+        try {
+          var tms = r.fantasy_content.league[1].teams, i, n = tms.count || 0;
+          for (i = 0; i < n; i++) {
+            var t = tms[String(i)] && tms[String(i)].team;
+            if (!t) { continue; }
+            var key = null, j;
+            for (j = 0; j < t[0].length; j++) {
+              if (t[0][j] && t[0][j].team_key) { key = t[0][j].team_key; break; }
+            }
+            var st = t[1] && t[1].team_stats && t[1].team_stats.stats;
+            if (!key || !st) { continue; }
+            for (j = 0; j < st.length; j++) {
+              if (st[j] && st[j].stat && String(st[j].stat.stat_id) === sid) {
+                var v = parseFloat(st[j].stat.value);
+                if (!isNaN(v)) { out[key] = v; }
+              }
+            }
+          }
+        } catch (e) {}
+        return out;
+      }).catch(function () { return {}; });
+  });
+}
+
 function _skGpUsageForTeam(league, teamKey, dateList) {
   var dates = dateList || _skGpDateRange(league);
   var byPos = {}, counted = 0;
@@ -160884,9 +160986,25 @@ function _skGpCapClose() {
 // derived because Yahoo won't publish that either.
 function _skIsGpCapLeague(league) {
   // NBA enforces the same per-position games cap the NHL does — PG/SG/SF/PF/C
-  // at 82 and Util at 328 in a 4-slot league — and Yahoo publishes neither the
-  // maximum nor the usage for either. Same hand-entered number, same derived
-  // usage. GPCAPNBA
+  // at 82 and Util at 328 in a 4-slot league.
+  //
+  // GPTRUTH -- and the old sentence here, "Yahoo publishes neither the
+  // maximum nor the usage for either", was wrong twice over for NBA and
+  // already contradicted the GPAUTO note a few hundred lines up. A probe
+  // of a live NBA roto league returned BOTH:
+  //
+  //   settings.max_games_played = "82"      the per-slot maximum
+  //   team stat_id 0 = 62                   games played, a TEAM total
+  //
+  // stat 0 is named GP by the SPORT's dictionary -- /game/{gk}/stat_categories
+  // -- and not by the league, which is why it prints unnamed everywhere
+  // that reads league stat_categories alone. It carries no rank points,
+  // so it is display-only.
+  //
+  // What is still unpublished, and the reason this board exists, is the
+  // SPLIT BY POSITION. Eight request shapes were tried for it. The total
+  // cannot manage a cap -- a team can be under its aggregate and finished
+  // at centre -- but it does grade the estimate below. GPCAPNBA
   if (!league) return false;
   var sp = String(league.sport || '').toLowerCase();
   // ── GPCAPMLBOUT ── Hockey and basketball only, deliberately.
@@ -160901,6 +161019,83 @@ function _skIsGpCapLeague(league) {
   // comparison it cannot survive. Cap Watch stays the IP board there.
   if (sp !== 'nhl' && sp !== 'nba') return false;
   return _skGetGpPerSlot(league.league_key) != null;
+}
+
+// GPTRUTH -- the published totals, fetched once per board paint.
+var _skGpPubCache = {};
+
+// GPTRUTH -- walk the days this board has never been shown and ask for
+// them. fetchTeamFpForDate already writes the tally the board reads, so
+// this adds no second path to the same number -- it just stops waiting
+// for him to happen to open the league on the right evening.
+var _skGpFilling = false;
+
+function _skGpBackfill(leagueKey) {
+  if (_skGpFilling) { return; }
+  var league = (typeof fyLeagues !== 'undefined' && fyLeagues)
+    ? fyLeagues.filter(function (l) { return l.league_key === leagueKey; })[0] : null;
+  if (!league) { return; }
+  // The same place the board itself gets them: the standings snapshot it
+  // already renders from. Inventing a second lookup here is how two
+  // counts of the same thing start disagreeing.
+  var data = (typeof skLeagueData !== 'undefined') ? skLeagueData[leagueKey] : null;
+  var teamKeys = Object.keys((data && data.allTeams) || {});
+  var dates = _skGpDateRange(league);
+  if (!teamKeys.length || !dates.length) {
+    if (typeof skToast === 'function') { skToast('Standings not loaded yet.'); }
+    return;
+  }
+
+  var jobs = [], di, ti;
+  for (di = 0; di < dates.length; di++) {
+    for (ti = 0; ti < teamKeys.length; ti++) {
+      if (!_skGpHasCachedMap(teamKeys[ti], dates[di])) {
+        jobs.push([teamKeys[ti], dates[di]]);
+      }
+    }
+  }
+  if (!jobs.length) { if (typeof skToast === 'function') { skToast('Nothing missing.'); } return; }
+
+  _skGpFilling = true;
+  var done = 0;
+  var btn = document.querySelector('.sk-gpb-fill');
+  function tick() {
+    if (btn) {
+      btn.textContent = 'FETCHING \u2026 ' + done + ' / ' + jobs.length;
+    }
+  }
+  tick();
+
+  // One at a time. A burst of several hundred parallel requests is how a
+  // token gets rate-limited, and this is a background chore, not a race.
+  var chain = Promise.resolve();
+  jobs.forEach(function (j) {
+    chain = chain.then(function () {
+      return fetchTeamFpForDate(j[0], j[1]).catch(function () { return null; })
+        .then(function () { done++; tick(); });
+    });
+  });
+  chain.then(function () {
+    _skGpFilling = false;
+    if (typeof skToast === 'function') {
+      skToast('Filled ' + done + ' of ' + jobs.length + ' days.');
+    }
+    try { _skRenderGpBoardRefresh(leagueKey); } catch (e) {}
+  });
+}
+
+// Repaint the pane the board actually lives in. skCapWatchContent is
+// where the caller renders it -- there is no element of my own here to
+// look for, and looking for one would have failed silently on every
+// repaint.
+function _skRenderGpBoardRefresh(leagueKey) {
+  var host = document.getElementById('skCapWatchContent');
+  var league = (typeof fyLeagues !== 'undefined' && fyLeagues)
+    ? fyLeagues.filter(function (l) { return l.league_key === leagueKey; })[0] : null;
+  if (host && league && typeof _skIsGpCapLeague === 'function' &&
+      _skIsGpCapLeague(league)) {
+    _skRenderGpBoard(league, host);
+  }
 }
 
 function _skRenderGpBoard(league, host) {
@@ -160945,6 +161140,17 @@ function _skRenderGpBoard(league, host) {
   var myKey = data && data.team && data.team.team_key;
 
   // GPCOMMON — one shared window so the rows can be compared.
+  // GPTRUTH -- ask Yahoo for its own totals once, then repaint. Guarded
+  // by a cache entry that exists even when the answer is "nothing", so a
+  // league whose sport has no GP stat does not re-ask on every paint.
+  if (_skGpPubCache[lk] === undefined) {
+    _skGpPubCache[lk] = null;
+    _skGpPublishedTotals(lk).then(function (t) {
+      _skGpPubCache[lk] = t || {};
+      try { _skRenderGpBoardRefresh(lk); } catch (e) {}
+    });
+  }
+
   var _win = _skGpCommonDates(league, teamKeys);
   var rows = [], minCoverage = _win.common.length, maxElapsed = _win.elapsed;
   teamKeys.forEach(function (tk) {
@@ -160992,6 +161198,49 @@ function _skRenderGpBoard(league, host) {
     ? Math.round((minCoverage / maxElapsed) * 100) : 0;
   var covCls = cov >= 90 ? 'ok' : (cov >= 50 ? 'mid' : 'low');
 
+  // GPTRUTH -- what this board's estimate is missing, in games.
+  //
+  // Deliberately NOT a cap number: his cap is per position and a total
+  // cannot speak to it. This is the board grading itself. Drawn only
+  // for his own team, because one honest number about the row he acts
+  // on beats ten he has to interpret.
+  var _pub = _skGpPubCache[lk];
+  var _gradeHtml = '';
+  if (_pub && myKey && _pub[myKey] != null) {
+    var _mine = null, _ri;
+    for (_ri = 0; _ri < rows.length; _ri++) {
+      if (rows[_ri].key === myKey) { _mine = rows[_ri]; break; }
+    }
+    if (_mine) {
+      var _derived = 0, _p;
+      for (_p in _mine.usage.byPos) {
+        if (_mine.usage.byPos.hasOwnProperty(_p)) { _derived += _mine.usage.byPos[_p]; }
+      }
+      var _published = _pub[myKey];
+      var _gap = Math.round((_published - _derived) * 10) / 10;
+      _gradeHtml = '<div class="sk-gpb-grade' + (_gap > 0 ? ' off' : ' ok') + '">' +
+        '<b>' + _derived + '</b> counted here against Yahoo\u2019s published <b>' +
+        _published + '</b>' +
+        (_gap > 0
+          ? (' \u2014 <b>' + _gap + '</b> appearance' + (_gap === 1 ? '' : 's') +
+             ' this board cannot see.')
+          : ' \u2014 nothing missing.') +
+        '<i>A total cannot tell you which position is draining; the columns ' +
+        'above do that. This says how far short they are running.</i></div>';
+    }
+  }
+
+  // GPTRUTH -- and the way to shrink the gap. Days never fetched are the
+  // bigger half of it and the half that CAN be recovered; a zero-line
+  // appearance cannot be, at any number of requests.
+  var _missing = Math.max(0, maxElapsed - minCoverage);
+  var _fillHtml = _missing
+    ? ('<button class="sk-gpb-fill" onclick="_skGpBackfill(\'' + lk + '\')">' +
+       'FETCH THE ' + _missing + ' MISSING DAY' + (_missing === 1 ? '' : 'S') +
+       '<i>' + (_missing * teamKeys.length) + ' requests \u00b7 cached once, ' +
+       'so it only ever runs for days it has not already got</i></button>')
+    : '';
+
   host.innerHTML =
     '<div class="sk-gpb-cov ' + covCls + '">Counted from ' + minCoverage + ' of ' +
       maxElapsed + ' elapsed days (' + cov + '%) \u2014 the days cached for ' +
@@ -160999,6 +161248,7 @@ function _skRenderGpBoard(league, host) {
       'Usage is derived from cached daily lineups, not published by Yahoo \u2014 ' +
       'treat it as an estimate and spot-check against Team \u2192 Max Games Played.</div>' +
     '<div class="sk-gpb">' + head + body + '</div>' +
+    _gradeHtml + _fillHtml +
     _skGpPaceBoard(league, rows, maxByPos, positions) +
     _skGpMinePanel(league, rows, maxByPos, positions, myKey, _win) +
     // GPBUDGET - MY SLOTS says where this team stands; this says what to do
