@@ -320,6 +320,38 @@
   }
   .ld-item-count.live { background: rgba(229,62,62,0.15); color: #e53e3e; }
   .ld-item-count.empty { opacity: 0.3; }
+  /* LGMUTE -- the per-league switch and the muted state. */
+  .ld-eye {
+    flex-shrink: 0; width: 26px; height: 26px; margin-left: 8px; padding: 0;
+    border-radius: 999px; cursor: pointer; font-size: 12px; line-height: 1;
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.16);
+    color: rgba(255,255,255,0.55);
+    display: flex; align-items: center; justify-content: center;
+  }
+  .ld-eye.off {
+    background: rgba(255,255,255,0.03);
+    border-color: rgba(255,255,255,0.10);
+    color: rgba(255,255,255,0.3);
+  }
+  /* A muted row stays readable -- it is still a league you can open --
+     but it should not look like one of the ones you kept. */
+  .ld-item.muted .ld-item-name,
+  .ld-item.muted .ld-item-count { opacity: 0.38; }
+  .ld-item.muted .ld-item-icon,
+  .ld-item.muted .ld-item-logo { opacity: 0.32; }
+  .ld-mute-note {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 20px 10px;
+    font-family: 'Outfit', sans-serif; font-size: 10.5px; font-weight: 600;
+    color: rgba(255,255,255,0.4);
+  }
+  .ld-mute-note button {
+    margin-left: auto; padding: 4px 10px; border-radius: 999px;
+    cursor: pointer; font-size: 9.5px; font-weight: 700; letter-spacing: 0.1em;
+    background: transparent; border: 1px solid rgba(255,255,255,0.2);
+    color: rgba(255,255,255,0.65); font-family: 'Outfit', sans-serif;
+  }
   .ld-divider {
     height: 1px; background: rgba(255,255,255,0.06); margin: 4px 0;
   }
@@ -44564,7 +44596,7 @@ function renderLeaguePills() {
   var label = document.getElementById('leagueLabel');
   if (!label) return;
   var icon = '🏟️', name = 'ALL SPORTS', count = 0;
-  var totalCount = Object.values(allGames).reduce(function(s, g) { return s + (g?.length || 0); }, 0);
+  var totalCount = _lgVisibleTotal();   // LGMUTE
 
   if (activeLeague === 'ALL') {
     count = totalCount;
@@ -45036,13 +45068,28 @@ function renderLeagueDrawerBody() {
   var body = document.getElementById('ldBody');
   if (!body) return;
   var favTeams = getFavTeams();
-  var totalCount = Object.values(allGames).reduce(function(s, g) { return s + (g?.length || 0); }, 0);
-  var anyLive = Object.values(allGames).some(function(gs) { return (gs || []).some(function(g) { return g.state === 'in'; }); });
+  var totalCount = _lgVisibleTotal();   // LGMUTE
+  var _mutedMap = _lgMuted();
+  var anyLive = Object.keys(allGames).some(function(k) {
+    return !_mutedMap[k] && (allGames[k] || []).some(function(g) { return g.state === 'in'; });
+  });
 
   var html = '';
 
   // ALL
   html += makeDrawerItem('ALL', '🏟️', 'All Sports', totalCount, anyLive);
+
+  // LGMUTE -- say what is being left out, and offer the way back. A
+  // view quietly missing three hundred games needs to admit it on
+  // screen; the switches themselves are too far down to count as an
+  // explanation.
+  var _nMuted = _lgMutedCount();
+  if (_nMuted) {
+    html += '<div class="ld-mute-note">' + _nMuted + ' league' +
+      (_nMuted === 1 ? '' : 's') + ' hidden from All Sports' +
+      '<button onclick="event.stopPropagation();_lgUnmuteAll()">SHOW ALL</button>' +
+      '</div>';
+  }
 
   // MY TEAMS
   if (favTeams.length) {
@@ -45075,8 +45122,13 @@ function renderLeagueDrawerBody() {
     if (!leagues.length) return;
 
     // Combined count + live flag across the group's leagues.
+    // LGMUTE -- the group header counts what All Sports will actually
+    // show, so Football cannot read 242 over a board that has 47 of
+    // them. The league's own row keeps its true count, because tapping
+    // it still opens every one of its games.
     var groupCount = 0, groupLive = false;
     leagues.forEach(function(k) {
+      if (_lgIsMuted(k)) { return; }
       var c = (allGames[k] && allGames[k].length) || 0;
       groupCount += c;
       if ((allGames[k] || []).some(function(g) { return g.state === 'in'; })) groupLive = true;
@@ -45100,7 +45152,8 @@ function renderLeagueDrawerBody() {
       var count = (allGames[k] && allGames[k].length) || 0;
       var hasLive = (allGames[k] || []).some(function(g) { return g.state === 'in'; });
       var fullName = _leagueFullName[k] || (val.label || k);
-      html += makeDrawerItem(k, val.icon, fullName, count, hasLive, _leagueLogoUrl(k));
+      html += makeDrawerItem(k, val.icon, fullName, count, hasLive,
+                             _leagueLogoUrl(k), true);   // LGMUTE
     });
     html += '</div>'; // .ld-sport-body
   });
@@ -45264,7 +45317,7 @@ function toggleDrawerTools() {
 // The one job it has is to disagree.
 var SK_BUILD = '2026-10-10 TAPE';
 
-function makeDrawerItem(key, icon, name, count, hasLive, logo) {
+function makeDrawerItem(key, icon, name, count, hasLive, logo, muteable) {
   var isActive = activeLeague === key;
   var countClass = 'ld-item-count' + (hasLive ? ' live' : '') + (count === 0 ? ' empty' : '');
   // Use the real league logo when available; if it fails to load, swap back
@@ -45272,10 +45325,26 @@ function makeDrawerItem(key, icon, name, count, hasLive, logo) {
   var iconHtml = logo
     ? '<img class="ld-item-logo" src="' + logo + '" alt="" onerror="this.outerHTML=\'' + icon + '\'">'
     : icon;
-  return '<div class="ld-item' + (isActive ? ' active' : '') + '" onclick="switchLeague(\'' + key + '\')">' +
+  // LGMUTE -- the switch, on league rows only. All Sports and My Teams
+  // are not leagues and have nothing to mute.
+  var muted = muteable ? _lgIsMuted(key) : false;
+  var eye = '';
+  if (muteable) {
+    // THE WHOLE ROW IS THE FILTER, so this has to stop the event dead --
+    // otherwise muting a league would also switch the board to it, which
+    // is the opposite of what the tap meant.
+    eye = '<button class="ld-eye' + (muted ? ' off' : '') +
+      '" onclick="event.stopPropagation();_lgToggleMute(\'' + key + '\')" ' +
+      'aria-pressed="' + (muted ? 'true' : 'false') + '" ' +
+      'aria-label="' + (muted ? 'Show' : 'Hide') + ' ' + name + ' in All Sports">' +
+      (muted ? '\u2715' : '\u2713') + '</button>';
+  }
+  return '<div class="ld-item' + (isActive ? ' active' : '') +
+    (muted ? ' muted' : '') + '" onclick="switchLeague(\'' + key + '\')">' +
     '<div class="ld-item-icon">' + iconHtml + '</div>' +
     '<div class="ld-item-name">' + name + '</div>' +
     '<div class="' + countClass + '">' + count + '</div>' +
+    eye +
   '</div>';
 }
 
@@ -68515,6 +68584,74 @@ function _compareGames(a, b) {
   return at - bt;
 }
 
+// LGMUTE -- which leagues All Sports is allowed to show.
+//
+// Stored as the list of MUTED keys, not the list of kept ones, so a
+// league added to the app later shows up by default instead of being
+// invisible until he goes and finds the switch for it.
+var GD_MUTE_KEY = 'gdhq_muted_leagues';
+
+function _lgMuted() {
+  var out = {};
+  try {
+    var raw = localStorage.getItem(GD_MUTE_KEY);
+    if (!raw) { return out; }
+    var arr = JSON.parse(raw);
+    if (!arr || !arr.length) { return out; }
+    for (var i = 0; i < arr.length; i++) {
+      if (arr[i]) { out[String(arr[i])] = 1; }
+    }
+  } catch (e) { return {}; }
+  return out;
+}
+
+function _lgIsMuted(k) { return !!_lgMuted()[String(k)]; }
+
+function _lgMutedCount() {
+  var m = _lgMuted(), n = 0, k;
+  for (k in m) { if (m.hasOwnProperty(k)) { n++; } }
+  return n;
+}
+
+function _lgSaveMuted(m) {
+  var arr = [], k;
+  for (k in m) { if (m.hasOwnProperty(k) && m[k]) { arr.push(k); } }
+  try { localStorage.setItem(GD_MUTE_KEY, JSON.stringify(arr)); } catch (e) {}
+}
+
+// Flip one league and redraw. The drawer redraws because its counts
+// change, and the board redraws because the user is probably looking at
+// All Sports while doing this -- the whole point is to watch it shrink.
+function _lgToggleMute(k) {
+  var m = _lgMuted();
+  if (m[k]) { delete m[k]; } else { m[k] = 1; }
+  _lgSaveMuted(m);
+  _lgAfterMuteChange();
+}
+
+function _lgUnmuteAll() {
+  _lgSaveMuted({});
+  _lgAfterMuteChange();
+}
+
+function _lgAfterMuteChange() {
+  try { if (typeof renderLeaguePills === 'function') { renderLeaguePills(); } } catch (e) {}
+  try { if (typeof renderCards === 'function') { renderCards(); } } catch (e) {}
+  try { if (typeof renderTicker === 'function') { renderTicker(); } } catch (e) {}
+}
+
+// THE ONE COUNT. The top bar, the drawer badge and the list each worked
+// this out separately, which is how a header comes to claim 386 over a
+// list of 84.
+function _lgVisibleTotal() {
+  var m = _lgMuted(), n = 0, k;
+  for (k in allGames) {
+    if (!allGames.hasOwnProperty(k) || m[k]) { continue; }
+    n += (allGames[k] && allGames[k].length) || 0;
+  }
+  return n;
+}
+
 function getGamesForLeague(league) {
   // Helper — apply the org filter to a game list. Skipped if no org
   // filter is set (returns the input unchanged). Applied to MLB and
@@ -68533,8 +68670,12 @@ function getGamesForLeague(league) {
     return list.slice().sort(_compareGames);
   }
   if (league === 'ALL') {
+    // LGMUTE -- a muted league is left out of ALL and nowhere else. Its
+    // own board still opens from the drawer with every game on it.
+    var _mute = _lgMuted();
     var all = [];
     Object.entries(allGames).forEach(function(entry) {
+      if (_mute[entry[0]]) { return; }
       (entry[1] || []).forEach(function(g) { all.push(g); });
     });
     // Sort: starred teams first, then live, then by time
