@@ -166792,21 +166792,50 @@ function skProbeGpCaps(leagueKey) {
   // Not leagueSettingsCache: that is filled by the app's parser, and a
   // probe that only works after some other screen has run is a probe
   // that will mislead the one time it matters.
-  var statAbbr = {};
+  var statAbbr = {};     // the league's own categories
+  var gameAbbr = {};     // every stat the SPORT defines -- GPPROBE4
   function sName(id) {
-    var a = statAbbr[String(id)];
-    return a ? (String(id) + ' ' + a) : String(id);
+    var k = String(id);
+    var a = statAbbr[k];
+    if (a) { return k + ' ' + a; }
+    // A name from the sport's dictionary is marked, because it means
+    // the league does not score this stat -- which is itself the
+    // interesting part for a games-played total.
+    if (gameAbbr[k]) { return k + ' ' + gameAbbr[k] + '*'; }
+    return k;
+  }
+
+  // GPPROBE4 -- Yahoo nests stat entries differently at game level and
+  // league level, so this finds them by SHAPE: any object carrying a
+  // stat_id and something that reads as a label.
+  function harvest(node, into, depth) {
+    if (!node || typeof node !== 'object' || depth > 9) { return; }
+    if (node.stat_id != null) {
+      var nm = node.abbr || node.display_name || node.name;
+      if (nm) { into[String(node.stat_id)] = String(nm); }
+    }
+    for (var k in node) {
+      if (node.hasOwnProperty(k) && node[k] && typeof node[k] === 'object') {
+        harvest(node[k], into, depth + 1);
+      }
+    }
   }
   // Anything whose NAME says games played, whatever its id turns out
   // to be. This is the check both earlier passes did not make.
   function gpIds() {
-    var out = [], k;
-    for (k in statAbbr) {
-      if (!statAbbr.hasOwnProperty(k)) { continue; }
-      if (/^(gp|g|games)$/i.test(statAbbr[k]) ||
-          /games?\s*played/i.test(statAbbr[k])) { out.push(k); }
+    var out = [], k, seen = {}, merged = {};
+    for (k in gameAbbr) { if (gameAbbr.hasOwnProperty(k)) { merged[k] = gameAbbr[k]; } }
+    for (k in statAbbr) { if (statAbbr.hasOwnProperty(k)) { merged[k] = statAbbr[k]; } }
+    for (k in merged) {
+      if (!merged.hasOwnProperty(k) || seen[k]) { continue; }
+      if (/^(gp|g|games|gms)$/i.test(merged[k]) ||
+          /games?\s*played/i.test(merged[k])) { seen[k] = 1; out.push(k); }
     }
     return out;
+  }
+  function anyName(id) {
+    var k = String(id);
+    return statAbbr[k] || gameAbbr[k] || null;
   }
 
   if (!leagueKey) {
@@ -166839,7 +166868,31 @@ function skProbeGpCaps(leagueKey) {
     }
   }
 
-  fyApi('/league/' + leagueKey + '/settings').then(function (r) {
+  // GPPROBE4 -- the sport's own stat dictionary, before anything else,
+  // so every number printed below can be named even when the league
+  // does not score it. A failure here must not stop the run: it is a
+  // nicety for the other blocks, not the probe's reason to exist.
+  var _gk = String(leagueKey).split('.')[0];
+  fyApi('/game/' + _gk + '/stat_categories').then(function (gr) {
+    window._skGpProbe = window._skGpProbe || {};
+    window._skGpProbe.gameStatCats = gr;
+    harvest(gr, gameAbbr, 0);
+    var _n = 0, _q;
+    for (_q in gameAbbr) { if (gameAbbr.hasOwnProperty(_q)) { _n++; } }
+    say('── THE SPORT\u2019S STAT DICTIONARY ──');
+    say('  /game/' + _gk + '/stat_categories named ' + _n + ' stats');
+    say('');
+    return null;
+  }).catch(function (e) {
+    say('── THE SPORT\u2019S STAT DICTIONARY ──');
+    say('  /game/' + _gk + '/stat_categories refused: ' +
+      ((e && e.message) || e));
+    say('  (names below fall back to the league\u2019s own categories only)');
+    say('');
+    return null;
+  }).then(function () {
+    return fyApi('/league/' + leagueKey + '/settings');
+  }).then(function (r) {
     window._skGpProbe = { leagueKey: leagueKey, settings: r };
     var hits = [];
     scan(r, 'settings', hits, 0);
@@ -166867,12 +166920,16 @@ function skProbeGpCaps(leagueKey) {
     say('\u2500\u2500 STAT IDS THAT NAME THEMSELVES GAMES PLAYED \u2500\u2500');
     if (_gp.length) {
       for (var _gi = 0; _gi < _gp.length; _gi++) {
-        say('  stat_id ' + _gp[_gi] + ' = "' + statAbbr[_gp[_gi]] + '"' +
-          '  <-- a games-played stat, published by this league');
+        var _id = _gp[_gi];
+        say('  stat_id ' + _id + ' = "' + anyName(_id) + '"  (named by ' +
+          (statAbbr[_id] ? 'this league' : 'the sport, not scored here') + ')');
       }
-      say('  (a TEAM total. Watch whether it is ever split by position below.)');
+      say('  A TEAM total. Whether it is ever split by position is the');
+      say('  question, and nothing below splits it.');
     } else {
-      say('  (none of this league\u2019s stat categories is named for games played)');
+      say('  Nothing in either table is named for games played.');
+      say('  If a bare id is printing a plausible games figure below,');
+      say('  it is a guess and should be treated as one.');
     }
     say('');
     say('── ROSTER POSITIONS ──');
