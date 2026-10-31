@@ -35090,7 +35090,7 @@
     <!-- GPPROBE — on-screen diagnostic, no devtools needed -->
     <button class="sk-account-item" onclick="skProbeGpCaps(); skCloseAccountMenu();">
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
-      <span>Probe GP caps (this league)</span>
+      <span>Probe GP caps &amp; usage (this league)</span>
     </button>
     <button class="sk-account-item" onclick="skCloseAccountMenu(); skShowLeagueAvailability();">
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
@@ -166608,6 +166608,109 @@ function skProbeEspnWeeks() {
 // the probe is CALLED and the sheet is the only thing that reads it.
 var _skProbeTitle = 'PROBE';
 
+// GPPROBE2 -- the endpoints the first pass never asked for.
+//
+// Every call is wrapped on its own: a 400 on one shape must not end the
+// run, because a refusal IS a result here and the next shape may be the
+// one that answers.
+function _skGpProbeMore(leagueKey, say) {
+  var tk = null;
+  try {
+    var _st = window._skGpProbe && window._skGpProbe.standings;
+    var _t0 = _st.fantasy_content.league[1].standings[0].teams['0'].team;
+    var _meta = _t0[0], _i;
+    for (_i = 0; _i < _meta.length; _i++) {
+      if (_meta[_i] && _meta[_i].team_key) { tk = _meta[_i].team_key; break; }
+    }
+  } catch (e) {}
+  if (!tk) {
+    tk = leagueKey + '.t.1';
+    say('(no team key in standings; trying ' + tk + ')');
+  }
+
+  var d = new Date();
+  var ymd = d.getFullYear() + '-' +
+    ('0' + (d.getMonth() + 1)).slice(-2) + '-' + ('0' + d.getDate()).slice(-2);
+
+  // Anything that could be a games-played count or a position maximum.
+  // Deliberately wide: the point is to stop guessing the key name.
+  var RE = /gam|played|\bgp\b|position_max|max_pos|used/i;
+
+  function sweep(node, path, hits, depth) {
+    if (!node || depth > 9 || typeof node !== 'object') { return; }
+    for (var k in node) {
+      if (!node.hasOwnProperty(k)) { continue; }
+      var v = node[k];
+      if (RE.test(k) && (v == null || typeof v !== 'object')) {
+        hits.push(path + '.' + k + ' = ' + JSON.stringify(v));
+      }
+      if (v && typeof v === 'object') { sweep(v, path + '.' + k, hits, depth + 1); }
+    }
+  }
+
+  var SHAPES = [
+    ['team stats, season',       '/team/' + tk + '/stats;type=season'],
+    ['team stats, today',        '/team/' + tk + '/stats;type=date;date=' + ymd],
+    ['team stats, lastweek',     '/team/' + tk + '/stats;type=lastweek'],
+    ['team stats, lastmonth',    '/team/' + tk + '/stats;type=lastmonth'],
+    ['team out=stats,standings', '/team/' + tk + ';out=stats,standings'],
+    ['team out=roster,settings', '/team/' + tk + ';out=roster,settings'],
+    ['league teams out=stats',   '/league/' + leagueKey + '/teams;out=stats'],
+    ['roster for ONE DATE',      '/team/' + tk + '/roster;type=date;date=' + ymd]
+  ];
+
+  window._skGpProbe = window._skGpProbe || {};
+  window._skGpProbe.more = {};
+
+  say('\u2500\u2500 GPPROBE2: the untried shapes \u2500\u2500');
+  say('team: ' + tk + '   date: ' + ymd);
+  say('');
+
+  var chain = Promise.resolve();
+  SHAPES.forEach(function (sh) {
+    chain = chain.then(function () {
+      return fyApi(sh[1]).then(function (res) {
+        window._skGpProbe.more[sh[0]] = res;
+        var hits = [];
+        sweep(res, '', hits, 0);
+        say(sh[0] + ':');
+        if (hits.length) {
+          var n = Math.min(hits.length, 12), q;
+          for (q = 0; q < n; q++) { say('   ' + hits[q]); }
+          if (hits.length > n) { say('   ... and ' + (hits.length - n) + ' more'); }
+        } else {
+          say('   no games-like key anywhere in the response');
+        }
+        // The reconstruction path, checked explicitly: a per-day roster
+        // is only useful if it says which SLOT each player was in.
+        if (sh[0].indexOf('ONE DATE') > -1) {
+          var slots = [];
+          sweep(res, '', slots, 0);
+          var ps = JSON.stringify(res || {});
+          say('   selected_position present: ' +
+            (ps.indexOf('selected_position') > -1 ? 'YES' : 'no'));
+          say('   -> ' + (ps.indexOf('selected_position') > -1
+            ? 'a per-position count can be rebuilt by walking dates'
+            : 'no slot data, so even rebuilding it is out'));
+        }
+        say('');
+      }).catch(function (e) {
+        say(sh[0] + ':');
+        say('   refused: ' + ((e && e.message) || e));
+        say('');
+      });
+    });
+  });
+
+  return chain.then(function () {
+    say('A "no games-like key" on every shape above, with the first');
+    say('probe already clear on settings, roster_positions, team season');
+    say('stats and standings, is as close to settled as this gets');
+    say('without Yahoo documenting it.');
+    say('');
+  });
+}
+
 function _skGpProbeShow(text) {
   var old = document.getElementById('skGpProbeSheet');
   if (old && old.parentNode) old.parentNode.removeChild(old);
@@ -166797,6 +166900,9 @@ function skProbeGpCaps(leagueKey) {
       say('  unreadable: ' + e.message);
     }
     say('');
+    _skGpProbeShow(lines.join('\n') + '\n\ntrying the untried shapes\u2026');
+    return _skGpProbeMore(leagueKey, say);
+  }).then(function () {
     say('(raw payloads also on window._skGpProbe)');
     _skGpProbeShow(lines.join('\n'));
   }).catch(function (e) {
