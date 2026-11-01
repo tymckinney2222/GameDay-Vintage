@@ -12731,6 +12731,31 @@
   color: rgba(255,255,255,0.28);
 }
 
+/* -- GYMSFX -- the sound toggle and the audition row -------------- */
+.stad-probe.on {
+  color: #0b0f16; background: rgba(255,255,255,0.74);
+  border-color: rgba(255,255,255,0.74);
+}
+.c3-sfx {
+  display: flex; align-items: center; gap: 6px;
+  padding: 0 16px 6px; background: rgba(0,0,0,0.26);
+  font-family: 'Barlow Condensed', sans-serif;
+  /* five chips and a label is close to the width of his screen, and a
+     row with nowhere to go clips rather than wraps by default */
+  flex-wrap: wrap; row-gap: 5px;
+}
+.c3-sfx span {
+  font-size: 8px; font-weight: 800; letter-spacing: 0.16em;
+  color: rgba(255,255,255,0.26);
+}
+.c3-sfx b {
+  font-size: 9.5px; font-weight: 800; letter-spacing: 0.12em;
+  color: rgba(255,255,255,0.48); background: rgba(255,255,255,0.06);
+  border: 1px solid rgba(255,255,255,0.1); border-radius: 3px;
+  padding: 2px 9px 3px; cursor: pointer;
+}
+.c3-sfx b:active { background: rgba(255,255,255,0.16); }
+
 /* -- the live shot cards -- LIVESHOT ------------------------------- */
 .c3-live {
   display: flex; gap: 6px; padding: 7px 10px 0;
@@ -91237,6 +91262,355 @@ function _c3QLen(p0, pc, p1) {
   return L;
 }
 
+// --- GYMSFX -- sound on the floor --------------------------------
+//
+// Synthesised rather than sampled: this file is already eleven and a
+// half megabytes, and a usable set of basketball samples is another
+// two or three once they are base64'd into it.
+//
+// NOTHING HERE WAS CHOSEN BY EAR. Every number below was set from the
+// thing it is imitating and then checked by rendering this same graph
+// through an OfflineAudioContext and measuring what came out: peak
+// level, length, and which octave the energy sits in. That catches
+// silence, clipping, a decay of the wrong length and a filter in the
+// wrong place. It does not catch "that sounds wrong".
+//
+// OFF BY DEFAULT. A page that makes a noise nobody asked for is a page
+// people close, and a browser will not let it anyway: an AudioContext
+// built at load time arrives suspended and stays suspended. So the
+// context is created inside the tap that turns sound on, which is both
+// the permission and the receipt.
+var _GSFX = { ctx: null, master: null, noise: null, on: false,
+  ready: false, flight: {} };
+var _GSFX_KEY = 'gdhq_gym_sfx';
+
+function _gsfxState() {
+  if (!_GSFX.ready) {
+    _GSFX.ready = true;
+    try { _GSFX.on = (localStorage.getItem(_GSFX_KEY) === '1'); }
+    catch (e) { _GSFX.on = false; }
+  }
+  return _GSFX.on;
+}
+
+function _gsfxCtx() {
+  var AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) { return null; }
+  if (!_GSFX.ctx) {
+    try { _GSFX.ctx = new AC(); } catch (e) { return null; }
+    _GSFX.master = _GSFX.ctx.createGain();
+    _GSFX.master.gain.value = 0.85;
+    _GSFX.master.connect(_GSFX.ctx.destination);
+  }
+  if (_GSFX.ctx.state === 'suspended') {
+    try {
+      var pr = _GSFX.ctx.resume();
+      // resume() hands back a PROMISE, and a promise that rejects is
+      // not caught by the try around it -- it surfaces as an unhandled
+      // rejection in the console. A context that refuses the call did
+      // so loudly here on every render until this was added.
+      if (pr && pr['catch']) { pr['catch'](function () {}); }
+    } catch (e2) {}
+  }
+  return _GSFX.ctx;
+}
+
+// Two seconds of noise, from a fixed seed rather than Math.random.
+// A sound built on random noise renders differently every time, which
+// would make the offline measurement unrepeatable and the test that
+// rests on it worthless. The multiplier is Park and Miller's rather
+// than the usual glibc one because the glibc constants push the
+// product past where a double can still count integers exactly, and
+// the sequence quietly stops being the sequence.
+function _gsfxNoise(ctx) {
+  if (_GSFX.noise && _GSFX.noise.sampleRate === ctx.sampleRate) {
+    return _GSFX.noise;
+  }
+  var n = Math.floor(ctx.sampleRate * 2);
+  var buf = ctx.createBuffer(1, n, ctx.sampleRate);
+  var d = buf.getChannelData(0), i, seed = 1337;
+  for (i = 0; i < n; i++) {
+    seed = (seed * 16807) % 2147483647;
+    d[i] = (seed / 1073741823.5) - 1;
+  }
+  _GSFX.noise = buf;
+  return buf;
+}
+
+// THE NET. A ball through a hoop is a hiss with nearly all of its
+// energy high up and almost nothing underneath a kilohertz. Put the
+// band much lower and it stops being a net and becomes wind.
+function _gsfxSwish(ctx, dest, t0, lvl) {
+  var src = ctx.createBufferSource();
+  src.buffer = _gsfxNoise(ctx);
+  src.loop = true;
+  var bp = ctx.createBiquadFilter();
+  bp.type = 'bandpass';
+  bp.frequency.value = 3100;
+  bp.Q.value = 1.1;
+  // A bandpass is only twelve decibels an octave, so on white noise
+  // its upper skirt leaves the entire top of the spectrum in: the
+  // first render of this measured a centroid of seven kilohertz, which
+  // is a hi-hat rather than a net. The lowpass is what puts the lid on.
+  var lp = ctx.createBiquadFilter();
+  lp.type = 'lowpass';
+  lp.frequency.value = 6200;
+  var g = ctx.createGain();
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.exponentialRampToValueAtTime(lvl, t0 + 0.012);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.19);
+  src.connect(bp); bp.connect(lp); lp.connect(g); g.connect(dest);
+  src.start(t0); src.stop(t0 + 0.24);
+}
+
+// THE RIM. A stiff steel ring, which is why the two partials are not a
+// whole-number ratio: make them one and it stops being a rim and
+// becomes a note. The noise burst in front is the ball itself hitting
+// it, and it is what makes the difference between a clank and a chime.
+function _gsfxRim(ctx, dest, t0, lvl) {
+  // Three PURE partials, at ratios that are deliberately not whole
+  // numbers. The first cut used triangle waves, which carry strong odd
+  // harmonics the whole way up and came out of the spectrogram as a
+  // stack of even stripes -- a reed buzzing, not a ring being struck.
+  // Struck metal is a few modes that are not in tune with each other,
+  // and the higher the mode the faster it dies.
+  var f = [392, 611, 1042], amp = [1, 0.5, 0.26], dec = [0.21, 0.12, 0.07];
+  var i, o, g;
+  for (i = 0; i < f.length; i++) {
+    o = ctx.createOscillator();
+    o.type = 'sine';
+    o.frequency.value = f[i];
+    g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(lvl * amp[i], t0 + 0.004);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dec[i]);
+    o.connect(g); g.connect(dest);
+    o.start(t0); o.stop(t0 + 0.26);
+  }
+  var src = ctx.createBufferSource();
+  src.buffer = _gsfxNoise(ctx);
+  src.loop = true;
+  var bp = ctx.createBiquadFilter();
+  bp.type = 'bandpass';
+  bp.frequency.value = 1700;
+  bp.Q.value = 0.8;
+  var ng = ctx.createGain();
+  ng.gain.setValueAtTime(lvl * 0.8, t0);
+  ng.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.055);
+  src.connect(bp); bp.connect(ng); ng.connect(dest);
+  src.start(t0); src.stop(t0 + 0.09);
+}
+
+// THE BUILDING. A full house heard from the floor is a broad mid-band
+// roar: the top is eaten by the room and the bottom was never there.
+// Slow up and slower down, because a crowd takes a moment to realise
+// what it saw and a good while to stop.
+function _gsfxCrowd(ctx, dest, t0, lvl, len) {
+  var src = ctx.createBufferSource();
+  src.buffer = _gsfxNoise(ctx);
+  src.loop = true;
+  var bp = ctx.createBiquadFilter();
+  bp.type = 'bandpass';
+  bp.frequency.value = 520;
+  bp.Q.value = 0.8;
+  // TWO lowpasses, not one. A single biquad is twelve decibels an
+  // octave and left this with real energy at twelve kilohertz, which
+  // is not a crowd -- it is rain. Cascading them doubles the slope and
+  // is what moves the sound from static towards a roar.
+  var lp = ctx.createBiquadFilter();
+  lp.type = 'lowpass';
+  lp.frequency.value = 1150;
+  var lp2 = ctx.createBiquadFilter();
+  lp2.type = 'lowpass';
+  lp2.frequency.value = 1150;
+  var g = ctx.createGain();
+  g.gain.setValueAtTime(0.0001, t0);
+  // in quicker than before, so it laps the tail of the net instead of
+  // arriving after an audible hole
+  g.gain.exponentialRampToValueAtTime(lvl, t0 + len * 0.13);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + len);
+  src.connect(bp); bp.connect(lp); lp.connect(lp2); lp2.connect(g);
+  g.connect(dest);
+  src.start(t0); src.stop(t0 + len + 0.05);
+}
+
+// MADE -- net, then the building. The crowd is deliberately late: the
+// noise in an arena starts when people SEE it drop, not when the ball
+// gets there.
+// The levels are not guesses either. A bandpass on noise throws most
+// of the signal away, and the first set of these measured a MISS at
+// 0.57 against a made basket at 0.22 -- the dullest thing on the floor
+// arriving as the loudest. These are what the offline render says puts
+// a three above a two above a miss, with headroom left.
+function _gsfxMade(ctx, dest, t0, three) {
+  _gsfxSwish(ctx, dest, t0, three ? 1.3 : 1.1);
+  _gsfxCrowd(ctx, dest, t0 + 0.07, three ? 2 : 0.95, three ? 1.9 : 1.05);
+}
+
+// THE HORN. Everything else in this set is struck or hissed: a hard
+// onset and then a decay. A horn is HELD, so the envelope is flat
+// through the middle instead of falling, and that is most of what
+// makes it read as a buzzer rather than as a note.
+//
+// Two sawtooths a few hertz apart, which beat against each other. That
+// beating is the whole character -- it is what makes a horn sound
+// POWERED rather than played, and a single oscillator here sounds like
+// a cheap doorbell no matter what else is done to it. The octave above
+// is a square for the hollowness, and the lowpass is what keeps a
+// sawtooth stack short of painful on a phone speaker: at this pitch it
+// leaves about eleven harmonics, which is buzz without shriek.
+// The level here is set against RMS, not against peak. A horn and a
+// swish at the same PEAK are nowhere near the same loudness: one is
+// held for a second and the other is gone in a tenth, and the ear
+// follows the energy. Matched on peak, the first render of this had
+// eight times the energy of a made three -- about eighteen decibels --
+// which is not a buzzer being loud, it is a buzzer being alarming.
+function _gsfxBuzzer(ctx, dest, t0, lvl, len) {
+  var v = [[233, 'sawtooth', 1], [236.5, 'sawtooth', 0.9],
+           [466, 'square', 0.34], [700, 'sawtooth', 0.12]];
+  var lp = ctx.createBiquadFilter();
+  lp.type = 'lowpass';
+  lp.frequency.value = 2600;
+  var g = ctx.createGain();
+  g.gain.setValueAtTime(0.0001, t0);
+  // Near instant on, flat all the way through, and off quickly. The
+  // hold is a setValueAtTime rather than a ramp, or the gain drifts
+  // between the two ends and the horn sags in the middle.
+  g.gain.exponentialRampToValueAtTime(lvl, t0 + 0.008);
+  g.gain.setValueAtTime(lvl, t0 + Math.max(0.05, len - 0.07));
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + len);
+  lp.connect(g); g.connect(dest);
+  var i, o, og;
+  for (i = 0; i < v.length; i++) {
+    o = ctx.createOscillator();
+    o.type = v[i][1];
+    o.frequency.value = v[i][0];
+    og = ctx.createGain();
+    og.gain.value = v[i][2];
+    o.connect(og); og.connect(lp);
+    o.start(t0); o.stop(t0 + len + 0.05);
+  }
+}
+
+// THE FINAL. The same horn, held longer, with the building under it --
+// which is the one place a crowd belongs without the feed having to
+// tell us anything about how it felt. A game ending is a fact.
+function _gsfxFinal(ctx, dest, t0) {
+  _gsfxBuzzer(ctx, dest, t0, 0.25, 1.9);
+  _gsfxCrowd(ctx, dest, t0 + 0.3, 1.8, 2.3);
+}
+
+// MISS -- the rim and nothing else. No groan: that is a reaction the
+// feed knows nothing about, and inventing one would be the floor
+// claiming to know how the building felt.
+function _gsfxMiss(ctx, dest, t0) {
+  _gsfxRim(ctx, dest, t0, 0.32);
+}
+
+// The delay is scheduled on the audio clock rather than with a
+// setTimeout, so it is sample accurate and survives a repaint in the
+// middle of a flight.
+function _gsfxPlay(kind, delayMs) {
+  if (!_gsfxState()) { return false; }
+  var ctx = _gsfxCtx();
+  if (!ctx) { return false; }
+  var wait = Math.max(0, Math.min(2400, delayMs || 0));
+  var t0 = ctx.currentTime + wait / 1000;
+  try {
+    if (kind === 'made3') { _gsfxMade(ctx, _GSFX.master, t0, true); }
+    else if (kind === 'made') { _gsfxMade(ctx, _GSFX.master, t0, false); }
+    else if (kind === 'buzzer') { _gsfxBuzzer(ctx, _GSFX.master, t0, 0.25, 1.15); }
+    else if (kind === 'final') { _gsfxFinal(ctx, _GSFX.master, t0); }
+    else { _gsfxMiss(ctx, _GSFX.master, t0); }
+  } catch (e) { return false; }
+  return true;
+}
+
+// One side's new shot. The wait is the flight _c3Arc worked out for
+// this very arc, so the rim lands when the ball does.
+function _gsfxShot(sh, side) {
+  if (!sh) { return false; }
+  var f = _GSFX.flight[String(side || '')];
+  return _gsfxPlay(sh.made ? (sh.three ? 'made3' : 'made') : 'miss',
+    (f == null) ? 0 : f);
+}
+
+// GYMHORN -- what the floor has already sounded, per game.
+var _GSFX_PER = {};
+
+// "0:00", "0.0" and "00.0" are all a clock that has run out. An EMPTY
+// clock is not: it means the feed did not say, and treating silence as
+// zero would sound a horn on every pregame panel in the app.
+function _gsfxClockZero(c) {
+  var t = String(c == null ? '' : c).replace(/\s/g, '');
+  if (!t) { return false; }
+  return /^0+(:0+)?(\.0+)?$/.test(t);
+}
+
+// Has a period just ended, and is this the first time we have noticed?
+//
+// Edge-triggered per period, because the clock sits on 0:00 across
+// several polls and a horn that goes off four times is worse than no
+// horn. Two signals feed it, since feeds differ about which they give
+// you: the period number going up means the one before it ended, and a
+// zeroed clock on a live game means this one just did. Whichever
+// arrives first wins and the period is marked.
+//
+// THE FIRST LOOK AT A GAME IS ALWAYS SILENT, including its state --
+// open one at half time and you should not be sounded a horn that went
+// twenty minutes ago; open one that is already over and you should not
+// be sounded the final at all. Seeding the record from that first look
+// rather than leaving it empty is what makes that true. Returns
+// 'final', 'period', or null.
+function _gsfxHornCheck(game) {
+  if (!game || game.id == null) { return null; }
+  var g = 'g' + String(game.id);
+  var per = Number(game.period || 0);
+  var done = (game.state === 'post');
+  var zero = _gsfxClockZero(game.clock);
+  var rec = _GSFX_PER[g];
+  if (!rec) {
+    rec = { per: per, done: done, buzzed: {} };
+    if (done) { rec.buzzed.fin = 1; }
+    if (zero && per > 0) { rec.buzzed[per] = 1; }
+    _GSFX_PER[g] = rec;
+    return null;
+  }
+  var out = null;
+  if (per > rec.per && rec.per > 0 && !rec.buzzed[rec.per]) {
+    rec.buzzed[rec.per] = 1;
+    out = 'period';
+  } else if (zero && per > 0 && game.state === 'in' && !rec.buzzed[per]) {
+    rec.buzzed[per] = 1;
+    out = 'period';
+  }
+  // The end of a game is the end of a period too, and the final is the
+  // one that should be heard.
+  if (done && !rec.buzzed.fin) { rec.buzzed.fin = 1; out = 'final'; }
+  rec.per = per;
+  rec.done = done;
+  return out;
+}
+
+function gymSfxToggle() {
+  _gsfxState();
+  _GSFX.on = !_GSFX.on;
+  try { localStorage.setItem(_GSFX_KEY, _GSFX.on ? '1' : '0'); } catch (e) {}
+  var i, btns = document.querySelectorAll('.gym-sfx');
+  for (i = 0; i < btns.length; i++) {
+    btns[i].textContent = _GSFX.on ? 'SOUND ON' : 'SOUND OFF';
+    btns[i].className = 'stad-probe gym-sfx' + (_GSFX.on ? ' on' : '');
+  }
+  var rows = document.querySelectorAll('.c3-sfx');
+  for (i = 0; i < rows.length; i++) {
+    rows[i].style.display = _GSFX.on ? 'flex' : 'none';
+  }
+  // the tap that turns it on is the gesture that unlocks audio, and
+  // the sound is the receipt that it worked
+  if (_GSFX.on) { _gsfxPlay('made', 0); }
+  return _GSFX.on;
+}
+
 // age is milliseconds since this shot first appeared, or null for a
 // floor that is not tracking it. A negative animation-delay of that
 // much starts the reveal already part way through, which is what lets
@@ -91288,6 +91662,11 @@ function _c3Arc(sh, col, uid, side, age) {
   // Half a second of lead-in so even a layup registers, then one pace
   // for everything. A thirty footer lands near a second and a half.
   var dur = Math.max(0.6, Math.min(1.9, 0.5 + L / 70));
+  // GYMSFX -- how long this particular ball is in the air, left where
+  // the sound can find it. Worked out here and nowhere else, so the
+  // rim lands with the ball rather than on a second guess at the same
+  // number that would drift the first time this line changed.
+  try { _GSFX.flight[String(side || '')] = dur * 1000; } catch (eFL) {}
   if (age >= dur * 1000) return s + ball;      // it already landed
   var mid = 'am' + String(uid || '') + String(side || '');
   // The mask box is given in user space and drawn generously: the
@@ -92215,6 +92594,27 @@ function _gymFloorPanel(data, game, awayAccent, homeAccent, divStyle, venue) {
       _c3LiveCard(latest.home, smap, homeAccent, game.home.abbr, seenH.code === 1) +
       '</div>';
   }
+  // GYMSFX -- a new shot, sounded. Hung off the SAME signal that
+  // drives the flash on the card and the draw-on of the arc: code 1
+  // from _c3Seen means the shot genuinely changed, where this floor is
+  // rebuilt every five seconds and a sound on every build would be a
+  // metronome rather than a game. Code 2 -- the first shot this floor
+  // has ever seen -- stays silent on purpose, or opening a game
+  // already in progress would go off in your hand.
+  try {
+    if (seenA.code === 1) { _gsfxShot(latest.away, 'away'); }
+    if (seenH.code === 1) { _gsfxShot(latest.home, 'home'); }
+  } catch (eSX) {}
+
+  // GYMHORN -- and the buzzer, which is edge-triggered on its own
+  // signal rather than on the shot one: a period can end on a free
+  // throw, a turnover or nothing at all.
+  try {
+    var _horn = _gsfxHornCheck(game);
+    if (_horn === 'final') { _gsfxPlay('final', 0); }
+    else if (_horn) { _gsfxPlay('buzzer', 0); }
+  } catch (eHZ) {}
+
   var lastPlay = null;
   try { lastPlay = _c3LastPlay(data); } catch (eLP) { lastPlay = null; }
   var playLine = '';
@@ -92263,10 +92663,27 @@ function _gymFloorPanel(data, game, awayAccent, homeAccent, divStyle, venue) {
       (all.length ? ('Nothing taken in ' + _c3QLabel(pick))
                   : 'No shot locations in the feed yet') + '</span>';
 
+  // GYMSFX -- off unless he has turned it on, read once per build so
+  // the button and the row agree with what the engine will actually do.
+  var sfxOn = _gsfxState();
   return '<div class="c3-head" style="color:' + homeAccent + ';border-bottom:' + divStyle + '">' +
       'THE FLOOR' +
       '<button class="stad-probe" onclick="event.stopPropagation();skProbeStadium(\'gym\')">' +
       'PROBE</button>' +
+      '<button class="stad-probe gym-sfx' + (sfxOn ? ' on' : '') +
+        '" onclick="event.stopPropagation();gymSfxToggle()">' +
+        (sfxOn ? 'SOUND ON' : 'SOUND OFF') + '</button>' +
+    '</div>' +
+    // and a way to hear each of them without waiting for somebody to
+    // shoot. Only on the screen while sound is on, because it is a
+    // thing to play with rather than part of the floor.
+    '<div class="c3-sfx" style="display:' + (sfxOn ? 'flex' : 'none') + '">' +
+      '<span>HEAR IT</span>' +
+      '<b onclick="event.stopPropagation();_gsfxPlay(\'made\',0)">MADE 2</b>' +
+      '<b onclick="event.stopPropagation();_gsfxPlay(\'made3\',0)">MADE 3</b>' +
+      '<b onclick="event.stopPropagation();_gsfxPlay(\'miss\',0)">MISS</b>' +
+      '<b onclick="event.stopPropagation();_gsfxPlay(\'buzzer\',0)">BUZZER</b>' +
+      '<b onclick="event.stopPropagation();_gsfxPlay(\'final\',0)">FINAL</b>' +
     '</div>' +
     '<div class="c3-wrap">' + svg + '</div>' +
     cards +
