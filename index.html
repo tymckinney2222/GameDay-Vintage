@@ -27934,6 +27934,8 @@
              white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .po-proj { font-family: var(--sk-font-mono); font-size: 9.5px;
              color: var(--sk-text-3); margin-top: 3px; }
+  .po-sos { font-family: var(--sk-font-mono); font-size: 9.5px;
+            color: var(--sk-text-4); margin-top: 2px; }
 
   /* The seed distribution: one bar per finishing position, the cut
      drawn where the playoffs stop. */
@@ -46233,6 +46235,19 @@ function renderLeagueDrawerBody() {
   html += '<div style="padding:14px 16px 4px;font-size:8.5px;letter-spacing:0.08em;' +
     'color:rgba(255,255,255,0.18);font-family:var(--sk-font-mono,monospace);">BUILD ' +
     SK_BUILD + '</div>';
+  // SETPROBE -- temporary. The settings keys for whichever league was
+  // parsed most recently, so the divisional-seeding question gets
+  // answered by reading rather than by me asserting it twice.
+  try {
+    var _spk = Object.keys(_skSetProbe);
+    if (_spk.length) {
+      var _spl = _spk[_spk.length - 1];
+      html += '<div style="padding:2px 16px 8px;font-size:8.5px;' +
+        'line-height:1.45;word-break:break-all;color:rgba(255,215,120,0.55);' +
+        'font-family:var(--sk-font-mono,monospace);">SETTINGS ' +
+        skEscape(_spl) + ' :: ' + skEscape(_skSetProbe[_spl]) + '</div>';
+    }
+  } catch (eSpd) {}
 
   body.innerHTML = html;
 }
@@ -46284,7 +46299,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = 'bo320 ODDS';
+var SK_BUILD = 'bo321 SCHED';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo, muteable) {
   var isActive = activeLeague === key;
@@ -140013,6 +140028,8 @@ function _rfPaint() {
 //   • a points league also records into the rank history, which fills
 //     any day a points snapshot missed.
 // ══════════════════════════════════════════════════════════════════
+var _skSetProbe = {};   // SETPROBE -- temporary, see ensureLeagueSettings
+
 var SK_RANKHIST_PREFIX = 'sk_rank_hist_v1_';
 var _skBumpCtx = {};   // domId -> context for repaints
 var _skBumpSel = {};   // leagueKey -> highlighted rival id
@@ -144918,6 +144935,18 @@ async function ensureLeagueSettings(leagueKey) {
       if (settingsArr.length === 0) settingsArr = [part.settings];
       settingsArr.forEach(function(s) {
         if (!s) return;
+        // SETPROBE -- temporary. I claimed Yahoo does not publish the
+        // divisional seeding rule, having only checked that this parser
+        // does not read it. Yahoo's own settings page states it. This
+        // records what the API actually sends so the question is
+        // settled by looking rather than by me guessing twice.
+        try {
+          if (!_skSetProbe[leagueKey]) {
+            var _sk = [], _kk;
+            for (_kk in s) { if (s.hasOwnProperty(_kk)) { _sk.push(_kk); } }
+            _skSetProbe[leagueKey] = _sk.sort().join(',');
+          }
+        } catch (eSp) {}
         // Playoff config — top-level settings keys. Yahoo returns these
         // as strings; coerce to integers for math. Roto leagues won't
         // populate these (no playoffs); we leave them null.
@@ -175381,7 +175410,12 @@ function _poStrength(scoresByTeam, keys) {
 // points-for. Simulating the score rather than a coin flip means the
 // tiebreak is applied to a simulated season's own points instead of
 // being bolted on from today's total.
-function _poSim(teams, remaining, seats, iters, seed) {
+// `sched` is optional: one entry per remaining week, each either a list
+// of [i, j] index pairs (the real fixtures) or null. A null week is
+// shuffled, so a schedule that only came back for some weeks still
+// improves the ones it covers. Without it the whole thing shuffles,
+// which is where this started.
+function _poSim(teams, remaining, seats, iters, seed, sched) {
   var nT = teams.length, i, j, w, it;
   if (!nT || seats <= 0) { return null; }
   var rng = _poRng(seed || 12345);
@@ -175412,16 +175446,28 @@ function _poSim(teams, remaining, seats, iters, seed) {
         scores[i] = teams[i].mu + teams[i].sd * _poNorm(rng);
         simPf[i] += scores[i];
       }
-      // shuffle, then pair adjacent
-      for (i = nT - 1; i > 0; i--) {
-        j = (rng() * (i + 1)) | 0;
-        var tmp = idx[i]; idx[i] = idx[j]; idx[j] = tmp;
-      }
-      for (i = 0; i + 1 < nT; i += 2) {
-        var a = idx[i], b = idx[i + 1];
-        if (scores[a] > scores[b]) { simW[a] += 1; }
-        else if (scores[b] > scores[a]) { simW[b] += 1; }
-        else { simW[a] += 0.5; simW[b] += 0.5; }
+      var wk = sched ? sched[w] : null;
+      if (wk) {
+        // THE REAL FIXTURES. Strength of schedule only exists here: who
+        // a team actually has to beat, week by week.
+        for (i = 0; i < wk.length; i++) {
+          var pa = wk[i][0], pb = wk[i][1];
+          if (scores[pa] > scores[pb]) { simW[pa] += 1; }
+          else if (scores[pb] > scores[pa]) { simW[pb] += 1; }
+          else { simW[pa] += 0.5; simW[pb] += 0.5; }
+        }
+      } else {
+        // shuffle, then pair adjacent
+        for (i = nT - 1; i > 0; i--) {
+          j = (rng() * (i + 1)) | 0;
+          var tmp = idx[i]; idx[i] = idx[j]; idx[j] = tmp;
+        }
+        for (i = 0; i + 1 < nT; i += 2) {
+          var a = idx[i], b = idx[i + 1];
+          if (scores[a] > scores[b]) { simW[a] += 1; }
+          else if (scores[b] > scores[a]) { simW[b] += 1; }
+          else { simW[a] += 0.5; simW[b] += 0.5; }
+        }
       }
     }
     // seed: wins desc, then points-for desc
@@ -175506,6 +175552,7 @@ var PO_ITERS = 10000;
 var _poOdds = {};        // leagueKey -> last computed result (session)
 var _poInflight = {};    // leagueKey -> true while fetching
 var _poFailed = {};      // leagueKey -> reason, so it stops retrying forever
+var _poMyKey = null;     // whose card this is, for the SOS line
 
 function _poWkLoad(lk) {
   try {
@@ -175615,7 +175662,7 @@ function _poSeed(lk, week) {
   return h >>> 0;
 }
 
-function _poCompute(league, allTeams, store) {
+function _poCompute(league, allTeams, store, schStore) {
   var keys = Object.keys(allTeams || {});
   if (keys.length < 4) { return null; }
   var scores = {}, i, wk;
@@ -175648,14 +175695,50 @@ function _poCompute(league, allTeams, store) {
                  w: rec.w, l: rec.l, t: rec.t,
                  pf: (t.points_for != null ? t.points_for : 0) });
   }
-  var res = _poSim(teams, remaining, seats, PO_ITERS, _poSeed(league.league_key, cur));
+  // POSCHED -- the real fixtures where we have them.
+  var simSched = null;
+  try {
+    if (schStore) { simSched = _poSchForSim(schStore, keys, cur, remaining); }
+  } catch (eSc) { simSched = null; }
+  var schedWeeks = 0;
+  if (simSched) {
+    for (i = 0; i < simSched.length; i++) { if (simSched[i]) { schedWeeks++; } }
+  }
+
+  var res = _poSim(teams, remaining, seats, PO_ITERS,
+                   _poSeed(league.league_key, cur), simSched);
   if (!res) { return null; }
+
+  // My own remaining strength of schedule, off the same fixtures --
+  // the number the Playoff Picture already shows, now actually used
+  // rather than displayed beside a model that ignored it.
+  var myKey = null, sos = null;
+  try {
+    myKey = _poMyKey;
+    if (myKey && schStore) {
+      var tot = 0, cnt = 0, ww, pr, j, opp;
+      for (ww = cur; ww <= end; ww++) {
+        pr = schStore.s[String(ww)] || [];
+        for (j = 0; j < pr.length; j++) {
+          opp = (pr[j][0] === myKey) ? pr[j][1]
+              : (pr[j][1] === myKey ? pr[j][0] : null);
+          if (!opp || !allTeams[opp]) { continue; }
+          var orc = _poRec(allTeams[opp].record);
+          var g = orc.w + orc.l + orc.t;
+          tot += g ? ((orc.w + orc.t * 0.5) / g) : 0.5;
+          cnt++;
+        }
+      }
+      if (cnt) { sos = { avg: tot / cnt, weeks: cnt }; }
+    }
+  } catch (eS2) { sos = null; }
 
   var byKey = {};
   for (i = 0; i < res.length; i++) { byKey[res[i].key] = res[i]; }
   return { rows: res, byKey: byKey, seats: seats, remaining: remaining,
            week: cur, strength: S, nTeams: keys.length,
-           weeksSeen: Object.keys(store.w).length };
+           weeksSeen: Object.keys(store.w).length,
+           schedWeeks: schedWeeks, sos: sos };
 }
 
 // A day's odds kept, so a trend line costs nothing later.
@@ -175675,6 +175758,179 @@ function _poRecordHistory(lk, out) {
     while (dates.length > 200) { delete o.d[dates.shift()]; }
     localStorage.setItem(key, JSON.stringify(o));
   } catch (e) {}
+}
+
+
+// ── THE REAL SCHEDULE ── POSCHED ──────────────────────────────────
+//
+// Ty: "it looks like our app already fetches schedules and strength of
+// schedule so can we fold that into the prediction?"
+//
+// It does, and I had said it did not. /team/<key>/matchups returns a
+// team's ENTIRE season -- every week, every opponent -- in one call,
+// and _ppParseMatchupsResponse has been reading week and opponent out
+// of it for the Playoff Picture's strength-of-schedule panel all along.
+// I looked in the bracket code, found it only fetched playoff weeks
+// that had already happened, and concluded the schedule was not
+// available instead of checking whether anything else in the app had
+// it.
+//
+// It matters. Pairing teams at random every week throws away strength
+// of schedule entirely, and Ty's own panel puts his remaining opponents
+// at .417 -- a good deal easier than neutral. In a league with
+// divisions it matters more still, because opponents repeat on a cycle
+// rather than averaging out over the season.
+//
+// THE SCHEDULE IS FIXED AT DRAFT TIME, so this is bought once per
+// league per season and then read from localStorage forever.
+//
+// ONE CALL PER TEAM, BUT NOT ALWAYS EVERY TEAM. Each reply names both
+// sides of every matchup, so after enough teams every pair is known and
+// the rest are never asked for -- in a twelve-team league the last few
+// requests are usually redundant by the time they come up.
+
+var PO_SCH_PREFIX = 'sk_po_sch_v1_';
+
+function _poSchLoad(lk) {
+  try {
+    var o = JSON.parse(localStorage.getItem(PO_SCH_PREFIX + lk) || 'null');
+    if (o && o.s) { return o; }
+  } catch (e) {}
+  return { v: 1, s: {} };
+}
+
+function _poSchSave(lk, o) {
+  try { localStorage.setItem(PO_SCH_PREFIX + lk, JSON.stringify(o)); } catch (e) {}
+}
+
+function _poSchAdd(store, week, a, b) {
+  var k = String(week);
+  if (!store.s[k]) { store.s[k] = []; }
+  var list = store.s[k], i;
+  for (i = 0; i < list.length; i++) {
+    if ((list[i][0] === a && list[i][1] === b) ||
+        (list[i][0] === b && list[i][1] === a)) { return; }
+  }
+  list.push([a, b]);
+}
+
+// A week is settled once every team in it is accounted for. With an odd
+// number of teams somebody sits out, so the test is "no team left over
+// that could still be paired", not a fixed count.
+function _poSchWeekDone(store, week, nTeams) {
+  var list = store.s[String(week)] || [];
+  return list.length >= Math.floor(nTeams / 2);
+}
+
+function _poSchDone(store, weeks, nTeams) {
+  var i;
+  for (i = 0; i < weeks.length; i++) {
+    if (!_poSchWeekDone(store, weeks[i], nTeams)) { return false; }
+  }
+  return true;
+}
+
+function _poSchTeamInWeek(store, week, teamKey) {
+  var list = store.s[String(week)] || [], j;
+  for (j = 0; j < list.length; j++) {
+    if (list[j][0] === teamKey || list[j][1] === teamKey) { return true; }
+  }
+  return false;
+}
+
+// WHICH TEAMS WOULD ACTUALLY TELL US SOMETHING. The first version asked
+// whether a team already appeared in EVERY remaining week and skipped
+// it only then -- which is almost never true early on, so it walked all
+// twelve teams and the early stop saved nothing. What matters is
+// narrower: a team is worth fetching only if some week that is still
+// INCOMPLETE does not yet name it. Once a week has its full set of
+// pairs, nobody needs to be asked about it again.
+function _poSchNeeded(store, keys, weeks, nTeams, limit) {
+  var out = [], i, w, need;
+  for (i = 0; i < keys.length && out.length < limit; i++) {
+    need = false;
+    for (w = 0; w < weeks.length; w++) {
+      if (_poSchWeekDone(store, weeks[w], nTeams)) { continue; }
+      if (!_poSchTeamInWeek(store, weeks[w], keys[i])) { need = true; break; }
+    }
+    if (need) { out.push(keys[i]); }
+  }
+  return out;
+}
+
+async function _poEnsureSched(league, allTeams) {
+  var lk = league.league_key;
+  var store = _poSchLoad(lk);
+  var end = _poRegEnd(league);
+  var cur = parseInt(league.current_week, 10) || 1;
+  var weeks = [], w;
+  for (w = cur; w <= end; w++) { weeks.push(w); }
+  if (!weeks.length) { return store; }
+
+  var keys = Object.keys(allTeams || {});
+  var nTeams = keys.length;
+  if (_poSchDone(store, weeks, nTeams)) { return store; }
+
+  // Four at a time, recomputing what is still needed between rounds:
+  // every reply names both sides of every matchup, so each round
+  // settles whole weeks and the next round asks about fewer teams.
+  var guard = 0;
+  while (guard++ < keys.length) {
+    var chunk = _poSchNeeded(store, keys, weeks, nTeams, 4);
+    if (!chunk.length) { break; }
+    var got = await Promise.all(chunk.map(function (tk) {
+      return fyApi('/team/' + tk + '/matchups')
+        .then(function (r) { return { tk: tk, ms: _ppParseMatchupsResponse(r) }; })
+        ['catch'](function () { return { tk: tk, ms: null }; });
+    }));
+    got.forEach(function (e) {
+      if (!e.ms) { return; }
+      e.ms.forEach(function (m) {
+        if (!m.opponentTeamKey) { return; }
+        // Regular season only: a playoff pairing is not part of the
+        // race to get in, and it is not decided yet anyway.
+        if (m.week < 1 || m.week > end) { return; }
+        _poSchAdd(store, m.week, e.tk, m.opponentTeamKey);
+      });
+    });
+    if (_poSchDone(store, weeks, nTeams)) { break; }
+  }
+  _poSchSave(lk, store);
+  return store;
+}
+
+// Turn the stored key pairs into index pairs for the simulator, one
+// entry per remaining week. Any week that did not come back complete is
+// handed back as null, and the simulator shuffles that week instead --
+// a partial schedule is still better than none, week by week.
+function _poSchForSim(store, keys, firstWeek, remaining) {
+  var idx = {}, i, w, out = [], any = false;
+  for (i = 0; i < keys.length; i++) { idx[keys[i]] = i; }
+  for (w = 0; w < remaining; w++) {
+    var list = store.s[String(firstWeek + w)] || [];
+    if (list.length < Math.floor(keys.length / 2)) { out.push(null); continue; }
+    // EVERY TEAM AT MOST ONCE. A week that names a team twice is not a
+    // week -- it hands out more wins than there were games, and the
+    // league's win total stops being a fixed quantity, which is the one
+    // thing the simulation leans on. Yahoo will not send such a week;
+    // a half-written cache or a league mid-reschedule might, and the
+    // failure would be a quietly inflated set of odds rather than an
+    // error. A week that fails this is shuffled instead.
+    var pairs = [], ok = true, seen = {};
+    for (i = 0; i < list.length; i++) {
+      var a = idx[list[i][0]], b = idx[list[i][1]];
+      if (a == null || b == null || a === b) { ok = false; break; }
+      if (seen[a] || seen[b]) { ok = false; break; }
+      seen[a] = seen[b] = 1;
+      pairs.push([a, b]);
+    }
+    if (!ok || pairs.length !== Math.floor(keys.length / 2)) {
+      out.push(null); continue;
+    }
+    out.push(pairs);
+    any = true;
+  }
+  return any ? out : null;
 }
 
 
@@ -175743,6 +175999,11 @@ function _poCardHtml(league, out, allTeams, myKey) {
         '<div class="po-mine">' + skEscape(mt.name || 'You') + '</div>' +
         '<div class="po-proj">projected ' + mine.projWins.toFixed(1) +
           ' wins · ' + out.remaining + ' to play</div>' +
+        (out.sos ? ('<div class="po-sos">opponents ' +
+          out.sos.avg.toFixed(3).replace(/^0\./, '.') +
+          (out.sos.avg >= 0.5 ? ' · a hard run-in'
+                              : ' · an easy run-in') +
+          '</div>') : '') +
       '</div>' +
     '</div>' +
     _poSeedStrip(mine.seeds, out.seats, PO_ITERS) +
@@ -175768,8 +176029,19 @@ function _poCardHtml(league, out, allTeams, myKey) {
   // fixtures every team is paired at random each week, so a genuinely
   // soft or brutal run-in does not show up.
   var notes = [];
-  notes.push('Remaining games are paired at random, so an easy or hard ' +
-             'run-in is not reflected.');
+  // POSCHED -- this used to say the fixtures were unknown, which was
+  // true of the model and not of the app: /team/<key>/matchups carries
+  // the whole season and the Playoff Picture had been reading it all
+  // along.
+  if (out.schedWeeks >= out.remaining) {
+    notes.push('Uses your league\u2019s actual remaining fixtures.');
+  } else if (out.schedWeeks > 0) {
+    notes.push('Uses the real fixtures for ' + out.schedWeeks + ' of the ' +
+      out.remaining + ' remaining weeks; the rest are paired at random.');
+  } else {
+    notes.push('Remaining games are paired at random, so an easy or hard ' +
+               'run-in is not reflected.');
+  }
   var sc = (typeof leagueSettingsCache === 'object' && leagueSettingsCache)
     ? leagueSettingsCache[league.league_key] : null;
   if (sc && sc.usesDivisions) {
@@ -175820,6 +176092,7 @@ function _poFill(lk, html) {
 
 function _poKick(league, leagueData, allTeams) {
   var lk = league && league.league_key;
+  _poMyKey = (leagueData && leagueData.team && leagueData.team.team_key) || null;
   if (!lk || _poInflight[lk]) { return; }
   if (_poFailed[lk]) { _poFill(lk, ''); return; }
   if (_poOdds[lk] && _poOdds[lk].week === (parseInt(league.current_week, 10) || 1)) {
@@ -175829,8 +176102,14 @@ function _poKick(league, leagueData, allTeams) {
   }
   _poInflight[lk] = true;
   _poEnsureWeeks(league).then(function (store) {
+    // POSCHED -- the fixtures, after the scores. Both are cached for
+    // the season, so this whole chain is a one-off per league.
+    return _poEnsureSched(league, allTeams)['catch'](function () { return null; })
+      .then(function (sch) { return { store: store, sch: sch }; });
+  }).then(function (both) {
+    var store = both.store;
     var out = null;
-    try { out = _poCompute(league, allTeams, store); } catch (e) { out = null; }
+    try { out = _poCompute(league, allTeams, store, both.sch); } catch (e) { out = null; }
     _poInflight[lk] = false;
     if (!out) { _poFailed[lk] = 'no data'; _poFill(lk, ''); return; }
     _poOdds[lk] = out;
@@ -175843,7 +176122,6 @@ function _poKick(league, leagueData, allTeams) {
     _poFill(lk, '');
   });
 }
-
 
 // ── STANDPLUS ── the playoff line, the shape of a record, and the
 // row you are actually in.
