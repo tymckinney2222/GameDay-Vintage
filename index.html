@@ -129063,6 +129063,33 @@ function skParseAllTeamsFromStandings(data) {
   return out;
 }
 
+// STREAKFIX -- team_standings.streak, in the one shape Yahoo sends it.
+//
+//   "streak": { "type": "win" | "loss" | "tie", "value": "2" }
+//
+// Returns a code the rest of the app can read: W2, L3, T1, or '' when
+// there is no streak to speak of (a 0-0 team has no streak node at
+// all, and the callers all render their own dash for an empty string).
+// The flat streak_type / streak_value pair is kept as a fallback
+// because it costs one branch, and an already-formatted string is
+// handed straight back so a second pass over the same value is safe.
+function _skStreakStr(st) {
+  if (!st) { return ''; }
+  var type = '', val = '';
+  if (st.streak && typeof st.streak === 'object') {
+    type = st.streak.type;
+    val = st.streak.value;
+  } else if (typeof st.streak === 'string' && st.streak) {
+    return st.streak.toUpperCase();
+  } else if (st.streak_type != null) {
+    type = st.streak_type;
+    val = st.streak_value;
+  }
+  var n = parseInt(val, 10);
+  if (!type || !n || n < 1) { return ''; }
+  return String(type).charAt(0).toUpperCase() + n;
+}
+
 // Parse all standings rows for the standings overlay
 function skParseStandingsRow(teamData) {
   // teamData is the raw team object from Yahoo's standings
@@ -129075,12 +129102,11 @@ function skParseStandingsRow(teamData) {
   var streak = null, gamesBack = null;
   if (st) {
     // W4 AND L2, not "+4" and "2". The old shape put the whole
-    // difference between a hot streak and a cold one into a plus sign,
-    // and nothing in the app has ever rendered it, so there is no
-    // reader to break.
-    if (st.streak_type && st.streak_value) {
-      streak = String(st.streak_type).toUpperCase() + st.streak_value;
-    }
+    // difference between a hot streak and a cold one into a plus sign.
+    // STREAKFIX -- and the two flat fields this used to read were not
+    // the shape either, so this came back null for every team and the
+    // your-row panel showed a dash at 2-0.
+    streak = _skStreakStr(st) || null;
     if (st.games_back != null) {
       gamesBack = parseFloat(st.games_back);
     }
@@ -184805,7 +184831,12 @@ function skBuildStandingsTeamRowHtml(team, rank, myTeamKey, scoringType) {
   }
   
   if (team.streak) {
-    var streakColor = team.streak.indexOf('-') === 0 ? '#ef4444' : '#22c55e';
+    // STREAKFIX -- was indexOf('-') === 0, left over from a "+4"/"-2"
+    // shape. Unreachable while the parser returned null; live now, and
+    // "L2" has no minus in it, so every losing streak would have been
+    // painted green.
+    var streakColor = /^L/i.test(team.streak) ? '#ef4444' :
+      (/^T/i.test(team.streak) ? '#9ca3af' : '#22c55e');
     statsHtml += '<div class="sk-standings-stat">' +
       '<div class="sk-standings-stat-value" style="color:' + streakColor + '">' + team.streak + '</div>' +
       '<div class="sk-standings-stat-label">Streak</div>' +
@@ -227472,7 +227503,10 @@ async function loadFyStats() {
         pf = parseFloat(tSt.points_for) || 0;
         pa = parseFloat(tSt.points_against) || 0;
         rank = tSt.rank || '—';
-        streak = tSt.streak ? tSt.streak.type + tSt.streak.value : '';
+        // STREAKFIX -- was type + value concatenated raw, so this
+        // printed "win2" and then tested startsWith('W') against a
+        // lowercase string and never coloured itself.
+        streak = _skStreakStr(tSt);
       }
 
       var totalGames = wins + losses + ties;
