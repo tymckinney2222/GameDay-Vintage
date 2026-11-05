@@ -46299,7 +46299,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = 'bo321 SCHED';
+var SK_BUILD = 'bo322 SETPROBE';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo, muteable) {
   var isActive = activeLeague === key;
@@ -140028,7 +140028,49 @@ function _rfPaint() {
 //   • a points league also records into the rank history, which fills
 //     any day a points snapshot missed.
 // ══════════════════════════════════════════════════════════════════
-var _skSetProbe = {};   // SETPROBE -- temporary, see ensureLeagueSettings
+var _skSetProbe = {};   // SETPROBE -- temporary
+var _skSetProbeBusy = {};
+
+// SETPROBE -- temporary. One call, for one league, the first time its
+// odds card is built. The parsed settings in localStorage are no use
+// here: they are this app's shape, not Yahoo's, and the question is
+// precisely what Yahoo sends.
+function _skSetProbeFetch(leagueKey) {
+  if (!leagueKey || _skSetProbe[leagueKey] || _skSetProbeBusy[leagueKey]) { return; }
+  _skSetProbeBusy[leagueKey] = true;
+  try {
+    fyApi('/league/' + leagueKey + '/settings').then(function (data) {
+      try {
+        var lg = data && data.fantasy_content && data.fantasy_content.league;
+        var part = null, i;
+        for (i = 0; lg && i < lg.length; i++) {
+          if (lg[i] && lg[i].settings) { part = lg[i]; break; }
+        }
+        if (!part) { _skSetProbe[leagueKey] = 'no settings node'; return; }
+        var arr = _yahooArr(part.settings);
+        if (!arr.length) { arr = [part.settings]; }
+        var names = {}, hits = [], k, v, j;
+        for (j = 0; j < arr.length; j++) {
+          if (!arr[j]) { continue; }
+          for (k in arr[j]) {
+            if (!arr[j].hasOwnProperty(k)) { continue; }
+            names[k] = 1;
+            // the values worth seeing, not just the names
+            if (/division|seed|playoff/i.test(k)) {
+              v = arr[j][k];
+              if (v == null || typeof v === 'object') { continue; }
+              hits.push(k + '=' + String(v));
+            }
+          }
+        }
+        _skSetProbe[leagueKey] = hits.sort().join(' ') + '  ||ALL|| ' +
+          Object.keys(names).sort().join(',');
+      } catch (e2) { _skSetProbe[leagueKey] = 'parse failed: ' + e2.message; }
+    })['catch'](function (e) {
+      _skSetProbe[leagueKey] = 'fetch failed';
+    });
+  } catch (e) { _skSetProbe[leagueKey] = 'threw'; }
+}
 
 var SK_RANKHIST_PREFIX = 'sk_rank_hist_v1_';
 var _skBumpCtx = {};   // domId -> context for repaints
@@ -144935,18 +144977,9 @@ async function ensureLeagueSettings(leagueKey) {
       if (settingsArr.length === 0) settingsArr = [part.settings];
       settingsArr.forEach(function(s) {
         if (!s) return;
-        // SETPROBE -- temporary. I claimed Yahoo does not publish the
-        // divisional seeding rule, having only checked that this parser
-        // does not read it. Yahoo's own settings page states it. This
-        // records what the API actually sends so the question is
-        // settled by looking rather than by me guessing twice.
-        try {
-          if (!_skSetProbe[leagueKey]) {
-            var _sk = [], _kk;
-            for (_kk in s) { if (s.hasOwnProperty(_kk)) { _sk.push(_kk); } }
-            _skSetProbe[leagueKey] = _sk.sort().join(',');
-          }
-        } catch (eSp) {}
+        // SETPROBE lived here and never ran: ensureLeagueSettings
+        // returns a parsed entry out of localStorage long before this
+        // loop. It asks Yahoo directly now -- see _skSetProbeFetch.
         // Playoff config — top-level settings keys. Yahoo returns these
         // as strings; coerce to integers for math. Roto leagues won't
         // populate these (no playoffs); we leave them null.
@@ -176093,6 +176126,7 @@ function _poFill(lk, html) {
 function _poKick(league, leagueData, allTeams) {
   var lk = league && league.league_key;
   _poMyKey = (leagueData && leagueData.team && leagueData.team.team_key) || null;
+  try { _skSetProbeFetch(lk); } catch (eSp) {}   // SETPROBE -- temporary
   if (!lk || _poInflight[lk]) { return; }
   if (_poFailed[lk]) { _poFill(lk, ''); return; }
   if (_poOdds[lk] && _poOdds[lk].week === (parseInt(league.current_week, 10) || 1)) {
