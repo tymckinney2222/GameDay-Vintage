@@ -28176,6 +28176,8 @@
             padding: 8px 2px 8px 10px; border-top: 1px solid rgba(255,255,255,0.06);
             -webkit-tap-highlight-color: transparent; cursor: pointer; }
   .ld-row:active { background: rgba(255,255,255,0.03); }
+  .ld-row.flat { cursor: default; }
+  .ld-row.flat:active { background: none; }
   /* The provider, as a rail. No height, no word. */
   .ld-rail { position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
              border-radius: 3px 0 0 3px; }
@@ -130838,8 +130840,12 @@ function _ldPressEnd() {
   if (_ldPressTimer) { clearTimeout(_ldPressTimer); _ldPressTimer = null; }
 }
 // A long press must not also open the league on release.
-function _ldTap(key) {
+function _ldTap(key, ext) {
   if (_ldPressed) { _ldPressed = false; return; }
+  // Sleeper, ESPN and Fantrax leagues are not in skLeagueData, so
+  // skOpenDetail answered "League not found" for every one of them.
+  // The card opens them with extOpenLeague; so does the row now.
+  if (ext) { try { extOpenLeague(key); } catch (e1) {} return; }
   try { skOpenDetail(key); } catch (e) {}
 }
 
@@ -130933,6 +130939,12 @@ function _ldBarHtml(r) {
     '" style="width:' + w.toFixed(1) + '%"></i></span>';
 }
 
+function _ldBtnHtml(call, label, icon, badge) {
+  return '<span class="ld-btn" role="button" tabindex="0" aria-label="' +
+    skEscape(label) + '" onclick="event.stopPropagation(); ' + call + '">' +
+    icon + (badge ? '<b>' + badge + '</b>' : '') + '</span>';
+}
+
 function _ldRowHtml(r) {
   var l = r.l, key = String(l.league_key).replace(/'/g, '');
   var nameAttr = skEscape(JSON.stringify(l.name || '')).replace(/"/g, '&quot;');
@@ -130959,11 +130971,31 @@ function _ldRowHtml(r) {
   var mg = _ldMargin(r);
   var nfl = false;
   try { nfl = _skIsNflLeague(l); } catch (e) {}
-  var todayCall = nfl ? ("skOpenNflLineup('" + key + "')")
-                      : ("skOpenTodaySheet('" + key + "')");
-  var wkCall = "skOpenTodaySheet('" + key + "','week')";
-  return '<div class="ld-row' + (r.live ? ' live' : '') + '" data-league-key="' +
-      key + '" onclick="_ldTap(\'' + key + '\')"' +
+  // THE GLYPHS HAVE TO MATCH THE PROVIDER. skOpenTodaySheet and
+  // skOpenNflLineup are Yahoo-only readers -- on an ESPN row they
+  // opened nothing at all. An external league has one lineup modal,
+  // reached through extOpenLineup, and no week sheet whatsoever, so
+  // the second glyph is left undrawn rather than drawn dead.
+  var btns = '';
+  if (r.ext) {
+    if (r.lineup) {
+      btns = _ldBtnHtml("extOpenLineup('" + key + "')",
+        r.lineupLabel || 'Lineup', _LD_ICON_LINEUP, r.live);
+    }
+  } else {
+    btns = _ldBtnHtml(nfl ? ("skOpenNflLineup('" + key + "')")
+                          : ("skOpenTodaySheet('" + key + "')"),
+        'Today\u2019s lineup', _LD_ICON_LINEUP, r.live) +
+      _ldBtnHtml("skOpenTodaySheet('" + key + "','week')",
+        'This week', _LD_ICON_WEEK, 0);
+  }
+  // No league view to open means no tap target: an external league
+  // with neither standings nor matchups has nothing behind the row.
+  var tapAttr = (r.ext && !r.hasDetail) ? ''
+    : (' onclick="_ldTap(\'' + key + '\'' + (r.ext ? ',1' : '') + ')"');
+  return '<div class="ld-row' + (r.live ? ' live' : '') +
+      (r.ext && !r.hasDetail ? ' flat' : '') + '" data-league-key="' +
+      key + '"' + tapAttr +
       ' ontouchstart="_ldPressStart(\'' + key + '\',' + nameAttr + ')"' +
       ' ontouchend="_ldPressEnd()" ontouchmove="_ldPressEnd()"' +
       ' ontouchcancel="_ldPressEnd()">' +
@@ -130976,13 +131008,7 @@ function _ldRowHtml(r) {
       skEscape(sub.join(' · ')) + '</s></span>' +
     '<span class="ld-rb">' + _ldBarHtml(r) + '</span>' +
     '<span class="ld-m ' + mg.cls + '">' + mg.txt + '</span>' +
-    '<span class="ld-btns">' +
-      '<span class="ld-btn" role="button" tabindex="0" aria-label="Today’s lineup"' +
-        ' onclick="event.stopPropagation(); ' + todayCall + '">' + _LD_ICON_LINEUP +
-        (r.live ? '<b>' + r.live + '</b>' : '') + '</span>' +
-      '<span class="ld-btn" role="button" tabindex="0" aria-label="This week"' +
-        ' onclick="event.stopPropagation(); ' + wkCall + '">' + _LD_ICON_WEEK + '</span>' +
-    '</span>' +
+    (btns ? '<span class="ld-btns">' + btns + '</span>' : '') +
   '</div>';
 }
 
@@ -130997,8 +131023,15 @@ function _ldWLT(txt) {
 }
 
 function _ldExtRowData(l) {
+  // A HUB GAME, NOT A LEAGUE ROW. _fhubFmtOf and _fhubMatchupFor both
+  // look for the league on g.lg, and when it is missing they fall back
+  // to the YAHOO branch -- so passing the league itself sent every
+  // external row into skLeagueData, which holds no entry under an ESPN
+  // key. That is why no ESPN or Fantrax league showed a score and why
+  // every one of them resolved to format ''.
+  var g = { lg: l, provider: l.provider, key: l.key, lgKey: l.key };
   var fmt = '';
-  try { fmt = String(_fhubFmtOf(l) || '').toLowerCase(); } catch (e) { fmt = ''; }
+  try { fmt = String(_fhubFmtOf(g) || '').toLowerCase(); } catch (e) { fmt = ''; }
   var season = _ldIsSeason(fmt);
   var cats = (fmt === 'head' || fmt === 'headone');
   // THE APP ALREADY KNOWS HOW TO READ THESE. _fhubMatchupFor walks
@@ -131006,7 +131039,7 @@ function _ldExtRowData(l) {
   // whether it is cats -- my own version of that walk got nothing out
   // of ESPN or Fantrax and labelled formats by guess.
   var fm = null;
-  try { fm = _fhubMatchupFor(l); } catch (e) { fm = null; }
+  try { fm = _fhubMatchupFor(g); } catch (e) { fm = null; }
   var my = null, op = null;
   if (fm) {
     cats = !!fm.isCat;
@@ -131027,22 +131060,35 @@ function _ldExtRowData(l) {
   return {
     key: l.key,
     l: { league_key: l.key, name: l.name || st.leagueName || '',
-         scoring_type: fmt, provider: l.provider },
+         scoring_type: fmt, provider: l.provider, sport: l.sport },
     team: { name: st.teamName || l.name || '', record: st.record || '',
+            points: (typeof _skExtSeasonTotal === 'function')
+              ? _skExtSeasonTotal(l) : null,
+            // THE LOGO WAS ALREADY IN THE APP. extGetMyLogo returns
+            // only the one the user uploaded by hand; ESPN serves a
+            // team logo on the row itself and the big card falls back
+            // to it. The row did not, so every ESPN league drew the
+            // empty crest while its card showed the badge.
             logoUrl: (function () {
+              var up = '';
               try {
-                if (typeof extGetMyLogo === 'function') {
-                  return extGetMyLogo(l.key) || '';
-                }
+                if (typeof extGetMyLogo === 'function') { up = extGetMyLogo(l.key) || ''; }
               } catch (e) {}
-              return l.teamLogo || '';
+              return up || l.myLogo || l.teamLogo || '';
             })() },
     m: has ? { myScore: my, oppScore: op } : null,
     live: live, season: season, cats: cats,
     rank: Number(st.rank || 0), total: Number(st.total || 0),
     unknown: !season && !has, share: sh,
     band: season ? 4 : (has ? _ldBand(sh, live) : 3),
-    ext: true
+    ext: true,
+    // The same two gates the big card uses: no standings table and no
+    // matchups means there is no league view behind the row, and no
+    // rosters.byTeam means there is no lineup modal to open.
+    hasDetail: !!((l.standingsAll && l.standingsAll.length) ||
+                  (l.matchups && l.matchups.length)),
+    lineup: !!(l.rosters && l.rosters.byTeam),
+    lineupLabel: (l.provider === 'fantrax') ? 'Roster stats' : 'Lineup'
   };
 }
 
