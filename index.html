@@ -46472,6 +46472,15 @@ function renderLeagueDrawerBody() {
   // only rows in this drawer that were not somewhere to go.
 
   // SKBUILD
+  html += '<div style="padding:10px 16px 2px;">' +
+    '<button type="button" onclick="_cxBacktest(3)" style="width:100%;' +
+    'padding:9px;border-radius:7px;background:rgba(245,213,71,0.08);' +
+    'border:1px solid rgba(245,213,71,0.45);color:#f5d547;font-size:10px;' +
+    'letter-spacing:0.09em;font-family:var(--sk-font-mono,monospace);">' +
+    'BACKTEST PROJECTION (3 WK)</button></div>';
+  html += '<div id="skCxBtOut" style="padding:6px 16px 2px;font-size:9px;' +
+    'line-height:1.6;color:rgba(255,255,255,0.55);' +
+    'font-family:var(--sk-font-mono,monospace);word-break:break-word;"></div>';
   html += '<div style="padding:14px 16px 4px;font-size:8.5px;letter-spacing:0.08em;' +
     'color:rgba(255,255,255,0.18);font-family:var(--sk-font-mono,monospace);">BUILD ' +
     SK_BUILD + '</div>';
@@ -46525,7 +46534,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = 'bo335 CATOPEN';
+var SK_BUILD = 'bo336 CATPROJ';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo, muteable) {
   var isActive = activeLeague === key;
@@ -152015,6 +152024,382 @@ function _skCpHtml(res, lk) {
       'picks up games left.</div>';
   }
   return h + '</div>';
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  CATS PROJECTION ── CATPROJ ──
+// ══════════════════════════════════════════════════════════════════
+// The analysis tab already classified every category and turned that
+// into a win probability with weights picked by hand: a locked win
+// counted 1.0, a likely win 0.85, a coin flip 0.5, a likely loss
+// 0.15. Those numbers were never on screen, so they were never
+// checked against an outcome, and there is no way to backtest a
+// constant somebody chose -- you can only ask whether a different
+// constant fits better.
+//
+// So the weights are gone. A category's probability is computed from
+// what can be measured -- the margin so far, the rate each side has
+// been scoring at, and how many days are left -- and the matchup
+// probability is the exact distribution over how many categories are
+// won, not a weighted average of labels.
+
+// THE ONLY FREE PARAMETERS LEFT, and the reason this is worth
+// backtesting at all. A counting category needs no constant: the
+// rate each side has scored at and the days remaining determine it.
+// A rate category has no rate to project, so how far a percentage
+// can still swing is set here -- inherited from the old classifier,
+// never once checked against an outcome. These three numbers are
+// what the on-device backtest measures.
+var CX_RATE_SWING = { early: 0.25, mid: 0.16, late: 0.10 };
+
+// Abramowitz & Stegun 7.1.26, max error 2.17e-6. Same approximation
+// the playoff-odds engine uses; kept separate so neither can be
+// changed for the other's sake.
+function _cxPhi(z) {
+  var sign = (z < 0) ? -1 : 1;
+  var x = Math.abs(z) / Math.sqrt(2);
+  var t = 1 / (1 + 0.3275911 * x);
+  var y = 1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t -
+    0.284496736) * t + 0.254829592) * t * Math.exp(-x * x);
+  return 0.5 * (1 + sign * y);
+}
+
+// ── ONE COUNTING CATEGORY ─────────────────────────────────────────
+// Each side keeps scoring at the rate it has been. The final margin
+// is what is banked plus what is still to come, and what is still to
+// come is a count: mean rate*days, and for a count the variance is
+// about the mean. A half-point continuity correction turns the
+// continuous approximation back into whole goals and assists, which
+// is what makes a tie a real outcome rather than a measure-zero one.
+function _cxCountProb(my, opp, daysPlayed, daysLeft, lowerWins) {
+  if (!(daysPlayed > 0)) { return { w: 1 / 3, t: 1 / 3, l: 1 / 3 }; }
+  var myRate = my / daysPlayed, opRate = opp / daysPlayed;
+  var myAdd = myRate * daysLeft, opAdd = opRate * daysLeft;
+  var mean = (my + myAdd) - (opp + opAdd);
+  // A count's spread comes only from what is still to be played; what
+  // is banked is banked. Floor each side's variance so a scoreless
+  // category is not treated as perfectly predictable.
+  var v = Math.max(myAdd, 0.5) + Math.max(opAdd, 0.5);
+  if (daysLeft <= 0) {
+    var d = my - opp;
+    if (d === 0) { return { w: 0, t: 1, l: 0 }; }
+    var win = lowerWins ? (d < 0) : (d > 0);
+    return win ? { w: 1, t: 0, l: 0 } : { w: 0, t: 0, l: 1 };
+  }
+  var sd = Math.sqrt(v);
+  if (lowerWins) { mean = -mean; }
+  var pUp = 1 - _cxPhi((0.5 - mean) / sd);
+  var pDn = _cxPhi((-0.5 - mean) / sd);
+  var pTie = 1 - pUp - pDn;
+  if (pTie < 0) { pTie = 0; }
+  return _cxNorm(pUp, pTie, pDn);
+}
+
+// ── ONE RATE CATEGORY ─────────────────────────────────────────────
+// A percentage has no rate to project forward -- it is already an
+// average, and both sides' averages converge as the week fills in.
+// What moves it is how much is still to come relative to what is in,
+// so the spread shrinks with the share of the week already played.
+// A rate landing exactly level is vanishingly unlikely, so a tie is
+// not modelled here.
+function _cxRateProb(my, opp, daysPlayed, daysLeft, lowerWins) {
+  var total = daysPlayed + daysLeft;
+  if (!(total > 0)) { return { w: 0.5, t: 0, l: 0.5 }; }
+  var adv = my - opp;
+  if (lowerWins) { adv = -adv; }
+  if (daysLeft <= 0) {
+    if (adv === 0) { return { w: 0, t: 1, l: 0 }; }
+    return adv > 0 ? { w: 1, t: 0, l: 0 } : { w: 0, t: 0, l: 1 };
+  }
+  var scale = Math.max(Math.abs(my), Math.abs(opp));
+  if (!(scale > 0)) { return { w: 0.5, t: 0, l: 0.5 }; }
+  // Early weeks swing hard on one start; late weeks barely move.
+  var basePct = (daysPlayed <= 2) ? CX_RATE_SWING.early
+    : (daysPlayed <= 4 ? CX_RATE_SWING.mid : CX_RATE_SWING.late);
+  var sd = scale * basePct * Math.sqrt(daysLeft / total);
+  if (!(sd > 0)) { return adv > 0 ? { w: 1, t: 0, l: 0 } : { w: 0, t: 0, l: 1 }; }
+  var pUp = _cxPhi(adv / sd);
+  return _cxNorm(pUp, 0, 1 - pUp);
+}
+
+function _cxNorm(w, t, l) {
+  var s = w + t + l;
+  if (!(s > 0)) { return { w: 1 / 3, t: 1 / 3, l: 1 / 3 }; }
+  return { w: w / s, t: t / s, l: l / s };
+}
+
+// ── THE MATCHUP ───────────────────────────────────────────────────
+// Not an average of the category probabilities: the exact
+// distribution of how many categories end up won minus lost. Each
+// category shifts that margin by +1, 0 or -1, so the whole thing is
+// a walk over at most 2N+1 states -- cheap, and exact, which a
+// weighted average never is.
+function _cxMatchup(cats) {
+  var n = (cats || []).length;
+  if (!n) { return { win: 0, tie: 1, loss: 0, expWin: 0, expLoss: 0 }; }
+  var dist = {}, i, k, c;
+  dist[0] = 1;
+  var expWin = 0, expLoss = 0;
+  for (i = 0; i < n; i++) {
+    c = cats[i];
+    expWin += c.w; expLoss += c.l;
+    var next = {};
+    for (k in dist) {
+      if (!dist.hasOwnProperty(k)) { continue; }
+      var p = dist[k], key = Number(k);
+      if (c.w > 0) { next[key + 1] = (next[key + 1] || 0) + p * c.w; }
+      if (c.t > 0) { next[key] = (next[key] || 0) + p * c.t; }
+      if (c.l > 0) { next[key - 1] = (next[key - 1] || 0) + p * c.l; }
+    }
+    dist = next;
+  }
+  var win = 0, tie = 0, loss = 0;
+  for (k in dist) {
+    if (!dist.hasOwnProperty(k)) { continue; }
+    var m = Number(k);
+    if (m > 0) { win += dist[k]; }
+    else if (m === 0) { tie += dist[k]; }
+    else { loss += dist[k]; }
+  }
+  return { win: win, tie: tie, loss: loss,
+           expWin: expWin, expLoss: expLoss, dist: dist };
+}
+
+// A label for the number, so the tab says something in words too.
+function _cxVerdict(win, tie) {
+  var p = win + tie * 0.5;
+  if (p >= 0.80) { return 'Commanding'; }
+  if (p >= 0.60) { return 'Favored'; }
+  if (p > 0.40) { return 'Toss-up'; }
+  if (p > 0.20) { return 'Underdog'; }
+  return 'Long shot';
+}
+
+// Which bucket a category falls in, derived FROM the probability
+// rather than computed beside it -- so the tiers on screen and the
+// percentage can never tell different stories.
+function _cxTier(c) {
+  if (c.t >= 0.5) { return 'tied'; }
+  if (c.w >= 0.90) { return 'locked'; }
+  if (c.w >= 0.65) { return 'likely'; }
+  if (c.w > 0.35) { return 'coin'; }
+  if (c.w > 0.10) { return 'slipping'; }
+  return 'gone';
+}
+
+function _cxCatProb(my, opp, daysPlayed, daysLeft, isRate, lowerWins) {
+  return isRate
+    ? _cxRateProb(my, opp, daysPlayed, daysLeft, lowerWins)
+    : _cxCountProb(my, opp, daysPlayed, daysLeft, lowerWins);
+}
+
+// ── CATPROJ BACKTEST ──────────────────────────────────────────────
+// The sandbox this was written in cannot reach Yahoo, so the only
+// finished weeks that exist are on this phone. This reconstructs
+// them: for each completed week it pulls both teams' rosters day by
+// day, rebuilds the category totals as they stood at the end of each
+// day, asks the projection what it would have said, and compares
+// that against how the category actually finished.
+//
+// Scored at the CATEGORY level, not the matchup level. Ten categories
+// times six mid-week days times a few weeks is a few hundred
+// predictions instead of a handful, and the category probability is
+// the thing the matchup number is built out of -- calibrate the
+// input and the output follows.
+
+var _cxBtBusy = false;
+
+function _cxBtOut(msg) {
+  try {
+    var el = document.getElementById('skCxBtOut');
+    if (el) { el.innerHTML = msg; }
+  } catch (e) {}
+  try { console.log('[cxbt] ' + String(msg).replace(/<[^>]+>/g, ' ')); } catch (e) {}
+}
+
+// One day's roster -> { sid: total } over the slots that counted.
+function _cxBtDay(players, acc) {
+  for (var i = 0; i < (players || []).length; i++) {
+    var p = players[i];
+    if (!p || !_isActiveSlot(p.selectedPos)) { continue; }
+    var st = p.stats || {}, k;
+    for (k in st) {
+      if (!st.hasOwnProperty(k)) { continue; }
+      var v = Number(st[k]);
+      if (isNaN(v)) { continue; }
+      acc[k] = (acc[k] || 0) + v;
+    }
+  }
+  return acc;
+}
+
+// A rate is rebuilt from its made/attempted pair; a rate without one
+// is skipped rather than guessed at, and the count of skipped
+// categories is reported so the coverage is visible.
+function _cxBtCatVal(acc, sid, abbr, statsMeta, isRate) {
+  var A = String(abbr).toUpperCase();
+  var basis = SK_CAT_RATE_BASIS[A];
+  if (!basis) {
+    // A RATE WITHOUT A PAIR IS NOT A COUNT. GAA, ERA and WHIP have no
+    // made/attempted stats to rebuild them from, and summing one
+    // across days is the exact error the rate blocklist exists to
+    // stop -- 1.09 on Monday plus 2.93 on Tuesday is not 4.02.
+    if (isRate || SK_KNOWN_RATE_STAT_ABBRS[A]) { return null; }
+    return { v: acc[sid] || 0, rate: false };
+  }
+  var mSid = _skCpSidFor(statsMeta, basis[0]);
+  var aSid = _skCpSidFor(statsMeta, basis[1]);
+  if (mSid == null || aSid == null) { return null; }
+  var att = acc[aSid];
+  if (!(att > 0)) { return null; }
+  return { v: (acc[mSid] || 0) / att, rate: true };
+}
+
+async function _cxBacktest(nWeeks) {
+  if (_cxBtBusy) { return; }
+  _cxBtBusy = true;
+  nWeeks = nWeeks || 3;
+  try {
+    var lk = (typeof skState === 'object' && skState) ? skState.activeLeagueKey : null;
+    if (!lk) { _cxBtOut('no active league'); return; }
+    var lg = null, all = (typeof fyLeagues !== 'undefined' && fyLeagues) ? fyLeagues : [];
+    for (var q = 0; q < all.length; q++) {
+      if (String(all[q].league_key) === String(lk)) { lg = all[q]; }
+    }
+    var cw = lg && lg.current_week ? Number(lg.current_week) : 0;
+    if (!cw) { _cxBtOut('no current week for ' + lk); return; }
+    await ensureLeagueSettings(lk)['catch'](function () {});
+    var statsMeta = (leagueSettingsCache[lk] && leagueSettingsCache[lk].stats) || {};
+    var cats = [], sid;
+    for (sid in statsMeta) {
+      if (!statsMeta.hasOwnProperty(sid)) { continue; }
+      var m = statsMeta[sid];
+      if (!m || !m.enabled || m.isOnlyDisplayStat) { continue; }
+      cats.push({ sid: sid, abbr: (m.abbr || m.displayName || sid) + '',
+                  lower: m.sortOrder === 0 });
+    }
+    if (!cats.length) { _cxBtOut('no enabled categories'); return; }
+
+    var buckets = {}, brierSum = 0, brierN = 0, skipped = 0, weeksDone = 0;
+    var b, i;
+    for (i = 0; i < 10; i++) { buckets[i] = { n: 0, won: 0 }; }
+
+    for (var wk = cw - 1; wk >= 1 && weeksDone < nWeeks; wk--) {
+      _cxBtOut('week ' + wk + '… (' + weeksDone + '/' + nWeeks + ' done)');
+      var sb = null;
+      try { sb = await fyApi('/league/' + lk + '/scoreboard;week=' + wk); }
+      catch (e) { continue; }
+      var pair = _cxBtFindMatchup(sb, lk);
+      if (!pair) { continue; }
+      var days = _cxBtDays(pair.start, pair.end);
+      if (days.length < 3) { continue; }
+
+      // Pull both teams, every day. Past dates cache forever.
+      var myAcc = {}, opAcc = {}, byDayMy = [], byDayOp = [];
+      var failed = false;
+      for (var d = 0; d < days.length; d++) {
+        var res = await Promise.all([
+          skFetchCatsRosterForDate(pair.me, days[d])['catch'](function () { return null; }),
+          skFetchCatsRosterForDate(pair.opp, days[d])['catch'](function () { return null; })
+        ]);
+        if (res[0] == null && res[1] == null) { failed = true; break; }
+        _cxBtDay(res[0], myAcc); _cxBtDay(res[1], opAcc);
+        byDayMy.push(JSON.parse(JSON.stringify(myAcc)));
+        byDayOp.push(JSON.parse(JSON.stringify(opAcc)));
+      }
+      if (failed || byDayMy.length < 3) { continue; }
+      var last = byDayMy.length - 1;
+
+      for (var ci = 0; ci < cats.length; ci++) {
+        var c = cats[ci];
+        var fin = _cxBtCatVal(byDayMy[last], c.sid, c.abbr, statsMeta, c.lower);
+        var finO = _cxBtCatVal(byDayOp[last], c.sid, c.abbr, statsMeta, c.lower);
+        if (!fin || !finO) { skipped++; continue; }
+        var adv = fin.v - finO.v;
+        if (c.lower) { adv = -adv; }
+        if (adv === 0) { continue; }         // a drawn category scores neither
+        var actuallyWon = adv > 0 ? 1 : 0;
+        // Every mid-week day is its own prediction.
+        for (var dd = 1; dd <= last; dd++) {
+          var mv = _cxBtCatVal(byDayMy[dd - 1], c.sid, c.abbr, statsMeta, c.lower);
+          var ov = _cxBtCatVal(byDayOp[dd - 1], c.sid, c.abbr, statsMeta, c.lower);
+          if (!mv || !ov) { continue; }
+          var pr = _cxCatProb(mv.v, ov.v, dd, (last + 1) - dd, mv.rate, c.lower);
+          // A predicted tie is split between the two live outcomes, so
+          // the number being scored is P(win | not drawn).
+          var pw = pr.t > 0 ? (pr.w + pr.t / 2) : pr.w;
+          b = Math.min(9, Math.max(0, Math.floor(pw * 10)));
+          buckets[b].n++; buckets[b].won += actuallyWon;
+          brierSum += (pw - actuallyWon) * (pw - actuallyWon);
+          brierN++;
+        }
+      }
+      weeksDone++;
+    }
+
+    if (!brierN) { _cxBtOut('no usable weeks found'); return; }
+    var h = '<b>CATPROJ BACKTEST</b> · ' + weeksDone + ' wk · n=' + brierN +
+      ' · brier ' + (brierSum / brierN).toFixed(3) +
+      (skipped ? (' · ' + skipped + ' cats unreconstructable') : '') + '<br>';
+    for (i = 0; i < 10; i++) {
+      if (!buckets[i].n) { continue; }
+      var said = (i * 10) + '-' + (i * 10 + 9);
+      var realPct = Math.round((buckets[i].won / buckets[i].n) * 100);
+      h += 'said ' + said + '% → actual ' + realPct + '% (n=' +
+        buckets[i].n + ')<br>';
+    }
+    h += 'swing ' + JSON.stringify(CX_RATE_SWING);
+    _cxBtOut(h);
+  } catch (e) {
+    _cxBtOut('backtest failed: ' + (e && e.message ? e.message : e));
+  } finally {
+    _cxBtBusy = false;
+  }
+}
+
+function _cxBtFindMatchup(sb, lk) {
+  try {
+    var sc = sb.fantasy_content.league[1].scoreboard;
+    var ms = sc['0'] ? sc['0'].matchups : sc.matchups;
+    var cnt = Number(ms.count || 0), i;
+    for (i = 0; i < cnt; i++) {
+      var mu = ms[String(i)].matchup;
+      var teams = mu['0'].teams;
+      var t0 = teams['0'].team[0], t1 = teams['1'].team[0];
+      var k0 = _cxBtKey(t0), k1 = _cxBtKey(t1);
+      var mine = null, opp = null;
+      if (_cxBtIsMine(t0)) { mine = k0; opp = k1; }
+      else if (_cxBtIsMine(t1)) { mine = k1; opp = k0; }
+      if (mine) {
+        return { me: mine, opp: opp, start: mu.week_start, end: mu.week_end };
+      }
+    }
+  } catch (e) {}
+  return null;
+}
+function _cxBtKey(arr) {
+  for (var i = 0; i < arr.length; i++) {
+    if (arr[i] && arr[i].team_key) { return arr[i].team_key; }
+  }
+  return null;
+}
+function _cxBtIsMine(arr) {
+  for (var i = 0; i < arr.length; i++) {
+    if (arr[i] && arr[i].is_owned_by_current_login) { return true; }
+  }
+  return false;
+}
+function _cxBtDays(start, end) {
+  var out = [];
+  if (!start || !end) { return out; }
+  var cur = new Date(start + 'T12:00:00'), stop = new Date(end + 'T12:00:00');
+  if (isNaN(cur.getTime()) || isNaN(stop.getTime())) { return out; }
+  var guard = 0;
+  while (cur <= stop && guard++ < 14) {
+    out.push(cur.toISOString().slice(0, 10));
+    cur.setDate(cur.getDate() + 1);
+  }
+  return out;
 }
 
 function skRenderCatsWeekContributors() {
