@@ -46583,7 +46583,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = 'bo340 PTPROJ';
+var SK_BUILD = 'bo343 PTMATH';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo, muteable) {
   var isActive = activeLeague === key;
@@ -151058,6 +151058,17 @@ function _skBuildScoreboardHTML(matchups, isCats, myKey, league, allTeams, stats
 // ── LSBSKIN ── the sport skins, and the switch ────────────────────
 // Yahoo calls the sport 'nhl' on a fantasy league and the app's own
 // tables call it 'hockey' in places, so both spellings map.
+// The Analysis panes had no skin at all. Same board classes the
+// matchup wrap uses, so the rink / hardwood / ballpark backdrop and
+// the accent colour come along without new CSS.
+function _skAnSkinCls(league) {
+  try {
+    var k = LSB_SKINS[String((league && league.sport) || '').toLowerCase()] || '';
+    if (!k) { return 'lsb-board'; }
+    return 'lsb-board lsb-skin ' + k + (_lsbSkinOn() ? ' on' : '');
+  } catch (e) { return 'lsb-board'; }
+}
+
 var LSB_SKINS = { nhl: 'nhl', hockey: 'nhl', mlb: 'mlb', baseball: 'mlb',
                   nba: 'nba', basketball: 'nba', nfl: 'nfl', football: 'nfl' };
 var LSB_SKIN_WORDS = { nhl: 'Rink', mlb: 'Ballpark', nba: 'Hardwood',
@@ -151888,6 +151899,11 @@ function _skCpSchedule(sport) {
     weekLeft: any,
     fn: function (abbr) {
       return _skCpGamesLeft(gpw, canon(String(abbr || '').toUpperCase()), idx);
+    },
+    total: function (abbr) {
+      var a = canon(String(abbr || '').toUpperCase());
+      var t = gpw.gamesByTeam ? gpw.gamesByTeam[a] : null;
+      return (t == null) ? null : t;
     }
   };
 }
@@ -152755,6 +152771,7 @@ function _ptProject(myScore, oppScore, myVals, opVals, daysLeft, myEff, opEff) {
     win = _cxPhi((myProj - opProj) / sd);
   }
   return { myProj: myProj, opProj: opProj, win: win, sd: sd,
+           myEff: myLeft, opEff: opLeft,
            verdict: _cxVerdict(win, 0), gap: myProj - opProj };
 }
 
@@ -153584,7 +153601,7 @@ function skBuildDetailHTML(league) {
     (_showAnalysisTab
       ? '<div class="sk-detail-pane" data-pane="analysis"' +
           (activeTab !== 'analysis' ? ' style="display:none"' : '') + '>' +
-          '<div id="skAnalysisContent">' +
+          '<div id="skAnalysisContent" class="' + _skAnSkinCls(league) + '">' +
             (_isRotoLg
               ? (_skBuildRotoPressureHTML(league, data) +    // ROTOPRESS
                  _skRotoSeasonGridHtml(league, data))        // ROTOSEASON
@@ -155192,6 +155209,23 @@ function _skMomTipHide(id) {
   if (cur) cur.style.display = 'none';
 }
 
+// A side's week in GAMES. Clubs we cannot match are skipped rather
+// than counted as zero -- the same rule the cats pivot uses, for the
+// same reason: our own miss must not read as "nothing left to play".
+function _ptSideGames(rows, sched) {
+  if (!sched || !rows || !rows.length) { return null; }
+  var left = 0, total = 0, seen = 0, i;
+  for (i = 0; i < rows.length; i++) {
+    var ab = rows[i] && rows[i].teamAbbr;
+    if (!ab) { continue; }
+    var l = sched.fn(ab), t = sched.total(ab);
+    if (l == null || t == null) { continue; }
+    left += l; total += t; seen++;
+  }
+  if (!seen) { return null; }
+  return { left: left, total: total, played: Math.max(0, total - left) };
+}
+
 function _skBuildPointsAnalysisHTML(league, leagueData) {
   if (!league || !leagueData) return '';
   var matchup = leagueData.matchup;
@@ -155274,6 +155308,11 @@ function _skBuildPointsAnalysisHTML(league, leagueData) {
     todayOppFp:  todayOppFp,
   });
 
+  // THE CHASE, on the face of the tab rather than below a table --
+  // and named for whoever is actually chasing. Per remaining GAME
+  // when the schedule is cached, because four days left is not four
+  // equal days.
+  var _ptChaseHtml = '';
   // Tier display metadata
   var tierMeta = {
     'locked-win':   { label: 'Locked Win',   glyph: '\u2713\u2713', cls: 'lockwin'  },
@@ -155288,13 +155327,41 @@ function _skBuildPointsAnalysisHTML(league, leagueData) {
   // decided beside it. "Locked Win" printed next to "86%" because one
   // set of rules chose the words and a separate logistic chose the
   // number, with nothing making them agree.
-  var _ptP = null;
+  var _ptP = null, _ptMy2 = [], _ptOp2 = [];
   try {
     var _ptD = (typeof skCurrentWeeklyFp !== 'undefined' && skCurrentWeeklyFp)
       ? skCurrentWeeklyFp.dates : null;
     var _ptMy = _ptDaily(_ptD, 'myFp'), _ptOp = _ptDaily(_ptD, 'oppFp');
+    _ptMy2 = _ptMy; _ptOp2 = _ptOp;
     if (_ptMy.length && _ptOp.length) {
-      _ptP = _ptProject(myScore, oppScore, _ptMy, _ptOp, daysRemaining);
+      // PROJECT PER GAME, NOT PER CLOCK DAY. The engine took the
+      // effective remaining days and nothing passed them, so the tab
+      // still ran the daily average across four days that do not hold
+      // four days of hockey -- 329 where the real pace gives 235.
+      // Rendering the tab is what showed it; the DOM test could not,
+      // because it exercised the engine rather than the page.
+      var _ptSc = null;
+      try {
+        var _ptSp = String(league.sport || '').toLowerCase();
+        _ptSc = (_ptSp === 'nhl' || _ptSp === 'nba') ? _skCpSchedule(_ptSp) : null;
+      } catch (eSc) { _ptSc = null; }
+      var _ptMyG = null, _ptOpG = null;
+      try {
+        var _ptWc = _computeWeekContributors();
+        _ptMyG = _ptSideGames((_ptWc && _ptWc.contributors) || [], _ptSc);
+        var _ptOw = _skOppWeekFp(matchup.oppTeamKey);
+        _ptOpG = _ptSideGames((_ptOw && _ptOw.rows) || [], _ptSc);
+      } catch (eG) {}
+      var _ptMyEff = _ptMyG
+        ? _ptEffDays(_ptMyG.left, _ptMyG.played, daysWithFullData, daysRemaining)
+        : daysRemaining;
+      var _ptOpEff = _ptOpG
+        ? _ptEffDays(_ptOpG.left, _ptOpG.played, daysWithFullData, daysRemaining)
+        : daysRemaining;
+      _ptP = _ptProject(myScore, oppScore, _ptMy, _ptOp, daysRemaining,
+                        _ptMyEff, _ptOpEff);
+      _ptP.myGamesLeft = _ptMyG ? _ptMyG.left : null;
+      _ptP.opGamesLeft = _ptOpG ? _ptOpG.left : null;
       tier = { label: _ptP.verdict, glyph: '', cls:
         (_ptP.win >= 0.8 ? 'lockwin' : (_ptP.win >= 0.6 ? 'likewin' :
          (_ptP.win > 0.4 ? 'coinflip' : (_ptP.win > 0.2 ? 'likeloss' : 'lockloss')))) };
@@ -155325,6 +155392,16 @@ function _skBuildPointsAnalysisHTML(league, leagueData) {
   var oppBand = Math.max(0, (verdict.oppMax || oppProj) - (verdict.oppMin || oppProj));
   var spread = (myBand + oppBand) / 2;
   if (daysRemaining <= 0) spread = 0; // week done — no uncertainty
+  if (_ptP) {
+    var _ptMySd = _ptSpread(_ptMy2, _ptP.myEff != null ? _ptP.myEff : daysRemaining);
+    var _ptOpSd = _ptSpread(_ptOp2, _ptP.opEff != null ? _ptP.opEff : daysRemaining);
+    verdict.myProjected = _ptP.myProj;
+    verdict.oppProjected = _ptP.opProj;
+    verdict.myMin = _ptP.myProj - _ptMySd;
+    verdict.myMax = _ptP.myProj + _ptMySd;
+    verdict.oppMin = _ptP.opProj - _ptOpSd;
+    verdict.oppMax = _ptP.opProj + _ptOpSd;
+  }
   var winPct;
   if (_ptP) {
     // Measured spread, not the +/-30% band.
@@ -155438,7 +155515,9 @@ function _skBuildPointsAnalysisHTML(league, leagueData) {
   } else if (daysWithFullData === 0) {
     keyText = 'Week just started \u2014 projection appears after Day 1 settles.';
   } else {
-    keyText = 'Solid = current \u00b7 Arrow = pace projection \u00b7 Band = realistic range (\u00b130%)';
+    keyText = _ptP
+    ? 'Solid = now \u00b7 Arrow = projected finish \u00b7 Band = one standard deviation, measured from this week\u2019s daily scores'
+    : 'Solid = current \u00b7 Arrow = pace projection \u00b7 Band = realistic range (\u00b130%)';
   }
   html += '<div class="sk-bp-projection">' +
     '<div class="sk-bp-section-head">SCORE PROJECTION</div>' +
@@ -155485,6 +155564,35 @@ function _skBuildPointsAnalysisHTML(league, leagueData) {
         '(' + paceDescriptor + ') to match opp\u2019s projected finish at ' +
         oppFinalAtPace.toFixed(0) + '.';
       ptsCls = 'work';
+    }
+    // THE MATH, from the two PROJECTIONS rather than from where you
+    // happen to stand now, and named for whoever is actually chasing.
+    // It read "Need 67.0 more pts" while projecting you to finish 211
+    // to their 208 -- true from a standing start, nonsense beside a
+    // projection that has you ahead. Per remaining GAME where the
+    // schedule is known, because four days left is not four equal days.
+    if (_ptP) {
+      var _need = _ptNeed(_ptP, _ptP.myGamesLeft, _ptP.opGamesLeft, daysRemaining);
+      if (_need.per == null) {
+        ptsLine = 'Nothing left to play \u2014 the week is done.';
+        ptsCls = _ptP.gap >= 0 ? 'good' : 'work';
+      } else {
+        var _over = _need.unit === 'game'
+          ? (' across their ' + _need.games + ' remaining game' +
+             (_need.games === 1 ? '' : 's') + '.')
+          : '.';
+        if (!_need.they) {
+          _over = _need.unit === 'game'
+            ? (' across your ' + _need.games + ' remaining game' +
+               (_need.games === 1 ? '' : 's') + '.')
+            : '.';
+        }
+        ptsLine = (_need.they ? 'They need <strong>' : 'You need <strong>') +
+          _need.deficit.toFixed(1) + '</strong> to ' +
+          (_need.they ? 'catch you' : 'catch them') + ' \u2014 <strong>' +
+          _need.per.toFixed(1) + '</strong> per ' + _need.unit + _over;
+        ptsCls = _need.they ? 'good' : 'work';
+      }
     }
     html += '<div class="sk-bp-math ' + ptsCls + '">' +
       '<div class="sk-bp-section-head">THE MATH</div>' +
