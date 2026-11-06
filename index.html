@@ -46640,7 +46640,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = 'bo345 LDROW';
+var SK_BUILD = 'bo347 LDEXT';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo, muteable) {
   var isActive = activeLeague === key;
@@ -130351,8 +130351,17 @@ function skRenderTodayCards() {
   // screen was 1.1 leagues per screen and 78 screens for all 82; a row
   // is 55px and the same list is 9. The cards remain as the fallback.
   try {
-    var _ldH = skBuildLadderHTML(leagues);
-    if (_ldH) { listEl.innerHTML = _ldH; return; }
+    // The ladder returned early and never appended extHtml, so in the
+    // combined view every Sleeper, ESPN and Fantrax league vanished
+    // from the list -- and _skDoneHtml went with them. They are rows
+    // in the same ladder now, sorted against everything else.
+    var _ldExtList = [];
+    try {
+      _ldExtList = (typeof skExtVisibleLeagues === 'function')
+        ? (skExtVisibleLeagues() || []) : [];
+    } catch (eEx) { _ldExtList = []; }
+    var _ldH = skBuildLadderHTML(leagues, _ldExtList);
+    if (_ldH) { listEl.innerHTML = _ldH + _skDoneHtml(); return; }
   } catch (eLd) {
     try { console.warn('[sk] ladder failed, falling back to cards', eLd); } catch (e2) {}
   }
@@ -130737,7 +130746,18 @@ function _ldBand(share, live) {
   return 3;
 }
 
-var LD_BANDS = ['LIVE · ON A KNIFE EDGE', 'LIVE', 'CLOSE', 'COMFORTABLE'];
+var LD_BANDS = ['LIVE · ON A KNIFE EDGE', 'LIVE', 'CLOSE', 'COMFORTABLE',
+                'SEASON · NO WEEKLY OPPONENT'];
+
+// A roto or season-points league has no opponent and therefore no
+// margin, so it cannot be ranked on closeness at all. Its own band,
+// sorted by standing, and the rank takes the column the margin uses
+// everywhere else -- the one number that IS comparable across
+// season-long leagues, where the point totals are not.
+function _ldIsSeason(scoring) {
+  var t = String(scoring || '').toLowerCase();
+  return t === 'roto' || t === 'point';
+}
 
 // Rows carry { key, share, live, band }. Sorted by band, then by how
 // close it is, so the thing most likely to need you is first and a
@@ -130751,6 +130771,11 @@ function _ldSort(rows) {
     if (a.unknown !== b.unknown) { return a.unknown ? 1 : -1; }
     if (a.unknown) { return a._i - b._i; }
     if (a.band !== b.band) { return a.band - b.band; }
+    if (a.band === 4) {
+      var ra = (a.rank > 0) ? a.rank : 9999, rb = (b.rank > 0) ? b.rank : 9999;
+      if (ra !== rb) { return ra - rb; }
+      return a._i - b._i;
+    }
     if (a.share !== b.share) { return a.share - b.share; }
     return a._i - b._i;
   });
@@ -130835,16 +130860,30 @@ function _ldRowData(l) {
   var m = data.matchup, team = data.team;
   var live = 0;
   try { live = (_skLeagueLivePlayers(l.league_key) || []).length; } catch (e) { live = 0; }
+  var season = _ldIsSeason(l.scoring_type);
   var has = !!(m && m.hasMatchup && m.myScore != null && m.oppScore != null);
-  var sh = has ? _ldShare(m.myScore, m.oppScore) : 1;
+  var rank = 0, total = 0;
+  try {
+    rank = Number((team && team.rank) || 0);
+    total = Number((team && (team.totalTeams || team.total)) || 0);
+  } catch (e) {}
+  var sh = (has && !season) ? _ldShare(m.myScore, m.oppScore) : 1;
   return {
     key: l.league_key, l: l, league: l, data: data, m: m, team: team,
-    live: live, unknown: !has, share: sh,
-    band: has ? _ldBand(sh, live) : 3
+    live: live, season: season, rank: rank, total: total,
+    unknown: !season && !has, share: sh,
+    band: season ? 4 : (has ? _ldBand(sh, live) : 3)
   };
 }
 
 function _ldMargin(r) {
+  if (r.season) {
+    if (r.rank > 0) {
+      return { txt: _ldOrdinal(r.rank), cls: 'lv',
+               sub: r.total ? ('of ' + r.total) : '' };
+    }
+    return { txt: '—', cls: 'lv' };
+  }
   if (r.unknown) { return { txt: '—', cls: 'lv' }; }
   var d = Number(r.m.myScore) - Number(r.m.oppScore);
   var cats = (r.l.scoring_type === 'head' || r.l.scoring_type === 'headone');
@@ -130855,7 +130894,18 @@ function _ldMargin(r) {
   return { txt: sign + body, cls: d > 0 ? 'up' : (d < 0 ? 'dn' : 'lv') };
 }
 
+function _ldOrdinal(n) {
+  n = Number(n) || 0;
+  var v = n % 100;
+  if (v >= 11 && v <= 13) { return n + 'th'; }
+  var last = n % 10;
+  return n + (last === 1 ? 'st' : (last === 2 ? 'nd' : (last === 3 ? 'rd' : 'th')));
+}
+
 function _ldBarHtml(r) {
+  // No opponent, no margin, no bar. Drawing an empty track beside a
+  // standing would suggest there is a gap being measured.
+  if (r.season) { return ''; }
   if (r.unknown) { return '<span class="ld-bar"><u></u></span>'; }
   var d = Number(r.m.myScore) - Number(r.m.oppScore);
   if (Math.abs(d) < 0.001) { return '<span class="ld-bar"><u></u></span>'; }
@@ -130870,9 +130920,20 @@ function _ldRowHtml(r) {
   var teamName = (r.team && r.team.name) || l.name || 'Loading…';
   var rec = (r.team && r.team.record) || '';
   var logo = (r.team && r.team.logoUrl) || '';
-  var sub = [String(l.name || '').toUpperCase()];
-  if (rec && rec !== '—') { sub.push(rec); }
-  if (!r.unknown) {
+  // THE LEAGUE NAME IS GONE from the subtitle. It was the longest
+  // thing on the line and it pushed the record and the scores off the
+  // end -- "HAVOC'S LATE NIGHT BASKETBALL - 2-..." told you less than
+  // "2-0 - 1737.0-1493.0" would have. The bold line is the team name,
+  // which identifies the league well enough to tap it.
+  var sub = [];
+  // For a season league the "record" IS the points total, so pushing
+  // both read "88.5 - 88.5 pts".
+  if (!r.season && rec && rec !== '—') { sub.push(rec); }
+  if (r.season) {
+    var pts = (r.team && (r.team.points != null ? r.team.points : r.team.record));
+    if (pts != null && pts !== '' && pts !== '—') { sub.push(String(pts) + ' pts'); }
+    if (r.total) { sub.push('of ' + r.total); }
+  } else if (!r.unknown) {
     sub.push(Number(r.m.myScore).toFixed(1) + '–' +
              Number(r.m.oppScore).toFixed(1));
   }
@@ -130906,10 +130967,68 @@ function _ldRowHtml(r) {
   '</div>';
 }
 
-function skBuildLadderHTML(leagues) {
+// Sleeper, ESPN and Fantrax arrive in a different shape -- scores live
+// on a game in liveScores, the team on a standings row -- so they are
+// adapted into the same row rather than given a second renderer. A
+// cats league there carries a W-L-T tally instead of a score, which
+// is the margin once it is parsed.
+function _ldWLT(txt) {
+  var m = String(txt == null ? '' : txt).match(/^(\d+)\s*-\s*(\d+)/);
+  return m ? { w: Number(m[1]), l: Number(m[2]) } : null;
+}
+
+function _ldExtRowData(l) {
+  var fmt = '';
+  try { fmt = String(_fhubFmtOf(l) || '').toLowerCase(); } catch (e) { fmt = ''; }
+  var season = _ldIsSeason(fmt);
+  var cats = (fmt === 'head' || fmt === 'headone');
+  var mg = null, meAway = false, i;
+  if (l.liveScores && l.liveScores.games && l.myTeamIds) {
+    for (i = 0; i < l.liveScores.games.length; i++) {
+      var g = l.liveScores.games[i];
+      if (g.awayId != null && l.myTeamIds[String(g.awayId)]) { mg = g; meAway = true; break; }
+      if (g.homeId != null && l.myTeamIds[String(g.homeId)]) { mg = g; meAway = false; break; }
+    }
+  }
+  var my = null, op = null;
+  if (mg) {
+    if (cats) {
+      var a = _ldWLT(meAway ? mg.awayRec : mg.homeRec);
+      var b = _ldWLT(meAway ? mg.homeRec : mg.awayRec);
+      if (a && b) { my = a.w; op = b.w; }
+    } else {
+      var ms = meAway ? mg.awayScore : mg.homeScore;
+      var os = meAway ? mg.homeScore : mg.awayScore;
+      if (ms != null && os != null) { my = Number(ms); op = Number(os); }
+    }
+  }
+  var st = l.standings || {};
+  var has = (my != null && op != null && isFinite(my) && isFinite(op));
+  var sh = (has && !season) ? _ldShare(my, op) : 1;
+  var live = 0;
+  try { live = (_skLeagueLivePlayers(l.key) || []).length; } catch (e) { live = 0; }
+  return {
+    key: l.key,
+    l: { league_key: l.key, name: l.name || st.leagueName || '',
+         scoring_type: fmt, provider: l.provider },
+    team: { name: st.teamName || l.name || '', record: st.record || '',
+            logoUrl: st.logo || l.teamLogo || l.logoUrl || '' },
+    m: has ? { myScore: my, oppScore: op } : null,
+    live: live, season: season,
+    rank: Number(st.rank || 0), total: Number(st.total || 0),
+    unknown: !season && !has, share: sh,
+    band: season ? 4 : (has ? _ldBand(sh, live) : 3),
+    ext: true
+  };
+}
+
+function skBuildLadderHTML(leagues, extRows) {
   var rows = [], i;
   for (i = 0; i < (leagues || []).length; i++) {
     try { rows.push(_ldRowData(leagues[i])); } catch (e) {}
+  }
+  for (i = 0; i < (extRows || []).length; i++) {
+    try { rows.push(_ldExtRowData(extRows[i])); } catch (e) {}
   }
   if (!rows.length) { return ''; }
   var groups = _ldGroups(_ldSort(rows));
