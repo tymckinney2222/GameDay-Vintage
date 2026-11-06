@@ -46640,7 +46640,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = 'bo347 LDEXT';
+var SK_BUILD = 'bo348 LDFIX';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo, muteable) {
   var isActive = activeLeague === key;
@@ -130339,7 +130339,13 @@ function skRenderTodayCards() {
     } else if (!extList.length) {
       listEl.innerHTML = '<div class="sk-empty-state">No leagues match this filter.</div>' + _skDoneHtml();
     } else {
-      listEl.innerHTML = extHtml + _skDoneHtml();   // SKDONE
+      // This path runs whenever the Yahoo set is empty -- which is
+      // every platform chip except Yahoo. It returned before the
+      // ladder was ever reached, so Sleeper, ESPN and Fantrax each
+      // dropped back to the full-height cards.
+      var _ldExtOnly = '';
+      try { _ldExtOnly = skBuildLadderHTML([], extList); } catch (eLx) { _ldExtOnly = ''; }
+      listEl.innerHTML = (_ldExtOnly || extHtml) + _skDoneHtml();   // SKDONE
     }
     return;
   }
@@ -130867,6 +130873,12 @@ function _ldRowData(l) {
     rank = Number((team && team.rank) || 0);
     total = Number((team && (team.totalTeams || team.total)) || 0);
   } catch (e) {}
+  // A matchup that has not begun sits at exactly 0.0-0.0, and a share
+  // of zero is PERFECT closeness -- so seventeen leagues that had not
+  // started were filing into CLOSE, ahead of real one-point games.
+  // Nothing has happened is not the same as nothing between them.
+  if (has && !season && Number(m.myScore) === 0 && Number(m.oppScore) === 0
+      && !live) { has = false; }
   var sh = (has && !season) ? _ldShare(m.myScore, m.oppScore) : 1;
   return {
     key: l.league_key, l: l, league: l, data: data, m: m, team: team,
@@ -130886,7 +130898,14 @@ function _ldMargin(r) {
   }
   if (r.unknown) { return { txt: '—', cls: 'lv' }; }
   var d = Number(r.m.myScore) - Number(r.m.oppScore);
-  var cats = (r.l.scoring_type === 'head' || r.l.scoring_type === 'headone');
+  // Football scores in weekly windows and never in categories, so a
+  // margin there is points however the scoring_type reads. The row was
+  // calling NFL leagues "2.7 cats".
+  var isNfl = false;
+  try { isNfl = _skIsNflLeague(r.l); } catch (e) { isNfl = false; }
+  var cats = !isNfl && (r.cats != null
+    ? !!r.cats
+    : (r.l.scoring_type === 'head' || r.l.scoring_type === 'headone'));
   var body = cats
     ? (Math.round(Math.abs(d) * 10) / 10) + '<small> cats</small>'
     : Math.abs(d).toFixed(1);
@@ -130982,28 +131001,26 @@ function _ldExtRowData(l) {
   try { fmt = String(_fhubFmtOf(l) || '').toLowerCase(); } catch (e) { fmt = ''; }
   var season = _ldIsSeason(fmt);
   var cats = (fmt === 'head' || fmt === 'headone');
-  var mg = null, meAway = false, i;
-  if (l.liveScores && l.liveScores.games && l.myTeamIds) {
-    for (i = 0; i < l.liveScores.games.length; i++) {
-      var g = l.liveScores.games[i];
-      if (g.awayId != null && l.myTeamIds[String(g.awayId)]) { mg = g; meAway = true; break; }
-      if (g.homeId != null && l.myTeamIds[String(g.homeId)]) { mg = g; meAway = false; break; }
-    }
-  }
+  // THE APP ALREADY KNOWS HOW TO READ THESE. _fhubMatchupFor walks
+  // liveScores against myTeamIds, picks the right side, and says
+  // whether it is cats -- my own version of that walk got nothing out
+  // of ESPN or Fantrax and labelled formats by guess.
+  var fm = null;
+  try { fm = _fhubMatchupFor(l); } catch (e) { fm = null; }
   var my = null, op = null;
-  if (mg) {
-    if (cats) {
-      var a = _ldWLT(meAway ? mg.awayRec : mg.homeRec);
-      var b = _ldWLT(meAway ? mg.homeRec : mg.awayRec);
+  if (fm) {
+    cats = !!fm.isCat;
+    if (fm.isCat) {
+      var a = _ldWLT(fm.my), b = _ldWLT(fm.opp);
       if (a && b) { my = a.w; op = b.w; }
     } else {
-      var ms = meAway ? mg.awayScore : mg.homeScore;
-      var os = meAway ? mg.homeScore : mg.awayScore;
-      if (ms != null && os != null) { my = Number(ms); op = Number(os); }
+      var ms = parseFloat(fm.my), os = parseFloat(fm.opp);
+      if (!isNaN(ms) && !isNaN(os)) { my = ms; op = os; }
     }
   }
   var st = l.standings || {};
   var has = (my != null && op != null && isFinite(my) && isFinite(op));
+  if (has && !season && my === 0 && op === 0) { has = false; }
   var sh = (has && !season) ? _ldShare(my, op) : 1;
   var live = 0;
   try { live = (_skLeagueLivePlayers(l.key) || []).length; } catch (e) { live = 0; }
@@ -131012,9 +131029,16 @@ function _ldExtRowData(l) {
     l: { league_key: l.key, name: l.name || st.leagueName || '',
          scoring_type: fmt, provider: l.provider },
     team: { name: st.teamName || l.name || '', record: st.record || '',
-            logoUrl: st.logo || l.teamLogo || l.logoUrl || '' },
+            logoUrl: (function () {
+              try {
+                if (typeof extGetMyLogo === 'function') {
+                  return extGetMyLogo(l.key) || '';
+                }
+              } catch (e) {}
+              return l.teamLogo || '';
+            })() },
     m: has ? { myScore: my, oppScore: op } : null,
-    live: live, season: season,
+    live: live, season: season, cats: cats,
     rank: Number(st.rank || 0), total: Number(st.total || 0),
     unknown: !season && !has, share: sh,
     band: season ? 4 : (has ? _ldBand(sh, live) : 3),
