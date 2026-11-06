@@ -46534,7 +46534,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = 'bo336 CATPROJ';
+var SK_BUILD = 'bo337 CATPROJ2';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo, muteable) {
   var isActive = activeLeague === key;
@@ -152052,6 +152052,13 @@ function _skCpHtml(res, lk) {
 // what the on-device backtest measures.
 var CX_RATE_SWING = { early: 0.25, mid: 0.16, late: 0.10 };
 
+// How much of a prior to put on a side's scoring rate, measured in
+// days. One day's worth is mild, and it is what stops a single big
+// night being extrapolated across a whole week. Named and exported
+// so the next backtest can measure it the way the first one measured
+// the swing constants.
+var CX_PRIOR_DAYS = 1;
+
 // Abramowitz & Stegun 7.1.26, max error 2.17e-6. Same approximation
 // the playoff-odds engine uses; kept separate so neither can be
 // changed for the other's sake.
@@ -152073,13 +152080,28 @@ function _cxPhi(z) {
 // is what makes a tie a real outcome rather than a measure-zero one.
 function _cxCountProb(my, opp, daysPlayed, daysLeft, lowerWins) {
   if (!(daysPlayed > 0)) { return { w: 1 / 3, t: 1 / 3, l: 1 / 3 }; }
-  var myRate = my / daysPlayed, opRate = opp / daysPlayed;
+  // THE RATE IS AN ESTIMATE, NOT A FACT. Taking one night's output and
+  // running it across the rest of the week called "me 1, them 6 after
+  // one day" a certainty -- and the backtest found 55 such calls at
+  // 0-9% that came in at 27%. Each side's rate is shrunk toward what
+  // the two of them have averaged, by one day's worth of prior, so a
+  // single big night moves the projection without deciding it.
+  var k = CX_PRIOR_DAYS;
+  var pooled = (my + opp) / (2 * daysPlayed);
+  var myRate = (my + pooled * k) / (daysPlayed + k);
+  var opRate = (opp + pooled * k) / (daysPlayed + k);
   var myAdd = myRate * daysLeft, opAdd = opRate * daysLeft;
   var mean = (my + myAdd) - (opp + opAdd);
-  // A count's spread comes only from what is still to be played; what
-  // is banked is banked. Floor each side's variance so a scoreless
-  // category is not treated as perfectly predictable.
-  var v = Math.max(myAdd, 0.5) + Math.max(opAdd, 0.5);
+  // Spread comes from what is still to be played, never from what is
+  // banked -- and from the MAGNITUDE of it. Using the signed figure
+  // floored a trailing plus/minus at 0.5 and called a one-point
+  // deficit in the most volatile category in hockey a dead certainty.
+  var scale = Math.max(Math.abs(myAdd), 0.25) + Math.max(Math.abs(opAdd), 0.25);
+  // And the rate's own uncertainty, which a single day cannot pin
+  // down: the predictive variance of a count whose rate was estimated
+  // from daysPlayed is inflated by (1 + daysLeft/daysPlayed). Late in
+  // the week that factor goes to one and this is the old model.
+  var v = scale * (1 + (daysLeft / daysPlayed));
   if (daysLeft <= 0) {
     var d = my - opp;
     if (d === 0) { return { w: 0, t: 1, l: 0 }; }
@@ -152281,6 +152303,10 @@ async function _cxBacktest(nWeeks) {
     if (!cats.length) { _cxBtOut('no enabled categories'); return; }
 
     var buckets = {}, brierSum = 0, brierN = 0, skipped = 0, weeksDone = 0;
+    // PER CATEGORY TOO. The first run left a bucket of 26 predictions
+    // at 50-59% that came in at 12%, and I could not say which
+    // categories were in it without guessing. Now it says.
+    var perCat = {}, skipNames = {};
     var b, i;
     for (i = 0; i < 10; i++) { buckets[i] = { n: 0, won: 0 }; }
 
@@ -152314,7 +152340,7 @@ async function _cxBacktest(nWeeks) {
         var c = cats[ci];
         var fin = _cxBtCatVal(byDayMy[last], c.sid, c.abbr, statsMeta, c.lower);
         var finO = _cxBtCatVal(byDayOp[last], c.sid, c.abbr, statsMeta, c.lower);
-        if (!fin || !finO) { skipped++; continue; }
+        if (!fin || !finO) { skipped++; skipNames[c.abbr] = 1; continue; }
         var adv = fin.v - finO.v;
         if (c.lower) { adv = -adv; }
         if (adv === 0) { continue; }         // a drawn category scores neither
@@ -152330,8 +152356,10 @@ async function _cxBacktest(nWeeks) {
           var pw = pr.t > 0 ? (pr.w + pr.t / 2) : pr.w;
           b = Math.min(9, Math.max(0, Math.floor(pw * 10)));
           buckets[b].n++; buckets[b].won += actuallyWon;
-          brierSum += (pw - actuallyWon) * (pw - actuallyWon);
-          brierN++;
+          var sq = (pw - actuallyWon) * (pw - actuallyWon);
+          brierSum += sq; brierN++;
+          var pc = perCat[c.abbr] || (perCat[c.abbr] = { n: 0, sq: 0, said: 0, won: 0 });
+          pc.n++; pc.sq += sq; pc.said += pw; pc.won += actuallyWon;
         }
       }
       weeksDone++;
@@ -152348,7 +152376,24 @@ async function _cxBacktest(nWeeks) {
       h += 'said ' + said + '% → actual ' + realPct + '% (n=' +
         buckets[i].n + ')<br>';
     }
-    h += 'swing ' + JSON.stringify(CX_RATE_SWING);
+    // Worst first: the categories costing the most are the ones to fix.
+    var names = [], nm;
+    for (nm in perCat) { if (perCat.hasOwnProperty(nm)) { names.push(nm); } }
+    names.sort(function (a, b) {
+      return (perCat[b].sq / perCat[b].n) - (perCat[a].sq / perCat[a].n);
+    });
+    h += '<br>worst cats (brier, said vs actual):<br>';
+    for (i = 0; i < Math.min(names.length, 6); i++) {
+      var pc2 = perCat[names[i]];
+      h += '&nbsp;' + names[i] + ' ' + (pc2.sq / pc2.n).toFixed(2) + ' \u00b7 said ' +
+        Math.round((pc2.said / pc2.n) * 100) + '% \u2192 ' +
+        Math.round((pc2.won / pc2.n) * 100) + '% (n=' + pc2.n + ')<br>';
+    }
+    var skList = [];
+    for (nm in skipNames) { if (skipNames.hasOwnProperty(nm)) { skList.push(nm); } }
+    if (skList.length) { h += 'could not rebuild: ' + skList.join(', ') + '<br>'; }
+    h += 'swing ' + JSON.stringify(CX_RATE_SWING) +
+      ' prior ' + CX_PRIOR_DAYS;
     _cxBtOut(h);
   } catch (e) {
     _cxBtOut('backtest failed: ' + (e && e.message ? e.message : e));
