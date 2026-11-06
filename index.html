@@ -46534,7 +46534,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = 'bo337 CATPROJ2';
+var SK_BUILD = 'bo338 CATHIST';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo, muteable) {
   var isActive = activeLeague === key;
@@ -152078,7 +152078,7 @@ function _cxPhi(z) {
 // about the mean. A half-point continuity correction turns the
 // continuous approximation back into whole goals and assists, which
 // is what makes a tie a real outcome rather than a measure-zero one.
-function _cxCountProb(my, opp, daysPlayed, daysLeft, lowerWins) {
+function _cxCountProb(my, opp, daysPlayed, daysLeft, lowerWins, prior) {
   if (!(daysPlayed > 0)) { return { w: 1 / 3, t: 1 / 3, l: 1 / 3 }; }
   // THE RATE IS AN ESTIMATE, NOT A FACT. Taking one night's output and
   // running it across the rest of the week called "me 1, them 6 after
@@ -152086,10 +152086,33 @@ function _cxCountProb(my, opp, daysPlayed, daysLeft, lowerWins) {
   // 0-9% that came in at 27%. Each side's rate is shrunk toward what
   // the two of them have averaged, by one day's worth of prior, so a
   // single big night moves the projection without deciding it.
-  var k = CX_PRIOR_DAYS;
+  // SHRINK TOWARD WHO YOU ARE, not toward your opponent.
+  //
+  // The pair average was the only prior available and it is the wrong
+  // one: it pulls a side's rate toward the other side's, which erases
+  // exactly the signal that matters in a category one roster
+  // dominates. The backtest found HIT called at 51% and won 3 times
+  // out of 3, and W called at 34% and lost 3 out of 3 -- both pure
+  // team strength, both invisible to a model that starts every week
+  // knowing nothing.
+  //
+  // So when a side's own history is known, that is the prior, and its
+  // weight is how many days it rests on, capped at a week so a run of
+  // form cannot outvote the week actually being played. Without
+  // history this falls back to the pair average and behaves as before.
+  var hist = prior || {};
+  var histDays = (hist.days > 0) ? Math.min(hist.days, 7) : 0;
   var pooled = (my + opp) / (2 * daysPlayed);
-  var myRate = (my + pooled * k) / (daysPlayed + k);
-  var opRate = (opp + pooled * k) / (daysPlayed + k);
+  // Usability is decided ONCE, for the base and the weight together.
+  // Deciding them separately let a malformed prior fall back to the
+  // pair average while keeping its full weight -- so bad history
+  // carried five days of influence where none carries one.
+  var usable = histDays > 0 && isFinite(hist.my) && isFinite(hist.op);
+  var myBase = usable ? hist.my : pooled;
+  var opBase = usable ? hist.op : pooled;
+  var k = usable ? histDays : CX_PRIOR_DAYS;
+  var myRate = (my + myBase * k) / (daysPlayed + k);
+  var opRate = (opp + opBase * k) / (daysPlayed + k);
   var myAdd = myRate * daysLeft, opAdd = opRate * daysLeft;
   var mean = (my + myAdd) - (opp + opAdd);
   // Spread comes from what is still to be played, never from what is
@@ -152209,10 +152232,10 @@ function _cxTier(c) {
   return 'gone';
 }
 
-function _cxCatProb(my, opp, daysPlayed, daysLeft, isRate, lowerWins) {
+function _cxCatProb(my, opp, daysPlayed, daysLeft, isRate, lowerWins, prior) {
   return isRate
     ? _cxRateProb(my, opp, daysPlayed, daysLeft, lowerWins)
-    : _cxCountProb(my, opp, daysPlayed, daysLeft, lowerWins);
+    : _cxCountProb(my, opp, daysPlayed, daysLeft, lowerWins, prior);
 }
 
 // ── CATPROJ BACKTEST ──────────────────────────────────────────────
@@ -152230,6 +152253,7 @@ function _cxCatProb(my, opp, daysPlayed, daysLeft, isRate, lowerWins) {
 // input and the output follows.
 
 var _cxBtBusy = false;
+var _cxBtPriorLog = [];
 
 function _cxBtOut(msg) {
   try {
@@ -152310,7 +152334,16 @@ async function _cxBacktest(nWeeks) {
     var b, i;
     for (i = 0; i < 10; i++) { buckets[i] = { n: 0, won: 0 }; }
 
-    for (var wk = cw - 1; wk >= 1 && weeksDone < nWeeks; wk--) {
+    // TWO PASSES, so the prior can never see the week it is scoring.
+    // Weeks are gathered newest-first, then replayed oldest-first:
+    // each is scored against the history accumulated from the weeks
+    // BEFORE it, and only then added to that history. The earliest
+    // week is scored with no prior at all, which is honest -- that is
+    // the state the app is really in at the start of a season.
+    var gathered = [];
+    // Recorded so a test can prove history only ever flows forward.
+    _cxBtPriorLog = [];
+    for (var wk = cw - 1; wk >= 1 && gathered.length < nWeeks; wk--) {
       _cxBtOut('week ' + wk + '… (' + weeksDone + '/' + nWeeks + ' done)');
       var sb = null;
       try { sb = await fyApi('/league/' + lk + '/scoreboard;week=' + wk); }
@@ -152334,6 +152367,14 @@ async function _cxBacktest(nWeeks) {
         byDayOp.push(JSON.parse(JSON.stringify(opAcc)));
       }
       if (failed || byDayMy.length < 3) { continue; }
+      gathered.push({ wk: wk, my: byDayMy, op: byDayOp });
+    }
+    gathered.reverse();
+
+    var hist = {};
+    for (var gi = 0; gi < gathered.length; gi++) {
+      var G = gathered[gi];
+      var byDayMy = G.my, byDayOp = G.op;
       var last = byDayMy.length - 1;
 
       for (var ci = 0; ci < cats.length; ci++) {
@@ -152350,7 +152391,16 @@ async function _cxBacktest(nWeeks) {
           var mv = _cxBtCatVal(byDayMy[dd - 1], c.sid, c.abbr, statsMeta, c.lower);
           var ov = _cxBtCatVal(byDayOp[dd - 1], c.sid, c.abbr, statsMeta, c.lower);
           if (!mv || !ov) { continue; }
-          var pr = _cxCatProb(mv.v, ov.v, dd, (last + 1) - dd, mv.rate, c.lower);
+          var hp = hist[c.abbr];
+          var prior = (hp && hp.days > 0)
+            ? { my: hp.myTot / hp.days, op: hp.opTot / hp.days, days: hp.days }
+            : null;
+          if (dd === 1) {
+            _cxBtPriorLog.push({ wk: G.wk, cat: c.abbr,
+              days: prior ? prior.days : 0 });
+          }
+          var pr = _cxCatProb(mv.v, ov.v, dd, (last + 1) - dd, mv.rate,
+                              c.lower, prior);
           // A predicted tie is split between the two live outcomes, so
           // the number being scored is P(win | not drawn).
           var pw = pr.t > 0 ? (pr.w + pr.t / 2) : pr.w;
@@ -152361,6 +152411,17 @@ async function _cxBacktest(nWeeks) {
           var pc = perCat[c.abbr] || (perCat[c.abbr] = { n: 0, sq: 0, said: 0, won: 0 });
           pc.n++; pc.sq += sq; pc.said += pw; pc.won += actuallyWon;
         }
+      }
+      // Only now does this week join the history, and only for the
+      // categories that reconstruct as counts -- a rate has no per-day
+      // total to average.
+      for (ci = 0; ci < cats.length; ci++) {
+        var ch = cats[ci];
+        var fv = _cxBtCatVal(byDayMy[last], ch.sid, ch.abbr, statsMeta, ch.lower);
+        var fo = _cxBtCatVal(byDayOp[last], ch.sid, ch.abbr, statsMeta, ch.lower);
+        if (!fv || !fo || fv.rate) { continue; }
+        var e2 = hist[ch.abbr] || (hist[ch.abbr] = { myTot: 0, opTot: 0, days: 0 });
+        e2.myTot += fv.v; e2.opTot += fo.v; e2.days += (last + 1);
       }
       weeksDone++;
     }
@@ -152393,7 +152454,7 @@ async function _cxBacktest(nWeeks) {
     for (nm in skipNames) { if (skipNames.hasOwnProperty(nm)) { skList.push(nm); } }
     if (skList.length) { h += 'could not rebuild: ' + skList.join(', ') + '<br>'; }
     h += 'swing ' + JSON.stringify(CX_RATE_SWING) +
-      ' prior ' + CX_PRIOR_DAYS;
+      ' prior ' + CX_PRIOR_DAYS + ' \u00b7 hist on';
     _cxBtOut(h);
   } catch (e) {
     _cxBtOut('backtest failed: ' + (e && e.message ? e.message : e));
