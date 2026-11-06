@@ -28152,6 +28152,12 @@
   .sk-bb-tot span:nth-child(2).up { color: var(--sk-green); }
   .sk-bb-tot span:nth-child(2).dn { color: var(--sk-red); }
   .sk-bb-tot span:last-child { text-align: right; color: var(--sk-text-3); }
+  .sk-sm-gap { position: relative; height: 7px; margin: 2px 0 1px; }
+  .sk-sm-gap u { position: absolute; top: 0; bottom: 0; left: 50%; width: 1px;
+                 background: var(--sk-border-strong); }
+  .sk-sm-gap i { position: absolute; top: 0; bottom: 0; border-radius: 2px; }
+  .sk-sm-gap i.me { right: 50%; background: var(--sk-green); }
+  .sk-sm-gap i.op { left: 50%; background: var(--sk-red); }
   /* ── CATPROJ ── the analysis tab as a projection ── */
   .cx-an { font-family: var(--sk-font); padding: 4px 2px 2px; }
   .cx-an-hd { display: flex; align-items: baseline; justify-content: space-between;
@@ -46577,7 +46583,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = 'bo339 ANALYSIS';
+var SK_BUILD = 'bo340 PTPROJ';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo, muteable) {
   var isActive = activeLeague === key;
@@ -152666,6 +152672,110 @@ function _cxSplitHtml(cx) {
   return '<div class="cx-an-split">' + out.join('') + '</div>';
 }
 
+// ══════════════════════════════════════════════════════════════════
+//  H2H POINTS PROJECTION ── PTPROJ ──
+// ══════════════════════════════════════════════════════════════════
+// The tab printed "Locked Win" beside "86%". Two systems: one set of
+// rules decided the label, a logistic with a hand-set slope decided
+// the number, and nothing made them agree. And the sigma of that
+// logistic was the +/-30% band -- a constant, in the one place on
+// this tab where the data to measure it was already sitting on the
+// screen in the momentum chart.
+//
+// Both go. The spread is the side's own observed day-to-day
+// variation, and the verdict reads off the probability.
+
+// One side's daily scores, settled days only.
+function _ptDaily(dates, key) {
+  var out = [], i;
+  for (i = 0; i < (dates || []).length; i++) {
+    var d = dates[i];
+    if (!d || d.future) { continue; }
+    var x = Number(d[key]);
+    if (isNaN(x)) { continue; }
+    out.push(x);
+  }
+  return out;
+}
+
+// How much this side's remaining days could still swing, measured.
+// One day of data cannot give a variance, so it falls back to the
+// day's own size -- deliberately wide, because one day IS the whole
+// sample. The (1 + daysLeft/n) term is the same predictive inflation
+// the cats model uses: a spread estimated from three days is itself
+// uncertain.
+function _ptSpread(vals, daysLeft) {
+  if (!(daysLeft > 0)) { return 0; }
+  var n = vals.length;
+  if (!n) { return 0; }
+  var sum = 0, i;
+  for (i = 0; i < n; i++) { sum += vals[i]; }
+  var mean = sum / n;
+  if (n < 2) { return Math.abs(mean) * Math.sqrt(daysLeft); }
+  var ss = 0;
+  for (i = 0; i < n; i++) { ss += (vals[i] - mean) * (vals[i] - mean); }
+  var sd = Math.sqrt(ss / (n - 1));
+  return sd * Math.sqrt(daysLeft * (1 + daysLeft / n));
+}
+
+// DAYS ARE NOT INTERCHANGEABLE, and this is where that bites hardest.
+// Extrapolating a daily average across four more days assumes those
+// days hold as many games as the ones already played -- which in the
+// NHL they rarely do. Converting the remaining games into the number
+// of AVERAGE days they amount to keeps the whole model in day units
+// while projecting the real remaining workload. My first version
+// skipped this and projected 328 where the old tab said 248, which
+// was the very error this redesign exists to fix.
+function _ptEffDays(gamesLeft, gamesPlayed, daysPlayed, daysLeft) {
+  if (gamesLeft == null || !(gamesPlayed > 0) || !(daysPlayed > 0)) {
+    return daysLeft;
+  }
+  var perDay = gamesPlayed / daysPlayed;
+  if (!(perDay > 0)) { return daysLeft; }
+  return gamesLeft / perDay;
+}
+
+// ONE NUMBER, AND A LABEL THAT READS OFF IT.
+function _ptProject(myScore, oppScore, myVals, opVals, daysLeft, myEff, opEff) {
+  var myLeft = (myEff != null && isFinite(myEff)) ? myEff : daysLeft;
+  var opLeft = (opEff != null && isFinite(opEff)) ? opEff : daysLeft;
+  var myMean = 0, opMean = 0, i;
+  for (i = 0; i < myVals.length; i++) { myMean += myVals[i]; }
+  for (i = 0; i < opVals.length; i++) { opMean += opVals[i]; }
+  myMean = myVals.length ? myMean / myVals.length : 0;
+  opMean = opVals.length ? opMean / opVals.length : 0;
+  var myProj = myScore + myMean * myLeft;
+  var opProj = oppScore + opMean * opLeft;
+  var mySd = _ptSpread(myVals, myLeft), opSd = _ptSpread(opVals, opLeft);
+  var sd = Math.sqrt(mySd * mySd + opSd * opSd);
+  var win;
+  if (!(sd > 0.0001)) {
+    win = (myProj > opProj) ? 1 : ((myProj < opProj) ? 0 : 0.5);
+  } else {
+    win = _cxPhi((myProj - opProj) / sd);
+  }
+  return { myProj: myProj, opProj: opProj, win: win, sd: sd,
+           verdict: _cxVerdict(win, 0), gap: myProj - opProj };
+}
+
+// What the side behind has to find, per game rather than per day.
+// Four days left is not four equal days -- a two-game Tuesday and a
+// ten-game Thursday are both "a day", and a pace stated per day
+// quietly assumes they are the same thing.
+function _ptNeed(p, myGamesLeft, opGamesLeft, daysLeft) {
+  var behind = p.gap >= 0;          // true: THEY are the ones chasing
+  var deficit = Math.abs(p.gap);
+  var games = behind ? opGamesLeft : myGamesLeft;
+  var out = { they: behind, deficit: deficit, games: games, per: null,
+              unit: null };
+  if (games != null && games > 0) {
+    out.per = deficit / games; out.unit = 'game';
+  } else if (daysLeft > 0) {
+    out.per = deficit / daysLeft; out.unit = 'day';
+  }
+  return out;
+}
+
 function skRenderCatsWeekContributors() {
   var bodyEl = document.getElementById('skCatsContribBody');
   var totalEl = document.getElementById('skCatsContribTotal');
@@ -154697,6 +154807,15 @@ function _skBuildSlotMatchupsHTML(matchup, daysPlayed, sport) {
   // for the grand-total summary rows above the per-slot breakdown.
   var myBat = 0, myPit = 0, oppBat = 0, oppPit = 0;
   function _isPitchBucket(b) { return b === 'SP' || b === 'RP' || b === 'P'; }
+  // The gap is drawn, not left as a column of numbers to subtract --
+  // the same centre line the matchup tab pairs players on. One pass
+  // first for the widest gap, so every row is drawn to one scale.
+  var _smMax = 0;
+  ordered.forEach(function(b) {
+    var mm = mine[b] || { fp: 0 }, oo = theirs[b] || { fp: 0 };
+    var e = Math.abs((mm.fp || 0) - (oo.fp || 0));
+    if (e > _smMax) { _smMax = e; }
+  });
   var rows = '';
   ordered.forEach(function(b) {
     var m = mine[b] || { fp: 0, names: [] };
@@ -154723,6 +154842,12 @@ function _skBuildSlotMatchupsHTML(matchup, daysPlayed, sport) {
       (anyPlayers ? ' onclick="_skOpenMlbSlotBreak(\'' + id + '\')"' : '') + '>' +
       _slotSide('l', m, meWin) +
       '<div class="sk-sm-mid"><div class="sk-sm-pos">' + skEscape(b) + '</div>' +
+        '<div class="sk-sm-gap"><u></u>' +
+          (_smMax > 0 && Math.abs(edge) > 0.05
+            ? ('<i class="' + (edge > 0 ? 'me' : 'op') + '" style="width:' +
+               Math.max(3, (Math.abs(edge) / _smMax) * 50).toFixed(1) + '%"></i>')
+            : '') +
+        '</div>' +
         '<div class="sk-sm-edge ' + edgeCls + '">' + edgeTxt + '</div></div>' +
       _slotSide('r', o, oppWin) +
     '</div>';
@@ -155159,6 +155284,22 @@ function _skBuildPointsAnalysisHTML(league, leagueData) {
     'tied':         { label: 'Dead Even',    glyph: '=',            cls: 'tied'     },
   };
   var tier = tierMeta[verdict.tier] || tierMeta['coin-flip'];
+  // PTPROJ -- the label now reads off the probability instead of being
+  // decided beside it. "Locked Win" printed next to "86%" because one
+  // set of rules chose the words and a separate logistic chose the
+  // number, with nothing making them agree.
+  var _ptP = null;
+  try {
+    var _ptD = (typeof skCurrentWeeklyFp !== 'undefined' && skCurrentWeeklyFp)
+      ? skCurrentWeeklyFp.dates : null;
+    var _ptMy = _ptDaily(_ptD, 'myFp'), _ptOp = _ptDaily(_ptD, 'oppFp');
+    if (_ptMy.length && _ptOp.length) {
+      _ptP = _ptProject(myScore, oppScore, _ptMy, _ptOp, daysRemaining);
+      tier = { label: _ptP.verdict, glyph: '', cls:
+        (_ptP.win >= 0.8 ? 'lockwin' : (_ptP.win >= 0.6 ? 'likewin' :
+         (_ptP.win > 0.4 ? 'coinflip' : (_ptP.win > 0.2 ? 'likeloss' : 'lockloss')))) };
+    }
+  } catch (ePt) { _ptP = null; }
 
   // Day labels — match cats Analysis vocabulary
   var dayLabel;
@@ -155185,7 +155326,12 @@ function _skBuildPointsAnalysisHTML(league, leagueData) {
   var spread = (myBand + oppBand) / 2;
   if (daysRemaining <= 0) spread = 0; // week done — no uncertainty
   var winPct;
-  if (spread < 0.5) {
+  if (_ptP) {
+    // Measured spread, not the +/-30% band.
+    winPct = Math.round(_ptP.win * 100);
+    if (winPct > 99) { winPct = 99; }
+    if (winPct < 1) { winPct = 1; }
+  } else if (spread < 0.5) {
     // Effectively settled — whoever's ahead wins
     winPct = projGap > 0 ? 99 : (projGap < 0 ? 1 : 50);
   } else {
@@ -155357,8 +155503,11 @@ function _skBuildPointsAnalysisHTML(league, leagueData) {
     return html;
   }
 
-  // Power Rankings — top 5 contributors
-  var topN = rosterAnalysis.contributors.slice(0, 5);
+  // POWER RANKINGS is gone. It was this side's top five by weekly
+  // points -- the left-hand column of the back-to-back contributors
+  // view on the matchup tab, minus the opponent. Strictly less than
+  // what is already a tap away.
+  var topN = [];
   if (topN.length) {
     html += '<div class="sk-bp-rankings">' +
       '<div class="sk-bp-section-head">POWER RANKINGS \u00b7 TOP CONTRIBUTORS</div>';
@@ -155378,8 +155527,9 @@ function _skBuildPointsAnalysisHTML(league, leagueData) {
     html += '</div>';
   }
 
-  // Drag — players with negative FP for the week
-  if (rosterAnalysis.drag.length) {
+  // DRAG ANCHORS is gone too. It fired on any negative number, so a
+  // player at -0.1 was presented as dragging the week down.
+  if (false) {
     html += '<div class="sk-bp-drag">' +
       '<div class="sk-bp-section-head">DRAG ANCHORS \u00b7 NEGATIVE THIS WEEK</div>';
     rosterAnalysis.drag.slice(0, 5).forEach(function(p) {
