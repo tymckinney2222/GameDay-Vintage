@@ -46517,7 +46517,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = 'bo333 CATPIVOT';
+var SK_BUILD = 'bo334 CATLEFT';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo, muteable) {
   var isActive = activeLeague === key;
@@ -151542,7 +151542,8 @@ function _skCpAccum(dates, isActive) {
       var e = out[p.playerKey];
       if (!e) {
         e = out[p.playerKey] = { key: p.playerKey, name: p.name || '',
-                                 teamAbbr: p.teamAbbr || '', stats: {} };
+                                 teamAbbr: p.teamAbbr || '', stats: {},
+                                 seen: {} };
       }
       if (p.name && !e.name) { e.name = p.name; }
       if (p.teamAbbr && !e.teamAbbr) { e.teamAbbr = p.teamAbbr; }
@@ -151552,6 +151553,13 @@ function _skCpAccum(dates, isActive) {
         var v = Number(st[k]);
         if (isNaN(v)) { continue; }
         e.stats[k] = (e.stats[k] || 0) + v;
+        // WHICH STATS THIS PLAYER CARRIES AT ALL, zeros included.
+        // Summed values cannot answer that: a goalie with no shutout
+        // yet sums to 0 and looks identical to a skater who cannot
+        // take one. Yahoo sends a player's whole stat set each day,
+        // so the presence of the key is the league's own answer to
+        // whether this player is eligible for that category.
+        if (!e.seen[k]) { e.seen[k] = 1; }
       }
     }
   }
@@ -151608,9 +151616,37 @@ function _skCpSide(acc, sid, basis, statsMeta, gl) {
   return rows;
 }
 
-// Games left across the players who are actually feeding this
-// category. Unknown clubs are counted separately rather than folded
-// in as zero, so the number is never quietly short.
+// WHO CAN FEED THIS CATEGORY, not just who already has.
+//
+// Basing games left on the contributors alone looked right until a
+// real week showed it: SHO had no contributors, because nobody has a
+// shutout most weeks, so it reported "nobody yet / ? left" when the
+// answer wanted was how many starts your goalies have. And for a
+// category nearly every skater touches, like +/-, the contributor
+// set is the roster anyway.
+//
+// Eligibility is whether the stat appears in the player's payload at
+// all. If no player carries the key -- a league whose feed omits
+// zeroes -- this finds nobody and the caller falls back to the
+// contributors, so the number can only get better, never worse.
+function _skCpEligible(acc, sids, gl) {
+  var out = [], k, i;
+  for (k in acc) {
+    if (!acc.hasOwnProperty(k)) { continue; }
+    var e = acc[k], hit = false;
+    for (i = 0; i < sids.length; i++) {
+      if (sids[i] != null && e.seen && e.seen[sids[i]]) { hit = true; break; }
+    }
+    if (!hit) { continue; }
+    out.push({ name: e.name, teamAbbr: e.teamAbbr,
+               left: gl ? gl(e.teamAbbr) : null });
+  }
+  return out;
+}
+
+// Games left across a set of players. Unknown clubs are counted
+// separately rather than folded in as zero, so the number is never
+// quietly short.
 function _skCpLeft(rows) {
   var n = 0, unknown = 0, known = false;
   for (var i = 0; i < rows.length; i++) {
@@ -151640,12 +151676,23 @@ function _skCpRows(cats, mineAcc, themAcc, opts) {
       you = _skCpSide(mineAcc, nm.sid, basis, statsMeta, gl);
       them = _skCpSide(themAcc, nm.sid, basis, statsMeta, gl);
     }
+    // A rate's eligibility rides on its ATTEMPTS stat as well as the
+    // rate itself: a goalie who has faced shots can move SV% whether
+    // or not the league's feed carries SV% for him directly.
+    var sids = [nm.sid];
+    if (basis) {
+      var attSid = _skCpSidFor(statsMeta, basis[1]);
+      if (attSid != null) { sids.push(attSid); }
+    }
+    var youElig = _skCpEligible(mineAcc, sids, gl);
+    var themElig = _skCpEligible(themAcc, sids, gl);
     var row = {
       sid: nm.sid, abbr: abbr, status: nm.status, close: close,
       myV: nm.myV, opV: nm.opV, myStr: nm.myStr, oppStr: nm.oppStr,
       you: you, them: them,
-      youLeft: you ? _skCpLeft(you) : null,
-      themLeft: them ? _skCpLeft(them) : null,
+      youLeft: youElig.length ? _skCpLeft(youElig) : (you ? _skCpLeft(you) : null),
+      themLeft: themElig.length ? _skCpLeft(themElig) : (them ? _skCpLeft(them) : null),
+      eligible: { you: youElig.length, them: themElig.length },
       decomposes: !!(you && them)
     };
     // STILL LIVE means the tug would call it tight AND somebody has a
@@ -151901,6 +151948,20 @@ function _skCpHtml(res) {
         skEscape(_skCpVal(b, 'op')) + '</i></span>';
     }
     h += '</div>';
+  }
+  // "22 left" meant nothing on its own -- Ty read it and asked what 22
+  // was. The column is worth a line of explanation once, at the foot,
+  // rather than a longer label on every row eating the names.
+  var anyLeft = false;
+  for (i = 0; i < res.live.length; i++) {
+    if ((res.live[i].youLeft && res.live[i].youLeft.games != null) ||
+        (res.live[i].themLeft && res.live[i].themLeft.games != null)) {
+      anyLeft = true; break;
+    }
+  }
+  if (anyLeft) {
+    h += '<div class="sk-cp-note dim">\u201cN left\u201d is games still to ' +
+      'play this week, counting every player who can feed that category.</div>';
   }
   if (res.note && res.note.name) {
     h += '<div class="sk-cp-note">' + skEscape(res.note.name) +
