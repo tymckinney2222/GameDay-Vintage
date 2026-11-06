@@ -46441,7 +46441,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = 'bo351 MDOUT';
+var SK_BUILD = 'bo352 MGROPEN';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo, muteable) {
   var isActive = activeLeague === key;
@@ -224920,7 +224920,118 @@ function openManagerRecord() {
     _mrFxHydrate(false);   // MGRFXWK
     if (typeof _mrPollTallies === 'function') _mrPollTallies(0);
   } catch (e2) {}
+  // MGROPEN -- and then go and get what Skipper used to fetch.
+  try { _mrOpenHydrate(); } catch (e3) {}
 }
+// ══ MGROPEN ══════════════════════════════════════════════════════
+// THE RECORD PULLS ITS OWN DATA IN.
+//
+// Manager Record reads two caches it never filled. fyLeagues is the
+// league list, loaded by fysilentInit a second and a half after the
+// app starts. skLeagueData[key] is where every Yahoo record, rank and
+// crest comes from, and it is written by skHydrateLeague -- which ran
+// only because OPENING SKIPPER ran it. So reaching the record from the
+// Tools drawer showed whatever the last Skipper visit happened to
+// leave behind, which is exactly the trip that moving it out of
+// Skipper was supposed to save.
+//
+// Every synced league is hydrated, not just the head-to-head ones:
+// the roto and season-points placings read skLeagueData[key].allTeams
+// for the field size and the rank, and the trophy case reads .team.
+var _mrHydrateBusy = false;
+// A double-open must not refetch three dozen leagues. Five minutes is
+// long enough to cover reopening the drawer and short enough that a
+// week finalising mid-session shows up the next time it is opened.
+var MR_STALE_MS = 5 * 60 * 1000;
+
+function _mrRepaint() {
+  var ov = document.getElementById('mrOverlay');
+  if (ov && ov.classList.contains('open')) {
+    try { mrRenderBody(); } catch (e) {}
+  }
+}
+
+// The eyebrow is the only line on this overlay that is not a number,
+// so it carries the progress rather than a spinner nobody asked for.
+function _mrSay(txt) {
+  var ov = document.getElementById('mrOverlay');
+  if (!ov) { return; }
+  var eb = ov.querySelector('.pp-eyebrow');
+  if (eb) { eb.textContent = txt || 'Across every platform'; }
+}
+
+// Never fetched, or fetched long enough ago to be worth asking again.
+// skHydrateLeague reads a finished season from the SKFINAL cache, so a
+// league that ended in June costs nothing to put in the queue.
+function _mrStale(lg) {
+  if (!lg || !lg.league_key) { return false; }
+  var ld = (typeof skLeagueData === 'object' && skLeagueData)
+    ? skLeagueData[lg.league_key] : null;
+  if (!ld || !ld.ts) { return true; }
+  return (Date.now() - Number(ld.ts)) > MR_STALE_MS;
+}
+
+async function _mrOpenHydrate() {
+  if (_mrHydrateBusy) { return; }
+  _mrHydrateBusy = true;
+  try {
+    // The drawer opens faster than fysilentInit's timer, so on a cold
+    // start there is no league list to hydrate from yet.
+    if (typeof fyLeagues !== 'undefined' && fyLeagues && !fyLeagues.length &&
+        typeof fysilentInit === 'function') {
+      _mrSay('Loading leagues…');
+      try { await fysilentInit(); } catch (e0) {}
+      _mrRepaint();
+    }
+    var leagues = [];
+    try {
+      if (typeof _ppLeagues === 'function') { leagues = _ppLeagues() || []; }
+    } catch (e1) { leagues = []; }
+    if (typeof skHydrateLeague !== 'function') { _mrSay(null); return; }
+    var queue = [], i;
+    for (i = 0; i < leagues.length; i++) {
+      if (_mrStale(leagues[i])) { queue.push(leagues[i]); }
+    }
+    var total = queue.length, done = 0;
+    if (!total) { _mrSay(null); return; }
+    _mrSay('Refreshing — 0 of ' + total + ' leagues');
+    await new Promise(function (resolve) {
+      var inflight = 0;
+      function pump() {
+        if (!queue.length && inflight === 0) { resolve(); return; }
+        // Three at a time, the same ceiling Playoff Picture uses. Yahoo
+        // is one account's worth of quota across every tool here.
+        while (inflight < 3 && queue.length) {
+          var lg = queue.shift();
+          inflight++;
+          Promise.resolve(skHydrateLeague(lg))['catch'](function () {})
+            .then(function () {
+              inflight--;
+              done++;
+              _mrSay('Refreshing — ' + done + ' of ' + total + ' leagues');
+              _mrRepaint();
+              pump();
+            });
+        }
+      }
+      pump();
+    });
+    _mrSay(null);
+    _mrRepaint();
+    // The cats tally is derived from the league list, which may only
+    // just have arrived -- so ask again now that it has. MGRREC5
+    try {
+      var need = mrYahooSeason().needCats;
+      if (need && need.length) { mrHydrateCats(need); }
+      mrCgHydrate(false);
+      _mrSlHydrate(false);
+      _mrFxHydrate(false);
+    } catch (e2) {}
+  } finally {
+    _mrHydrateBusy = false;
+  }
+}
+
 function closeManagerRecord() {
   var ov = document.getElementById('mrOverlay');
   if (ov) ov.classList.remove('open');
