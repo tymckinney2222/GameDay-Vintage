@@ -46600,7 +46600,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = 'bo356 HISTSHAPE';
+var SK_BUILD = 'bo358 GLROSTER';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo, muteable) {
   var isActive = activeLeague === key;
@@ -66541,6 +66541,117 @@ function _glCurrentSeasonString() {
   var endShort = String((startYear + 1) % 100);
   if (endShort.length < 2) endShort = '0' + endShort;
   return startYear + '-' + endShort;
+}
+
+
+// ── GLROSTER ── the G League roster reads the feed the CARDS read ──
+// Ty: "I think we are pulling g league stats from NBA.com ... it's routed
+// through my cloud flare worker." It is, and the comment block above
+// _GL_PROXY_BASE says why: ESPN carries no G League player stats, the
+// overview call answers with statistics.splits = [] for every player.
+// The player CARD has gone to stats.gleague.nba.com through the worker
+// since the day that was written. The roster TABLE never did, so it kept
+// asking ESPN fourteen times for fourteen empty answers.
+//
+// One call covers the whole roster rather than one per player:
+// leaguedashplayerstats carries every player in the league for the
+// season, which is also the freshest view NBA publishes -- a career
+// endpoint can take a day to grow a new season's row, which is why a
+// card could sit on no stats the morning after the first game.
+var _glDashCache = null, _glDashPromise = null, _glDashWhy = '';
+
+function _glSeasonDash() {
+  if (_glDashCache) { return Promise.resolve(_glDashCache); }
+  if (_glDashPromise) { return _glDashPromise; }
+  var season = _glCurrentSeasonString();
+  var url = _GL_PROXY_BASE + '/stats/leaguedashplayerstats?LeagueID=20&Season=' +
+    encodeURIComponent(season) + '&SeasonType=Regular%20Season&PerMode=PerGame' +
+    '&MeasureType=Base&PaceAdjust=N&PlusMinus=N&Rank=N&Month=0&Period=0' +
+    '&LastNGames=0&OpponentTeamID=0&TeamID=0&PlayerExperience=&PlayerPosition=' +
+    '&StarterBench=&GameSegment=&DateFrom=&DateTo=&Outcome=&Location=' +
+    '&SeasonSegment=&VsConference=&VsDivision=&College=&Country=&DraftYear=' +
+    '&DraftPick=&Height=&Weight=&Division=&Conference=&GameScope=&ShotClockRange=';
+  _glDashPromise = fetch(url)
+    .then(function (r) {
+      if (!r.ok) { _glDashWhy = 'status ' + r.status; return null; }
+      return r.json();
+    })
+    .then(function (json) {
+      var rows = json ? _glParseResultSet(json, 'LeagueDashPlayerStats') : [];
+      if (!rows.length && json) {
+        // Some builds of this endpoint name the set differently; take the
+        // first set rather than returning nothing on a naming change.
+        rows = _glParseResultSet(json, '');
+      }
+      var byId = {}, byName = {}, i, row, key;
+      for (i = 0; i < rows.length; i++) {
+        row = rows[i];
+        if (row.PLAYER_ID != null) { byId[String(row.PLAYER_ID)] = row; }
+        key = (typeof _skNormalizeName === 'function')
+          ? _skNormalizeName(row.PLAYER_NAME || '')
+          : String(row.PLAYER_NAME || '').toLowerCase();
+        if (key && !byName[key]) { byName[key] = row; }
+      }
+      if (!rows.length && !_glDashWhy) { _glDashWhy = 'no rows'; }
+      _glDashCache = { byId: byId, byName: byName, n: rows.length, season: season };
+      return _glDashCache;
+    })
+    .catch(function (e) {
+      _glDashWhy = 'unreachable';
+      _glDashCache = { byId: {}, byName: {}, n: 0, season: season };
+      return _glDashCache;
+    });
+  return _glDashPromise;
+}
+
+// The columns the table shows, in the order a basketball reader expects.
+var _GL_DASH_COLS = [
+  ['GP', 'GP'], ['MIN', 'MIN'], ['PTS', 'PTS'], ['REB', 'REB'], ['AST', 'AST'],
+  ['STL', 'STL'], ['BLK', 'BLK'], ['FG_PCT', 'FG%'], ['FG3_PCT', '3P%'],
+  ['FT_PCT', 'FT%'], ['TOV', 'TO']
+];
+
+function _glDashLabels() {
+  return _GL_DASH_COLS.map(function (c) { return c[1]; });
+}
+
+function _glDashVals(row) {
+  return _GL_DASH_COLS.map(function (c) {
+    var v = row[c[0]];
+    if (v == null || v === '') { return '-'; }
+    if (/_PCT$/.test(c[0])) {
+      var p = Number(v);
+      return isFinite(p) ? (p * 100).toFixed(1) : '-';
+    }
+    if (c[0] === 'GP') { return String(v); }
+    var n = Number(v);
+    return isFinite(n) ? n.toFixed(1) : String(v);
+  });
+}
+
+// Fill in a roster whose ESPN stats came back empty. Returns how many
+// players it managed to place, so the caller can say so.
+function _glFillRoster(playerStats) {
+  return _glSeasonDash().then(function (dash) {
+    if (!dash || !dash.n) { return { filled: 0, why: _glDashWhy || 'no data', dash: dash }; }
+    var labels = _glDashLabels(), filled = 0, i, p, key, row;
+    for (i = 0; i < playerStats.length; i++) {
+      p = playerStats[i];
+      key = (typeof _skNormalizeName === 'function')
+        ? _skNormalizeName(p.fullName || p.name || '')
+        : String(p.fullName || p.name || '').toLowerCase();
+      row = key ? dash.byName[key] : null;
+      if (!row) { continue; }
+      p.stats = _glDashVals(row);
+      p.playerLabels = labels;
+      p.gp = Number(row.GP) || 0;
+      // A player with games in the book is not a DNP, whatever ESPN's
+      // roster status said.
+      if (p.gp > 0) { p.dnp = false; p.injuryNote = ''; }
+      filled++;
+    }
+    return { filled: filled, why: '', labels: labels, dash: dash };
+  });
 }
 
 // Fetch + parse a G League player's stats. Resolves the NBA id, calls
@@ -126700,6 +126811,49 @@ function _espTeamIdentityLocal(teamId, league) {
   };
 }
 
+// TEAMIDENT -- and when memory has nothing, ask. The league teams list
+// is one call, it is the same endpoint the teams browser uses, and the
+// result is cached into tbCache so the browser is warm afterwards too.
+// Returns the same shape as _espTeamIdentityLocal.
+async function _espTeamIdentityFetch(teamId, league) {
+  var cfg = (typeof LEAGUES !== 'undefined' && LEAGUES[league]) || null;
+  if (!cfg || !cfg.sport || !cfg.slug) { return null; }
+  var url = 'https://site.api.espn.com/apis/site/v2/sports/' + cfg.sport + '/' +
+    cfg.slug + '/teams?limit=600';
+  var got = await _espGetJson(url);
+  if (!got.ok || !got.data) { return null; }
+  var groups = [];
+  try { groups = got.data.sports[0].leagues[0].teams || []; } catch (eG) { groups = []; }
+  if (!groups.length) { return null; }
+  var rows = [], i, t;
+  for (i = 0; i < groups.length; i++) {
+    t = groups[i] && (groups[i].team || groups[i]);
+    if (!t || !t.id) { continue; }
+    var rec = '';
+    try {
+      if (t.record && t.record.items && t.record.items.length) {
+        rec = t.record.items[0].summary || '';
+      }
+    } catch (eR) { rec = ''; }
+    rows.push({
+      id: String(t.id), name: t.shortDisplayName || t.name || t.displayName || '?',
+      fullName: t.displayName || t.name || '?', abbr: t.abbreviation || '?',
+      logo: (t.logos && t.logos[0] && t.logos[0].href) || '',
+      record: rec, level: '', parentOrg: '', league: league
+    });
+  }
+  if (!rows.length) { return null; }
+  // Warm the browser's cache with what we just paid for.
+  try {
+    if (typeof tbCache !== 'undefined' && tbCache && !tbCache[league]) {
+      tbCache[league] = rows.slice().sort(function (a, b) {
+        return String(a.name).localeCompare(String(b.name));
+      });
+    }
+  } catch (eC) {}
+  return _espTeamIdentityLocal(teamId, league);
+}
+
 // What to tell someone looking at a blank page. The old text covered every
 // cause with one sentence, so it could not be acted on: a league ESPN has
 // stopped serving and a phone that cannot reach ESPN at all read the same.
@@ -126892,6 +127046,11 @@ async function fetchTeamPage(teamId, league) {
     var _tdTeam = (teamData && teamData.team) || teamData;
     if (!_tdTeam || !(_tdTeam.displayName || _tdTeam.name)) {
       var _ident = _espTeamIdentityLocal(teamId, league);
+      // TEAMIDENT -- nothing in memory is a reason to ask, not a reason
+      // to draw a question mark.
+      if (!_ident) {
+        try { _ident = await _espTeamIdentityFetch(teamId, league); } catch (eI) { _ident = null; }
+      }
       if (_ident) {
         teamData = { team: _ident };
         if (typeof __skDiag !== 'undefined' && __skDiag.push) {
@@ -126926,7 +127085,12 @@ async function fetchTeamPage(teamId, league) {
       var batch = playerIds.slice(bi, bi + BATCH_SIZE);
       var batchResults = await Promise.allSettled(
         batch.map(function(pid) {
-          return fetch(overviewBase + pid + '/overview').then(function(r) { return r.ok ? r.json() : null; });
+          // STATSWHY -- carry the status alongside the body.
+          return fetch(overviewBase + pid + '/overview').then(function(r) {
+            if (!r.ok) { return { _why: 'http', _status: r.status }; }
+            return r.json().then(function (j) { return j; },
+                                 function () { return { _why: 'notjson', _status: r.status }; });
+          }, function () { return { _why: 'unreachable', _status: 0 }; });
         })
       );
       overviewResults = overviewResults.concat(batchResults);
@@ -126936,6 +127100,9 @@ async function fetchTeamPage(teamId, league) {
     // Build player stat entries — NEVER silently drop players
     var playerStats = [];
     var statLabels = [];
+    // STATSWHY -- what the stat feed actually did, counted as we go.
+    var _swOk = 0, _swFail = 0, _swNoSplits = 0, _swSeen = 0;
+    var _swStatus = {}, _swLabels = [];
     // SEASONPICK — the season year and the whole split-priority chain now
     // live in _espSeasonSplitFor, which the starred-team prefetch calls too.
     
@@ -126947,6 +127114,24 @@ async function fetchTeamPage(teamId, league) {
       var athlete = a.athlete || a;
       var pid = a.id || (athlete.id) || '';
       var overview = overviewResults[i] && overviewResults[i].status === 'fulfilled' ? overviewResults[i].value : null;
+      // STATSWHY -- a carrier is a failure, not a reply with no stats.
+      if (overview && overview._why) {
+        _swFail++;
+        _swStatus[overview._status] = (_swStatus[overview._status] || 0) + 1;
+        overview = null;
+      } else if (overview) {
+        _swOk++;
+        var _swSp = (overview.statistics && overview.statistics.splits) || [];
+        if (!_swSp.length) { _swNoSplits++; }
+        else {
+          _swSeen++;
+          for (var _si = 0; _si < _swSp.length; _si++) {
+            var _dn = String(_swSp[_si].displayName || '');
+            if (_dn && !/career|all.?time/i.test(_dn) && _swLabels.indexOf(_dn) === -1 &&
+                _swLabels.length < 6) { _swLabels.push(_dn); }
+          }
+        }
+      }
 
       var pos = (athlete.position && athlete.position.abbreviation) || athlete.position || '';
       var name = athlete.shortName || athlete.displayName || athlete.fullName || '?';
@@ -127020,7 +127205,46 @@ async function fetchTeamPage(teamId, league) {
       });
     });
 
+    // STATSWHY -- the most common failure status, if they failed.
+    var _swTop = '', _swTopN = 0;
+    for (var _sk in _swStatus) {
+      if (_swStatus[_sk] > _swTopN) { _swTopN = _swStatus[_sk]; _swTop = _sk; }
+    }
+    var _statsDiagExtra = '';
+    var _statsDiag = { ok: _swOk, failed: _swFail, noSplits: _swNoSplits,
+      withSplits: _swSeen, status: _swTop, statusN: _swTopN,
+      seasons: _swLabels, wanted: (typeof _seasonYearFor === 'function')
+        ? _seasonYearFor(league) : null, league: league, glWhy: '' };
+    if (typeof __skDiag !== 'undefined' && __skDiag.push) {
+      __skDiag.push({ stage: 'team-page:stats', note: league + ' team ' + teamId +
+        _statsDiagExtra +
+        ' -- ' + _swOk + ' ok / ' + _swFail + ' failed' +
+        (_swTop ? (' (' + _swTop + ' x' + _swTopN + ')') : '') +
+        (_swLabels.length ? (' seasons: ' + _swLabels.join(', ')) : '') });
+    }
+
+    // GLROSTER -- ESPN has no G League player stats and never did; the
+    // player card has read stats.gleague.nba.com through the worker
+    // since that was discovered. The table asks the same feed now,
+    // in one call for the whole roster rather than one per player.
+    var _glFill = null;
+    if (league === 'GLEAGUE' && _swOk && !_swSeen) {
+      try {
+        _glFill = await _glFillRoster(playerStats);
+        if (_glFill && _glFill.filled) {
+          statLabels = _glFill.labels;
+          _statsDiagExtra = ' - NBA feed filled ' + _glFill.filled + ' of ' +
+            playerStats.length;
+        } else {
+          _statsDiag.glWhy = (_glFill && _glFill.why) || 'no matching players';
+          _statsDiagExtra = ' - NBA feed: ' + _statsDiag.glWhy;
+        }
+      } catch (eGL) { _statsDiagExtra = ' - NBA feed threw'; }
+    }
+
     var combined = {
+      glFill: _glFill,
+      statsDiag: _statsDiag,
       team: teamData,
       roster: rosterData,
       playerStats: playerStats,
@@ -127054,7 +127278,12 @@ function renderTeamPage(data, teamId, league) {
   var slugLc = getHeadshotSlug(league);
 
   // Team info
-  var team = (data.team && data.team.team) || {};
+  // TEAMUNWRAP -- nested OR flat. ESPN wraps the team for most
+  // leagues and hands it over bare for others (nba-development is one),
+  // and the identity gate upstream already accepts both. When only the
+  // renderer insisted on the wrapper, a team ESPN had named perfectly
+  // well drew a question mark.
+  var team = (data.team && (data.team.team || data.team)) || {};
   var tName = team.displayName || team.name || '?';
   var tAbbr = team.abbreviation || '?';
   // Remember the abbr so the BALLPARK tab can open the matching dossier.
@@ -127437,9 +127666,36 @@ function renderTeamPage(data, teamId, league) {
                                : ('Out / DNP (' + dnpPlayers.length + ')');
     html += '<div style="font-size:9px;font-weight:700;color:rgba(255,255,255,0.2);letter-spacing:1px;padding:16px 20px 8px;text-transform:uppercase">' + _heading + '</div>';
     if (_noneActive) {
-      var _note = _isVbLg
-        ? 'ESPN publishes no player statistics for college volleyball. This roster comes from ESPN and may not match the current season.'
-        : 'No player statistics available from the feed for this team.';
+      // STATSWHY -- three different causes used to read the same. The
+      // counts come from the fetch itself, so this reports what
+      // happened rather than guessing what it meant.
+      var _note;
+      var _sd = data.statsDiag || null;
+      if (_isVbLg) {
+        _note = 'ESPN publishes no player statistics for college volleyball. This roster comes from ESPN and may not match the current season.';
+      } else if (_sd && _sd.failed && !_sd.ok) {
+        _note = 'ESPN answered every player-stats request with ' +
+          (_sd.status ? ('status ' + _sd.status) : 'an error') + ' (' + _sd.failed +
+          ' of ' + _sd.failed + '). It publishes no stats feed for this league.';
+      } else if (_sd && _sd.glWhy) {
+        // GLROSTER -- ESPN was never going to answer for this league. If
+        // the note is showing at all, the NBA feed did not either.
+        _note = 'ESPN publishes no player stats for this league, and the ' +
+          'NBA G League feed came back with ' + _sd.glWhy + '.';
+      } else if (_sd && _sd.ok && !_sd.withSplits) {
+        _note = 'ESPN returned a stats record for all ' + _sd.ok +
+          ' players and every one of them was empty \u2014 no season has been ' +
+          'filed for this league yet.';
+      } else if (_sd && _sd.seasons && _sd.seasons.length) {
+        _note = 'ESPN has stats here, but none for ' + (_sd.wanted || 'this season') +
+          '. What it holds: ' + _sd.seasons.slice(0, 4).join(', ') + '.';
+      } else if (_sd && _sd.failed) {
+        _note = _sd.ok + ' of ' + (_sd.ok + _sd.failed) +
+          ' player-stats requests came back; none carried a season for ' +
+          (_sd.wanted || 'now') + '.';
+      } else {
+        _note = 'No player statistics available from the feed for this team.';
+      }
       html += '<div style="padding:0 20px 10px;font-size:10px;line-height:1.5;color:rgba(255,255,255,0.28)">' + _note + '</div>';
     }
     html += '<div style="padding:0 20px 12px">';
