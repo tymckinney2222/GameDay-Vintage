@@ -47230,7 +47230,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = 'bo371 LDDAY';
+var SK_BUILD = 'bo372 LDDAY2';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo, muteable) {
   var isActive = activeLeague === key;
@@ -133516,7 +133516,18 @@ function _ldDayLoad() {
     // first one taken today. Baselining on first sight would mean
     // opening the app at nine in the evening showed only what moved
     // after nine, and called it the day.
-    o.base = o.last || {};
+    //
+    // CARRIED, and marked as carried. A baseline taken today is not a
+    // yesterday and must never be read as one -- that is what made a
+    // fresh install show numbers at all: they were the drift between
+    // the first paint and the next, which is "since you opened the
+    // app" wearing the label "today".
+    var carried = {}, ck;
+    for (ck in (o.last || {})) {
+      if (!o.last.hasOwnProperty(ck) || !o.last[ck]) { continue; }
+      carried[ck] = { m: o.last[ck].m, p: o.last[ck].p, w: o.last[ck].w, c: 1 };
+    }
+    o.base = carried;
     o.last = {};
     o.d = today;
     _ldDayDirty = true;
@@ -133568,6 +133579,29 @@ function _ldDayValue(r) {
   return { m: my - op, p: my, w: _ldDayWeek(r) };
 }
 
+// A REAL YESTERDAY, where one has already been written down. The cats
+// snapshots have stored one per league per day since long before this
+// line existed -- TODAY'S SWINGS reads them -- so a category league
+// can answer on its very first day instead of sitting out a day to
+// build a baseline it already had.
+function _ldDaySeed(r, key) {
+  if (!r || !r.cats) { return null; }
+  if (typeof listCatsSnapshotsForWeek !== 'function') { return null; }
+  var w = _ldDayWeek(r), snaps = [];
+  try { snaps = listCatsSnapshotsForWeek(key, w || 0) || []; }
+  catch (e) { return null; }
+  if (!snaps.length) { return null; }
+  var today = _ldDayToday(), best = null, i;
+  // Sorted ascending, so the last one dated before today is the one.
+  for (i = 0; i < snaps.length; i++) {
+    if (snaps[i] && snaps[i].date && snaps[i].date < today) { best = snaps[i]; }
+  }
+  if (!best) { return null; }
+  var wn = Number(best.wins), ls = Number(best.losses);
+  if (!isFinite(wn) || !isFinite(ls)) { return null; }
+  return { m: wn - ls, p: wn, w: (best.week != null ? best.week : w), c: 1 };
+}
+
 // What moved today. Null when there is nothing honest to say.
 function _ldDayDelta(r, keyOverride) {
   var key = keyOverride || (r && r.l && r.l.league_key) ||
@@ -133581,11 +133615,17 @@ function _ldDayDelta(r, keyOverride) {
   _ldDayDirty = true;
   _ldDayFlush();
   if (!base) {
-    // Never seen before. There is no yesterday to measure from, so
-    // the honest answer is to say nothing until there is one.
-    st.base[key] = cur;
-    return null;
+    // Never seen before. Look for a yesterday someone else already
+    // wrote down; failing that, start one and say nothing until it
+    // has aged into a real one.
+    base = _ldDaySeed(r, key);
+    if (!base) { st.base[key] = cur; return null; }
+    st.base[key] = base;
   }
+  // A BASELINE TAKEN TODAY IS NOT A YESTERDAY. Measuring against it
+  // reports the drift since the app was opened and calls it the day,
+  // which is both wrong and, worse, wrong by a plausible amount.
+  if (!base.c) { return null; }
   // A WEEK ROLLS OVER AND EVERYTHING GOES BACK TO NOUGHT. Measured
   // against Sunday's total, Monday morning reads as a hundred-point
   // collapse. Where the provider names the week, that settles it.
