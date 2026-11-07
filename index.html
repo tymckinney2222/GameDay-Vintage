@@ -28524,7 +28524,15 @@
   .ld-bar i.up { left: 50%; background: #4ade80; }
   .ld-bar i.dn { right: 50%; background: #f87171; }
   .ld-m { flex: none; width: 52px; text-align: right; font-size: 13.5px;
-          font-family: var(--sk-font-mono, monospace); }
+          font-family: var(--sk-font-mono, monospace); line-height: 1.15; }
+  /* LDDAY -- what moved today, under what it adds up to. Dimmer and
+     smaller than the figure above it on purpose: the standing is the
+     number you are scanning the ladder for, and this is the footnote
+     that says how fresh it is. */
+  .ld-day { display: block; font-style: normal; font-size: 8.5px;
+            letter-spacing: 0.02em; margin-top: 1px; opacity: 0.72; }
+  .ld-day.up { color: #4ade80; }
+  .ld-day.dn { color: #f87171; }
   .ld-m.up { color: #4ade80; } .ld-m.dn { color: #f87171; }
   .ld-m.lv { color: rgba(255,255,255,0.4); }
   .ld-m small { font-family: var(--sk-font, sans-serif); font-size: 9px; }
@@ -47222,7 +47230,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = 'bo370 FBBUG';
+var SK_BUILD = 'bo371 LDDAY';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo, muteable) {
   var isActive = activeLeague === key;
@@ -133460,6 +133468,171 @@ function _ldRowData(l) {
   };
 }
 
+
+// ==================================================================
+//  LDDAY -- what moved today, on the ladder
+// ==================================================================
+// The ladder's big number is where a league stands: the margin in a
+// head-to-head, the rank in a season league. What it has never said
+// is how much of that happened TODAY -- whether a +8.8 is a lead
+// built on Tuesday and sat on since, or forty points taken this
+// afternoon.
+//
+// IT COSTS NO FETCH. Every value needed is already on the row the
+// ladder just drew; the only thing missing is what the same row said
+// yesterday. So this keeps one small record per league and reads the
+// difference -- the same idea the cats snapshots already use for
+// TODAY'S SWINGS, which stores one snapshot per day and diffs them.
+//
+// ONE KEY, NOT ONE PER LEAGUE. At the league count this app reaches,
+// a read and a write per row per paint is a few hundred synchronous
+// localStorage calls on a list that repaints on every tick.
+
+var LD_DAY_KEY = 'skLdDay_v1';
+var _ldDayMem = null;
+var _ldDayDirty = false;
+var _ldDayTimer = null;
+
+function _ldDayToday() {
+  try {
+    if (typeof _todayDateString === 'function') { return _todayDateString(); }
+  } catch (e) {}
+  var d = new Date();
+  function p(n) { return (n < 10 ? '0' : '') + n; }
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+}
+
+function _ldDayLoad() {
+  if (_ldDayMem) { return _ldDayMem; }
+  var o = null;
+  try { o = JSON.parse(localStorage.getItem(LD_DAY_KEY) || 'null'); }
+  catch (e) { o = null; }
+  if (!o || typeof o !== 'object') { o = { d: '', base: {}, last: {} }; }
+  if (!o.base) { o.base = {}; }
+  if (!o.last) { o.last = {}; }
+  var today = _ldDayToday();
+  if (o.d !== today) {
+    // A NEW DAY STARTS FROM YESTERDAY'S LAST READING, not from the
+    // first one taken today. Baselining on first sight would mean
+    // opening the app at nine in the evening showed only what moved
+    // after nine, and called it the day.
+    o.base = o.last || {};
+    o.last = {};
+    o.d = today;
+    _ldDayDirty = true;
+  }
+  _ldDayMem = o;
+  return o;
+}
+
+function _ldDaySave() {
+  _ldDayTimer = null;
+  if (!_ldDayDirty || !_ldDayMem) { return; }
+  try { localStorage.setItem(LD_DAY_KEY, JSON.stringify(_ldDayMem)); }
+  catch (e) {}
+  _ldDayDirty = false;
+}
+
+function _ldDayFlush() {
+  if (_ldDayTimer) { return; }
+  _ldDayTimer = setTimeout(_ldDaySave, 1200);
+}
+
+// The week, where the provider names one. It is the only reliable way
+// to tell a new week from a bad day in a CATEGORY league, where the
+// number legitimately falls inside a week -- which is the whole of
+// what this line is for.
+function _ldDayWeek(r) {
+  try {
+    var k = (r && r.l && (r.l.league_key || r.l.key)) || '';
+    var d = (typeof skLeagueData === 'object' && skLeagueData)
+      ? skLeagueData[k] : null;
+    var n = parseInt(d && d.matchup && d.matchup.week, 10);
+    return (isFinite(n) && n > 0) ? n : null;
+  } catch (e) { return null; }
+}
+
+// The two numbers a row can move in: the margin it is ranked on, and
+// the points the team itself has put up.
+function _ldDayValue(r) {
+  if (!r) { return null; }
+  if (r.season) {
+    var p = (r.team && (r.team.points != null ? r.team.points : r.team.record));
+    var pv = parseFloat(p);
+    if (!isFinite(pv)) { return null; }
+    return { m: null, p: pv, w: null };
+  }
+  if (r.unknown || !r.m) { return null; }
+  var my = Number(r.m.myScore), op = Number(r.m.oppScore);
+  if (!isFinite(my) || !isFinite(op)) { return null; }
+  return { m: my - op, p: my, w: _ldDayWeek(r) };
+}
+
+// What moved today. Null when there is nothing honest to say.
+function _ldDayDelta(r, keyOverride) {
+  var key = keyOverride || (r && r.l && r.l.league_key) ||
+            (r && r.l && r.l.key) || '';
+  if (!key) { return null; }
+  var cur = _ldDayValue(r);
+  if (!cur) { return null; }
+  var st = _ldDayLoad();
+  var base = st.base[key];
+  st.last[key] = cur;
+  _ldDayDirty = true;
+  _ldDayFlush();
+  if (!base) {
+    // Never seen before. There is no yesterday to measure from, so
+    // the honest answer is to say nothing until there is one.
+    st.base[key] = cur;
+    return null;
+  }
+  // A WEEK ROLLS OVER AND EVERYTHING GOES BACK TO NOUGHT. Measured
+  // against Sunday's total, Monday morning reads as a hundred-point
+  // collapse. Where the provider names the week, that settles it.
+  if (cur.w != null && base.w != null && cur.w !== base.w) {
+    st.base[key] = cur;
+    return null;
+  }
+  // Without a week, a FALL is the only signal left -- and it is a
+  // sound one for points, which only ever go up inside a week. It is
+  // NOT sound for categories: losing a category you were winning is
+  // a fall inside the week, and it is precisely the movement this
+  // line exists to show. Guarding on it there hid every bad day.
+  if (!r.cats && cur.p != null && base.p != null && cur.p < base.p) {
+    st.base[key] = cur;
+    return null;
+  }
+  var useSeason = !!r.season;
+  var a = useSeason ? cur.p : cur.m;
+  var b = useSeason ? base.p : base.m;
+  if (a == null || b == null) { return null; }
+  var d = a - b;
+  if (!isFinite(d)) { return null; }
+  return { d: d, season: useSeason, cats: !!r.cats };
+}
+
+// The second line under the margin. Nothing at all on a day that has
+// not moved: a column of "+0.0" down eighty rows is noise with the
+// shape of information.
+function _ldDayHtml(r) {
+  var x = null;
+  try { x = _ldDayDelta(r); } catch (e) { return ''; }
+  if (!x) { return ''; }
+  var v = Math.round(x.d * 10) / 10;
+  if (!v) { return ''; }
+  var sign = v > 0 ? '+' : '\u2212';
+  var mag = Math.abs(v);
+  var txt = x.cats ? String(Math.round(mag)) : mag.toFixed(1);
+  var cls = v > 0 ? 'up' : 'dn';
+  // NO WORD BESIDE IT. "today" needs about ten more pixels than the
+  // margin column has, and the only place to take them from is the
+  // team name -- which ladder_test guards, because an earlier pass
+  // deliberately clawed that gutter back for exactly that column.
+  // Eighty rows each repeating the same word is a poor trade for it.
+  return '<i class="ld-day ' + cls + '">' + sign + txt + '</i>';
+}
+
+
 function _ldMargin(r) {
   if (r.season) {
     if (r.rank > 0) {
@@ -133573,7 +133746,7 @@ function _ldRowHtml(r) {
     '<span class="ld-who"><b>' + skEscape(teamName) + '</b><s>' +
       skEscape(sub.join(' · ')) + '</s></span>' +
     '<span class="ld-rb">' + _ldBarHtml(r) + '</span>' +
-    '<span class="ld-m ' + mg.cls + '">' + mg.txt + '</span>' +
+    '<span class="ld-m ' + mg.cls + '">' + mg.txt + _ldDayHtml(r) + '</span>' +
     (btns ? '<span class="ld-btns">' + btns + '</span>' : '') +
   '</div>';
 }
