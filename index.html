@@ -28043,6 +28043,7 @@
               text-align: center; font-family: var(--sk-font-mono, monospace); }
   /* ── CATPROJ ── the analysis tab as a projection ── */
   .cx-an { font-family: var(--sk-font); padding: 4px 2px 2px; }
+  .cx-an-form { font-style: normal; color: var(--sk-gold, #f5d547); opacity: 0.8; }
   .cx-an-hd { display: flex; align-items: baseline; justify-content: space-between;
               font-size: 10px; letter-spacing: 0.1em; color: var(--sk-text-3);
               margin: 0 0 14px; }
@@ -46668,7 +46669,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = 'bo362 LDSKIN';
+var SK_BUILD = 'bo363 CATPRIOR';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo, muteable) {
   var isActive = activeLeague === key;
@@ -153325,6 +153326,76 @@ function _cxTier(c) {
   return 'gone';
 }
 
+
+// ══════════════════════════════════════════════════════════════════
+//  CATPRIOR ── the history the projection already paid for
+// ══════════════════════════════════════════════════════════════════
+// _cxCountProb takes a prior -- roughly how much of a category each
+// side puts up on an ordinary day -- and the live Analysis tab has
+// been passing null. Without one every category falls back to the
+// POOLED rate: the two teams' week-to-date totals averaged together
+// and split down the middle, which assumes both sides are the same
+// team. In a category league that is precisely the assumption that is
+// wrong: the point of the matchup is that one of you gets more blocks.
+//
+// The history is already in memory and already paid for.
+// _skAllPlayCache holds every team's per-category totals for every
+// completed week -- fetched for the all-play number on the History
+// tab -- and the same rows answer "what does this team usually do in
+// a day" for the cost of walking them.
+//
+// RATE CATEGORIES ARE NOT IN HERE. Averaging a week of FG% over seven
+// days is not a daily rate, it is nonsense; _cxCatProb only hands the
+// prior to the COUNT model, so rate stats never see one either way.
+// Building it for them anyway would leave a wrong number sitting
+// where a right one might later be read by mistake.
+function _cxPriorFrom(store, myKey, oppKey, currentWeek, daysPerWeek, isRateSid) {
+  if (!store || !store.byWeek || !myKey || !oppKey) { return null; }
+  var dpw = (daysPerWeek > 0) ? daysPerWeek : 7;
+  var totals = {}, weeks = 0, wk;
+  for (wk in store.byWeek) {
+    var w = Number(wk);
+    if (!isFinite(w)) { continue; }
+    // The live week is the thing being predicted; it cannot also be
+    // the evidence. This is the leak the backtest was built to catch.
+    if (currentWeek != null && w >= Number(currentWeek)) { continue; }
+    if (store.completed && !store.completed[w]) { continue; }
+    var rows = store.byWeek[wk];
+    if (!rows || !rows.length) { continue; }
+    var mine = null, theirs = null, i;
+    for (i = 0; i < rows.length; i++) {
+      if (!rows[i]) { continue; }
+      if (String(rows[i].teamKey) === String(myKey)) { mine = rows[i]; }
+      else if (String(rows[i].teamKey) === String(oppKey)) { theirs = rows[i]; }
+    }
+    // BOTH sides or neither. A week where only one of them appears
+    // would give the two priors different denominators, and the model
+    // compares them directly.
+    if (!mine || !theirs || !mine.cats || !theirs.cats) { continue; }
+    weeks++;
+    var sid;
+    for (sid in mine.cats) {
+      if (isRateSid && isRateSid(sid)) { continue; }
+      var mv = parseFloat(mine.cats[sid]);
+      var ov = parseFloat(theirs.cats[sid]);
+      if (!isFinite(mv) || !isFinite(ov)) { continue; }
+      var t = totals[sid] || (totals[sid] = { my: 0, op: 0, n: 0 });
+      t.my += mv; t.op += ov; t.n += dpw;
+    }
+  }
+  if (!weeks) { return null; }
+  var out = {}, any = false, s2;
+  for (s2 in totals) {
+    var t2 = totals[s2];
+    if (!t2.n) { continue; }
+    out[s2] = { days: t2.n, my: t2.my / t2.n, op: t2.op / t2.n };
+    any = true;
+  }
+  if (!any) { return null; }
+  return { bySid: out, weeks: weeks, days: weeks * dpw };
+}
+
+
 function _cxCatProb(my, opp, daysPlayed, daysLeft, isRate, lowerWins, prior) {
   return isRate
     ? _cxRateProb(my, opp, daysPlayed, daysLeft, lowerWins)
@@ -153628,7 +153699,7 @@ function _cxFmt(v, meta) {
   return String(v);
 }
 
-function _cxAnalysisHtml(cx, daysPlayed, daysLeft, dayOfWeek, daysTotal) {
+function _cxAnalysisHtml(cx, daysPlayed, daysLeft, dayOfWeek, daysTotal, prior) {
   if (!cx || !cx.length) { return ''; }
   var m = _cxMatchup(cx.map(function (c) { return c.p; }));
   var pct = Math.round((m.win + m.tie * 0.5) * 100);
@@ -153637,7 +153708,15 @@ function _cxAnalysisHtml(cx, daysPlayed, daysLeft, dayOfWeek, daysTotal) {
   var verdict = _cxVerdict(m.win, m.tie);
 
   var h = '<div class="cx-an"><div class="cx-an-hd">' +
-    '<span>WHERE THIS IS HEADING</span><span>' +
+    '<span>WHERE THIS IS HEADING' +
+      // CATPRIOR -- a projection that quietly got better is
+      // indistinguishable from one that did not change.
+      (prior && prior.weeks
+        ? ('<i class="cx-an-form" title="Using ' + prior.weeks +
+           ' completed week' + (prior.weeks === 1 ? '' : 's') +
+           ' of form for both teams"> \u00b7 ' + prior.weeks + 'W FORM</i>')
+        : '') +
+    '</span><span>' +
     (dayOfWeek > 0 ? ('DAY ' + dayOfWeek + ' OF ' + daysTotal + ' · ') : '') +
     daysLeft + ' LEFT</span></div>';
 
@@ -155466,6 +155545,25 @@ function _skBuildCatsAnalysisHTML(league, leagueData) {
   // the same ten totals twice. _board and tableHTML are both dropped;
   // what each category is worth now reads off the model instead.
   try {
+    // CATPRIOR -- what these two teams usually do, from the weeks
+    // already fetched for the History tab. Absent (nothing cached
+    // yet, a first week, a league whose history has not been pulled)
+    // the model falls back to the pooled rate exactly as before.
+    var _cxIsRate = function (sid) {
+      var m2 = statsMeta[sid] || {};
+      var so2 = m2.sortOrder == null ? 1 : Number(m2.sortOrder);
+      var ab2 = ((m2.abbr || m2.displayName || sid) + '').toUpperCase();
+      return (so2 === 0) || !!SK_KNOWN_RATE_STAT_ABBRS[ab2];
+    };
+    var _cxPrior = null;
+    try {
+      var _store = (typeof _skAllPlayCache === 'object' && _skAllPlayCache)
+        ? _skAllPlayCache[league.league_key] : null;
+      var _myK = (leagueData.team && leagueData.team.team_key) || '';
+      _cxPrior = _cxPriorFrom(_store, _myK, matchup.oppTeamKey,
+        matchup.week, daysTotal, _cxIsRate);
+    } catch (ePr) { _cxPrior = null; }
+
     var _cxList = [];
     Object.keys(myCats).forEach(function (sid) {
       var meta = statsMeta[sid] || {};
@@ -155475,13 +155573,14 @@ function _skBuildCatsAnalysisHTML(league, leagueData) {
       var rate = (so === 0) || !!SK_KNOWN_RATE_STAT_ABBRS[ab];
       var mv = Number(myCats[sid]), ov = Number(oppCats[sid]);
       if (isNaN(mv) || isNaN(ov)) { return; }
-      var p = _cxCatProb(mv, ov, daysPlayed, daysRemaining, rate, so === 0, null);
+      var _pr = (_cxPrior && _cxPrior.bySid) ? _cxPrior.bySid[sid] : null;
+      var p = _cxCatProb(mv, ov, daysPlayed, daysRemaining, rate, so === 0, _pr);
       _cxList.push({ sid: sid, abbr: ab, p: p, tier: _cxTier(p),
         posType: String(meta.positionType || ''),
         myDisp: _cxFmt(myCats[sid], meta), opDisp: _cxFmt(oppCats[sid], meta) });
     });
     var _cxH = _cxAnalysisHtml(_cxList, daysPlayed, daysRemaining,
-                               dayOfWeek, daysTotal);
+                               dayOfWeek, daysTotal, _cxPrior);
     if (_cxH) { return _cxH + _cxSplitHtml(_cxList); }
   } catch (eCx) {}
   return _board + tableHTML;
