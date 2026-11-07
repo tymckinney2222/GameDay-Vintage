@@ -46600,7 +46600,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = 'bo358 GLROSTER';
+var SK_BUILD = 'bo361 GLBUNDLE';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo, muteable) {
   var isActive = activeLeague === key;
@@ -65172,6 +65172,21 @@ document.addEventListener('keydown', e => {
 });
 
 async function fetchPlayerData(athleteId, league) {
+  // GLSQUAD -- a player the NBA feed knows and ESPN does not. The three
+  // ESPN calls below could only 404 on an id ESPN never issued, so go
+  // straight to the G League card.
+  if (String(athleteId).indexOf('glnba-') === 0) {
+    var _gn = ((window._playerCtx || {})[athleteId] || {}).name || '';
+    var _gs = null;
+    try { _gs = await _glFetchPlayerStats(_gn); } catch (eGS) { _gs = null; }
+    window._l10GamelogData = null;
+    window._l10League = league;
+    // Hand the renderer the athlete it would otherwise go and fetch a
+    // bio for -- on an id ESPN never issued, that call can only 404.
+    return renderPlayerModal(athleteId,
+      { athlete: { id: athleteId, displayName: _gn, fullName: _gn } },
+      null, null, league, null, _gs);
+  }
   const { sport, slug } = LEAGUES[league];
   const overviewUrl = `https://site.web.api.espn.com/apis/common/v3/sports/${sport}/${slug}/athletes/${athleteId}/overview`;
   const statsUrl = `https://site.web.api.espn.com/apis/common/v3/sports/${sport}/${slug}/athletes/${athleteId}/stats`;
@@ -66473,6 +66488,18 @@ function _glLoadPlayerIndex() {
 // similar names), prefer the most recently active (highest TO_YEAR), which is
 // almost always the player on a current roster. Returns null if unresolved.
 function _glResolveNbaId(espnName) {
+  if (!espnName) { return Promise.resolve(null); }
+  // GLSQUAD -- ask the people who are playing before asking the archive.
+  return _glSeasonDash().then(function (dash) {
+    var k = (typeof _skNormalizeName === 'function')
+      ? _skNormalizeName(espnName) : String(espnName).toLowerCase();
+    var hit = (dash && dash.byName && k) ? dash.byName[k] : null;
+    if (hit && hit.PLAYER_ID != null) { return hit.PLAYER_ID; }
+    return _glResolveNbaIdFromIndex(espnName);
+  }, function () { return _glResolveNbaIdFromIndex(espnName); });
+}
+
+function _glResolveNbaIdFromIndex(espnName) {
   return _glLoadPlayerIndex().then(function(idx) {
     if (!espnName) return null;
     var key = (typeof _skNormalizeName === 'function') ? _skNormalizeName(espnName) : String(espnName).toLowerCase();
@@ -66560,45 +66587,69 @@ function _glCurrentSeasonString() {
 // card could sit on no stats the morning after the first game.
 var _glDashCache = null, _glDashPromise = null, _glDashWhy = '';
 
-function _glSeasonDash() {
-  if (_glDashCache) { return Promise.resolve(_glDashCache); }
-  if (_glDashPromise) { return _glDashPromise; }
-  var season = _glCurrentSeasonString();
-  var url = _GL_PROXY_BASE + '/stats/leaguedashplayerstats?LeagueID=20&Season=' +
-    encodeURIComponent(season) + '&SeasonType=Regular%20Season&PerMode=PerGame' +
+var GL_SEASON_TYPES = ['Regular Season', 'Showcase'];
+
+function _glDashUrl(season, seasonType) {
+  return _GL_PROXY_BASE + '/stats/leaguedashplayerstats?LeagueID=20&Season=' +
+    encodeURIComponent(season) + '&SeasonType=' + encodeURIComponent(seasonType) +
+    '&PerMode=PerGame' +
     '&MeasureType=Base&PaceAdjust=N&PlusMinus=N&Rank=N&Month=0&Period=0' +
     '&LastNGames=0&OpponentTeamID=0&TeamID=0&PlayerExperience=&PlayerPosition=' +
     '&StarterBench=&GameSegment=&DateFrom=&DateTo=&Outcome=&Location=' +
     '&SeasonSegment=&VsConference=&VsDivision=&College=&Country=&DraftYear=' +
     '&DraftPick=&Height=&Weight=&Division=&Conference=&GameScope=&ShotClockRange=';
-  _glDashPromise = fetch(url)
+}
+
+function _glDashOnce(season, seasonType) {
+  return fetch(_glDashUrl(season, seasonType))
     .then(function (r) {
-      if (!r.ok) { _glDashWhy = 'status ' + r.status; return null; }
-      return r.json();
-    })
-    .then(function (json) {
-      var rows = json ? _glParseResultSet(json, 'LeagueDashPlayerStats') : [];
-      if (!rows.length && json) {
-        // Some builds of this endpoint name the set differently; take the
-        // first set rather than returning nothing on a naming change.
-        rows = _glParseResultSet(json, '');
-      }
-      var byId = {}, byName = {}, i, row, key;
-      for (i = 0; i < rows.length; i++) {
-        row = rows[i];
+      if (!r.ok) { return { rows: [], why: 'status ' + r.status }; }
+      return r.json().then(function (json) {
+        var rows = _glParseResultSet(json, 'LeagueDashPlayerStats');
+        if (!rows.length) {
+          // A naming change in the result set should not read as an
+          // empty league.
+          rows = _glParseResultSet(json, '');
+        }
+        return { rows: rows, why: rows.length ? '' : 'no rows' };
+      }, function () { return { rows: [], why: 'unreadable' }; });
+    }, function () { return { rows: [], why: 'unreachable' }; });
+}
+
+function _glSeasonDash() {
+  if (_glDashCache) { return Promise.resolve(_glDashCache); }
+  if (_glDashPromise) { return _glDashPromise; }
+  var season = _glCurrentSeasonString();
+  // SEASONTYPE -- regular season first, tournament second. Asking in
+  // this order means the day the regular season tips off this starts
+  // answering with it, with no edit here.
+  function attempt(i, lastWhy) {
+    if (i >= GL_SEASON_TYPES.length) {
+      _glDashWhy = lastWhy || 'no rows';
+      _glDashCache = { byId: {}, byName: {}, n: 0, season: season, seasonType: '' };
+      return _glDashCache;
+    }
+    return _glDashOnce(season, GL_SEASON_TYPES[i]).then(function (got) {
+      if (!got.rows.length) { return attempt(i + 1, got.why); }
+      var byId = {}, byName = {}, j, row, key;
+      for (j = 0; j < got.rows.length; j++) {
+        row = got.rows[j];
         if (row.PLAYER_ID != null) { byId[String(row.PLAYER_ID)] = row; }
         key = (typeof _skNormalizeName === 'function')
           ? _skNormalizeName(row.PLAYER_NAME || '')
           : String(row.PLAYER_NAME || '').toLowerCase();
         if (key && !byName[key]) { byName[key] = row; }
       }
-      if (!rows.length && !_glDashWhy) { _glDashWhy = 'no rows'; }
-      _glDashCache = { byId: byId, byName: byName, n: rows.length, season: season };
+      _glDashWhy = '';
+      _glDashCache = { byId: byId, byName: byName, n: got.rows.length,
+                       season: season, seasonType: GL_SEASON_TYPES[i] };
       return _glDashCache;
-    })
-    .catch(function (e) {
+    });
+  }
+  _glDashPromise = Promise.resolve(attempt(0, ''))
+    .catch(function () {
       _glDashWhy = 'unreachable';
-      _glDashCache = { byId: {}, byName: {}, n: 0, season: season };
+      _glDashCache = { byId: {}, byName: {}, n: 0, season: season, seasonType: '' };
       return _glDashCache;
     });
   return _glDashPromise;
@@ -66629,12 +66680,68 @@ function _glDashVals(row) {
   });
 }
 
+
+// ── GLSQUAD ── the roster is whoever the NBA feed says played ─────
+// Ty's College Park roster listed fourteen names. Nine players took
+// the floor the night before. TWO names appear on both lists -- and
+// those two were the only two the table could fill. ESPN's G League
+// roster is simply a different squad from the one that plays, so
+// matching stats onto it was never going to work for more than the
+// handful that happen to coincide.
+//
+// The dash already carries TEAM_ABBREVIATION for every player with a
+// game in the book, so the team's real squad is in a response the page
+// has already made. Match on the abbreviation, and when it does not
+// line up change nothing and say so rather than guessing a mapping.
+function _glDashSquad(dash, abbr) {
+  if (!dash || !dash.byId || !abbr) { return null; }
+  var want = String(abbr).toUpperCase(), out = [], k;
+  for (k in dash.byId) {
+    var row = dash.byId[k];
+    if (String(row.TEAM_ABBREVIATION || '').toUpperCase() === want) { out.push(row); }
+  }
+  return out.length ? out : null;
+}
+
+// Every abbreviation the feed knows, for the note when ours is not
+// among them -- a mapping is only worth writing once it is needed.
+function _glDashAbbrs(dash) {
+  var seen = {}, out = [], k;
+  if (!dash || !dash.byId) { return out; }
+  for (k in dash.byId) {
+    var a = String(dash.byId[k].TEAM_ABBREVIATION || '').toUpperCase();
+    if (a && !seen[a]) { seen[a] = 1; out.push(a); }
+  }
+  return out.sort();
+}
+
+// A dash row as a player the roster table can draw. The id is prefixed
+// so nothing downstream mistakes an NBA PERSON_ID for an ESPN athlete
+// id -- the card opener branches on it and goes straight to the NBA
+// path, skipping three ESPN calls that could only 404.
+function _glRowToPlayer(row, labels) {
+  var full = String(row.PLAYER_NAME || '');
+  var parts = full.split(' ');
+  var short = parts.length > 1
+    ? (parts[0].charAt(0) + '. ' + parts.slice(1).join(' '))
+    : full;
+  return {
+    id: 'glnba-' + row.PLAYER_ID,
+    name: short, fullName: full,
+    pos: '', jersey: '',
+    stats: _glDashVals(row), playerLabels: labels,
+    gp: Number(row.GP) || 0, dnp: !(Number(row.GP) > 0),
+    injuryNote: '', _glRow: row
+  };
+}
+
 // Fill in a roster whose ESPN stats came back empty. Returns how many
 // players it managed to place, so the caller can say so.
-function _glFillRoster(playerStats) {
+function _glFillRoster(playerStats, teamAbbr) {
   return _glSeasonDash().then(function (dash) {
     if (!dash || !dash.n) { return { filled: 0, why: _glDashWhy || 'no data', dash: dash }; }
     var labels = _glDashLabels(), filled = 0, i, p, key, row;
+    var used = {};
     for (i = 0; i < playerStats.length; i++) {
       p = playerStats[i];
       key = (typeof _skNormalizeName === 'function')
@@ -66642,6 +66749,7 @@ function _glFillRoster(playerStats) {
         : String(p.fullName || p.name || '').toLowerCase();
       row = key ? dash.byName[key] : null;
       if (!row) { continue; }
+      used[String(row.PLAYER_ID)] = 1;
       p.stats = _glDashVals(row);
       p.playerLabels = labels;
       p.gp = Number(row.GP) || 0;
@@ -66650,7 +66758,20 @@ function _glFillRoster(playerStats) {
       if (p.gp > 0) { p.dnp = false; p.injuryNote = ''; }
       filled++;
     }
-    return { filled: filled, why: '', labels: labels, dash: dash };
+    // GLSQUAD -- and everyone the feed puts on this team who was not on
+    // ESPN's list at all. Seven of the nine who played for College Park
+    // were in that position.
+    var extra = [], squad = _glDashSquad(dash, teamAbbr), j;
+    if (squad) {
+      for (j = 0; j < squad.length; j++) {
+        if (used[String(squad[j].PLAYER_ID)]) { continue; }
+        extra.push(_glRowToPlayer(squad[j], labels));
+      }
+    }
+    return { filled: filled, why: '', labels: labels, dash: dash,
+             seasonType: dash.seasonType || '', extra: extra,
+             squad: squad ? squad.length : 0,
+             abbrs: squad ? null : _glDashAbbrs(dash) };
   });
 }
 
@@ -66733,7 +66854,13 @@ function _glFetchPlayerStats(espnName) {
         }
       }
 
-      if (!regular.season.length && !regular.career && !college.season.length && !college.career) return null;
+      // ALL FOUR. Anything at all is a card worth drawing; only
+      // nothing anywhere is nothing.
+      var _any = regular.season.length || regular.career ||
+                 college.season.length || college.career ||
+                 (tipoff && (tipoff.season.length || tipoff.career)) ||
+                 (nba && (nba.season.length || nba.career));
+      if (!_any) { return null; }
       return { nbaId: nbaId, regular: regular, college: college, tipoff: tipoff, nba: nba };
     });
   }).catch(function() { return null; });
@@ -66831,13 +66958,44 @@ function _glRenderTables(bundle, isCollege, logoLeague) {
 
 // Build the tabbed G League stats region and stash render state on
 // window._glView so the tab/pill handlers can re-render without re-fetching.
+// Does this bundle carry a row for the season we are in?
+function _glHasCurrent(bundle) {
+  if (!bundle || !bundle.season || !bundle.season.length) { return false; }
+  var want = _glCurrentSeasonString(), i;
+  for (i = 0; i < bundle.season.length; i++) {
+    if (String(bundle.season[i].SEASON_ID || '') === want) { return true; }
+  }
+  return false;
+}
+
 function _glBuildStatsHtml(glStats, teamColor) {
   if (!glStats) return '';
+  // SEASONTYPE -- open on the competition that is actually being
+  // played. The G League's November is the Tip-Off Tournament, so a
+  // card hardcoded to the regular season opened on an empty table
+  // with this season's numbers hidden behind a pill.
+  var _st = 'regular';
+  if (!_glHasCurrent(glStats.regular) && _glHasCurrent(glStats.tipoff)) {
+    _st = 'tipoff';
+  }
+  // GLBUNDLE -- and the sub-tab, by the same rule. A player with no G
+  // League numbers at all used to land on an empty G League table with
+  // the tab holding his actual stats sitting unpressed beside it.
+  var _glAny = !!(glStats.regular &&
+    (glStats.regular.season.length || glStats.regular.career));
+  var _tipAny = !!(glStats.tipoff &&
+    (glStats.tipoff.season.length || glStats.tipoff.career));
+  var _nbaAny = !!(glStats.nba &&
+    (glStats.nba.season.length || glStats.nba.career));
+  var _colAny = !!(glStats.college &&
+    (glStats.college.season.length || glStats.college.career));
+  var _tab = 'gleague';
+  if (!_glAny && !_tipAny) { _tab = _nbaAny ? 'nba' : (_colAny ? 'college' : 'gleague'); }
   window._glView = {
     glStats: glStats,
     teamColor: teamColor,
-    tab: 'gleague',
-    seasonType: 'regular'
+    tab: _tab,
+    seasonType: _st
   };
   return _glRenderRegion();
 }
@@ -96494,6 +96652,8 @@ function _fwBattingSide(game) {
 var _pmBioCache = {};
 
 function _pmBioLoad(athleteId, league) {
+  // GLSQUAD -- an id ESPN never issued has no ESPN bio behind it.
+  if (String(athleteId).indexOf('glnba-') === 0) { return; }
   var el = document.getElementById('pm-bio-line');
   if (!el || !athleteId) { return; }
   var key = String(league || '') + ':' + athleteId;
@@ -127044,6 +127204,21 @@ async function fetchTeamPage(teamId, league) {
     // built from what is already in memory rather than left under a question
     // mark, so recover the identity before deciding anything is missing.
     var _tdTeam = (teamData && teamData.team) || teamData;
+    // The ROSTER reply carries the team it belongs to, and the page has
+    // been fetching it all along and reading only the athletes out of
+    // it. Free, already paid for, and it needs no second guess about
+    // which endpoint wraps what.
+    if ((!_tdTeam || !(_tdTeam.displayName || _tdTeam.name)) && rosterData) {
+      var _rt = rosterData.team || (rosterData.athletes && rosterData.athletes.team);
+      if (_rt && (_rt.displayName || _rt.name)) {
+        teamData = { team: _rt };
+        _tdTeam = _rt;
+        if (typeof __skDiag !== 'undefined' && __skDiag.push) {
+          __skDiag.push({ stage: 'team-page:identity',
+            note: league + ' team ' + teamId + ' named from the roster reply' });
+        }
+      }
+    }
     if (!_tdTeam || !(_tdTeam.displayName || _tdTeam.name)) {
       var _ident = _espTeamIdentityLocal(teamId, league);
       // TEAMIDENT -- nothing in memory is a reason to ask, not a reason
@@ -127230,11 +127405,35 @@ async function fetchTeamPage(teamId, league) {
     var _glFill = null;
     if (league === 'GLEAGUE' && _swOk && !_swSeen) {
       try {
-        _glFill = await _glFillRoster(playerStats);
-        if (_glFill && _glFill.filled) {
+        var _glAbbr = '';
+        try {
+          var _gt = (teamData && teamData.team) || teamData || {};
+          _glAbbr = _gt.abbreviation || '';
+        } catch (eA) { _glAbbr = ''; }
+        _glFill = await _glFillRoster(playerStats, _glAbbr);
+        if (_glFill && _glFill.extra && _glFill.extra.length) {
+          // The players ESPN never listed. Seed each one's name so the
+          // card has a title and something to resolve its id by.
+          window._playerCtx = window._playerCtx || {};
+          for (var _xi = 0; _xi < _glFill.extra.length; _xi++) {
+            var _xp = _glFill.extra[_xi];
+            window._playerCtx[_xp.id] = { name: _xp.fullName, pos: '',
+              teamAbbr: _glAbbr, league: league };
+            playerStats.push(_xp);
+          }
+        }
+        if (_glFill && (_glFill.filled || (_glFill.extra && _glFill.extra.length))) {
           statLabels = _glFill.labels;
-          _statsDiagExtra = ' - NBA feed filled ' + _glFill.filled + ' of ' +
-            playerStats.length;
+          _statsDiagExtra = ' - NBA feed (' + (_glFill.seasonType || '?') +
+            ') filled ' + _glFill.filled +
+            (_glFill.extra && _glFill.extra.length
+              ? (' + ' + _glFill.extra.length + ' not on ESPN roster') : '') +
+            (_glFill.abbrs ? (' - no team ' + _glAbbr + ' in: ' +
+              _glFill.abbrs.join(',')) : '');
+          if (_glFill.abbrs) {
+            _statsDiag.glAbbrs = _glFill.abbrs.join(', ');
+            _statsDiag.glAbbrWanted = _glAbbr || '?';
+          }
         } else {
           _statsDiag.glWhy = (_glFill && _glFill.why) || 'no matching players';
           _statsDiagExtra = ' - NBA feed: ' + _statsDiag.glWhy;
@@ -127243,6 +127442,13 @@ async function fetchTeamPage(teamId, league) {
     }
 
     var combined = {
+      teamWhy: _espWhy || '', teamStatus: _espStatus || 0,
+      teamKeys: (function () {
+        try {
+          var t = (teamData && teamData.team) || teamData;
+          return t ? Object.keys(t).slice(0, 8).join(',') : '(null)';
+        } catch (eK) { return '(unreadable)'; }
+      })(),
       glFill: _glFill,
       statsDiag: _statsDiag,
       team: teamData,
@@ -127414,7 +127620,16 @@ function renderTeamPage(data, teamId, league) {
     (tLogo ? '<img src="' + tLogo + '">' : '') +
     '<div class="tp-header-info">' +
       '<div class="tp-team-name" style="color:' + tColor + '">' + tName + '</div>' +
-      '<div class="tp-team-meta">' + (tRecord ? tRecord : '') + (tStanding ? ' · ' + tStanding : '') + '</div>' +
+      '<div class="tp-team-meta">' +
+        (tName === '?' && !tRecord
+          // TEAMIDENT -- a bare "?" has shipped three times now because
+          // nobody could see what the team endpoint actually returned.
+          // When the page cannot name the team, it says what it got.
+          ? skEscape('team feed: ' + (data.teamWhy || 'ok') +
+              (data.teamStatus ? (' ' + data.teamStatus) : '') +
+              ' \u00b7 ' + (data.teamKeys || '?'))
+          : ((tRecord ? tRecord : '') + (tStanding ? ' \u00b7 ' + tStanding : ''))) +
+      '</div>' +
       // GDVENUE — the location table for the leagues it covers, and ESPN's
       // own venue record for the college pages, which it doesn't.
       _gdVenueMetaHtml(league, { abbr: tAbbr, id: teamId, name: tName, fullName: tName }, team.venue) +
@@ -127622,6 +127837,14 @@ function renderTeamPage(data, teamId, league) {
     if (activeGroup && activeGroup.filter) sectionTitle = activeGroup.label;
     html += '<div style="font-size:9px;font-weight:700;color:rgba(255,255,255,0.25);letter-spacing:1px;padding:12px 20px 4px;text-transform:uppercase">' + sectionTitle + ' (' + activePlayers.length + ')</div>';
     html += '<div class="tp-sort-hint">↑↓ tap column to sort</div>';
+    // GLSQUAD -- the roster could not be taken from the NBA feed because
+    // its team abbreviations are not ours. Say which ones they are: that
+    // is the whole of what a mapping would need.
+    if (data.statsDiag && data.statsDiag.glAbbrs) {
+      html += '<div class="tp-sort-hint" style="opacity:0.6">' +
+        skEscape('NBA feed has no team ' + data.statsDiag.glAbbrWanted +
+          ' - it calls them: ' + data.statsDiag.glAbbrs) + '</div>';
+    }
     html += '<div class="tp-table-wrap"><table class="tp-table"><thead><tr>';
     html += '<th>NAME</th>';
     tableLabels.forEach(function(l, li) {
