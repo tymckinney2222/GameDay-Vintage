@@ -27634,6 +27634,17 @@
   .sk-st-ladder u { position: absolute; top: -3px; bottom: -3px; width: 2px;
                     margin-left: -1px; background: #fff; text-decoration: none;
                     box-shadow: 0 0 0 1px rgba(8,8,14,0.9); }
+  .sk-st-magic {
+    display: flex; align-items: baseline; gap: 9px; margin-top: 9px;
+    padding-top: 9px; border-top: 1px solid var(--sk-border);
+  }
+  .sk-st-magic b {
+    font-family: var(--sk-font-display, Georgia, serif); font-size: 26px;
+    line-height: 1; font-weight: 700; color: var(--sk-gold);
+  }
+  .sk-st-magic span { font-size: 11px; line-height: 1.45; color: var(--sk-text-3); }
+  .sk-st-top.st-clinched { border-color: rgba(74,222,128,0.28); }
+  .sk-st-top.st-eliminated { border-color: rgba(248,113,113,0.26); }
   .sk-st-say { margin: 7px 0 0; font-size: 11.5px; line-height: 1.42;
                color: var(--sk-text-2); }
   .sk-st-say b { color: var(--sk-text-1); }
@@ -46669,7 +46680,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = 'bo363 CATPRIOR';
+var SK_BUILD = 'bo364 STMAGIC';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo, muteable) {
   var isActive = activeLeague === key;
@@ -153691,6 +153702,18 @@ function _cxTierMeta() {
   ];
 }
 
+// CXPAIR -- "6--6" is the en dash separator meeting a negative number.
+// A middle dot separates them where a dash cannot, and the minus
+// becomes a typographic one so it is not mistaken for the separator
+// either.
+function _cxPair(a, b) {
+  var x = String(a == null ? '' : a), y = String(b == null ? '' : b);
+  var neg = /^-/.test(x) || /^-/.test(y);
+  x = x.replace(/^-/, '\u2212');
+  y = y.replace(/^-/, '\u2212');
+  return skEscape(x) + (neg ? ' \u00b7 ' : '\u2013') + skEscape(y);
+}
+
 function _cxFmt(v, meta) {
   if (v == null || v === '' || isNaN(Number(v))) { return '—'; }
   if (typeof _skFmtCatVal === 'function') {
@@ -153752,7 +153775,7 @@ function _cxAnalysisHtml(cx, daysPlayed, daysLeft, dayOfWeek, daysTotal, prior) 
       '<span class="cx-an-cats">';
     for (j = 0; j < row.length; j++) {
       h += '<span class="cx-an-c"><s>' + skEscape(row[j].abbr) + '</s><i>' +
-        skEscape(row[j].myDisp) + '–' + skEscape(row[j].opDisp) +
+        _cxPair(row[j].myDisp, row[j].opDisp) +
         '</i></span>';
     }
     h += '</span></div>';
@@ -166341,7 +166364,26 @@ function skBuildStandingsTable(league, leagueData, allTeams) {
   // the screen.
   var topHtml = '', youHtml = '';
   if (groupMode === 'league') {
-    try { topHtml = _stTop(rows, myKey, _stSeatCount); } catch (eT) { topHtml = ''; }
+    var _stWk = null;
+    try {
+      var _lsx = leagueSettingsCache[league.league_key];
+      _stWk = _stWeeksLeft(league.current_week,
+        _lsx && _lsx.playoff && _lsx.playoff.startWeek, league.end_week);
+    } catch (eW) { _stWk = null; }
+    try {
+      // STMAGIC -- a league with a playoff line gets the line; one
+      // without gets the chase, which is the same question asked of a
+      // table that ranks on a total.
+      // NO SEATS MEANS TWO DIFFERENT THINGS. For roto and season
+      // points there is no playoff line to have, and the chase is the
+      // honest equivalent. For an H2H league it means the SETTINGS
+      // HAVE NOT LANDED -- we do not know the cut yet, and drawing a
+      // chase strip there would invent a shape that changes under the
+      // reader the moment they arrive.
+      topHtml = _stSeatCount
+        ? _stTop(rows, myKey, _stSeatCount, _stWk)
+        : (isSeasonPts ? _stTopPts(rows, myKey, _stWk) : '');
+    } catch (eT) { topHtml = ''; }
     try { youHtml = _stYou(rows, myKey, _stSeatCount, _stEx); } catch (eY) { youHtml = ''; }
   }
 
@@ -180356,9 +180398,118 @@ function _stLadder(rows, seats, myKey) {
     '<u style="left:' + ((seats / rows.length) * 100).toFixed(3) + '%"></u></span>';
 }
 
-// THE STRIP ABOVE THE TABLE: where you are, and how far that is from
-// the only line that matters.
-function _stTop(rows, myKey, seats) {
+
+// ══════════════════════════════════════════════════════════════════
+//  STMAGIC ── what has to happen, and how long there is to do it
+// ══════════════════════════════════════════════════════════════════
+// The strip above the standings already finds the playoff line, the
+// team on the other side of it and the gap in games. What it never
+// says is WHEN. "Two games off the last spot" is a different sentence
+// in week 3 than in the last week of the regular season, and the
+// screen read identically in both. It also has no idea that a season
+// can be over: a team mathematically eliminated was still being told
+// how far off the pace it was, as though there were something left to
+// do about it.
+
+// Weeks still to play before the playoffs start. The regular season
+// ends the week BEFORE playoff_start_week, and the week in progress
+// still counts because it has not been lost yet.
+function _stWeeksLeft(curWeek, playoffStart, endWeek) {
+  var c = parseInt(curWeek, 10);
+  if (!isFinite(c) || c <= 0) { return null; }
+  var last = parseInt(playoffStart, 10);
+  if (isFinite(last) && last > 1) { last = last - 1; }
+  else {
+    last = parseInt(endWeek, 10);
+    if (!isFinite(last) || last <= 0) { return null; }
+  }
+  var r = last - c + 1;
+  return (r >= 0) ? r : 0;
+}
+
+// GAMES BACK IS THE WIN DIFFERENTIAL when both sides have played the
+// same number of games, which in a fantasy league they have: games
+// back is (dW + dL) / 2 and dL is -dW, so the two are the same number.
+// That is what lets one formula do both ends of this.
+//
+//   clinched when the lead cannot be erased:  lead  > weeksLeft
+//   eliminated when the deficit cannot be made up: -lead > weeksLeft
+//
+// and in between, the magic number -- any combination of your results
+// and theirs that settles it -- is weeksLeft - |lead| + 1.
+function _stOutlook(rows, myKey, seats, weeksLeft) {
+  if (!rows || !rows.length || !seats || seats >= rows.length) { return null; }
+  var mi = -1, i;
+  for (i = 0; i < rows.length; i++) {
+    if (rows[i].key === myKey) { mi = i; break; }
+  }
+  if (mi < 0) { return null; }
+  var me = rows[mi], pos = mi + 1, inside = pos <= seats;
+  // The team on the other side of the line: the first one out if I am
+  // in, the last one in if I am out.
+  var edge = inside ? rows[seats] : rows[seats - 1];
+  if (!edge) { return null; }
+  var lead = _stGames(me, edge);
+  var out = {
+    pos: pos, seats: seats, teams: rows.length, inside: inside,
+    lead: lead, gap: Math.abs(lead), edge: edge,
+    edgeName: edge.name || '', weeksLeft: weeksLeft,
+    between: inside ? 0 : Math.max(0, (mi - (seats - 1)) - 1),
+    state: inside ? 'in' : 'out', magic: null
+  };
+  if (weeksLeft == null) { return out; }
+  if (weeksLeft <= 0) {
+    // The regular season is over: the table is the answer.
+    out.state = inside ? 'clinched' : 'eliminated';
+    out.magic = 0;
+    return out;
+  }
+  if (inside && lead > weeksLeft) { out.state = 'clinched'; out.magic = 0; return out; }
+  if (!inside && -lead > weeksLeft) { out.state = 'eliminated'; out.magic = 0; return out; }
+  out.magic = Math.max(1, Math.ceil(weeksLeft - Math.abs(lead) + 1));
+  if (lead === 0) { out.state = inside ? 'in' : 'level'; }
+  return out;
+}
+
+// The leader, and the team immediately ahead, for a league with no
+// playoff line to stand either side of -- roto and season points,
+// where _stSeats returns 0 and the strip above the table has
+// therefore never drawn at all.
+function _stChase(rows, myKey, weeksLeft) {
+  if (!rows || rows.length < 2) { return null; }
+  var mi = -1, i;
+  for (i = 0; i < rows.length; i++) {
+    if (rows[i].key === myKey) { mi = i; break; }
+  }
+  if (mi < 0) { return null; }
+  var me = rows[mi];
+  var leader = rows[0];
+  var ahead = (mi > 0) ? rows[mi - 1] : null;
+  var behind = (mi < rows.length - 1) ? rows[mi + 1] : null;
+  return {
+    pos: mi + 1, teams: rows.length, weeksLeft: weeksLeft,
+    leading: mi === 0,
+    leader: leader, ahead: ahead, behind: behind,
+    toLeader: (mi === 0) ? 0 : _stPts(leader, me),
+    toAhead: ahead ? _stPts(ahead, me) : null,
+    overBehind: behind ? _stPts(me, behind) : null
+  };
+}
+
+// Season points and roto rank on a total, not a record, so the
+// distance between two teams is that total's difference rather than
+// anything games-back can express.
+function _stPts(a, b) {
+  var av = (a && a.pf != null) ? Number(a.pf) : null;
+  var bv = (b && b.pf != null) ? Number(b.pf) : null;
+  if (av == null || bv == null || !isFinite(av) || !isFinite(bv)) { return null; }
+  return av - bv;
+}
+
+
+// THE STRIP ABOVE THE TABLE: where you are, how far that is from the
+// only line that matters, and -- STMAGIC -- how long there is left.
+function _stTop(rows, myKey, seats, weeksLeft) {
   var me = null, i;
   for (i = 0; i < rows.length; i++) { if (rows[i].key === myKey) { me = rows[i]; break; } }
   if (!me || !seats || seats >= rows.length) { return ''; }
@@ -180369,8 +180520,25 @@ function _stTop(rows, myKey, seats) {
   var edge = inside ? rows[seats] : rows[seats - 1];
   var gap = Math.abs(_stGames(me, edge));
   var between = inside ? 0 : (seats - 1 >= 0 ? (i - (seats - 1)) - 1 : 0);
+  var ol = null;
+  try { ol = _stOutlook(rows, myKey, seats, weeksLeft); } catch (eO) { ol = null; }
+  var st8 = ol ? ol.state : (inside ? 'in' : 'out');
+
   var say;
-  if (inside) {
+  if (st8 === 'clinched') {
+    say = '<b>You are in.</b> ' + _stG(gap) + (gap === 1 ? ' game' : ' games') +
+      ' clear of the first team out with ' +
+      (weeksLeft > 0 ? (weeksLeft + (weeksLeft === 1 ? ' week' : ' weeks') + ' to play')
+                     : 'the regular season done') + '.';
+  } else if (st8 === 'eliminated') {
+    // A SEASON CAN BE OVER. Telling a mathematically eliminated team
+    // how far off the pace it is reads as though there were still
+    // something to do about it.
+    say = '<b>Out of it.</b> ' + _stG(gap) + (gap === 1 ? ' game' : ' games') +
+      ' off the last spot with ' +
+      (weeksLeft > 0 ? (weeksLeft + (weeksLeft === 1 ? ' week' : ' weeks') + ' left')
+                     : 'the regular season done') + ' \u2014 the gap cannot be closed.';
+  } else if (inside) {
     say = 'You hold <b>' + _skSbOrdinal(pos) + '</b>, <b>' + _stG(gap) +
       (gap === 1 ? ' game' : ' games') + '</b> clear of the first team out.';
   } else {
@@ -180379,12 +180547,72 @@ function _stTop(rows, myKey, seats) {
       (between > 0 ? (', with <b>' + between + '</b> team' + (between === 1 ? '' : 's') +
         ' in between') : '') + '.';
   }
-  return '<div class="sk-st-top">' +
+
+  // THE MAGIC NUMBER, which is the thing nothing on this screen has
+  // ever said: not where you are, but what has to happen.
+  var magic = '';
+  if (ol && ol.magic > 0 && weeksLeft > 0) {
+    magic = '<div class="sk-st-magic"><b>' + ol.magic + '</b><span>' +
+      (inside
+        ? ('any mix of your wins and ' + skEscape(ol.edgeName) +
+           ' losses and your spot is safe')
+        : ('any mix of your wins and ' + skEscape(ol.edgeName) +
+           ' losses puts you in')) +
+      '</span></div>';
+  }
+
+  var when = (weeksLeft != null)
+    ? (' \u00b7 ' + (weeksLeft > 0
+        ? (weeksLeft + (weeksLeft === 1 ? ' week left' : ' weeks left'))
+        : 'regular season done'))
+    : '';
+
+  return '<div class="sk-st-top' + (st8 ? (' st-' + st8) : '') + '">' +
     '<div class="sk-st-top-hd">' +
       '<div class="sk-st-top-t">' + rows.length + ' teams \u00b7 ' + seats +
-        ' make the playoffs</div>' +
+        ' make the playoffs' + when + '</div>' +
       '<div class="sk-st-top-r"><b>' + _skSbOrdinal(pos) + '</b></div>' +
     '</div>' + _stLadder(rows, seats, myKey) +
+    '<div class="sk-st-say">' + say + '</div>' + magic + '</div>';
+}
+
+// STMAGIC -- roto and season points have no playoff line, so _stSeats
+// returns 0 and the strip above the table has never drawn for them at
+// all. They rank on a total instead of a record, and the honest
+// equivalent of "how far from the line" is how far from the teams
+// either side of you, and from the top.
+function _stTopPts(rows, myKey, weeksLeft) {
+  var c = null;
+  try { c = _stChase(rows, myKey, weeksLeft); } catch (eC) { c = null; }
+  if (!c) { return ''; }
+  function num(v) {
+    if (v == null || !isFinite(v)) { return null; }
+    var a = Math.abs(v);
+    return (a >= 100) ? a.toFixed(0) : ((Math.round(a * 10) / 10) + '');
+  }
+  var say;
+  if (c.leading) {
+    var over = num(c.overBehind);
+    say = '<b>You lead.</b>' + (over != null
+      ? (' ' + over + ' clear of ' + skEscape((c.behind && c.behind.name) || 'second') + '.')
+      : '');
+  } else {
+    var toL = num(c.toLeader), toA = num(c.toAhead);
+    say = (toL != null ? ('<b>' + toL + '</b> behind ' +
+            skEscape(c.leader.name || 'the leader')) : 'Chasing');
+    if (toA != null && c.ahead && c.ahead.key !== c.leader.key) {
+      say += ', <b>' + toA + '</b> behind ' + skEscape(c.ahead.name || '');
+    }
+    say += '.';
+  }
+  var when = (weeksLeft != null && weeksLeft > 0)
+    ? (' \u00b7 ' + weeksLeft + (weeksLeft === 1 ? ' week left' : ' weeks left'))
+    : (weeksLeft === 0 ? ' \u00b7 season done' : '');
+  return '<div class="sk-st-top">' +
+    '<div class="sk-st-top-hd">' +
+      '<div class="sk-st-top-t">' + rows.length + ' teams' + when + '</div>' +
+      '<div class="sk-st-top-r"><b>' + _skSbOrdinal(c.pos) + '</b></div>' +
+    '</div>' +
     '<div class="sk-st-say">' + say + '</div></div>';
 }
 
