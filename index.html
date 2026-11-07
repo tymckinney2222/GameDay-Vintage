@@ -47230,7 +47230,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = 'bo373 LDDAY3';
+var SK_BUILD = 'bo374 LDDAY4';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo, muteable) {
   var isActive = activeLeague === key;
@@ -133470,68 +133470,117 @@ function _ldRowData(l) {
 
 
 // ==================================================================
-//  LDDAY -- what moved today, on the ladder
+//  LDDAY -- today's change, on the ladder
 // ==================================================================
-// THE APP ALREADY KNOWS THIS. It is on three screens already:
+// THE NUMBERS ARE ALREADY IN THE APP and this reads them rather than
+// deriving anything of its own:
 //
-//   - the DAILY MOMENTUM table, which prints a swing per day
-//   - the DAILY FP leaderboard, with a column headed "Today"
-//   - TODAY'S SWINGS, which says "+2 yours" on the face of a button
+//   - getTeamFpDayTotal(teamKey, date) is what the DAILY FP chart's
+//     tooltip prints -- "Sat: You 43.9, Opp 48.8". Both sides, for a
+//     given day, already summed over active slots only.
+//   - _skSwingsVerdict(leagueKey) is what TODAY'S SWINGS puts on the
+//     face of its button -- "+2 yours".
 //
-// The first version of this file ignored all three and kept its own
-// store instead: it wrote down what a row said, waited a day, and
-// subtracted. That was wrong twice over. It could say nothing at all
-// until it had been installed for a day -- and on the day it was, the
-// numbers it did show were the drift between two paints, which is
-// "since you opened the app" wearing the label "today".
+// Two earlier attempts got this wrong in opposite ways. The first
+// kept its own baseline and subtracted, which could say nothing until
+// it had been installed a day, and on that day reported the drift
+// between two paints. The second read the night strip's pass, which
+// is free and exact but only covers MY players -- so it could only
+// ever report my own points, never the gap, and the gap is the
+// question: on a day I score 43.9 and my opponent scores 48.8 I am
+// four points worse off, and neither of those versions could say so.
 //
-// There is nothing to store. Today's points for a league are the sum
-// of what my players have scored in it today, and the night strip
-// above the nav already walks exactly that -- every sport's slate,
-// every one of my players on it, one row per league with its own
-// points on it. The strip reduces the lot to one total; this groups
-// the same rows by league instead. A category league has no points,
-// and does not need any: _skSwingsVerdict already answers it.
-//
-// So: no baseline, no snapshot, nothing to wait a day for. It works
-// on the first paint because the numbers were already there.
+// This one asks for both sides. That costs two requests per league,
+// so they are queued a few at a time and the rows fill in as they
+// land, the same way every other fan-out in this app behaves. A
+// league that has not answered yet shows nothing rather than a
+// placeholder.
 
-var _ldFpCache = null;
+var _ldDayFp = {};        // leagueKey -> { my: n, opp: n|null }
+var _ldDayAsked = {};     // leagueKey -> ms when last asked
+var _ldDayQueue = [];
+var _ldDayRunning = 0;
+var _LD_DAY_LANES = 4;
+// The same window fetchTeamFpForDate keeps a live day for, so a row
+// refreshes on its clock rather than on one of ours.
+var _LD_DAY_TTL = 5 * 60 * 1000;
+var _ldDayPaint = null;
 
-// Today's points per league, from the pass the night strip is making
-// anyway. Memoised against that pass rather than on a clock of its
-// own, so the ladder and the strip can never be a scan apart.
-function _ldTodayFpByLeague() {
-  var scan = null;
+function _ldDayToday() {
   try {
-    scan = (typeof _pxTonightScan === 'function') ? _pxTonightScan(false) : null;
-  } catch (e) { scan = null; }
-  if (!scan || !scan.map) { return {}; }
-  if (_ldFpCache && _ldFpCache.ts === scan.ts) { return _ldFpCache.by; }
-  var by = {}, k, i;
-  for (k in scan.map) {
-    if (!scan.map.hasOwnProperty(k)) { continue; }
-    var rows = (scan.map[k] && scan.map[k].rows) || [];
-    for (i = 0; i < rows.length; i++) {
-      var row = rows[i];
-      if (!row || !row.leagueKey) { continue; }
-      // BENCHED POINTS ARE NOT YOUR POINTS, and a category row carries
-      // none at all -- the same two exclusions the night strip makes
-      // before it puts a figure on the screen.
-      if (row.benched === true || row.isCats || row.fp == null) { continue; }
-      var v = Number(row.fp);
-      if (!isFinite(v)) { continue; }
-      by[row.leagueKey] = (by[row.leagueKey] || 0) + v;
-    }
+    if (typeof _todayDateString === 'function') { return _todayDateString(); }
+  } catch (e) {}
+  var d = new Date();
+  function p(n) { return (n < 10 ? '0' : '') + n; }
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+}
+
+// The two team keys a league's day needs. Yahoo only: the per-date
+// endpoint is a Yahoo one, and an external league has no equivalent.
+function _ldDayKeys(r) {
+  var key = (r && r.l && r.l.league_key) || '';
+  if (!key || (r && r.ext)) { return null; }
+  var d = null;
+  try {
+    d = (typeof skLeagueData === 'object' && skLeagueData) ? skLeagueData[key] : null;
+  } catch (e) { d = null; }
+  if (!d) { return null; }
+  var mu = d.matchup || {};
+  var my = mu.myTeamKey || (d.team && d.team.team_key) || '';
+  if (!my) { return null; }
+  // A SEASON LEAGUE HAS NO OPPONENT, so it has no gap -- its day is
+  // simply what it scored, which is the question asked of it anyway.
+  var opp = (r && r.season) ? '' : (mu.oppTeamKey || '');
+  return { key: key, my: my, opp: opp, season: !!(r && r.season) };
+}
+
+function _ldDayRepaint() {
+  if (_ldDayPaint) { return; }
+  _ldDayPaint = setTimeout(function () {
+    _ldDayPaint = null;
+    try {
+      if (typeof skRenderTodayCards === 'function') { skRenderTodayCards(); }
+    } catch (e) {}
+  }, 350);
+}
+
+function _ldDayPump() {
+  while (_ldDayRunning < _LD_DAY_LANES && _ldDayQueue.length) {
+    (function (job) {
+      _ldDayRunning++;
+      var date = _ldDayToday();
+      var jobs = [getTeamFpDayTotal(job.my, date)];
+      jobs.push(job.opp ? getTeamFpDayTotal(job.opp, date) : Promise.resolve(null));
+      Promise.all(jobs).then(function (pair) {
+        _ldDayRunning--;
+        if (pair[0] != null) {
+          _ldDayFp[job.key] = { my: pair[0], opp: pair[1] };
+          _ldDayRepaint();
+        }
+        _ldDayPump();
+      }, function () {
+        _ldDayRunning--;
+        _ldDayPump();
+      });
+    })(_ldDayQueue.shift());
   }
-  _ldFpCache = { ts: scan.ts, by: by };
-  return by;
+}
+
+// Ask once per league per TTL. Without that guard the repaint this
+// triggers would walk straight back in here and ask again.
+function _ldDayAsk(need) {
+  var now = Date.now();
+  if (_ldDayAsked[need.key] && (now - _ldDayAsked[need.key]) < _LD_DAY_TTL) {
+    return;
+  }
+  if (typeof getTeamFpDayTotal !== 'function') { return; }
+  _ldDayAsked[need.key] = now;
+  _ldDayQueue.push(need);
+  _ldDayPump();
 }
 
 // A category league moves in categories, and TODAY'S SWINGS has been
-// working that out from its own daily snapshots since long before
-// this line existed. Net: the ones that came my way, less the ones
-// that went the other.
+// working that out from its own daily snapshots all along.
 function _ldTodayCats(key) {
   var v = null;
   try {
@@ -133542,6 +133591,11 @@ function _ldTodayCats(key) {
   return isFinite(n) ? n : null;
 }
 
+function _ldDayNum(v, cls) {
+  var s = (v > 0 ? '+' : '\u2212') + Math.abs(v).toFixed(1);
+  return '<i class="ld-day ' + cls + '">' + s + '</i>';
+}
+
 // The second line under the margin.
 function _ldDayHtml(r) {
   if (!r) { return ''; }
@@ -133550,25 +133604,28 @@ function _ldDayHtml(r) {
 
   if (r.cats) {
     var c = _ldTodayCats(key);
-    // Nothing has turned over today. A nought in a column of eighty
-    // is noise with the shape of information.
     if (!c) { return ''; }
     return '<i class="ld-day ' + (c > 0 ? 'up' : 'dn') + '">' +
       (c > 0 ? '+' : '\u2212') + Math.abs(c) + '</i>';
   }
 
-  var by = {};
-  try { by = _ldTodayFpByLeague(); } catch (e2) { return ''; }
-  var fp = by[key];
-  if (fp == null || !isFinite(fp)) { return ''; }
-  fp = Math.round(fp * 10) / 10;
-  if (!fp) { return ''; }
-  // POINTS SCORED, NOT A MARGIN. These are my players' points today,
-  // which is the question asked of a season league and the honest
-  // half of the question asked of a weekly one -- the opponent's day
-  // is not in this pass, and inventing a swing out of half of it
-  // would be worse than reporting the half there is.
-  return '<i class="ld-day up">' + fp.toFixed(1) + '</i>';
+  var need = _ldDayKeys(r);
+  if (!need) { return ''; }
+  var got = _ldDayFp[key];
+  if (!got) { _ldDayAsk(need); return ''; }
+
+  if (need.season) {
+    var p = Math.round(Number(got.my) * 10) / 10;
+    if (!p) { return ''; }
+    return '<i class="ld-day up">' + p.toFixed(1) + '</i>';
+  }
+  // THE GAP, NOT MY HALF OF IT. Scoring 43.9 on a day my opponent
+  // scores 48.8 is a day I lost ground, and a line that reported only
+  // the 43.9 would read as a good one.
+  if (got.opp == null) { return ''; }
+  var d = Math.round((Number(got.my) - Number(got.opp)) * 10) / 10;
+  if (!d) { return ''; }
+  return _ldDayNum(d, d > 0 ? 'up' : 'dn');
 }
 
 
