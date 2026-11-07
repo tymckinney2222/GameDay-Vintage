@@ -47230,7 +47230,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = 'bo372 LDDAY2';
+var SK_BUILD = 'bo373 LDDAY3';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo, muteable) {
   var isActive = activeLeague === key;
@@ -133472,204 +133472,103 @@ function _ldRowData(l) {
 // ==================================================================
 //  LDDAY -- what moved today, on the ladder
 // ==================================================================
-// The ladder's big number is where a league stands: the margin in a
-// head-to-head, the rank in a season league. What it has never said
-// is how much of that happened TODAY -- whether a +8.8 is a lead
-// built on Tuesday and sat on since, or forty points taken this
-// afternoon.
+// THE APP ALREADY KNOWS THIS. It is on three screens already:
 //
-// IT COSTS NO FETCH. Every value needed is already on the row the
-// ladder just drew; the only thing missing is what the same row said
-// yesterday. So this keeps one small record per league and reads the
-// difference -- the same idea the cats snapshots already use for
-// TODAY'S SWINGS, which stores one snapshot per day and diffs them.
+//   - the DAILY MOMENTUM table, which prints a swing per day
+//   - the DAILY FP leaderboard, with a column headed "Today"
+//   - TODAY'S SWINGS, which says "+2 yours" on the face of a button
 //
-// ONE KEY, NOT ONE PER LEAGUE. At the league count this app reaches,
-// a read and a write per row per paint is a few hundred synchronous
-// localStorage calls on a list that repaints on every tick.
+// The first version of this file ignored all three and kept its own
+// store instead: it wrote down what a row said, waited a day, and
+// subtracted. That was wrong twice over. It could say nothing at all
+// until it had been installed for a day -- and on the day it was, the
+// numbers it did show were the drift between two paints, which is
+// "since you opened the app" wearing the label "today".
+//
+// There is nothing to store. Today's points for a league are the sum
+// of what my players have scored in it today, and the night strip
+// above the nav already walks exactly that -- every sport's slate,
+// every one of my players on it, one row per league with its own
+// points on it. The strip reduces the lot to one total; this groups
+// the same rows by league instead. A category league has no points,
+// and does not need any: _skSwingsVerdict already answers it.
+//
+// So: no baseline, no snapshot, nothing to wait a day for. It works
+// on the first paint because the numbers were already there.
 
-var LD_DAY_KEY = 'skLdDay_v1';
-var _ldDayMem = null;
-var _ldDayDirty = false;
-var _ldDayTimer = null;
+var _ldFpCache = null;
 
-function _ldDayToday() {
+// Today's points per league, from the pass the night strip is making
+// anyway. Memoised against that pass rather than on a clock of its
+// own, so the ladder and the strip can never be a scan apart.
+function _ldTodayFpByLeague() {
+  var scan = null;
   try {
-    if (typeof _todayDateString === 'function') { return _todayDateString(); }
-  } catch (e) {}
-  var d = new Date();
-  function p(n) { return (n < 10 ? '0' : '') + n; }
-  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
-}
-
-function _ldDayLoad() {
-  if (_ldDayMem) { return _ldDayMem; }
-  var o = null;
-  try { o = JSON.parse(localStorage.getItem(LD_DAY_KEY) || 'null'); }
-  catch (e) { o = null; }
-  if (!o || typeof o !== 'object') { o = { d: '', base: {}, last: {} }; }
-  if (!o.base) { o.base = {}; }
-  if (!o.last) { o.last = {}; }
-  var today = _ldDayToday();
-  if (o.d !== today) {
-    // A NEW DAY STARTS FROM YESTERDAY'S LAST READING, not from the
-    // first one taken today. Baselining on first sight would mean
-    // opening the app at nine in the evening showed only what moved
-    // after nine, and called it the day.
-    //
-    // CARRIED, and marked as carried. A baseline taken today is not a
-    // yesterday and must never be read as one -- that is what made a
-    // fresh install show numbers at all: they were the drift between
-    // the first paint and the next, which is "since you opened the
-    // app" wearing the label "today".
-    var carried = {}, ck;
-    for (ck in (o.last || {})) {
-      if (!o.last.hasOwnProperty(ck) || !o.last[ck]) { continue; }
-      carried[ck] = { m: o.last[ck].m, p: o.last[ck].p, w: o.last[ck].w, c: 1 };
+    scan = (typeof _pxTonightScan === 'function') ? _pxTonightScan(false) : null;
+  } catch (e) { scan = null; }
+  if (!scan || !scan.map) { return {}; }
+  if (_ldFpCache && _ldFpCache.ts === scan.ts) { return _ldFpCache.by; }
+  var by = {}, k, i;
+  for (k in scan.map) {
+    if (!scan.map.hasOwnProperty(k)) { continue; }
+    var rows = (scan.map[k] && scan.map[k].rows) || [];
+    for (i = 0; i < rows.length; i++) {
+      var row = rows[i];
+      if (!row || !row.leagueKey) { continue; }
+      // BENCHED POINTS ARE NOT YOUR POINTS, and a category row carries
+      // none at all -- the same two exclusions the night strip makes
+      // before it puts a figure on the screen.
+      if (row.benched === true || row.isCats || row.fp == null) { continue; }
+      var v = Number(row.fp);
+      if (!isFinite(v)) { continue; }
+      by[row.leagueKey] = (by[row.leagueKey] || 0) + v;
     }
-    o.base = carried;
-    o.last = {};
-    o.d = today;
-    _ldDayDirty = true;
   }
-  _ldDayMem = o;
-  return o;
+  _ldFpCache = { ts: scan.ts, by: by };
+  return by;
 }
 
-function _ldDaySave() {
-  _ldDayTimer = null;
-  if (!_ldDayDirty || !_ldDayMem) { return; }
-  try { localStorage.setItem(LD_DAY_KEY, JSON.stringify(_ldDayMem)); }
-  catch (e) {}
-  _ldDayDirty = false;
-}
-
-function _ldDayFlush() {
-  if (_ldDayTimer) { return; }
-  _ldDayTimer = setTimeout(_ldDaySave, 1200);
-}
-
-// The week, where the provider names one. It is the only reliable way
-// to tell a new week from a bad day in a CATEGORY league, where the
-// number legitimately falls inside a week -- which is the whole of
-// what this line is for.
-function _ldDayWeek(r) {
+// A category league moves in categories, and TODAY'S SWINGS has been
+// working that out from its own daily snapshots since long before
+// this line existed. Net: the ones that came my way, less the ones
+// that went the other.
+function _ldTodayCats(key) {
+  var v = null;
   try {
-    var k = (r && r.l && (r.l.league_key || r.l.key)) || '';
-    var d = (typeof skLeagueData === 'object' && skLeagueData)
-      ? skLeagueData[k] : null;
-    var n = parseInt(d && d.matchup && d.matchup.week, 10);
-    return (isFinite(n) && n > 0) ? n : null;
-  } catch (e) { return null; }
+    v = (typeof _skSwingsVerdict === 'function') ? _skSwingsVerdict(key) : null;
+  } catch (e) { v = null; }
+  if (!v) { return null; }
+  var n = (Number(v.mine) || 0) - (Number(v.theirs) || 0);
+  return isFinite(n) ? n : null;
 }
 
-// The two numbers a row can move in: the margin it is ranked on, and
-// the points the team itself has put up.
-function _ldDayValue(r) {
-  if (!r) { return null; }
-  if (r.season) {
-    var p = (r.team && (r.team.points != null ? r.team.points : r.team.record));
-    var pv = parseFloat(p);
-    if (!isFinite(pv)) { return null; }
-    return { m: null, p: pv, w: null };
-  }
-  if (r.unknown || !r.m) { return null; }
-  var my = Number(r.m.myScore), op = Number(r.m.oppScore);
-  if (!isFinite(my) || !isFinite(op)) { return null; }
-  return { m: my - op, p: my, w: _ldDayWeek(r) };
-}
-
-// A REAL YESTERDAY, where one has already been written down. The cats
-// snapshots have stored one per league per day since long before this
-// line existed -- TODAY'S SWINGS reads them -- so a category league
-// can answer on its very first day instead of sitting out a day to
-// build a baseline it already had.
-function _ldDaySeed(r, key) {
-  if (!r || !r.cats) { return null; }
-  if (typeof listCatsSnapshotsForWeek !== 'function') { return null; }
-  var w = _ldDayWeek(r), snaps = [];
-  try { snaps = listCatsSnapshotsForWeek(key, w || 0) || []; }
-  catch (e) { return null; }
-  if (!snaps.length) { return null; }
-  var today = _ldDayToday(), best = null, i;
-  // Sorted ascending, so the last one dated before today is the one.
-  for (i = 0; i < snaps.length; i++) {
-    if (snaps[i] && snaps[i].date && snaps[i].date < today) { best = snaps[i]; }
-  }
-  if (!best) { return null; }
-  var wn = Number(best.wins), ls = Number(best.losses);
-  if (!isFinite(wn) || !isFinite(ls)) { return null; }
-  return { m: wn - ls, p: wn, w: (best.week != null ? best.week : w), c: 1 };
-}
-
-// What moved today. Null when there is nothing honest to say.
-function _ldDayDelta(r, keyOverride) {
-  var key = keyOverride || (r && r.l && r.l.league_key) ||
-            (r && r.l && r.l.key) || '';
-  if (!key) { return null; }
-  var cur = _ldDayValue(r);
-  if (!cur) { return null; }
-  var st = _ldDayLoad();
-  var base = st.base[key];
-  st.last[key] = cur;
-  _ldDayDirty = true;
-  _ldDayFlush();
-  if (!base) {
-    // Never seen before. Look for a yesterday someone else already
-    // wrote down; failing that, start one and say nothing until it
-    // has aged into a real one.
-    base = _ldDaySeed(r, key);
-    if (!base) { st.base[key] = cur; return null; }
-    st.base[key] = base;
-  }
-  // A BASELINE TAKEN TODAY IS NOT A YESTERDAY. Measuring against it
-  // reports the drift since the app was opened and calls it the day,
-  // which is both wrong and, worse, wrong by a plausible amount.
-  if (!base.c) { return null; }
-  // A WEEK ROLLS OVER AND EVERYTHING GOES BACK TO NOUGHT. Measured
-  // against Sunday's total, Monday morning reads as a hundred-point
-  // collapse. Where the provider names the week, that settles it.
-  if (cur.w != null && base.w != null && cur.w !== base.w) {
-    st.base[key] = cur;
-    return null;
-  }
-  // Without a week, a FALL is the only signal left -- and it is a
-  // sound one for points, which only ever go up inside a week. It is
-  // NOT sound for categories: losing a category you were winning is
-  // a fall inside the week, and it is precisely the movement this
-  // line exists to show. Guarding on it there hid every bad day.
-  if (!r.cats && cur.p != null && base.p != null && cur.p < base.p) {
-    st.base[key] = cur;
-    return null;
-  }
-  var useSeason = !!r.season;
-  var a = useSeason ? cur.p : cur.m;
-  var b = useSeason ? base.p : base.m;
-  if (a == null || b == null) { return null; }
-  var d = a - b;
-  if (!isFinite(d)) { return null; }
-  return { d: d, season: useSeason, cats: !!r.cats };
-}
-
-// The second line under the margin. Nothing at all on a day that has
-// not moved: a column of "+0.0" down eighty rows is noise with the
-// shape of information.
+// The second line under the margin.
 function _ldDayHtml(r) {
-  var x = null;
-  try { x = _ldDayDelta(r); } catch (e) { return ''; }
-  if (!x) { return ''; }
-  var v = Math.round(x.d * 10) / 10;
-  if (!v) { return ''; }
-  var sign = v > 0 ? '+' : '\u2212';
-  var mag = Math.abs(v);
-  var txt = x.cats ? String(Math.round(mag)) : mag.toFixed(1);
-  var cls = v > 0 ? 'up' : 'dn';
-  // NO WORD BESIDE IT. "today" needs about ten more pixels than the
-  // margin column has, and the only place to take them from is the
-  // team name -- which ladder_test guards, because an earlier pass
-  // deliberately clawed that gutter back for exactly that column.
-  // Eighty rows each repeating the same word is a poor trade for it.
-  return '<i class="ld-day ' + cls + '">' + sign + txt + '</i>';
+  if (!r) { return ''; }
+  var key = (r.l && (r.l.league_key || r.l.key)) || '';
+  if (!key) { return ''; }
+
+  if (r.cats) {
+    var c = _ldTodayCats(key);
+    // Nothing has turned over today. A nought in a column of eighty
+    // is noise with the shape of information.
+    if (!c) { return ''; }
+    return '<i class="ld-day ' + (c > 0 ? 'up' : 'dn') + '">' +
+      (c > 0 ? '+' : '\u2212') + Math.abs(c) + '</i>';
+  }
+
+  var by = {};
+  try { by = _ldTodayFpByLeague(); } catch (e2) { return ''; }
+  var fp = by[key];
+  if (fp == null || !isFinite(fp)) { return ''; }
+  fp = Math.round(fp * 10) / 10;
+  if (!fp) { return ''; }
+  // POINTS SCORED, NOT A MARGIN. These are my players' points today,
+  // which is the question asked of a season league and the honest
+  // half of the question asked of a weekly one -- the opponent's day
+  // is not in this pass, and inventing a swing out of half of it
+  // would be worse than reporting the half there is.
+  return '<i class="ld-day up">' + fp.toFixed(1) + '</i>';
 }
 
 
