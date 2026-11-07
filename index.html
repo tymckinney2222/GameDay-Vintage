@@ -46940,7 +46940,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = 'bo365 PXAXIS';
+var SK_BUILD = 'bo366 PXSLATE';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo, muteable) {
   var isActive = activeLeague === key;
@@ -109531,6 +109531,29 @@ function _pxWidest(players, sports, minLeagues) {
   return best;
 }
 
+// ------------------------------------------------------------------
+// ONLY THE PLAYERS WHO ARE ACTUALLY PLAYING
+// ------------------------------------------------------------------
+// A benched player with no game today is not a lineup mistake, he is
+// a man on a day off -- and listing him under BENCHED, with a dash
+// where his points should be, reads as an accusation. The slate is
+// the filter: _allInScan already matches every player on every roster
+// to tonight's games by club, so "is he on today's slate" is a set
+// this tab is handed rather than a question it has to ask.
+//
+// The set is built from the SLATE HITS, not from the fantasy rows
+// that follow. A player whose club is playing belongs on this screen
+// even when no provider could price him; hiding him would be hiding a
+// gap in the data behind a statement about his schedule.
+function _pxPlaying(players, on) {
+  if (!on) { return players || []; }
+  var out = [], i;
+  for (i = 0; i < (players || []).length; i++) {
+    if (players[i] && players[i].playing) { out.push(players[i]); }
+  }
+  return out;
+}
+
 // Sport filter. 'all' keeps everything; anything else keeps one sport.
 function _pxFilter(players, sport) {
   if (!sport || sport === 'all') { return players || []; }
@@ -109607,21 +109630,21 @@ var _PX_TONIGHT_TTL = 25000;
 function _pxTonightScan(force) {
   if (!force && _pxTonightCache &&
       (Date.now() - _pxTonightCache.ts) < _PX_TONIGHT_TTL) {
-    return _pxTonightCache.map;
+    return _pxTonightCache;
   }
-  var map = {};
+  var map = {}, slate = {}, nSlate = 0;
   try {
     // Off today the fantasy caches and the slate describe two
     // different days, so the honest answer is no rows at all rather
     // than a figure made of both. Same rule the hub and strip state.
     if (typeof isToday === 'function' && !isToday()) {
-      _pxTonightCache = { ts: Date.now(), map: map };
-      return map;
+      _pxTonightCache = { ts: Date.now(), map: map, slate: slate, n: 0 };
+      return _pxTonightCache;
     }
     if (typeof _allInScan !== 'function' ||
         typeof _fhubRowsForAthlete !== 'function') {
-      _pxTonightCache = { ts: Date.now(), map: map };
-      return map;
+      _pxTonightCache = { ts: Date.now(), map: map, slate: slate, n: 0 };
+      return _pxTonightCache;
     }
     var scan = _allInScan();
     var espIdx = (typeof _espFhubIndex === 'function') ? _espFhubIndex() : null;
@@ -109633,6 +109656,13 @@ function _pxTonightScan(force) {
       if (!sc || !sc.hits || !sc.hits.length) { continue; }
       for (j = 0; j < sc.hits.length; j++) {
         var h = sc.hits[j];
+        var key0 = _pxKey(sc.sport, h.name, normFn);
+        // ON THE SLATE BEFORE ANY ROW IS ASKED FOR. A hit means his
+        // club has a game today, which is the whole of the question
+        // this set answers; whether a provider can then price him is
+        // a different one, and conflating them would quietly hide a
+        // data gap behind a claim about his schedule.
+        if (key0 && !slate[key0]) { slate[key0] = 1; nSlate++; }
         var rows = [];
         try {
           rows = _fhubRowsForAthlete(
@@ -109640,9 +109670,8 @@ function _pxTonightScan(force) {
               gameId: (h.gm && h.gm.g && h.gm.g.id) || null },
             espIdx, extIdx, sc.sport) || [];
         } catch (eR) { rows = []; }
-        if (!rows.length) { continue; }
-        var key = _pxKey(sc.sport, h.name, normFn);
-        if (!key) { continue; }
+        if (!rows.length || !key0) { continue; }
+        var key = key0;
         var ent = map[key];
         if (!ent) {
           ent = map[key] = { fp: null, rows: [], injury: '', state: '' };
@@ -109675,8 +109704,8 @@ function _pxTonightScan(force) {
       }
     }
   } catch (e) {}
-  _pxTonightCache = { ts: Date.now(), map: map };
-  return map;
+  _pxTonightCache = { ts: Date.now(), map: map, slate: slate, n: nSlate };
+  return _pxTonightCache;
 }
 
 // ------------------------------------------------------------------
@@ -109698,6 +109727,7 @@ function _pxBuild(force) {
   var d = _pxCollect(rows, normFn);
   var tn = _pxTonightScan(force);
   var i;
+  d.slateN = tn.n || 0;
   // A NUMERIC HANDLE, not the key. The key folds the player's name,
   // and a folded name can still carry an apostrophe -- O'Reilly --
   // which cannot survive the trip through an inline onclick attribute
@@ -109706,7 +109736,8 @@ function _pxBuild(force) {
   d.byId = {};
   for (i = 0; i < d.players.length; i++) {
     var p = d.players[i];
-    p.tonight = tn[p.key] || null;
+    p.tonight = tn.map[p.key] || null;
+    p.playing = !!tn.slate[p.key];
     p.id = i;
     d.byId[i] = p;
   }
@@ -109742,29 +109773,47 @@ function _pxNum(v) {
 }
 
 // ---- 1. the header -----------------------------------------------
-function _pxHeaderHtml(d, sport) {
-  var shown = _pxFilter(d.players, sport);
+function _pxHeaderHtml(d, sport, shown, slateOn) {
   var pills = _pxSportPills(d.sports), i;
+  var all = _pxFilter(d.players, sport).length;
   var top = shown.length ? shown[0] : null;
   var topBar = top ? _pxBar(top, d.sports) : null;
   var sub = 'Across <b>' + d.leagues + '</b> league' + (d.leagues === 1 ? '' : 's') +
     ' and ' + _pxProvCount(d) + '.';
   if (top && topBar) {
-    sub += ' Your deepest hold is <b>' + skEscape(_pxShortName(top.name)) +
-      '</b>, in <b>' + top.n + ' of ' + topBar.of + '</b> ' +
-      _pxSportLbl(top.sport) + ' leagues.';
+    sub += ' Your deepest hold ' + (slateOn ? 'today ' : '') + 'is <b>' +
+      skEscape(_pxShortName(top.name)) + '</b>, in <b>' + top.n + ' of ' +
+      topBar.of + '</b> ' + _pxSportLbl(top.sport) + ' leagues.';
   }
+  if (!slateOn) {
+    sub += ' <b>Nothing of yours is on today\u2019s slate</b>, so this ' +
+      'is your whole portfolio rather than tonight\u2019s.';
+  }
+  // WHICH LIST IS THIS. The number means two different things either
+  // side of the filter, so it says which one it is rather than
+  // leaving the reader to infer it from a count they cannot check.
+  var cap = slateOn
+    ? ('PLAYING TODAY \u00b7 OF ' + all)
+    : ('PLAYER' + (shown.length === 1 ? '' : 'S') + ' \u00b7 ' + d.spots +
+       ' ROSTER SPOTS');
   var h = '<div class="px-hd">' +
-    '<div class="px-hd-n"><b>' + shown.length + '</b><span>PLAYER' +
-      (shown.length === 1 ? '' : 'S') + ' \u00b7 ' + d.spots + ' ROSTER SPOTS</span></div>' +
+    '<div class="px-hd-n"><b>' + shown.length + '</b><span>' + cap + '</span></div>' +
     '<div class="px-hd-s">' + sub + '</div>' +
     '<div class="px-pills">' +
     '<button class="px-pill' + (sport === 'all' ? ' on' : '') +
-      '" onclick="pxSetSport(\'all\')">ALL<i>' + d.players.length + '</i></button>';
+      '" onclick="pxSetSport(\'all\')">ALL<i>' +
+      _pxPlaying(d.players, slateOn).length + '</i></button>';
+  // EVERY PILL COUNTS THE SAME THING. ALL counted players and the
+  // sport pills counted LEAGUES, so "ALL 76" sat beside "NHL 38"
+  // reading like a breakdown of itself. They all count the men this
+  // tab would actually show you, and a sport with nobody on tonight
+  // drops out rather than offering a pill that leads to an empty list.
   for (i = 0; i < pills.length; i++) {
+    var pn = _pxPlaying(_pxFilter(d.players, pills[i].sport), slateOn).length;
+    if (!pn && sport !== pills[i].sport) { continue; }
     h += '<button class="px-pill' + (sport === pills[i].sport ? ' on' : '') +
       '" onclick="pxSetSport(\'' + skEscape(pills[i].sport) + '\')">' +
-      skEscape(_pxSportLbl(pills[i].sport)) + '<i>' + pills[i].n + '</i></button>';
+      skEscape(_pxSportLbl(pills[i].sport)) + '<i>' + pn + '</i></button>';
   }
   return h + '</div></div>';
 }
@@ -109945,15 +109994,16 @@ function pxRender() {
   var body = document.getElementById('pxBody');
   if (!body) { return; }
   var d = _pxData || _pxBuild(false);
-  if (_pxOpenKey != null && d.byId && d.byId[_pxOpenKey]) {
-    body.innerHTML = _pxSheetHtml(d.byId[_pxOpenKey]);
+  if (_pxOpenKey && d.byKey && d.byKey[_pxOpenKey]) {
+    body.innerHTML = _pxSheetHtml(d.byKey[_pxOpenKey]);
     body.scrollTop = 0;
     return;
   }
   _pxOpenKey = null;
-  var shown = _pxFilter(d.players, _pxSport);
+  var slateOn = d.slateN > 0;
+  var shown = _pxPlaying(_pxFilter(d.players, _pxSport), slateOn);
   body.innerHTML =
-    _pxHeaderHtml(d, _pxSport) +
+    _pxHeaderHtml(d, _pxSport, shown, slateOn) +
     _pxBenchHtml(shown) +
     _pxBlastHtml(shown, d.sports) +
     '<div class="px-eyebrow">EXPOSURE</div>' +
@@ -109964,8 +110014,57 @@ function pxSetSport(s) {
   _pxSport = s; _pxLimit = _PX_PAGE; _pxOpenKey = null; pxRender();
 }
 function pxMore() { _pxLimit += 24; pxRender(); }
-function pxOpenPlayer(i) { _pxOpenKey = i; pxRender(); }
+function pxOpenPlayer(i) {
+  // HELD BY KEY, NOT BY INDEX. A repaint while the warmer is still
+  // bringing leagues in re-sorts the list, and an index would then
+  // point at a different man than the one tapped.
+  var p = _pxData && _pxData.players && _pxData.players[i];
+  _pxOpenKey = p ? p.key : null;
+  pxRender();
+}
 function pxClosePlayer() { _pxOpenKey = null; pxRender(); }
+
+// ------------------------------------------------------------------
+// PXWARM -- the rosters this tab reads are not all there on open
+// ------------------------------------------------------------------
+// _skSearchAllRosters reads whatever is CACHED. Yahoo and ESPN carry
+// their players' names inline, so they are there as soon as the league
+// list is; Sleeper and Fantrax items carry only an id, and the name
+// dictionary is fetched lazily by whichever screen needs it first.
+// Open this tab straight from the drawer and those two providers are
+// simply absent -- the same load-order accident the search box hit,
+// and the same one that made Manager Record depend on having opened
+// Skipper first.
+//
+// _skSearchWarmRosters is the one place that knows the right sequence
+// to kick, so it is called rather than copied. Its own poll watches
+// skSearchOverlay and clears itself on the first tick when that is
+// shut, which is exactly what we want: the kick is shared, the
+// repainting is ours.
+var _pxWarmTimer = null;
+function _pxWarm() {
+  if (_pxWarmTimer) { clearInterval(_pxWarmTimer); _pxWarmTimer = null; }
+  try {
+    if (typeof _skSearchWarmRosters === 'function') { _skSearchWarmRosters(); }
+  } catch (e) {}
+  var tries = 0;
+  _pxWarmTimer = setInterval(function () {
+    tries++;
+    var ov = document.getElementById('pxOverlay');
+    if (!ov || !ov.classList.contains('open') || tries > 20) {
+      clearInterval(_pxWarmTimer); _pxWarmTimer = null; return;
+    }
+    try {
+      // The roster side is a local walk and rebuilds every tick. The
+      // slate side costs a pass over every sport, so it is refreshed
+      // every fourth -- often enough that leagues landing late bring
+      // their rows with them, rarely enough not to run four times a
+      // second.
+      _pxBuild(tries % 4 === 0);
+      pxRender();
+    } catch (e2) {}
+  }, 600);
+}
 
 function openPlayerAxis() {
   var ov = document.getElementById('pxOverlay');
@@ -109973,6 +110072,7 @@ function openPlayerAxis() {
   ov.classList.add('open');
   _pxOpenKey = null; _pxLimit = _PX_PAGE;
   try { _pxBuild(true); } catch (e) { _pxData = null; }
+  try { _pxWarm(); } catch (eW) {}
   try { pxRender(); } catch (e2) {
     var b = document.getElementById('pxBody');
     if (b) {
@@ -109984,6 +110084,7 @@ function openPlayerAxis() {
 function closePlayerAxis() {
   var ov = document.getElementById('pxOverlay');
   if (ov) { ov.classList.remove('open'); }
+  if (_pxWarmTimer) { clearInterval(_pxWarmTimer); _pxWarmTimer = null; }
 }
 
 var _skNightCache = null;
