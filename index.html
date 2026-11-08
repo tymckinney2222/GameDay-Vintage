@@ -33012,6 +33012,17 @@
     margin-top: 8px;
     border-top: 1px solid rgba(255,255,255,0.07);
   }
+  /* NFLWK -- the slot a football player was started in. inline-flex
+     because a bare <span> is display:inline and would ignore the box. */
+  .sk-contrib-slot {
+    display: inline-flex; align-items: center; flex: 0 0 auto;
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 8.5px; font-weight: 700; letter-spacing: 0.04em;
+    color: rgba(255,255,255,0.55);
+    background: rgba(255,255,255,0.07);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 3px; padding: 1px 4px; line-height: 1.35;
+  }
   .sk-contrib-group-label.first {
     border-top: none;
     margin-top: 0;
@@ -46977,7 +46988,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = 'bo389 YTALL';
+var SK_BUILD = 'bo390 NFLWK';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo, muteable) {
   var isActive = activeLeague === key;
@@ -133718,11 +133729,14 @@ function _ldRowHtml(r) {
         r.lineupLabel || 'Lineup', _LD_ICON_LINEUP, r.live);
     }
   } else {
+    // NFLWK -- football gets ONE glyph. Its lineup button now opens
+    // the week sheet, and the second glyph opened that same sheet --
+    // two buttons landing in the same place is worse than one.
     btns = _ldBtnHtml(nfl ? ("skOpenNflLineup('" + key + "')")
                           : ("skOpenTodaySheet('" + key + "')"),
-        'Today\u2019s lineup', _LD_ICON_LINEUP, r.live) +
-      _ldBtnHtml("skOpenTodaySheet('" + key + "','week')",
-        'This week', _LD_ICON_WEEK, 0);
+        nfl ? 'Week lineup' : 'Today\u2019s lineup', _LD_ICON_LINEUP, r.live) +
+      (nfl ? '' : _ldBtnHtml("skOpenTodaySheet('" + key + "','week')",
+        'This week', _LD_ICON_WEEK, 0));
   }
   // No league view to open means no tap target: an external league
   // with neither standings nor matchups has nothing behind the row.
@@ -145395,6 +145409,15 @@ var skTodayState = {
 // than the daily Today snapshot sheet which doesn't fit a weekly sport.
 function skOpenNflLineup(leagueKey) {
   if (!leagueKey) return;
+  // NFLWK -- the week sheet, which is the modal this button always
+  // should have opened. A football CATS league has no week source
+  // worth trusting here, so it keeps the old route to the roster tab
+  // rather than being shown a roll-up built the wrong way.
+  if (typeof _skNflWeekLeague === 'function' && _skNflWeekLeague(leagueKey) &&
+      typeof skOpenTodaySheet === 'function') {
+    skOpenTodaySheet(leagueKey, 'week');
+    return;
+  }
   skOpenDetail(leagueKey);
   if (typeof skSetDetailTab === 'function') skSetDetailTab('roster');
 }
@@ -145409,12 +145432,130 @@ function skOpenNflLineup(leagueKey) {
 // so the entire Today-sheet rendering layer (team colors, hot/cold,
 // batter/pitcher split, opponent toggle) is reused unchanged.
 
+
+// ── NFLWK ── the weekly lineup, for football ─────────────────────
+//
+// Ty: "Would you be able to build me a today's lineup modal, or I
+// guess in this case it would be a weekly lineup modal for NFL
+// leagues? We already have a button but it just routes to the roster
+// page."
+//
+// The button did route to the roster page -- skOpenNflLineup was three
+// lines that opened the detail view and switched a tab. But the modal
+// he is asking for is already built: the Today sheet's WEEK mode, which
+// every other sport's leagues already use.
+//
+// What football needed was not a new modal, it was the right source.
+// The week view rolls a week up by summing the cached DAILY fantasy
+// points, which is exactly right for basketball and hockey and exactly
+// wrong for football: the endpoint Yahoo answers a football week with
+// is the week one, and it is already in this app -- the roster-flag
+// scan has been calling fetchTeamFpForWeek for NFL all along.
+//
+// So this swaps the source for football and leaves the whole rendering
+// layer, the opponent toggle and the header alone.
+
+// Is the sheet currently open on a football league the week view can
+// actually answer? Categories leagues are left out: a football cats
+// league is a rare thing and the cats roll-up has its own day-summing
+// path that this does not touch.
+function _skNflWeekLeague(leagueKey) {
+  var lg = null;
+  try {
+    lg = (fyLeagues || []).find(function (l) { return l.league_key === leagueKey; });
+  } catch (e) { return null; }
+  if (!lg) { return null; }
+  var isNfl = false;
+  try { isNfl = !!_skIsNflLeague(lg); } catch (e2) { isNfl = false; }
+  if (!isNfl) { return null; }
+  var st = String(lg.scoring_type || '');
+  if (st !== 'headpoint' && st !== 'point') { return null; }
+  return lg;
+}
+
+// THE WEEK, FROM THE WEEK ENDPOINT. Returns the same map shape the
+// day-summing path builds, filtered the same way -- active slots only,
+// because that is what the body and the totals below it expect, and
+// what "lineup" means.
+//
+// An empty slot or a player on bye is still an ACTIVE slot scoring
+// nothing, so it stays on the sheet. Those are the rows worth opening
+// this for.
+function _skNflWeekFpMap(teamKey, league) {
+  if (!teamKey || !league) { return Promise.resolve({}); }
+  if (typeof fetchTeamFpForWeek !== 'function') { return Promise.resolve({}); }
+  var cw = parseInt(league.current_week, 10);
+  if (!cw || isNaN(cw)) { return Promise.resolve({}); }
+  return fetchTeamFpForWeek(teamKey, cw, cw).then(function (m) {
+    var out = {};
+    if (!m) { return out; }
+    Object.keys(m).forEach(function (pk) {
+      var e = m[pk];
+      if (!e || pk.charAt(0) === '_') { return; }
+      if (typeof _isActiveSlot === 'function' && !_isActiveSlot(e.selectedPos)) { return; }
+      out[pk] = e;
+    });
+    return out;
+  }, function () { return {}; });
+}
+
+// GROUP HEADINGS, per sport. Four renderers each carried their own copy
+// of the same ternary and all four fell through to baseball, so a
+// football lineup was headed BATTERS. One owner answers it now -- the
+// Yahoo twin of _espGroupLabel, which has had a per-sport map all along.
+//
+// The secondary heading only renders for a sport whose roster splits in
+// two (baseball's pitchers, hockey's goaltenders). It is inert for
+// basketball and football and kept so the shape stays uniform.
+//
+// Football's word is STARTERS, and it is accurate here rather than
+// loose: this sheet is active slots only, by _isActiveSlot.
+var SK_GROUP_LABEL = {
+  mlb: ['Batters', 'Pitchers'],
+  nba: ['Ballers', 'Pitchers'],
+  nhl: ['Skaters', 'Goaltenders'],
+  nfl: ['Starters', 'Pitchers']
+};
+function _skSportGroupLabel(sport, wantSecondary) {
+  var m = SK_GROUP_LABEL[String(sport || '').toLowerCase()] || SK_GROUP_LABEL.mlb;
+  return wantSecondary ? m[1] : m[0];
+}
+
+// THE SLOT, on a football row. A lineup is read as slots -- whether each
+// one is filled and which one is the hole -- and the row carried the
+// player's real NFL team but never the slot he was started in, so a
+// bye-week hole and a quiet flex read exactly alike.
+//
+// Football only. A basketball or hockey row is read as a list of
+// players, and baseball's split heading already says which group a row
+// belongs to.
+function _skNflSlotChip(sport, selectedPos) {
+  if (String(sport || '').toLowerCase() !== 'nfl') { return ''; }
+  var s = String(selectedPos || '').toUpperCase();
+  if (!s) { return ''; }
+  var esc = (typeof skEscape === 'function') ? skEscape
+    : function (x) { return String(x == null ? '' : x); };
+  return '<span class="sk-contrib-slot">' + esc(s) + '</span>';
+}
+
 function _skTodayWeekDatesUpToToday() {
   var today = _todayDateString();
   return _weekDaysForDate(today).filter(function(d) { return d <= today; });
 }
 
 function _skTodayWeekRangeLabel() {
+  // NFLWK -- a football week is "Week 10", not a Monday-to-Sunday date
+  // range. Three places print this label; the owner is made aware of
+  // football rather than each of them.
+  try {
+    var _nl = (typeof _skNflWeekLeague === 'function' &&
+               typeof skTodayState !== 'undefined')
+      ? _skNflWeekLeague(skTodayState.leagueKey) : null;
+    if (_nl) {
+      var _w = parseInt(_nl.current_week, 10);
+      if (_w) { return 'Week ' + _w; }
+    }
+  } catch (eNW) {}
   var MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
   function fmt(dstr) {
     var p = String(dstr).split('-');
@@ -145974,9 +146115,20 @@ async function _skTodayRefresh(isInitial) {
         // sides, then feed the SAME points body the daily view uses.
         // Opp is summed upfront (header pair + instant toggle); no lazy
         // roster enrich needed since the summed maps carry per-day stats.
+        // NFLWK -- football is answered by the WEEK endpoint, not by
+        // summing days. Everything below this is unchanged: the same
+        // map shape, the same body, the same opponent toggle.
+        var _nflLg = (typeof _skNflWeekLeague === 'function')
+          ? _skNflWeekLeague(leagueKey) : null;
         var weekDates = _skTodayWeekDatesUpToToday();
-        var myWkP  = _skWeekSumFpMap(myTeamKey, weekDates);
-        var oppWkP = oppTeamKey ? _skWeekSumFpMap(oppTeamKey, weekDates) : Promise.resolve({});
+        var myWkP, oppWkP;
+        if (_nflLg) {
+          myWkP  = _skNflWeekFpMap(myTeamKey, _nflLg);
+          oppWkP = oppTeamKey ? _skNflWeekFpMap(oppTeamKey, _nflLg) : Promise.resolve({});
+        } else {
+          myWkP  = _skWeekSumFpMap(myTeamKey, weekDates);
+          oppWkP = oppTeamKey ? _skWeekSumFpMap(oppTeamKey, weekDates) : Promise.resolve({});
+        }
         var wkSettP = leagueSettingsCache[leagueKey]
           ? Promise.resolve(leagueSettingsCache[leagueKey])
           : ensureLeagueSettings(leagueKey);
@@ -146622,8 +146774,8 @@ function _skTodayBuildCatsDailyBody(players, statsMeta) {
     }
   });
   // Sport-appropriate group labels.
-  var primaryLabel = sport === 'nba' ? 'Ballers' : (sport === 'nhl' ? 'Skaters' : 'Batters');
-  var secondaryLabel = sport === 'nhl' ? 'Goaltenders' : 'Pitchers';
+  var primaryLabel = _skSportGroupLabel(sport, false);
+  var secondaryLabel = _skSportGroupLabel(sport, true);
   
   // Count of players with real production today (drives header label
   // and tells us whether to render any pace badges at all — a roster
@@ -146780,8 +146932,8 @@ function _skTodayBuildPointsDailyBody(myFpMap, statsMeta) {
       if (slot === 'SP' || slot === 'RP' || slot === 'P') pitchers.push(r); else batters.push(r);
     }
   });
-  var primaryLabel = sport === 'nba' ? 'Ballers' : (sport === 'nhl' ? 'Skaters' : 'Batters');
-  var secondaryLabel = sport === 'nhl' ? 'Goaltenders' : 'Pitchers';
+  var primaryLabel = _skSportGroupLabel(sport, false);
+  var secondaryLabel = _skSportGroupLabel(sport, true);
   // percentile pool (otherwise an all-zero roster trips every player
   // into HOT).
   var producing = rows.filter(function(r) { return r.fp > 0; }).length;
@@ -146810,6 +146962,9 @@ function _skTodayBuildPointsDailyBody(myFpMap, statsMeta) {
   // (which would be skewed by batter-heavy production).
   var renderRow = function(r, groupList) {
     var teamChip = r.teamAbbr ? _skBuildTeamChip(r.teamAbbr) : '';
+    // NFLWK -- the slot he was started in, football only.
+    var slotChip = (typeof _skNflSlotChip === 'function')
+      ? _skNflSlotChip(sport, r.selectedPos) : '';
     var groupProd = groupList.filter(function(x) { return x.fp > 0; }).length;
     var groupProducingRows = groupList.filter(function(x) { return x.fp > 0; });
     var localIdx = groupProducingRows.indexOf(r);
@@ -146843,6 +146998,7 @@ function _skTodayBuildPointsDailyBody(myFpMap, statsMeta) {
       ' onclick="_skTodayOpenPlayerSheet(this.getAttribute(\'data-player-key\'))">' +
       '<div class="sk-cats-contrib-row-main">' +
       '  <div class="sk-contrib-info sk-today-info" style="flex-wrap:wrap;gap:3px;align-items:center">' +
+      slotChip +
       '    <span class="sk-contrib-name sk-today-name">' + skEscape(r.name) + '</span>' +
       teamChip +
       paceBadge +
@@ -151835,8 +151991,8 @@ function skRenderWeekContributors() {
       if (c.isPitcher) pitchers.push(c); else batters.push(c);
     }
   });
-  var _wcPrimary = _wcSport === 'nba' ? 'Ballers' : (_wcSport === 'nhl' ? 'Skaters' : 'Batters');
-  var _wcSecondary = _wcSport === 'nhl' ? 'Goaltenders' : 'Pitchers';
+  var _wcPrimary = _skSportGroupLabel(_wcSport, false);
+  var _wcSecondary = _skSportGroupLabel(_wcSport, true);
   
   // Bar width relative to the top contributor IN THIS GROUP. Without
   // re-scoping max, a great pitcher with 40 FP would render as a tiny
@@ -156238,8 +156394,8 @@ function skRenderCatsWeekContributors() {
       if (c.isPitcher) pitchers.push(c); else batters.push(c);
     }
   });
-  var _ccPrimary = _ccSport === 'nba' ? 'Ballers' : (_ccSport === 'nhl' ? 'Skaters' : 'Batters');
-  var _ccSecondary = _ccSport === 'nhl' ? 'Goaltenders' : 'Pitchers';
+  var _ccPrimary = _skSportGroupLabel(_ccSport, false);
+  var _ccSecondary = _skSportGroupLabel(_ccSport, true);
   
   // Renders a single row — extracted so we can call it twice (batters
   // section, then pitchers) without duplicating markup. groupList is
