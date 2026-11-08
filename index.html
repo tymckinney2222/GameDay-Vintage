@@ -46951,7 +46951,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = 'bo384 SHMAP';
+var SK_BUILD = 'bo385 ESPDAY';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo, muteable) {
   var isActive = activeLeague === key;
@@ -132649,6 +132649,8 @@ function _ldIsCats(r) {
 // endpoint is a Yahoo one, and an external league has no equivalent.
 function _ldDayKeys(r) {
   var key = (r && r.l && r.l.league_key) || '';
+  // Yahoo only, and deliberately: an external row never reaches here
+  // because _ldDayHtml answers it first. ESPDAY
   if (!key || (r && r.ext)) { return null; }
   var d = null;
   try {
@@ -132726,6 +132728,99 @@ function _ldDayNum(v, cls) {
   return '<i class="ld-day ' + cls + '">' + s + '</i>';
 }
 
+
+// ── ESPDAY ── today's number on an ESPN ladder card ───────────────
+//
+// Ty: "that 37 is what I've scored so far today... given that don't we
+// have what we need?"
+//
+// We do, and I had said we did not. The ladder's day line was written
+// to bail on anything external -- `if (r.ext) return null` -- on the
+// reasoning that only the Yahoo side had a per-day figure. That was
+// wrong about this app: the ESPN detail view has been drawing BOTH of
+// these for a while.
+//
+//   H2H points   the MATCHUP FLOW table's last SWING row, which is the
+//                gap's movement over the live day
+//   season pts   the standings' TODAY column
+//
+// So neither number is computed here. The flow table and the today
+// total are the owners, and this reads them -- which is also the only
+// way the card and the league view can be guaranteed to agree.
+//
+// NO FETCHING. Both read rosters already in memory; a league whose
+// rosters have not landed yet returns nothing and picks the line up on
+// the next repaint, exactly as the Yahoo side does.
+
+function _ldEspLeague(key) {
+  if (!key) { return null; }
+  // ONE DEFENCE, NOT TWO. A `typeof extSyncedLeagues === "function"`
+  // guard sat here as well, which is the cold-start case -- the ext
+  // registry loads after the Skipper shell. The catch below already
+  // covers it, and a second guard that cannot be reached is a line no
+  // test can hold honest.
+  var all = [];
+  try { all = extSyncedLeagues() || []; } catch (e) { return null; }
+  var i;
+  for (i = 0; i < all.length; i++) {
+    if (all[i] && all[i].key === key) {
+      // ESPN ONLY. Sleeper and Fantrax reach this row too, and neither
+      // carries pointsByScoringPeriod or a per-player today window --
+      // guessing a number for them would be worse than the blank.
+      return (all[i].provider === 'espn') ? all[i] : null;
+    }
+  }
+  return null;
+}
+
+// What my team has scored today. The same call the standings TODAY
+// column makes, through the same owner.
+function _ldEspToday(l) {
+  if (!l || typeof espMyTeamId !== 'function' ||
+      typeof espTodayTeamTotal !== 'function') { return null; }
+  var id = espMyTeamId(l);
+  if (id == null) { return null; }
+  var v = espTodayTeamTotal(l.rosters, String(id));
+  return (v == null || isNaN(v)) ? null : v;
+}
+
+// How far the gap moved today. Taken from the flow table rather than
+// recomputed, so the card can never disagree with the table.
+//
+// ONLY WHEN THE LAST ROW IS THE LIVE ONE. Before today has any points
+// the series stops at yesterday, and that row's swing is yesterday's
+// movement -- which would sit on the card all morning reading as
+// today's.
+function _ldEspSwing(l) {
+  if (!l || typeof espFlowTable !== 'function') { return null; }
+  var rows = null;
+  try { rows = espFlowTable(l); } catch (e) { return null; }
+  if (!rows || !rows.length) { return null; }
+  var last = rows[rows.length - 1];
+  if (!last || !last.live) { return null; }
+  var v = Number(last.swing);
+  return isNaN(v) ? null : v;
+}
+
+// The day line for an ESPN row, or '' when there is nothing honest to
+// put there.
+function _ldEspDayHtml(r, key) {
+  var l = _ldEspLeague(key);
+  if (!l) { return ''; }
+  if (r.season) {
+    var p = _ldEspToday(l);
+    if (p == null) { return ''; }
+    p = Math.round(p * 10) / 10;
+    if (!p) { return ''; }
+    // A season league has no opponent, so its day is simply what it
+    // scored -- which is the question asked of it anyway.
+    return '<i class="ld-day up">' + p.toFixed(1) + '</i>';
+  }
+  var d = _ldEspSwing(l);
+  if (d == null || !d) { return ''; }
+  return _ldDayNum(d, d > 0 ? 'up' : 'dn');
+}
+
 // The second line under the margin.
 function _ldDayHtml(r) {
   if (!r) { return ''; }
@@ -132738,6 +132833,12 @@ function _ldDayHtml(r) {
     return '<i class="ld-day ' + (c > 0 ? 'up' : 'dn') + '">' +
       (c > 0 ? '+' : '\u2212') + Math.abs(c) + '</i>';
   }
+
+  // ESPDAY -- external rows are not all alike. ESPN publishes a
+  // per-day figure for both formats and the detail view already draws
+  // it; Sleeper and Fantrax do not, and _ldEspLeague returns null for
+  // them so they keep the blank they had.
+  if (r.ext) { return _ldEspDayHtml(r, key); }
 
   var need = _ldDayKeys(r);
   if (!need) { return ''; }
