@@ -47347,7 +47347,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = 'bo400 LEDGER';
+var SK_BUILD = 'bo401 SEATFIX';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo, muteable) {
   var isActive = activeLeague === key;
@@ -150509,6 +150509,32 @@ function _yahooArr(x) {
   return out;
 }
 
+// SEATFIX -- an hour, for an entry that came back half answered.
+var SETTINGS_PARTIAL_TTL_MS = 60 * 60 * 1000;
+
+// Is this entry's playoff block a HALF ANSWER? A start week with no
+// field size is: Yahoo told us when the playoffs begin and not how many
+// get in, which is the one number the bracket needs. A block with
+// NEITHER is not half answered -- a roto or season-points league has no
+// playoffs at all, and that is a complete answer.
+function _skSettingsPartial(entry) {
+  var pl = entry && entry.playoff;
+  if (!pl) { return false; }
+  return pl.startWeek != null && pl.numTeams == null;
+}
+
+// May this cached entry stand? A whole one always may. A half answer
+// may only until the short clock runs out, and only once a real fetch
+// has been back and found the size still missing -- which is what stops
+// an entry cached before this existed from being trusted, and what
+// stops the refetch from looping when Yahoo truly has nothing to give.
+function _skSettingsUsable(entry) {
+  if (!entry) { return false; }
+  if (!_skSettingsPartial(entry)) { return true; }
+  if (!entry.playoff.sizeMissing) { return false; }
+  return (Date.now() - (entry.ts || 0)) < SETTINGS_PARTIAL_TTL_MS;
+}
+
 function _readSettingsFromLS(leagueKey) {
   try {
     var raw = localStorage.getItem(SETTINGS_LS_PREFIX + leagueKey);
@@ -150576,7 +150602,9 @@ async function ensureLeagueSettings(leagueKey) {
       var hasPointModifierField = Object.keys(existing.stats).some(function(sid) {
         return existing.stats[sid] && Object.prototype.hasOwnProperty.call(existing.stats[sid], 'pointModifier');
       });
-      var hasPlayoffField = !!existing.playoff;
+      // SEATFIX -- "a playoff object exists" was the whole test, and a
+      // half-filled one passes it. What matters is whether it answers.
+      var hasPlayoffField = _skSettingsUsable(existing);
       if (hasPointModifierField && hasPlayoffField) return existing;
     }
     delete leagueSettingsCache[leagueKey];
@@ -150588,7 +150616,7 @@ async function ensureLeagueSettings(leagueKey) {
     var lsHasModifier = ls.stats && Object.keys(ls.stats).some(function(sid) {
       return ls.stats[sid] && Object.prototype.hasOwnProperty.call(ls.stats[sid], 'pointModifier');
     });
-    var lsHasPlayoff = !!ls.playoff;
+    var lsHasPlayoff = _skSettingsUsable(ls);
     if (lsHasModifier && lsHasPlayoff) {
       leagueSettingsCache[leagueKey] = ls;
       return ls;
@@ -150811,6 +150839,13 @@ async function ensureLeagueSettings(leagueKey) {
     var statCount = Object.keys(stats).length;
     if (typeof __skDiag !== 'undefined') {
       __skDiag.push({ stage: 'settings:parsed', note: leagueKey + ' \u2014 ' + statCount + ' stats, ' + rosterPositions.length + ' positions, ' + divisions.length + ' divisions (uses=' + usesDivisions + ')' });
+    }
+    // SEATFIX -- a fetch has been and gone. If the block is STILL half
+    // answered, that is Yahoo's answer rather than a load that has not
+    // happened, and saying so is what keeps the retry to once an hour
+    // instead of once a call.
+    if (playoff && playoff.startWeek != null && playoff.numTeams == null) {
+      playoff.sizeMissing = true;
     }
     var entry = {
       stats: stats,
@@ -159526,9 +159561,24 @@ function _ptPanelHtml(league, leagueData) {
   var seats = 0;
   try { seats = _stSeats(league) || 0; } catch (e) { seats = 0; }
   if (!seats) {
+    // SEATFIX -- "try again in a moment" was a promise this could not
+    // keep: where Yahoo does not publish a field size, a moment never
+    // comes. Once a fetch has been back and found none, the panel says
+    // which of the two it is.
+    var _ptKnown = false;
+    try {
+      var _ptSet = leagueSettingsCache[lk];
+      _ptKnown = !!(_ptSet && _ptSet.playoff && _ptSet.playoff.sizeMissing);
+    } catch (eK) { _ptKnown = false; }
     return '<div class="sk-empty-state" style="padding:24px 16px">' +
-      'Yahoo hasn\u2019t given up this league\u2019s playoff size yet. ' +
-      'It arrives with league settings \u2014 try again in a moment.</div>';
+      (_ptKnown
+        ? ('Yahoo publishes no playoff size for this league, so there is ' +
+           'no bracket to draw. Everything else on the league works \u2014 ' +
+           'it is this one number that is missing, and it is checked ' +
+           'again every hour.')
+        : ('Yahoo hasn\u2019t given up this league\u2019s playoff size yet. ' +
+           'It arrives with league settings \u2014 try again in a moment.')) +
+      '</div>';
   }
   // THE SAME TOGGLE AS STANDINGS, not a second one beside it. State
   // lives in skStandingsState, so flipping it on either tab moves both.
