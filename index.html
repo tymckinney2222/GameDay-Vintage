@@ -47347,7 +47347,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = 'bo401 SEATFIX';
+var SK_BUILD = 'bo402 SEATSAY';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo, muteable) {
   var isActive = activeLeague === key;
@@ -150517,6 +150517,60 @@ var SETTINGS_PARTIAL_TTL_MS = 60 * 60 * 1000;
 // get in, which is the one number the bracket needs. A block with
 // NEITHER is not half answered -- a roto or season-points league has no
 // playoffs at all, and that is a complete answer.
+// SEATSAY -- what the last settings fetch for a league did. The
+// failure branch already pushed a line into __skDiag, which no view
+// reads; this is the same fact where the panel can get at it.
+var _skSettingsNote = {};
+
+function _skSettingsSay(leagueKey, state, note) {
+  try {
+    _skSettingsNote[leagueKey] = { state: state, note: note || '',
+      ts: Date.now() };
+  } catch (e) {}
+}
+
+// What the app HOLDS for a league's playoff config, in the four states
+// it can actually be in. The panel drew one sentence for three of them.
+//   none    -- no settings entry: never asked, or the ask failed
+//   partial -- a start week and no field size (the bo401 case)
+//   empty   -- neither field: Yahoo publishes no playoff config at all
+//   ok      -- a field size, so the bracket draws
+function _skSeatState(leagueKey) {
+  var entry = null;
+  try { entry = leagueSettingsCache[leagueKey] || null; } catch (e) {}
+  if (!entry) {
+    var note = _skSettingsNote[leagueKey] || null;
+    return { state: 'none', asked: !!note,
+             why: (note && note.note) || '' };
+  }
+  var pl = entry.playoff || null;
+  if (pl && pl.numTeams != null) { return { state: 'ok', pl: pl }; }
+  if (pl && pl.startWeek != null) {
+    return { state: 'partial', pl: pl, checked: !!pl.sizeMissing };
+  }
+  return { state: 'empty', pl: pl, checked: !!(pl && pl.sizeMissing) };
+}
+
+// The block itself, printed. On a phone with no devtools this line is
+// the whole instrument -- it is what tells the three apart in a
+// screenshot instead of in a guess.
+function _skSeatFacts(leagueKey) {
+  var st = _skSeatState(leagueKey);
+  if (st.state === 'none') {
+    return 'settings: none \u00b7 ' +
+      (st.asked ? ('last fetch failed \u2014 ' + (st.why || 'no reason given'))
+                : 'never fetched for this league');
+  }
+  var pl = st.pl;
+  if (!pl) { return 'settings: yes \u00b7 playoff: absent'; }
+  return 'settings: yes \u00b7 startWeek: ' +
+    (pl.startWeek == null ? 'null' : pl.startWeek) +
+    ' \u00b7 numTeams: ' + (pl.numTeams == null ? 'null' : pl.numTeams) +
+    ' \u00b7 consolation: ' +
+    (pl.consolation == null ? 'null' : pl.consolation) +
+    (pl.sizeMissing ? ' \u00b7 rechecked' : '');
+}
+
 function _skSettingsPartial(entry) {
   var pl = entry && entry.playoff;
   if (!pl) { return false; }
@@ -150630,6 +150684,8 @@ async function ensureLeagueSettings(leagueKey) {
       if (typeof __skDiag !== 'undefined') {
         __skDiag.push({ stage: 'settings:fetch-failed', note: leagueKey + ' \u2014 ' + (data && data.error || 'no data') });
       }
+      // SEATSAY -- and where a view can read it.
+      _skSettingsSay(leagueKey, 'fail', String((data && data.error) || 'no data'));
       return null;
     }
     var stats = {};
@@ -150847,6 +150903,7 @@ async function ensureLeagueSettings(leagueKey) {
     if (playoff && playoff.startWeek != null && playoff.numTeams == null) {
       playoff.sizeMissing = true;
     }
+    _skSettingsSay(leagueKey, 'ok', '');
     var entry = {
       stats: stats,
       statOrder: statOrder,
@@ -150868,6 +150925,7 @@ async function ensureLeagueSettings(leagueKey) {
     }
     return entry;
   } catch (e) {
+    _skSettingsSay(leagueKey, 'fail', String((e && e.message) || e));
     if (typeof __skDiag !== 'undefined') {
       __skDiag.push({ stage: 'settings:exception', note: leagueKey + ' \u2014 ' + (e.message || e) });
     }
@@ -159561,23 +159619,41 @@ function _ptPanelHtml(league, leagueData) {
   var seats = 0;
   try { seats = _stSeats(league) || 0; } catch (e) { seats = 0; }
   if (!seats) {
-    // SEATFIX -- "try again in a moment" was a promise this could not
-    // keep: where Yahoo does not publish a field size, a moment never
-    // comes. Once a fetch has been back and found none, the panel says
-    // which of the two it is.
-    var _ptKnown = false;
-    try {
-      var _ptSet = leagueSettingsCache[lk];
-      _ptKnown = !!(_ptSet && _ptSet.playoff && _ptSet.playoff.sizeMissing);
-    } catch (eK) { _ptKnown = false; }
+    // SEATSAY -- one sentence used to stand for three different
+    // states, which is how a build that fixed one of them looked
+    // exactly like a build that fixed none. Each says what it is, and
+    // the facts line underneath prints the block itself.
+    var _ptSt = { state: 'none', asked: false, why: '' };
+    try { _ptSt = _skSeatState(lk); } catch (eK) {}
+    var _ptMsg;
+    if (_ptSt.state === 'none') {
+      _ptMsg = _ptSt.asked
+        ? ('This league\u2019s settings did not come back from Yahoo, so ' +
+           'there is no field size to build a bracket from. The rest of ' +
+           'the league reads fine because it comes from other calls.')
+        : ('This league\u2019s settings haven\u2019t been fetched yet. ' +
+           'Everything else here comes from other calls, which is why ' +
+           'the rest of the league reads fine.');
+    } else if (_ptSt.state === 'partial') {
+      _ptMsg = 'Yahoo sent this league\u2019s playoff start week but not ' +
+        'how many teams make it, and that one number is what a bracket ' +
+        'is built from.';
+    } else {
+      _ptMsg = 'Yahoo publishes no playoff settings for this league at ' +
+        'all \u2014 no start week and no field size \u2014 so there is ' +
+        'no bracket to draw.';
+    }
+    var _ptFacts = '';
+    try { _ptFacts = _skSeatFacts(lk); } catch (eF) { _ptFacts = ''; }
     return '<div class="sk-empty-state" style="padding:24px 16px">' +
-      (_ptKnown
-        ? ('Yahoo publishes no playoff size for this league, so there is ' +
-           'no bracket to draw. Everything else on the league works \u2014 ' +
-           'it is this one number that is missing, and it is checked ' +
-           'again every hour.')
-        : ('Yahoo hasn\u2019t given up this league\u2019s playoff size yet. ' +
-           'It arrives with league settings \u2014 try again in a moment.')) +
+      _ptMsg +
+      '<div style="margin-top:14px">' +
+        '<button class="fpp-probe-btn" onclick="_ptSeatRetry(\'' + lk +
+          '\')">Check Yahoo again</button>' +
+      '</div>' +
+      '<div style="margin-top:12px;font-family:var(--sk-font-mono,monospace);' +
+        'font-size:10px;letter-spacing:0.04em;opacity:0.6;' +
+        'word-break:break-word">' + _ptFacts + '</div>' +
       '</div>';
   }
   // THE SAME TOGGLE AS STANDINGS, not a second one beside it. State
@@ -159646,6 +159722,23 @@ function _ptWarm(league) {
     var el = document.getElementById('skPtreeBody');
     if (el) { el.innerHTML = _ptPanelHtml(league, skLeagueData[league.league_key] || {}); }
   })['catch'](function () {});
+}
+
+// SEATSAY -- drop everything cached for this league's settings and go
+// back to Yahoo, then repaint. The caches are the whole reason a stale
+// or half answer can outlive the thing that caused it, so the button
+// that says "check again" has to clear them rather than re-read them.
+function _ptSeatRetry(leagueKey) {
+  var el = document.getElementById('skPtreeBody');
+  if (el) {
+    el.innerHTML = '<div class="sk-empty-state" style="padding:24px 16px">' +
+      'Asking Yahoo\u2026</div>';
+  }
+  try { delete leagueSettingsCache[leagueKey]; } catch (e) {}
+  try { localStorage.removeItem(SETTINGS_LS_PREFIX + leagueKey); } catch (e2) {}
+  try { delete _skSettingsNote[leagueKey]; } catch (e3) {}
+  ensureLeagueSettings(leagueKey)['catch'](function () { return null; })
+    .then(function () { _ptRepaint(leagueKey); });
 }
 
 // Called by skSetStandingsView so one toggle moves both surfaces.
