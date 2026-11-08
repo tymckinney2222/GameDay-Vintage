@@ -145410,9 +145410,8 @@ var skTodayState = {
 function skOpenNflLineup(leagueKey) {
   if (!leagueKey) return;
   // NFLWK -- the week sheet, which is the modal this button always
-  // should have opened. A football CATS league has no week source
-  // worth trusting here, so it keeps the old route to the roster tab
-  // rather than being shown a roll-up built the wrong way.
+  // should have opened. Every football league qualifies; the roster
+  // route below is only the fallback for a league this cannot find.
   if (typeof _skNflWeekLeague === 'function' && _skNflWeekLeague(leagueKey) &&
       typeof skOpenTodaySheet === 'function') {
     skOpenTodaySheet(leagueKey, 'week');
@@ -145455,10 +145454,19 @@ function skOpenNflLineup(leagueKey) {
 // So this swaps the source for football and leaves the whole rendering
 // layer, the opponent toggle and the header alone.
 
-// Is the sheet currently open on a football league the week view can
-// actually answer? Categories leagues are left out: a football cats
-// league is a rare thing and the cats roll-up has its own day-summing
-// path that this does not touch.
+// Is the sheet open on a football league? EVERY football league is one
+// this can answer, because FOOTBALL IS NEVER CATEGORICAL -- the app has
+// owned that answer all along in _skIsCatsLeague, which returns false
+// for NFL whatever scoring_type reads, and in _skIsPointsH2HLeague,
+// which reads an NFL league scored 'head' as points for that same
+// reason.
+//
+// This first shipped with a hand-rolled scoring_type check that let
+// 'headpoint' and 'point' through and nothing else. A Yahoo football
+// H2H league reports 'head', so every one of them fell back to the
+// roster page -- the exact bug the button was built to fix. Re-deriving
+// an answer the app already owns is what caused it; asking the owner is
+// the fix.
 function _skNflWeekLeague(leagueKey) {
   var lg = null;
   try {
@@ -145467,10 +145475,7 @@ function _skNflWeekLeague(leagueKey) {
   if (!lg) { return null; }
   var isNfl = false;
   try { isNfl = !!_skIsNflLeague(lg); } catch (e2) { isNfl = false; }
-  if (!isNfl) { return null; }
-  var st = String(lg.scoring_type || '');
-  if (st !== 'headpoint' && st !== 'point') { return null; }
-  return lg;
+  return isNfl ? lg : null;
 }
 
 // THE WEEK, FROM THE WEEK ENDPOINT. Returns the same map shape the
@@ -146009,7 +146014,22 @@ async function _skTodayRefresh(isInitial) {
   }
 
   try {
-    if (scoringType === 'head' || scoringType === 'headone') {
+    // NFLWK -- the owner decides, not scoring_type. Football is never
+    // categorical, so an NFL league scored 'head' is a POINTS league
+    // and belongs in the branch below.
+    var _lgT = null;
+    try { _lgT = (fyLeagues || []).find(function (l) { return l.league_key === leagueKey; }); }
+    catch (eLT) { _lgT = null; }
+    var _isCatsT = (_lgT && typeof _skIsCatsLeague === 'function')
+      ? !!_skIsCatsLeague(_lgT)
+      : (scoringType === 'head' || scoringType === 'headone');
+    // ...and the points branch is the same question answered the other
+    // way. Roto is deliberately untouched: it matched neither branch
+    // before this and still does.
+    var _isPointsT = (_lgT && typeof _skIsPointsH2HLeague === 'function' &&
+                      _skIsPointsH2HLeague(_lgT)) ||
+                     scoringType === 'headpoint' || scoringType === 'point';
+    if (_isCatsT) {
       if (skTodayState.mode === 'week') {
         // CATS WEEK ROLL-UP — sum each active-slot day's per-player
         // cat stats Mon..today, then feed the SAME cats body the daily
@@ -146109,7 +146129,7 @@ async function _skTodayRefresh(isInitial) {
       };
       _skTodayRenderBody(isInitial);
 
-    } else if (scoringType === 'headpoint' || scoringType === 'point') {
+    } else if (_isPointsT) {
       if (skTodayState.mode === 'week') {
         // WEEK ROLL-UP — sum each active-slot day Mon..today for both
         // sides, then feed the SAME points body the daily view uses.
