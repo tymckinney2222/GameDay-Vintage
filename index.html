@@ -46988,7 +46988,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = 'bo390 NFLWK';
+var SK_BUILD = 'bo391 GRIDFB';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo, muteable) {
   var isActive = activeLeague === key;
@@ -145948,7 +145948,9 @@ function _skTodayModeToggleHtml() {
   try {
     var sport = (typeof _skActiveSport === 'function') ? _skActiveSport() : '';
     sport = String(sport || '').toLowerCase();
-    if (sport !== 'nba' && sport !== 'nhl') { return ''; }
+    // GRIDFB -- the same question, so the same owner. A sheet that drew
+    // a table with no way back to the cards would be a trap.
+    if (!_skTodaySportHasTable(sport)) { return ''; }
     if (typeof _rgMode !== 'function') { return ''; }
     var t = (_rgMode() === 'table');
     return '<div class="sk-today-side-toggle sk-today-rgmode">' +
@@ -146640,6 +146642,63 @@ function _skTodayLeadHtml(title, dateLabel, active, producing) {
     '</div></div>';
 }
 
+
+// ── GRIDFB ── the table, for Yahoo football ──────────────────────
+//
+// Ty: "Can you make the yahoo modals for NFL look like the ones that
+// ESPN leagues have... I really like the tables as they are easier to
+// read."
+//
+// The table he is pointing at is this app's own. ESPN's lineup draws it
+// through _erTable and the Yahoo sheet draws it through _rgTable, and
+// both wear the same rg- styles -- so football was not missing a
+// renderer, it was being refused by one. Two places said the same
+// thing, in the same words, for the same wrong reason:
+//
+//   if (sport !== 'nba' && sport !== 'nhl') { return ''; }
+//
+// That was written when the grid was a CATEGORIES device, and football
+// is never categorical. But what _rgTable actually needs is a stat set
+// and a map of figures, which a Yahoo football points league has as
+// surely as a hockey one does. The refusal outlived its reason.
+//
+// One owner answers it now, rather than a third copy of the ternary.
+function _skTodaySportHasTable(sport) {
+  var s = String(sport || '').toLowerCase();
+  return s === 'nba' || s === 'nhl' || s === 'nfl';
+}
+
+// A FOOTBALL LINEUP READS IN SLOT ORDER -- QB, the runners, the
+// receivers, the flex, the kicker, the defence -- which is how the
+// reference reads and how the position chips are worth scanning. The
+// other sports keep the figure-first order they have: everybody there
+// plays the same night, so the biggest number is the most interesting
+// row.
+//
+// Football does not work that way. Nineteen starters play across
+// Thursday, Sunday and Monday, so sorting by points sorts by WHO HAS
+// PLAYED -- the table reshuffles under you every day of the week and
+// the empty slot you opened it to find has moved again.
+//
+// _skNflSlotRank is the app's own slot order and already carries the
+// IDP positions, which this league has.
+function _skNflGridSort(players) {
+  if (!players || !players.length) { return players; }
+  if (typeof _skNflSlotRank !== 'function') { return players; }
+  players.sort(function (a, b) {
+    var ra = _skNflSlotRank(String((a && a.selectedPos) || '').toUpperCase());
+    var rb = _skNflSlotRank(String((b && b.selectedPos) || '').toUpperCase());
+    if (ra !== rb) { return ra - rb; }
+    // Within one slot -- two RBs, three receivers -- the better week
+    // leads, which is the only ordering left worth having.
+    var fa = (a && a._gridFp != null) ? Number(a._gridFp) : -1e9;
+    var fb = (b && b._gridFp != null) ? Number(b._gridFp) : -1e9;
+    if (fb !== fa) { return fb - fa; }
+    return String((a && a.name) || '').localeCompare(String((b && b.name) || ''));
+  });
+  return players;
+}
+
 function _skTodayGridHtml(rows, statsMeta, isPts, label) {
   try {
     if (typeof _rgMode !== 'function' || _rgMode() !== 'table') { return ''; }
@@ -146647,9 +146706,11 @@ function _skTodayGridHtml(rows, statsMeta, isPts, label) {
     if (!rows || !rows.length || !statsMeta) { return ''; }
     var sport = (typeof _skActiveSport === 'function') ? _skActiveSport() : '';
     sport = String(sport || '').toLowerCase();
-    // The grid is built for category sports and refuses the others in
-    // _rgContext; asking it here keeps the two answers the same.
-    if (sport !== 'nba' && sport !== 'nhl') { return ''; }
+    // GRIDFB -- one owner says which sports this sheet tabulates. The
+    // refusal here read "nba or nhl" because the grid began as a
+    // CATEGORIES device; what it actually needs is a stat set and a map
+    // of figures, which a Yahoo football points league has too.
+    if (!_skTodaySportHasTable(sport)) { return ''; }
 
     var players = [], byKey = {}, started = 0, i, r, st, hasAny;
     for (i = 0; i < rows.length; i++) {
@@ -146674,6 +146735,14 @@ function _skTodayGridHtml(rows, statsMeta, isPts, label) {
       }
     }
     if (!players.length) { return ''; }
+    // GRIDFB -- football reads in slot order; see _skNflGridSort.
+    if (sport === 'nfl' && typeof _skNflGridSort === 'function') {
+      for (i = 0; i < players.length; i++) {
+        var _pr = byKey[players[i].playerKey];
+        players[i]._gridFp = _pr ? _pr.fp : null;
+      }
+      _skNflGridSort(players);
+    }
 
     var ord = null;
     try {
@@ -189808,7 +189877,7 @@ function _rgIsKeeper(p, sport) {
 
 // The columns this set of players actually has values for, in the
 // league's own order. A category nobody has posted is not a column.
-function _rgCols(rows, byKey, meta, ord) {
+function _rgCols(rows, byKey, meta, ord, wantAll) {
   var ids = (ord && ord.length) ? ord.slice() : Object.keys(meta || {});
   var out = [], played = [], i, j;
   for (i = 0; i < ids.length; i++) {
@@ -189843,6 +189912,12 @@ function _rgCols(rows, byKey, meta, ord) {
   // played, prefer the narrower set -- an opening night of five played
   // categories should not be padded out to eleven - but never return
   // nothing while the league plainly has categories to show.
+  // GRIDFB -- except in football, where narrowing to what has been
+  // posted narrows to WHO HAS PLAYED. Nineteen starters play across
+  // Thursday, Sunday and Monday, so the table would change shape every
+  // day of the week and the Thursday game would decide its columns.
+  // The league's own stat set is the honest answer there.
+  if (wantAll) { return out; }
   return played.length ? played : out;
 }
 
@@ -190030,7 +190105,8 @@ function _rgTable(rows, byKey, meta, ord, sport, opts) {
   // says what has been put up so far. On a morning with nothing played
   // that is a full table of em-dashes, rather than no table at all.
   var shapeBy = (opts && opts.shapeBy) || byKey;
-  var cols = _rgCols(rows, shapeBy, meta, ord);
+  var cols = _rgCols(rows, shapeBy, meta, ord,
+    String(sport || '').toLowerCase() === 'nfl');
   if (!cols.length || !rows.length) { return ''; }
   var best = {}, c, r;
   for (c = 0; c < cols.length; c++) {
