@@ -47046,7 +47046,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = 'bo392 CLOCK';
+var SK_BUILD = 'bo393 CLOCKFB';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo, muteable) {
   var isActive = activeLeague === key;
@@ -139451,7 +139451,7 @@ function _skWireNflSchedule() {
 function _skWireNflBuildStates(list, win) {
   // gameOf: club -> a key for the game it is in, so callers can count
   // GAMES rather than clubs. Two starters in one game is one game left.
-  var out = { byTeam: {}, gameOf: {}, lastFinal: '', nextKick: null,
+  var out = { byTeam: {}, gameOf: {}, kickOf: {}, lastFinal: '', nextKick: null,
     anyLive: false, anyPre: false, games: 0 };
   if (!list || !list.length) return out;
   function ds(x) {
@@ -139481,6 +139481,10 @@ function _skWireNflBuildStates(list, win) {
       if (!ab) continue;
       ab = String(ab).toUpperCase();
       out.byTeam[ab] = state;
+      // CLOCKFB -- and the KICKOFF, which was in hand here and dropped.
+      // nextKick answers "when is the next one" for the whole side; a
+      // view that groups men by window needs it per club.
+      out.kickOf[ab] = gd.getTime();
       var gkey = String(g.id || (gds + '|' +
         ((g.away && g.away.abbr) || '?') + '@' + ((g.home && g.home.abbr) || '?')));
       out.gameOf[ab] = gkey;
@@ -139488,7 +139492,10 @@ function _skWireNflBuildStates(list, win) {
       // different APIs and don't always agree, so both spellings go in.
       if (typeof _skNormalizeTeamAbbr === 'function') {
         var nb = String(_skNormalizeTeamAbbr(ab) || '').toUpperCase();
-        if (nb && nb !== ab) { out.byTeam[nb] = state; out.gameOf[nb] = gkey; }
+        if (nb && nb !== ab) {
+          out.byTeam[nb] = state; out.gameOf[nb] = gkey;
+          out.kickOf[nb] = gd.getTime();
+        }
       }
     }
   }
@@ -146982,6 +146989,42 @@ function _skClockVerdict(mine, theirs, oppLeft) {
 var _skClockRangeCache = {};
 var _skClockRangeInflight = {};
 
+// CLOCKFB -- the Wire's football week, in the shape this view reads.
+// Nothing is fetched here: the schedule is already in hand, cached and
+// keyed by club, and this only turns byTeam/kickOf into the per-club
+// list of games the bands walk.
+function _skClockSetFromNflWeek(sch) {
+  var set = {};
+  if (!sch || !sch.byTeam) { return set; }
+  Object.keys(sch.byTeam).forEach(function (club) {
+    var st = sch.byTeam[club];
+    if (!st) { return; }
+    var ms = sch.kickOf ? sch.kickOf[club] : null;
+    var iso = '';
+    try { if (ms != null) { iso = new Date(ms).toISOString(); } } catch (e) { iso = ''; }
+    set[String(club).toUpperCase()] = [{ st: st, iso: iso }];
+  });
+  return set;
+}
+
+// Every YYYYMMDD from a to b inclusive, which is how this endpoint wants
+// to be asked.
+function _skClockDaysBetween(a, b) {
+  var out = [];
+  try {
+    var d = new Date(a + 'T12:00:00');
+    var end = new Date(b + 'T12:00:00');
+    if (isNaN(d.getTime()) || isNaN(end.getTime())) { return out; }
+    var guard = 0;
+    while (d.getTime() <= end.getTime() && guard++ < 40) {
+      out.push(d.getFullYear() + String(d.getMonth() + 1).padStart(2, '0') +
+               String(d.getDate()).padStart(2, '0'));
+      d.setDate(d.getDate() + 1);
+    }
+  } catch (e2) {}
+  return out;
+}
+
 function _skClockRangeKey(sport, a, b) {
   return String(sport || '').toLowerCase() + '|' + a + '|' + b;
 }
@@ -147006,21 +147049,48 @@ function _skClockRangeLoad(sport, a, b) {
   var da = _skClockDs(a), db = _skClockDs(b);
   if (!da || !db) { return; }
   _skClockRangeInflight[ck] = 1;
-  fetch('https://site.api.espn.com/apis/site/v2/sports/' + cfg.sport + '/' +
-        cfg.slug + '/scoreboard?dates=' + da + '-' + db + '&limit=400')
-    .then(function (r) { return r.ok ? r.json() : null; })
-    .then(function (data) {
-      _skClockRangeCache[ck] = { set: _skClockParseEvents(sp, data), ts: Date.now() };
-      delete _skClockRangeInflight[ck];
-      if (typeof _skTodayRenderBody === 'function') {
-        try { _skTodayRenderBody(false); } catch (e) {}
-      }
-    })
-    .catch(function () {
-      // Left uncached on purpose, exactly as the day loader does: a
-      // failed fetch should be retried, not remembered as "no games".
-      delete _skClockRangeInflight[ck];
-    });
+  // CLOCKFB -- ONE REQUEST PER DAY, not a date range. The range form is
+  // rejected by this endpoint with HTTP 400; the Wire's football
+  // schedule carries a comment saying exactly that, and this asked for
+  // a range anyway. Seven small calls beat one clever call the server
+  // refuses, and the cache means a week is fetched once either way.
+  var days = _skClockDaysBetween(a, b);
+  var set = {}, errs = 0, idx = 0;
+  function _ckLane() {
+    if (idx >= days.length) { return Promise.resolve(); }
+    var ds = days[idx++];
+    return fetch('https://site.api.espn.com/apis/site/v2/sports/' + cfg.sport +
+                 '/' + cfg.slug + '/scoreboard?dates=' + ds + '&limit=300')
+      .then(function (r) {
+        // A NON-OK RESPONSE IS NOT AN EMPTY DAY. Reading it as one is
+        // what wrote a whole week of "no game" into the cache and left
+        // it there.
+        if (!r.ok) { throw new Error('HTTP ' + r.status); }
+        return r.json();
+      })
+      .then(function (j) {
+        var one = _skClockParseEvents(sp, j);
+        Object.keys(one).forEach(function (k) {
+          if (!set[k]) { set[k] = []; }
+          set[k] = set[k].concat(one[k]);
+        });
+      })
+      .catch(function () { errs++; })
+      .then(_ckLane);
+  }
+  var lanes = [];
+  for (var L = 0; L < 3 && L < days.length; L++) { lanes.push(_ckLane()); }
+  Promise.all(lanes).then(function () {
+    delete _skClockRangeInflight[ck];
+    // A clean sweep of failures is a failure, and is left uncached so
+    // the next open retries. One bad day out of seven is not: a partial
+    // week beats no week.
+    if (errs >= days.length) { return; }
+    _skClockRangeCache[ck] = { set: set, ts: Date.now() };
+    if (typeof _skTodayRenderBody === 'function') {
+      try { _skTodayRenderBody(false); } catch (e) {}
+    }
+  });
 }
 
 function _skClockStore(sport, weekMode) {
@@ -147031,6 +147101,21 @@ function _skClockStore(sport, weekMode) {
     var hit = (typeof _skPlayTodayCache !== 'undefined') ? _skPlayTodayCache[ck] : null;
     if (!hit && typeof _skPlayTodayLoad === 'function') { _skPlayTodayLoad(sp); }
     return hit || null;
+  }
+  // CLOCKFB -- FOOTBALL'S WEEK HAS AN OWNER, and it is the one behind
+  // the Wire's who's-left sheet. It fetches a day at a time because the
+  // range form is rejected, it caches, it backs off after a failure, and
+  // it maps Yahoo's club spellings onto ESPN's. All of that was already
+  // written and this view was reinventing it badly.
+  if (sp === 'nfl') {
+    if (typeof _skWireNflSchedule !== 'function') { return null; }
+    var sch = null;
+    try { sch = _skWireNflSchedule(); } catch (eW) { sch = null; }
+    // Null means loading or failed. Either way it is NOT "no games" --
+    // falling through to the body that was already there beats drawing a
+    // week in which nobody plays.
+    if (!sch || !sch.games) { return null; }
+    return { set: _skClockSetFromNflWeek(sch) };
   }
   if (typeof _weekDaysForDate !== 'function' || typeof _todayDateString !== 'function') {
     return null;
