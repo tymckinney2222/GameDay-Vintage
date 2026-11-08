@@ -33012,6 +33012,21 @@
     margin-top: 8px;
     border-top: 1px solid rgba(255,255,255,0.07);
   }
+  /* CATDUEL -- a row is a category, so the figure is the headline and
+     the verdict is a word rather than a margin: a margin of 7 rebounds
+     and a margin of 7 points are not the same claim. */
+  .sk-dc-v {
+    font-family: var(--sk-font-mono, monospace); font-size: 14px;
+    font-weight: 700; color: var(--sk-text-2);
+  }
+  .sk-dc-v.win { color: var(--sk-text-1); }
+  .sk-dc-row .sk-du-side.l { text-align: left; }
+  .sk-dc-row .sk-du-side.r { text-align: right; }
+  .sk-dc-low {
+    font-style: normal; font-size: 7.5px; opacity: 0.75; margin-left: 2px;
+  }
+  .sk-dc .sk-du-edge { font-size: 8.5px; letter-spacing: 0.08em; }
+  .sk-du-f.lose { opacity: 0.32; }
   /* DUEL -- slot against slot. Colour says which SIDE; the edge number
      says who is ahead. Colouring the trailing bar grey made a real ten
      points look like nothing beside a fifteen. */
@@ -47115,7 +47130,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = 'bo394 DUEL';
+var SK_BUILD = 'bo395 CATDUEL';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo, muteable) {
   var isActive = activeLeague === key;
@@ -146135,8 +146150,25 @@ function _skTodayRenderBody(resetScroll) {
       var _duOpp = _skClockRows(bd, 'opp');
       var _duM = (skTodayState.matchup && skTodayState.matchup.myTeamName) || 'You';
       var _duO = (skTodayState.matchup && skTodayState.matchup.oppTeamName) || 'Opponent';
-      _duHtml = _skDuelHtml(_duMine, _duOpp, _duSport, _duM, _duO,
-        (skTodayState.mode === 'week') ? _skTodayWeekRangeLabel() : _skTodayLabel()) || '';
+      var _duLbl = (skTodayState.mode === 'week')
+        ? _skTodayWeekRangeLabel() : _skTodayLabel();
+      // CATDUEL -- which duel depends on what the league scores. Same
+      // shell, same shape on screen; a row is a category rather than a
+      // slot, because that is what a cats matchup is actually made of.
+      if (bd.kind === 'cats' && typeof _skDuelCatsHtml === 'function') {
+        var _duMeta = bd.statsMeta || {};
+        var _duOrd = null;
+        try {
+          var _duSet = leagueSettingsCache[skTodayState.leagueKey];
+          if (_duSet && typeof _skSeasonCatOrder === 'function') {
+            _duOrd = _skSeasonCatOrder(_duSet, _duMeta);
+          }
+        } catch (eDO) { _duOrd = null; }
+        _duHtml = _skDuelCatsHtml(_duMine, _duOpp, _duMeta, _duOrd,
+          _duM, _duO, _duLbl) || '';
+      } else {
+        _duHtml = _skDuelHtml(_duMine, _duOpp, _duSport, _duM, _duO, _duLbl) || '';
+      }
     }
   } catch (eDU) { _duHtml = ''; }
   if (_duHtml) {
@@ -147259,10 +147291,14 @@ function _skClockRows(bd, side) {
       if (!p || !p.playerKey) { continue; }
       if (typeof _isActiveSlot === 'function' && !_isActiveSlot(p.selectedPos)) { continue; }
       out.push({ playerKey: p.playerKey, name: p.name, teamAbbr: p.teamAbbr,
-                 selectedPos: p.selectedPos, fp: (p.fp == null ? 0 : p.fp) });
+                 selectedPos: p.selectedPos, fp: (p.fp == null ? 0 : p.fp),
+                 stats: p.stats || null });
     }
     return out;
   }
+  // CATDUEL -- a cats roster carries `stats` per man, and the category
+  // engine sums those. The array branch above already returns them;
+  // this is the points shape, which carries a figure instead.
   var map = (side === 'opp') ? bd.oppFpMap : bd.myFpMap;
   if (!map) { return out; }
   Object.keys(map).forEach(function (pk) {
@@ -147500,14 +147536,9 @@ function _skDuelAvailable(bd) {
   try {
     if (!skTodayState || !skTodayState.matchup) { return false; }
     if (!skTodayState.matchup.oppTeamKey) { return false; }
-    if (bd && bd.kind === 'cats') { return false; }
-    if (!bd) {
-      var lg = (typeof _skLeagueObjFor === 'function')
-        ? _skLeagueObjFor(skTodayState.leagueKey) : null;
-      if (lg && typeof _skIsCatsLeague === 'function' && _skIsCatsLeague(lg)) {
-        return false;
-      }
-    }
+    // CATDUEL -- a cats league duels too now. Its rows are categories
+    // rather than men, which is a different engine behind the same
+    // shell; what both need is simply an opponent.
     return true;
   } catch (e) { return false; }
 }
@@ -147603,6 +147634,277 @@ function _skDuelHtml(myRows, oppRows, sport, myName, oppName, scopeLabel) {
     '<div class="sk-du-sum">' + summary + '</div>' + rows +
     (scopeLabel ? ('<div class="sk-du-foot">' + esc(scopeLabel) +
       ' \u00b7 best against best within each slot</div>') : '') +
+  '</div>';
+}
+
+
+
+// ── CATDUEL ── the duel, for categories ──────────────────────────
+//
+// A cats matchup is not man against man and never was. You do not win
+// it by having a better centre than his centre -- you win it by taking
+// more categories, and the only question worth opening the sheet for is
+// WHICH ones you are taking and which are close enough to chase.
+//
+// So the row unit changes. In a points league a row is a slot; here a
+// row is a CATEGORY, and both sides of it are a figure in that
+// category's own unit.
+
+// Sum one side's active men, category by category.
+//
+// A COUNTING STAT ADDS UP AND A RATE DOES NOT. Adding nine field-goal
+// percentages gives a number with no meaning, so a rate is derived from
+// the summed MAKES and ATTEMPTS where the league's basis is known, and
+// is left absent where it is not. An absent row says "not at this
+// scope"; a summed one would say something false.
+function _skDuelCatSums(rows, statsMeta) {
+  var out = { sum: {}, has: {} };
+  if (!rows || !rows.length || !statsMeta) { return out; }
+  for (var i = 0; i < rows.length; i++) {
+    var st = rows[i] && rows[i].stats;
+    if (!st) { continue; }
+    for (var sid in st) {
+      if (!st.hasOwnProperty(sid)) { continue; }
+      var v = Number(st[sid]);
+      if (st[sid] == null || st[sid] === '' || isNaN(v)) { continue; }
+      out.sum[sid] = (out.sum[sid] || 0) + v;
+      out.has[sid] = 1;
+    }
+  }
+  return out;
+}
+
+// The stat id carrying a given abbreviation, which is how a rate finds
+// its own makes and attempts in a league that numbers them its own way.
+function _skDuelSidFor(statsMeta, abbr) {
+  if (!statsMeta || !abbr) { return null; }
+  var want = String(abbr).toUpperCase();
+  for (var sid in statsMeta) {
+    if (!statsMeta.hasOwnProperty(sid)) { continue; }
+    var m = statsMeta[sid];
+    var a = ((m && (m.abbr || m.displayName)) || '') + '';
+    if (a.toUpperCase() === want) { return sid; }
+  }
+  return null;
+}
+
+// One side's value in one category: a sum for a counting stat, a
+// derived rate where the basis is known, null where neither applies.
+function _skDuelCatValue(acc, sid, meta, statsMeta) {
+  var abbr = ((meta && (meta.abbr || meta.displayName)) || '') + '';
+  var basis = (typeof SK_CAT_RATE_BASIS !== 'undefined')
+    ? SK_CAT_RATE_BASIS[abbr.toUpperCase()] : null;
+  if (basis) {
+    var mSid = _skDuelSidFor(statsMeta, basis[0]);
+    var aSid = _skDuelSidFor(statsMeta, basis[1]);
+    if (mSid == null || aSid == null) { return null; }
+    var made = acc.sum[mSid], att = acc.sum[aSid];
+    if (att == null || !att) { return null; }
+    return made / att;
+  }
+  if (_skDuelCatIsRate(abbr)) {
+    // A rate with no basis this league exposes. Absent, not invented.
+    return null;
+  }
+  return acc.has[sid] ? acc.sum[sid] : 0;
+}
+
+// IS THIS A RATE? Deliberately NOT _skIsCountingCatStat, which answers
+// no for anything with sortOrder 0 -- and sortOrder 0 means LOWER WINS,
+// not "is a rate". Turnovers and goals against are counting stats you
+// want fewer of; asking that owner dropped the turnover category off
+// the sheet entirely.
+//
+// Summability is about the unit, so the unit is what gets asked: a
+// known rate abbreviation, or one carrying a per-sign.
+function _skDuelCatIsRate(abbr) {
+  var a = String(abbr || '').toUpperCase().trim();
+  if (!a) { return false; }
+  if (typeof SK_KNOWN_RATE_STAT_ABBRS !== 'undefined' &&
+      SK_KNOWN_RATE_STAT_ABBRS[a]) { return true; }
+  if (a.indexOf('%') > -1 || a.indexOf('/') > -1) { return true; }
+  return a === 'AVG' || a === 'PCT' || a === 'RATE';
+}
+
+// WHO IS TAKING THIS CATEGORY. The lower-wins rule -- ERA, WHIP,
+// turnovers, goals against -- has an owner in _skCatWinner, so the
+// comparison is handed to it rather than written again.
+//
+// ABSENT IS NOT NOUGHT, though, and that part is handled here first.
+// _skCatWinner reads a null as a zero, which is right where Yahoo omits
+// a stat it scored as nothing, and wrong for a rate this scope cannot
+// derive: nought-all would be reported as a tie in a category neither
+// side has actually drawn.
+function _skDuelCatWinner(meta, mine, theirs) {
+  if (mine == null || theirs == null) { return 'none'; }
+  if (typeof _skCatWinner !== 'function') {
+    if (mine === theirs) { return 'level'; }
+    return ((meta && meta.sortOrder === 0) ? (mine < theirs) : (mine > theirs))
+      ? 'me' : 'them';
+  }
+  var w = _skCatWinner(mine, theirs, meta);
+  if (w === 'me') { return 'me'; }
+  if (w === 'opp') { return 'them'; }
+  if (w === 'tie') { return 'level'; }
+  return 'none';
+}
+
+// Every scored category in the league's own order, with both sides'
+// figures and who is taking it.
+function _skDuelCatRows(myRows, oppRows, statsMeta, ord) {
+  var out = [];
+  if (!statsMeta) { return out; }
+  var mine = _skDuelCatSums(myRows, statsMeta);
+  var theirs = _skDuelCatSums(oppRows, statsMeta);
+  var ids = (ord && ord.length) ? ord.slice() : Object.keys(statsMeta);
+  for (var i = 0; i < ids.length; i++) {
+    var sid = String(ids[i]);
+    var meta = statsMeta[sid];
+    if (!meta || !meta.enabled || meta.isOnlyDisplayStat) { continue; }
+    var a = _skDuelCatValue(mine, sid, meta, statsMeta);
+    var b = _skDuelCatValue(theirs, sid, meta, statsMeta);
+    out.push({
+      sid: sid,
+      abbr: ((meta.abbr || meta.displayName) || ('#' + sid)) + '',
+      meta: meta,
+      lower: !!(meta.sortOrder === 0),
+      mine: a, theirs: b,
+      winner: _skDuelCatWinner(meta, a, b)
+    });
+  }
+  return out;
+}
+
+// The matchup score, the way a cats league reports it.
+//
+// `live` is the count of categories SOMEBODY HAS A FIGURE IN, and it is
+// separate from the tie count on purpose: nought against nought is a
+// tie by arithmetic and nothing at all by any other measure. Without
+// it, a sheet opened before tip-off reported "Taking 0-0-9", which is
+// the cats version of claiming every slot before kickoff.
+function _skDuelCatTally(rows) {
+  var o = { w: 0, l: 0, t: 0, scored: 0, live: 0, absent: 0 };
+  for (var i = 0; i < (rows || []).length; i++) {
+    var r = rows[i];
+    if (r.winner === 'none') { o.absent++; continue; }
+    if (r.winner === 'me') { o.w++; }
+    else if (r.winner === 'them') { o.l++; }
+    else { o.t++; }
+    o.scored++;
+    if ((Number(r.mine) || 0) !== 0 || (Number(r.theirs) || 0) !== 0) { o.live++; }
+  }
+  return o;
+}
+
+// A category's figure, in its own notation. A rate reads as a rate.
+function _skDuelCatFmt(v, row) {
+  if (v == null) { return '\u2014'; }
+  var abbr = String(row && row.abbr || '').toUpperCase();
+  var basis = (typeof SK_CAT_RATE_BASIS !== 'undefined')
+    ? SK_CAT_RATE_BASIS[abbr] : null;
+  if (basis) {
+    // .478 rather than 0.478 -- the leading nought is noise in a column
+    // of them, and it is how every scoreboard in this app writes one.
+    var s = v.toFixed(3);
+    return (v < 1 && s.charAt(0) === '0') ? s.slice(1) : s;
+  }
+  // A COUNTING STAT IS NOT A RATE, in the formatter either. _skFmtCatVal
+  // reads sortOrder 0 as a rate and rendered nine turnovers as "9.000".
+  if (!_skDuelCatIsRate(abbr) && typeof _skFmtCountingVal === 'function') {
+    try { return String(_skFmtCountingVal(v)); } catch (e0) {}
+  }
+  if (typeof _skFmtCatVal === 'function') {
+    try { return String(_skFmtCatVal(v, row && row.meta, null)); } catch (e) {}
+  }
+  return (Math.round(v * 10) / 10) + '';
+}
+
+
+// ── CATDUEL, drawn ───────────────────────────────────────────────
+
+function _skDuelCatRowHtml(row) {
+  var esc = (typeof skEscape === 'function') ? skEscape
+    : function (x) { return String(x == null ? '' : x); };
+  var a = row.mine, b = row.theirs;
+  // EVERY ROW IS SCALED TO ITSELF HERE, unlike the points duel. There
+  // one scale across the sheet is right because every row is the same
+  // unit; here a row of points and a row of blocks share no unit at
+  // all, and one scale would flatten every category but the biggest.
+  var m = Math.max(Math.abs(Number(a) || 0), Math.abs(Number(b) || 0));
+  if (!m) { m = 1; }
+  // THE LOSING SIDE'S BAR RECEDES. Length is magnitude and that stays
+  // truthful, but in a lower-wins category the longer bar belongs to
+  // the side LOSING it -- nine turnovers drew a fuller bar than eight
+  // and read as a win until the word underneath was read. Intensity
+  // carries the verdict so the two stop contradicting each other.
+  var w = function (v) {
+    if (v == null) { return 0; }
+    return Math.min(100, (Math.abs(Number(v)) / m) * 100);
+  };
+  var edge, edgeCls;
+  if (row.winner === 'none') { edge = '\u2014'; edgeCls = 'level'; }
+  else if (row.winner === 'level') { edge = 'TIED'; edgeCls = 'level'; }
+  else { edge = (row.winner === 'me') ? 'WIN' : 'LOSS';
+         edgeCls = (row.winner === 'me') ? 'up' : 'down'; }
+  return '<div class="sk-du-row sk-dc-row">' +
+      '<div class="sk-du-r1">' +
+        '<div class="sk-du-side l"><span class="sk-dc-v' +
+          (row.winner === 'me' ? ' win' : '') + '">' +
+          esc(_skDuelCatFmt(a, row)) + '</span></div>' +
+        '<div class="sk-du-slot">' + esc(row.abbr) +
+          (row.lower ? '<i class="sk-dc-low">\u2193</i>' : '') + '</div>' +
+        '<div class="sk-du-side r"><span class="sk-dc-v' +
+          (row.winner === 'them' ? ' win' : '') + '">' +
+          esc(_skDuelCatFmt(b, row)) + '</span></div>' +
+      '</div>' +
+      '<div class="sk-du-r2">' +
+        '<div class="sk-du-t l"><div class="sk-du-f mine' +
+          (row.winner === 'them' ? ' lose' : '') + '" style="width:' +
+          w(a).toFixed(2) + '%"></div></div>' +
+        '<div class="sk-du-edge ' + edgeCls + '">' + esc(edge) + '</div>' +
+        '<div class="sk-du-t r"><div class="sk-du-f theirs' +
+          (row.winner === 'me' ? ' lose' : '') + '" style="width:' +
+          w(b).toFixed(2) + '%"></div></div>' +
+      '</div>' +
+    '</div>';
+}
+
+function _skDuelCatsHtml(myRows, oppRows, statsMeta, ord, myName, oppName, scopeLabel) {
+  var esc = (typeof skEscape === 'function') ? skEscape
+    : function (x) { return String(x == null ? '' : x); };
+  var rows = _skDuelCatRows(myRows, oppRows, statsMeta, ord);
+  if (!rows.length) { return ''; }
+  var t = _skDuelCatTally(rows);
+  var body = '', i;
+  for (i = 0; i < rows.length; i++) { body += _skDuelCatRowHtml(rows[i]); }
+  var summary;
+  if (!t.live) {
+    summary = 'Nothing has been scored in any of the ' + rows.length +
+      ' categories yet.';
+  } else {
+    // THE SCORE A CATS LEAGUE ACTUALLY REPORTS -- wins, losses, ties,
+    // in that order, which is how the standings and the ladder card
+    // both already write it.
+    summary = 'Taking <em>' + t.w + '\u2013' + t.l + '\u2013' + t.t + '</em>' +
+      (t.absent
+        ? (' \u00b7 ' + t.absent + ' not scored at this scope')
+        : '');
+  }
+  return '<div class="sk-du sk-dc">' +
+    '<div class="sk-du-top">' +
+      '<div class="sk-du-hs l">' +
+        '<div class="sk-du-hn">' + esc(myName || 'YOU') + '</div>' +
+        '<div class="sk-du-sc' + (t.w < t.l ? ' lo' : '') + '">' + t.w + '</div>' +
+      '</div>' +
+      '<div class="sk-du-vs">CATS</div>' +
+      '<div class="sk-du-hs r">' +
+        '<div class="sk-du-hn">' + esc(oppName || 'OPPONENT') + '</div>' +
+        '<div class="sk-du-sc' + (t.l < t.w ? ' lo' : '') + '">' + t.l + '</div>' +
+      '</div>' +
+    '</div>' +
+    '<div class="sk-du-sum">' + summary + '</div>' + body +
+    (scopeLabel ? ('<div class="sk-du-foot">' + esc(scopeLabel) +
+      ' \u00b7 \u2193 marks a category where lower wins</div>') : '') +
   '</div>';
 }
 
