@@ -1810,6 +1810,57 @@
   .fxr-grid tr.mine .t { color: #fff; font-weight: 700; }
   .fxr-grid tr.mine td { border-bottom-color: rgba(245,197,24,0.3); }
 
+  /* ═══ CATMOVE — rank movement, one category at a time ═══ */
+  .cm-wrap { padding: 14px 14px 12px; }
+  .cm-hd span {
+    font-family: var(--sk-font-display, serif); font-size: 17px; color: #fff;
+  }
+  .cm-sel {
+    width: 100%; margin: 10px 0 4px; padding: 8px 10px; border-radius: 8px;
+    background: var(--sk-bg-card); border: 1px solid var(--sk-border-strong);
+    color: var(--sk-gold, #f5d547); font-family: var(--sk-font-mono, monospace);
+    font-size: 12px; font-weight: 700; letter-spacing: 0.06em;
+  }
+  .cm-ch { margin-top: 12px; }
+  .cm-ch-hd {
+    display: flex; align-items: baseline; justify-content: space-between;
+    gap: 8px; margin-bottom: 3px;
+  }
+  .cm-ch-hd s {
+    text-decoration: none; font-family: var(--sk-font-mono, monospace);
+    font-size: 8.5px; font-weight: 700; letter-spacing: 0.12em;
+    color: var(--sk-text-4); text-transform: uppercase;
+  }
+  .cm-ch-hd b {
+    font-family: var(--sk-font-mono, monospace); font-size: 11px;
+    color: var(--sk-gold, #f5d547);
+  }
+  .cm-svg { width: 100%; height: 92px; display: block; overflow: visible; }
+  .cm-grid { stroke: rgba(255,255,255,0.06); stroke-width: 1; }
+  .cm-line {
+    /* FALLBACK ON PURPOSE: var() with no fallback is an INVALID stroke
+       where the token is not in scope, and an invalid stroke draws
+       nothing at all -- the chart keeps its frame, its labels and its
+       grid and silently loses its line. */
+    fill: none; stroke: var(--sk-gold, #f5d547); stroke-width: 2;
+    stroke-linejoin: round; stroke-linecap: round;
+    vector-effect: non-scaling-stroke;
+  }
+  .cm-dot { fill: var(--sk-gold, #f5d547); }
+  .cm-ax { display: flex; justify-content: space-between; margin-top: 3px; }
+  .cm-ax s {
+    text-decoration: none; font-family: var(--sk-font-mono, monospace);
+    font-size: 8.5px; color: var(--sk-text-4);
+  }
+  .cm-note {
+    margin-top: 11px; padding-top: 9px; border-top: 1px solid var(--sk-border);
+    font-size: 10px; line-height: 1.55; color: var(--sk-text-4);
+  }
+  .cm-note b { color: var(--sk-text-2); }
+  .cm-empty {
+    padding: 14px 0; text-align: center; font-size: 11px; color: var(--sk-text-4);
+  }
+
   /* Rank movement under the daily totals. FXROTODELTA */
   .fx-daytot-rk {
     margin-top: 8px; padding-top: 7px;
@@ -47579,7 +47630,7 @@ function toggleDrawerTools() {
 // useless: a device running a month-old copy and a device running today's
 // one both read NFLTREND, so the marker agreed with whatever was on screen.
 // The one job it has is to disagree.
-var SK_BUILD = 'bo411 TIEBRACE';
+var SK_BUILD = 'bo412 CATMOVE';
 
 function makeDrawerItem(key, icon, name, count, hasLive, logo, muteable) {
   var isActive = activeLeague === key;
@@ -132804,6 +132855,9 @@ async function skHydrateAll() {
   // SKBUMP — bank today's ranks for every season-points / roto league, so
   // the rank movement chart fills in daily without opening each league.
   if (typeof _skRankHistRecordYahoo === 'function') _skRankHistRecordYahoo();
+  // CATMOVE -- the per-category history, banked beside the overall one
+  // so the two can never be recorded for different days.
+  if (typeof _cmRecordAll === 'function') _cmRecordAll();
   // SKWIREID -- and NOW repaint the Wire. Names, crests and roto
   // movement all come out of skLeagueData at render time, and the
   // movement additionally needs the ranks SKBUMP has only just banked.
@@ -144712,10 +144766,270 @@ function _rfPaint() {
 //   • a points league also records into the rank history, which fills
 //     any day a points snapshot missed.
 // ══════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════
+// CATMOVE -- a per-category history, which nothing banked before.
+// ══════════════════════════════════════════════════════════════════
+//
+// Per day, per category: my raw value and my roto points. The PLACE is
+// not stored because it is not independent -- place is teams + 1 -
+// points, and that holds through ties, so banking both would be
+// banking one fact twice and inviting them to disagree.
+var SK_CATHIST_PREFIX = 'sk_cat_hist_v1_';
+var CATHIST_DAYS = 200;
+
+function _cmRecordLeague(league, data) {
+  var lk = league && league.league_key;
+  if (!lk || !data || !data.allTeams) { return; }
+  var myKey = (data.team && data.team.team_key) || null;
+  if (!myKey) { return; }
+  var statsMeta = null, order = null;
+  try {
+    statsMeta = (leagueSettingsCache[lk] || {}).stats || null;
+    order = (leagueSettingsCache[lk] || {}).statOrder || null;
+  } catch (e) { return; }
+  if (!statsMeta || !order || !order.length) { return; }
+  var MS = null;
+  // THE ONE DERIVATION. The category board is built from this and so is
+  // its started line; a second way of working out where I stand would
+  // be a second answer waiting to differ from the board's.
+  try { MS = _skRotoMathSummary(data, order, statsMeta, myKey); }
+  catch (e2) { MS = null; }
+  if (!MS || !MS.rows || !MS.rows.length) { return; }
+
+  var rec = {}, i, teams = 0;
+  for (i = 0; i < MS.rows.length; i++) {
+    var row = MS.rows[i];
+    if (row.val == null && row.pts == null) { continue; }
+    rec[String(row.id)] = [
+      (row.val == null) ? null : Number(row.val),
+      (row.pts == null) ? null : Number(row.pts)
+    ];
+    if (row.teams > teams) { teams = row.teams; }
+  }
+  if (!teams) { return; }
+
+  var key = SK_CATHIST_PREFIX + lk, o = null;
+  try { o = JSON.parse(localStorage.getItem(key) || 'null'); } catch (e3) { o = null; }
+  if (!o || !o.d) { o = { d: {} }; }
+  o.t = teams;
+  var today = (typeof _todayDateString === 'function')
+    ? _todayDateString() : new Date().toISOString().slice(0, 10);
+  o.d[today] = rec;                       // the day's last sync wins
+  var dates = Object.keys(o.d).sort();
+  while (dates.length > CATHIST_DAYS) { delete o.d[dates.shift()]; }
+  try {
+    if (typeof _skSafeSetItem === 'function') { _skSafeSetItem(key, JSON.stringify(o)); }
+    else { localStorage.setItem(key, JSON.stringify(o)); }
+  } catch (e4) {}
+}
+
+// Every roto league loaded, on the same sync the rank history uses.
+function _cmRecordAll() {
+  try {
+    var ls = (typeof fyLeagues !== 'undefined' && fyLeagues) ? fyLeagues : [];
+    for (var i = 0; i < ls.length; i++) {
+      if (String(ls[i].scoring_type || '') !== 'roto') { continue; }
+      var ld = skLeagueData[ls[i].league_key];
+      if (ld) { _cmRecordLeague(ls[i], ld); }
+    }
+  } catch (e) {}
+}
+
+// What was banked, as two series for one category.
+//   place = teams + 1 - points, which is the identity the board's own
+//   "T7-8" is printed from.
+function _cmSeries(leagueKey, statId) {
+  var o = null;
+  try { o = JSON.parse(localStorage.getItem(SK_CATHIST_PREFIX + leagueKey) || 'null'); }
+  catch (e) { return null; }
+  if (!o || !o.d) { return null; }
+  var teams = o.t || 0, dates = Object.keys(o.d).sort(), out = [], i;
+  for (i = 0; i < dates.length; i++) {
+    var cell = o.d[dates[i]] && o.d[dates[i]][String(statId)];
+    if (!cell) { continue; }
+    var val = cell[0], pts = cell[1];
+    out.push({ date: dates[i], val: val,
+               place: (pts == null || !teams) ? null : (teams + 1 - pts),
+               pts: pts });
+  }
+  return out.length ? { teams: teams, pts: out } : null;
+}
+
+// Which categories there is any history for, in the league's own order.
+function _cmCats(leagueKey, statsMeta, order) {
+  var o = null;
+  try { o = JSON.parse(localStorage.getItem(SK_CATHIST_PREFIX + leagueKey) || 'null'); }
+  catch (e) { return []; }
+  if (!o || !o.d) { return []; }
+  var seen = {}, d;
+  for (d in o.d) {
+    if (!o.d.hasOwnProperty(d)) { continue; }
+    var c;
+    for (c in o.d[d]) { if (o.d[d].hasOwnProperty(c)) { seen[c] = 1; } }
+  }
+  var out = [], i;
+  for (i = 0; i < (order || []).length; i++) {
+    var sid = String(order[i]);
+    if (!seen[sid]) { continue; }
+    var m = statsMeta && statsMeta[sid];
+    out.push({ id: sid, label: (m && (m.abbr || m.displayName || m.name)) || sid });
+  }
+  return out;
+}
+
 var SK_RANKHIST_PREFIX = 'sk_rank_hist_v1_';
 var _skBumpCtx = {};   // domId -> context for repaints
 var _skBumpSel = {};   // leagueKey -> highlighted rival id
 var _skBumpSpan = {};  // leagueKey -> '2w' | '6w' | 'all'
+
+// CATMOVE -- one line, drawn twice: the place in a category, and the
+// number that put it there. Both read the same banked series, so they
+// cannot disagree about which days exist.
+var _cmSel = {};     // leagueKey -> chosen stat id
+
+function _cmPath(pts, pick, w, h, lo, hi, invert) {
+  var n = pts.length, d = '', i, drawn = 0;
+  var span = (hi - lo) || 1;
+  for (i = 0; i < n; i++) {
+    var v = pick(pts[i]);
+    if (v == null) { continue; }
+    var x = (n === 1) ? (w / 2) : (i / (n - 1)) * w;
+    var f = (v - lo) / span;
+    var y = invert ? (f * h) : (h - f * h);
+    d += (drawn ? 'L' : 'M') + x.toFixed(1) + ' ' + y.toFixed(1) + ' ';
+    drawn++;
+  }
+  return drawn ? { d: d, n: drawn } : null;
+}
+
+function _cmChart(series, pick, invert, fmt, lo, hi, lab) {
+  var W = 320, H = 92;
+  var p = _cmPath(series.pts, pick, W, H, lo, hi, invert);
+  if (!p) {
+    return '<div class="cm-empty">No ' + skEscape(lab) + ' banked yet.</div>';
+  }
+  var g = '', i;
+  for (i = 0; i <= 3; i++) {
+    var gy = (i / 3) * H;
+    g += '<line x1="0" y1="' + gy.toFixed(1) + '" x2="' + W + '" y2="' +
+      gy.toFixed(1) + '" class="cm-grid"/>';
+  }
+  // the ends, labelled, because a line with no numbers on it is a shape
+  var first = null, last = null;
+  for (i = 0; i < series.pts.length; i++) {
+    var v = pick(series.pts[i]);
+    if (v == null) { continue; }
+    if (first === null) { first = v; }
+    last = v;
+  }
+  var dots = '';
+  if (p.n === 1) {
+    dots = '<circle cx="' + (W / 2) + '" cy="' +
+      (invert ? (((last - lo) / ((hi - lo) || 1)) * H)
+              : (H - ((last - lo) / ((hi - lo) || 1)) * H)).toFixed(1) +
+      '" r="3" class="cm-dot"/>';
+  }
+  return '<div class="cm-ch"><div class="cm-ch-hd"><s>' + skEscape(lab) +
+    '</s><b>' + skEscape(fmt(first)) + ' \u2192 ' + skEscape(fmt(last)) +
+    '</b></div>' +
+    '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" ' +
+    'class="cm-svg">' + g +
+    '<path d="' + p.d + '" class="cm-line"/>' + dots + '</svg>' +
+    '<div class="cm-ax"><s>' + skEscape(series.pts[0].date.slice(5)) +
+    '</s><s>' + skEscape(series.pts[series.pts.length - 1].date.slice(5)) +
+    '</s></div></div>';
+}
+
+function _cmSetCat(leagueKey, sid) {
+  _cmSel[leagueKey] = String(sid);
+  var host = document.getElementById('cmBody_' + _cmDom(leagueKey));
+  if (!host) { return; }
+  try { host.innerHTML = _cmBodyHtml(leagueKey); } catch (e) {}
+}
+
+function _cmDom(leagueKey) {
+  return String(leagueKey).replace(/[^A-Za-z0-9]/g, '_');
+}
+
+function _cmBodyHtml(leagueKey) {
+  var statsMeta = null, order = null, fmtRaw = null;
+  try {
+    statsMeta = (leagueSettingsCache[leagueKey] || {}).stats || null;
+    order = (leagueSettingsCache[leagueKey] || {}).statOrder || null;
+  } catch (e) { return ''; }
+  var cats = _cmCats(leagueKey, statsMeta, order);
+  if (!cats.length) { return ''; }
+  // A REMEMBERED CATEGORY THAT HAS NO HISTORY must not blank the whole
+  // card. It can happen the moment a league's categories change, and
+  // the honest answer is to show one that does rather than nothing.
+  var sid = _cmSel[leagueKey];
+  var series = sid ? _cmSeries(leagueKey, sid) : null;
+  if (!series) {
+    sid = cats[0].id;
+    series = _cmSeries(leagueKey, sid);
+  }
+  if (!series) { return ''; }
+  // THE SAME FORMATTER THE BOARD USES, called the same way: it takes
+  // the whole settings entry and the stat id, not one stat's meta --
+  // the board's own _mFmt(val, id) is the shape to copy.
+  var full = null;
+  try { full = leagueSettingsCache[leagueKey] || null; } catch (eF0) { full = null; }
+  try { fmtRaw = _skRotoFmtRawFor(full); } catch (e2) { fmtRaw = null; }
+  // AN AVERAGE IS CHARTED AS AN AVERAGE, and whether it is one is the
+  // format's question -- _skRotoFmtRawFor already answers it for the
+  // category board, so the axis asks the same owner.
+  var fmtV = function (v) {
+    if (v == null) { return '\u2013'; }
+    try { if (fmtRaw) { return String(fmtRaw(v, sid)); } } catch (e3) {}
+    return String(Math.round(v * 100) / 100);
+  };
+  var fmtP = function (v) {
+    if (v == null) { return '\u2013'; }
+    var r = Math.round(v * 10) / 10;
+    return (Math.abs(r - Math.round(r)) < 0.05) ? String(Math.round(r)) : String(r);
+  };
+
+  var lo = 1, hi = series.teams || 10;
+  var vlo = null, vhi = null, i;
+  for (i = 0; i < series.pts.length; i++) {
+    var v = series.pts[i].val;
+    if (v == null) { continue; }
+    if (vlo === null || v < vlo) { vlo = v; }
+    if (vhi === null || v > vhi) { vhi = v; }
+  }
+  if (vlo === null) { vlo = 0; vhi = 1; }
+  if (vhi === vlo) { vhi = vlo + (Math.abs(vlo) * 0.05 || 1); }
+
+  var sel = '<select class="cm-sel" onchange="_cmSetCat(\'' + leagueKey +
+    '\', this.value)">', c;
+  for (c = 0; c < cats.length; c++) {
+    sel += '<option value="' + skEscape(cats[c].id) + '"' +
+      (cats[c].id === String(sid) ? ' selected' : '') + '>' +
+      skEscape(cats[c].label) + '</option>';
+  }
+  sel += '</select>';
+
+  var days = series.pts.length;
+  return sel +
+    _cmChart(series, function (p) { return p.place; }, true, fmtP, lo, hi,
+             'PLACE OF ' + (series.teams || '?')) +
+    _cmChart(series, function (p) { return p.val; }, false, fmtV, vlo, vhi,
+             'TOTAL') +
+    '<div class="cm-note"><b>' + days + '</b> day' + (days === 1 ? '' : 's') +
+    ' banked. Category history is recorded on each sync from the day ' +
+    'this arrived \u2014 it does not reach back before that.</div>';
+}
+
+function skCatMoveHtml(league, leagueData) {
+  if (!league || String(league.scoring_type || '') !== 'roto') { return ''; }
+  var lk = league.league_key;
+  var body = '';
+  try { body = _cmBodyHtml(lk); } catch (e) { body = ''; }
+  if (!body) { return ''; }
+  return '<div class="sk-card cm-wrap" id="cmWrap_' + _cmDom(lk) + '">' +
+    '<div class="cm-hd"><span>Category movement</span></div>' +
+    '<div id="cmBody_' + _cmDom(lk) + '">' + body + '</div></div>';
+}
 
 function _skRankHistRecord(leagueKey, ranks, pts) {
   var ids = Object.keys(ranks || {});
@@ -173268,6 +173582,11 @@ function skBuildStandingsTable(league, leagueData, allTeams) {
   if (isSeasonPts) {
     try { bumpHtml = skBumpHtmlYahoo(league, allTeams, myKey); }
     catch (e) { bumpHtml = ''; try { console.error('Rank movement chart:', e); } catch (e2) {} }
+  }
+  // CATMOVE -- the same question asked of one category, under it.
+  if (scoringType === 'roto') {
+    try { bumpHtml += skCatMoveHtml(league, leagueData); }
+    catch (eCM) { try { console.error('Category movement:', eCM); } catch (eC2) {} }
   }
   // LSBSKIN -- the same board wrapper the scoreboard uses, around the
   // same three pieces: the strip, the table, the panel. The view and
