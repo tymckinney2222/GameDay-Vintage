@@ -2410,6 +2410,17 @@
     font-weight: 700; letter-spacing: 0.03em;
     color: rgba(240,138,122,0.75); margin-top: 1px; white-space: nowrap;
   }
+  .gpc-sl.soft { color: rgba(240,138,122,0.5); font-weight: 700; }
+  .gpc-sx b { color: rgba(250,204,21,0.75); font-weight: 700; }
+  /* CUTFIRM -- amber, not grey. The number is real and the man is
+     playing; it is the VERDICT that is being withheld. */
+  .gpc-p.hold .gpc-k b { color: rgba(250,204,21,0.8); }
+  .gpc-p.hold .gpc-k i { color: rgba(250,204,21,0.5); }
+  .gpc-p.hold .gpc-v { color: rgba(255,255,255,0.6); }
+  /* CUTFIRM -- and a START nothing is asked of, off a sample that
+     could not have carried a SIT, says START in a smaller voice. */
+  .gpc-p.go.lite .gpc-k { color: rgba(123,216,143,0.45); }
+  .gpc-p.go.lite .gpc-v { color: rgba(255,255,255,0.6); }
   .gpc-p.sit .gpc-v, .gpc-p.sit .gpc-k { color: #f08a7a; }
   .gpc-p.go .gpc-k { color: #7bd88f; }
   .gpc-p.na .gpc-v, .gpc-p.na .gpc-k, .gpc-p.na .gpc-nm,
@@ -174963,8 +174974,11 @@ function _skCutHistory(teamKey, dates, meta) {
     kept.push(s);
     var bk = s.pk + '|' + s.pos;
     var b = byPlayer[bk];
-    if (!b) { b = byPlayer[bk] = { n: 0, sum: 0, name: s.name }; }
-    b.n++; b.sum += v;
+    if (!b) { b = byPlayer[bk] = { n: 0, sum: 0, sq: 0, name: s.name }; }
+    // CUTFIRM -- the squares as well as the total. A mean on its own
+    // cannot say whether it is worth anything, and the panel was acting
+    // on three-night means as if they were settled facts.
+    b.n++; b.sum += v; b.sq += v * v;
     if (!b.name) { b.name = s.name; }
   }
   // == COMPARE LIKE WITH LIKE ==
@@ -175037,6 +175051,92 @@ function _skCutPlace(values, frac, mean) {
   return { sit: true, share: (cut - lo) / eq };
 }
 
+// == HOW MUCH A MAN'S OWN NUMBER IS WORTH == CUTFIRM ==
+//
+// A mean off three nights and a mean off thirty print identically and
+// are not the same claim. The panel placed both against the line with
+// the same confidence, and on a nine-start slot that produced the one
+// result it had no business producing: sit Jack Eichel, on the evidence
+// of three games.
+//
+// So a man carries his own spread now. sd is how much his nights swing;
+// se is how far his MEAN could reasonably be from where it is printed.
+// Under SK_CUT_PMIN nights there is no honest spread to take -- one
+// night has none at all and three give a figure as unstable as the mean
+// it is meant to qualify -- so the answer is no answer.
+var SK_CUT_PMIN = 4;
+
+function _skCutSteady(b) {
+  if (!b || !(b.n >= SK_CUT_PMIN)) { return null; }
+  var mean = b.sum / b.n;
+  // Sample variance, over n-1: the population form reads steadier than
+  // a handful of nights has earned.
+  var va = (b.sq - b.n * mean * mean) / (b.n - 1);
+  if (!(va > 0)) { va = 0; }           // and rounding can push it under
+  var sd = Math.sqrt(va);
+  return { n: b.n, mean: mean, sd: sd, se: sd / Math.sqrt(b.n) };
+}
+
+// Is the LINE itself worth standing on? It is a quantile, so what holds
+// it up is the number of starts underneath the cut. At five or more,
+// moving one night moves it a little. At two, the line IS that night.
+var SK_CUT_FIRM = 5;
+
+function _skCutFirm(values, frac) {
+  if (!values || !(frac > 0)) { return true; }   // no line, nothing to doubt
+  var f = (frac > 0.95) ? 0.95 : frac;
+  return (f * values.length) >= SK_CUT_FIRM;
+}
+
+// The cheapest start ABOVE his own, which is the one he is being asked
+// to give way to. values is sorted, so the first one past him is the
+// nearest. Null means nobody is above him at all.
+function _skCutNextUp(values, mean) {
+  var i;
+  for (i = 0; i < values.length; i++) {
+    if (values[i] > mean) { return values[i]; }
+  }
+  return null;
+}
+
+// What the panel is entitled to say about one man.
+//
+//   none   he has never started here
+//   thin   too few nights to sit him on
+//   close  his swing reaches the next man up, so the order is not his
+//   sit    below the cut, and clear of the man above him
+//   go     above the cut, or there is nothing to cut
+//
+// The burden is asymmetric on purpose. SIT asks him to change the
+// lineup and has to be defended; START asks for nothing and does not.
+// So both gates below apply to a sit and neither blocks a start.
+//
+// The second gate compares him to the NEXT MAN UP and not to the line,
+// which is the correction that saved this feature. The line is a
+// quantile, and a quantile lands ON the straddler's own mean by
+// construction -- so a test of "is he near the line" answered YES for
+// every marginal man in the app, which is to say for the only men the
+// panel exists to name. What is actually being claimed about him is
+// that he is cheaper than the men above him, and that is what has to
+// survive his own swing.
+function _skCutCall(values, frac, b) {
+  if (!b || !b.n) { return { state: 'none' }; }
+  var mean = b.sum / b.n;
+  var place = _skCutPlace(values, frac, mean);
+  if (!place || !place.sit) { return { state: 'go', mean: mean, n: b.n }; }
+  var every = (place.share < 1) ? _skGpSitLine(place.share) : '';
+  // A share too small to name is no instruction, so there is nothing
+  // here to defend and nothing to hold back either.
+  if (place.share < 1 && !every) { return { state: 'go', mean: mean, n: b.n }; }
+  var st = _skCutSteady(b);
+  if (!st) { return { state: 'thin', mean: mean, n: b.n }; }
+  var up = _skCutNextUp(values, mean);
+  if (up != null && (up - mean) <= st.se) {
+    return { state: 'close', mean: mean, se: st.se, n: b.n };
+  }
+  return { state: 'sit', mean: mean, share: place.share, se: st.se, n: b.n };
+}
+
 // Tonight's active slots, off today's own day map. The stats in it are
 // irrelevant -- the game has not been played -- so only the names, the
 // slots and the clubs are read, and the VALUE of each start comes from
@@ -175062,6 +175162,9 @@ function _skCutTonight(league, teamKey, hist) {
     bySlot[pos].push({ pk: pk, name: e.name || pk, team: e.teamAbbr || '',
       idle: (plays === false),
       mean: (ph && ph.n > 0) ? (ph.sum / ph.n) : null,
+      // CUTFIRM -- the whole record travels, because the spread is read
+      // off it downstream and a mean alone cannot be questioned.
+      rec: ph || null,
       n: (ph ? ph.n : 0) });
   }
   return { bySlot: bySlot, pending: pending };
@@ -175135,7 +175238,7 @@ function _skGpCutPanel(league, rows, maxByPos, positions, myKey, win) {
       'line. Open Today\u2019s Lineup once and come back.</div>');
   }
 
-  var body = '', below = 0, decisions = 0, drawn = 0;
+  var body = '', below = 0, decisions = 0, drawn = 0, held = 0;
 
   for (i = 0; i < pr.rows.length; i++) {
     var r = pr.rows[i];
@@ -175148,51 +175251,76 @@ function _skGpCutPanel(league, rows, maxByPos, positions, myKey, win) {
     var line = _skCutLine(vals, (bg && bg.over) ? bg.frac : 0);
     here = here.slice().sort(_skCutSortTonight);
 
-    var slotBelow = 0, slotLive = 0, pb = '';
+    var slotBelow = 0, slotLive = 0, slotHeld = 0, pb = '';
+    var _frac = (bg && bg.over) ? bg.frac : 0;
     for (j = 0; j < here.length; j++) {
       var pl = here[j];
-      var cls, verdict;
+      var cls, verdict, call = null;
       if (pl.idle) {
         cls = ' idle'; verdict = '<b>IDLE</b>';
-      } else if (pl.mean == null) {
-        cls = ' na'; verdict = '<b>NO DATA</b>';
-        slotLive++;
       } else {
         slotLive++;
-        var place = _skCutPlace(vals, (bg && bg.over) ? bg.frac : 0, pl.mean);
-        var every = '';
-        if (place && place.sit && place.share < 1) {
-          // ONE JUDGE of how often a share is worth acting on, and it is
-          // the budget's own. An empty answer means the share is a
-          // sliver, and a sliver is not an instruction.
-          every = _skGpSitLine(place.share).replace(/^sit /, '');
-        }
-        if (place && place.sit && (place.share >= 1 || every)) {
+        call = _skCutCall(vals, _frac, pl.rec);
+        if (call.state === 'none') {
+          cls = ' na'; verdict = '<b>NO DATA</b>';
+        } else if (call.state === 'thin') {
+          // CUTFIRM -- NOT a verdict of innocence and not one of guilt.
+          // The panel is declining, and it says which of the two
+          // reasons it is declining for, because they want different
+          // things from him: one wants nights, the other wants nothing.
+          cls = ' hold'; slotHeld++;
+          verdict = '<b>NO CALL</b><i>' + call.n + ' night' +
+            (call.n === 1 ? '' : 's') + '</i>';
+        } else if (call.state === 'close') {
+          cls = ' hold'; slotHeld++;
+          verdict = '<b>NO CALL</b><i>too close</i>';
+        } else if (call.state === 'sit') {
+          var every = (call.share < 1)
+            ? _skGpSitLine(call.share).replace(/^sit /, '') : '';
           cls = ' sit'; slotBelow++;
           verdict = '<b>SIT</b>' + (every ? ('<i>' + every + '</i>') : '');
         } else {
-          cls = ' go'; verdict = '<b>START</b>';
+          // CUTFIRM -- a START off two nights is not an endorsement, it
+          // is an absence of objection, and it must not out-shout a NO
+          // CALL sitting next to it off thirteen. Same word, less voice.
+          cls = ' go' + ((call.n && call.n < SK_CUT_PMIN) ? ' lite' : '');
+          verdict = '<b>START</b>';
         }
       }
+      // CUTFIRM -- the count of nights sits beside every number, and the
+      // swing beside every number steady enough to have one. A 4.98 off
+      // a single night should not be able to look like a 4.98 off forty.
+      var _se = (call && call.se != null)
+        ? ('<small>\u00b1' + _skCutFmt(call.se, hist.basis) + '</small>') : '';
       pb += '<div class="gpc-p' + cls + '">' +
         '<span class="gpc-nm">' + skEscape(pl.name) +
           (pl.team ? ('<small>' + skEscape(pl.team) + '</small>') : '') +
           (pl.mean != null
-            ? ('<small>' + pl.n + ' start' + (pl.n === 1 ? '' : 's') + '</small>')
-            : '') +
+            ? ('<small>' + pl.n + ' night' + (pl.n === 1 ? '' : 's') + '</small>')
+            : '') + _se +
         '</span>' +
         '<span class="gpc-v">' + _skCutFmt(pl.mean, hist.basis) + '</span>' +
         '<span class="gpc-k">' + verdict + '</span>' +
       '</div>';
     }
+    held += slotHeld;
     below += slotBelow;
     decisions += slotLive;
 
     var tag, note;
     if (line != null) {
-      tag = '<span class="gpc-sl">line ' + _skCutFmt(line, hist.basis) + '</span>';
-      note = (_skGpSitLine(bg.frac) || 'just over') + ' \u00b7 ' +
-        vals.length + ' start' + (vals.length === 1 ? '' : 's') + ' read';
+      // CUTFIRM -- a quantile off nine starts cuts between the second
+      // and third of them, so one quiet night moves it. Said out loud,
+      // next to the line it is talking about, and only where the slot
+      // is actually asking for sits -- a slot a sliver over is not
+      // leaning on its line for anything.
+      var _ask = _skGpSitLine(bg.frac);
+      var _soft = !!_ask && !_skCutFirm(vals, bg.frac);
+      tag = '<span class="gpc-sl' + (_soft ? ' soft' : '') + '">line ' +
+        _skCutFmt(line, hist.basis) + '</span>';
+      note = (_ask || 'just over') + ' \u00b7 ' +
+        vals.length + ' start' + (vals.length === 1 ? '' : 's') + ' read' +
+        (_soft ? ' \u00b7 <b>line not firm</b>' : '');
     } else if (bg && bg.over) {
       tag = '<span class="gpc-sx">no line</span>';
       note = 'over, but only ' + vals.length + ' counted start' +
@@ -175227,6 +175355,12 @@ function _skGpCutPanel(league, rows, maxByPos, positions, myKey, win) {
     ' nights MY SLOTS counted \u2014 the per-slot counts outlive the full ' +
     'lineups, so this sample is the smaller one. ' +
     'A club not playing burns no game, so it is no decision. ' +
+    'Beside each man is how many nights his number rests on and, once ' +
+    'that is enough to measure, how far it could reasonably be out ' +
+    '(<b>\u00b1</b>). <b>NO CALL</b> means the panel is declining to ' +
+    'place him: either too few nights, or a line close enough to his own ' +
+    'swing that neither side of it is his. It never sits a man on a ' +
+    'number that cannot carry it. ' +
     'The man ON the line carries the slot\u2019s whole shortfall, so his ' +
     'share is steeper than the slot\u2019s \u2014 the slot sits one night in ' +
     'four, he sits one in two, and nobody else sits at all. ' +
@@ -175237,9 +175371,11 @@ function _skGpCutPanel(league, rows, maxByPos, positions, myKey, win) {
     'higher</b>, never lower.' +
     '</div>';
 
-  var sub = below
+  var _heldTxt = held ? (' \u00b7 ' + held + ' no call') : '';
+  var sub = (below
     ? (below + ' of ' + decisions + ' to sit')
-    : (decisions + ' start' + (decisions === 1 ? '' : 's') + ' \u00b7 none below');
+    : (decisions + ' start' + (decisions === 1 ? '' : 's') +
+       ' \u00b7 none below')) + _heldTxt;
   return shell(sub, body);
 }
 
