@@ -2356,6 +2356,67 @@
   }
   .gps-note b { color: rgba(255,255,255,0.6); font-weight: 700; }
 
+  /* GPCUT -- tonight's cut line. Same shell as .gps deliberately: it is
+     the second half of one thought, and a second card style would read
+     as a second subject. */
+  .gpc {
+    margin: 10px 0 0; padding: 12px 13px 10px; border-radius: 12px;
+    background: rgba(255,255,255,0.025);
+    border: 1px solid rgba(255,255,255,0.07);
+  }
+  .gpc-slot {
+    margin: 7px 0 0; padding-top: 7px;
+    border-top: 1px solid rgba(255,255,255,0.05);
+  }
+  .gpc-sh { display: flex; align-items: baseline; gap: 7px; margin: 0 0 3px; }
+  .gpc-sp {
+    flex: 0 0 34px; font-family: var(--sk-font-mono, monospace);
+    font-size: 11px; font-weight: 700; color: rgba(255,255,255,0.65);
+  }
+  .gpc-sl {
+    font-family: var(--sk-font-mono, monospace); font-size: 10.5px;
+    font-weight: 800; color: #f08a7a; white-space: nowrap;
+  }
+  .gpc-sx {
+    font-size: 9px; color: rgba(255,255,255,0.3);
+    margin-left: auto; text-align: right; line-height: 1.3;
+  }
+  .gpc-p {
+    display: flex; align-items: center; gap: 8px; padding: 4px 0 4px 34px;
+  }
+  .gpc-nm {
+    flex: 1 1 auto; min-width: 0; font-size: 12px;
+    color: rgba(255,255,255,0.82);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .gpc-nm small {
+    font-size: 9px; color: rgba(255,255,255,0.3); margin-left: 5px;
+  }
+  .gpc-v {
+    flex: 0 0 42px; text-align: right;
+    font-family: var(--sk-font-mono, monospace);
+    font-size: 12px; font-weight: 800; color: rgba(255,255,255,0.9);
+  }
+  .gpc-k {
+    flex: 0 0 56px; text-align: right; line-height: 1.25;
+    color: rgba(255,255,255,0.4);
+  }
+  .gpc-k b {
+    display: block; font-size: 8.5px; font-weight: 800;
+    letter-spacing: 0.07em;
+  }
+  .gpc-k i {
+    display: block; font-style: normal; font-size: 8.5px;
+    font-weight: 700; letter-spacing: 0.03em;
+    color: rgba(240,138,122,0.75); margin-top: 1px; white-space: nowrap;
+  }
+  .gpc-p.sit .gpc-v, .gpc-p.sit .gpc-k { color: #f08a7a; }
+  .gpc-p.go .gpc-k { color: #7bd88f; }
+  .gpc-p.na .gpc-v, .gpc-p.na .gpc-k, .gpc-p.na .gpc-nm,
+  .gpc-p.idle .gpc-v, .gpc-p.idle .gpc-k, .gpc-p.idle .gpc-nm {
+    color: rgba(255,255,255,0.28);
+  }
+
   /* ── GPTRUTH ── how far short the estimate runs, and the way to fix
      the half of it that is fixable. */
   .sk-gpb-grade {
@@ -174691,6 +174752,11 @@ function _skRenderGpBoard(league, host) {
   // HIS days now that nobody else's are counted.
   host.innerHTML =
     _skGpMinePanel(league, rows, maxByPos, positions, myKey, _win) +
+    // GPCUT - and the one that has to be answered before he puts the
+    // phone down: of the players in his slots tonight, which starts the
+    // budget above cannot afford. Second, not third, because the week
+    // can wait and tonight cannot.
+    _skGpCutPanel(league, rows, maxByPos, positions, myKey, _win) +
     // GPBUDGET - MY SLOTS says where the slots stand; this says what to
     // do about it this week, which is the question a manager acts on.
     _skGpBudgetPanel(league, rows, maxByPos, positions, myKey, _win) +
@@ -174745,6 +174811,436 @@ function _skGpSitLine(frac) {
 function _skGpB2(n) {
   if (n == null || isNaN(n)) { return '\u2014'; }
   return (Math.round(n * 100) / 100).toFixed(2);
+}
+
+// == TONIGHT'S CUT LINE == GPCUT ==
+//
+// MY SLOTS says a slot is overspent and how many starts have to come
+// off it. It does not say WHICH start to give up, which is the thing he
+// is sitting with his phone deciding.
+//
+// The budget already gives the fraction that has to go: a centre slot
+// running 1.05 a night against an allowance of 0.79 has to drop a
+// quarter of its starts. So the question is which quarter, and the
+// answer the arithmetic supports is the cheapest quarter. The evidence
+// for what a start in that slot is worth is the starts he has already
+// made in it -- so sort those by what they produced, take the value a
+// quarter of the way up, and that is the line. A start worth less than
+// the line is a start the cap cannot afford to spend.
+//
+// Nothing here is projected. The line is a quantile of starts that
+// actually happened, and a player's number is his own mean over those
+// same starts.
+//
+// Three limits, every one of them printed on the panel rather than
+// buried in this comment:
+//
+//  * The full day maps this reads are trimmed to FP_LS_MAX, while the
+//    per-slot TALLIES outlive them. So the sample is the days still
+//    cached, which is FEWER than the days MY SLOTS counted. Both
+//    numbers are shown.
+//  * A player with no counted starts in tonight's slot has no mean, so
+//    he cannot be placed. He reads unmeasured -- never below the line.
+//  * Usage is a floor, so LEFT reads high, so the allowance reads high,
+//    so the fraction to sit reads LOW and the line sits LOW with it.
+//    The line is forgiving: the real cut is here or higher.
+//
+// A quantile off six starts is a number pretending to be evidence.
+var SK_CUT_MIN = 8;
+
+// Every start in the window, with the slot it was made in. Deliberately
+// the FULL day map and not the tally: a tally knows how many starts a
+// slot spent, not what any of them returned.
+function _skCutStarts(teamKey, dates) {
+  var starts = [], days = 0, i, pk;
+  for (i = 0; i < (dates || []).length; i++) {
+    var map = _skGpReadCachedMap(teamKey, dates[i]);
+    if (!map) { continue; }
+    days++;
+    for (pk in map) {
+      if (!map.hasOwnProperty(pk)) { continue; }
+      var e = map[pk];
+      // The same two questions the games-cap count asks, and the same
+      // owners answering them, so a start that burned a game and a
+      // start on this panel are the same start.
+      if (!e || !_isActiveSlot(e.selectedPos)) { continue; }
+      if (!_skPlayedThatDay(e)) { continue; }
+      starts.push({ pk: pk, pos: String(e.selectedPos || ''),
+        name: e.name || '', fp: e.fp, stats: e.stats || {} });
+    }
+  }
+  return { starts: starts, days: days };
+}
+
+// What a start is worth is decided by the DATA, not by a settings
+// lookup. Yahoo returns player_points only for a league that scores
+// them; where it does, that is the league's own measure of a start and
+// there is nothing to argue with. Where it does not, the cats line is
+// all there is.
+function _skCutBasis(starts) {
+  var i;
+  for (i = 0; i < starts.length; i++) {
+    if (typeof starts[i].fp === 'number' && !isNaN(starts[i].fp)) { return 'fp'; }
+  }
+  return 'cats';
+}
+
+// Per slot, the mean of each counting cat over the starts made in it.
+// A crease line and a defence line share no scale, which is why this is
+// per slot and not per roster.
+function _skCutScale(starts, meta) {
+  var sum = {}, n = {}, i, sid, p;
+  for (i = 0; i < starts.length; i++) {
+    p = starts[i].pos;
+    if (!sum[p]) { sum[p] = {}; n[p] = 0; }
+    n[p]++;
+    var st = starts[i].stats;
+    for (sid in st) {
+      if (!st.hasOwnProperty(sid)) { continue; }
+      // A RATE stat cannot be averaged into a sum of ratios -- a .500
+      // shooting night is not twice a .250 one in any sense that adds
+      // up -- and _skIsCountingCatStat is the app's one answer to
+      // which is which.
+      if (!_skIsCountingCatStat(meta[sid])) { continue; }
+      sum[p][sid] = (sum[p][sid] || 0) + (st[sid] || 0);
+    }
+  }
+  var out = {};
+  for (p in sum) {
+    if (!sum.hasOwnProperty(p)) { continue; }
+    out[p] = {};
+    for (sid in sum[p]) {
+      if (!sum[p].hasOwnProperty(sid)) { continue; }
+      var m = (n[p] > 0) ? (sum[p][sid] / n[p]) : 0;
+      // A cat nobody in this slot ever recorded has no scale, and
+      // dividing by it would make one stray point worth a season.
+      if (m > 0) { out[p][sid] = m; }
+    }
+  }
+  return out;
+}
+
+// One start, as a number. Points leagues already have one. Cats leagues
+// get the mean of (value / that cat's mean in this slot) across the
+// slot's cats -- so 1.00 is an average start of his in that slot, and
+// the unit means the same thing on every night of the season.
+function _skCutValue(s, basis, scale) {
+  if (basis === 'fp') {
+    return (typeof s.fp === 'number' && !isNaN(s.fp)) ? s.fp : null;
+  }
+  var sc = (scale && scale[s.pos]) || null;
+  var k = 0, tot = 0, sid;
+  for (sid in sc) {
+    if (!sc.hasOwnProperty(sid)) { continue; }
+    // EVERY start in a slot divides by the SAME cats, missing ones
+    // counted as nought. Otherwise a thin stat line reads as a short
+    // one and a blank night scores an average.
+    k++;
+    tot += ((s.stats && s.stats[sid]) || 0) / sc[sid];
+  }
+  // A slot with no measured starts has no scale to divide by, so it has
+  // no value to claim. That is this line's job and nothing else's.
+  return (k > 0) ? (tot / k) : null;
+}
+
+// The distribution of his own starts, by slot, and his own mean within
+// each slot. Keyed by player AND slot on purpose: in a cats league the
+// two slots do not share a scale, so pooling a wing's starts into a
+// centre's mean would be adding up two different units.
+function _skCutHistory(teamKey, dates, meta) {
+  var raw = _skCutStarts(teamKey, dates);
+  var basis = _skCutBasis(raw.starts);
+  if (basis === 'cats' && !meta) {
+    return { basis: 'cats', noMeta: true, days: raw.days, starts: 0,
+             bySlot: {}, byPlayer: {} };
+  }
+  var scale = (basis === 'cats') ? _skCutScale(raw.starts, meta) : null;
+  var bySlot = {}, byPlayer = {}, kept = [], i, p;
+  for (i = 0; i < raw.starts.length; i++) {
+    var s = raw.starts[i];
+    var v = _skCutValue(s, basis, scale);
+    if (v == null) { continue; }
+    kept.push(s);
+    var bk = s.pk + '|' + s.pos;
+    var b = byPlayer[bk];
+    if (!b) { b = byPlayer[bk] = { n: 0, sum: 0, name: s.name }; }
+    b.n++; b.sum += v;
+    if (!b.name) { b.name = s.name; }
+  }
+  // == COMPARE LIKE WITH LIKE ==
+  //
+  // The distribution is of what a start in this slot is WORTH GOING IN,
+  // which is the starter's mean -- not what that particular night
+  // happened to return. Tonight he is placing players, and the only
+  // number he has on a player before puck drop is his mean, so the line
+  // has to be cut from a list of the same kind of number.
+  //
+  // Cutting a list of single nights instead put the line down among the
+  // quiet ones: a quarter of all CENTRE STARTS came in under 0.38, but
+  // no centre he owns AVERAGES under 0.38, so a slot that had to sit
+  // one night in four told him to start everybody. Weighted by starts,
+  // so a man who plays every night counts for more than a spare.
+  for (i = 0; i < kept.length; i++) {
+    var kb = byPlayer[kept[i].pk + '|' + kept[i].pos];
+    if (!kb || !kb.n) { continue; }
+    if (!bySlot[kept[i].pos]) { bySlot[kept[i].pos] = []; }
+    bySlot[kept[i].pos].push(kb.sum / kb.n);
+  }
+  for (p in bySlot) {
+    if (bySlot.hasOwnProperty(p)) {
+      bySlot[p].sort(function (a, b2) { return a - b2; });
+    }
+  }
+  return { basis: basis, noMeta: false, days: raw.days,
+           starts: raw.starts.length, bySlot: bySlot, byPlayer: byPlayer,
+           scale: scale };
+}
+
+// The f-quantile of an ASCENDING list: the value an f fraction of his
+// starts fall below. f comes from the budget, so the line is the cap's
+// own arithmetic pointed at a list of starts.
+function _skCutLine(values, frac) {
+  if (!values || values.length < SK_CUT_MIN) { return null; }
+  if (!(frac > 0)) { return null; }
+  // Past 95% the slot is not asking which start to drop, it is asking
+  // whether to field the slot at all, and a quantile that high is just
+  // the top of the list.
+  var f = (frac > 0.95) ? 0.95 : frac;
+  var idx = Math.floor(f * values.length);
+  if (idx >= values.length) { idx = values.length - 1; }
+  return values[idx];
+}
+
+// Where one man sits against the cut, which is not always one side of
+// it. The slot has to drop f of its starts and they come off the bottom
+// of the list; a man whose own starts STRADDLE that boundary is the
+// marginal man, and the share of HIS nights that has to go is steeper
+// than the slot's own -- because he is carrying the whole shortfall.
+//
+//   lo        starts by men who average LESS than he does
+//   eq        starts at his own number, his included
+//   lo >= cut none of his nights are inside the cut   -> start him
+//   lo+eq<=cut all of them are                        -> sit him
+//   otherwise  (cut - lo) of his eq nights have to go
+function _skCutPlace(values, frac, mean) {
+  if (!values || values.length < SK_CUT_MIN) { return null; }
+  if (!(frac > 0) || mean == null) { return null; }
+  var f = (frac > 0.95) ? 0.95 : frac;
+  var cut = f * values.length;
+  var lo = 0, eq = 0, i;
+  for (i = 0; i < values.length; i++) {
+    if (values[i] < mean) { lo++; }
+    else if (values[i] === mean) { eq++; }
+  }
+  if (lo >= cut) { return { sit: false, share: 0 }; }
+  if (lo + eq <= cut) { return { sit: true, share: 1 }; }
+  return { sit: true, share: (cut - lo) / eq };
+}
+
+// Tonight's active slots, off today's own day map. The stats in it are
+// irrelevant -- the game has not been played -- so only the names, the
+// slots and the clubs are read, and the VALUE of each start comes from
+// his history.
+function _skCutTonight(league, teamKey, hist) {
+  var map = _skGpReadCachedMap(teamKey, _todayDateString());
+  if (!map) { return null; }
+  var sport = String((league && league.sport) || '').toLowerCase();
+  var bySlot = {}, pending = false, pk;
+  for (pk in map) {
+    if (!map.hasOwnProperty(pk)) { continue; }
+    var e = map[pk];
+    if (!e || !_isActiveSlot(e.selectedPos)) { continue; }
+    var pos = String(e.selectedPos || '');
+    // Tri-state, and treated as the schedule's own owner treats it: a
+    // definite NO is an idle club that burns nothing, and anything
+    // short of that is a start until proven otherwise.
+    var plays = null;
+    try { plays = _skPlaysToday(sport, e.teamAbbr); } catch (eP) { plays = null; }
+    if (plays === null) { pending = true; }
+    var ph = hist.byPlayer[pk + '|' + pos];
+    if (!bySlot[pos]) { bySlot[pos] = []; }
+    bySlot[pos].push({ pk: pk, name: e.name || pk, team: e.teamAbbr || '',
+      idle: (plays === false),
+      mean: (ph && ph.n > 0) ? (ph.sum / ph.n) : null,
+      n: (ph ? ph.n : 0) });
+  }
+  return { bySlot: bySlot, pending: pending };
+}
+
+// A fantasy total reads to a tenth; an index whose whole range is about
+// 0.3 to 2.5 needs the second decimal to say anything at all.
+function _skCutFmt(v, basis) {
+  if (v == null || isNaN(v)) { return '\u2014'; }
+  return (basis === 'fp') ? _skGpB1(v) : _skGpB2(v);
+}
+
+// Measured best first, then the unmeasured, then the clubs that are not
+// playing -- which is the order he reads them in: decisions, then
+// unknowns, then things that are not decisions at all.
+function _skCutSortTonight(a, b) {
+  if (a.idle !== b.idle) { return a.idle ? 1 : -1; }
+  var am = (a.mean == null), bm = (b.mean == null);
+  if (am !== bm) { return am ? 1 : -1; }
+  if (am && bm) { return 0; }
+  return b.mean - a.mean;
+}
+
+function _skGpCutPanel(league, rows, maxByPos, positions, myKey, win) {
+  var mine = null, i, j;
+  for (i = 0; i < rows.length; i++) { if (rows[i].isMine) { mine = rows[i]; } }
+  if (!mine) { return ''; }
+  var lk = league.league_key;
+  var pr = _skGpProjectSlots(league, mine.usage, maxByPos, positions);
+  if (!pr.rows.length) { return ''; }
+
+  var meta = null;
+  try {
+    meta = (typeof leagueSettingsCache !== 'undefined' && leagueSettingsCache[lk] &&
+            leagueSettingsCache[lk].stats) || null;
+  } catch (eM) { meta = null; }
+
+  var dates = (win && win.common) || [];
+  var hist = _skCutHistory(myKey, dates, meta);
+  var tn = _skCutTonight(league, myKey, hist);
+
+  function shell(sub, body) {
+    return '<div class="gpc">' +
+      '<div class="gps-head">' +
+        '<span class="gps-h1">TONIGHT\u2019S CUT LINE</span>' +
+        '<span class="gps-h2">' + sub + '</span>' +
+      '</div>' + body + '</div>';
+  }
+
+  // NOTHING CACHED OUTRANKS CANNOT-SCORE. A team with no surviving day
+  // maps reports no fantasy points either, so the basis falls to cats
+  // and a league with no stat table loaded then blamed the stat table
+  // for an empty sample. The stat table only matters once there is
+  // something to score with it.
+  if (hist.days === 0) {
+    return shell('no lineups cached', '<div class="gps-note">The line is cut ' +
+      'from your own past starts, and none of the day-by-day lineups behind ' +
+      'MY SLOTS are still cached \u2014 the per-slot counts outlive the full ' +
+      'lineups they were counted from. Fill a few days above and the line ' +
+      'appears with them.</div>');
+  }
+  if (hist.noMeta) {
+    return shell('needs the stat table', '<div class="gps-note">A cats line ' +
+      'can only be scored once the league\u2019s own stat categories are ' +
+      'loaded \u2014 without them there is no telling a counting cat from a ' +
+      'rate. Open the league once and this fills in.</div>');
+  }
+  if (!tn) {
+    return shell(hist.days + ' nights read', '<div class="gps-note">Tonight\u2019s ' +
+      'lineup has not been read yet, so there is nobody to place against the ' +
+      'line. Open Today\u2019s Lineup once and come back.</div>');
+  }
+
+  var body = '', below = 0, decisions = 0, drawn = 0;
+
+  for (i = 0; i < pr.rows.length; i++) {
+    var r = pr.rows[i];
+    var here = tn.bySlot[r.pos] || [];
+    // A slot with nobody in it tonight is not a decision tonight.
+    if (!here.length) { continue; }
+    drawn++;
+    var bg = _skGpSlotBudget(r, pr);
+    var vals = hist.bySlot[r.pos] || [];
+    var line = _skCutLine(vals, (bg && bg.over) ? bg.frac : 0);
+    here = here.slice().sort(_skCutSortTonight);
+
+    var slotBelow = 0, slotLive = 0, pb = '';
+    for (j = 0; j < here.length; j++) {
+      var pl = here[j];
+      var cls, verdict;
+      if (pl.idle) {
+        cls = ' idle'; verdict = '<b>IDLE</b>';
+      } else if (pl.mean == null) {
+        cls = ' na'; verdict = '<b>NO DATA</b>';
+        slotLive++;
+      } else {
+        slotLive++;
+        var place = _skCutPlace(vals, (bg && bg.over) ? bg.frac : 0, pl.mean);
+        var every = '';
+        if (place && place.sit && place.share < 1) {
+          // ONE JUDGE of how often a share is worth acting on, and it is
+          // the budget's own. An empty answer means the share is a
+          // sliver, and a sliver is not an instruction.
+          every = _skGpSitLine(place.share).replace(/^sit /, '');
+        }
+        if (place && place.sit && (place.share >= 1 || every)) {
+          cls = ' sit'; slotBelow++;
+          verdict = '<b>SIT</b>' + (every ? ('<i>' + every + '</i>') : '');
+        } else {
+          cls = ' go'; verdict = '<b>START</b>';
+        }
+      }
+      pb += '<div class="gpc-p' + cls + '">' +
+        '<span class="gpc-nm">' + skEscape(pl.name) +
+          (pl.team ? ('<small>' + skEscape(pl.team) + '</small>') : '') +
+          (pl.mean != null
+            ? ('<small>' + pl.n + ' start' + (pl.n === 1 ? '' : 's') + '</small>')
+            : '') +
+        '</span>' +
+        '<span class="gpc-v">' + _skCutFmt(pl.mean, hist.basis) + '</span>' +
+        '<span class="gpc-k">' + verdict + '</span>' +
+      '</div>';
+    }
+    below += slotBelow;
+    decisions += slotLive;
+
+    var tag, note;
+    if (line != null) {
+      tag = '<span class="gpc-sl">line ' + _skCutFmt(line, hist.basis) + '</span>';
+      note = (_skGpSitLine(bg.frac) || 'just over') + ' \u00b7 ' +
+        vals.length + ' start' + (vals.length === 1 ? '' : 's') + ' read';
+    } else if (bg && bg.over) {
+      tag = '<span class="gpc-sx">no line</span>';
+      note = 'over, but only ' + vals.length + ' counted start' +
+        (vals.length === 1 ? '' : 's') + ' \u2014 needs ' + SK_CUT_MIN;
+    } else {
+      tag = '<span class="gpc-sx">no line</span>';
+      note = 'inside the budget \u2014 start everyone';
+    }
+    body += '<div class="gpc-slot">' +
+      '<div class="gpc-sh">' +
+        '<span class="gpc-sp">' + skEscape(_skGpPosLabel(lk, r.pos)) + '</span>' +
+        tag + '<span class="gpc-sx">' + note + '</span>' +
+      '</div>' + pb + '</div>';
+  }
+
+  if (!drawn) {
+    return shell(hist.days + ' nights read', '<div class="gps-note">Nobody is ' +
+      'in an active slot tonight, so there is nothing to cut.</div>');
+  }
+
+  body += '<div class="gps-note">' +
+    'The line is the value a slot\u2019s cheapest starts fall below \u2014 the ' +
+    'share the budget above says has to be sat, taken off your own counted ' +
+    'starts in that slot. A player under it is a start the cap cannot afford; ' +
+    'his number is his own mean over those starts, not a projection. ' +
+    (hist.basis === 'fp'
+      ? 'Numbers are fantasy points. '
+      : 'Numbers are an index of your own starts in that slot, so ' +
+        '<b>1.00</b> is an average one and 1.40 is forty per cent better. ')
+    + 'Read off <b>' + hist.days + '</b> of the ' +
+    ((win && win.common && win.common.length) || hist.days) +
+    ' nights MY SLOTS counted \u2014 the per-slot counts outlive the full ' +
+    'lineups, so this sample is the smaller one. ' +
+    'A club not playing burns no game, so it is no decision. ' +
+    'The man ON the line carries the slot\u2019s whole shortfall, so his ' +
+    'share is steeper than the slot\u2019s \u2014 the slot sits one night in ' +
+    'four, he sits one in two, and nobody else sits at all. ' +
+    (tn.pending ? 'Tonight\u2019s schedule is still loading, so some clubs may ' +
+      'be marked as playing when they are idle \u2014 reopen the tab. ' : '') +
+    'And because usage is a floor the allowance reads high, the share to sit ' +
+    'reads low, and the line sits low with it: the real cut is <b>here or ' +
+    'higher</b>, never lower.' +
+    '</div>';
+
+  var sub = below
+    ? (below + ' of ' + decisions + ' to sit')
+    : (decisions + ' start' + (decisions === 1 ? '' : 's') + ' \u00b7 none below');
+  return shell(sub, body);
 }
 
 // == MY SLOTS == GPPROJ ==
