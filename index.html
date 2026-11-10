@@ -2419,6 +2419,16 @@
   .gpc-p.hold .gpc-v { color: rgba(255,255,255,0.6); }
   /* CUTFIRM -- and a START nothing is asked of, off a sample that
      could not have carried a SIT, says START in a smaller voice. */
+  /* BENCHALT -- the bench sits under a hairline, indented with the
+     men it is being measured against. */
+  .gpc-bh {
+    margin: 5px 0 1px; padding: 4px 0 0 34px;
+    border-top: 1px dashed rgba(255,255,255,0.08);
+    font-size: 8.5px; letter-spacing: 0.1em; text-transform: uppercase;
+    color: rgba(255,255,255,0.28);
+  }
+  .gpc-p.opt .gpc-k { color: #facc15; }
+  .gpc-p.opt .gpc-v { color: #fff; }
   .gpc-p.go.lite .gpc-k { color: rgba(123,216,143,0.45); }
   .gpc-p.go.lite .gpc-v { color: rgba(255,255,255,0.6); }
   .gpc-p.sit .gpc-v, .gpc-p.sit .gpc-k { color: #f08a7a; }
@@ -55394,6 +55404,13 @@ async function fetchTeamFpForDate(teamKey, date) {
       // whole season in its own namespace, untouched by either eviction.
       if (_hasData && typeof _skGpWriteTally === 'function') {
         try { _skGpWriteTally(teamKey, date, byKey, isImmutable); } catch (e3) {}
+      }
+      // CUTLOG - and the starts themselves, for his own team, in a third
+      // store of the same kind. The tally knows a slot spent a start; it
+      // cannot say who made it or what it returned, which is the whole
+      // question the cut line answers.
+      if (_hasData && typeof _skCutLogWrite === 'function') {
+        try { _skCutLogWrite(teamKey, date, byKey, isImmutable); } catch (e3b) {}
       }
       // PSPARK - the same parsed map, kept as one number per player per day in
       // a store the FP cache's eviction cannot reach.
@@ -174859,25 +174876,133 @@ function _skGpB2(n) {
 // A quantile off six starts is a number pretending to be evidence.
 var SK_CUT_MIN = 8;
 
-// Every start in the window, with the slot it was made in. Deliberately
-// the FULL day map and not the tally: a tally knows how many starts a
-// slot spent, not what any of them returned.
+// == THE SEASON, KEPT == CUTLOG ==
+//
+// The full day maps this used to read are capped at FP_LS_MAX entries
+// across every league and evicted oldest first -- about eleven days in a
+// twelve-team league, as the tally beside this one already says in its
+// own words. So the cut line was drawn from whatever fortnight happened
+// to survive, while MY SLOTS counted the whole season from its tally.
+// On a three-week-old NBA league that meant ten nights of twenty-one and
+// five counted starts in a slot that needs eight -- a panel that could
+// not answer the question it was built for, not because the arithmetic
+// was wrong but because the evidence had been thrown out from under it.
+//
+// A start is a player, a slot, and what he returned. That is a few dozen
+// bytes against the seven kilobytes of roster it came from, so it keeps
+// for the whole season in a namespace neither eviction can reach -- the
+// same trade the games-played tally and the form sparklines already
+// make.
+//
+// Zeros are dropped. _skCutScale sums and _skCutValue reads a missing
+// cat as nought, so dropping them changes neither the scale nor any
+// value, and they are most of the bytes.
+var SK_CUTLOG_PREFIX = 'sk_cutlog_v1_';
+
+// ONE OWNER of what in a day map counts as a start and what of it
+// matters. Both the live map and the kept log go through here, so a
+// night read off the cache and the same night read off the log cannot
+// come out as different starts.
+function _skCutSlim(fpMap) {
+  var out = [], pk, sid;
+  if (!fpMap) { return out; }
+  for (pk in fpMap) {
+    if (!fpMap.hasOwnProperty(pk)) { continue; }
+    var e = fpMap[pk];
+    // The same two questions the games-cap count asks, and the same
+    // owners answering them, so a start that burned a game and a start
+    // on this panel are the same start.
+    if (!e || !_isActiveSlot(e.selectedPos)) { continue; }
+    if (!_skPlayedThatDay(e)) { continue; }
+    // CUTUTIL -- the app's slot keys are uppercase. _skGpCountDate
+    // uppercases before it tallies, and the rows this feeds are keyed
+    // off maxByPos, which is uppercase too.
+    var pos = String(e.selectedPos || '').toUpperCase();
+    if (!pos) { continue; }
+    var st = null;
+    if (e.stats) {
+      for (sid in e.stats) {
+        if (!e.stats.hasOwnProperty(sid)) { continue; }
+        var v = e.stats[sid];
+        if (typeof v === 'number' && v !== 0) {
+          if (!st) { st = {}; }
+          st[sid] = v;
+        }
+      }
+    }
+    out.push([pk, pos,
+      (typeof e.fp === 'number' && !isNaN(e.fp)) ? e.fp : null, st]);
+  }
+  return out;
+}
+
+function _skCutLogRecord(teamKey, date) {
+  try {
+    var raw = localStorage.getItem(SK_CUTLOG_PREFIX + _fpKey(teamKey, date));
+    if (!raw) { return null; }
+    var rec = JSON.parse(raw);
+    if (!rec || Object.prototype.toString.call(rec.r) !== '[object Array]') {
+      return null;
+    }
+    return rec;
+  } catch (e) { return null; }
+}
+
+function _skCutLogWrite(teamKey, date, fpMap, settled) {
+  if (!teamKey || !date || !fpMap) { return false; }
+  // HIS TEAM ONLY. The cut line never asks about anybody else's slots,
+  // and the grid fetches every team in the league most nights -- logging
+  // all twelve would cost twelve times the room for eleven twelfths
+  // nobody will ever read.
+  var lk = String(teamKey).split('.t.')[0];
+  var mine = null;
+  try {
+    mine = (typeof skLeagueData !== 'undefined' && skLeagueData[lk] &&
+            skLeagueData[lk].team && skLeagueData[lk].team.team_key) || null;
+  } catch (e) {}
+  if (!mine || mine !== teamKey) { return false; }
+  // Settled beats provisional, whatever arrives later -- the same rule
+  // the tally beside it follows, and the reason the FETCH button can
+  // repair a night that was banked before its games had been played.
+  var prev = _skCutLogRecord(teamKey, date);
+  if (prev && prev.s && !settled) { return false; }
+  var k = SK_CUTLOG_PREFIX + _fpKey(teamKey, date);
+  // GAPHOLE -- a blank night is written down too, so "read, nobody
+  // played" stays distinguishable from "never read".
+  var body = JSON.stringify({ v: 1, s: settled ? 1 : 0, r: _skCutSlim(fpMap) });
+  // _fpSafeSet gives up the FAT cache to make room, which is the right
+  // way round: the roster maps are a cache and this is the record.
+  try { return !!_fpSafeSet(k, body); } catch (e2) { return false; }
+}
+
+// Every start in the window, with the slot it was made in. The kept log
+// first; a day still in the fat cache is slimmed into the log on the way
+// past, which is the whole migration -- every render carries a few more
+// nights across before eviction takes them.
 function _skCutStarts(teamKey, dates) {
-  var starts = [], days = 0, i, pk;
+  var starts = [], days = 0, i, j;
   for (i = 0; i < (dates || []).length; i++) {
-    var map = _skGpReadCachedMap(teamKey, dates[i]);
-    if (!map) { continue; }
+    var rec = _skCutLogRecord(teamKey, dates[i]);
+    // A PROVISIONAL NIGHT YIELDS TO A LIVE MAP. A day banked before its
+    // games finished is a line of zeros; if the cache still holds that
+    // night, re-reading it is how the record gets better rather than
+    // staying wrong for ever.
+    var map = (!rec || !rec.s) ? _skGpReadCachedMap(teamKey, dates[i]) : null;
+    var rows = null;
+    if (map) {
+      rows = _skCutSlim(map);
+      // Written as PROVISIONAL: a cached map carries no vintage, so this
+      // must never out-rank a day a real fetch has settled.
+      try { _skCutLogWrite(teamKey, dates[i], map, false); } catch (eW) {}
+    } else if (rec) {
+      rows = rec.r;
+    }
+    if (!rows) { continue; }
     days++;
-    for (pk in map) {
-      if (!map.hasOwnProperty(pk)) { continue; }
-      var e = map[pk];
-      // The same two questions the games-cap count asks, and the same
-      // owners answering them, so a start that burned a game and a
-      // start on this panel are the same start.
-      if (!e || !_isActiveSlot(e.selectedPos)) { continue; }
-      if (!_skPlayedThatDay(e)) { continue; }
-      starts.push({ pk: pk, pos: String(e.selectedPos || ''),
-        name: e.name || '', fp: e.fp, stats: e.stats || {} });
+    for (j = 0; j < rows.length; j++) {
+      starts.push({ pk: rows[j][0], pos: rows[j][1], name: '',
+        fp: (rows[j][2] == null) ? null : rows[j][2],
+        stats: rows[j][3] || {} });
     }
   }
   return { starts: starts, days: days };
@@ -174958,29 +175083,62 @@ function _skCutValue(s, basis, scale) {
 // each slot. Keyed by player AND slot on purpose: in a cats league the
 // two slots do not share a scale, so pooling a wing's starts into a
 // centre's mean would be adding up two different units.
+// == A MAN IS VALUED IN THE SLOT YOU ARE CONSIDERING HIM FOR == BENCHALT ==
+//
+// His starts used to be filed under the slot he happened to make them
+// in, and that was defended on the grounds that two slots do not share
+// a scale -- a crease line and a defence line are not the same unit, so
+// pooling them would be adding up two different things.
+//
+// True, and the wrong conclusion. The fix is not to refuse the question
+// but to re-ask it in the right unit: take the raw stat lines he
+// actually produced and value them against the scale of the slot being
+// asked about. A wing's nights, read as centre nights, are what he
+// would be worth at centre -- and in a points league, where fp does not
+// care what slot it was earned in, it is the same number either way.
+//
+// That is what lets a man on the bench be placed at all. He has no
+// starts in the slot you are considering him for, by definition.
 function _skCutHistory(teamKey, dates, meta) {
   var raw = _skCutStarts(teamKey, dates);
   var basis = _skCutBasis(raw.starts);
+  var none = function () { return null; };
   if (basis === 'cats' && !meta) {
     return { basis: 'cats', noMeta: true, days: raw.days, starts: 0,
-             bySlot: {}, byPlayer: {} };
+             bySlot: {}, byPlayer: {}, forSlot: none };
   }
   var scale = (basis === 'cats') ? _skCutScale(raw.starts, meta) : null;
-  var bySlot = {}, byPlayer = {}, kept = [], i, p;
+  var bySlot = {}, byPlayer = {}, i, p;
   for (i = 0; i < raw.starts.length; i++) {
     var s = raw.starts[i];
-    var v = _skCutValue(s, basis, scale);
-    if (v == null) { continue; }
-    kept.push(s);
-    var bk = s.pk + '|' + s.pos;
-    var b = byPlayer[bk];
-    if (!b) { b = byPlayer[bk] = { n: 0, sum: 0, sq: 0, name: s.name }; }
-    // CUTFIRM -- the squares as well as the total. A mean on its own
-    // cannot say whether it is worth anything, and the panel was acting
-    // on three-night means as if they were settled facts.
-    b.n++; b.sum += v; b.sq += v * v;
+    var b = byPlayer[s.pk];
+    if (!b) { b = byPlayer[s.pk] = { n: 0, lines: [], name: s.name }; }
+    b.n++; b.lines.push(s);
     if (!b.name) { b.name = s.name; }
   }
+
+  // Re-valuing every line on every lookup is cheap but not free, and the
+  // panel asks for the same pair over and over.
+  var memo = {};
+  var forSlot = function (pk, pos) {
+    var mk = pk + '|' + pos;
+    if (memo[mk] !== undefined) { return memo[mk]; }
+    var bb = byPlayer[pk], n = 0, sum = 0, sq = 0, j, v;
+    if (bb) {
+      for (j = 0; j < bb.lines.length; j++) {
+        v = _skCutValue({ pos: pos, fp: bb.lines[j].fp,
+                          stats: bb.lines[j].stats }, basis, scale);
+        if (v == null) { continue; }
+        // CUTFIRM -- the squares as well as the total. A mean on its own
+        // cannot say whether it is worth anything, and the panel was
+        // acting on three-night means as if they were settled facts.
+        n++; sum += v; sq += v * v;
+      }
+    }
+    memo[mk] = n ? { n: n, sum: sum, sq: sq } : null;
+    return memo[mk];
+  };
+
   // == COMPARE LIKE WITH LIKE ==
   //
   // The distribution is of what a start in this slot is WORTH GOING IN,
@@ -174994,11 +175152,12 @@ function _skCutHistory(teamKey, dates, meta) {
   // no centre he owns AVERAGES under 0.38, so a slot that had to sit
   // one night in four told him to start everybody. Weighted by starts,
   // so a man who plays every night counts for more than a spare.
-  for (i = 0; i < kept.length; i++) {
-    var kb = byPlayer[kept[i].pk + '|' + kept[i].pos];
-    if (!kb || !kb.n) { continue; }
-    if (!bySlot[kept[i].pos]) { bySlot[kept[i].pos] = []; }
-    bySlot[kept[i].pos].push(kb.sum / kb.n);
+  for (i = 0; i < raw.starts.length; i++) {
+    var st = raw.starts[i];
+    var rec = forSlot(st.pk, st.pos);
+    if (!rec) { continue; }
+    if (!bySlot[st.pos]) { bySlot[st.pos] = []; }
+    bySlot[st.pos].push(rec.sum / rec.n);
   }
   for (p in bySlot) {
     if (bySlot.hasOwnProperty(p)) {
@@ -175007,7 +175166,21 @@ function _skCutHistory(teamKey, dates, meta) {
   }
   return { basis: basis, noMeta: false, days: raw.days,
            starts: raw.starts.length, bySlot: bySlot, byPlayer: byPlayer,
-           scale: scale };
+           scale: scale, forSlot: forSlot };
+}
+
+// == IS THIS MAN BETTER THAN THAT ONE == BENCHALT ==
+//
+// Two men, two swings. The claim is that one is worth more than the
+// other, so what has to clear is the gap against BOTH their errors --
+// not against either one alone, which would call a swap on half the
+// evidence it needs. Null means one of them cannot be measured at all,
+// which is not the same answer as no.
+function _skCutBeats(a, bb) {
+  var sa = _skCutSteady(a), sb = _skCutSteady(bb);
+  if (!sa || !sb) { return null; }
+  var gap = (a.sum / a.n) - (bb.sum / bb.n);
+  return gap > Math.sqrt(sa.se * sa.se + sb.se * sb.se);
 }
 
 // The f-quantile of an ASCENDING list: the value an f fraction of his
@@ -175145,19 +175318,29 @@ function _skCutTonight(league, teamKey, hist) {
   var map = _skGpReadCachedMap(teamKey, _todayDateString());
   if (!map) { return null; }
   var sport = String((league && league.sport) || '').toLowerCase();
-  var bySlot = {}, pending = false, pk;
+  var bySlot = {}, bench = [], pending = false, pk;
   for (pk in map) {
     if (!map.hasOwnProperty(pk)) { continue; }
     var e = map[pk];
-    if (!e || !_isActiveSlot(e.selectedPos)) { continue; }
-    var pos = String(e.selectedPos || '');
+    if (!e) { continue; }
     // Tri-state, and treated as the schedule's own owner treats it: a
     // definite NO is an idle club that burns nothing, and anything
     // short of that is a start until proven otherwise.
     var plays = null;
     try { plays = _skPlaysToday(sport, e.teamAbbr); } catch (eP) { plays = null; }
     if (plays === null) { pending = true; }
-    var ph = hist.byPlayer[pk + '|' + pos];
+    if (!_isActiveSlot(e.selectedPos)) {
+      // BENCHALT -- a reserve whose club is NOT playing is no option at
+      // all, so he is left off rather than listed and dismissed. The
+      // slot he could fill is worked out per slot, because one man is
+      // eligible at several.
+      if (plays !== false) {
+        bench.push({ pk: pk, name: e.name || pk, team: e.teamAbbr || '', p: e });
+      }
+      continue;
+    }
+    var pos = String(e.selectedPos || '').toUpperCase();   // CUTUTIL
+    var ph = hist.forSlot(pk, pos);
     if (!bySlot[pos]) { bySlot[pos] = []; }
     bySlot[pos].push({ pk: pk, name: e.name || pk, team: e.teamAbbr || '',
       idle: (plays === false),
@@ -175167,7 +175350,7 @@ function _skCutTonight(league, teamKey, hist) {
       rec: ph || null,
       n: (ph ? ph.n : 0) });
   }
-  return { bySlot: bySlot, pending: pending };
+  return { bySlot: bySlot, bench: bench, pending: pending };
 }
 
 // A fantasy total reads to a tenth; an index whose whole range is about
@@ -175238,7 +175421,8 @@ function _skGpCutPanel(league, rows, maxByPos, positions, myKey, win) {
       'line. Open Today\u2019s Lineup once and come back.</div>');
   }
 
-  var body = '', below = 0, decisions = 0, drawn = 0, held = 0;
+  var body = '', below = 0, decisions = 0, drawn = 0, held = 0, swaps = 0;
+  var sport = String((league && league.sport) || '').toLowerCase();
 
   for (i = 0; i < pr.rows.length; i++) {
     var r = pr.rows[i];
@@ -175304,6 +175488,76 @@ function _skGpCutPanel(league, rows, maxByPos, positions, myKey, win) {
       '</div>';
     }
     held += slotHeld;
+
+    // == WITH WHOM? == BENCHALT ==
+    //
+    // A slot over its budget is a slot being told to sit somebody, and
+    // the next question out of his mouth is who goes in instead. Only
+    // over slots get this: a slot with room is not replacing anybody,
+    // and listing its bench would be four more rows about nothing.
+    //
+    // The comparison is against the WEAKEST man he has started here --
+    // the one the cap is coming for -- and not against the line. Man
+    // against man needs no quantile, so it works on a slot too thin to
+    // draw a line at all, which is most of them in a young season.
+    if (bg && bg.over && tn.bench.length) {
+      var worst = null, wi;
+      for (wi = 0; wi < here.length; wi++) {
+        // The weakest man he can actually MEASURE. Comparing a bench man
+        // to a three-night starter can only ever come back NO CALL, so
+        // it would turn the whole block into a shrug.
+        if (here[wi].idle || !here[wi].rec) { continue; }
+        if (!_skCutSteady(here[wi].rec)) { continue; }
+        if (!worst || (here[wi].mean < worst.mean)) { worst = here[wi]; }
+      }
+      if (worst) {
+        var opts = [], bi;
+        for (bi = 0; bi < tn.bench.length; bi++) {
+          var bm = tn.bench[bi], can = false;
+          try { can = _skYwCanFill(sport, bm.p, r.pos); } catch (eE) { can = false; }
+          if (!can) { continue; }
+          var brec = hist.forSlot(bm.pk, r.pos);
+          opts.push({ name: bm.name, team: bm.team, rec: brec,
+            n: brec ? brec.n : 0,
+            mean: brec ? (brec.sum / brec.n) : null });
+        }
+        opts.sort(_skCutSortTonight);
+        var ob = '';
+        for (bi = 0; bi < opts.length; bi++) {
+          var op = opts[bi], ocls, over;
+          var beats = op.rec ? _skCutBeats(op.rec, worst.rec) : null;
+          if (!op.rec) {
+            ocls = ' na'; over = '<b>NO DATA</b>';
+          } else if (beats === null) {
+            ocls = ' hold';
+            over = '<b>NO CALL</b><i>' + op.n + ' night' +
+              (op.n === 1 ? '' : 's') + '</i>';
+          } else if (beats) {
+            ocls = ' opt'; over = '<b>SWAP IN</b>'; swaps++;
+          } else {
+            ocls = ' na'; over = '<b>NO EDGE</b>';
+          }
+          var ose = '';
+          if (op.rec && _skCutSteady(op.rec)) {
+            ose = '<small>\u00b1' +
+              _skCutFmt(_skCutSteady(op.rec).se, hist.basis) + '</small>';
+          }
+          ob += '<div class="gpc-p' + ocls + '">' +
+            '<span class="gpc-nm">' + skEscape(op.name) +
+              (op.team ? ('<small>' + skEscape(op.team) + '</small>') : '') +
+              (op.rec ? ('<small>' + op.n + ' night' +
+                (op.n === 1 ? '' : 's') + '</small>') : '') + ose +
+            '</span>' +
+            '<span class="gpc-v">' + _skCutFmt(op.mean, hist.basis) + '</span>' +
+            '<span class="gpc-k">' + over + '</span>' +
+          '</div>';
+        }
+        if (ob) {
+          pb += '<div class="gpc-bh">on your bench \u00b7 against ' +
+            skEscape(worst.name) + '</div>' + ob;
+        }
+      }
+    }
     below += slotBelow;
     decisions += slotLive;
 
@@ -175350,11 +175604,26 @@ function _skGpCutPanel(league, rows, maxByPos, positions, myKey, win) {
       ? 'Numbers are fantasy points. '
       : 'Numbers are an index of your own starts in that slot, so ' +
         '<b>1.00</b> is an average one and 1.40 is forty per cent better. ')
-    + 'Read off <b>' + hist.days + '</b> of the ' +
-    ((win && win.common && win.common.length) || hist.days) +
-    ' nights MY SLOTS counted \u2014 the per-slot counts outlive the full ' +
-    'lineups, so this sample is the smaller one. ' +
+    + (function () {
+        // CUTLOG -- once the kept log has every counted night there is
+        // no shortfall to admit, and a standing apology for one would
+        // be its own kind of wrong.
+        var _cn = (win && win.common && win.common.length) || hist.days;
+        if (hist.days >= _cn) {
+          return 'Read off all <b>' + _cn + '</b> nights MY SLOTS counted. ';
+        }
+        return 'Read off <b>' + hist.days + '</b> of the ' + _cn +
+          ' nights MY SLOTS counted \u2014 the rest were never read, or were ' +
+          'read before this kept a record of them. The FETCH button above ' +
+          'recovers them. ';
+      })() +
     'A club not playing burns no game, so it is no decision. ' +
+    'Under an over-budget slot are the men on your bench who could fill ' +
+    'it and whose clubs play tonight, measured in THAT slot\u2019s unit \u2014 ' +
+    'a wing\u2019s nights read as centre nights, which is what he would be ' +
+    'worth there. <b>SWAP IN</b> means he beats your weakest man in the ' +
+    'slot by more than the two of them swing; <b>NO EDGE</b> means he ' +
+    'does not. ' +
     'Beside each man is how many nights his number rests on and, once ' +
     'that is enough to measure, how far it could reasonably be out ' +
     '(<b>\u00b1</b>). <b>NO CALL</b> means the panel is declining to ' +
@@ -175371,7 +175640,9 @@ function _skGpCutPanel(league, rows, maxByPos, positions, myKey, win) {
     'higher</b>, never lower.' +
     '</div>';
 
-  var _heldTxt = held ? (' \u00b7 ' + held + ' no call') : '';
+  var _heldTxt = (swaps ? (' \u00b7 ' + swaps + ' swap' +
+      (swaps === 1 ? '' : 's')) : '') +
+    (held ? (' \u00b7 ' + held + ' no call') : '');
   var sub = (below
     ? (below + ' of ' + decisions + ' to sit')
     : (decisions + ' start' + (decisions === 1 ? '' : 's') +
