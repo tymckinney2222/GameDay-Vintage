@@ -18276,6 +18276,24 @@
     background: rgba(255,255,255,0.06);
     color: var(--sk-text-dim, rgba(255,255,255,0.45));
   }
+  /* TNVS -- a scoreboard line, so the figure sits where a score sits. */
+  .tn-vs {
+    display: flex; align-items: baseline; gap: 8px;
+    padding: 0 14px 7px;
+    font-size: 10.5px; color: var(--sk-text-dim, rgba(255,255,255,0.4));
+  }
+  .tn-vs b { color: rgba(255,255,255,0.72); font-weight: 800; }
+  .tn-vs-me { flex: 0 0 auto; }
+  .tn-vs-o {
+    flex: 1 1 auto; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .tn-vs-fp {
+    flex: 0 0 auto; font-family: var(--sk-font-mono, monospace);
+    font-size: 12px; font-weight: 800;
+    color: rgba(255,255,255,0.88);
+  }
+
   .tn-note {
     padding: 8px 14px 14px; font-size: 11.5px; line-height: 1.5;
     color: var(--sk-text-dim, rgba(255,255,255,0.4));
@@ -195639,6 +195657,16 @@ function _tnLeagues() {
   return lgs;
 }
 
+// TNVS -- the rival worth a request: an H2H points league with a
+// matchup on record. Anything else has no opponent to put a number to.
+function _tnOppKey(lg) {
+  try {
+    if (!_skIsPointsH2HLeague(lg)) { return null; }
+    var lgd = skLeagueData[lg.league_key];
+    return (lgd && lgd.matchup && lgd.matchup.oppTeamKey) || null;
+  } catch (e) { return null; }
+}
+
 function _tnTeamKey(lk) {
   try {
     return (typeof skLeagueData !== 'undefined' && skLeagueData[lk] &&
@@ -195679,12 +195707,73 @@ function _tnRows(lg) {
   return { rows: out, idle: idle };
 }
 
+// == WHO YOU ARE PLAYING == TNVS ==
+//
+// Only in a head-to-head POINTS league, because only there is a nightly
+// total the thing being compared. A cats or roto league is won category
+// by category and a season-points league has no opponent at all, so a
+// number beside either would be a figure pretending to be a scoreboard.
+// _skIsPointsH2HLeague is the app's own answer to which is which, and it
+// already knows that an NFL head league scores in points.
+//
+// The opponent's total is summed off the SAME cached day map every other
+// figure on this board comes from, so his number and yours cannot have
+// been worked out two different ways.
+function _tnNightFp(teamKey) {
+  var map = teamKey ? _skGpReadCachedMap(teamKey, _todayDateString()) : null;
+  if (!map) { return null; }
+  var tot = 0, any = false, pk;
+  for (pk in map) {
+    if (!map.hasOwnProperty(pk)) { continue; }
+    var e = map[pk];
+    if (!e || !_isActiveSlot(e.selectedPos)) { continue; }
+    if (typeof e.fp === 'number' && !isNaN(e.fp)) { tot += e.fp; any = true; }
+  }
+  // Nought is an answer -- nobody has played yet. No numeric figure at
+  // all is not, and reads as a dash.
+  return any ? (Math.round(tot * 10) / 10) : null;
+}
+
+function _tnRank(t) {
+  var n = parseInt((t && t.rank), 10);
+  return (n > 0) ? ('#' + n) : '';
+}
+
+function _tnVsHtml(lg) {
+  var isH2H = false;
+  try { isH2H = !!_skIsPointsH2HLeague(lg); } catch (e) { isH2H = false; }
+  if (!isH2H) { return ''; }
+  var lgd = null;
+  try {
+    lgd = (typeof skLeagueData !== 'undefined') ? skLeagueData[lg.league_key] : null;
+  } catch (e2) { lgd = null; }
+  var m = lgd && lgd.matchup;
+  if (!m || !m.oppTeamKey) { return ''; }
+  var all = (lgd && lgd.allTeams) || {};
+  var mine = all[m.myTeamKey] || lgd.team || {};
+  var opp = all[m.oppTeamKey] || {};
+  var myRk = _tnRank(mine), opRk = _tnRank(opp);
+  var fp = _tnNightFp(m.oppTeamKey);
+  var oppName = opp.name || 'Opponent';
+  return '<div class="tn-vs">' +
+    '<span class="tn-vs-me">You' +
+      (myRk ? (' <b>' + myRk + '</b>') : '') + '</span>' +
+    '<span class="tn-vs-o">vs ' + skEscape(oppName) +
+      (opRk ? (' <b>' + opRk + '</b>') : '') + '</span>' +
+    '<span class="tn-vs-fp">' +
+      (fp == null ? '\u2014' : fp.toFixed(1)) + '</span>' +
+  '</div>';
+}
+
 function _tnSectionHtml(lg) {
   var lk = lg.league_key;
   var sport = String(lg.sport || '').toLowerCase();
   var head = '<div class="tn-h"><span class="tn-nm">' +
     skEscape(lg.name || lk) + '</span>' +
-    '<span class="tn-sp">' + skEscape(sport.toUpperCase()) + '</span></div>';
+    '<span class="tn-sp">' + skEscape(sport.toUpperCase()) + '</span></div>' +
+    // TNVS -- under the name, because it is about the league and not
+    // about any row in the table below it.
+    _tnVsHtml(lg);
   if (!_skTodaySportHasTable(sport)) {
     // A sport with no grid has nothing to show tonight either way, so it
     // joins the quiet line rather than repeating itself once a league.
@@ -195843,6 +195932,14 @@ function _tnFetchAll() {
     if (!tk) { continue; }
     jobs.push(fetchTeamFpForDate(tk, today).then(
       function (x) { return x; }, function () { return null; }));
+    // TNVS -- and the man you are playing, in the leagues where that is
+    // a question. _skCutLogWrite keeps the season log to HIS OWN team,
+    // so reading a rival's night costs a request and nothing else.
+    var _op = _tnOppKey(lg);
+    if (_op) {
+      jobs.push(fetchTeamFpForDate(_op, today).then(
+        function (x) { return x; }, function () { return null; }));
+    }
   }
   _tnState.busy = jobs.length;
   _tnRenderInto();
