@@ -195654,11 +195654,210 @@ function _tnLeagues() {
   try {
     lgs = (typeof skSyncedLeagues === 'function') ? (skSyncedLeagues() || []) : [];
   } catch (e) { lgs = []; }
+  // TNESP -- after the Yahoo ones, in each provider's own order.
+  try { lgs = lgs.concat(_tnEspList()); } catch (e2) {}
   return lgs;
 }
 
 // TNVS -- the rival worth a request: an H2H points league with a
 // matchup on record. Anything else has no opponent to put a number to.
+// == ESPN ON THE BOARD == TNESP ==
+//
+// bo426 shipped Yahoo alone and said ESPN "carries the figures but not
+// the column list a grid needs". That was wrong, and the evidence was
+// already on screen: the ESPN lineup sheet has drawn G, A, +/-, PPA and
+// FOW as columns for as long as it has existed. _erCols is the owner --
+// every stat id any man on the roster carries, named through
+// ESP_STAT_NAMES, sorted by id. A Yahoo stat table is the same facts in
+// a different shape.
+//
+// The rest is EASIER than Yahoo. ESPN publishes `starter` and `noGame`
+// on the roster item itself, so this board does not have to ask a
+// scoreboard who is playing or canon a club abbreviation to find out --
+// the roster already says, in the league's own words.
+// BOTH TABLES ARE KEYED BY GAME FIRST, then by name -- a save
+// percentage is a rate in hockey and means nothing in football, so the
+// same word cannot answer for both. Reading them one level too shallow
+// returns undefined for every category, which is to say no category is
+// ever a rate and every one reads upward.
+function _tnEspIsRate(game, abbr) {
+  try {
+    var m = ESP_RATE_BY_NAME && ESP_RATE_BY_NAME[game];
+    return !!(m && m[abbr]);
+  } catch (e) { return false; }
+}
+function _tnEspIsLower(game, abbr) {
+  try {
+    var m = ESP_LOWER_BY_NAME && ESP_LOWER_BY_NAME[game];
+    return !!(m && m[abbr]);
+  } catch (e) { return false; }
+}
+
+// His own team in every synced, not-done ESPN league. extSyncedLeagues is
+// the other side of skSyncedLeagues and drops a finished league the same
+// way, so a done ESPN league never reaches the board either.
+function _tnEspList() {
+  var out = [], list = [], i, k;
+  try {
+    list = (typeof extSyncedLeagues === 'function') ? (extSyncedLeagues() || []) : [];
+  } catch (e) { return out; }
+  for (i = 0; i < list.length; i++) {
+    var row = list[i];
+    if (!row || row.provider !== 'espn') { continue; }
+    if (!row.rosters || !row.rosters.byTeam) { continue; }
+    var myIds = row.myTeamIds || {}, tk = null;
+    for (k in row.rosters.byTeam) {
+      if (row.rosters.byTeam.hasOwnProperty(k) && myIds[k]) { tk = k; break; }
+    }
+    if (!tk) { continue; }
+    out.push({
+      league_key: String(row.key || ('espn.' + i)),
+      name: row.name || 'ESPN league',
+      sport: String(row.sport || '').toLowerCase(),
+      // TNESP -- the marker the section renderer dispatches on. A Yahoo
+      // league never carries one.
+      _esp: { row: row, items: (row.rosters.byTeam[tk].items) || [] }
+    });
+  }
+  return out;
+}
+
+function _tnEspRows(lg) {
+  var items = (lg._esp && lg._esp.items) || [], out = [], idle = 0, i;
+  // THE REAL CLUB, not the fantasy slot. ESPPLAYERID learned this the
+  // hard way: a blank club opened a Philadelphia guard's card as "UTIL".
+  // Keyed by game and season, the same two facts the roster pane uses.
+  var pt = null;
+  try {
+    var row = lg._esp.row;
+    var ptSeason = (row.rosters && row.rosters.season) || row.season || null;
+    var ptGame = _espGameCode(row);
+    var ptKey = ptSeason ? (ptGame + ':' + ptSeason) : null;
+    pt = ptKey ? (_espProTeams[ptKey] || null) : null;
+    if (ptSeason && !pt && typeof espProTeamMap === 'function') {
+      // Repaint once it lands, the same way the roster pane does.
+      espProTeamMap(ptGame, ptSeason, function () {
+        try {
+          var ov = document.getElementById('tnOverlay');
+          if (ov && ov.classList.contains('open')) { _tnRenderInto(); }
+        } catch (eR) {}
+      });
+    }
+  } catch (eP) { pt = null; }
+  for (i = 0; i < items.length; i++) {
+    var it = items[i];
+    if (!it || !it.playerId) { continue; }
+    // ESPN says both of these on the item, so there is no scoreboard to
+    // ask and no abbreviation to canon in order to find out.
+    if (!it.starter) { continue; }
+    if (it.noGame) { idle++; continue; }
+    var w = (it.windows && it.windows.today) || null;
+    out.push({
+      playerKey: lg.league_key + '::' + it.playerId,
+      name: it.name || String(it.playerId),
+      teamAbbr: (pt && it.teamId != null) ? (pt[String(it.teamId)] || '') : '',
+      selectedPos: it.slot || '', pos: '',
+      stats: (w && w.stats) || {},
+      fp: (w && w.total != null && !isNaN(Number(w.total))) ? Number(w.total) : null
+    });
+  }
+  return { rows: out, idle: idle };
+}
+
+// _erCols in Yahoo's shape. Two windows, because the fullest one in hand
+// says which categories this roster plays and tonight's alone would drop
+// a column the moment nobody had recorded one yet.
+function _tnEspMeta(lg) {
+  var game = '';
+  try { game = _espGameCode(lg._esp.row) || ''; } catch (e) { game = ''; }
+  var cols = [];
+  try {
+    cols = _erCols(lg._esp.items || [], ['today', 'season'], game) || [];
+  } catch (e2) { cols = []; }
+  var meta = {}, ord = [], i;
+  for (i = 0; i < cols.length; i++) {
+    var ab = cols[i].label;
+    if (!ab) { continue; }
+    // A RATE IS NOT A COLUMN HERE. This grid foots every column into a
+    // team total, and four goalies at .915 do not make a save
+    // percentage of 3.66 -- the Nightly Leaders board refuses the same
+    // sum for the same reason.
+    if (_tnEspIsRate(game, ab)) { continue; }
+    meta[String(cols[i].id)] = { abbr: ab, enabled: 1,
+      sortOrder: _tnEspIsLower(game, ab) ? '0' : '1' };
+    ord.push(String(cols[i].id));
+  }
+  return ord.length ? { meta: meta, ord: ord } : null;
+}
+
+// == ONE TABLE, TWO PROVIDERS == TNESP ==
+//
+// Yahoo and ESPN differ in where the rows come from and where the stat
+// table comes from. After that they are the same forty lines, and two
+// copies of forty lines is how two sections come to disagree about what
+// a started night is or how a label reads.
+function _tnTableHtml(head, got, meta, ord, sport, isPts) {
+  var players = [], byKey = {}, started = 0, i, r;
+  for (i = 0; i < got.rows.length; i++) {
+    r = got.rows[i];
+    players.push({ playerKey: r.playerKey, name: r.name, teamAbbr: r.teamAbbr,
+      selectedPos: r.selectedPos, pos: r.pos, imageUrl: '' });
+    // TAPCARD -- the same stash the Today table fills, so a row here
+    // opens the same card.
+    try { _skTodayStash(r, isPts ? 'points' : 'cats', meta, ''); } catch (eT) {}
+    if (_skRowStarted(r)) {
+      byKey[r.playerKey] = { fp: r.fp, stats: r.stats || {} };
+      started++;
+    }
+  }
+  if (sport === 'nfl' && typeof _skNflGridSort === 'function') {
+    for (i = 0; i < players.length; i++) {
+      var _pr = byKey[players[i].playerKey];
+      players[i]._gridFp = _pr ? _pr.fp : null;
+    }
+    try { _skNflGridSort(players); } catch (eN) {}
+  }
+  var lbl = got.rows.length + ' playing';
+  if (!started) { lbl += ' \u00b7 nothing played yet'; }
+  else if (started < players.length) { lbl += ' \u00b7 ' + started + ' in'; }
+  if (got.idle) { lbl += ' \u00b7 ' + got.idle + ' sat out'; }
+  var tbl = '';
+  try {
+    tbl = _rgGroupHtml(players, byKey, meta, ord, sport,
+      { fp: !!isPts, scopeLabel: lbl, shapeBy: byKey, totals: true,
+        tapFn: '_skTodayOpenPlayerSheet' }) || '';
+  } catch (eG) { tbl = ''; }
+  if (!tbl) {
+    return '<div class="tn-lg">' + head +
+      '<div class="tn-note">Could not draw the table for this league.</div></div>';
+  }
+  return '<div class="tn-lg">' + head +
+    '<div class="rg-dark rg-bleed">' + tbl + '</div></div>';
+}
+
+function _tnEspSectionHtml(lg) {
+  var sport = String(lg.sport || '').toLowerCase();
+  var head = '<div class="tn-h"><span class="tn-nm">' +
+    skEscape(lg.name || lg.league_key) + '</span>' +
+    '<span class="tn-sp">' + skEscape(sport.toUpperCase()) + '</span></div>';
+  if (!_skTodaySportHasTable(sport)) { return null; }
+  var got = _tnEspRows(lg);
+  if (!got.rows.length) { return null; }
+  var mo = _tnEspMeta(lg);
+  if (!mo) {
+    return '<div class="tn-lg">' + head +
+      '<div class="tn-note">No category names established for this ' +
+      'sport yet, so there are no columns to draw.</div></div>';
+  }
+  var isPts = true;
+  try {
+    isPts = !espIsCats(lg._esp.row) &&
+      !((typeof extFormatKey === 'function') && extFormatKey(lg._esp.row) === 'roto');
+  } catch (eC) { isPts = true; }
+
+  return _tnTableHtml(head, got, mo.meta, mo.ord, sport, isPts);
+}
+
 function _tnOppKey(lg) {
   try {
     if (!_skIsPointsH2HLeague(lg)) { return null; }
@@ -195766,6 +195965,9 @@ function _tnVsHtml(lg) {
 }
 
 function _tnSectionHtml(lg) {
+  // TNESP -- a different provider is a different roster shape, not a
+  // different table. Both ends meet at _rgGroupHtml.
+  if (lg && lg._esp) { return _tnEspSectionHtml(lg); }
   var lk = lg.league_key;
   var sport = String(lg.sport || '').toLowerCase();
   var head = '<div class="tn-h"><span class="tn-nm">' +
@@ -195802,43 +196004,7 @@ function _tnSectionHtml(lg) {
   try { isPts = !_skIsCatsLeague(lg); } catch (eC) { isPts = true; }
   var ord = null;
   try { ord = _skSeasonCatOrder(set, meta); } catch (eO) { ord = null; }
-
-  var players = [], byKey = {}, started = 0, i, r;
-  for (i = 0; i < got.rows.length; i++) {
-    r = got.rows[i];
-    players.push({ playerKey: r.playerKey, name: r.name, teamAbbr: r.teamAbbr,
-      selectedPos: r.selectedPos, pos: r.pos, imageUrl: '' });
-    // TAPCARD -- the same stash the Today table fills, so a row here
-    // opens the same card.
-    try { _skTodayStash(r, isPts ? 'points' : 'cats', meta, ''); } catch (eT) {}
-    if (_skRowStarted(r)) {
-      byKey[r.playerKey] = { fp: r.fp, stats: r.stats || {} };
-      started++;
-    }
-  }
-  if (sport === 'nfl' && typeof _skNflGridSort === 'function') {
-    for (i = 0; i < players.length; i++) {
-      var _pr = byKey[players[i].playerKey];
-      players[i]._gridFp = _pr ? _pr.fp : null;
-    }
-    try { _skNflGridSort(players); } catch (eN) {}
-  }
-  var lbl = got.rows.length + ' playing';
-  if (!started) { lbl += ' \u00b7 nothing played yet'; }
-  else if (started < players.length) { lbl += ' \u00b7 ' + started + ' in'; }
-  if (got.idle) { lbl += ' \u00b7 ' + got.idle + ' sat out'; }
-  var tbl = '';
-  try {
-    tbl = _rgGroupHtml(players, byKey, meta, ord, sport,
-      { fp: !!isPts, scopeLabel: lbl, shapeBy: byKey, totals: true,
-        tapFn: '_skTodayOpenPlayerSheet' }) || '';
-  } catch (eG) { tbl = ''; }
-  if (!tbl) {
-    return '<div class="tn-lg">' + head +
-      '<div class="tn-note">Could not draw the table for this league.</div></div>';
-  }
-  return '<div class="tn-lg">' + head +
-    '<div class="rg-dark rg-bleed">' + tbl + '</div></div>';
+  return _tnTableHtml(head, got, meta, ord, sport, isPts);
 }
 
 function _tnRenderInto() {
@@ -195901,9 +196067,9 @@ function _tnRenderInto() {
   } else {
     top = '<div class="tn-top">Everyone in a starting spot with a game ' +
       'tonight, by league. A man whose club is off tonight is left out ' +
-      'rather than drawn as a row of noughts. <b>Yahoo only for now</b> ' +
-      '\u2014 ESPN carries the figures but not the column list a grid needs.' +
-      '</div>';
+      'rather than drawn as a row of noughts. <b>Yahoo and ESPN</b>; ' +
+      'Sleeper publishes a week rather than a night, and Fantrax no ' +
+      'per-player points at all.</div>';
   }
   var foot = '';
   if (quiet.length) {
@@ -195928,6 +196094,10 @@ function _tnFetchAll() {
     var lg = lgs[i];
     if (!lg || !lg.league_key) { continue; }
     if (!_skTodaySportHasTable(String(lg.sport || '').toLowerCase())) { continue; }
+    // TNESP -- an ESPN roster arrives with its league sync and carries
+    // tonight's window already, so there is no per-date call to make.
+    // No guard here for it: _tnTeamKey answers null for a key Yahoo
+    // never issued, and one owner for that is enough.
     var tk = _tnTeamKey(lg.league_key);
     if (!tk) { continue; }
     jobs.push(fetchTeamFpForDate(tk, today).then(
