@@ -189037,6 +189037,10 @@ function _poKick(league, leagueData, allTeams) {
     _poInflight[lk] = false;
     if (!out) { _poFailed[lk] = 'no data'; _poFill(lk, ''); return; }
     _poOdds[lk] = out;
+    // WPCOLD -- the bar was drawn before this existed. Everything that
+    // reads the strength model has to be told, not just the card this
+    // function was written to fill.
+    try { _skWinProbRefresh(lk); } catch (eWp) {}
     try { _poRecordHistory(lk, out); } catch (e) {}
     _poFill(lk, _poCardHtml(league, out, allTeams,
       leagueData.team && leagueData.team.team_key));
@@ -191862,13 +191866,27 @@ function skBuildSeasonScoringStrip(leagueData) {
 // this league, the old share of projected points if it has not. The
 // share is kept as the fallback because it is what the card had, not
 // because it is right.
+// WPCOLD -- ONE READING OF WHERE EACH SIDE IS HEADED. The sheet
+// preferred Yahoo's LIVE projection, which moves as games finish, and
+// this bar preferred the preseason one -- so the figure on the bar and
+// the figure on the sheet behind it could differ, and tapping the bar
+// changed the number it had just shown you.
+function _skOddsProj(m) {
+  if (!m) { return { my: null, opp: null }; }
+  return {
+    my: (m.myLiveProj != null) ? m.myLiveProj : m.myProj,
+    opp: (m.oppLiveProj != null) ? m.oppLiveProj : m.oppProj
+  };
+}
+
 function _skWinProbPct(league, matchup) {
   try {
     var o = (typeof _poOdds === 'object' && _poOdds)
       ? _poOdds[league.league_key] : null;
     var sd = (o && o.strength && o.strength.sd) || 0;
+    var pr = _skOddsProj(matchup);
     var p = _poLiveProb(matchup.myScore, matchup.oppScore,
-                        matchup.myProj, matchup.oppProj, sd);
+                        pr.my, pr.opp, sd);
     if (p != null) { return Math.round(p * 100); }
   } catch (e) {}
   return (matchup && matchup.winProb != null) ? matchup.winProb : null;
@@ -191889,6 +191907,70 @@ function skBuildCatsLedBar(pct) {
   '</div>';
 }
 
+// == THE BAR IS TOLD WHEN THE MODEL LANDS == WPCOLD ==
+//
+// skBuildDetailHTML is synchronous and _poKick is not. The strength
+// model -- the thing that gives this league a measured spread -- is
+// fetched and computed on a timeout, and when it arrived the only
+// thing that heard about it was the playoff card, which _poFill
+// replaces in place.
+//
+// So the bar was drawn from a cold cache and left there. TWO THINGS
+// WERE WRONG WITH IT, not one. The missing door was the visible half:
+// no measured spread, so no way in to The Odds until something else
+// re-rendered the card. The half nobody could see was worse -- with
+// the cache cold, _skWinProbPct falls back to Yahoo's share of
+// projected points, so THE PERCENTAGE ITSELF was the fallback number
+// on first view and the measured one after a round trip to the
+// matchup tab. The same matchup read two different figures depending
+// on how you had got there.
+//
+// The playoff card already solved this shape of problem with a
+// placeholder that holds its slot until the real thing arrives. This
+// is the same answer for the bar: it keeps its slot, and it is told.
+// ONE WAY OF ANSWERING IT. A fast path through _poLast was here and
+// was dead weight: _poKick only ever runs on leagues that are in
+// fyLeagues, so the scan below already answers every case it did.
+function _skWpbLeague(lk) {
+  try {
+    var i, arr = (typeof fyLeagues !== 'undefined' && fyLeagues) || [];
+    for (i = 0; i < arr.length; i++) {
+      if (arr[i] && arr[i].league_key === lk) { return arr[i]; }
+    }
+  } catch (e2) {}
+  return null;
+}
+
+// Returns whether it found a bar to correct. Not finding one is the
+// ordinary case -- the model lands for leagues whose card is nowhere
+// on screen -- so it is a no-op and never an error.
+function _skWinProbRefresh(lk) {
+  try {
+    if (!lk) { return 0; }
+    var sel = '.sk-winprob[data-wpb="' + String(lk).replace(/["\\]/g, '') + '"]';
+    var host = document.querySelector(sel);
+    if (!host) { return 0; }
+    var lg = _skWpbLeague(lk);
+    var d = (typeof skLeagueData !== 'undefined' && skLeagueData[lk]) || {};
+    if (!lg || !d.matchup) { return 0; }
+    var pct = _skWinProbPct(lg, d.matchup);
+    // No figure at all is not an improvement on the one already up.
+    if (pct == null) { return 0; }
+    // NOTHING TO CORRECT IS NOT A CORRECTION. Replacing a bar with an
+    // identical one throws away the node for no reason, and this is
+    // safe to call at any time precisely because it does not.
+    var wantDoor = (_skOddsSd(lk) > 0);
+    var hadDoor = !!host.getAttribute('onclick');
+    var hadPct = (host.querySelector('.sk-winprob-pct') || {}).textContent || '';
+    if (hadDoor === wantDoor && hadPct === (pct + '%')) { return 0; }
+    var tmp = document.createElement('div');
+    tmp.innerHTML = skBuildWinProbBar(pct, lk);
+    if (!tmp.firstChild) { return 0; }
+    host.parentNode.replaceChild(tmp.firstChild, host);
+    return 1;
+  } catch (e) { return 0; }
+}
+
 function skBuildWinProbBar(pct, lk) {
   // ODDS -- the bar is the door. Only when there is a measured spread
   // behind it: a door onto a sheet that says "not enough weeks yet" is
@@ -191896,7 +191978,10 @@ function skBuildWinProbBar(pct, lk) {
   var open = (lk && _skOddsSd(lk) > 0)
     ? (' style="cursor:pointer" onclick="openSkOdds(\'' +
        String(lk).replace(/[\\']/g, '') + '\')"') : '';
-  return '<div class="sk-winprob"' + open + '><div class="sk-winprob-row">' +
+  // WPCOLD -- so the bar can be found again when the strength model
+  // lands, which is after this has already been drawn.
+  var tag = lk ? (' data-wpb="' + skEscape(String(lk)) + '"') : '';
+  return '<div class="sk-winprob"' + tag + open + '><div class="sk-winprob-row">' +
     '<span class="sk-winprob-label">WIN PROBABILITY' +
       (open ? '<span class="sk-winprob-more">THE ODDS \u203a</span>' : '') +
       '</span>' +
@@ -196821,11 +196906,11 @@ function _odCtx(lkIn) {
   var m = d && d.matchup;
   if (!m || !m.hasMatchup) { return null; }
   // The live projection where Yahoo has one -- it moves as games finish
-  // -- and the preseason projection only as a fallback.
-  var myP = (m.myLiveProj != null) ? m.myLiveProj : m.myProj;
-  var opP = (m.oppLiveProj != null) ? m.oppLiveProj : m.oppProj;
+  // -- and the preseason projection only as a fallback. The bar on the
+  // card reads this through the same owner, so the two cannot disagree.
+  var pr = _skOddsProj(m);
   var sd = _skOddsSd(lk);
-  var o = _skOddsOf(m.myScore, m.oppScore, myP, opP, sd);
+  var o = _skOddsOf(m.myScore, m.oppScore, pr.my, pr.opp, sd);
   if (!o) { return null; }
   // nTeams is the STRENGTH MODEL'S, not the matchup's. Read off the
   // matchup it printed "pooled across all  sides".
