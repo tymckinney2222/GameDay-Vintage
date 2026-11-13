@@ -22448,6 +22448,25 @@ opacity='0.42'/></svg>");
   .sk-sc-tbl td.e.you { color: #4ade80; } .sk-sc-tbl td.e.them { color: #f87171; }
   .sk-sc-tbl td.e.even { color: var(--sk-text-4); }
   .sk-sc-tbl tfoot td { border-top: 1px solid rgba(255,255,255,0.12); border-bottom: none; font-weight: 700; }
+  /* SIZEUP — the team picker. A native select, because a list of
+     twelve teams with records is exactly what one is for, and the
+     phone's own wheel beats anything built out of divs here. */
+  .sk-vs-pick {
+    display: flex; align-items: center; gap: 8px; margin: 2px 6px 10px;
+  }
+  .sk-vs-pick label {
+    font-family: var(--sk-font-mono); font-size: 9px; font-weight: 700;
+    letter-spacing: 0.12em; text-transform: uppercase;
+    color: var(--sk-text-4); flex: 0 0 auto;
+  }
+  .sk-vs-pick select {
+    flex: 1 1 auto; min-width: 0; padding: 7px 10px; border-radius: 10px;
+    font-family: var(--sk-font-mono); font-size: 12px; font-weight: 700;
+    color: var(--sk-text); background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.14); cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+  }
+  .sk-vs-pick select option { color: #111; background: #fff; }
   /* SKSCOUT3 — team labels over each form row */
   .sk-sc-formlbl {
     font-family: var(--sk-font-mono); font-size: 9.5px; font-weight: 700; letter-spacing: 0.12em;
@@ -147319,6 +147338,506 @@ function _skRecapHtml(league, drafted) {
   return h;
 }
 
+// SIZEUP -- any team in the league, not just this week's opponent.
+//
+// The scouting report answers "how do I match up against the man I am
+// playing". This answers "how do I match up against anyone" -- the 6-0
+// team, the one a place above me, the one I am chasing for the last
+// playoff spot -- and puts a league rank beside each category so a
+// number means something. 142 goals is not information. First in goals
+// against my eighth is.
+var _skVsPick = {};       // leagueKey -> team_key being sized up
+var _skVsCache = {};      // leagueKey -> { ts, vals, strs, meta, mode }
+var _skVsInflight = {};
+
+// WHICH LEAGUES GET IT. Any league with a team of mine and other teams
+// to compare against; the mode below decides what is actually shown.
+function _skVsEligible(league) {
+  if (!league || !league.league_key) { return false; }
+  var ld = (typeof skLeagueData === 'object' && skLeagueData)
+    ? skLeagueData[league.league_key] : null;
+  if (!ld) { return false; }
+  var at = ld.allTeams || {};
+  var n = 0, k;
+  for (k in at) { if (Object.prototype.hasOwnProperty.call(at, k)) { n++; } }
+  if (n < 2) { return false; }
+  return !!(ld.team && ld.team.team_key) ||
+    !!(ld.matchup && ld.matchup.myTeamKey);
+}
+
+function _skVsMyKey(leagueKey) {
+  var ld = (typeof skLeagueData === 'object' && skLeagueData)
+    ? skLeagueData[leagueKey] : null;
+  if (!ld) { return ''; }
+  return (ld.matchup && ld.matchup.myTeamKey) ||
+    (ld.team && ld.team.team_key) || '';
+}
+
+// CATS OR POINTS -- asked of the one owner, not decided again here.
+// _skCmpLeagueIsPointsFp already knows that Yahoo codes H2H points
+// football as 'head' and that NBA/NHL/MLB 'head' is true categories.
+function _skVsIsPoints(leagueKey) {
+  try {
+    if (typeof _skCmpLeagueIsPointsFp === 'function') {
+      return !!_skCmpLeagueIsPointsFp(leagueKey);
+    }
+  } catch (e) {}
+  return false;
+}
+
+function _skVsStatsMeta(leagueKey) {
+  return (typeof leagueSettingsCache === 'object' && leagueSettingsCache &&
+    leagueSettingsCache[leagueKey] && leagueSettingsCache[leagueKey].stats) || null;
+}
+
+// The categories that actually score. Display-only stats are on the
+// page in Yahoo too and win nothing, so ranking them would invent
+// standings that do not exist.
+function _skVsCatIds(meta) {
+  var out = [], sid;
+  if (!meta) { return out; }
+  for (sid in meta) {
+    if (!Object.prototype.hasOwnProperty.call(meta, sid)) { continue; }
+    var m = meta[sid];
+    if (m && m.enabled && !m.isOnlyDisplayStat) { out.push(sid); }
+  }
+  return out;
+}
+
+// EVERY TEAM\u2019S SEASON TOTALS, from whichever copy is already here.
+// Yahoo returns them on the standings call for roto and on the teams
+// call for head-to-head, so both are read and the richer one wins. Both
+// are already fetched elsewhere; this adds a request only when neither
+// has landed yet.
+function _skVsVals(leagueKey, scoutTeams, catIds) {
+  var ld = (typeof skLeagueData === 'object' && skLeagueData)
+    ? skLeagueData[leagueKey] : null;
+  var at = (ld && ld.allTeams) || {};
+  var vals = {}, strs = {}, k, i, sid;
+  function take(tk, raw) {
+    if (!raw) { return 0; }
+    var got = 0;
+    for (i = 0; i < catIds.length; i++) {
+      sid = catIds[i];
+      if (raw[sid] == null || raw[sid] === '') { continue; }
+      var v = parseFloat(raw[sid]);
+      if (isNaN(v)) { continue; }
+      if (!vals[tk]) { vals[tk] = {}; strs[tk] = {}; }
+      vals[tk][sid] = v;
+      strs[tk][sid] = String(raw[sid]);
+      got++;
+    }
+    return got;
+  }
+  for (k in at) {
+    if (!Object.prototype.hasOwnProperty.call(at, k)) { continue; }
+    take(k, at[k] && at[k].catStats);
+  }
+  for (k in (scoutTeams || {})) {
+    if (!Object.prototype.hasOwnProperty.call(scoutTeams, k)) { continue; }
+    take(k, scoutTeams[k] && scoutTeams[k].stats);
+  }
+  return { vals: vals, strs: strs };
+}
+
+// THE RANK. Competition ranking, so two teams level on 31 goals are
+// both 4th and the next is 6th -- which is how a standings table reads
+// and how Yahoo reads it. sortOrder 0 means lower wins: ERA, WHIP, GAA,
+// losses. Getting that backwards would report a league leader in ERA as
+// last, so the direction comes from the same field _skCatWinner uses.
+function _skVsRank(vals, sid, meta) {
+  var rows = [], tk;
+  for (tk in vals) {
+    if (!Object.prototype.hasOwnProperty.call(vals, tk)) { continue; }
+    if (vals[tk][sid] == null) { continue; }
+    rows.push({ teamKey: tk, v: vals[tk][sid] });
+  }
+  var lower = !!(meta && meta[sid] && Number(meta[sid].sortOrder) === 0);
+  rows.sort(function (a, b) { return lower ? (a.v - b.v) : (b.v - a.v); });
+  var rank = {}, i, place = 0;
+  for (i = 0; i < rows.length; i++) {
+    if (i === 0 || rows[i].v !== rows[i - 1].v) { place = i + 1; }
+    rank[rows[i].teamKey] = place;
+  }
+  return { rows: rows, rank: rank, lower: lower, n: rows.length };
+}
+
+// Does the device already hold season category totals for every team?
+// Only then is the request skippable: a partial answer would rank a
+// league of twelve on the four teams that happen to have numbers, and
+// report a fourth place that is really a tenth.
+function _skVsHaveLocal(leagueKey) {
+  var meta = _skVsStatsMeta(leagueKey);
+  var catIds = _skVsCatIds(meta);
+  if (!catIds.length) { return false; }
+  var ld = (typeof skLeagueData === 'object' && skLeagueData)
+    ? skLeagueData[leagueKey] : null;
+  var at = (ld && ld.allTeams) || {};
+  var n = 0, ok = 0, k, i;
+  for (k in at) {
+    if (!Object.prototype.hasOwnProperty.call(at, k)) { continue; }
+    n++;
+    var cs = at[k] && at[k].catStats;
+    if (!cs) { continue; }
+    for (i = 0; i < catIds.length; i++) {
+      if (cs[catIds[i]] != null && cs[catIds[i]] !== '') { ok++; break; }
+    }
+  }
+  return n > 1 && ok === n;
+}
+
+function _skVsFetch(leagueKey) {
+  var c = _skVsCache[leagueKey];
+  if (c && (Date.now() - c.ts) < 10 * 60 * 1000) { return Promise.resolve(c); }
+  if (_skVsInflight[leagueKey]) { return _skVsInflight[leagueKey]; }
+
+  var pSet = _skVsStatsMeta(leagueKey)
+    ? Promise.resolve(_skVsStatsMeta(leagueKey))
+    : ((typeof ensureLeagueSettings === 'function')
+        ? ensureLeagueSettings(leagueKey)['catch'](function () { return null; })
+        : Promise.resolve(null));
+
+  // WHICHEVER COPY IS ALREADY HERE.
+  //   1. the standings call, cached on skLeagueData -- Yahoo puts season
+  //      category totals on it for roto, and that costs nothing;
+  //   2. the scouting report's own teams call, when it is fresh;
+  //   3. otherwise one request, the same one the scouting report makes.
+  // Checked in that order so a league whose totals are already on the
+  // device opens without going to the network at all.
+  var sc = (typeof _skScoutCache === 'object' && _skScoutCache)
+    ? _skScoutCache[leagueKey] : null;
+  var pTeams;
+  if (_skVsHaveLocal(leagueKey)) {
+    pTeams = Promise.resolve({});
+  } else if (sc && sc.teams && (Date.now() - sc.ts) < 10 * 60 * 1000) {
+    pTeams = Promise.resolve(sc.teams);
+  } else if (typeof fyApi === 'function') {
+    pTeams = fyApi('/league/' + leagueKey + '/teams/stats;type=season')
+      .then(_skScoutTeams, function () { return {}; });
+  } else {
+    pTeams = Promise.resolve({});
+  }
+
+  var p = Promise.all([pSet, pTeams]).then(function (r) {
+    var meta = _skVsStatsMeta(leagueKey) || (r[0] && r[0].stats) || r[0] || null;
+    var catIds = _skVsCatIds(meta);
+    var got = _skVsVals(leagueKey, r[1] || {}, catIds);
+    var data = { ts: Date.now(), meta: meta, catIds: catIds,
+      vals: got.vals, strs: got.strs, teams: r[1] || {},
+      points: _skVsIsPoints(leagueKey) };
+    _skVsCache[leagueKey] = data;
+    delete _skVsInflight[leagueKey];
+    return data;
+  })['catch'](function () {
+    delete _skVsInflight[leagueKey];
+    return null;
+  });
+  _skVsInflight[leagueKey] = p;
+  return p;
+}
+
+// THE PICKER. Ordered by the standings, because "the 6-0 team" and "the
+// one above me" are how a team gets chosen -- never alphabetically.
+function _skVsOptions(leagueKey, myKey, pickKey) {
+  var ld = (typeof skLeagueData === 'object' && skLeagueData)
+    ? skLeagueData[leagueKey] : null;
+  var at = (ld && ld.allTeams) || {};
+  var oppKey = (ld && ld.matchup && ld.matchup.oppTeamKey) || '';
+  var list = [], k;
+  for (k in at) {
+    if (!Object.prototype.hasOwnProperty.call(at, k)) { continue; }
+    if (k === myKey) { continue; }
+    var t = at[k] || {};
+    var rk = parseInt(t.rank, 10);
+    list.push({ key: k, name: t.name || k, rec: t.record || '',
+      rank: isNaN(rk) ? 999 : rk, opp: (k === oppKey) });
+  }
+  list.sort(function (a, b) {
+    if (a.rank !== b.rank) { return a.rank - b.rank; }
+    return String(a.name).localeCompare(String(b.name));
+  });
+  var html = '', i;
+  for (i = 0; i < list.length; i++) {
+    var o = list[i];
+    var lbl = (o.rank < 999 ? (o.rank + '. ') : '') + o.name +
+      (o.rec ? ('  ' + o.rec) : '') +
+      (o.opp ? ('  \u00b7 this week') : '');
+    html += '<option value="' + skEscape(o.key) + '"' +
+      (o.key === pickKey ? ' selected' : '') + '>' + skEscape(lbl) + '</option>';
+  }
+  return { html: html, list: list };
+}
+
+// Who to open on: the league leader that is not me, which is the team
+// the question is usually about.
+function _skVsDefaultPick(leagueKey, myKey) {
+  var o = _skVsOptions(leagueKey, myKey, '');
+  return o.list.length ? o.list[0].key : '';
+}
+
+function _skVsCatRows(d, myKey, pickKey) {
+  var out = [], i;
+  for (i = 0; i < d.catIds.length; i++) {
+    var sid = d.catIds[i];
+    var m = (d.meta && d.meta[sid]) || {};
+    var mv = d.vals[myKey] && d.vals[myKey][sid];
+    var tv = d.vals[pickKey] && d.vals[pickKey][sid];
+    if (mv == null && tv == null) { continue; }
+    var R = _skVsRank(d.vals, sid, d.meta);
+    var myR = R.rank[myKey] || null, thR = R.rank[pickKey] || null;
+    var lower = R.lower;
+    var edge = 'even';
+    if (mv != null && tv != null && mv !== tv) {
+      edge = ((mv > tv) === !lower) ? 'you' : 'them';
+    }
+    // WHAT IT WOULD TAKE. Two different questions, both worth an
+    // answer: the gap to this team, and the gap to the next place up
+    // the league table -- which is often a much smaller number and the
+    // one actually within reach.
+    var gap = (mv != null && tv != null) ? Math.abs(tv - mv) : null;
+    var nextV = null;
+    if (myR && myR > 1) {
+      var j, best = null;
+      for (j = 0; j < R.rows.length; j++) {
+        if (R.rank[R.rows[j].teamKey] < myR) { best = R.rows[j].v; }
+      }
+      nextV = best;
+    }
+    out.push({ sid: sid, meta: m,
+      abbr: m.abbr || m.displayName || m.name || ('#' + sid),
+      name: (m.name && m.name !== (m.abbr || '')) ? m.name : '',
+      mv: mv, tv: tv, myStr: d.strs[myKey] && d.strs[myKey][sid],
+      thStr: d.strs[pickKey] && d.strs[pickKey][sid],
+      myR: myR, thR: thR, n: R.n, edge: edge, gap: gap,
+      nextGap: (nextV != null && mv != null) ? Math.abs(nextV - mv) : null });
+  }
+  // BIGGEST HOLE FIRST. He asked where he needs to catch up, so the
+  // categories he is losing lead, ordered by how many places behind
+  // this team he is; level categories next, then the ones he leads.
+  out.sort(function (a, b) {
+    var ao = (a.edge === 'them') ? 0 : (a.edge === 'even' ? 1 : 2);
+    var bo = (b.edge === 'them') ? 0 : (b.edge === 'even' ? 1 : 2);
+    if (ao !== bo) { return ao - bo; }
+    var ad = (a.myR && a.thR) ? (a.myR - a.thR) : 0;
+    var bd = (b.myR && b.thR) ? (b.myR - b.thR) : 0;
+    if (ad !== bd) { return bo === 2 ? (ad - bd) : (bd - ad); }
+    return String(a.abbr).localeCompare(String(b.abbr));
+  });
+  return out;
+}
+
+function _skVsHtml(league, d, myKey, pickKey) {
+  var leagueKey = league.league_key;
+  var ld = (typeof skLeagueData === 'object' && skLeagueData)
+    ? skLeagueData[leagueKey] : null;
+  var at = (ld && ld.allTeams) || {};
+  var me = at[myKey] || {}, them = at[pickKey] || {};
+  var opts = _skVsOptions(leagueKey, myKey, pickKey);
+
+  // A single quote built from its code point: the attribute needs one
+  // inside an onchange that is itself inside a double-quoted attribute,
+  // and every escaping layer between here and the page mangles it.
+  var Q = String.fromCharCode(39);
+  var pick = '<div class="sk-vs-pick">' +
+    '<label for="skVsSel">Size up</label>' +
+    '<select id="skVsSel" onchange="skVsPick(' + Q +
+      skEscape(leagueKey) + Q + ', this.value)">' +
+    opts.html + '</select></div>';
+
+  if (!opts.list.length) {
+    return pick + '<div class="sk-wire-sheet-empty">No other teams in this ' +
+      'league yet.</div>';
+  }
+
+  var head = '<div class="sk-rc-tiles">' +
+    '<div><b>' + skEscape(String(me.record || '\u2014')) + '</b>' +
+      '<span>You</span></div>' +
+    '<div><b>' + skEscape(String(them.record || '\u2014')) + '</b>' +
+      '<span>' + skEscape(String(them.name || 'Them')) + '</span></div>' +
+    '</div>';
+
+  // ---- POINTS LEAGUES ----
+  // No categories to rank, so the same question is asked of the only
+  // numbers a points league keeps: what each of you has scored, what
+  // you average, and where that puts you in the league.
+  if (d.points || !d.catIds.length) {
+    var rows = [], k;
+    for (k in at) {
+      if (!Object.prototype.hasOwnProperty.call(at, k)) { continue; }
+      var pf = parseFloat(at[k].points_for);
+      if (!isNaN(pf)) { rows.push({ teamKey: k, v: pf }); }
+    }
+    rows.sort(function (a, b) { return b.v - a.v; });
+    var pr = {}, i2, pl = 0;
+    for (i2 = 0; i2 < rows.length; i2++) {
+      if (i2 === 0 || rows[i2].v !== rows[i2 - 1].v) { pl = i2 + 1; }
+      pr[rows[i2].teamKey] = pl;
+    }
+    var myPf = parseFloat(me.points_for), thPf = parseFloat(them.points_for);
+    var gp = function (t) {
+      var w = parseInt(t.wins, 10) || 0, l = parseInt(t.losses, 10) || 0,
+          ti = parseInt(t.ties, 10) || 0;
+      return w + l + ti;
+    };
+    var myG = gp(me), thG = gp(them);
+    var f1 = function (v) { return (v == null || isNaN(v)) ? '\u2014' : v.toFixed(1); };
+    var rk = function (r) { return r ? ('#' + r) : '\u2014'; };
+    var body = '<table class="sk-sc-tbl"><thead><tr>' +
+      '<th>Points</th><th>You</th><th>Rk</th><th>' +
+        skEscape(_skVsShort(them.name)) + '</th><th>Rk</th><th>Edge</th>' +
+      '</tr></thead><tbody>' +
+      '<tr><td class="k">Total</td>' +
+        '<td>' + f1(myPf) + '</td>' +
+        '<td class="rk">' + rk(pr[myKey]) + '</td>' +
+        '<td>' + f1(thPf) + '</td>' +
+        '<td class="rk">' + rk(pr[pickKey]) + '</td>' +
+        '<td class="e ' + ((myPf > thPf) ? 'you' : (myPf < thPf ? 'them' : 'even')) +
+          '">' + ((isNaN(myPf) || isNaN(thPf)) ? '\u2014'
+            : ((myPf >= thPf ? '+' : '\u2212') + f1(Math.abs(myPf - thPf)))) +
+        '</td></tr>' +
+      '<tr><td class="k">Per week</td>' +
+        '<td>' + f1(myG ? myPf / myG : NaN) + '</td><td class="rk"></td>' +
+        '<td>' + f1(thG ? thPf / thG : NaN) + '</td><td class="rk"></td>' +
+        '<td class="e even"></td></tr>' +
+      '</tbody></table>' +
+      '<div class="sk-rc-note">A points league keeps no categories, so ' +
+      'there is nothing to rank one by one \u2014 this is every number the ' +
+      'league does keep.</div>';
+    return pick + head + body;
+  }
+
+  // ---- CATEGORY LEAGUES ----
+  var rowsC = _skVsCatRows(d, myKey, pickKey);
+  if (!rowsC.length) {
+    return pick + head + '<div class="sk-wire-sheet-empty">No category ' +
+      'totals for this league yet.</div>';
+  }
+  var nBehind = 0, nAhead = 0, nLevel = 0, i3;
+  for (i3 = 0; i3 < rowsC.length; i3++) {
+    if (rowsC[i3].edge === 'them') { nBehind++; }
+    else if (rowsC[i3].edge === 'you') { nAhead++; }
+    else { nLevel++; }
+  }
+  var chips = '<div class="sk-sc-chips">' +
+    '<span class="sk-sc-chip w">Ahead <b>' + nAhead + '</b></span>' +
+    '<span class="sk-sc-chip l">Behind <b>' + nBehind + '</b></span>' +
+    (nLevel ? ('<span class="sk-sc-chip t">Level <b>' + nLevel +
+      '</b></span>') : '') + '</div>';
+
+  var body2 = '<table class="sk-sc-tbl"><thead><tr>' +
+    '<th>Cat</th><th>You</th><th>Rk</th><th>' +
+      skEscape(_skVsShort(them.name)) + '</th><th>Rk</th><th>Gap</th>' +
+    '</tr></thead><tbody>';
+  for (i3 = 0; i3 < rowsC.length; i3++) {
+    var r2 = rowsC[i3];
+    var gapTxt = '\u2014';
+    if (r2.gap != null && r2.edge !== 'even') {
+      gapTxt = (r2.edge === 'you' ? '+' : '\u2212') +
+        _skFmtDiff(r2.gap, r2.myStr || r2.thStr, r2.meta);
+    } else if (r2.edge === 'even') {
+      gapTxt = 'level';
+    }
+    var myRkCls = 'rk';
+    if (r2.myR && r2.n) {
+      if (r2.myR <= Math.max(1, Math.ceil(r2.n / 3))) { myRkCls = 'rk hi'; }
+      else if (r2.myR > r2.n - Math.ceil(r2.n / 3)) { myRkCls = 'rk lo'; }
+    }
+    body2 += '<tr><td class="k" title="' + skEscape(r2.name || r2.abbr) + '">' +
+      skEscape(r2.abbr) + '</td>' +
+      '<td>' + skEscape(_skFmtCatVal(r2.mv, r2.meta, r2.myStr)) + '</td>' +
+      '<td class="' + myRkCls + '">' +
+        (r2.myR ? ('#' + r2.myR) : '\u2014') + '</td>' +
+      '<td>' + skEscape(_skFmtCatVal(r2.tv, r2.meta, r2.thStr)) + '</td>' +
+      '<td class="rk">' + (r2.thR ? ('#' + r2.thR) : '\u2014') + '</td>' +
+      '<td class="e ' + r2.edge + '">' + gapTxt + '</td></tr>';
+  }
+  body2 += '</tbody></table>';
+
+  // WHAT IS ACTUALLY WITHIN REACH. The gap to the team above you in a
+  // category is usually a far smaller number than the gap to the leader,
+  // and it is the one that moves you up the table.
+  var climb = [], i4;
+  for (i4 = 0; i4 < rowsC.length; i4++) {
+    var r3 = rowsC[i4];
+    if (r3.nextGap == null || !r3.myR || r3.myR <= 1) { continue; }
+    climb.push({ abbr: r3.abbr, gap: r3.nextGap, meta: r3.meta,
+      str: r3.myStr, to: r3.myR - 1 });
+  }
+  climb.sort(function (a, b) { return a.gap - b.gap; });
+  var climbHtml = '';
+  if (climb.length) {
+    climbHtml = '<div class="sk-sc-formlbl you">Nearest places to gain</div>' +
+      '<div class="sk-sc-chips">';
+    for (i4 = 0; i4 < Math.min(4, climb.length); i4++) {
+      var cg = climb[i4];
+      climbHtml += '<span class="sk-sc-chip">' + skEscape(cg.abbr) +
+        ' <b>+' + skEscape(_skFmtDiff(cg.gap, cg.str, cg.meta)) + '</b> \u2192 #' +
+        cg.to + '</span>';
+    }
+    climbHtml += '</div>';
+  }
+
+  var note = '<div class="sk-rc-note">Season totals, with each side\u2019s place ' +
+    'in the league on that category beside it. Behind first, furthest ' +
+    'behind at the top.</div>';
+  return pick + head + chips + body2 + climbHtml + note;
+}
+
+// A long team name in a table header costs the numbers their width.
+function _skVsShort(nm) {
+  var t = String(nm || 'Them');
+  return t.length > 12 ? (t.slice(0, 11) + '\u2026') : t;
+}
+
+function skVsPick(leagueKey, teamKey) {
+  if (!teamKey) { return; }
+  _skVsPick[leagueKey] = teamKey;
+  var league = (fyLeagues || []).filter(function (l) {
+    return l.league_key === leagueKey; })[0];
+  var d = _skVsCache[leagueKey];
+  if (!league || !d) { return; }
+  var myKey = _skVsMyKey(leagueKey);
+  _skSheetTitle(_skVsName(leagueKey, teamKey), _skTeamLogo(leagueKey, teamKey));
+  _skSheetBody(_skVsHtml(league, d, myKey, teamKey));
+}
+
+function _skVsName(leagueKey, teamKey) {
+  var ld = (typeof skLeagueData === 'object' && skLeagueData)
+    ? skLeagueData[leagueKey] : null;
+  var t = ld && ld.allTeams && ld.allTeams[teamKey];
+  return (t && t.name) || 'Team';
+}
+
+function skOpenSizeUp(leagueKey) {
+  var league = (fyLeagues || []).filter(function (l) {
+    return l.league_key === leagueKey; })[0];
+  if (!league) { return; }
+  var myKey = _skVsMyKey(leagueKey);
+  var pickKey = _skVsPick[leagueKey] || _skVsDefaultPick(leagueKey, myKey);
+  _skSheetOpen('Size up <span class="sep">\u00b7</span> ' +
+    skEscape(league.name || ''),
+    _skVsName(leagueKey, pickKey), '',
+    '<div class="sk-wire-sheet-empty">Reading the league\u2026</div>',
+    _skTeamLogo(leagueKey, pickKey));
+  if (!myKey) {
+    _skSheetBody('<div class="sk-wire-sheet-empty">Couldn\u2019t work out which ' +
+      'team is yours in this league.</div>');
+    return;
+  }
+  _skVsFetch(leagueKey).then(function (d) {
+    if (!d) {
+      _skSheetBody('<div class="sk-wire-sheet-empty">Couldn\u2019t load the ' +
+        'league\u2019s numbers.</div>');
+      return;
+    }
+    var pk = _skVsPick[leagueKey] || pickKey ||
+      _skVsDefaultPick(leagueKey, myKey);
+    _skVsPick[leagueKey] = pk;
+    _skSheetTitle(_skVsName(leagueKey, pk), _skTeamLogo(leagueKey, pk));
+    _skSheetBody(_skVsHtml(league, d, myKey, pk));
+  });
+}
+
 // ── Scouting report ── SKSCOUT ──
 // Your current opponent: their form, how engaged they are, who's hot, and
 // where they're strong or weak. Four small Yahoo requests on open, cached
@@ -162979,7 +163498,8 @@ function skBuildDetailHTML(league) {
         : '') +
       // SKSCOUT / SKRECAP — scouting report on this week's opponent, and the
       // season-so-far view built from the daily bank.
-      ((_skScoutEligible(league) || _skBankEligible(league))
+      ((_skScoutEligible(league) || _skBankEligible(league) ||
+        _skVsEligible(league))
         ? '<div class="sk-duel-trigger-wrap">' +
             (_skScoutEligible(league)
               ? '<button class="sk-duel-trigger sk-scout-trigger" onclick="skOpenScouting(\'' + league.league_key + '\')">' +
@@ -162987,6 +163507,11 @@ function skBuildDetailHTML(league) {
             (_skBankEligible(league)
               ? '<button class="sk-duel-trigger sk-scout-trigger" onclick="skOpenRecap(\'' + league.league_key + '\')">' +
                 '\ud83d\udcdc Season So Far \u2014 Your Roster</button>' : '') +
+            // SIZEUP -- the same question as the scouting report, aimed
+            // at whoever you like instead of only at this week's man.
+            (_skVsEligible(league)
+              ? '<button class="sk-duel-trigger sk-scout-trigger" onclick="skOpenSizeUp(\'' + league.league_key + '\')">' +
+                '\u2696\ufe0f Size Up \u2014 Any Team in the League</button>' : '') +
           '</div>'
         : '') ;
 
