@@ -19178,15 +19178,13 @@ opacity='0.42'/></svg>");
     flex-direction: column;
     color: var(--sk-text, #e8eaee);
   }
-  .fm-overlay {
-    display: none;
-    position: fixed; inset: 0;
-    z-index: 400;
-    background: var(--sk-bg, #0a0d12);
-    flex-direction: column;
-    color: var(--sk-text, #e8eaee);
+  /* FANMODE -- the body as a mode, inside the page rather than an
+     overlay. The overlay supplied the padding; the grid does not. */
+  .fm-body-mode { padding: 0 12px 100px; }
+  body.fan-mode #cardsGrid {
+    display: block; padding: 0; grid-template-columns: none;
   }
-  .fm-overlay.open { display: flex; }
+
 
   /* ── NBA Rotations (depth chart tool) ── NBAROT ──
      Standalone tool; deliberately shares nothing with fetchTeamDepthTab.
@@ -19642,8 +19640,8 @@ opacity='0.42'/></svg>");
     border-top-color: rgba(74,51,28,0.20);
   }
   .vintage-mode .fm-card .fm-tie { color: #9a6b00; }
-  @keyframes fm-spin { to { transform: rotate(360deg); } }
-  #fmRefreshBtn.fm-spinning svg { animation: fm-spin 0.8s linear infinite; }
+
+
   .fa-overlay.open,
   .pw-overlay.open { display: flex; }
   /* ─── Free Agent Picks overlay ────────────────────────────────
@@ -37227,34 +37225,6 @@ opacity='0.42'/></svg>");
   </div>
 </div>
 
-<!-- Fantasy Matchups overlay — vintage scorecards for each of my H2H
-     fantasy matchups (points + cats; season-points excluded). Pulls
-     from Skipper's parsed matchup data (skLeagueData[*].matchup),
-     re-pulled on open and on manual refresh. Tapping a card opens that
-     league's Matchup tab in Skipper. -->
-<div class="fm-overlay" id="fmOverlay">
-  <div class="pp-header">
-    <div>
-      <div class="pp-eyebrow">Head to Head</div>
-      <h2 class="pp-title">Fantasy Matchups</h2>
-    </div>
-    <div style="display:flex;align-items:center;gap:8px">
-      <button class="pp-close" id="fmRefreshBtn" onclick="refreshFantasyMatchups()" aria-label="Refresh" title="Re-pull matchups">
-        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
-      </button>
-      <button class="pp-close" onclick="closeFantasyMatchups()" aria-label="Close">
-        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-      </button>
-    </div>
-  </div>
-  <!-- Sport filter — FMSORT. Built by _fmFilterHtml() from the sports that
-       actually have a card, so it never offers a sport with nothing in it. -->
-  <div class="fm-filter" id="fmFilter"></div>
-  <div class="fm-body" id="fmBody">
-    <div class="pp-loading">Loading your matchups\u2026</div>
-  </div>
-</div>
-
 <!-- Free Agent Picks overlay — surfaces available FAs across each
      synced Pts league, ranked by recent FP performance. Cats leagues
      show a "coming soon" stub for v1. -->
@@ -40323,7 +40293,7 @@ try { localStorage.removeItem('gdhq_tapdebug'); } catch (e) {}
 // The mode was a BOOLEAN, and 515 places branch on it. None of them
 // change, because the board never builds card markup: renderCards
 // branches at the top and returns.
-var SB_MODES = ['vintage', 'modern', 'board', 'broadcast'];
+var SB_MODES = ['vintage', 'modern', 'board', 'broadcast', 'fantasy'];
 
 function sbMode() {
   var m = null;
@@ -40350,14 +40320,17 @@ function sbApplyMode(m) {
   body.classList.toggle('vintage-mode', m === 'vintage');
   body.classList.toggle('board-mode', m === 'board');
   body.classList.toggle('bcast-mode', m === 'broadcast');
+  body.classList.toggle('fan-mode', m === 'fantasy');
   try { localStorage.setItem('gdhq_theme', m); } catch (e) {}
   var btn = document.getElementById('themeBtn');
   if (btn) {
     btn.textContent = (m === 'board') ? 'BOARD'
       : (m === 'broadcast') ? 'BROADCAST'
+      : (m === 'fantasy') ? 'FANTASY'
       : (m === 'vintage' ? 'VINTAGE' : 'MODERN');
     btn.style.color = (m === 'board') ? '#ffb224'
       : (m === 'broadcast') ? '#2fe3ff'
+      : (m === 'fantasy') ? '#a78bfa'
       : (m === 'vintage' ? '#e8a020' : 'rgba(255,255,255,0.5)');
   }
   // SETSHEET -- Settings is not a vintage feature. The team theme
@@ -40374,7 +40347,12 @@ function sbApplyMode(m) {
   // slate with the live games at the top, so the rail is redundant there
   // -- and Ty asked for it and the filter pills gone.
   var rail = document.getElementById('liveRail');
-  if (rail && m === 'board') { rail.style.display = 'none'; rail.innerHTML = ''; }
+  if (rail && (m === 'board' || m === 'fantasy')) {
+    // FANMODE -- the rail is a list of tonight's real games, which has
+    // nothing to do with a fantasy week. Hidden here for the same
+    // reason it is hidden on the board.
+    rail.style.display = 'none'; rail.innerHTML = '';
+  }
   renderTicker();
   renderCards();
 }
@@ -43310,10 +43288,26 @@ try { rankedFilter = localStorage.getItem('gdhq_ranked_filter') === '1'; } catch
 function gamePassesRankedFilter(g) {
   if (!rankedFilter || !g) return true;
   if (typeof getTeamRank !== 'function') return true;
+  // T25SCOPE -- A FILTER ONLY APPLIES WHERE ITS OWN SWITCH IS SHOWING.
+  //
+  // The chip renders only when the ACTIVE league has a poll. This
+  // function used to ask only whether the GAME's league had one, and
+  // the two disagree on ALL SPORTS: no chip, but every college game
+  // still filtered. rankedFilter is remembered in localStorage, so
+  // turning it on in volleyball and going back to ALL SPORTS cut the
+  // board from 198 games to 72 -- every unranked college game gone,
+  // the NHL untouched beside them, and nothing on screen to say why
+  // or any way to undo it from there.
+  //
+  // Asked of the active league first, so the filter can never be on
+  // somewhere it cannot be turned off.
+  var act = (typeof activeLeague !== 'undefined') ? activeLeague : 'ALL';
+  if (typeof T25_RANK_LEAGUES !== 'object' || !T25_RANK_LEAGUES[act]) {
+    return true;
+  }
   var lg = g.league;
-  // Only meaningful where a poll exists. Other leagues pass through so a
-  // remembered filter can't blank the NFL.
-  if (typeof T25_RANK_LEAGUES !== 'object' || !T25_RANK_LEAGUES[lg]) return true;
+  // And the game's own league, which still matters for a mixed list.
+  if (!T25_RANK_LEAGUES[lg]) return true;
   // Rankings not fetched yet: pass everything through rather than blank the
   // board for the second before the poll lands. The card badges and the chip
   // count both appear at the same moment the filter starts biting.
@@ -47587,6 +47581,13 @@ function manualRefresh() {
     setTimeout(function() { icon.style.transition = 'none'; icon.style.transform = 'rotate(0deg)'; }, 650);
   }
   if (btn) { btn.style.background = 'rgba(255,255,255,0.12)'; setTimeout(function() { btn.style.background = ''; }, 650); }
+  // FANMODE -- fetchAll pulls tonight's games, which is the right
+  // thing to refresh in four of the five modes and nothing at all in
+  // this one: the matchups come from Skipper's league data. The
+  // overlay had its own refresh button; the mode uses this one.
+  if (typeof _fmShowing === 'function' && _fmShowing()) {
+    try { refreshFantasyMatchups(); } catch (eFR) {}
+  }
   fetchAll();
 }
 
@@ -49033,10 +49034,6 @@ function renderLeagueDrawerBody() {
   html += '<div class="ld-tool-item" onclick="openManagerRecord(); closeLeagueDrawer();">' +
     '<div class="ld-tool-icon">\ud83e\uddfe</div>' +
     '<div class="ld-tool-name">Manager Record</div>' +
-  '</div>';
-  html += '<div class="ld-tool-item" onclick="openFantasyMatchups(); closeLeagueDrawer();">' +
-    '<div class="ld-tool-icon">\ud83c\udd9a</div>' +
-    '<div class="ld-tool-name">Fantasy</div>' +
   '</div>';
   // TNALL - above All-In, because it is the same night asked about from
   // the side he opens most: one league at a time, in the table.
@@ -53750,6 +53747,16 @@ function renderCards() {
     try { _sbRenderBoard(); } catch (eB) {
       var _bg = document.getElementById('cardsGrid');
       if (_bg) { _bg.innerHTML = '<div class="sb-b-empty">The board could not be drawn.</div>'; }
+    }
+    return;
+  }
+  // FANMODE -- branches here for the same reason the board does: it is
+  // its own surface and none of the card markup below applies to it.
+  if (document.body.classList.contains('fan-mode')) {
+    try { _fmMountMode(); } catch (eF) {
+      var _fg = document.getElementById('cardsGrid');
+      if (_fg) { _fg.innerHTML = '<div class="fm-empty">The matchups could ' +
+        'not be drawn.</div>'; }
     }
     return;
   }
@@ -208024,7 +208031,7 @@ function _fmSetSport(sp) {
 }
 
 function _fmPaintFilter(ready) {
-  var host = document.getElementById('fmFilter');
+  var host = _fmEl('filter');
   if (!host) return;
   var seen = {}, sports = [];
   for (var i = 0; i < ready.length; i++) {
@@ -208057,28 +208064,51 @@ function _fmEligibleLeagues() {
   });
 }
 
-function openFantasyMatchups() {
-  var ov = document.getElementById('fmOverlay');
-  if (!ov) return;
-  ov.classList.add('open');
-  // Requires Skipper connected — unless other platforms are synced, in which
-  // case there's a board to show without Yahoo. FMALL
-  var _hasExt = (typeof extSyncedLeaguesAll === 'function') && extSyncedLeaguesAll().length > 0;
-  if ((typeof fyTokens === 'undefined' || !fyTokens) && !_hasExt) {
-    var body0 = document.getElementById('fmBody');
-    if (body0) {
-      body0.innerHTML = '<div class="fm-empty">Connect Yahoo in Skipper first to see your fantasy matchups.<br><br>' +
-        '<button class="sk-card-cta" onclick="closeFantasyMatchups();openFantasy();" style="display:inline-flex;width:auto;padding:10px 22px;margin-top:8px">Open Skipper</button></div>';
+// ── FANMODE ── where the fantasy board lives now.
+//
+// It was a Tools overlay; it is a scoreboard mode. Three places used
+// to ask "is the overlay open?" in three different ways, and the mode
+// would have been invisible to all of them -- the refresh would have
+// refused to run and arriving ESPN scores would never have repainted.
+// So the question has one owner, and so does the answer to "which
+// elements does it draw into".
+function _fmShowing() {
+  return document.body.classList.contains('fan-mode');
+}
+
+var _fmMount = { body: 'fmModeBody', filter: 'fmModeFilter' };
+function _fmEl(which) { return document.getElementById(_fmMount[which]); }
+
+// The mode draws into the cards grid, so the grid gets the two
+// elements the renderer expects and the mount is pointed at them.
+// Rebuilt only when missing: renderCards runs on every tick and
+// replacing the body each time would throw away the scroll position.
+function _fmMountMode() {
+  var el = document.getElementById('cardsGrid');
+  if (!el) { return; }
+  if (!document.getElementById('fmModeBody')) {
+    el.innerHTML = '<div class="fm-filter" id="fmModeFilter"></div>' +
+      '<div class="fm-body fm-body-mode" id="fmModeBody">' +
+      '<div class="pp-loading">Loading your matchups…</div></div>';
+  }
+  _fmMount = { body: 'fmModeBody', filter: 'fmModeFilter' };
+  // Yahoo is not required if another platform is synced -- there is a
+  // board to show without it. FMALL
+  var hasExt = (typeof extSyncedLeaguesAll === 'function') &&
+    extSyncedLeaguesAll().length > 0;
+  if ((typeof fyTokens === 'undefined' || !fyTokens) && !hasExt) {
+    var b0 = _fmEl('body');
+    if (b0) {
+      b0.innerHTML = '<div class="fm-empty">Connect Yahoo in Skipper ' +
+        'first to see your fantasy matchups.<br><br>' +
+        '<button class="sk-card-cta" onclick="openFantasy()" ' +
+        'style="display:inline-flex;width:auto;padding:10px 22px;' +
+        'margin-top:8px">Open Skipper</button></div>';
     }
     return;
   }
-  // Always re-pull on open (per spec), then render.
+  _fmRender();
   refreshFantasyMatchups();
-}
-
-function closeFantasyMatchups() {
-  var ov = document.getElementById('fmOverlay');
-  if (ov) ov.classList.remove('open');
 }
 
 // Re-pull every eligible league's matchup, then render. Bounded
@@ -208086,11 +208116,9 @@ function closeFantasyMatchups() {
 var _fmRefreshing = false;
 function refreshFantasyMatchups() {
   if (_fmRefreshing) return;
-  var ov = document.getElementById('fmOverlay');
-  if (!ov || !ov.classList.contains('open')) return;
+  if (!_fmShowing()) return;
   var leagues = _fmEligibleLeagues();
-  var btn = document.getElementById('fmRefreshBtn');
-  if (btn) btn.classList.add('fm-spinning');
+
 
   // Render once immediately from whatever's already cached (fast paint),
   // then re-pull in the background and re-render as data lands.
@@ -208104,7 +208132,6 @@ function refreshFantasyMatchups() {
   try { if (typeof espEnrichLeagues === 'function') espEnrichLeagues(); } catch (e3) {}
 
   if (!leagues.length || typeof skHydrateLeague !== 'function') {
-    if (btn) btn.classList.remove('fm-spinning');
     _fmRender();
     return;
   }
@@ -208115,11 +208142,8 @@ function refreshFantasyMatchups() {
   var remaining = leagues.length;
   function done() {
     remaining--;
-    if (remaining <= 0) {
-      _fmRefreshing = false;
-      if (btn) btn.classList.remove('fm-spinning');
-    }
-    if (ov.classList.contains('open')) _fmRender();
+    if (remaining <= 0) { _fmRefreshing = false; }
+    if (_fmShowing()) { _fmRender(); }
   }
   function pump() {
     while (inflight < 3 && queue.length) {
@@ -208258,7 +208282,7 @@ function _fmCardHTML(league, matchup) {
 }
 
 function _fmRender() {
-  var body = document.getElementById('fmBody');
+  var body = _fmEl('body');
   if (!body) return;
   var leagues = _fmEligibleLeagues();
   var extPairs = _fmExtPairs();   // FMALL
@@ -208443,7 +208467,9 @@ function _fmTallyHtml(list, sportKey) {
 
 function _fmOpenLeague(leagueKey) {
   if (!leagueKey) return;
-  closeFantasyMatchups();
+  // FANMODE -- nothing to close any more: Skipper opens over the mode
+  // the same way it opened over the overlay, and the mode is still
+  // there behind it.
   // Ext keys are prefixed (slp:/fx:/esp:) — route those to their own opener. FMALL
   if (/^(slp|fx|esp):/.test(String(leagueKey)) && typeof extOpenLeague === 'function') {
     if (typeof openFantasy === 'function') openFantasy();
@@ -257551,8 +257577,8 @@ function _extRepaintToday() {
   // If the Fantasy Matchups board is open, fresh ext scores should land
   // there too — it reads the rows at render time. FMALL
   try {
-    var _fmOv = document.getElementById('fmOverlay');
-    if (_fmOv && _fmOv.classList.contains('open') && typeof _fmRender === 'function') _fmRender();
+    if (typeof _fmShowing === 'function' && _fmShowing() &&
+        typeof _fmRender === 'function') { _fmRender(); }
   } catch (e) {}
   try {
     // SKWIREPAINT -- in Wire mode this called skRenderTodayCards, which
