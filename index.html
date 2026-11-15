@@ -19356,6 +19356,13 @@ opacity='0.42'/></svg>");
   }
   .fm-catv.dim span { color: rgba(255,255,255,0.6); }
 
+
+  .fm-pill.fm-pull {
+    margin-left: auto; border-color: rgba(167,139,250,0.45);
+    color: #c4b5fd; letter-spacing: 0.1em;
+  }
+  .fm-pill.fm-pull:active { background: rgba(167,139,250,0.16); }
+
   /* FANMODE -- the body as a mode, inside the page rather than an
      overlay. The overlay supplied the padding; the grid does not. */
   .fm-body-mode { padding: 0 12px 100px; }
@@ -208809,19 +208816,40 @@ function _fmPaintFilter(ready) {
   // If the remembered sport no longer has any card, fall back to all so the
   // board can't be filtered into emptiness.
   if (_fmSport && !seen[_fmSport]) _fmSport = '';
-  if (sports.length < 2) { host.innerHTML = ''; return; }
-  var order = ['mlb', 'nfl', 'nba', 'nhl'];
-  sports.sort(function (a, b) {
-    var ia = order.indexOf(a), ib = order.indexOf(b);
-    return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
-  });
-  var html = '<button class="fm-pill' + (!_fmSport ? ' on' : '') + '" onclick="_fmSetSport(\'\')">ALL</button>';
-  for (var k = 0; k < sports.length; k++) {
-    var s2 = sports[k];
-    html += '<button class="fm-pill' + (_fmSport === s2 ? ' on' : '') + '" onclick="_fmSetSport(\'' + s2 + '\')">' +
-      (_FM_SPORT_LABEL[s2] || s2.toUpperCase()) + '</button>';
+  var html = '';
+  // FANPULL -- the pills come and go with the sports on screen; the
+  // refresh does not. It is the only thing that updates this board
+  // now, so it cannot disappear because he happens to have one sport
+  // in play.
+  if (sports.length >= 2) {
+    var order = ['mlb', 'nfl', 'nba', 'nhl'];
+    sports.sort(function (a, b) {
+      var ia = order.indexOf(a), ib = order.indexOf(b);
+      return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+    });
+    html += '<button class="fm-pill' + (!_fmSport ? ' on' : '') + '" onclick="_fmSetSport(\'\')">ALL</button>';
+    for (var k = 0; k < sports.length; k++) {
+      var s2 = sports[k];
+      html += '<button class="fm-pill' + (_fmSport === s2 ? ' on' : '') + '" onclick="_fmSetSport(\'' + s2 + '\')">' +
+        (_FM_SPORT_LABEL[s2] || s2.toUpperCase()) + '</button>';
+    }
   }
+  html += '<button class="fm-pill fm-pull" id="fmPullBtn" onclick="_fmRefreshNow()">' +
+    (_fmRefreshing ? '\u2026' : '\u21bb') + ' ' + _fmPullLabel() + '</button>';
   host.innerHTML = html;
+}
+
+// WHEN IT LAST PULLED. A board that no longer updates itself has to
+// say how old it is, or it is indistinguishable from a board that is
+// simply wrong.
+function _fmPullLabel() {
+  if (_fmRefreshing) { return 'PULLING'; }
+  if (!_fmLastPull) { return 'REFRESH'; }
+  var mins = Math.floor((Date.now() - _fmLastPull) / 60000);
+  if (mins < 1) { return 'JUST NOW'; }
+  if (mins < 60) { return mins + 'M AGO'; }
+  var hrs = Math.floor(mins / 60);
+  return hrs + 'H AGO';
 }
 
 function _fmEligibleLeagues() {
@@ -208876,15 +208904,50 @@ function _fmMountMode() {
     return;
   }
   _fmRender();
+  if (!_fmAnyMatchup()) { refreshFantasyMatchups(); }
+}
+
+// Is there anything to paint? If Skipper has already parsed a matchup
+// for one of the eligible leagues, the board has content and needs no
+// pull of its own.
+function _fmAnyMatchup() {
+  var leagues = _fmEligibleLeagues();
+  for (var i = 0; i < leagues.length; i++) {
+    var d = (typeof skLeagueData !== 'undefined') && skLeagueData[leagues[i].league_key];
+    if (d && d.matchup && d.matchup.hasMatchup) { return true; }
+  }
+  try {
+    var ex = _fmExtPairs();
+    if (ex && ex.length) { return true; }
+  } catch (e) {}
+  return false;
+}
+
+// What the button does: forget the weeks it is holding for these
+// leagues, then pull. Without the first step the charts would keep
+// showing the week they were drawn with, and a refresh that leaves
+// half the card stale is not a refresh.
+function _fmRefreshNow() {
+  if (_fmRefreshing) { return; }
+  try {
+    var ls = _fmEligibleLeagues();
+    for (var i = 0; i < ls.length; i++) {
+      if (typeof _skTrendFpCache !== 'undefined') {
+        delete _skTrendFpCache[ls[i].league_key];
+      }
+    }
+  } catch (e) {}
   refreshFantasyMatchups();
 }
 
 // Re-pull every eligible league's matchup, then render. Bounded
 // concurrency so we don't fire 16 Yahoo calls at once.
 var _fmRefreshing = false;
+var _fmLastPull = 0;
 function refreshFantasyMatchups() {
   if (_fmRefreshing) return;
   if (!_fmShowing()) return;
+  _fmLastPull = Date.now();
   var leagues = _fmEligibleLeagues();
 
 
@@ -209061,8 +209124,13 @@ function _fmTrendFill(el) {
   var ok2 = el.getAttribute('data-opp');
   if (!lk || !mk || !ok2) { return; }
   if (typeof _skTrendFpCache === 'undefined') { return; }
+  // FANPULL -- no age check here. The Week Trends overlay keeps its
+  // five-minute window; this board does not, because a repaint every
+  // minute would walk straight past a stale entry and pull the week
+  // again. A week already in hand is drawn, and only the refresh
+  // button clears it.
   var hit = _skTrendFpCache[lk];
-  if (hit && hit.data && (Date.now() - hit.ts) < 5 * 60 * 1000) {
+  if (hit && hit.data) {
     _fmTrendPaint(lk, hit.data);
     return;
   }
