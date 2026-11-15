@@ -28764,6 +28764,27 @@ opacity='0.42'/></svg>");
                   font-size: 10px; color: var(--sk-text-2); }
 
   /* One row per team, sorted by chance. */
+
+  /* ODDSHIST -- the season's odds as a line per team */
+  .po-hist { margin-top: 13px; border-top: 1px solid var(--sk-border);
+    padding-top: 11px; }
+  .po-hist-hd { display: flex; justify-content: space-between;
+    align-items: baseline; margin-bottom: 7px; }
+  .po-hist-hd span { font: 800 8.5px/1 var(--sk-font-mono, monospace);
+    letter-spacing: 0.18em; color: var(--po-gold, #f5d547); }
+  .po-hist-hd b { font: 700 8.5px/1 var(--sk-font-mono, monospace);
+    letter-spacing: 0.1em; color: rgba(255,255,255,0.4); }
+  .po-hist-wrap { position: relative; padding-left: 26px; }
+  .po-hist-ax { position: absolute; left: 0; font: 700 7px/1
+    var(--sk-font-mono, monospace); color: rgba(255,255,255,0.3);
+    text-decoration: none; letter-spacing: 0.04em; }
+  .po-hist-ax.t { top: 3px; }
+  .po-hist-ax.m { top: 47px; }
+  .po-hist-ax.b { top: 91px; }
+  .po-hist-svg { display: block; width: 100%; height: 96px; overflow: visible; }
+  .po-hist-lbl { display: flex; justify-content: space-between;
+    margin-top: 5px; font: 700 7.5px/1 var(--sk-font-mono, monospace);
+    letter-spacing: 0.1em; color: rgba(255,255,255,0.33); }
   .po-bars { margin-top: 12px; border-top: 1px solid var(--sk-border);
              padding-top: 8px; }
   .po-row { display: grid; grid-template-columns: 18px minmax(0,1fr) 92px 38px;
@@ -191123,6 +191144,312 @@ function _poSeedOrder(simW, simTb, teams, order, nT, divSeeding) {
 }
 
 
+
+// ══════════════════════════════════════════════════════════════════
+//  ODDSHIST -- what the odds HAVE BEEN, week by week
+// ══════════════════════════════════════════════════════════════════
+//
+// A REPLAY, NOT A RECORDING. Nothing was written down as the season
+// went, and waiting two months to draw a line is no answer. Every
+// ingredient of a past week's figure is still here: the results of
+// the weeks before it rebuild the table, the same weeks fit the
+// strength model, and the fixtures that were still to come are the
+// ones that have since been played. So each point is worked out from
+// what was knowable THEN -- no lookahead, and no new requests.
+//
+// The honest cost of doing it this way: these are the numbers the
+// model would have given, not the numbers it did give. Improve the
+// model and the whole history changes shape with it. The card says so.
+var PO_HIST_PREFIX = 'sk_po_hist_v1_';
+var PO_HIST_ITERS = 1500;
+var PO_HIST_CAT_ITERS = 800;
+var PO_HIST_FROM = 2;     // week 1 has no form to read; the line starts at 2
+
+// The table as it stood after week `upto`, rebuilt from the weeks
+// themselves rather than from a standings call that only knows today.
+function _poRecsAt(store, keys, upto, kind) {
+  var rec = {}, i;
+  for (i = 0; i < keys.length; i++) { rec[keys[i]] = { w: 0, l: 0, t: 0 }; }
+  for (var wk in store.w) {
+    if (!store.w.hasOwnProperty(wk)) { continue; }
+    if (Number(wk) > upto) { continue; }
+    var rows = store.w[wk] || [];
+    for (i = 0; i < rows.length; i++) {
+      var m = rows[i], A = rec[m.a], B = rec[m.b];
+      if (!A || !B) { continue; }
+      if (kind === 'cat') {
+        // every category its own win, so the week hands out as many
+        // results as there were categories in it
+        var wa = Number(m.wa) || 0, wb = Number(m.wb) || 0, tie = 0;
+        if (m.sw) {
+          for (var sd in m.sw) {
+            if (m.sw.hasOwnProperty(sd) && m.sw[sd] === 'tie') { tie++; }
+          }
+        }
+        A.w += wa; A.l += wb; A.t += tie;
+        B.w += wb; B.l += wa; B.t += tie;
+      } else if (kind === 'catone') {
+        var ca = Number(m.wa) || 0, cb = Number(m.wb) || 0;
+        if (ca > cb) { A.w++; B.l++; }
+        else if (cb > ca) { B.w++; A.l++; }
+        else { A.t++; B.t++; }
+      } else {
+        if (m.w === m.a) { A.w++; B.l++; }
+        else if (m.w === m.b) { B.w++; A.l++; }
+        else { A.t++; B.t++; }
+      }
+    }
+  }
+  return rec;
+}
+
+// The weeks of store.w up to and including `upto`, which is what the
+// strength model is allowed to see at that point in the season.
+function _poWeeksUpto(store, upto) {
+  var out = {};
+  for (var wk in store.w) {
+    if (!store.w.hasOwnProperty(wk)) { continue; }
+    if (Number(wk) <= upto) { out[wk] = store.w[wk]; }
+  }
+  return out;
+}
+
+// The fixtures still to come at week `from`. The ones that have since
+// been played are taken from the results -- they are the real
+// matchups, not a guess -- and anything past today from the schedule
+// cache. A week neither can supply is left null and the simulation
+// shuffles it, exactly as it does today.
+function _poSchAt(store, schStore, keys, from, lastWeek) {
+  var idx = {}, i, w, out = [];
+  for (i = 0; i < keys.length; i++) { idx[keys[i]] = i; }
+  var half = Math.floor(keys.length / 2);
+  for (w = from; w <= lastWeek; w++) {
+    var pairs = [], seen = {}, ok = true, rows = store.w[String(w)];
+    if (rows && rows.length) {
+      for (i = 0; i < rows.length; i++) {
+        var a = idx[rows[i].a], b = idx[rows[i].b];
+        if (a == null || b == null || a === b || seen[a] || seen[b]) { ok = false; break; }
+        seen[a] = seen[b] = 1;
+        pairs.push([a, b]);
+      }
+    } else if (schStore && schStore.s) {
+      var list = schStore.s[String(w)] || [];
+      for (i = 0; i < list.length; i++) {
+        var a2 = idx[list[i][0]], b2 = idx[list[i][1]];
+        if (a2 == null || b2 == null || a2 === b2 || seen[a2] || seen[b2]) { ok = false; break; }
+        seen[a2] = seen[b2] = 1;
+        pairs.push([a2, b2]);
+      }
+    } else { ok = false; }
+    out.push((ok && pairs.length === half) ? pairs : null);
+  }
+  return out;
+}
+
+// One past week's figure for every team.
+function _poOddsAt(store, schStore, keys, upto, lastWeek, seats, divMap,
+                   kind, lk) {
+  var recs = _poRecsAt(store, keys, upto, kind), i;
+  var remaining = lastWeek - upto;
+  if (remaining <= 0) { return null; }
+  var teams = [], S = null, catModel = null;
+  if (kind === 'pts') {
+    var scores = {};
+    for (i = 0; i < keys.length; i++) { scores[keys[i]] = []; }
+    var seen = _poWeeksUpto(store, upto);
+    for (var wk in seen) {
+      if (!seen.hasOwnProperty(wk)) { continue; }
+      var rows = seen[wk] || [];
+      for (i = 0; i < rows.length; i++) {
+        if (rows[i].pa != null && scores[rows[i].a]) { scores[rows[i].a].push(rows[i].pa); }
+        if (rows[i].pb != null && scores[rows[i].b]) { scores[rows[i].b].push(rows[i].pb); }
+      }
+    }
+    S = _poStrength(scores, keys);
+    if (!S) { return null; }
+  } else {
+    catModel = _poCatModel(_poWeeksUpto(store, upto), keys);
+    if (!catModel) { return null; }
+  }
+  for (i = 0; i < keys.length; i++) {
+    var k = keys[i], r = recs[k];
+    teams.push({ key: k,
+                 mu: (S && S.teams[k]) ? S.teams[k].mu : 0,
+                 sd: (S && S.teams[k]) ? S.teams[k].sd : 1,
+                 w: r.w, l: r.l, t: r.t, pf: 0,
+                 div: divMap ? (divMap[k] || null) : null });
+  }
+  var sched = _poSchAt(store, schStore, keys, upto + 1, lastWeek);
+  var divSeed = false;
+  if (divMap) {
+    var dSeen = {};
+    for (i = 0; i < keys.length; i++) {
+      if (divMap[keys[i]] != null && divMap[keys[i]] !== '') { dSeen[divMap[keys[i]]] = 1; }
+    }
+    var nd = 0;
+    for (var dk in dSeen) { if (dSeen.hasOwnProperty(dk)) { nd++; } }
+    divSeed = nd > 1;
+  }
+  // The same seed for the same league and week, so reopening the card
+  // redraws the same line rather than a slightly different one.
+  var seed = _poSeed(lk, upto);
+  var iters = (kind === 'pts') ? PO_HIST_ITERS : PO_HIST_CAT_ITERS;
+  var res = (kind === 'pts')
+    ? _poSim(teams, remaining, seats, iters, seed, sched, divSeed)
+    : _poSimCats(teams, catModel, remaining, seats, iters, seed, sched,
+                 divSeed, kind === 'cat');
+  if (!res) { return null; }
+  var byKey = {};
+  for (i = 0; i < res.length; i++) { byKey[res[i].key] = res[i].odds; }
+  return byKey;
+}
+
+
+// ── ODDSHIST ── the whole season's worth, and the cache for it ────
+function _poHistLoad(lk) {
+  try {
+    var o = JSON.parse(localStorage.getItem(PO_HIST_PREFIX + lk) || 'null');
+    if (o && o.o) { return o; }
+  } catch (e) {}
+  return null;
+}
+
+function _poHistSave(lk, o) {
+  try { localStorage.setItem(PO_HIST_PREFIX + lk, JSON.stringify(o)); } catch (e) {}
+}
+
+// Does the rebuilt table agree with the one Yahoo is showing? If it
+// does not, the replay is reading the weeks wrongly and every point
+// on the line is wrong with it -- so nothing is drawn. A chart that
+// is quietly off is worse than no chart.
+function _poHistAgrees(store, keys, upto, kind, allTeams) {
+  var recs = _poRecsAt(store, keys, upto, kind), i;
+  for (i = 0; i < keys.length; i++) {
+    var t = allTeams[keys[i]];
+    if (!t) { return false; }
+    var real = _poRec(t.record), mine = recs[keys[i]];
+    if (!real) { return false; }
+    if (real.w !== mine.w || real.l !== mine.l) { return false; }
+  }
+  return true;
+}
+
+function _poHistory(league, store, schStore, keys, allTeams, cur, end,
+                    seats, divMap, kind, nowByKey) {
+  var lk = league.league_key;
+  var lastDone = cur - 1;
+  if (lastDone < PO_HIST_FROM) { return null; }
+  if (!_poHistAgrees(store, keys, lastDone, kind, allTeams)) { return null; }
+
+  var hit = _poHistLoad(lk);
+  if (hit && hit.cur === cur && hit.kind === kind && hit.from === PO_HIST_FROM &&
+      hit.n === keys.length) {
+    return hit;
+  }
+
+  var weeks = [], o = {}, i, w;
+  for (i = 0; i < keys.length; i++) { o[keys[i]] = []; }
+  for (w = PO_HIST_FROM; w <= lastDone; w++) {
+    var by = (w === lastDone && nowByKey)
+      // the last point IS the figure printed above the chart, so the
+      // line ends where the big number says it should
+      ? nowByKey
+      : _poOddsAt(store, schStore, keys, w, end, seats, divMap, kind, lk);
+    if (!by) { continue; }
+    weeks.push(w);
+    for (i = 0; i < keys.length; i++) {
+      o[keys[i]].push(by[keys[i]] == null ? null : Math.round(by[keys[i]] * 1000) / 1000);
+    }
+  }
+  if (weeks.length < 2) { return null; }
+  var out = { v: 1, cur: cur, kind: kind, from: PO_HIST_FROM,
+              n: keys.length, weeks: weeks, o: o };
+  _poHistSave(lk, out);
+  return out;
+}
+
+// ── the chart ─────────────────────────────────────────────────────
+// Everyone faded, his own in gold on top. The interesting thing in a
+// season of these is not any one line, it is where they cross.
+function _poHistChart(hist, keys, allTeams, myKey) {
+  if (!hist || !hist.weeks || hist.weeks.length < 2) { return ''; }
+  // padR leaves room for the dot on the last point, which otherwise
+  // sits half outside the box.
+  var W = 300, H = 96, padL = 2, padR = 9, padT = 7, padB = 3;
+  var n = hist.weeks.length, i, j;
+  function X(ix) { return padL + (ix / (n - 1)) * (W - padL - padR); }
+  function Y(p) { return padT + (1 - p) * (H - padT - padB); }
+
+  function path(arr) {
+    var d = '', started = false;
+    for (j = 0; j < arr.length; j++) {
+      // A week with no figure BREAKS the line. Skipping it and
+      // carrying on drew a straight segment across the gap, which
+      // reads as a known value moving smoothly through a week the
+      // replay could not rebuild at all.
+      if (arr[j] == null) { started = false; continue; }
+      d += (started ? 'L' : 'M') + X(j).toFixed(1) + ' ' + Y(arr[j]).toFixed(1) + ' ';
+      started = true;
+    }
+    return d;
+  }
+
+  var grid = '';
+  for (i = 1; i <= 3; i++) {
+    var gy = Y(i / 4);
+    grid += '<line x1="' + padL + '" y1="' + gy.toFixed(1) + '" x2="' +
+      (W - padR) + '" y2="' + gy.toFixed(1) + '" stroke="rgba(255,255,255,' +
+      (i === 2 ? '0.13' : '0.06') + ')" stroke-width="1" ' +
+      'vector-effect="non-scaling-stroke"></line>';
+  }
+
+  var others = '', mineP = '';
+  for (i = 0; i < keys.length; i++) {
+    var d2 = path(hist.o[keys[i]] || []);
+    if (!d2) { continue; }
+    if (keys[i] === myKey) {
+      // non-scaling-stroke: the box is stretched to the card's width,
+      // and without it every line is drawn thicker across than down.
+      mineP = '<path d="' + d2 + '" fill="none" stroke="var(--po-gold, #f5d547)" ' +
+        'stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" ' +
+        'vector-effect="non-scaling-stroke"></path>';
+    } else {
+      others += '<path d="' + d2 + '" fill="none" stroke="rgba(255,255,255,0.18)" ' +
+        'stroke-width="1.1" stroke-linejoin="round" ' +
+        'vector-effect="non-scaling-stroke"></path>';
+    }
+  }
+  if (!mineP && !others) { return ''; }
+
+  // the last point on his line, marked, so the eye lands where the
+  // headline figure is
+  var dot = '';
+  if (myKey && hist.o[myKey]) {
+    var arr2 = hist.o[myKey];
+    for (j = arr2.length - 1; j >= 0; j--) {
+      if (arr2[j] != null) {
+        dot = '<circle cx="' + X(j).toFixed(1) + '" cy="' + Y(arr2[j]).toFixed(1) +
+          '" r="3" fill="var(--po-gold, #f5d547)"></circle>';
+        break;
+      }
+    }
+  }
+
+  return '<div class="po-hist">' +
+    '<div class="po-hist-hd"><span>HOW IT GOT HERE</span>' +
+      '<b>weeks ' + hist.weeks[0] + '–' + hist.weeks[n - 1] + '</b></div>' +
+    '<div class="po-hist-wrap"><u class="po-hist-ax t">100%</u>' +
+    '<u class="po-hist-ax m">50%</u><u class="po-hist-ax b">0%</u>' +
+    '<svg class="po-hist-svg" viewBox="0 0 ' + W + ' ' + H + '" ' +
+      'preserveAspectRatio="none" aria-hidden="true">' +
+      grid + others + mineP + dot +
+    '</svg></div>' +
+    '<div class="po-hist-lbl"><span>wk ' + hist.weeks[0] + '</span>' +
+      '<span>every team · yours in gold</span>' +
+      '<span>wk ' + hist.weeks[n - 1] + '</span></div>' +
+  '</div>';
+}
+
 // ── THE STREAK, from results rather than from a field Yahoo may or
 //    may not send. Walks the stored weeks backwards from the latest.
 function _poStreak(weeks, teamKey) {
@@ -191260,10 +191587,7 @@ function _poSeats(league) {
   return (sc && sc.playoff && sc.playoff.numTeams) || 0;
 }
 
-// Which leagues get a card. Points head-to-head only for now: the model
-// simulates a SCORE, and a categories matchup is nine or twenty-two
-// separate contests rather than one number, so it needs a model of its
-// own rather than this one applied where it does not fit.
+// Which leagues get a card.
 // CATODDS -- head-to-head of either kind now. 'headpoint' is one
 // score a week; 'head' and 'headone' are nine or twelve contests a
 // week, which is a different model but the same question.
@@ -191287,7 +191611,7 @@ function _poEligible(league, leagueData) {
   return 'ok';
 }
 
-async function _poEnsureWeeks(league, wantCats) {
+async function _poEnsureWeeks(league) {
   var lk = league.league_key;
   var store = _poWkLoad(lk);
   var wantCats = (_poKind(league) !== 'pts');
@@ -191505,8 +191829,28 @@ function _poCompute(league, allTeams, store, schStore) {
 
   var byKey = {};
   for (i = 0; i < res.length; i++) { byKey[res[i].key] = res[i]; }
+  // ODDSHIST -- the same question asked of every week that has been
+  // played, from the weeks themselves. Cached, so this is paid once
+  // per new week rather than on every open.
+  var hist = null;
+  try {
+    var divMap = null;
+    if (nDiv > 1) {
+      divMap = {};
+      for (i = 0; i < keys.length; i++) {
+        divMap[keys[i]] = (allTeams[keys[i]] || {}).division_id;
+      }
+    }
+    // byKey holds the full result per team; the history wants the one
+    // number, and wants the last point to BE the headline figure.
+    var nowOdds = {};
+    for (i = 0; i < res.length; i++) { nowOdds[res[i].key] = res[i].odds; }
+    hist = _poHistory(league, store, schStore, keys, allTeams, cur, end,
+                      seats, divMap, kind, nowOdds);
+  } catch (eH) { hist = null; }
+
   return { rows: res, byKey: byKey, seats: seats, remaining: remaining,
-           week: cur, strength: S, nTeams: keys.length,
+           week: cur, strength: S, nTeams: keys.length, hist: hist,
            kind: kind, iters: iters, cats: catModel ? catModel.nCats : 0,
            weeksSeen: Object.keys(store.w).length,
            schedWeeks: schedWeeks, sos: sos,
@@ -191813,12 +192157,12 @@ function _poCardHtml(league, out, allTeams, myKey) {
           '</div>') : '') +
       '</div>' +
     '</div>' +
-    _poSeedStrip(mine.seeds, out.seats, PO_ITERS) +
+    _poSeedStrip(mine.seeds, out.seats, out.iters || PO_ITERS) +
     '<div class="po-seeds-lbl"><span>1st</span>' +
       '<span>where you finish · green = a playoff place</span>' +
       '<span>' + out.nTeams + 'th</span></div>' +
     (function () {
-      var w = _poSeedWords(mine.seeds, PO_ITERS);
+      var w = _poSeedWords(mine.seeds, out.iters || PO_ITERS);
       return w ? ('<div class="po-seeds-say">' + w + '</div>') : '';
     })();
   }
@@ -191878,6 +192222,11 @@ function _poCardHtml(league, out, allTeams, myKey) {
       out.cats + ' of them, drawn together so a big week lifts a team ' +
       'everywhere at once.');
   }
+  if (out.hist) {
+    notes.push('The line is a replay: each week is re-simulated from ' +
+      'what was known at the time, so improving the model changes the ' +
+      'whole history with it.');
+  }
   if (out.weeksSeen < 4) {
     notes.push('Only ' + out.weeksSeen + ' week' +
       (out.weeksSeen === 1 ? '' : 's') + ' of scores so far, so these lean ' +
@@ -191893,6 +192242,7 @@ function _poCardHtml(league, out, allTeams, myKey) {
     '</div>' +
     head +
     '<div class="po-bars">' + bars + '</div>' +
+    (out.hist ? _poHistChart(out.hist, Object.keys(out.byKey), allTeams, myKey) : '') +
     '<div class="po-note">' + skEscape(notes.join(' ')) + '</div>' +
     divNote +
   '</div>';
@@ -191935,7 +192285,7 @@ function _poKick(league, leagueData, allTeams) {
     return;
   }
   _poInflight[lk] = true;
-  _poEnsureWeeks(league, _poKind(league) !== 'pts').then(function (store) {
+  _poEnsureWeeks(league).then(function (store) {
     // POSCHED -- the fixtures, after the scores. Both are cached for
     // the season, so this whole chain is a one-off per league.
     return _poEnsureSched(league, allTeams)['catch'](function () { return null; })
