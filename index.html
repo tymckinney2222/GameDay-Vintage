@@ -214394,8 +214394,10 @@ function _svSettle(date, boxes) {
 }
 
 // Read tonight's games, and settle any earlier night still open.
+// SETTLEALL -- returns a promise now, so a caller that is not the
+// overlay can wait for the record to settle before repainting.
 function _svRefresh(force) {
-  if (_svState.busy) { return; }
+  if (_svState.busy) { return Promise.resolve(false); }
   var st = _svStore(), dates = [], k;
   for (k in st.nights) {
     if (st.nights.hasOwnProperty(k) && st.nights[k].locked && !st.nights[k].settled) {
@@ -214403,7 +214405,7 @@ function _svRefresh(force) {
     }
   }
   dates.sort();
-  if (!dates.length) { return; }
+  if (!dates.length) { return Promise.resolve(false); }
   _svState.busy = true;
   var streakWas = st.streak || 0;
   _svRender();
@@ -214433,7 +214435,7 @@ function _svRefresh(force) {
     _svRender();
     _svEnsurePool();
   }
-  Promise.all(jobs).then(done, done);
+  return Promise.all(jobs).then(done, done).then(function () { return true; });
 }
 
 // ── the record ─────────────────────────────────
@@ -214806,7 +214808,7 @@ function _csSettle(date, games) {
 }
 
 function _csRefresh(force) {
-  if (_csState.busy) { return; }
+  if (_csState.busy) { return Promise.resolve(false); }
   var st = _csStore(), dates = [], k;
   for (k in st.nights) {
     if (!st.nights.hasOwnProperty(k)) { continue; }
@@ -214818,8 +214820,7 @@ function _csRefresh(force) {
       }
     }
   }
-  if (!dates.length && !force) { return; }
-  if (!dates.length) { return; }
+  if (!dates.length) { return Promise.resolve(false); }
   _csState.busy = true;
   var jobs = dates.map(function (d) {
     // CALLSCORE5 -- against the slate it was played on. A night keyed
@@ -214831,7 +214832,7 @@ function _csRefresh(force) {
       return { d: d, games: games || [] };
     }, function () { return null; });
   });
-  Promise.all(jobs).then(function (res) {
+  return Promise.all(jobs).then(function (res) {
     var changed = false, i;
     for (i = 0; i < res.length; i++) {
       if (res[i] && _csSettle(res[i].d, res[i].games)) { changed = true; }
@@ -214842,7 +214843,8 @@ function _csRefresh(force) {
     // refresh does. Belt and braces now that the flags are separate,
     // but it is the line whose absence let this sit there.
     _csEnsurePool();
-  }, function () { _csState.busy = false; _csEnsurePool(); });
+    return changed;
+  }, function () { _csState.busy = false; _csEnsurePool(); return false; });
 }
 
 // CALLSCORE -- the record, overall and by sport. Solo nights are
@@ -222518,6 +222520,19 @@ function openTheSeason() {
   if (!ov) { return; }
   ov.classList.add('open');
   _tsnRender(true);
+  // SETTLEALL -- the calling games bank their own results when their
+  // overlays open, and nowhere else, so THE CALLING GAMES here used to
+  // read whatever each game had last been shown. Five visits to make
+  // one summary true. Now it settles them from here and redraws if
+  // anything moved -- keeping his scroll, because he is reading.
+  try {
+    _gxSettleAll(false).then(function (moved) {
+      if (!moved) { return; }
+      var ov2 = document.getElementById('tsnOverlay');
+      if (!ov2 || ov2.className.indexOf('open') === -1) { return; }
+      _tsnRender(false);
+    });
+  } catch (eS) {}
   // PULLOWN -- and then go and get the same data the Manager Record
   // goes and gets. Reading mrCollect made the two screens agree on
   // what was cached; this makes them agree on what is true, in
@@ -223979,6 +223994,74 @@ var GX_GAMES = [
     ask: 'Two buttons a game, every night' }
 ];
 
+
+// ══════════════════════════════════════════════════════════════════
+//  SETTLEALL -- the calling games settle without being opened
+// ══════════════════════════════════════════════════════════════════
+//
+// Every calling game banks its own results when its overlay opens,
+// and nowhere else. So the records on The Season and in the Games
+// list were whatever they had been the last time each game was
+// looked at -- five separate visits to make one summary true, and a
+// summary nobody can trust is worse than no summary.
+//
+// Each game already knows how to catch itself up; none of them needed
+// the overlay to do it. This runs all five and waits, and because
+// the three that grade off slates now share one request per
+// league-day, running them together costs barely more than running
+// the slowest alone.
+var _gxSettle = { busy: false, at: 0 };
+
+// What the five records add up to. Compared before and after, it says
+// whether anything actually banked -- so a view repaints when there
+// is something new and sits still when there is not.
+function _gxCallingSig() {
+  var out = [], i;
+  for (i = 0; i < GX_GAMES.length; i++) {
+    if (GX_GAMES[i].kind !== 'calls') { continue; }
+    var st = null;
+    try { st = _gxStat(GX_GAMES[i]); } catch (e) { st = null; }
+    out.push(st ? (st.k + ':' + st.w + '-' + st.l + '-' + st.t + '-' +
+      st.n + '-' + st.played + '|' + st.line) : '?');
+  }
+  return out.join('|');
+}
+
+function _gxSettleAll(force) {
+  var now = Date.now();
+  if (_gxSettle.busy) { return Promise.resolve(false); }
+  // Opening The Season and then the Games list should not pay twice.
+  if (!force && _gxSettle.at && (now - _gxSettle.at) < 90000) {
+    return Promise.resolve(false);
+  }
+  _gxSettle.busy = true;
+  _gxSettle.at = now;
+  var before = _gxCallingSig();
+  // ONE JOB THAT FAILS MUST NOT CUT THE OTHERS SHORT. Promise.all
+  // settles on the first rejection, and the records would then be read
+  // before the rest had finished writing theirs -- the summary would be
+  // stale again, for a reason nothing on screen could explain. So every
+  // job is swallowed here and the signature, not the return value, says
+  // whether anything banked.
+  function run(fn) {
+    var r = null;
+    try { r = fn(); } catch (e) { return Promise.resolve(false); }
+    if (!r || typeof r.then !== 'function') { return Promise.resolve(false); }
+    return r.then(function () { return true; }, function () { return false; });
+  }
+  var jobs = [
+    run(function () { return _svRefresh(); }),
+    run(function () { return _csRefresh(); }),
+    run(function () { return _stvRefresh(); }),
+    run(function () { return _peRunGrading(); }),
+    run(function () { return _auctSettleCatchUp(); })
+  ];
+  return Promise.all(jobs).then(function () {
+    _gxSettle.busy = false;
+    return _gxCallingSig() !== before;
+  });
+}
+
 function _gxRecStr(t) {
   return t.w + '-' + t.l + (t.t ? ('-' + t.t) : '');
 }
@@ -224940,7 +225023,7 @@ function _stvSettle(date, games) {
 }
 
 function _stvRefresh(force) {
-  if (_stvState.busy) { return; }
+  if (_stvState.busy) { return Promise.resolve(false); }
   // GMSETTLE -- THE NIGHT-LEVEL locked/settled PAIR STOPPED BEING
   // WRITTEN when STVSPORT moved the lock onto each sport's pick, so
   // this collected nothing and Team Edition quietly stopped settling
@@ -224957,7 +225040,7 @@ function _stvRefresh(force) {
     }
   }
   dates.sort();
-  if (!dates.length) { return; }
+  if (!dates.length) { return Promise.resolve(false); }
   _stvState.busy = true;
   var streakWas = st.streak || 0;
   _stvRender();
@@ -224976,7 +225059,7 @@ function _stvRefresh(force) {
     _stvRender();
     _stvEnsurePool();
   }
-  Promise.all(jobs).then(done, done);
+  return Promise.all(jobs).then(done, done).then(function () { return true; });
 }
 
 // SURVPEEK -- open this fixture in whichever stadium mode its sport
@@ -225521,6 +225604,18 @@ function openGames() {
   var body = document.getElementById('skGamesBody');
   if (body) { body.innerHTML = _auctGamesHtml(); }
   ov.classList.add('open');
+  // SETTLEALL -- draw what is banked, then go and bank the rest. The
+  // list is up before the first request leaves, and it is rebuilt only
+  // if a record actually moved.
+  try {
+    _gxSettleAll(false).then(function (moved) {
+      if (!moved) { return; }
+      var ov2 = document.getElementById('skGamesOverlay');
+      if (!ov2 || ov2.className.indexOf('open') === -1) { return; }
+      var b2 = document.getElementById('skGamesBody');
+      if (b2) { b2.innerHTML = _auctGamesHtml(); }
+    });
+  } catch (eS) {}
 }
 
 function closeGames() {
@@ -226783,6 +226878,52 @@ function _auctCheckLastNight() {
       _auctRender();
     }
   }, function () {});
+}
+
+// SETTLEALL -- every night that can be scored, not only the one on
+// screen. _auctCheckLastNight settles the night at nightIdx, which is
+// the night he happens to be looking at; two nights away left the
+// older one unscored until he stepped back to it by hand. This walks
+// the locked nights OLDEST FIRST, because those are the ones about to
+// fall out of the sixty-day window, and banks each one it can. It
+// touches no overlay state and draws nothing, so it is safe to run
+// from a screen that is not Auction Night.
+//
+// Capped per run: a night costs one request a game. A final game is
+// cached for the session once read and a settled night is never read
+// again, so the cap only spreads a long absence over a few opens
+// instead of one long wait.
+var AUCT_CATCHUP_MAX = 3;
+
+function _auctSettleCatchUp() {
+  var list, i;
+  try { list = _auctNights(); } catch (eN) { return Promise.resolve(false); }
+  var todo = [];
+  for (i = list.length - 1; i >= 0; i--) {
+    var ln = list[i];
+    if (!ln || !ln.card || ln.card.settled) { continue; }
+    // Locked before the app saved its fixtures: nothing left to score
+    // it against, and the overlay says so in its own words.
+    if (!(ln.card.gids && ln.card.gids.length)) { continue; }
+    todo.push(ln);
+    if (todo.length >= AUCT_CATCHUP_MAX) { break; }
+  }
+  if (!todo.length) { return Promise.resolve(false); }
+  var jobs = [];
+  for (i = 0; i < todo.length; i++) {
+    jobs.push((function (n) {
+      var sp = n.card.sport || _auctSport();
+      return _auctLiveFetch(false, n.card.gids, sp).then(function (box) {
+        if (!box) { return false; }
+        return !!_auctSettleNight(n.date, n.league || _auctState.leagueKey,
+          n.card, box, sp);
+      }, function () { return false; });
+    })(todo[i]));
+  }
+  return Promise.all(jobs).then(function (rs) {
+    for (var j = 0; j < rs.length; j++) { if (rs[j]) { return true; } }
+    return false;
+  }, function () { return false; });
 }
 
 // AUCTSETTLE -- last night's card, and the running record under it.
@@ -237306,9 +237447,40 @@ function _peFetchSlate(dayKey, leagues) {
   });
 }
 
+// SETTLEALL -- one request per league-day, shared.
+//
+// Three of the calling games grade off the same slates, and each was
+// fetching them for itself: settling a week of Call the Score, Team
+// Survivor and Pick 'Em asked ESPN for the same league-days three
+// times over. The dash already knew this ("opening the three of them
+// costs three") and worked around it for tonight only.
+//
+// A finished day never changes, so it is held for the session.
+// TODAY does change, so it is held for three quarters of a minute.
+// An EMPTY answer is never held at all: a failed fetch and a day with
+// no games look the same from here, and caching the failure would
+// close that day forever.
+var _peDayCache = {};
+
 function _peFetchLeagueDay(league, dayKey) {
   var cfg = (typeof LEAGUES !== 'undefined') ? LEAGUES[league] : null;
   if (!cfg) return Promise.resolve([]);
+  var ckey = league + '|' + dayKey;
+  var today = '';
+  try { today = _peToday(); } catch (eT) { today = ''; }
+  var hit = _peDayCache[ckey];
+  if (hit && (dayKey !== today || (Date.now() - hit.ts) < 45000)) {
+    return hit.p;
+  }
+  var p = _peFetchLeagueDayRaw(cfg, league, dayKey);
+  _peDayCache[ckey] = { ts: Date.now(), p: p };
+  p.then(function (out) {
+    if (!out || !out.length) { delete _peDayCache[ckey]; }
+  }, function () { delete _peDayCache[ckey]; });
+  return p;
+}
+
+function _peFetchLeagueDayRaw(cfg, league, dayKey) {
   var url = 'https://site.api.espn.com/apis/site/v2/sports/' + cfg.sport +
     '/' + cfg.slug + '/scoreboard?dates=' + dayKey + '&limit=300';
   return fetch(url).then(function (r) {
