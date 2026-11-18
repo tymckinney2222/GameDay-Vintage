@@ -141685,7 +141685,68 @@ function skUpdateCard(league) {
       return;
     }
   }
-  // If card wasn't found (filter changed mid-fetch), do nothing.
+  // LADDERFILL -- no card was found, and since the ladder shipped that
+  // is the ordinary case rather than the rare one: Today draws .ld-row,
+  // not .sk-card, so this swap has had nothing to swap. A league's data
+  // arrived and the row that was waiting for it went on showing a dash
+  // -- no logo, no score, filed under NOT STARTED -- until something
+  // else redrew the list, which in practice meant tapping another tab.
+  // So when the ladder or the Hub is what is on screen, the list is
+  // asked to redraw itself.
+  _skTodayRepaintSoon();
+}
+
+// A THROTTLE, not a debounce. Sixty leagues land four at a time over
+// several seconds; a debounce would wait for the last of them and leave
+// the page blank until then, where this fills it in as they come, at
+// most twice a second.
+var _skTodayRepaintT = null;
+function _skTodayRepaintSoon() {
+  if (_skTodayRepaintT) { return; }
+  _skTodayRepaintT = setTimeout(function () {
+    _skTodayRepaintT = null;
+    try {
+      var ov = document.getElementById('skOverlay');
+      if (!ov || !ov.classList.contains('open')) { return; }
+      if (skState.view !== 'today' || skState.mode !== 'today') { return; }
+      var listEl = document.getElementById('skLeagueList');
+      if (!listEl || !listEl.querySelector('.ld, .dh')) { return; }
+      skRenderTodayCards();
+    } catch (e) {}
+  }, 500);
+}
+
+// BOOTHYDRATE -- Yahoo league data, loaded without Skipper being opened.
+//
+// skLeagueData is filled by skHydrateAll, and the only things that ran
+// it were Skipper's own shell and its refresh button. So anything on
+// the GameDay side that reads a matchup -- the Tonight cover's fantasy
+// week, its on-the-line count -- saw every Yahoo league as empty until
+// Skipper had been opened once. ESPN and Fantrax load themselves at
+// boot, which is why the cover showed twelve matchups and not none.
+//
+// This is that same routine, started early: it reads the cache first
+// and only asks Yahoo for a league whose copy has gone stale, and it
+// honours the pause switch. Once a session; opening Skipper afterwards
+// finds the work already done.
+var _skEnsureState = 0;   // 0 idle, 1 waiting on the league list, 2 started
+function skEnsureHydrated() {
+  if (_skEnsureState === 2) { return; }
+  try {
+    if (typeof fyTokens === 'undefined' || !fyTokens) { return; }
+    if (typeof fyIsPaused === 'function' && fyIsPaused()) { return; }
+    if (typeof fyLeagues === 'undefined' || !fyLeagues || !fyLeagues.length) {
+      if (_skEnsureState === 1 || typeof loadFyLeagues !== 'function') { return; }
+      _skEnsureState = 1;
+      loadFyLeagues().then(function () {
+        _skEnsureState = 0;
+        if (typeof fyLeagues !== 'undefined' && fyLeagues && fyLeagues.length) { skEnsureHydrated(); }
+      }, function () { _skEnsureState = 0; });
+      return;
+    }
+    _skEnsureState = 2;
+    skHydrateAll();
+  } catch (e) {}
 }
 
 // Format chip row — varies by selected sport. MLB / NBA / NHL leagues can
@@ -213916,6 +213977,9 @@ function cvrOpen() {
   var ov = document.getElementById('cvrOv');
   if (!ov) { return; }
   ov.classList.add('open');
+  // BOOTHYDRATE -- the fantasy tiles read Yahoo data nobody has loaded
+  // yet on a cold start. The cover's own timer picks it up as it lands.
+  try { skEnsureHydrated(); } catch (eH) {}
   try { cvrRender(); } catch (e) {}
   // It rides the polls the app already runs: a repaint on a timer picks
   // up whatever the last one brought in.
@@ -213968,7 +214032,12 @@ function _cvrLaunch() {
   } catch (e) { return; }
   cvrOpen();
 }
-window.addEventListener('load', function () { setTimeout(_cvrLaunch, 1800); });
+window.addEventListener('load', function () {
+  setTimeout(_cvrLaunch, 1800);
+  // BOOTHYDRATE -- at every launch, cover or no cover: it is not only
+  // the cover that reads across from Skipper.
+  setTimeout(function () { try { skEnsureHydrated(); } catch (e) {} }, 2600);
+});
 
 // SKMORE -- the header's fourth button. Same open-and-close contract as
 // the Tools and Account menus it leads to, so the three cannot be open
