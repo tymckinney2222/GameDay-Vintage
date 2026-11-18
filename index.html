@@ -10507,6 +10507,12 @@
   .pcd-rule { height: 1px; background: rgba(255,255,255,0.09); }
   .pcd-own { display: flex; align-items: center; gap: 9px; min-height: 40px;
              border-top: 1px solid rgba(255,255,255,0.07); font-size: 13.5px; }
+  .pcd-own[role="button"] { cursor: pointer; -webkit-tap-highlight-color: transparent;
+                            margin: 0 -8px; padding: 0 8px; border-radius: 8px; }
+  .pcd-own.sel { background: rgba(245,213,71,0.10); border-top-color: transparent;
+                 box-shadow: inset 0 0 0 1px rgba(245,213,71,0.45); }
+  .pcd-own.sel span { color: #f5d547; font-weight: 600; }
+  .pcd-none b { color: #f5d547; font-weight: 600; }
   .pcd-own u { flex: none; width: 8px; height: 8px; border-radius: 50%; text-decoration: none; }
   .pcd-own span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
                   white-space: nowrap; }
@@ -106209,6 +106215,10 @@ function _pmBioFrom(a) {
 // come from the rosters every league has already loaded.
 var _pcCur = null;
 var _pcSide = 'front';
+// PCPICK -- which of his leagues the bars are scored in. null until he
+// taps a team, and then it is that team's league for as long as the
+// card is open.
+var _pcLg = null;
 
 function _pcEsc(t) {
   return (typeof skEscape === 'function') ? skEscape(String(t == null ? '' : t))
@@ -106250,10 +106260,24 @@ function _pcOwned(name) {
   return out;
 }
 
-// The banked nights, from the first of his leagues that has any.
+// The banked nights. The league he tapped, when he has tapped one --
+// and that answer stands even when it is "nothing banked", because a
+// card that quietly showed another league's points under the team he
+// chose would be wrong in the one way he could not see. Until then, the
+// first of his leagues that has any.
 function _pcSeries(name, owned) {
   var i, j;
   if (typeof _skSparkSeries !== 'function') { return null; }
+  if (_pcLg != null) {
+    for (i = 0; i < owned.length; i++) {
+      if (String(owned[i].leagueKey) !== String(_pcLg)) { continue; }
+      var sp = [];
+      try { sp = _skSparkSeries(name, owned[i].leagueKey, 10, null) || []; } catch (eP) { sp = []; }
+      var any = false;
+      for (j = 0; j < sp.length; j++) { if (sp[j].fp != null) { any = true; break; } }
+      return { rows: any ? sp : [], from: owned[i], empty: !any };
+    }
+  }
   for (i = 0; i < owned.length; i++) {
     if (!owned[i].leagueKey) { continue; }
     var s = [];
@@ -106297,7 +106321,10 @@ function _pcBackHtml(S, owned, ser) {
   var h = '<div class="pcd-card back" onclick="pcFlip()"><div class="pcd-body">' +
     '<div class="pcd-lab">LAST ' + (ser ? ser.rows.length : 10) + ' DAYS<em>FANTASY POINTS</em></div>';
   var i;
-  if (!ser) {
+  if (ser && ser.empty) {
+    h += '<div class="pcd-none">No fantasy points are banked for him in ' +
+      _pcEsc(ser.from.teamName || ser.from.leagueName || 'that league') + ' over these days.</div>';
+  } else if (!ser) {
     h += '<div class="pcd-none">' + (owned.length
       ? 'No fantasy points are banked for this player yet.'
       : 'He is not on any of your teams, so no fantasy points are banked for him.') + '</div>';
@@ -106322,8 +106349,9 @@ function _pcBackHtml(S, owned, ser) {
           (mx ? Math.max(3, Math.round(Math.abs(c.fp) / mx * 52)) : 3) + 'px"></i><s>' + _pcEsc(d) + '</s></div>';
       }
     }
-    h += '</div><div class="pcd-none">Scored in ' +
-      _pcEsc(ser.from.teamName || ser.from.leagueName || 'your league') + '.</div>';
+    h += '</div><div class="pcd-none">Scored in <b>' +
+      _pcEsc(ser.from.teamName || ser.from.leagueName || 'your league') + '</b>.' +
+      (owned.length > 1 ? ' Tap a team below to see him in that league.' : '') + '</div>';
   }
   h += '<div class="pcd-rule"></div><div class="pcd-lab">ON YOUR TEAMS · ' + owned.length + '</div>';
   if (!owned.length) {
@@ -106332,7 +106360,12 @@ function _pcBackHtml(S, owned, ser) {
     var dots = (typeof MYP_PROV_DOT === 'object' && MYP_PROV_DOT) ? MYP_PROV_DOT : {};
     for (i = 0; i < owned.length; i++) {
       var o = owned[i];
-      h += '<div class="pcd-own"><u style="background:' + (dots[o.provider] || '#9aa4b2') + '"></u>' +
+      // PCPICK -- a row is a button for the league it names. The tap is
+      // kept from reaching the card, which would turn it over.
+      var inUse = !!(ser && ser.from === o);
+      h += '<div class="pcd-own' + (inUse ? ' sel' : '') + '"' +
+        (o.leagueKey ? (' role="button" tabindex="0" onclick="event.stopPropagation();pcPickLeague(' + i + ')"') : '') +
+        '><u style="background:' + (dots[o.provider] || '#9aa4b2') + '"></u>' +
         '<span>' + _pcEsc(o.teamName || o.leagueName || 'League') + '</span>' +
         '<s>' + _pcEsc(o.slot || o.displayPos || '') + '</s>' +
         '<em class="' + (o.active === false ? '' : 'on') + '">' + (o.active === false ? 'BENCH' : 'ACTIVE') + '</em></div>';
@@ -106361,12 +106394,21 @@ function pcRender() {
 }
 
 function pcSide(s) { _pcSide = (s === 'back') ? 'back' : 'front'; pcRender(); }
+
+// The index is into the same owned list the back was just drawn from.
+function pcPickLeague(i) {
+  var S = _pcCur || {};
+  var owned = _pcOwned(S.name);
+  if (owned[i] && owned[i].leagueKey) { _pcLg = owned[i].leagueKey; }
+  pcRender();
+}
 function pcFlip() { pcSide(_pcSide === 'front' ? 'back' : 'front'); }
 
 function pcOpen() {
   var ov = document.getElementById('pcOv');
   if (!ov || !_pcCur) { return; }
   _pcSide = 'front';
+  _pcLg = null;
   ov.classList.add('open');
   try { pcRender(); } catch (e) {
     var el = document.getElementById('pcBody');
