@@ -220492,34 +220492,53 @@ function _skTrophyRender() {
   ov.innerHTML = h;
 }
 
+// SCANGENTLE -- the first scan asked three clubs at once, every club,
+// every press. Yahoo's matchups call is the heaviest one the app makes
+// -- a whole season a club -- and three abreast was enough to push some
+// past the fifteen-second limit, which is what filled the health panel
+// with timeouts. Now: one at a time with a breath between, a club that
+// answered is not asked again that day, and one that did not is left
+// for the next press instead of being tried again on the spot.
 function skTrophyScan() {
   if (_skTrophyBusy || typeof skLeagueData === 'undefined' || !skLeagueData) { return; }
-  var todo = [], k;
+  var st = _skTrophyLoad(), todo = [], k, now = Date.now();
+  if (!st.done) { st.done = {}; }
   for (k in skLeagueData) {
     if (!Object.prototype.hasOwnProperty.call(skLeagueData, k)) { continue; }
     var d = skLeagueData[k] || {}, tk = (d.matchup && d.matchup.myTeamKey) || (d.team && d.team.team_key) || '';
-    if (tk) { todo.push({ lk: k, tk: tk }); }
+    if (!tk) { continue; }
+    if (st.done[tk] && (now - st.done[tk]) < 20 * 3600000) { continue; }
+    todo.push({ lk: k, tk: tk });
   }
   var btn = document.getElementById('skrScan');
-  if (!todo.length) { if (btn) { btn.textContent = 'NO TEAMS LOADED YET'; } return; }
+  if (!todo.length) { if (btn) { btn.textContent = 'ALL TEAMS ALREADY SCANNED TODAY'; } return; }
   _skTrophyBusy = true;
-  var at = 0;
+  var at = 0, missed = 0;
   var step = function () {
     var b2 = document.getElementById('skrScan');
-    if (at >= todo.length) {
+    if (at >= todo.length || !document.getElementById('skTrophyOv') ||
+        !document.getElementById('skTrophyOv').classList.contains('open')) {
       _skTrophyBusy = false;
-      _skTrophyLoad().scanned = Date.now(); _skTrophySave();
-      _skTrophyRender();
+      st.scanned = Date.now(); _skTrophySave();
+      if (document.getElementById('skrScan')) {
+        _skTrophyRender();
+        var b3 = document.getElementById('skrScan');
+        if (b3 && missed) { b3.textContent = missed + ' TEAM' + (missed === 1 ? '' : 'S') + ' DID NOT ANSWER · TAP TO TRY THOSE'; }
+      }
       return;
     }
-    if (b2) { b2.textContent = 'SCANNING ' + at + ' OF ' + todo.length + ' TEAMS'; }
-    var batch = todo.slice(at, at + 3), ps = [], q; at += 3;
-    for (q = 0; q < batch.length; q++) {
-      (function (it) {
-        ps.push(_skTapeSeason(it.tk).then(function (list) { try { _skTrophyFromSeason(it.lk, list); } catch (e) {} }));
-      })(batch[q]);
-    }
-    Promise.all(ps).then(function () { setTimeout(step, 150); }, function () { setTimeout(step, 150); });
+    var it = todo[at]; at++;
+    if (b2) { b2.textContent = 'SCANNING ' + at + ' OF ' + todo.length; }
+    var after = function (list) {
+      if (list && list.length && !list._apiError) {
+        try { _skTrophyFromSeason(it.lk, list); } catch (e) {}
+        st.done[it.tk] = Date.now();
+      } else if (list && !list._apiError) {
+        st.done[it.tk] = Date.now();          // answered, with nothing in it: a league with no matchups
+      } else { missed++; }
+      setTimeout(step, 700);
+    };
+    _skTapeSeason(it.tk).then(after, function () { missed++; setTimeout(step, 700); });
   };
   step();
 }
