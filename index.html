@@ -15995,6 +15995,33 @@
   .sk-rv-binder .sk-roster-row.sk-rv-no { opacity: 0.48; }
   .sk-rv-binder .sk-roster-row.sk-roster-empty { min-height: 96px; align-items: center; justify-content: center; background: rgba(255,255,255,0.03); border-style: dashed; }
   .sk-rv-binder .sk-roster-row.sk-roster-empty > .sk-roster-info { background: none; margin: 0; text-align: center; }
+  /* CONTROLROOM */
+  .cr-wall { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; padding: 10px 10px 90px; }
+  .cr-tv { position: relative; background: #1b1b1f; border-radius: 10px; padding: 6px 6px 15px; border: 1px solid #333; box-shadow: inset 0 0 0 2px #0a0a0a;
+           cursor: pointer; -webkit-tap-highlight-color: transparent; min-width: 0; }
+  .cr-tv.big { grid-column: span 2; }
+  .cr-tv.ride { border-color: rgba(255,210,74,0.75); }
+  .cr-s { position: relative; overflow: hidden; border-radius: 6px; background: #05070b; aspect-ratio: 16 / 10; }
+  .cr-tv.big .cr-s { aspect-ratio: 16 / 9; }
+  .cr-s > svg { position: absolute; left: 0; top: 56%; transform: translateY(-50%); width: 100% !important; height: auto !important; display: block; pointer-events: none; }
+  .cr-s::after { content: ''; position: absolute; inset: 0; pointer-events: none;
+                 background: repeating-linear-gradient(0deg, rgba(0,0,0,0) 0 2px, rgba(0,0,0,0.15) 2px 3px); }
+  .cr-tv.done .cr-s > svg { filter: saturate(0.35) brightness(0.6); }
+  .cr-lg { position: absolute; left: 6px; top: 6px; z-index: 2; font-style: normal; background: rgba(0,0,0,0.7); border-radius: 3px; padding: 2px 5px;
+           font: 700 7px/1.2 ui-monospace, monospace; letter-spacing: 0.1em; color: #fff; }
+  .cr-bug { position: absolute; left: 5px; right: 5px; bottom: 5px; z-index: 2; display: flex; overflow: hidden; border-radius: 4px; background: rgba(0,0,0,0.84);
+            color: #fff; font: 800 12px/1 'Barlow Condensed', 'Arial Narrow', Arial, sans-serif; }
+  .cr-tv.big .cr-bug { font-size: 21px; }
+  .cr-bug b { flex: 1 1 0; min-width: 0; display: flex; justify-content: space-between; gap: 3px; padding: 5px 4px 5px 5px; border-left: 4px solid var(--k, #888); white-space: nowrap; overflow: hidden; }
+  .cr-bug u { flex: none; text-decoration: none; display: flex; align-items: center; padding: 4px 5px; background: #f5d547; color: #1c1503;
+              font: 800 8px/1 ui-monospace, monospace; white-space: nowrap; }
+  .cr-tv.big .cr-bug u { font-size: 10px; padding: 4px 8px; }
+  .cr-on { position: absolute; left: 8px; right: 20px; bottom: 3px; font: 700 7px/1 ui-monospace, monospace; letter-spacing: 0.08em; color: rgba(255,255,255,0.42);
+           white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .cr-tv.big .cr-on { font-size: 8.5px; }
+  .cr-led { position: absolute; right: 9px; bottom: 4px; width: 6px; height: 6px; border-radius: 50%; background: #444; }
+  .cr-tv.live .cr-led { background: #ff3b3b; box-shadow: 0 0 6px #ff3b3b; }
+  .cr-tv.live .cr-on { color: #ff8a8e; }
   /* HOT / SLATE */
   .skt-none { padding: 40px 24px; text-align: center; color: rgba(255,255,255,0.55); font: 500 14px/1.5 'Outfit', Arial, sans-serif; }
   .skh-ov { position: fixed; inset: 0; z-index: 9640; display: none; flex-direction: column; background: #07090e; color: #f5f5f0; }
@@ -42135,7 +42162,7 @@ function sbApplyMode(m) {
   var btn = document.getElementById('themeBtn');
   if (btn) {
     btn.textContent = (m === 'guide') ? 'GUIDE'
-      : (m === 'board') ? 'BOARD'
+      : (m === 'board') ? 'CONTROL'
       : (m === 'broadcast') ? 'BROADCAST'
       : (m === 'fantasy') ? 'FANTASY'
       : (m === 'vintage' ? 'VINTAGE' : 'MODERN');
@@ -43734,6 +43761,284 @@ function _tvgRender(el) {
   el.innerHTML = h;
 }
 
+// == THE CONTROL ROOM == CONTROLROOM ==
+//
+// The board, as a wall of monitors. Each one shows the HOME club's
+// building off the Venue Gallery's own shelf -- the same drawing, by
+// the same call -- with a score bug across the foot of the screen and
+// a red light when the game is on.
+//
+// THE BUILDINGS ARE HEAVY, a ballpark is half a megabyte of drawing,
+// so three things keep the wall cheap. A screen is only drawn when it
+// scrolls into view. A building drawn once is kept and not drawn
+// again. And a refresh that changes nothing but the scores rewrites
+// the bugs and leaves every drawing where it is.
+//
+// NO OVERHEAD BOARDS, at his asking: the bug says the score, and an
+// empty cube hanging over the floor said nothing. _crNoBoard is up
+// only while a monitor is being drawn, so the gallery and the live
+// views keep theirs.
+var _crNoBoard = false;
+var _crArt = {};          // 'NBA:LAL' -> svg
+var _crGames = {};        // id -> game, for the screens waiting to be drawn
+var _crObs = null;
+
+function _crSport(g) {
+  var lg = String(g.league || '');
+  try { if (typeof LEAGUES !== 'undefined' && LEAGUES[lg] && LEAGUES[lg].sport) { return String(LEAGUES[lg].sport); } } catch (e) {}
+  if (/VB$/.test(lg)) { return 'volleyball'; }
+  if (/HL$|HOCKEY/i.test(lg)) { return 'hockey'; }
+  if (/FB$|FL$/i.test(lg)) { return 'football'; }
+  if (/BB$|BA$/i.test(lg)) { return 'basketball'; }
+  return '';
+}
+
+// A plain surface in the home club's colour, for a league with no
+// building on the shelf.
+function _crPlain(g) {
+  var sp = _crSport(g), col = _tvgColor(g.home), s = '';
+  s += '<svg viewBox="0 0 160 100" preserveAspectRatio="xMidYMid slice" xmlns="http://www.w3.org/2000/svg">';
+  s += '<rect width="160" height="100" fill="#0a0d13"/>';
+  var L = 'fill="none" stroke="#ffffff" stroke-opacity="0.75" stroke-width="0.8"';
+  if (sp === 'hockey') {
+    s += '<rect x="14" y="14" width="132" height="62" rx="22" fill="#eaf2f9" stroke="' + col + '" stroke-width="2.5"/>' +
+      '<line x1="80" y1="14" x2="80" y2="76" stroke="#d62e2e" stroke-width="1.6"/>' +
+      '<line x1="58" y1="14" x2="58" y2="76" stroke="#3468c0" stroke-width="1.6"/><line x1="102" y1="14" x2="102" y2="76" stroke="#3468c0" stroke-width="1.6"/>' +
+      '<circle cx="80" cy="45" r="9" fill="none" stroke="#3468c0" stroke-width="0.9"/>' +
+      '<circle cx="36" cy="30" r="7" fill="none" stroke="#d62e2e" stroke-width="0.7"/><circle cx="36" cy="60" r="7" fill="none" stroke="#d62e2e" stroke-width="0.7"/>' +
+      '<circle cx="124" cy="30" r="7" fill="none" stroke="#d62e2e" stroke-width="0.7"/><circle cx="124" cy="60" r="7" fill="none" stroke="#d62e2e" stroke-width="0.7"/>';
+  } else if (sp === 'football') {
+    s += '<rect x="10" y="16" width="140" height="58" fill="#2f7d3b"/>' +
+      '<rect x="10" y="16" width="14" height="58" fill="' + col + '"/><rect x="136" y="16" width="14" height="58" fill="' + col + '"/>';
+    var y;
+    for (y = 1; y < 10; y++) { s += '<line x1="' + (24 + y * 11.2) + '" y1="16" x2="' + (24 + y * 11.2) + '" y2="74" stroke="#fff" stroke-opacity="' + (y === 5 ? 0.9 : 0.45) + '" stroke-width="0.7"/>'; }
+    s += '<rect x="10" y="16" width="140" height="58" ' + L + '/>';
+  } else if (sp === 'baseball') {
+    s += '<rect x="0" y="0" width="160" height="100" fill="#1f5a2b"/>' +
+      '<path d="M80 82 L20 30 A84 84 0 0 1 140 30 Z" fill="#2f7d3b" stroke="' + col + '" stroke-width="2"/>' +
+      '<path d="M80 82 L56 60 L80 38 L104 60 Z" fill="#b98a55" stroke="#fff" stroke-opacity="0.7" stroke-width="0.7"/>' +
+      '<path d="M80 76 L62 60 L80 44 L98 60 Z" fill="#2f7d3b"/><circle cx="80" cy="60" r="3" fill="#b98a55"/>';
+  } else if (sp === 'volleyball') {
+    s += '<rect x="24" y="20" width="112" height="52" fill="' + col + '" fill-opacity="0.55"/><rect x="24" y="20" width="112" height="52" ' + L + '/>' +
+      '<line x1="80" y1="14" x2="80" y2="78" stroke="#fff" stroke-width="1.6"/>' +
+      '<line x1="61" y1="20" x2="61" y2="72" ' + L + '/><line x1="99" y1="20" x2="99" y2="72" ' + L + '/>';
+  } else if (sp === 'basketball') {
+    s += '<rect x="12" y="14" width="136" height="62" fill="#c99a5e"/>' +
+      '<rect x="12" y="32" width="24" height="26" fill="' + col + '"/><rect x="124" y="32" width="24" height="26" fill="' + col + '"/>' +
+      '<rect x="12" y="14" width="136" height="62" ' + L + '/><line x1="80" y1="14" x2="80" y2="76" ' + L + '/>' +
+      '<circle cx="80" cy="45" r="9" ' + L + '/>' +
+      '<path d="M12 20 H24 A30 26 0 0 1 24 70 H12" ' + L + '/><path d="M148 20 H136 A30 26 0 0 0 136 70 H148" ' + L + '/>';
+  } else {
+    s += '<rect x="12" y="14" width="136" height="62" fill="#2f7d3b"/><rect x="12" y="14" width="136" height="62" ' + L + '/>' +
+      '<line x1="80" y1="14" x2="80" y2="76" ' + L + '/><circle cx="80" cy="45" r="10" ' + L + '/>' +
+      '<rect x="12" y="28" width="20" height="34" ' + L + '/><rect x="128" y="28" width="20" height="34" ' + L + '/>' +
+      '<rect x="12" y="14" width="136" height="3" fill="' + col + '"/>';
+  }
+  return s + '</svg>';
+}
+
+function _crVenue(g) {
+  var lg = String(g.league || ''), ab = String((g.home && g.home.abbr) || '').toUpperCase();
+  if (!/^(NBA|WNBA|NHL|NFL|MLB)$/.test(lg) || !ab || typeof _vgList !== 'function') { return null; }
+  var list = _vgList(lg), i, alt = '';
+  try { alt = _skbAbbr(lg, ab); } catch (e) { alt = ab; }
+  for (i = 0; i < list.length; i++) { if (!list[i].floorId && list[i].abbr === ab) { return list[i]; } }
+  for (i = 0; i < list.length; i++) { if (!list[i].floorId && list[i].abbr === alt) { return list[i]; } }
+  for (i = 0; i < list.length; i++) { try { if (!list[i].floorId && _skbAbbr(lg, list[i].abbr) === alt) { return list[i]; } } catch (e2) {} }
+  return null;
+}
+
+function _crDrawn(g) {
+  var sp = _crSport(g), lg = String(g.league || ''), h = g.home || {}, a = g.away || {};
+  var uid = 'cr' + String(g.id).replace(/[^A-Za-z0-9]/g, '');
+  var hc = _tvgColor(h), ac = _tvgColor(a), art = '';
+  var hl = (h.logo && /^https?:/i.test(String(h.logo))) ? String(h.logo) : '';
+  _crNoBoard = true;
+  try {
+    if (sp === 'basketball') {
+      art = _gymFloor3D({ league: lg, uid: uid, homeAbbr: h.abbr || '', awayAbbr: '', homeColor: hc, awayColor: ac,
+        homeName: h.name || h.displayName || h.abbr || '', homeLogo: hl, awayLogo: '', shots: [], roster: false });
+    } else if (sp === 'hockey') {
+      art = _rk3Arena({ uid: uid, league: lg, homeAbbr: h.abbr || '', awayAbbr: '', homeColor: hc, awayColor: ac, homeLogo: hl, awayLogo: '' });
+    } else if (sp === 'football') {
+      art = _fwField3D({ league: lg, uid: uid, homeAbbr: h.abbr || '', awayAbbr: '', homeColor: hc, awayColor: ac,
+        homeLogo: hl, awayLogo: '', isDay: _f3IsDayGame(g) });
+    } else if (sp === 'volleyball') {
+      var d = _courtDiagram(g, ac, hc, '', hl, skEscape, null, {}) || '';
+      var i0 = d.indexOf('<svg'), i1 = d.lastIndexOf('</svg>');
+      art = (i0 >= 0 && i1 > i0) ? d.slice(i0, i1 + 6) : '';
+    }
+  } catch (e) { art = ''; }
+  _crNoBoard = false;
+  return (art && art.indexOf('<svg') === 0) ? art : '';
+}
+
+function _crArtFor(g) {
+  var k = String(g.league || '') + ':' + String((g.home && g.home.abbr) || '');
+  if (Object.prototype.hasOwnProperty.call(_crArt, k)) { return _crArt[k]; }
+  var v = _crVenue(g), art = '';
+  if (v) {
+    _crNoBoard = true;
+    try { art = _vgDraw(String(g.league), v) || ''; } catch (e) { art = ''; }
+    _crNoBoard = false;
+  }
+  // CRDRAWN -- no building on the shelf does not mean nothing to draw.
+  // The live views already draw a college floor, a college field, a
+  // junior rink and a volleyball court from the two clubs alone; the
+  // monitor asks the same renderers, with no game in them.
+  if (!art) { try { art = _crDrawn(g) || ''; } catch (e3) { art = ''; } }
+  if (!art) { try { art = _crPlain(g); } catch (e2) { art = ''; } }
+  _crArt[k] = art;
+  return art;
+}
+
+function _crStatus(g) {
+  var t = '';
+  try { t = String(_sbStatus(g) || '').replace(/\s+/g, ' ').replace(/^\s+|\s+$/g, ''); } catch (e) { t = ''; }
+  t = t || String(g.statusDetail || '').toUpperCase().slice(0, 12);
+  // CRTIME -- a start time does not need its time zone in a box this
+  // narrow: "10:00 AM MST" was being cut to "10:00 AM M".
+  if (g.state === 'pre') { t = t.replace(/\s+[A-Z]{1,4}T?$/, function (z) { return /\b(AM|PM)$/.test(z) ? z : ''; }); }
+  return t;
+}
+
+// CRNOTE -- what the strip under a live screen says beside ON AIR.
+// One line a sport, each off what the scoreboard already carries:
+//   basketball  the game's leading scorer
+//   hockey      the last goal, when the last play the feed names IS a
+//               goal; otherwise the game's leading goal scorer, said as such
+//   volleyball  the sets so far
+//   football    down, distance and the spot, flagged in the red zone
+function _crLeader(g, want) {
+  var cats = g.leaders || {}, k, best = null, sd, sides = ['away', 'home'];
+  for (k in cats) {
+    if (!Object.prototype.hasOwnProperty.call(cats, k) || !want.test(k)) { continue; }
+    for (sd = 0; sd < 2; sd++) {
+      var L = cats[k][sides[sd]];
+      if (!L || !L.name) { continue; }
+      var v = (L.value != null && !isNaN(L.value)) ? Number(L.value) : parseFloat(L.stat);
+      if (isNaN(v)) { continue; }
+      if (!best || v > best.v) { best = { v: v, name: String(L.name), team: String(L.team || '') }; }
+    }
+  }
+  return best;
+}
+
+function _crNote(g) {
+  if (!g || g.state !== 'in') { return ''; }
+  var sp = _crSport(g), b, i;
+  if (sp === 'basketball') {
+    b = _crLeader(g, /^points/i);
+    return b ? (b.name + ' ' + Math.round(b.v) + ' PTS') : '';
+  }
+  if (sp === 'hockey') {
+    if (g.lastPlayText && /goal/i.test(String(g.lastPlayType || '')) && !/no goal|goalie|goaltender/i.test(String(g.lastPlayType || ''))) {
+      return 'GOAL \u00b7 ' + String(g.lastPlayText).replace(/\s*\(.*$/, '').replace(/\s+/g, ' ').slice(0, 40);
+    }
+    b = _crLeader(g, /^goals/i);
+    return (b && b.v > 0) ? (b.name + ' ' + Math.round(b.v) + ' G') : '';
+  }
+  if (sp === 'volleyball') {
+    var a = g.awayInnings || [], h = g.homeInnings || [], out = [];
+    var num = function (x) { return (x != null && typeof x === 'object') ? (x.value != null ? x.value : (x.runs != null ? x.runs : x.score)) : x; };
+    for (i = 0; i < a.length && i < h.length; i++) {
+      var x = num(a[i]), y = num(h[i]);
+      if (x == null || y == null || x === '' || y === '') { continue; }
+      out.push(x + '-' + y);
+    }
+    return out.join('  ');
+  }
+  if (sp === 'football') {
+    var f = g.fbSituation;
+    if (!f || !f.downDistance) { return ''; }
+    return (f.isRedZone ? 'RED ZONE \u00b7 ' : '') + String(f.downDistance).replace(/\s+at\s+.*$/i, '') + (f.spot ? ' \u00b7 ' + f.spot : '');
+  }
+  return '';
+}
+
+function _crOnText(g) {
+  var n = '';
+  try { n = _crNote(g); } catch (e) { n = ''; }
+  return (g.state === 'in' ? 'ON AIR' : (g.state === 'post' ? 'OFF AIR' : 'STANDBY')) + (n ? ' \u00b7 ' + String(n).toUpperCase() : '');
+}
+
+function _crBugHtml(g) {
+  var sc = (g.state !== 'pre');
+  var side = function (t) {
+    return '<b style="--k:' + _tvgColor(t) + '">' + skEscape(String((t && t.abbr) || '')) + '<span>' +
+      (sc && t && t.score != null ? skEscape(String(t.score)) : '') + '</span></b>';
+  };
+  return side(g.away) + side(g.home) + '<u>' + skEscape(_crStatus(g)) + '</u>';
+}
+
+function _crCls(g, big) {
+  var ride = false;
+  try { ride = _sbRiding(g).length > 0; } catch (e) { ride = false; }
+  return 'cr-tv' + (big ? ' big' : '') + (g.state === 'in' ? ' live' : (g.state === 'post' ? ' done' : '')) + (ride ? ' ride' : '');
+}
+
+function _crFill(el) {
+  if (!el || el.getAttribute('data-done')) { return; }
+  var g = _crGames[el.getAttribute('data-g')];
+  if (!g) { return; }
+  el.setAttribute('data-done', '1');
+  el.insertAdjacentHTML('afterbegin', _crArtFor(g));
+}
+
+function _crWatch(wall) {
+  var slots = wall.querySelectorAll('.cr-s'), i;
+  if (_crObs) { try { _crObs.disconnect(); } catch (e) {} _crObs = null; }
+  if (typeof IntersectionObserver === 'undefined') {
+    for (i = 0; i < slots.length && i < 10; i++) { _crFill(slots[i]); }
+    return;
+  }
+  _crObs = new IntersectionObserver(function (ents) {
+    var j;
+    for (j = 0; j < ents.length; j++) {
+      if (ents[j].isIntersecting) { _crFill(ents[j].target); try { _crObs.unobserve(ents[j].target); } catch (e2) {} }
+    }
+  }, { rootMargin: '300px 0px' });
+  for (i = 0; i < slots.length; i++) { _crObs.observe(slots[i]); }
+}
+
+function _crRender(el, games, headHtml) {
+  var all = games.slice().sort(function (a, b) {
+    if (a.state === 'in' && b.state === 'in') {
+      var hot = _sbHeat(b) - _sbHeat(a);
+      if (hot) { return hot; }
+    }
+    return _compareGames(a, b);
+  });
+  var i, sig = [];
+  _crGames = {};
+  for (i = 0; i < all.length; i++) { sig.push(String(all[i].id)); _crGames[String(all[i].id)] = all[i]; }
+  sig = sig.join(',');
+  var wall = el.querySelector('.cr-wall');
+  // the same games in the same order: only the bugs and the lights move
+  if (wall && wall.getAttribute('data-sig') === sig) {
+    var tvs = wall.querySelectorAll('.cr-tv');
+    for (i = 0; i < tvs.length && i < all.length; i++) {
+      tvs[i].className = _crCls(all[i], i === 0 && all[i].state === 'in');
+      var bug = tvs[i].querySelector('.cr-bug'), on = tvs[i].querySelector('.cr-on');
+      if (bug) { bug.innerHTML = _crBugHtml(all[i]); }
+      if (on) { on.textContent = _crOnText(all[i]); }
+    }
+    return;
+  }
+  var h = headHtml + '<div class="cr-wall" data-sig="' + skEscape(sig) + '">';
+  for (i = 0; i < all.length; i++) {
+    var g = all[i], id = String(g.id).replace(/[^A-Za-z0-9_.:-]/g, '');
+    h += '<div class="' + _crCls(g, i === 0 && g.state === 'in') + '" onclick="_sbOpen(\'' + id + '\')">' +
+      '<div class="cr-s" data-g="' + id + '"><i class="cr-lg">' + skEscape(String((typeof LEAGUES !== 'undefined' && LEAGUES[g.league] && LEAGUES[g.league].label) || g.league || '')) + '</i>' +
+      '<div class="cr-bug">' + _crBugHtml(g) + '</div></div>' +
+      '<span class="cr-on">' + skEscape(_crOnText(g)) + '</span><span class="cr-led"></span></div>';
+  }
+  h += '</div></div>';
+  el.innerHTML = h;
+  wall = el.querySelector('.cr-wall');
+  if (wall) { _crWatch(wall); }
+}
+
 function _sbRenderBoard() {
   var el = document.getElementById('cardsGrid');
   if (!el) { return; }
@@ -43748,7 +44053,7 @@ function _sbRenderBoard() {
   try { _htLineWarm(games); } catch (eHL) {}
 
   var h = '<div class="sb-board">';
-  h += '<div class="sb-b-title">THE BOARD</div>';
+  h += '<div class="sb-b-title">CONTROL ROOM</div>';
   var when = '';
   try {
     when = (typeof currentDate !== 'undefined' && currentDate)
@@ -43773,43 +44078,13 @@ function _sbRenderBoard() {
     }
   } catch (eT) {}
 
-  // ONE closing tag in the source, not one per branch. The div-balance
-  // check counts the text, so an early return that closed the wrapper
-  // itself read as an extra closing tag even though only one path runs.
+  // CONTROLROOM -- the rows are a wall of monitors now. The head above
+  // is kept; the wall is drawn, or only refreshed, by _crRender.
   if (!games.length) {
-    h += '<div class="sb-b-empty">Nothing on the board tonight.</div>';
-  } else {
-    // BOARDFLAT -- ONE LIST, in vintage's tiers: live, then what is
-    // coming up, then finals. Grouping by league meant the live games
-    // were spread down the page behind whichever sports happened to
-    // sort above them, and finding them was a scroll.
-    //
-    // BOARDHEAT -- but inside the LIVE tier the order is the board's
-    // own. _compareGames puts live games in start-time order, which is
-    // right for a schedule and wrong for a board: the thing worth
-    // seeing is the one-score game in the fourth, not whichever
-    // tipped first. _sbHeat scores exactly that -- closeness, how late
-    // it is, and lead changes -- and the flat list had left it with no
-    // callers at all.
-    //
-    // The tiers come from _compareGames at the foot of this
-    // comparator, which opens by comparing _gameStatePriority -- so
-    // they are NOT restated here. An earlier version did restate
-    // them, and the tooth written to break that restatement could
-    // not bite: zeroing it changed nothing, because the fallback
-    // imposed the same order one line later. Two lines saying what
-    // the next line already said.
-    var all = games.slice().sort(function (a, b) {
-      if (a.state === 'in' && b.state === 'in') {
-        var hot = _sbHeat(b) - _sbHeat(a);
-        if (hot) { return hot; }
-      }
-      return _compareGames(a, b);
-    });
-    for (i = 0; i < all.length; i++) { h += _sbRowHtml(all[i]); }
+    el.innerHTML = h + '<div class="sb-b-empty">Nothing on tonight.</div></div>';
+    return;
   }
-  h += '</div>';
-  el.innerHTML = h;
+  _crRender(el, games, h);
 }
 
 // ── Scoreboard brightness control ─────────────────────────────────
@@ -43898,7 +44173,7 @@ document.addEventListener('click', function(e) {
     // once the slate has loaded, as it does for the other two.
     document.body.classList.add('board-mode');
     var bbtn = document.getElementById('themeBtn');
-    if (bbtn) { bbtn.textContent = 'BOARD'; bbtn.style.color = '#ffb224'; }
+    if (bbtn) { bbtn.textContent = 'CONTROL'; bbtn.style.color = '#ffb224'; }
     var bmeta = document.getElementById('themeColorMeta');
     if (bmeta) { bmeta.setAttribute('content', '#06070a'); }
     return;
@@ -49025,6 +49300,9 @@ function parseGames(events, league) {
       currBatter,
       liveState,
       fbSituation,   // FBSIT
+      // CRNOTE -- the last thing that happened, where the feed says: the control room reads it for hockey
+      lastPlayText: (situation && situation.lastPlay && situation.lastPlay.text) ? String(situation.lastPlay.text) : null,
+      lastPlayType: (situation && situation.lastPlay && situation.lastPlay.type && situation.lastPlay.type.text) ? String(situation.lastPlay.type.text) : null,
       homeProbable,
       awayProbable,
     };
@@ -84260,7 +84538,7 @@ function _fwField3D(o) {
   var _domed = !!(_wx && _wx.domed);
   if (!_domed) s += _f3LightTowers(!_day);
   // SBOARD -- between the inner pair of standards.
-  if (!o.cs) { s += _f3Scoreboard(o); }   // FBSIDE -- sideways, the corner card is the board
+  if (!o.cs && !_crNoBoard) { s += _f3Scoreboard(o); }   // FBSIDE -- sideways, the corner card is the board
 
   // The slab edge under the near sideline, which is what sells the depth.
   var nl = _f3Proj(0, _F3_WID), nr = _f3Proj(_F3_LEN, _F3_WID);
@@ -93696,7 +93974,7 @@ function _rk3Arena(o) {
 
   s += _rk3Bowl(o, uid);
   s += '<g class="cs-over">' + _rk3Rafters(uid, _rk3BoardTop(!!o.pp), o) + '</g>';   // COURTSIDE
-  s += '<g class="cs-over">' + _rk3Jumbo(o, uid) + '</g>';
+  if (!_crNoBoard) { s += '<g class="cs-over">' + _rk3Jumbo(o, uid) + '</g>'; }   // CONTROLROOM
   s += _rk3Wall(o, uid);
   s += _rk3Benches(o);
   try { s += _rk3GlassDetail(o); } catch (eGD) {}   // RINKDETAIL
@@ -106596,7 +106874,7 @@ function _gymFloor3D(o) {
   // hangs between them and the camera.
   try { s += _c3Tunnels(); } catch (eTU) {}     // AROUNDFLOOR
   s += _c3Chairs('far');
-  s += '<g class="cs-over">' + _c3Jumbo(o, uid) + '</g>';
+  if (!_crNoBoard) { s += '<g class="cs-over">' + _c3Jumbo(o, uid) + '</g>'; }   // CONTROLROOM
 
   // The SLAB, which runs past the painted lines the way a real floor
   // does. Everything courtside stands on the strip between the two.
@@ -220307,6 +220585,13 @@ function skHotPick(lk) {
   var lgs = _skHotLeagues(), team = '', i;
   for (i = 0; i < lgs.length; i++) { if (lgs[i].key === lk) { team = lgs[i].team; } }
   if (!team) { return; }
+  // HOTONCE -- a league read in the last ten minutes is not walked again.
+  // Every swipe used to go back through all ten days: the days were
+  // already kept, so nothing was asked of Yahoo, but each one still
+  // took its quarter-second pause under a READING banner -- two and a
+  // half seconds of looking busy, and no swiping until it was over.
+  if (!_skHot.read) { _skHot.read = {}; }
+  if (_skHot.read[lk] && (Date.now() - _skHot.read[lk]) < 600000) { return; }
   var days = _skHotDays(10), at = 0, got = 0;
   _skHot.busy = true;
   skHotOpen();                 // again, now with the reading banner up
@@ -220314,6 +220599,7 @@ function skHotPick(lk) {
     var ov = document.getElementById('skHotOv'), open = ov && ov.classList.contains('open');
     if (at >= days.length || !open || _skHot.lk !== lk) {
       _skHot.busy = false;
+      if (at >= days.length) { _skHot.read[lk] = Date.now(); }
       _skHot.note = got ? '' : 'Yahoo sent nothing back for this league\u2019s last ten days.';
       if (open && _skHot.lk === lk) { skHotOpen(); }
       return;
@@ -220321,11 +220607,13 @@ function skHotPick(lk) {
     var el = document.getElementById('skhLoad');
     if (el) { el.textContent = 'READING DAY ' + (at + 1) + ' OF ' + days.length; }
     var day = days[at]; at++;
+    var t0 = Date.now();
     var next = function (m) {
       var k, any = false;
       if (m) { for (k in m) { if (Object.prototype.hasOwnProperty.call(m, k)) { any = true; break; } } }
       if (any) { got++; }
-      setTimeout(step, 250);
+      // a day that came straight back was already kept: no need to wait after it
+      setTimeout(step, (Date.now() - t0) < 40 ? 0 : 250);
     };
     try { fetchTeamFpForDate(team, day).then(next, function () { next(null); }); } catch (e) { next(null); }
   };
