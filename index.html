@@ -16013,6 +16013,8 @@
   .skh-v { flex: none; width: 54px; text-align: right; font: 900 19px/1 'Barlow Condensed', 'Arial Narrow', Arial, sans-serif; }
   .skh-v small { display: block; margin-top: 3px; font: 700 7px/1 ui-monospace, monospace; letter-spacing: 0.06em; opacity: 0.8; }
   .skh-v.up { color: #7ee0a1; } .skh-v.dn { color: #ff7b7b; }
+  .skh-load { margin: 12px 2px 0; padding: 10px; border-radius: 8px; background: rgba(245,213,71,0.08); border: 1px solid rgba(245,213,71,0.3); text-align: center;
+              font: 800 10px/1 ui-monospace, monospace; letter-spacing: 0.16em; color: #f5d547; }
   .skh-e { padding: 10px 4px; font: 500 12px/1.4 'Outfit', Arial, sans-serif; color: rgba(255,255,255,0.45); }
   .skh-note { margin-top: 12px; background: #1c1a10; border: 1px solid rgba(245,213,71,0.35); border-radius: 10px; padding: 10px; font: 600 12px/1.4 'Outfit', Arial, sans-serif; color: #f5e9b0; }
   .skh-foot { margin-top: 12px; font: 500 10.5px/1.45 'Outfit', Arial, sans-serif; color: rgba(255,255,255,0.4); text-align: center; }
@@ -220432,7 +220434,7 @@ function skTapeOpen(lk) {
 // Three recent games and two before them are the least it will rank on.
 //
 // Points leagues only: a categories league keeps no fantasy points.
-var _skHot = { rows: [] };
+var _skHot = { rows: [], lk: '', busy: false, note: '' };
 
 // One-off: the Trophy Case's records, which nothing reads any more.
 try { localStorage.removeItem('gdhq_trophy_v1'); } catch (eTr0) {}
@@ -220443,6 +220445,7 @@ function _skHotGather() {
   for (i = 0; i < all.length; i++) {
     var y = all[i];
     if (!y || !y.name || !y.leagueKey) { continue; }
+    if (_skHot.lk && String(y.leagueKey) !== _skHot.lk) { continue; }      // HOTLOAD -- one league at a time
     var ser = [];
     try { ser = _skSparkSeries(y.name, y.leagueKey, 10, null) || []; } catch (e2) { ser = []; }
     var pts = [];
@@ -220504,6 +220507,76 @@ function skHotClose() {
   if (ov) { ov.classList.remove('open'); ov.innerHTML = ''; }
 }
 
+// == WHERE THE DAYS COME FROM == HOTLOAD ==
+//
+// This screen and the roster's "This Week" are different questions.
+// The week is ONE number a player -- Yahoo adds it up and one request
+// brings it. A trend needs a number for EACH DAY, and Yahoo has no
+// request for ten days at once: it is a request a day, a team. So the
+// days are only ever on hand for teams whose roster tab happened to be
+// opened on those days, which after a clean-out is nobody.
+//
+// So it asks -- but only for the league he picks, never for all of
+// them: ten days of one team is ten requests, most of them kept for
+// good once made. Ten days of every team would be hundreds.
+function _skHotLeagues() {
+  var all = [], out = [], seen = {}, i;
+  try { all = (typeof fyFullRosters !== 'undefined' && fyFullRosters) ? fyFullRosters : []; } catch (e) { all = []; }
+  for (i = 0; i < all.length; i++) {
+    var y = all[i];
+    if (!y || !y.leagueKey || !y.myTeamKey || seen[y.leagueKey]) { continue; }
+    var st = String(y.scoringType || '');
+    if (st !== 'headpoint' && st !== 'point') { continue; }
+    seen[y.leagueKey] = 1;
+    out.push({ key: String(y.leagueKey), name: y.leagueName || y.myTeamName || y.leagueKey, team: y.myTeamKey });
+  }
+  return out;
+}
+
+function _skHotDays(n) {
+  var out = [], d = new Date(_todayDateString() + 'T12:00:00'), i;
+  for (i = 0; i < n; i++) {
+    var m = d.getMonth() + 1, dd = d.getDate();
+    out.push(d.getFullYear() + '-' + (m < 10 ? '0' : '') + m + '-' + (dd < 10 ? '0' : '') + dd);
+    d.setDate(d.getDate() - 1);
+  }
+  return out;
+}
+
+function skHotPick(lk) {
+  if (_skHot.busy) { return; }
+  _skHot.lk = lk || '';
+  _skHot.note = '';
+  skHotOpen();
+  if (!lk || typeof fetchTeamFpForDate !== 'function') { return; }
+  var lgs = _skHotLeagues(), team = '', i;
+  for (i = 0; i < lgs.length; i++) { if (lgs[i].key === lk) { team = lgs[i].team; } }
+  if (!team) { return; }
+  var days = _skHotDays(10), at = 0, got = 0;
+  _skHot.busy = true;
+  skHotOpen();                 // again, now with the reading banner up
+  var step = function () {
+    var ov = document.getElementById('skHotOv'), open = ov && ov.classList.contains('open');
+    if (at >= days.length || !open || _skHot.lk !== lk) {
+      _skHot.busy = false;
+      _skHot.note = got ? '' : 'Yahoo sent nothing back for this league\u2019s last ten days.';
+      if (open && _skHot.lk === lk) { skHotOpen(); }
+      return;
+    }
+    var el = document.getElementById('skhLoad');
+    if (el) { el.textContent = 'READING DAY ' + (at + 1) + ' OF ' + days.length; }
+    var day = days[at]; at++;
+    var next = function (m) {
+      var k, any = false;
+      if (m) { for (k in m) { if (Object.prototype.hasOwnProperty.call(m, k)) { any = true; break; } } }
+      if (any) { got++; }
+      setTimeout(step, 250);
+    };
+    try { fetchTeamFpForDate(team, day).then(next, function () { next(null); }); } catch (e) { next(null); }
+  };
+  step();
+}
+
 function skHotOpen() {
   var ov = document.getElementById('skHotOv');
   if (!ov) { ov = document.createElement('div'); ov.id = 'skHotOv'; ov.className = 'skh-ov'; document.body.appendChild(ov); }
@@ -220512,9 +220585,24 @@ function skHotOpen() {
   for (i = 0; i < hot.length && top.length < 8; i++) { if (hot[i].heat > 0) { top.push(hot[i]); } }
   for (i = hot.length - 1; i >= 0 && cold.length < 5; i--) { if (hot[i].heat < 0) { cold.push(hot[i]); } }
   h += '<div class="skb-top"><div class="skb-ttl">WHO’S HOT<small>' + got.length + ' PLAYERS WITH ENOUGH GAMES</small></div>' +
-    '<button type="button" class="skb-x" onclick="skHotClose()" aria-label="Close">✕</button></div><div class="skh-scroll">';
+    '<button type="button" class="skb-x" onclick="skHotClose()" aria-label="Close">✕</button></div>';
+  // HOTLOAD -- a pill a points league; picking one reads its last ten days
+  var lgs = _skHotLeagues(), li;
+  if (lgs.length) {
+    h += '<div class="skb-pills"><button type="button" class="' + (_skHot.lk ? '' : 'on') + '" onclick="skHotPick(\'\')">ALL KEPT</button>';
+    for (li = 0; li < lgs.length; li++) {
+      h += '<button type="button" class="' + (lgs[li].key === _skHot.lk ? 'on' : '') + '" onclick="skHotPick(\'' +
+        String(lgs[li].key).replace(/[^A-Za-z0-9_.-]/g, '') + '\')">' + skEscape(String(lgs[li].name).toUpperCase().slice(0, 20)) + '</button>';
+    }
+    h += '</div>';
+  }
+  h += '<div class="skh-scroll">';
+  if (_skHot.busy) { h += '<div class="skh-load" id="skhLoad">READING THE LAST TEN DAYS</div>'; }
   if (!got.length) {
-    h += '<div class="skt-none">Not enough kept history yet. A player needs five games inside the last ten days, in a points league, before he can be ranked. It fills in as Skipper is opened each day.</div>';
+    h += '<div class="skt-none">' + (_skHot.busy ? 'One request a day for this team. Days already read are kept and not asked for again.'
+      : (_skHot.note ? skEscape(_skHot.note) + ' '
+        : '') + (_skHot.lk ? 'Nobody in this league has five games in the last ten days yet.'
+        : 'Nothing is on hand yet. Pick a league above and its last ten days are read from Yahoo \u2014 ten requests, kept once made.')) + '</div>';
   } else {
     h += '<div class="skh-h"><span>HOTTEST · LAST 3 GAMES</span><b>VS THE GAMES BEFORE</b></div>';
     for (i = 0; i < top.length; i++) { h += _skHotRow(top[i], rows.length); rows.push(top[i]); }
