@@ -15938,6 +15938,9 @@
   .skb-cd { border: 3px solid #394150; border-radius: 9px; overflow: hidden; cursor: pointer; display: flex; flex-direction: column; height: 100%; box-sizing: border-box;
             -webkit-tap-highlight-color: transparent; }
   .skb-cd.bn { opacity: 0.62; }
+  .skb-cd.play { box-shadow: 0 0 0 2.5px #f5d547, 0 0 10px rgba(245,213,71,0.55); }
+  .skb-slot { overflow: visible; }
+  .skb-gold { color: #f5d547; font-weight: 800; }
   .skb-cd-t { display: flex; justify-content: space-between; align-items: flex-start; padding: 5px 6px 0; font: 800 8px/1 ui-monospace, monospace; letter-spacing: 0.1em; }
   .skb-cd-t b { font: 800 9px/1 ui-monospace, monospace; opacity: 0.85; }
   .skb-cd-j { flex: 1 1 auto; display: flex; align-items: center; justify-content: center; padding: 2px 10% 3px; min-height: 62px; }
@@ -41493,7 +41496,10 @@ var _SK_CACHE_KEYS = [
   /^sk_player_stats_v/,
   /^sk_team_stats_v/,
   /^sk_cats_roster_v/,
-  /^sk_pspark_/,                   // the sparkline: days and the names table
+  // SPARKKEEP -- the sparkline is OFF this list. It was here as "debatable",
+  // and then the trading card's back was built on it: a cleanup that took
+  // it left a chart with one bar and nothing to fetch the rest back from.
+  // It trims itself to ten days, which is all the housekeeping it needs.
   /^sk_league_settings_v[1-7]_/,   // STALE versions only; v8 is his settings
   /^sk_final_league_v/,            // one week
   /^sk_game_weeks_v/,              // football week windows, seven days
@@ -110095,7 +110101,8 @@ function _tcNum(S) {
   if (n) { return n; }
   try {
     var hn = window._tcNumHint;
-    if (hn && String(hn.id) === String(S.id) && hn.num !== '' && hn.num != null) {
+    if (hn && hn.num !== '' && hn.num != null &&
+        ((hn.id != null && String(hn.id) === String(S.id)) || (hn.name && typeof _pmNameKey === 'function' && _pmNameKey(S.name) === hn.name))) {
       n = String(hn.num).replace(/[^0-9]/g, '');
       if (n) { return n; }
     }
@@ -218281,6 +218288,7 @@ function _skBinderFmt() {
 // Yahoo's own rosters: they carry the team key and the player key, which
 // is what a night's stats are fetched and matched by.
 var _skbSport = 'all';
+var _skbToday = {};
 function _skBinderPages() {
   var all = [], by = {}, order = [], i, fm = _skBinderFmt();
   try { all = (typeof fyFullRosters !== 'undefined' && fyFullRosters) ? fyFullRosters : []; } catch (e) { all = []; }
@@ -218377,6 +218385,121 @@ function _skBinderLoad(pi) {
     })['catch'](function () {});
 }
 
+// BINDER3 -- two things the fantasy rosters do not carry, fetched or read
+// from what is already loaded.
+//
+// THE NUMBER. Yahoo's roster has a name and a club and no jersey number;
+// the player card has one because ESPN's athlete record does. So the
+// binder asks ESPN for each club's roster once -- a request a club, kept
+// for a week -- and sets the numbers on the jerseys when it answers.
+//
+// WHO PLAYS TODAY. "Active" is where he sits in the lineup, not whether
+// his club has a game. That comes from today's scoreboard, which the app
+// has already loaded: a club on it is playing today.
+function _skbAbbr(lg, ab) {
+  var u = String(ab || '').toUpperCase();
+  try {
+    if (lg === 'NBA' && C3_BENCH_ALIAS.hasOwnProperty(u)) { return C3_BENCH_ALIAS[u]; }
+    if (lg === 'NHL' && RK_PEN_ALIAS.hasOwnProperty(u)) { return RK_PEN_ALIAS[u]; }
+  } catch (e) {}
+  return u;
+}
+
+// lg -> { ABBR: 1 } for the clubs on today's board, or null when the
+// board is showing another day or has nothing for that league.
+function _skbPlaying() {
+  var out = {}, lg, i;
+  try {
+    if (typeof isToday === 'function' && !isToday()) { return out; }
+    for (lg in allGames) {
+      if (!Object.prototype.hasOwnProperty.call(allGames, lg)) { continue; }
+      var arr = allGames[lg] || [];
+      for (i = 0; i < arr.length; i++) {
+        var g = arr[i];
+        if (!g || !g.away || !g.home) { continue; }
+        if (!out[lg]) { out[lg] = {}; }
+        out[lg][_skbAbbr(lg, g.away.abbr)] = 1;
+        out[lg][_skbAbbr(lg, g.home.abbr)] = 1;
+      }
+    }
+  } catch (e) {}
+  return out;
+}
+
+var _skbNums = null, SKB_NUM_KEY = 'gdhq_jsy_nums_v1';
+function _skbNumsLoad() {
+  if (_skbNums) { return _skbNums; }
+  _skbNums = {};
+  try { _skbNums = JSON.parse(localStorage.getItem(SKB_NUM_KEY) || '{}') || {}; } catch (e) { _skbNums = {}; }
+  return _skbNums;
+}
+function _skbNumsSave() {
+  try { localStorage.setItem(SKB_NUM_KEY, JSON.stringify(_skbNums || {})); } catch (e) {}
+}
+function _skbNumFor(lg, ab, name) {
+  try {
+    var t = _skbNumsLoad()[lg + ':' + _skbAbbr(lg, ab)];
+    if (!t || !t.m) { return ''; }
+    var v = t.m[_pmNameKey(name)];
+    return (v == null) ? '' : String(v);
+  } catch (e) { return ''; }
+}
+
+// The clubs on a page that have no numbers yet, asked for two at a time.
+function _skBinderNums(pi) {
+  var pg = _skbPages[pi];
+  if (!pg || pg._nums) { return; }
+  pg._nums = true;
+  var lg = String(pg.sport || '').toUpperCase();
+  if ((lg !== 'NBA' && lg !== 'NHL') || typeof LEAGUES === 'undefined' || !LEAGUES[lg]) { return; }
+  var store = _skbNumsLoad(), want = [], seen = {}, i, now = Date.now();
+  for (i = 0; i < pg.rows.length; i++) {
+    var ab = _skbAbbr(lg, pg.rows[i].teamAbbr), k = lg + ':' + ab;
+    if (!ab || seen[k]) { continue; }
+    seen[k] = 1;
+    if (store[k] && (now - (store[k].t || 0)) < 7 * 86400000) { continue; }
+    want.push(ab);
+  }
+  var repaint = function () {
+    var j;
+    for (j = 0; j < pg.rows.length; j++) {
+      var r = pg.rows[j], el = document.getElementById('skbJ_' + pi + '_' + j);
+      if (!el) { continue; }
+      var num = _skbNumFor(lg, r.teamAbbr, r.name);
+      if (num === '') { continue; }
+      var art = null;
+      try { art = _tcArt({ teamName: r.teamAbbr }, lg); } catch (e) { art = null; }
+      if (art) { el.innerHTML = _jgSvg(art.lg, art.art, _tcSurname(r.name), num); }
+    }
+  };
+  var at = 0, L = LEAGUES[lg];
+  var next = function () {
+    if (at >= want.length) { _skbNumsSave(); return; }
+    var pair = want.slice(at, at + 2), ps = [], q; at += 2;
+    for (q = 0; q < pair.length; q++) {
+      (function (ab2) {
+        ps.push(fetch('https://site.api.espn.com/apis/site/v2/sports/' + L.sport + '/' + L.slug + '/teams/' + ab2.toLowerCase() + '/roster')
+          .then(function (r) { return r.ok ? r.json() : null; })
+          .then(function (j) {
+            var m = {}, list = (j && j.athletes) || [], a, b, n = 0;
+            for (a = 0; a < list.length; a++) {
+              var items = (list[a] && list[a].items) ? list[a].items : [list[a]];
+              for (b = 0; b < items.length; b++) {
+                var p = items[b] || {};
+                if (p.jersey == null || p.jersey === '' || !(p.displayName || p.fullName)) { continue; }
+                m[_pmNameKey(p.displayName || p.fullName)] = String(p.jersey); n++;
+              }
+            }
+            if (n) { store[lg + ':' + ab2] = { t: Date.now(), m: m }; }
+          })['catch'](function () {}));
+      })(pair[q]);
+    }
+    Promise.all(ps).then(function () { repaint(); setTimeout(next, 120); }, function () { setTimeout(next, 120); });
+  };
+  repaint();
+  next();
+}
+
 function skBinderSport(sp) {
   _skbSport = sp;
   skBinderOpen();
@@ -218406,10 +218529,13 @@ function _skBinderCard(pg, r, pi, ri) {
     } catch (e4) { foot = ''; }
   }
   if (!foot) { foot = (r.active === false ? 'BENCH' : 'ACTIVE') + (r.slot ? ' · ' + String(r.slot).toUpperCase() : ''); dim = true; }
-  return '<div class="skb-cd' + (r.active === false ? ' bn' : '') + '" onclick="_skBinderTap(' + pi + ',' + ri + ')" style="border-color:' + col +
+  var _num = _skbNumFor(lg, r.teamAbbr, r.name);
+  var _pl = false;
+  try { _pl = !!(_skbToday && _skbToday[lg] && _skbToday[lg][_skbAbbr(lg, r.teamAbbr)]); } catch (eP) { _pl = false; }
+  return '<div class="skb-cd' + (r.active === false ? ' bn' : '') + (_pl ? ' play' : '') + '" onclick="_skBinderTap(' + pi + ',' + ri + ')" style="border-color:' + col +
       ';color:' + ink + ';background:radial-gradient(ellipse at 50% 40%, rgba(255,255,255,0.28), rgba(0,0,0,0.25)),' + col + '">' +
     '<div class="skb-cd-t"><span>' + _pcEsc(String(r.displayPos || '').toUpperCase().slice(0, 7)) + '</span><b>' + _pcEsc(String(r.teamAbbr || '').toUpperCase()) + '</b></div>' +
-    '<div class="skb-cd-j">' + (art ? _jgSvg(art.lg, art.art, sur, '') : '<i>' + _pcEsc(String(r.teamAbbr || lg || '').toUpperCase()) + '</i>') + '</div>' +
+    '<div class="skb-cd-j" id="skbJ_' + pi + '_' + ri + '">' + (art ? _jgSvg(art.lg, art.art, sur, _num) : '<i>' + _pcEsc(String(r.teamAbbr || lg || '').toUpperCase()) + '</i>') + '</div>' +
     '<div class="skb-cd-p"><b>' + _pcEsc(sur || r.name) + '</b><s id="skbF_' + pi + '_' + ri + '" class="' + (dim ? 'dim' : '') + '">' + _pcEsc(foot) + '</s></div></div>';
 }
 
@@ -218424,6 +218550,7 @@ function _skBinderTap(pi, ri) {
     // steps out of the way, the card is opened the moment its header
     // arrives, and closing the card brings the binder back.
     window._pcAuto = { t: Date.now(), binder: true };
+    try { var _hn = _skbNumFor(lg, r.teamAbbr, r.name); if (_hn !== '') { window._tcNumHint = { name: _pmNameKey(r.name), num: _hn }; } } catch (eH) {}
     var ov = document.getElementById('skBinderOv');
     if (ov) { ov.style.display = 'none'; }
     openSkNbaNhlPlayerCard(r.name, r.teamAbbr, r.displayPos, lg);
@@ -218444,6 +218571,7 @@ function _skBinderDots() {
   var n = _skbPages.length, at = n ? Math.round(rail.scrollLeft / Math.max(1, rail.clientWidth)) : 0;
   lab.textContent = n ? ('PAGE ' + (at + 1) + ' OF ' + n) : '';
   try { _skBinderLoad(at); } catch (e) {}
+  try { _skBinderNums(at); } catch (e2) {}
 }
 function _skBinderGo(d) {
   var rail = document.getElementById('skbRail');
@@ -218463,6 +218591,7 @@ function skBinderOpen() {
   var ov = document.getElementById('skBinderOv');
   if (!ov) { ov = document.createElement('div'); ov.id = 'skBinderOv'; document.body.appendChild(ov); }
   ov.style.display = '';
+  _skbToday = _skbPlaying();
   var allPg = _skBinderPages(), cnt = {}, seenSp = [], pi, ri, h = '', total = 0;
   for (pi = 0; pi < allPg.length; pi++) {
     var s0 = allPg[pi].sport || '?';
@@ -218489,12 +218618,16 @@ function skBinderOpen() {
     h += '<div class="skb-rail" id="skbRail" onscroll="_skBinderDots()">';
     for (pi = 0; pi < _skbPages.length; pi++) {
       var pg = _skbPages[pi], act = 0;
-      for (ri = 0; ri < pg.rows.length; ri++) { if (pg.rows[ri].active !== false) { act++; } }
+      var _plN = 0, _lgU = String(pg.sport || '').toUpperCase(), _known = !!(_skbToday && _skbToday[_lgU]);
+      for (ri = 0; ri < pg.rows.length; ri++) {
+        if (pg.rows[ri].active !== false) { act++; }
+        if (_known && _skbToday[_lgU][_skbAbbr(_lgU, pg.rows[ri].teamAbbr)]) { _plN++; }
+      }
       h += '<div class="skb-page"><div class="skb-hd">' +
         (pg.logo ? '<img src="' + _pcEsc(pg.logo) + '" alt="" onerror="this.style.display=\'none\'">' : '') +
         '<b>' + _pcEsc(pg.team) + '</b>' + (_SKB_TAG[pg.fmt] ? '<em>' + _SKB_TAG[pg.fmt] + '</em>' : '') + '</div>' +
         '<div class="skb-sub">' + _pcEsc(String(pg.sport || '').toUpperCase()) + (pg.league && pg.league !== pg.team ? ' · ' + _pcEsc(pg.league.toUpperCase()) : '') +
-          ' \u00b7 ' + pg.rows.length + ' CARDS \u00b7 ' + act + ' ACTIVE<span id="skbW_' + pi + '"></span></div>';
+          ' \u00b7 ' + pg.rows.length + ' CARDS \u00b7 ' + act + ' ACTIVE' + (_known ? ' \u00b7 <b class="skb-gold">' + _plN + ' PLAY TODAY</b>' : '') + '<span id="skbW_' + pi + '"></span></div>';
       // nine pockets a sheet; the last row is filled out with empty pockets
       for (ri = 0; ri < pg.rows.length; ri += 9) {
         h += '<div class="skb-sheet">';
