@@ -174652,12 +174652,55 @@ function skApplyDetailWeek() {
 // Season mode hides the date navigator (a season has no date), keeps
 // every row/section identical, and swaps only the FP source. Flipping
 // back restores the previously selected date untouched.
+// WEEKMODE -- is there a week to show? Football is already weekly and
+// keeps its own stepper; a league with no current week has none.
+function _skWeekModeOk(league) {
+  try {
+    if (!league || !parseInt(league.current_week, 10)) { return false; }
+    if (typeof _skIsNflLeague === 'function' && _skIsNflLeague(league)) { return false; }
+    if (typeof _skIsSeasonTotalLeague === 'function' && _skIsSeasonTotalLeague(league)) { return false; }
+    return true;
+  } catch (e) { return false; }
+}
+
+function _skWeekModeLoad(league, players, targetDate, leagueKeyAtStart) {
+  var ld = skLeagueData[league.league_key], teamKey = ld && ld.team && ld.team.team_key;
+  var wk = parseInt(league.current_week, 10);
+  if (!teamKey || !wk) { return; }
+  // the rows are cleared of today's line straight away
+  var i;
+  for (i = 0; i < players.length; i++) { if (players[i]) { players[i]._wkLine = ''; } }
+  try { skUpdateRosterLinesInPlace(players, targetDate); } catch (e0) {}
+  var setP = leagueSettingsCache[league.league_key]
+    ? Promise.resolve(leagueSettingsCache[league.league_key]) : ensureLeagueSettings(league.league_key);
+  Promise.all([fetchTeamFpForWeek(teamKey, wk, wk), setP]).then(function (res) {
+    if (skState.activeLeagueKey !== leagueKeyAtStart || skDetailFpMode !== 'week') { return; }
+    var map = res[0] || null, meta = (res[1] && res[1].stats) || null, j;
+    skCurrentFpMap = map;
+    for (j = 0; j < players.length; j++) {
+      var p = players[j], e = (p && p.playerKey && map) ? map[p.playerKey] : null, html = '';
+      if (e && e.stats && meta && typeof _skBuildCatStatLine === 'function') {
+        try { html = _skBuildCatStatLine(e.stats, meta, 0, null, { rates: true }) || ''; } catch (e2) { html = ''; }
+      }
+      if (p) { p._wkLine = html; }
+    }
+    skUpdateRosterLinesInPlace(players, targetDate);
+  })['catch'](function () {});
+}
+
 function skSetDetailFpMode(mode) {
-  if (mode !== 'day' && mode !== 'season') return;
+  // WEEKMODE -- a third view: this fantasy week. Like the season it has
+  // no single date, so the date navigator steps aside for it too.
+  if (mode !== 'day' && mode !== 'season' && mode !== 'week') return;
   if (skDetailFpMode === mode) return;
   skDetailFpMode = mode;
   var nav = document.getElementById('skDetailDateNav');
-  if (nav) nav.style.display = (mode === 'season' ? 'none' : '');
+  if (nav) nav.style.display = (mode !== 'day' ? 'none' : '');
+  var _wmBtns = document.querySelectorAll('.sk-fpmode-scope .sk-side-btn'), _wi;
+  if (_wmBtns && _wmBtns.length === 3) {
+    var _wmOrder = ['day', 'week', 'season'];
+    for (_wi = 0; _wi < 3; _wi++) { _wmBtns[_wi].classList.toggle('active', _wmOrder[_wi] === mode); }
+  }
   // ROSTERGRID4 -- scoped to THIS row. It used to be every .sk-fpmode-row
   // on the page, which was one row until the Table/Cards toggle borrowed
   // the class; then it was four buttons, the length check failed, and the
@@ -177419,13 +177462,14 @@ function skBuildDetailHTML(league) {
       : ((isPointsLeague ||
           (typeof _rgHasSeasonView === 'function' && _rgHasSeasonView(league)))
         ? '<div class="sk-fpmode-row sk-fpmode-scope">' +
-          '  <button class="sk-side-btn' + (skDetailFpMode !== 'season' ? ' active' : '') + '" onclick="skSetDetailFpMode(\'day\')">Daily</button>' +
+          '  <button class="sk-side-btn' + (skDetailFpMode === 'day' ? ' active' : '') + '" onclick="skSetDetailFpMode(\'day\')">Daily</button>' +
+          (_skWeekModeOk(league) ? '  <button class="sk-side-btn' + (skDetailFpMode === 'week' ? ' active' : '') + '" onclick="skSetDetailFpMode(\'week\')">This Week</button>' : '') +
           '  <button class="sk-side-btn' + (skDetailFpMode === 'season' ? ' active' : '') + '" onclick="skSetDetailFpMode(\'season\')">Season Total</button>' +
           '</div>'
         : '') +
       // ROSTERGRID -- cards or table, for every group at once.
       ((typeof _rgToggleHtml === 'function') ? _rgToggleHtml() : '') +
-      '<div class="sk-date-nav" id="skDetailDateNav"' + (skDetailFpMode === 'season' ? ' style="display:none"' : '') + '>' +
+      '<div class="sk-date-nav" id="skDetailDateNav"' + (skDetailFpMode !== 'day' ? ' style="display:none"' : '') + '>' +
       '  <button class="sk-date-step" onclick="skDetailStepDate(-1)" title="Previous day" aria-label="Previous day">' +
       '    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>' +
       '  </button>' +
@@ -207786,7 +207830,11 @@ function skRenderDetailRoster(league, players) {
   // scoring_type). Re-renders are self-contained.
   if (isNflLeague) {
     _skHydrateNflWeekTotals(league, players, nflWeek, leagueKeyAtStart);
-  } else if (skDetailFpMode === 'season') {
+  } else if (skDetailFpMode !== 'day') {
+    // WEEKMODE -- the week's figures, for every kind of league: one
+    // week-addressed request for this team, the same one football has
+    // always used, and the rows are filled from it.
+    if (skDetailFpMode === 'week') { try { _skWeekModeLoad(league, players, targetDate, leagueKeyAtStart); } catch (_eWm) {} }
     // Season view: the Day Totals card summarizes a single DAY, which
     // would contradict the season row totals below. Hide it entirely
     // rather than show a mismatched number. (Re-shown on flip back.)
@@ -207898,6 +207946,8 @@ function skRenderDetailRoster(league, players) {
           skCurrentNflSchedMap = res[2] || null;
           skUpdateRosterLinesInPlace(players, targetDate);
         });
+      } else if (skDetailFpMode === 'week') {
+        // WEEKMODE -- _skWeekModeLoad above has this
       } else if (skDetailFpMode === 'season') {
         // Season-total view: one dateless roster+season call. The
         // stat sub-line stays the daily one (harmless), the FP value
@@ -207914,7 +207964,7 @@ function skRenderDetailRoster(league, players) {
           // to the season view while this was in flight.
           if (skState.activeLeagueKey !== leagueKeyAtStart) return;
           if ((skDetailDate || _todayDateString()) !== dateAtStart) return;
-          if (skDetailFpMode === 'season') return;
+          if (skDetailFpMode !== 'day') return;
           skCurrentFpMap = fpMap || null;
           skUpdateRosterLinesInPlace(players, targetDate);
         });
@@ -209766,6 +209816,11 @@ function skUpdateRosterLinesInPlace(players, targetDate) {
     } else {
       line = getCachedMlbLine({ player_key: p.playerKey, name: p.name, team: p.teamAbbr }, targetDate);
     }
+    // WEEKMODE -- the line is the week's, or nothing: never today's beside a week's total
+    if (skDetailFpMode === 'week' && !_ulIsNfl) {
+      line = p._wkLine || null;
+      _isHtmlLine = !!line;
+    }
     var rendered = skRenderLineHTML(p, line, skCurrentFpMap);
 
     // Update the stat-line element (left side of the second row)
@@ -210818,7 +210873,8 @@ function _rgContext(league) {
     // the points branch does. Its day figures live in the category cache,
     // which every NBA and NHL roster fills whatever it scores by. The date
     // must match, or yesterday's night would be served under today's label.
-    if (!dayBy || !Object.keys(dayBy).length) {
+    var _wmWeek = (typeof skDetailFpMode !== 'undefined' && skDetailFpMode === 'week');
+    if (!_wmWeek && (!dayBy || !Object.keys(dayBy).length)) {
       var _dc = (typeof skDailyCatStatsCache !== 'undefined')
         ? skDailyCatStatsCache[league.league_key] : null;
       if (_dc && _dc.date === dstr && _dc.byKey) { dayBy = _dc.byKey; }
@@ -210828,6 +210884,10 @@ function _rgContext(league) {
     if (!shapeBy) { return null; }
     label = isToday ? 'Today'
       : ((typeof skFormatDateLabel === 'function') ? skFormatDateLabel(dstr) : dstr);
+    if (_wmWeek) {
+      label = 'This week' + (league.current_week ? ' \u00b7 week ' + league.current_week : '');
+      if (!_rgHasAnyValue(byKey)) { label += ' \u00b7 nothing played yet'; }
+    } else
     if (!_rgHasAnyValue(byKey)) {
       label += isToday ? ' \u00b7 nothing played yet' : ' \u00b7 nothing recorded';
     }
