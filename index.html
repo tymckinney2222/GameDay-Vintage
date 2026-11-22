@@ -9000,7 +9000,9 @@
   .du-j svg { display: block; width: 100%; height: auto; }
   .du-j0 { height: 40px; border-radius: 6px; background: rgba(255,255,255,0.08); font: 800 10px/40px 'Outfit', Arial, sans-serif; text-align: center; color: rgba(255,255,255,0.6); }
   .du-pi { min-width: 0; flex: 1; }
-  .du-pn { font: 800 11px/1.15 'Outfit', Arial, sans-serif; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .du-pn { display: flex; align-items: center; gap: 4px; font: 800 11px/1.15 'Outfit', Arial, sans-serif; color: #fff; min-width: 0; }
+  .du-pn > span:first-child { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .du-pn .sk-duel-start, .du-pn .sk-duel-dec { flex: none; margin-left: 0; }
   .du-ps { display: block; font: 800 8px/1 'Outfit', Arial, sans-serif; letter-spacing: 0.08em; color: rgba(255,255,255,0.45); margin: 3px 0 4px; }
   .du-ps.lv { color: #ff8080; }
   .du-pl { font: 700 10.5px/1.3 'Outfit', Arial, sans-serif; color: #e5eaf3; font-variant-numeric: tabular-nums; }
@@ -63199,26 +63201,76 @@ function _duAvg(players, sid) {
   }
   return n ? (t / n) : null;
 }
+// DUELBASEBALL -- a baseball rate, from today's box lines: earned runs and
+// outs for ERA, hits and at-bats for the average. Null where the lines do
+// not carry what the rate needs.
+function _duBbRate(abbr, players, kind) {
+  var a = String(abbr || '').toUpperCase(), i;
+  try {
+    if (kind === 'pitcher') {
+      var t = { h: 0, er: 0, k: 0, bb: 0 };
+      for (i = 0; i < players.length; i++) {
+        var q = _skParsePitLine((typeof players[i]._line === 'string') ? players[i]._line : '');
+        t.h += q.h; t.er += q.er; t.k += q.k; t.bb += q.bb;
+      }
+      var outs = _skSumOuts(players), ip = outs / 3;
+      if (!(outs > 0)) { return null; }
+      if (a === 'ERA') { return t.er * 9 / ip; }
+      if (a === 'WHIP') { return (t.bb + t.h) / ip; }
+      if (a === 'K/9') { return t.k * 9 / ip; }
+      if (a === 'BB/9') { return t.bb * 9 / ip; }
+      if (a === 'H/9') { return t.h * 9 / ip; }
+      if (a === 'K/BB') { return t.bb ? (t.k / t.bb) : null; }
+      return null;
+    }
+    if (kind === 'batter' && a === 'AVG') {
+      var ab = 0, h = 0;
+      for (i = 0; i < players.length; i++) {
+        var b = _skParseBatLine((typeof players[i]._line === 'string') ? players[i]._line : '');
+        ab += b.ab; h += b.h;
+      }
+      return ab ? (h / ab) : null;
+    }
+  } catch (e) {}
+  return null;
+}
 function _duCatTable(s, mine, theirs) {
   var sm = s.statsMeta, ord = null;
   try { ord = leagueSettingsCache[s.leagueKey] && leagueSettingsCache[s.leagueKey].statOrder; } catch (e) { ord = null; }
   if (!sm) { return ''; }
-  var rows = _skDuelCatRows(mine, theirs, sm, ord), i, avgAny = false;
+  var all = _skDuelCatRows(mine, theirs, sm, ord), rows = [], i, avgAny = false;
+  // DUELBASEBALL -- the batting sheet shows batting categories and the
+  // pitching sheet pitching ones; the league marks each stat B or P.
+  var ptype = (s.kind === 'batter') ? 'B' : ((s.kind === 'pitcher') ? 'P' : '');
+  for (i = 0; i < all.length; i++) {
+    var pt0 = String((all[i].meta && all[i].meta.positionType) || '').toUpperCase();
+    if (ptype && pt0 && pt0 !== ptype) { continue; }
+    rows.push(all[i]);
+  }
   if (!rows.length) { return ''; }
   for (i = 0; i < rows.length; i++) {
     var r = rows[i];
     if (_skDuelCatIsRate(r.abbr) && (r.mine == null || r.theirs == null)) {
-      if (r.mine == null) { r.mine = _duAvg(mine, r.sid); }
-      if (r.theirs == null) { r.theirs = _duAvg(theirs, r.sid); }
-      r.avg = true; avgAny = true;
+      var viaLine = false;
+      if (ptype) {
+        var bm = _duBbRate(r.abbr, mine, s.kind), bo = _duBbRate(r.abbr, theirs, s.kind);
+        if (bm != null || bo != null) { r.mine = bm; r.theirs = bo; viaLine = true; }
+      }
+      if (!viaLine) {
+        if (r.mine == null) { r.mine = _duAvg(mine, r.sid); }
+        if (r.theirs == null) { r.theirs = _duAvg(theirs, r.sid); }
+        avgAny = true;
+      }
+      r.avg = true;
       r.winner = _skDuelCatWinner(r.meta, r.mine, r.theirs);
     }
   }
   var fmt = function (v, r) {
     if (v == null) { return '–'; }
     if (r.avg) {
-      var t = (Math.abs(v) < 1.5) ? v.toFixed(3) : v.toFixed(2);
-      return (Math.abs(v) < 1 && t.charAt(0) === '0') ? t.slice(1) : t;
+      var three = /AVG|OBP|SLG|OPS|%|PCT/.test(String(r.abbr).toUpperCase());
+      var t = three ? v.toFixed(3) : v.toFixed(2);
+      return (three && Math.abs(v) < 1 && t.charAt(0) === '0') ? t.slice(1) : t;
     }
     return _skDuelCatFmt(v, r);
   };
@@ -63261,25 +63313,35 @@ function _duPtsTable(s, mine, theirs, sport) {
   h += '<td class="tot' + (B.tot > A.tot ? ' w' : '') + '">' + (B.any ? B.tot.toFixed(1) : '–') + '</td></tr></table>';
   return { html: h, n: list.length + 1, totA: A, totB: B };
 }
-function _duCard(row, lg, isPts) {
+function _duCard(row, lg, isPts, s) {
   var p = row.p, chip = row.chip, jersey = '';
   try { jersey = _skRvJersey(lg, p.teamAbbr || p.team, p.name) || ''; } catch (e) { jersey = ''; }
   var line = (p._line != null) ? p._line : '', lineHtml;
+  if (lg === 'MLB' && p._line == null) { try { line = getCachedMlbLine(p, s.date) || ''; } catch (eL) { line = ''; } }
+  var soft = '';
+  if (/^(pre-game|no game|did not pitch|not yet|off today)$/i.test(String(line))) { soft = String(line).toLowerCase(); line = ''; }
   if (!line || line === '—') { lineHtml = ''; }
   else { lineHtml = p._lineHtml ? line : skEscape(line); }
+  // DUELBASEBALL -- the confirmed-starter tick and a pitcher's decision, as the old sheet had them
+  var marks = '';
+  if (p.isStarting === true) { marks += '<span class="sk-duel-start" title="Confirmed starting today">✓</span>'; }
+  if (p._decision === 'W') { marks += '<span class="sk-duel-dec win">W</span>'; }
+  else if (p._decision === 'L') { marks += '<span class="sk-duel-dec loss">L</span>'; }
+  else if (p._decision === 'SV') { marks += '<span class="sk-duel-dec save">SV</span>'; }
   var fp = (isPts && p.fp != null && !isNaN(Number(p.fp))) ? Number(p.fp).toFixed(1) : '';
   // DUELDATE -- a game that has not started has no line and no points, whatever a feed says
   if (chip && chip.cls === 'up') { lineHtml = ''; fp = ''; }
   var st = chip ? chip.txt : '';
   return '<div class="du-pc">' +
     '<div class="du-j">' + (jersey || '<div class="du-j0">' + skEscape(String(p.teamAbbr || p.team || '')) + '</div>') + '</div>' +
-    '<div class="du-pi"><div class="du-pn">' + skEscape(p.name || '') + '</div>' +
+    '<div class="du-pi"><div class="du-pn"><span>' + skEscape(p.name || '') + '</span>' + marks + '</div>' +
     '<b class="du-ps' + ((chip && chip.cls === 'lv') ? ' lv' : '') + '">' + skEscape(String(p.selectedPos || '')) + (st ? ' · ' + skEscape(st) : '') + '</b>' +
     '<div class="du-pl' + (lineHtml || fp ? '' : ' q') + '">' + (fp ? '<i class="du-fp">' + fp + '</i>' + (lineHtml ? ' · ' : '') : '') +
-      (lineHtml || (fp ? '' : ((chip && chip.cls === 'up') ? 'not started' : '–'))) + '</div></div></div>';
+      (lineHtml || (fp ? '' : ((chip && chip.cls === 'up') ? 'not started' : (soft ? skEscape(soft) : '–')))) + '</div></div></div>';
 }
 function _duNewHtml(s, loading) {
-  var lg = (s.kind === 'baller') ? 'NBA' : 'NHL', sport = (s.kind === 'baller') ? 'nba' : 'nhl';
+  var ball = (s.kind === 'pitcher' || s.kind === 'batter');
+  var lg = ball ? 'MLB' : ((s.kind === 'baller') ? 'NBA' : 'NHL'), sport = ball ? 'mlb' : ((s.kind === 'baller') ? 'nba' : 'nhl');
   var league = _duLeague(s.leagueKey), st = String((league && league.scoring_type) || '');
   var isPts = (st === 'headpoint' || st === 'point');
   var M = _duPlaying(s.my, lg), T = _duPlaying(s.opp, lg);
@@ -63293,14 +63355,14 @@ function _duNewHtml(s, loading) {
       (isLoading ? 'LOADING' : (R.rows.length + ' PLAYING' + ((isPts && tb && (mineSide ? tb.totA : tb.totB).any) ? ' · ' + (mineSide ? tb.totA : tb.totB).tot.toFixed(1) : ''))) + '</small></div>';
     if (isLoading) { return h + '<div class="sk-duel-loading">Loading opponent…</div>'; }
     if (!R.rows.length) { return h + '<div class="du-none">Nobody in an active slot plays today.</div>'; }
-    for (var i = 0; i < R.rows.length; i++) { h += _duCard(R.rows[i], lg, isPts); }
+    for (var i = 0; i < R.rows.length; i++) { h += _duCard(R.rows[i], lg, isPts, s); }
     return h;
   };
   return '<div class="du-date">' + skEscape(String(dateTxt).toUpperCase()) + ' · ACTIVE SLOTS WITH A GAME TODAY</div>' +
     ((tb && tb.html) ? '<div class="du-stick"><div class="du-tw' + (tb.n > 9 ? ' wide' : '') + '">' + tb.html + '</div></div>' : '') +
     '<div class="du-nt">' + (isPts
       ? 'Today’s fantasy points, added up by the slot each player is in. A dash is a slot with nobody playing or no figure yet.'
-      : 'Today only, active players with a game. Green leads the category.' + ((tb && tb.avg) ? ' A percentage or average with no makes and attempts behind it is the average of today’s figures.' : '')) +
+      : 'Today only, active players with a game. Green leads the category.' + (ball ? ' ERA, WHIP and the batting average are worked out from today’s box lines.' : '') + ((tb && tb.avg) ? ' A percentage or average with no makes and attempts behind it is the average of today’s figures.' : '')) +
       ((!M.known || !T.known) ? ' Today’s scoreboard is not loaded for this date, so every active player is listed.' : '') + '</div>' +
     '<div class="du-cols"><div>' + col(M, s.myName, true, false) + '</div><div>' + col(T, s.oppName, false, !!loading) + '</div></div>';
 }
@@ -63318,7 +63380,8 @@ function _skRenderDuelModal(loading) {
   }
   // DUELJERSEY -- basketball and hockey have their own sheet now; anything
   // that goes wrong building it falls through to the old one below.
-  if (s.kind === 'baller' || s.kind === 'skater') {
+  // DUELBASEBALL -- and baseball's two sheets with them.
+  if (s.kind === 'baller' || s.kind === 'skater' || s.kind === 'pitcher' || s.kind === 'batter') {
     var _duH = '';
     try { _duH = _duNewHtml(s, loading); } catch (eDu) { _duH = ''; try { console.error('Duel sheet:', eDu); } catch (e9) {} }
     if (_duH) { body.innerHTML = _duH; return; }
@@ -180283,6 +180346,140 @@ function _skCpOppDates(leagueKey, dates) {
   return out;
 }
 
+// ==================================================================
+// == GAMESLEFT == games a fantasy side still has this week, counted off its
+// LINEUP rather than off everyone who was active at some point in the week.
+// The old count kept a player's club's remaining games after he had been
+// benched or dropped, which is how a side with three men playing on the
+// last day was shown with five games left.
+//   today      : players in an active slot whose club plays today
+//   later days : nobody has set those lineups yet, so the healthy roster
+//                (active and bench, not IL) with a game that day, capped at
+//                the number of active slots
+// elig(player) narrows it to who can feed one category (goalies, skaters).
+// ==================================================================
+// The day's roster for a side when the points cache has not got it: the
+// categories week keeps its own copy, mine and the opponent's.
+function _glAlt(leagueKey, mineSide) {
+  return function (ds) {
+    try {
+      if (mineSide) {
+        var dd = (skCurrentCatsWeekly && skCurrentCatsWeekly.leagueKey === leagueKey) ? skCurrentCatsWeekly.dates : [];
+        for (var i = 0; i < dd.length; i++) { if (dd[i].date === ds && dd[i].players && dd[i].players.length) { return dd[i].players; } }
+        return null;
+      }
+      var st = _skCpOpp[leagueKey] || {};
+      return (st[ds] && st[ds].length) ? st[ds] : null;
+    } catch (e) { return null; }
+  };
+}
+function _glTeam(teamKey, sport, elig, alt) {
+  if (!teamKey || (sport !== 'nba' && sport !== 'nhl')) { return null; }
+  var gpw = null;
+  try { gpw = _skGpwCache[sport + '|0']; } catch (e) { gpw = null; }
+  if (!gpw || !gpw.byDay || !gpw.byDay.length) { return null; }
+  var idx = _skYwTodayIdx(gpw);
+  var canon = (sport === 'nhl') ? nhsNhlCanon : nspNbaCanon;
+  var today = _todayDateString(), map = null, isToday = false, k, back;
+  var dayOf = function (ds) {
+    var m0 = null;
+    try { m0 = teamFpCache[teamKey + '|' + ds] || null; } catch (e0) { m0 = null; }
+    if (!m0 && alt) { m0 = alt(ds); }
+    return m0;
+  };
+  try {
+    map = dayOf(today);
+    if (map) { isToday = true; }
+    for (back = 1; !map && back <= 6; back++) {
+      var d0 = new Date(today + 'T12:00:00'); d0.setDate(d0.getDate() - back);
+      var mm = d0.getMonth() + 1, dd = d0.getDate();
+      map = dayOf(d0.getFullYear() + '-' + (mm < 10 ? '0' : '') + mm + '-' + (dd < 10 ? '0' : '') + dd);
+    }
+  } catch (e2) { map = null; }
+  if (!map) { return null; }
+  var act = [], pool = [];
+  for (k in map) {
+    if (!map.hasOwnProperty(k)) { continue; }
+    var p = map[k];
+    if (!p || !p.teamAbbr) { continue; }
+    if (elig && !elig(p)) { continue; }
+    var slot = String(p.selectedPos || '').toUpperCase();
+    var club = canon(String(p.teamAbbr).toUpperCase());
+    if (_isActiveSlot(p.selectedPos)) { act.push(club); pool.push(club); }
+    else if (!/^(IL|IR|NA|INJ)/.test(slot)) { pool.push(club); }
+  }
+  var out = { games: 0, byDay: [], lineupToday: isToday }, d, i;
+  if (idx < 0) { return out; }
+  for (d = idx; d < gpw.byDay.length; d++) {
+    var day = gpw.byDay[d] || {}, n = 0;
+    if (d === idx && isToday) {
+      for (i = 0; i < act.length; i++) { if (day[act[i]]) { n++; } }
+    } else {
+      for (i = 0; i < pool.length; i++) { if (day[pool[i]]) { n++; } }
+      if (act.length && n > act.length) { n = act.length; }
+    }
+    out.byDay.push({ d: d, n: n });
+    out.games += n;
+  }
+  return out;
+}
+// Games the lineup HAS played this week: for each day already gone, the
+// players who were in an active slot that day and whose club played. `days`
+// is how many of those days the device holds a roster for, so a pace taken
+// from the two is a pace over the same days.
+function _glPlayed(teamKey, sport) {
+  if (!teamKey || (sport !== 'nba' && sport !== 'nhl')) { return null; }
+  var gpw = null;
+  try { gpw = _skGpwCache[sport + '|0']; } catch (e) { gpw = null; }
+  if (!gpw || !gpw.byDay || !gpw.byDay.length || !gpw.days) { return null; }
+  var idx = _skYwTodayIdx(gpw), canon = (sport === 'nhl') ? nhsNhlCanon : nspNbaCanon;
+  if (idx < 0) { idx = gpw.byDay.length; }
+  var out = { games: 0, days: 0 }, d, k;
+  for (d = 0; d < idx; d++) {
+    var ds = gpw.days[d];
+    var str = (typeof ds === 'string') ? ds.slice(0, 10) : ((typeof _skLocalDayOf === 'function') ? _skLocalDayOf(ds) : '');
+    var map = null;
+    try { map = str ? teamFpCache[teamKey + '|' + str] : null; } catch (e2) { map = null; }
+    if (!map) { continue; }
+    out.days++;
+    var day = gpw.byDay[d] || {};
+    for (k in map) {
+      if (!map.hasOwnProperty(k)) { continue; }
+      var p = map[k];
+      if (!p || !p.teamAbbr || !_isActiveSlot(p.selectedPos)) { continue; }
+      if (day[canon(String(p.teamAbbr).toUpperCase())]) { out.games++; }
+    }
+  }
+  return out;
+}
+// Who can feed a category: a goaltending stat is for goalies, the rest for skaters.
+function _glEligFor(meta, sport) {
+  if (sport !== 'nhl') { return null; }
+  var g = String((meta && meta.positionType) || '').toUpperCase() === 'G';
+  return function (p) {
+    var isG = String(p.positionType || '').toUpperCase() === 'G' || String(p.displayPosition || '').toUpperCase() === 'G';
+    return g ? isG : !isG;
+  };
+}
+// Put the lineup counts on the rows the contributors build produced.
+function _glFixRows(res, leagueKey, sport) {
+  if (!res || (sport !== 'nba' && sport !== 'nhl')) { return; }
+  var myK = '', opK = '';
+  try { myK = skCurrentCatsWeekly.myTeamKey || ''; } catch (e) { myK = ''; }
+  try { opK = (skLeagueData[leagueKey].matchup || {}).oppTeamKey || ''; } catch (e2) { opK = ''; }
+  var all = (res.live || []).concat(res.banked || []), i, memo = {};
+  for (i = 0; i < all.length; i++) {
+    var row = all[i], meta = null;
+    try { meta = leagueSettingsCache[leagueKey].stats[row.sid]; } catch (e3) { meta = null; }
+    var tag = (sport === 'nhl' && String((meta && meta.positionType) || '').toUpperCase() === 'G') ? 'G' : 'S';
+    if (!memo[tag]) {
+      var el = _glEligFor(meta, sport);
+      memo[tag] = { me: _glTeam(myK, sport, el, _glAlt(leagueKey, true)), op: _glTeam(opK, sport, el, _glAlt(leagueKey, false)) };
+    }
+    if (memo[tag].me && row.youLeft) { row.youLeft = { games: memo[tag].me.games, unknown: 0 }; }
+    if (memo[tag].op && row.themLeft) { row.themLeft = { games: memo[tag].op.games, unknown: 0 }; }
+  }
+}
 // The schedule the Usable Games panel already built. Read straight
 // out of its cache: if it is not there this pane shows no games-left
 // number rather than firing a request of its own.
@@ -180362,6 +180559,7 @@ function _skCpBuild(leagueKey) {
     gamesLeftFor: sched ? sched.fn : null,
     weekLeft: sched ? sched.weekLeft : null
   });
+  try { _glFixRows(res, leagueKey, sport); } catch (eGl) {}   // GAMESLEFT
   res.haveOpp = haveOpp;
   res.hasSchedule = !!sched;
   res.sport = sport;
@@ -184990,27 +185188,19 @@ function _anGames(lk, sport) {
   if (!skCurrentCatsWeekly || skCurrentCatsWeekly.leagueKey !== lk) {
     return h + '<div class="an-note">Fills in once the week’s player lines have loaded.</div>';
   }
-  var canon = (sport === 'nhl') ? nhsNhlCanon : nspNbaCanon;
-  var mine = _skCpAccum(skCurrentCatsWeekly.dates, _isActiveSlot), them = {}, opp = [];
-  try { opp = _skCpOppDates(lk, skCurrentCatsWeekly.dates) || []; them = _skCpAccum(opp, _isActiveSlot); } catch (e2) { them = {}; }
-  var idx = _skYwTodayIdx(gpw);
-  if (idx < 0) { return h + '<div class="an-note">Nothing left to play this week.</div>'; }
-  var cnt = function (set, d) {
-    var n = 0, k;
-    for (k in set) {
-      if (!set.hasOwnProperty(k) || !set[k].teamAbbr) { continue; }
-      if (gpw.byDay[d] && gpw.byDay[d][canon(String(set[k].teamAbbr).toUpperCase())]) { n++; }
-    }
-    return n;
-  };
-  var haveThem = false, kk;
-  for (kk in them) { if (them.hasOwnProperty(kk)) { haveThem = true; break; } }
+  // GAMESLEFT -- off each side's lineup, the same count the matchup tab shows
+  var opKey = '';
+  try { opKey = (skLeagueData[lk].matchup || {}).oppTeamKey || ''; } catch (eOk) { opKey = ''; }
+  var GA = _glTeam(skCurrentCatsWeekly.myTeamKey, sport, null, _glAlt(lk, true)), GB = _glTeam(opKey, sport, null, _glAlt(lk, false));
+  if (!GA) { return h + '<div class="an-note">Fills in once today\u2019s lineup has loaded.</div>'; }
+  if (!GA.byDay.length) { return h + '<div class="an-note">Nothing left to play this week.</div>'; }
+  var haveThem = !!GB;
   var rows = [], mx = 1, d, tm = 0, tt = 0, wd = ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'];
-  for (d = idx; d < gpw.byDay.length; d++) {
-    var a = cnt(mine, d), b = haveThem ? cnt(them, d) : null, ds = gpw.days[d];
+  for (d = 0; d < GA.byDay.length; d++) {
+    var gi = GA.byDay[d].d, a = GA.byDay[d].n, b = (haveThem && GB.byDay[d]) ? GB.byDay[d].n : null, ds = gpw.days[gi];
     var str = (typeof ds === 'string') ? ds.slice(0, 10) : ((typeof _skLocalDayOf === 'function') ? _skLocalDayOf(ds) : '');
-    var lbl = str ? wd[new Date(str + 'T12:00:00').getDay()] : ('DAY ' + (d + 1));
-    rows.push({ a: a, b: b, lbl: lbl + (d === idx ? ' · TODAY' : '') });
+    var lbl = str ? wd[new Date(str + 'T12:00:00').getDay()] : ('DAY ' + (gi + 1));
+    rows.push({ a: a, b: b, lbl: lbl + (d === 0 ? ' \u00b7 TODAY' : '') });
     if (a > mx) { mx = a; } if (b != null && b > mx) { mx = b; }
     tm += a; if (b != null) { tt += b; }
   }
@@ -185024,7 +185214,7 @@ function _anGames(lk, sport) {
   h += '</div></div><div class="an-note">' + (haveThem
     ? ('In all: <b>' + tm + '</b> for you, <b>' + tt + '</b> for them. ')
     : 'Their side fills in once their week has loaded. ') +
-    'Counted over the players each side has had in an active slot this week, today included.</div>';
+    'Today counts each lineup as it is set. Later days assume the healthy roster, up to the number of active slots.</div>';
   return h;
 }
 // The season so far, from the completed weeks already on the device.
@@ -186326,11 +186516,29 @@ function _skBuildPointsAnalysisHTML(league, leagueData) {
         var _ptOw = _skOppWeekFp(matchup.oppTeamKey);
         _ptOpG = _ptSideGames((_ptOw && _ptOw.rows) || [], _ptSc);
       } catch (eG) {}
+      // GAMESLEFT -- both sides off their lineups, the rule the categories
+      // tabs use: today's active players with a game, later days the healthy
+      // roster up to the active slots. Games played come from the same
+      // lineups, day by day, so the pace is games per day over days the
+      // device actually holds. Either side falls back to the old figure
+      // when its lineup or its past days are not on the device.
+      try {
+        var _glSp = String(league.sport || '').toLowerCase();
+        var _glMyK = (leagueData.team && leagueData.team.team_key) || '';
+        var _glA = _glTeam(_glMyK, _glSp, null, null), _glAp = _glPlayed(_glMyK, _glSp);
+        if (_glA && _glAp && _glAp.games > 0 && _glAp.days > 0) {
+          _ptMyG = { left: _glA.games, played: _glAp.games, days: _glAp.days, total: _glA.games + _glAp.games };
+        }
+        var _glB = _glTeam(matchup.oppTeamKey, _glSp, null, null), _glBp = _glPlayed(matchup.oppTeamKey, _glSp);
+        if (_glB && _glBp && _glBp.games > 0 && _glBp.days > 0) {
+          _ptOpG = { left: _glB.games, played: _glBp.games, days: _glBp.days, total: _glB.games + _glBp.games };
+        }
+      } catch (eGl2) {}
       var _ptMyEff = _ptMyG
-        ? _ptEffDays(_ptMyG.left, _ptMyG.played, daysWithFullData, daysRemaining)
+        ? _ptEffDays(_ptMyG.left, _ptMyG.played, (_ptMyG.days != null ? _ptMyG.days : daysWithFullData), daysRemaining)
         : daysRemaining;
       var _ptOpEff = _ptOpG
-        ? _ptEffDays(_ptOpG.left, _ptOpG.played, daysWithFullData, daysRemaining)
+        ? _ptEffDays(_ptOpG.left, _ptOpG.played, (_ptOpG.days != null ? _ptOpG.days : daysWithFullData), daysRemaining)
         : daysRemaining;
       _ptP = _ptProject(myScore, oppScore, _ptMy, _ptOp, daysRemaining,
                         _ptMyEff, _ptOpEff);
@@ -214036,6 +214244,13 @@ function _skCgData(lk) {
       my: _skFmtCatVal(c.myV, c.meta, c.myStr), op: _skFmtCatVal(c.opV, c.meta, c.oppStr) });
   }
   cats.sort(function (a, b) { return ((b.tight ? 1 : 0) - (a.tight ? 1 : 0)) || (a.close - b.close); });
+  // GAMESLEFT -- the header counts the whole lineup, not one category's share of it
+  try {
+    var spG = String((res && res.sport) || '');
+    var gA = _glTeam(skCurrentCatsWeekly && skCurrentCatsWeekly.myTeamKey, spG, null, _glAlt(lk, true));
+    var gB = _glTeam((skLeagueData[lk].matchup || {}).oppTeamKey, spG, null, _glAlt(lk, false));
+    if (gA && gB) { youG = gA.games; themG = gB.games; }
+  } catch (eGh) {}
   return { cats: cats, res: res, nTight: nTight, youG: youG, themG: themG };
 }
 function _skCgBar(c) {
