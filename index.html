@@ -11771,6 +11771,26 @@
     backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
   }
   .fw-liveab.open { display: flex; }
+  /* STATCASTLIVE (SCX) -- the matchup strip and the batted-ball line in the live at-bat panel */
+  .scx-strip { margin: 8px 12px 4px; padding: 10px 12px; border-radius: 12px; background: rgba(8,10,16,0.72); border: 1px solid rgba(255,255,255,0.12); font-family: 'Barlow Condensed', sans-serif; }
+  .scx-title { display: flex; justify-content: space-between; font-size: 10px; font-weight: 800; letter-spacing: 0.16em; color: rgba(255,255,255,0.5); margin-bottom: 8px; }
+  .scx-title i { font-style: normal; }
+  .scx-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .scx-who { font-size: 15px; font-weight: 800; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .scx-who i { font-style: normal; font-size: 9px; letter-spacing: 0.12em; padding: 1px 5px; border-radius: 4px; background: rgba(255,255,255,0.1); color: rgba(255,255,255,0.6); vertical-align: middle; }
+  .scx-ln { display: flex; justify-content: space-between; gap: 6px; font-size: 12px; font-weight: 700; color: rgba(255,255,255,0.75); margin-top: 7px; white-space: nowrap; }
+  .scx-ln b { color: #fff; }
+  .scx-bar { height: 5px; border-radius: 3px; background: rgba(255,255,255,0.1); margin-top: 3px; overflow: hidden; }
+  .scx-bar u { display: block; height: 100%; border-radius: 3px; }
+  .scx-none { font-size: 11px; color: rgba(255,255,255,0.4); margin-top: 8px; }
+  .scx-edge { margin-top: 10px; font-size: 13px; font-weight: 700; color: rgba(255,255,255,0.8); line-height: 1.25; }
+  .scx-edge.bat { color: #4ade80; }
+  .scx-edge.pit { color: #f4a261; }
+  .scx-bb { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; margin: 6px 10px 0; }
+  .scx-chip { font-family: 'Barlow Condensed', sans-serif; font-size: 11px; font-weight: 800; letter-spacing: 0.06em; padding: 3px 8px; border-radius: 6px; background: rgba(255,255,255,0.1); color: #c9ced8; }
+  .scx-chip.up { background: rgba(74,222,128,0.16); color: #4ade80; }
+  .scx-chip.dn { background: rgba(96,165,250,0.16); color: #93c5fd; }
+  .scx-chip.top { background: #ffd23f; color: #14161a; }
   .fw-liveab-head {
     display: flex; align-items: center; justify-content: space-between;
     padding: 14px 16px 10px; flex-shrink: 0;
@@ -119060,6 +119080,7 @@ function _showLiveABResult(play) {
   // Stash for the replay button.
   _liveABLastResultInfo = info;
   _liveABLastResultBatter = batterName;
+  _scxResBatter = (matchup.batter && matchup.batter.id) || null;   // STATCASTLIVE
 
   // Keep the full-column body gradient in sync with this AB's teams.
   if (fenwayGame) {
@@ -119657,6 +119678,7 @@ function _buildLiveABResultHtml(info, batterName) {
     scoreBanner +
     (sub ? '<div class="fw-res-sub">' + skEscapeMaybe(sub) + '</div>' : '') +
     (chips ? '<div class="fw-res-chips">' + chips + '</div>' : '') +
+    _scxBattedHtml(info.launchSpeed, _scxResBatter) +   // STATCASTLIVE
     '<button class="fw-res-replay" onclick="_replayLiveABResult()" aria-label="Replay">↻ Replay</button>' +
   '</div>';
 }
@@ -120592,6 +120614,109 @@ function _liveABBuildSplitsLine(batterId, pitchHandCode, game) {
   return h;
 }
 
+// ── STATCASTLIVE (SCX) -- season Statcast beside a live MLB at-bat ──────────────
+// Two things, both in the live at-bat panel of stadium mode:
+//   the matchup strip -- where the hitter ranks, what the pitcher throws, and who has the edge;
+//   the batted-ball line -- how a ball just hit compares with what is normal for that hitter.
+// One call to the baseball proxy per hitter-and-pitcher pair, kept for the session. MLB only:
+// Statcast does not cover the minor leagues the same panel also shows.
+var _scx = { m: {}, bat: {}, busy: {} };
+var _scxResBatter = null;
+function _scxGet(b, p) {
+  var key = b + ':' + p, now = (new Date()).getTime(), c = _scx.m[key];
+  if (c && (c.ok || now - c.at < 300000)) { return c.ok ? c : null; }
+  if (_scx.busy[key]) { return null; }
+  _scx.busy[key] = 1;
+  var done = function (j) {
+    _scx.busy[key] = 0;
+    var o = (j && j.ok) ? j : { ok: false };
+    o.at = (new Date()).getTime();
+    _scx.m[key] = o;
+    if (o.ok && o.batter) { _scx.bat[String(b)] = o.batter; }
+    if (o.ok) { try { if (typeof fenwayGame !== 'undefined' && fenwayGame && typeof _renderLiveAB === 'function') { _renderLiveAB(); } } catch (e) {} }
+  };
+  try {
+    fetch(BASEBALL_PROXY_BASE + '/matchup?b=' + encodeURIComponent(b) + '&p=' + encodeURIComponent(p))
+      .then(function (r) { return r.json(); }).then(function (j) { done(j); })['catch'](function () { done(null); });
+  } catch (e) { done(null); }
+  return null;
+}
+function _scxOrd(n) {
+  var t = n % 100, u = n % 10;
+  return n + ((t >= 11 && t <= 13) ? 'th' : u === 1 ? 'st' : u === 2 ? 'nd' : u === 3 ? 'rd' : 'th');
+}
+function _scxEsc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+function _scxLast(name) { var w = String(name || '').split(' '); return w.length > 1 ? w.slice(1).join(' ') : String(name || ''); }
+function _scxF3(v) { var n = Number(v); return isNaN(n) ? '' : (n < 1 ? '.' + ('000' + Math.round(n * 1000)).slice(-3) : n.toFixed(3)); }
+function _scxPitchCol(code) {
+  if (/^(FF|SI|FC|FA)$/.test(code)) { return '#f87171'; }
+  if (/^(SL|ST|CU|KC|SV|CS)$/.test(code)) { return '#60a5fa'; }
+  if (/^(CH|FS|FO|SC)$/.test(code)) { return '#4ade80'; }
+  return '#c4b5fd';
+}
+function _scxPctRow(label, pct) {
+  if (pct == null) { return ''; }
+  var col = pct >= 70 ? '#4ade80' : pct <= 30 ? '#f87171' : '#60a5fa';
+  return '<div class="scx-ln"><span>' + label + '</span><b style="color:' + col + '">' + _scxOrd(pct) + '</b></div><div class="scx-bar"><u style="width:' + Math.max(3, pct) + '%;background:' + col + '"></u></div>';
+}
+// Who has the edge, in one line. First by the pitch that matters: the pitcher's most-missed
+// pitch against how this hitter has done with that pitch. Failing that, by season form.
+function _scxEdge(B, P) {
+  var ars = (P && P.arsenal) || [], best = null, i, vs = null;
+  for (i = 0; i < ars.length; i++) { if (ars[i].whiff != null && (ars[i].usage || 0) >= 15 && (!best || ars[i].whiff > best.whiff)) { best = ars[i]; } }
+  if (best && B && B.vs) { for (i = 0; i < B.vs.length; i++) { if (B.vs[i].code === best.code && (B.vs[i].pa || 0) >= 20 && B.vs[i].xwoba != null) { vs = B.vs[i]; } } }
+  var all = B ? parseFloat(B.xwoba) : NaN, nm = best ? String(best.name || '').toLowerCase() : '';
+  if (vs && !isNaN(all)) {
+    if (vs.xwoba <= all - 0.03) { return { who: 'pit', txt: 'Edge: pitcher. His most-missed pitch, the ' + nm + ', is one this hitter struggles with.' }; }
+    if (vs.xwoba >= all + 0.03) { return { who: 'bat', txt: 'Edge: hitter. He handles the ' + nm + ', this pitcher’s most-missed pitch.' }; }
+  }
+  var bp = B ? B.xwobaPct : null, pp = P ? P.xwobaPct : null;
+  if (bp != null && pp != null) {
+    if (bp - pp > 15) { return { who: 'bat', txt: 'Edge: hitter, on season form.' }; }
+    if (pp - bp > 15) { return { who: 'pit', txt: 'Edge: pitcher, on season form.' }; }
+    return { who: '', txt: 'An even matchup on season form.' };
+  }
+  return null;
+}
+function _scxMatchupHtml(batterId, pitcherId, batterName, pitcherName, game) {
+  if (!game || game.league !== 'MLB' || !batterId || !pitcherId) { return ''; }
+  var D = _scxGet(batterId, pitcherId);
+  if (!D) { return ''; }
+  var B = D.batter || null, P = D.pitcher || null, i, left = '', right = '';
+  if (B) {
+    left = _scxPctRow('xwOBA', B.xwobaPct) + _scxPctRow('EYE', B.chasePct) + _scxPctRow('POWER', B.barrelPct);
+    var top = P && P.arsenal && P.arsenal[0], v = null;
+    if (top && B.vs) { for (i = 0; i < B.vs.length; i++) { if (B.vs[i].code === top.code && B.vs[i].xba != null && (B.vs[i].pa || 0) >= 10) { v = B.vs[i]; } } }
+    if (v) { left += '<div class="scx-ln"><span>vs ' + _scxEsc(String(top.name || '').toLowerCase()) + '</span><b>' + _scxF3(v.xba) + ' xBA</b></div>'; }
+  }
+  if (P && P.arsenal) {
+    for (i = 0; i < P.arsenal.length && i < 3; i++) {
+      var a = P.arsenal[i];
+      if (a.usage == null) { continue; }
+      right += '<div class="scx-ln"><span>' + _scxEsc(a.name) + ' ' + Math.round(a.usage) + '%</span><b>' + (a.whiff != null ? Math.round(a.whiff) + '% whiff' : '') + '</b></div>' +
+        '<div class="scx-bar"><u style="width:' + Math.max(3, Math.min(100, a.usage)) + '%;background:' + _scxPitchCol(a.code) + '"></u></div>';
+    }
+  }
+  if (!left && !right) { return ''; }
+  var edge = _scxEdge(B, P), yr = (B && B.year) || (P && P.year) || '';
+  return '<div class="scx-strip"><div class="scx-title"><span>STATCAST · WHO HAS THE EDGE</span><i>' + _scxEsc(yr) + '</i></div><div class="scx-cols">' +
+    '<div class="scx-col"><div class="scx-who">' + _scxEsc(_scxLast(batterName)) + ' <i>BAT</i></div>' + (left || '<div class="scx-none">No Statcast numbers</div>') + '</div>' +
+    '<div class="scx-col"><div class="scx-who">' + _scxEsc(_scxLast(pitcherName)) + ' <i>PITCH</i></div>' + (right || '<div class="scx-none">No Statcast numbers</div>') + '</div></div>' +
+    (edge ? '<div class="scx-edge' + (edge.who ? ' ' + edge.who : '') + '">' + _scxEsc(edge.txt) + '</div>' : '') + '</div>';
+}
+// A ball just hit, against what is normal for the man who hit it.
+function _scxBattedHtml(ev, batterId) {
+  var B = batterId != null ? _scx.bat[String(batterId)] : null, v = parseFloat(ev);
+  if (!B || isNaN(v) || B.avgEv == null) { return ''; }
+  var d = v - B.avgEv, h = '<span class="scx-chip">HIS AVERAGE ' + B.avgEv.toFixed(1) + '</span>';
+  h += '<span class="scx-chip ' + (d >= 0 ? 'up' : 'dn') + '">' + (d >= 0 ? '+' : '−') + Math.abs(d).toFixed(1) + (d >= 0 ? ' OVER' : ' UNDER') + ' HIS AVERAGE</span>';
+  if (B.maxEv != null) {
+    if (v >= B.maxEv - 0.05) { h += '<span class="scx-chip top">HIS HARDEST OF THE YEAR</span>'; }
+    else if (v >= B.maxEv - 2) { h += '<span class="scx-chip top">NEAR HIS BEST, ' + B.maxEv.toFixed(1) + '</span>'; }
+  }
+  return '<div class="scx-bb">' + h + '</div>';
+}
+
 function _renderLiveAB() {
   var body = document.getElementById('fwLiveABBody');
   var game = fenwayGame;
@@ -120844,6 +120969,7 @@ function _renderLiveAB() {
   // ── Batter platoon splits (vs LHP / vs RHP), both sides shown with the
   // side matching the current pitcher's hand emphasized. MLB + AA/AAA only. ──
   h += _liveABBuildSplitsLine(batterId, pitchHandCode, game);
+  h += _scxMatchupHtml(batterId, pitcherId, batterName, pitcherName, game);   // STATCASTLIVE
 
   // ── Top-prospect badge strip — flags batter/pitcher by Standouts rank or
   // official MLB Top 100. MiLB Standouts is MiLB-only; Top 100 is any level.──
