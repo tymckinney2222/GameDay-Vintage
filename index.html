@@ -63783,6 +63783,85 @@ function _duCard(row, lg, isPts, s) {
 // page is the sheet a league already has, with that week's score on top.
 // ==================================================================
 var _tvSt = null, _tvCalling = false, _tvBound = false;
+// ==================================================================
+// == FOOTBALLERS == the football page of Today's Lineups. Football is a
+// week, not a day, so this is the week's starters on both sides in slot
+// order: jersey, points, and whether each man is done, playing or still
+// to come.
+// ==================================================================
+var _tfTimer = 0;
+function _tfLeagues() {
+  var out = [], L = (typeof fyLeagues !== 'undefined' && fyLeagues) ? fyLeagues : [], i;
+  for (i = 0; i < L.length; i++) {
+    try {
+      var lg = L[i], d = lg && skLeagueData[lg.league_key], m = d && d.matchup;
+      if (lg && _skIsNflLeague(lg) && m && m.hasMatchup && m.myTeamKey && m.oppTeamKey && String(m.scoringType || lg.scoring_type || '') !== 'point' && !d.is_guillotine) { out.push(lg.league_key); }
+    } catch (e) {}
+  }
+  return out;
+}
+function _tfSort(list) {
+  var ord = {}, i;
+  for (i = 0; i < _SK_NFL_SLOT_ORDER.length; i++) { ord[_SK_NFL_SLOT_ORDER[i]] = i; }
+  var idx = list.map(function (p, n) { return { p: p, n: n, o: (ord[String(p.slot || '').toUpperCase()] != null) ? ord[String(p.slot || '').toUpperCase()] : 99 }; });
+  idx.sort(function (a, b) { return (a.o - b.o) || (a.n - b.n); });
+  return idx.map(function (x) { return x.p; });
+}
+function _tfCard(p, gs) {
+  var jersey = '', w = gs ? _muWin(p, gs) : { st: 'unknown', kick: null }, st = '', live = (w.st === 'in');
+  try { jersey = _skRvJersey('NFL', p.teamAbbr, p.name) || ''; } catch (e) { jersey = ''; }
+  if (w.st === 'post') { st = 'FINAL'; }
+  else if (live) { st = 'LIVE'; try { var ab = String(p.teamAbbr || '').toUpperCase(), lk2 = String((typeof _skEspnNflAbbr === 'function' ? _skEspnNflAbbr(ab) : ab) || ab).toUpperCase(), dt = (gs.detailOf && (gs.detailOf[lk2] || gs.detailOf[ab])) || ''; if (dt) { st = 'LIVE ' + dt; } } catch (e2) {} }
+  else if (w.st === 'pre') { st = _muWhenShort(w.kick) || 'TO COME'; }
+  else if (w.st === 'bye') { st = 'BYE'; }
+  var started = (w.st === 'post' || live || (!gs && Number(p.fp) > 0)), fp = (typeof p.fp === 'number' && !isNaN(p.fp)) ? p.fp : 0;
+  return '<div class="du-pc"><div class="du-j">' + (jersey || '<div class="du-j0">' + skEscape(String(p.teamAbbr || '')) + '</div>') + '</div>' +
+    '<div class="du-pi"><div class="du-pn"><span>' + skEscape(p.name || '') + '</span></div>' +
+    '<b class="du-ps' + (live ? ' lv' : '') + '">' + skEscape(String(p.slot || '')) + (st ? ' · ' + skEscape(st) : '') + '</b>' +
+    '<div class="du-pl' + (started ? '' : ' q') + '">' + (started ? '<i class="du-fp">' + fp.toFixed(1) + '</i> pts' : (w.st === 'bye' ? 'no game this week' : 'not started')) + '</div></div></div>';
+}
+function _tfRender() {
+  var s = _skDuelState, body = document.getElementById('skDuelBody'), te = document.getElementById('skDuelTitle');
+  if (!body || !s || s.kind !== 'footballer') { return; }
+  if (te) { te.textContent = 'THIS WEEK’S FOOTBALLERS'; }
+  var head = '';
+  try { head = _tvHeadHtml(s); } catch (e) { head = ''; }
+  if (s.loading) { body.innerHTML = head + '<div class="sk-duel-loading" style="padding:24px 10px">Loading both lineups…</div>'; return; }
+  if (s.err) { body.innerHTML = head + '<div class="du-none" style="padding:24px 10px">Couldn’t load the lineups for this league. Swipe away and back to try again.</div>'; return; }
+  var gs = null;
+  try { gs = _skWireNflGameStates(); } catch (e2) { gs = null; }
+  if (!gs && s.tries < 8) {
+    s.tries++;
+    clearTimeout(_tfTimer);
+    _tfTimer = setTimeout(function () { if (_skDuelState === s) { _tfRender(); } }, 1500);
+  }
+  var col = function (list, name, me) {
+    var left = 0, on = 0, i, h;
+    for (i = 0; i < list.length && gs; i++) { var w = _muWin(list[i], gs); if (w.st === 'pre') { left++; } else if (w.st === 'in') { on++; } }
+    h = '<div class="du-hd' + (me ? ' me' : '') + '">' + skEscape(name) + '<small>' + list.length + ' STARTERS' + (gs ? (' · ' + on + ' ON NOW · ' + left + ' TO COME') : '') + '</small></div>';
+    if (!list.length) { return h + '<div class="du-none">No starters found.</div>'; }
+    for (i = 0; i < list.length; i++) { h += _tfCard(list[i], gs); }
+    return h;
+  };
+  body.innerHTML = head + '<div class="du-date">WEEK ' + skEscape(String(s.week)) + ' · EVERY STARTER, IN SLOT ORDER</div>' +
+    (gs ? '' : '<div class="du-nt">This week’s schedule is still loading, so who has played is not marked yet.</div>') +
+    '<div class="du-cols"><div>' + col(s.my, s.myName, true) + '</div><div>' + col(s.opp, s.oppName, false) + '</div></div>';
+}
+function _tfOpen(lk) {
+  var league = _duLeague(lk), d = skLeagueData[lk] || {}, m = d.matchup || {};
+  var s = { leagueKey: lk, kind: 'footballer', date: _todayDateString(), my: [], opp: [], myName: m.myName || (d.team && d.team.name) || 'My Team', oppName: m.oppName || 'Opponent',
+    statsMeta: null, loading: true, err: false, tries: 0, week: (league && league.current_week) || m.week || '' };
+  _skDuelState = s;
+  var ov = document.getElementById('skDuelOverlay');
+  if (ov) { ov.classList.add('open'); }
+  _tfRender();
+  var cw = league ? league.current_week : s.week;
+  Promise.all([fetchTeamFpForWeek(m.myTeamKey, s.week, cw), fetchTeamFpForWeek(m.oppTeamKey, s.week, cw)]).then(function (res) {
+    if (_skDuelState !== s) { return; }
+    s.my = _tfSort(_skNflActiveStarters(res[0])); s.opp = _tfSort(_skNflActiveStarters(res[1])); s.loading = false;
+    _tfRender();
+  })['catch'](function () { if (_skDuelState === s) { s.loading = false; s.err = true; _tfRender(); } });
+}
 function _tvGroups() {
   var G = [{ id: 'nhl|skater', sport: 'nhl', kind: 'skater', label: 'SKATERS', list: [] }, { id: 'nba|baller', sport: 'nba', kind: 'baller', label: 'BALLERS', list: [] },
     { id: 'mlb|batter', sport: 'mlb', kind: 'batter', label: 'HITTERS', list: [] }, { id: 'mlb|pitcher', sport: 'mlb', kind: 'pitcher', label: 'PITCHERS', list: [] }], i, g;
@@ -63796,6 +63875,10 @@ function _tvGroups() {
     var sp = String(lg.sport || '').toLowerCase();
     for (g = 0; g < G.length; g++) { if (G[g].sport === sp) { G[g].list.push(lg.league_key); } }
   }
+  try {   // FOOTBALLERS
+    var fb = _tfLeagues();
+    if (fb.length) { G.push({ id: 'nfl|footballer', sport: 'nfl', kind: 'footballer', label: 'FOOTBALLERS', list: fb }); }
+  } catch (eFb) {}
   var out = [];
   for (g = 0; g < G.length; g++) { if (G[g].list.length) { out.push(G[g]); } }
   return out;
@@ -63808,7 +63891,7 @@ function tvOpen(id) {
     _tvSt = null;
     var te = document.getElementById('skDuelTitle');
     if (te) { te.textContent = 'TODAY’S LINEUPS'; }
-    body.innerHTML = '<div class="du-none" style="padding:26px 10px">No head-to-head matchup is loaded for a hockey, basketball or baseball league right now. Open Skipper’s home so your leagues load, then try again.</div>';
+    body.innerHTML = '<div class="du-none" style="padding:26px 10px">No head-to-head matchup is loaded for a hockey, basketball, baseball or football league right now. Open Skipper’s home so your leagues load, then try again.</div>';
     ov.classList.add('open');
     return;
   }
@@ -63834,6 +63917,12 @@ function tvOpen(id) {
 function _tvShow() {
   if (!_tvSt) { return; }
   var lk = _tvSt.list[_tvSt.i];
+  if (_tvSt.kind === 'footballer') {   // FOOTBALLERS -- a week of starters, not a day's sheet
+    _tvSt.on = true;
+    try { _tfOpen(lk); } catch (eTf) {}
+    try { var mf = document.querySelector('#skDuelOverlay .sk-duel-modal'); if (mf) { mf.scrollTop = 0; } } catch (eTf2) {}
+    return;
+  }
   _tvCalling = true;
   try { openSkDuel(lk, _todayDateString(), _tvSt.kind); } catch (e) {}
   _tvCalling = false;
@@ -63986,7 +64075,7 @@ function _tvHeadHtml(s) {
   }
   h += '</div>';
   var lk = s.leagueKey, lg = _duLeague(lk) || {}, ld = skLeagueData[lk] || {}, m = ld.matchup || {}, n = _tvSt.list.length;
-  var st = String(lg.scoring_type || ''), isPts = (st === 'headpoint'), dots = '';
+  var st = String(lg.scoring_type || ''), isPts = (st === 'headpoint') || _skIsNflLeague(lg), dots = '';
   for (i = 0; i < n && n > 1; i++) { dots += '<u class="' + (i === _tvSt.i ? 'on' : '') + '" onclick="_tvPick(' + i + ')"></u>'; }
   h += '<div class="tv-nav">' + (n > 1 ? '<button type="button" onclick="_tvStep(-1)" aria-label="Previous league">‹</button>' : '<span></span>') +
     '<div><b>' + skEscape(lg.name || 'League') + '</b><small>' + (n > 1 ? ('TEAM ' + (_tvSt.i + 1) + ' OF ' + n + ' · SWIPE TO CHANGE') : 'YOUR ONLY TEAM IN THIS SPORT') + '</small></div>' +
@@ -64043,6 +64132,7 @@ function _skRenderDuelModal(loading) {
   var body = document.getElementById('skDuelBody');
   if (!body) return;
   var s = _skDuelState;
+  if (s && s.kind === 'footballer') { try { _tfRender(); } catch (eTf) {} return; }   // FOOTBALLERS
   var titleEl = document.getElementById('skDuelTitle');
   if (titleEl) {
     var _t = 'PITCHING MATCHUP';
