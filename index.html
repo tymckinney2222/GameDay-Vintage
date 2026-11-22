@@ -21237,6 +21237,13 @@ opacity='0.42'/></svg>");
   .rml-wr span { font-size: 10px; font-weight: 700; color: rgba(255,255,255,0.45); }
   .rml-none { padding: 22px 20px; text-align: center; font-size: 12.5px; line-height: 1.45; color: rgba(255,255,255,0.5); }
   .rml-src { padding: 14px 20px 0; text-align: center; font-size: 10.5px; line-height: 1.4; color: rgba(255,255,255,0.35); }
+  .rml-strip { display: block; width: 100%; margin: 10px 0 0; text-align: left; border-radius: 14px; border: 1px solid rgba(245,213,71,0.42); background: linear-gradient(90deg, rgba(245,213,71,0.13), rgba(255,255,255,0.03) 72%); padding: 11px 12px; cursor: pointer; font-family: 'Outfit', sans-serif; color: #fff; }
+  .rml-strip span { display: block; }
+  .rml-strip .k { font: 800 10px/1 'Barlow Condensed', sans-serif; letter-spacing: 0.14em; color: #f5d547; }
+  .rml-strip .h { font-size: 14px; font-weight: 700; line-height: 1.25; margin-top: 6px; }
+  .rml-strip .s { font-size: 10.5px; color: rgba(255,255,255,0.55); margin-top: 5px; }
+  .rml-flag { display: inline-block; margin-left: 6px; padding: 1px 5px; border-radius: 4px; background: #f5d547; color: #14161a; font: 800 9px/1.3 'Barlow Condensed', sans-serif; letter-spacing: 0.04em; vertical-align: middle; cursor: pointer; white-space: nowrap; }
+  .rml-flag.hot { background: #e63946; color: #fff; }
   .rml-card { padding: 12px 6px 6px; border-bottom: 1px solid rgba(255,255,255,0.06); }
   .rml-ch { font: 800 10px/1 'Barlow Condensed', sans-serif; letter-spacing: 0.18em; color: rgba(255,255,255,0.45); margin: 0 14px 8px; }
   .player-overlay.pm-trading-card .rml-art { background: rgba(74,60,42,0.07); border-color: rgba(74,60,42,0.25); }
@@ -41373,6 +41380,9 @@ opacity='0.42'/></svg>");
         <span class="sk-att-dot"></span>
         <span class="sk-att-label">Checking rosters…</span>
       </button>
+
+      <!-- RUMORMILL: appears only when there is something new about a player on his rosters -->
+      <div id="rmlStrip"></div>
 
       <!-- Sport filter row -->
       <!-- Platform filter, above the sport tabs. Compact on purpose so the
@@ -156391,6 +156401,7 @@ function skPickerSave() {
 // Tappable; tapping switches to Plan mode so the user can see the
 // breakdown.
 function skRenderAttention() {
+  try { _rmlSkipperHook(); } catch (eRmlHook) {}   // RUMORMILL -- the strip and the flags
   var el = document.getElementById('skAttention');
   if (!el) return;
   var labelEl = el.querySelector('.sk-att-label');
@@ -254876,7 +254887,7 @@ function _rmlMine(sport) {
 // Which of his players a post is about: a tag that is the player's name, or the name in the headline.
 function _rmlHits(post, mine) {
   var hits = [], i, j, title = ' ' + _rmlKey(post.t) + ' ', tags = {};
-  for (j = 0; j < (post.tags || []).length; j++) { tags[_rmlKey(post.tags[j])] = 1; }
+  for (j = 0; j < (post.tags || []).length; j++) { tags[_rmlKey(String(post.tags[j]).replace(/\s*\([^)]*\)\s*$/, ''))] = 1; }
   for (i = 0; i < mine.length; i++) { if (tags[mine[i].key] || title.indexOf(' ' + mine[i].key + ' ') >= 0) { hits.push(mine[i]); } }
   return hits;
 }
@@ -254983,6 +254994,92 @@ function _rmlRender() {
   }
   el.innerHTML = h + '<div class="rml-src">Headlines and excerpts from ' + _rmlEsc(D.site || '') + '’s RSS feed. Tap a post to read it on their site.</div>';
 }
+// RUMORMILL around Skipper -- the strip on its home screen and the flags beside players' names.
+// Both come from one table: for each player on his rosters, the posts about him from the last
+// three days. Only the sports he has players in are asked for.
+var _rmlNews = { by: {}, list: [], obs: null, timer: 0 };
+function _rmlNewsBuild() {
+  var by = {}, list = [], now = (new Date()).getTime(), seen = _rmlSeen(), s, i, q;
+  var again = function () { try { _rmlNewsBuild(); _rmlStripFill(); _rmlFlagSoon(); } catch (e) {} };
+  for (s = 0; s < RML_SPORTS.length; s++) {
+    var sp = RML_SPORTS[s][0], mine = _rmlMine(sp);
+    if (!mine.length) { continue; }
+    var D = _rmlLoad(sp, again);
+    if (!D || !D.posts) { continue; }
+    for (q = 0; q < D.posts.length; q++) {
+      var p = D.posts[q];
+      if (!p.at || now - p.at > 3 * 86400000) { continue; }
+      var hits = _rmlHits(p, mine);
+      for (i = 0; i < hits.length; i++) {
+        var k = hits[i].key;
+        if (!by[k]) { by[k] = { key: k, name: hits[i].name, sport: sp, n: 0, hot: 0, fresh: 0, posts: [] }; }
+        by[k].n++;
+        by[k].posts.push(p);
+        if (p.kind === 'IL' || p.kind === 'TRADE' || p.kind === 'CUT') { by[k].hot = 1; }
+        var isFresh = seen[sp] ? p.at > seen[sp] : now - p.at < 86400000;
+        if (isFresh) { by[k].fresh++; list.push({ p: p, who: hits[i], sport: sp }); }
+      }
+    }
+  }
+  list.sort(function (a, b) { return (b.p.at || 0) - (a.p.at || 0); });
+  _rmlNews.by = by;
+  _rmlNews.list = list;
+}
+function _rmlStripFill() {
+  var el = document.getElementById('rmlStrip');
+  if (!el) { return; }
+  var L = _rmlNews.list, i, also = [], seenT = {};
+  if (!L.length) { el.innerHTML = ''; return; }
+  seenT[L[0].p.u] = 1;
+  for (i = 1; i < L.length && also.length < 2; i++) { if (!seenT[L[i].p.u]) { seenT[L[i].p.u] = 1; also.push(L[i].who.name.split(' ').slice(-1)[0]); } }
+  var n = 0, cnt = {};
+  for (i = 0; i < L.length; i++) { if (!cnt[L[i].p.u]) { cnt[L[i].p.u] = 1; n++; } }
+  el.innerHTML = '<button class="rml-strip" onclick="openRumorMillMine(\'' + L[0].sport + '\')"><span class="k">📰 RUMOR MILL · ' + n + ' NEW ON YOUR PLAYERS</span>' +
+    '<span class="h">' + _rmlEsc(L[0].p.t) + '</span><span class="s">' + _rmlAgo(L[0].p.at) + (also.length ? ' · also: ' + _rmlEsc(also.join(', ')) : '') + ' ›</span></button>';
+}
+function openRumorMillMine(sport) { _rml.view = 'mine'; openRumorMill(sport); }
+// Beside a player's name anywhere in Skipper's lists: a small tag when he is in the news.
+function _rmlFlagPass() {
+  var root = document.getElementById('skOverlay'), by = _rmlNews.by, any = false, k;
+  for (k in by) { if (by.hasOwnProperty(k)) { any = true; break; } }
+  if (!root || !any) { return; }
+  var els = root.querySelectorAll('.sk-today-name, .sk-contrib-name, .sk-wire-player-name, .sk-wpl-name, .sk-da-name, .sk-yw-pl'), i;
+  for (i = 0; i < els.length; i++) {
+    var e = els[i];
+    if (e.getAttribute('data-rml')) { continue; }
+    e.setAttribute('data-rml', '1');
+    var txt = '', c;
+    for (c = 0; c < e.childNodes.length; c++) { if (e.childNodes[c].nodeType === 3) { txt += e.childNodes[c].nodeValue; } }
+    var N = by[_rmlKey(txt)];
+    if (!N) { continue; }
+    var f = document.createElement('span');
+    f.className = 'rml-flag' + (N.hot ? ' hot' : '');
+    f.textContent = '📰 ' + N.n;
+    f.setAttribute('onclick', 'event.stopPropagation();event.preventDefault();openRumorMillMine(\'' + N.sport + '\')');
+    e.appendChild(f);
+  }
+}
+function _rmlFlagSoon() {
+  if (_rmlNews.timer) { return; }
+  _rmlNews.timer = setTimeout(function () { _rmlNews.timer = 0; try { _rmlFlagPass(); } catch (e) {} }, 500);
+}
+// Called whenever Skipper redraws its roster health: by then his rosters are in hand.
+function _rmlSkipperHook() {
+  var now = (new Date()).getTime();
+  if (_rmlNews.last && now - _rmlNews.last < 20000) { _rmlFlagSoon(); return; }   // Skipper redraws often; the table need not
+  _rmlNews.last = now;
+  _rmlNewsBuild();
+  _rmlStripFill();
+  _rmlFlagSoon();
+  if (!_rmlNews.obs && typeof MutationObserver !== 'undefined') {
+    var root = document.getElementById('skOverlay');
+    if (root) {
+      _rmlNews.obs = new MutationObserver(function () { _rmlFlagSoon(); });
+      _rmlNews.obs.observe(root, { childList: true, subtree: true });
+    }
+  }
+}
+
 function openRumorMill(sport) {
   var ov = document.getElementById('rmlOverlay');
   if (!ov) { return; }
