@@ -8972,6 +8972,8 @@
   .ts-hd { flex-wrap: wrap; } .ts-hd s .sg-wait { white-space: normal; line-height: 1.4; }
   /* ── PLAYOFFHUB ── */
   #phOverlay { z-index: 610; }
+  .ph-chs i { display: inline-block; font: 700 8.5px/1 'Outfit', Arial, sans-serif; font-style: normal; padding: 5px 6px; border-radius: 5px; border: 1px solid rgba(255,255,255,0.14); color: rgba(255,255,255,0.8); margin: 0 4px 4px 0; } .ph-chs i.r { color: #f87171; border-color: rgba(248,113,113,0.4); } .ph-chs i.g { color: #4ade80; border-color: rgba(74,222,128,0.4); }
+  .ph-po { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; padding: 9px 0; border-top: 1px solid rgba(255,255,255,0.07); font: 800 12px/1.15 'Outfit', Arial, sans-serif; } .ph-po:first-child { border-top: 0; } .ph-po small { display: block; font: 600 9px/1.25 'Outfit', Arial, sans-serif; color: rgba(255,255,255,0.5); margin-top: 3px; } .ph-po b { font: 900 13px/1 'Outfit', Arial, sans-serif; font-variant-numeric: tabular-nums; white-space: nowrap; } .ph-po b em { font-style: normal; color: rgba(255,255,255,0.4); font-weight: 600; }
   #phBody { font-family: 'Outfit', Arial, sans-serif; color: #fff; }
   .ph-dt { margin: 0 -4px 6px; padding: 10px; border-radius: 9px; background: rgba(245,197,24,0.05); border: 1px solid rgba(245,197,24,0.25); }
   .ph-dt .ln { font: 700 11.5px/1.45 'Outfit', Arial, sans-serif; color: rgba(255,255,255,0.88); margin-bottom: 4px; } .ph-dt .ln b.g { color: #4ade80; } .ph-dt .ln b.r { color: #f87171; } .ph-dt .ln b.y { color: #f5c518; }
@@ -270939,6 +270941,53 @@ function _phFinishes(trk, rec, left, per, iters) {
   }
   return out;
 }
+// ROAD -- how hard the fixtures left are. recs:[{w,l,t}], weeks:[[i,j]..] per week, names by index.
+function _phSos(recs, weeks, me, names) {
+  var pct = function (r) { var g = r.w + r.l + r.t; return g ? (r.w + r.t / 2) / g : 0.5; }, n = recs.length, sum = [], cnt = [], i, w, list = [];
+  for (i = 0; i < n; i++) { sum.push(0); cnt.push(0); }
+  for (w = 0; w < weeks.length; w++) {
+    var wk = weeks[w] || [];
+    for (i = 0; i < wk.length; i++) {
+      var a = wk[i][0], b = wk[i][1];
+      if (a == null || b == null || !recs[a] || !recs[b]) { continue; }
+      sum[a] += pct(recs[b]); cnt[a]++; sum[b] += pct(recs[a]); cnt[b]++;
+      if (a === me || b === me) { var o = (a === me) ? b : a; list.push({ w: w, name: names[o], pct: pct(recs[o]) }); }
+    }
+  }
+  if (!cnt[me]) { return null; }
+  var mine = sum[me] / cnt[me], harder = 0, counted = 0;
+  for (i = 0; i < n; i++) { if (cnt[i]) { counted++; if (i !== me && sum[i] / cnt[i] > mine + 1e-9) { harder++; } } }
+  return { avg: mine, rank: harder + 1, of: counted, list: list };
+}
+// ROOT -- every other game this week, played both ways, to see which result helps.
+function _phRoot(teams, sched, remaining, seats, me, each, seed, names) {
+  var out = [], i;
+  if (!sched || !sched[0]) { return out; }
+  for (i = 0; i < sched[0].length; i++) {
+    var a = sched[0][i][0], b = sched[0][i][1];
+    if (a === me || b === me) { continue; }
+    var base = { teams: teams, sched: sched, remaining: remaining, seats: seats, iters: 900, seed: seed, each: each };
+    base.force = { a: a, b: b, win: true }; var A = _phSim(base);
+    base.force = { a: a, b: b, win: false }; var B = _phSim(base);
+    if (!A || !B) { continue; }
+    var d = A[me].odds - B[me].odds;
+    if (Math.abs(d) < 0.015) { continue; }
+    out.push({ f: names[d > 0 ? a : b], ag: names[d > 0 ? b : a], d: Math.abs(d) });
+  }
+  out.sort(function (x, y) { return y.d - x.d; });
+  return out;
+}
+// FIRST -- who you would draw if the bracket were set today.
+function _phFirst(field, myKey, P) {
+  var n = field.length, size = 1, i, me = null;
+  while (size < n) { size *= 2; }
+  for (i = 0; i < n; i++) { if (field[i].key === myKey) { me = field[i]; } }
+  if (!me) { return null; }
+  var os = size + 1 - me.seed;
+  if (os > n) { return { bye: true }; }
+  var p = null; try { p = P(myKey, field[os - 1].key); } catch (e) { p = null; }
+  return { bye: false, name: field[os - 1].name, seed: os, p: p };
+}
 function _phSwing(teams, sched, remaining, seats, me, each, seed) {
   if (!sched || !sched[0] || me < 0) { return null; }
   var opp = -1, i;
@@ -270971,7 +271020,18 @@ function _phYahoo(lk) {
     for (i = 0; i < seats && i < out.order.length; i++) { field.push({ key: out.order[i].teamKey, name: out.order[i].name, seed: out.order[i].seed }); }
     R.br = _phBracket(field, function (a, b) { return _tqProb(league, keys, a, b); }, _ptReseeds(league), _poSeed(lk, cur) + 9);
     if (R.br) { R.title = R.br.title[myKey] || 0; R.myKey = myKey; }
+    if (R.inField) { R.first = _phFirst(field, myKey, function (a, b) { return _tqProb(league, keys, a, b); }); }
   } catch (e2) { R.br = null; }
+  try {   // ROAD -- the fixtures left, from the stored schedule
+    var sst = _poSchLoad(lk), kix = {}, wkP = [], recsS = [], nmS = [], miS = -1, endS = _poRegEnd(league), wS, pS;
+    for (i = 0; i < keys.length; i++) { kix[keys[i]] = i; recsS.push(_poRec(ld.allTeams[keys[i]].record)); nmS.push(ld.allTeams[keys[i]].name || '?'); if (keys[i] === myKey) { miS = i; } }
+    for (wS = cur; wS <= endS; wS++) {
+      var prs = (sst && sst.s && sst.s[String(wS)]) || [], one = [];
+      for (pS = 0; pS < prs.length; pS++) { if (kix[prs[pS][0]] != null && kix[prs[pS][1]] != null) { one.push([kix[prs[pS][0]], kix[prs[pS][1]]]); } }
+      wkP.push(one);
+    }
+    if (miS >= 0 && wkP.length) { R.sos = _phSos(recsS, wkP, miS, nmS); R.week0 = cur; }
+  } catch (eS) {}
   try {
     var S = o.strength && o.strength.teams;
     if (o.kind === 'pts' && S && o.remaining > 0) {
@@ -270987,6 +271047,9 @@ function _phYahoo(lk) {
         var tr = _phSim({ teams: teams, sched: sch, remaining: o.remaining, seats: seats, iters: 3000, seed: _poSeed(lk, cur) + 57, each: 0, track: mi });
         if (tr && tr.track) { R.fin = _phFinishes(tr.track, teams[mi], o.remaining, 1, 3000); }
       } catch (e4) {}
+      try {   // ROOT
+        if (R.odds != null && R.odds > 0.03 && R.odds < 0.97) { var nmR = []; for (i = 0; i < keys.length; i++) { nmR.push(ld.allTeams[keys[i]].name || '?'); } R.root = _phRoot(teams, sch, o.remaining, seats, mi, 0, _poSeed(lk, cur) + 71, nmR); }
+      } catch (e6) {}
     }
   } catch (e3) { R.swing = null; }
   try {   // CLINCH -- the arithmetic, for every kind of league
@@ -271006,7 +271069,26 @@ function _phEspn(row) {
   R.team = st[mi].teamName || row.name || ''; R.seed = mi + 1; R.n = st.length; R.seats = ps.teams; R.record = st[mi].record || ''; R.inField = (mi < ps.teams);
   var cats = espIsCats(row), each = (cats && espIsEachCategory(row)) ? 1 : 0, nC = 0;
   if (each) { var items = ((((row.raw || {}).settings || {}).scoringSettings) || {}).scoringItems || []; nC = items.length || 9; }
-  if (cur > ps.lastRegular) { R.state = 'over'; return R; }
+  if (cur > ps.lastRegular) {
+    R.state = 'over';
+    try {   // PLAYOFFWEEK -- this period's game, and which ladder it is on
+      var rd = Math.floor((cur - ps.startPeriod) / Math.max(1, ps.roundLen)), po = { round: rd, rounds: ps.rounds, tier: '', found: false };
+      for (i = 0; i < j.schedule.length; i++) {
+        var pm = j.schedule[i] || {}, pa = pm.away, ph = pm.home;
+        if (Number(pm.matchupPeriodId) !== cur) { continue; }
+        var mineA = pa && String(pa.teamId) === keys[mi], mineH = ph && String(ph.teamId) === keys[mi];
+        if (!mineA && !mineH) { continue; }
+        var meS = mineA ? pa : ph, opS = mineA ? ph : pa;
+        po.found = true; po.tier = String(pm.playoffTierType || '').toUpperCase();
+        if (opS && opS.teamId != null && ix[String(opS.teamId)] != null) { po.opp = st[ix[String(opS.teamId)]].teamName || ''; }
+        else { po.bye = true; }
+        if (cats) { var c1 = meS.cumulativeScore || {}, c2 = (opS && opS.cumulativeScore) || {}; po.my = (c1.wins || 0) + '-' + (c1.losses || 0) + '-' + (c1.ties || 0); po.their = (c2.wins || 0) + '-' + (c2.losses || 0) + '-' + (c2.ties || 0); }
+        else { po.my = (Number(meS.totalPoints) || 0).toFixed(1); po.their = ((opS && Number(opS.totalPoints)) || 0).toFixed(1); }
+      }
+      R.po = po;
+    } catch (ePo) {}
+    return R;
+  }
   R.left = Math.max(0, ps.lastRegular - cur + 1);
   var scores = {}, played = 0, sched = [], w;
   for (i = 0; i < keys.length; i++) { scores[keys[i]] = []; }
@@ -271054,7 +271136,15 @@ function _phEspn(row) {
     for (i = 0; i < ps.teams && i < keys.length; i++) { field.push({ key: keys[i], name: st[i].teamName || ('Team ' + keys[i]), seed: i + 1 }); }
     R.br = _phBracket(field, function (x, y) { return _poMatchupProb(S.teams[x], S.teams[y]); }, ps.reseed, seed + 9);
     if (R.br) { R.title = R.br.title[keys[mi]] || 0; R.myKey = keys[mi]; }
+    if (R.inField) { R.first = _phFirst(field, keys[mi], function (x, y) { return _poMatchupProb(S.teams[x], S.teams[y]); }); }
   } catch (e) { R.br = null; }
+  try {   // ROAD and ROOT
+    var nmE = [], wkE = [];
+    for (i = 0; i < keys.length; i++) { nmE.push(st[i].teamName || ('Team ' + keys[i])); }
+    for (w = 0; w < sched.length; w++) { wkE.push(sched[w] || []); }
+    R.sos = _phSos(teams, wkE, mi, nmE); R.week0 = cur;
+    if (R.odds != null && R.odds > 0.03 && R.odds < 0.97) { R.root = _phRoot(teams, sched, R.left, ps.teams, mi, each ? nC : 0, seed + 71, nmE); }
+  } catch (eR) {}
   try {
     R.swing = _phSwing(teams, sched, R.left, ps.teams, mi, each ? nC : 0, seed + 31);
     if (R.swing) { R.opp = st[R.swing.opp].teamName || ''; R.weekP = _poMatchupProb(S.teams[keys[mi]], S.teams[keys[R.swing.opp]]); }
@@ -271106,7 +271196,20 @@ function _phPump() {
   var lk = cur.lk, league = _duLeague(lk), go = function () {
     var ld = skLeagueData[lk] || {}, el = '';
     try { el = _poEligible(league, ld); } catch (e) { el = ''; }
-    if (el !== 'ok') { var R0; try { R0 = _phYahoo(lk); } catch (e0) { R0 = cur; } R0.state = (el === 'over') ? 'over' : (el === 'early' ? 'early' : 'none'); _phFinish(id, R0); return; }
+    if (el !== 'ok') {
+      var R0; try { R0 = _phYahoo(lk); } catch (e0) { R0 = cur; }
+      R0.state = (el === 'over') ? 'over' : (el === 'early' ? 'early' : 'none');
+      if (el === 'over') {
+        try {   // PLAYOFFWEEK
+          var mY = ld.matchup || {}, endY = _poRegEnd(league), cwY = parseInt(league.current_week, 10) || 0, seatsY = _poSeats(league), rnY = 0, qY = seatsY;
+          while (qY > 1) { qY = Math.ceil(qY / 2); rnY++; }
+          R0.po = { round: Math.max(0, cwY - endY - 1), rounds: rnY, tier: '', found: !!(mY.hasMatchup && mY.oppTeamKey), opp: mY.oppName || '' };
+          if (_poKind(league) === 'pts') { R0.po.my = (mY.myScore != null) ? Number(mY.myScore).toFixed(1) : ''; R0.po.their = (mY.oppScore != null) ? Number(mY.oppScore).toFixed(1) : ''; try { R0.po.wp = _skWinProbPct(league, mY); } catch (eW) {} }
+          else { R0.po.my = (mY.wins != null) ? (mY.wins + '-' + mY.losses + '-' + (mY.ties || 0)) : ''; R0.po.their = ''; }
+        } catch (ePY) {}
+      }
+      _phFinish(id, R0); return;
+    }
     if (!_poOdds[lk] && !_poInflight[lk]) { try { _poKick(league, ld, ld.allTeams || {}); } catch (e1) {} }
     var tries = 0, tick = function () {
       tries++;
@@ -271146,6 +271249,16 @@ function _phDetail(R, withTree) {
   if (R.fin && R.fin.length && !(R.sc && (R.sc.clinched || R.sc.out))) {
     h += '<div class="ph-fr hd"><div>IF YOU FINISH</div><div></div><span>GET IN</span><em>HOW LIKELY</em></div>';
     for (i = 0; i < R.fin.length; i++) { var f = R.fin[i]; h += '<div class="ph-fr"><div>' + f.lab + '</div><div class="t"><u style="width:' + Math.max(2, f.p * 100).toFixed(0) + '%;background:' + _phCol(f.p) + '"></u></div><span style="color:' + _phCol(f.p) + '">' + _phPct(f.p) + '</span><em>' + _phPct(f.share) + '</em></div>'; }
+  }
+  if (R.first) { h += '<div class="ln" style="margin-top:8px">If the playoffs started today: ' + (R.first.bye ? '<b class="g">a first-round bye</b>.' : ('you would play <b>#' + R.first.seed + ' ' + skEscape(R.first.name) + '</b>' + (R.first.p != null ? ', <b class="' + (R.first.p >= 0.5 ? 'g' : 'r') + '">' + Math.round(R.first.p * 100) + '%</b> to win.' : '.'))) + '</div>'; }
+  if (R.sos) {
+    var hard = R.sos.rank <= Math.ceil(R.sos.of / 3), soft = R.sos.rank > R.sos.of - Math.ceil(R.sos.of / 3), ch = '';
+    for (i = 0; i < R.sos.list.length && i < 8; i++) { var g = R.sos.list[i]; ch += '<i class="' + (g.pct >= 0.6 ? 'r' : (g.pct <= 0.4 ? 'g' : '')) + '">W' + (R.week0 + g.w) + ' ' + skEscape(String(g.name).slice(0, 12)) + ' ' + g.pct.toFixed(3).replace(/^0/, '') + '</i>'; }
+    h += '<div class="ph-fr hd" style="grid-template-columns:1fr"><div>THE ROAD AHEAD</div></div><div class="ln">Opponents left average <b>' + R.sos.avg.toFixed(3).replace(/^0/, '') + '</b>: the <b class="' + (hard ? 'r' : (soft ? 'g' : 'y')) + '">' + _phOrd(R.sos.rank) + ' hardest</b> run-in of ' + R.sos.of + '.</div><div class="ph-chs">' + ch + '</div>';
+  }
+  if (R.root && R.root.length) {
+    h += '<div class="ph-fr hd" style="grid-template-columns:1fr"><div>ROOT FOR THIS WEEK</div></div>';
+    for (i = 0; i < R.root.length && i < 5; i++) { h += '<div class="ln"><b class="g">' + skEscape(R.root[i].f) + '</b> over ' + skEscape(R.root[i].ag) + ' <b class="y">+' + Math.round(R.root[i].d * 100) + '</b></div>'; }
   }
   if (withTree && R.br && R.inField) { h += '<div style="margin-top:9px">' + _phTree(R, true) + '</div>'; }
   return h + '<a class="ph-open" onclick="_phOpen(\'' + R.id + '\')">OPEN THIS LEAGUE \u203A</a></div>';
@@ -271191,11 +271304,11 @@ function _phTree(R, bare) {
 function _phRender() {
   var S = _phSt, body = document.getElementById('phBody');
   if (!body || !S.open) { return; }
-  var all = [], i, R, exp = 0, tit = 0, bub = 0, nOdds = 0, sports = {}, waiting = S.queue.length + (S.busy ? 1 : 0), over = 0;
+  var all = [], i, R, exp = 0, tit = 0, bub = 0, nOdds = 0, sports = {}, waiting = S.queue.length + (S.busy ? 1 : 0), over = 0, PO = [];
   for (i = 0; i < S.ids.length; i++) {
     R = S.rows[S.ids[i]];
     if (!R || R.state === 'wait' || R.state === 'none' || R.seed == null) { continue; }
-    if (R.state === 'over') { over++; continue; }
+    if (R.state === 'over') { over++; if (R.po) { PO.push(R); } continue; }
     all.push(R); sports[R.sport] = (sports[R.sport] || 0) + 1;
     if (R.odds != null) { nOdds++; exp += R.odds; if (R.odds >= 0.25 && R.odds < 0.75) { bub++; } }
     if (R.title != null && R.inField) { tit += R.title; }
@@ -271206,11 +271319,26 @@ function _phRender() {
   h += '<div class="ph-tabs">';
   for (i = 0; i < tabs.length; i++) { h += '<button type="button" class="' + (S.tab === tabs[i][0] ? 'on' : '') + '" onclick="_phSet(\'tab\',\'' + tabs[i][0] + '\')">' + tabs[i][1] + '</button>'; }
   h += '</div>';
+  var poH = '';
+  if (PO.length) {
+    var RN = ['FIRST ROUND', 'QUARTERFINAL', 'SEMIFINAL', 'FINAL'];
+    poH = '<div class="ph-sec">IN THE PLAYOFFS NOW <span>THIS WEEK’S GAME</span></div><div class="ph-card">';
+    for (i = 0; i < PO.length; i++) {
+      R = PO[i];
+      var p0 = R.po, rn = (p0.round < p0.rounds) ? RN[Math.max(0, 4 - p0.rounds + p0.round)] : 'AFTER THE FINAL';
+      var tier = /CONSOL|LOSER/.test(p0.tier) ? 'consolation' : (/WINNER/.test(p0.tier) ? 'championship bracket' : (R.plat === 'yahoo' ? (R.inField ? 'made the field as #' + R.seed : 'finished #' + R.seed + ', outside the field') : ''));
+      poH += '<div class="ph-po" onclick="_phOpen(\'' + R.id + '\')"><div>' + skEscape(R.team) + '<small>' + skEscape(String(R.sport).toUpperCase() + (R.plat === 'espn' ? ' · ESPN' : '') + ' · ' + rn + (tier ? ' · ' + tier : '')) + '</small><small>' +
+        (p0.found ? (p0.bye ? 'Bye this round' : ('v ' + skEscape(p0.opp || 'opponent') + (p0.wp != null ? ' · ' + Math.round(p0.wp) + '% to win' : ''))) : 'No game this week: eliminated, or the bracket has not been posted') + '</small></div>' +
+        '<b>' + ((p0.found && !p0.bye && p0.my !== '' && p0.my != null) ? (skEscape(String(p0.my)) + (p0.their !== '' && p0.their != null ? ' <em>v</em> ' + skEscape(String(p0.their)) : '')) : '') + '</b></div>';
+    }
+    poH += '</div><div class="ph-say z">Tap one to open that league. Yahoo does not say here which bracket a game belongs to, so those show how you finished the regular season instead.</div>';
+  }
   if (!all.length) {
-    body.innerHTML = h + '<div class="ph-say z">' + (waiting ? 'Nothing to show yet.' : 'No head-to-head league with a playoff bracket is loaded. Open Skipper’s home so your leagues load, then come back.') + '</div>';
+    body.innerHTML = h + poH + '<div class="ph-say z">' + (waiting ? 'Nothing to show yet.' : 'No head-to-head league with a playoff bracket is loaded. Open Skipper’s home so your leagues load, then come back.') + '</div>';
     return;
   }
   if (S.tab === 'now') {
+    h += poH;
     var sw = [], ti = [], mv = [];
     for (i = 0; i < all.length; i++) { R = all[i]; if (R.swing) { sw.push(R); } if (R.title != null && R.inField && R.title > 0) { ti.push(R); } if (R.move != null && Math.abs(R.move) >= 0.03) { mv.push(R); } }
     sw.sort(function (a, b) { return (b.swing.win - b.swing.lose) - (a.swing.win - a.swing.lose); });
@@ -271224,6 +271352,22 @@ function _phRender() {
       }
       h += '</div><div class="ph-say">' + skEscape(sw[0].team) + ' is your biggest game of the week: ' + Math.round((sw[0].swing.win - sw[0].swing.lose) * 100) + ' points of playoff odds ride on it.</div>';
     } else { h += '<div class="ph-say z">' + (waiting ? 'This week’s swings appear as each league finishes.' : 'No league has a week left where a result can be weighed.') + '</div>'; }
+    var RT = [], q2;
+    for (i = 0; i < all.length; i++) { R = all[i]; for (q2 = 0; R.root && q2 < R.root.length && q2 < 3; q2++) { RT.push({ R: R, x: R.root[q2] }); } }
+    RT.sort(function (a, b) { return b.x.d - a.x.d; });
+    if (RT.length) {
+      h += '<div class="ph-sec">WHO TO ROOT FOR <span>OTHER GAMES THIS WEEK · ODDS GAINED</span></div><div class="ph-card">';
+      for (i = 0; i < RT.length && i < 10; i++) { h += '<div class="ph-rw mv" onclick="_phGo(\'' + RT[i].R.id + '\')"><i></i><div>' + skEscape(RT[i].x.f) + ' <span style="color:rgba(255,255,255,0.45);font-weight:600">over</span> ' + skEscape(RT[i].x.ag) + '<small>' + skEscape(String(RT[i].R.sport).toUpperCase() + ' · for ' + RT[i].R.team) + '</small></div><span class="g">+' + Math.round(RT[i].x.d * 100) + '</span></div>'; }
+      h += '</div><div class="ph-say z">Each other game in your league was played both ways; the number is how many points of playoff odds the better result is worth to you.</div>';
+    }
+    var RD = [];
+    for (i = 0; i < all.length; i++) { R = all[i]; if (R.sos && R.odds != null && R.odds >= 0.1 && R.odds <= 0.9) { RD.push(R); } }
+    RD.sort(function (a, b) { return b.sos.avg - a.sos.avg; });
+    if (RD.length) {
+      h += '<div class="ph-sec">THE ROAD AHEAD <span>LEAGUES STILL IN DOUBT · HARDEST FIRST</span></div><div class="ph-card">';
+      for (i = 0; i < RD.length && i < 8; i++) { R = RD[i]; h += '<div class="ph-rw" onclick="_phGo(\'' + R.id + '\')"><i>#' + R.seed + '</i><div>' + skEscape(R.team) + '<small>' + skEscape(String(R.sport).toUpperCase() + ' · ' + _phOrd(R.sos.rank) + ' hardest of ' + R.sos.of + ' · ' + R.sos.list.length + ' left') + '</small></div><div class="t"><u style="width:' + Math.max(2, R.sos.avg * 100).toFixed(0) + '%;background:' + (R.sos.avg >= 0.55 ? '#f87171' : (R.sos.avg <= 0.45 ? '#4ade80' : '#f5c518')) + '"></u></div><span>' + R.sos.avg.toFixed(3).replace(/^0/, '') + '</span></div>' + (S.sel === R.id ? _phDetail(R, true) : ''); }
+      h += '</div>';
+    }
     var cw = [];
     for (i = 0; i < all.length; i++) { R = all[i]; if (R.sc && !R.sc.clinched && !R.sc.out && ((R.sc.magic != null && R.sc.magic <= Math.max(2, R.sc.per)) || (R.sc.tragic != null && R.sc.tragic <= Math.max(2, R.sc.per)))) { cw.push(R); } }
     if (cw.length) {
@@ -271249,6 +271393,7 @@ function _phRender() {
       h += '</div>';
     }
   } else if (S.tab === 'board') {
+    h += poH;
     var sp = ['nfl', 'nba', 'nhl', 'mlb'], G = [['LOOKING GOOD', []], ['ON THE BUBBLE', []], ['LONG SHOTS', []], ['NO ODDS YET', []]];
     h += '<div class="ph-pl"><button type="button" class="' + (S.sport === 'all' ? 'on' : '') + '" onclick="_phSet(\'sport\',\'all\')">ALL ' + all.length + '</button>';
     for (i = 0; i < sp.length; i++) { if (sports[sp[i]]) { h += '<button type="button" class="' + (S.sport === sp[i] ? 'on' : '') + '" onclick="_phSet(\'sport\',\'' + sp[i] + '\')">' + sp[i].toUpperCase() + ' ' + sports[sp[i]] + '</button>'; } }
@@ -271261,7 +271406,7 @@ function _phRender() {
       for (var q = 0; q < G[i][1].length; q++) { h += _phRow(G[i][1][q]); }
       h += '</div>';
     }
-    h += '<div class="ph-say z">Tap a league for its scenarios and tree.' + (over ? ' ' + over + ' league' + (over === 1 ? ' is' : 's are') + ' already in the playoffs and not listed.' : '') + '</div>';
+    h += '<div class="ph-say z">Tap a league for its scenarios and tree.' + '' + '</div>';
   } else {
     var T = [];
     for (i = 0; i < all.length; i++) { if (all[i].br && all[i].inField) { T.push(all[i]); } }
