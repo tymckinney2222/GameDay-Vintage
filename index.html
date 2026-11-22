@@ -184259,7 +184259,8 @@ var _sgSetTried = {};
 function _sgWhy(league, leagueData) {
   try {
     var lk = league.league_key, e = _poEligible(league, leagueData);
-    if (_poFailed[lk]) { return 'chances unavailable · this season’s scores did not load'; }
+    if (_poFailed[lk]) { return 'chances unavailable \u00b7 ' + (_poWhy[lk] || 'this season\u2019s scores did not load'); }
+    if (!_poTeamsReady(lk, leagueData)) { return 'waiting for the league\u2019s teams\u2026'; }
     if (e === 'settings') { return _sgSetTried[lk] === 2 ? 'chances unavailable · no playoff settings for this league' : 'loading league settings…'; }
     if (e === 'over') { return 'the regular season is over'; }
     if (e === 'early') { return 'chances start after the first finished week'; }
@@ -184281,7 +184282,8 @@ function _sgEnsure(league, leagueData) {
       if (el0 && el0.innerHTML.indexOf('sg-wait') >= 0) { paint(); }
       return;
     }
-    if (_poFailed[lk] || _sgPoll[lk]) { return; }
+    if (_sgPoll[lk]) { return; }
+    if (_poFailed[lk] && Date.now() - (_poFailAt[lk] || 0) < 15000) { return; }
     var elig = _poEligible(league, leagueData);
     if (elig === 'settings' && !_sgSetTried[lk] && typeof ensureLeagueSettings === 'function') {
       _sgSetTried[lk] = 1;
@@ -184293,11 +184295,17 @@ function _sgEnsure(league, leagueData) {
     }
     if (elig !== 'ok') { return; }
     _sgPoll[lk] = 1;
-    if (!_poInflight[lk]) { _poKick(league, leagueData, leagueData.allTeams || {}); }
+    var kicked = false, kick = function () {
+      var ld = (skLeagueData && skLeagueData[lk]) || leagueData;
+      if (kicked || _poInflight[lk] || !_poTeamsReady(lk, leagueData)) { return; }
+      kicked = true; _poKick(league, ld, ld.allTeams || {});
+    };
+    kick();
     var tries = 0, tick = function () {
       tries++;
       if (_poOdds[lk]) { _sgPoll[lk] = 0; paint(); return; }
-      if (_poFailed[lk] || tries > 90) { _sgPoll[lk] = 0; paint(); return; }
+      if (!kicked) { kick(); }
+      if ((kicked && _poFailed[lk]) || tries > 90) { _sgPoll[lk] = 0; paint(); return; }
       setTimeout(tick, 700);
     };
     setTimeout(tick, 700);
@@ -184683,13 +184691,24 @@ function _tqHtml(league, leagueData, out, seats, myKey, br) {
 function _tqEnsure(league, leagueData) {
   try {
     var lk = league.league_key;
-    if (_poOdds[lk] || _poFailed[lk] || _tqPoll[lk] || _poEligible(league, leagueData) !== 'ok') { return; }
+    if (_poOdds[lk]) {   // POSTICKY -- odds that arrived by another road still have to reach this page
+      try { if (!document.querySelector('.tq-rd') && skState && skState.activeLeagueKey === lk) { _ptRepaint(lk); } } catch (eRp) {}
+      return;
+    }
+    if (_tqPoll[lk] || _poEligible(league, leagueData) !== 'ok') { return; }
+    if (_poFailed[lk] && Date.now() - (_poFailAt[lk] || 0) < 15000) { return; }
     _tqPoll[lk] = 1;
-    if (!_poInflight[lk]) { _poKick(league, leagueData, leagueData.allTeams || {}); }
+    var kicked = false, kick = function () {
+      var ld = (skLeagueData && skLeagueData[lk]) || leagueData;
+      if (kicked || _poInflight[lk] || !_poTeamsReady(lk, leagueData)) { return; }
+      kicked = true; _poKick(league, ld, ld.allTeams || {});
+    };
+    kick();
     var tries = 0, tick = function () {
       tries++;
       if (_poOdds[lk]) { _tqPoll[lk] = 0; if (skState && skState.activeLeagueKey === lk) { _ptRepaint(lk); } return; }
-      if (_poFailed[lk] || tries > 30) { _tqPoll[lk] = 0; return; }
+      if (!kicked) { kick(); }
+      if ((kicked && _poFailed[lk]) || tries > 90) { _tqPoll[lk] = 0; return; }
       setTimeout(tick, 700);
     };
     setTimeout(tick, 700);
@@ -213428,6 +213447,10 @@ var PO_CAT_ITERS = 5000;
 var _poOdds = {};        // leagueKey -> last computed result (session)
 var _poInflight = {};    // leagueKey -> true while fetching
 var _poFailed = {};      // leagueKey -> reason, so it stops retrying forever
+var _poFailAt = {}, _poWhy = {};   // POSTICKY -- when it failed, and why in words
+function _poTeamsReady(lk, leagueData) {
+  try { var ld = (skLeagueData && skLeagueData[lk]) || leagueData || {}; return Object.keys(ld.allTeams || {}).length >= 4; } catch (e) { return false; }
+}
 var _poMyKey = null;     // whose card this is, for the SOS line
 var _poLast = {};        // leagueKey -> what the card was built from
 var PO_DIVSEED_PREFIX = 'sk_po_divseed_v1_';
@@ -214215,7 +214238,12 @@ function _poKick(league, leagueData, allTeams) {
   // without refetching anything
   _poLast[lk] = { league: league, leagueData: leagueData, allTeams: allTeams };
   if (!lk || _poInflight[lk]) { return; }
-  if (_poFailed[lk]) { _poFill(lk, ''); return; }
+  if (_poFailed[lk]) {
+    // POSTICKY -- try again once fifteen seconds have passed
+    if (Date.now() - (_poFailAt[lk] || 0) < 15000) { _poFill(lk, ''); return; }
+    _poFailed[lk] = null;
+  }
+  if (Object.keys(allTeams || {}).length < 4) { return; }   // the league's teams are not here yet: not a failure, just early
   if (_poOdds[lk] && _poOdds[lk].week === (parseInt(league.current_week, 10) || 1)) {
     _poFill(lk, _poCardHtml(league, _poOdds[lk], allTeams,
       leagueData.team && leagueData.team.team_key));
@@ -214232,18 +214260,29 @@ function _poKick(league, leagueData, allTeams) {
     var out = null;
     try { out = _poCompute(league, allTeams, store, both.sch); } catch (e) { out = null; }
     _poInflight[lk] = false;
-    if (!out) { _poFailed[lk] = 'no data'; _poFill(lk, ''); return; }
+    if (!out) {
+      _poFailed[lk] = 'no data'; _poFailAt[lk] = Date.now();
+      try {
+        var nWk = 0, kW; for (kW in ((store && store.w) || {})) { if (store.w.hasOwnProperty(kW)) { nWk++; } }
+        _poWhy[lk] = (Object.keys(allTeams || {}).length < 4) ? 'the league\u2019s teams had not loaded' : (!nWk ? 'no finished weeks came back from Yahoo' : (!_poSeats(league) ? 'no playoff seats in the league settings' : 'the model returned nothing from ' + nWk + ' weeks'));
+      } catch (eW) { _poWhy[lk] = 'no data'; }
+      _poFill(lk, ''); return;
+    }
     _poOdds[lk] = out;
     // WPCOLD -- the bar was drawn before this existed. Everything that
     // reads the strength model has to be told, not just the card this
     // function was written to fill.
     try { _skWinProbRefresh(lk); } catch (eWp) {}
     try { _poRecordHistory(lk, out); } catch (e) {}
-    _poFill(lk, _poCardHtml(league, out, allTeams,
-      leagueData.team && leagueData.team.team_key));
+    try {   // POSTICKY -- a card that cannot be drawn must not throw away odds that were worked out
+      _poFill(lk, _poCardHtml(league, out, allTeams,
+        leagueData.team && leagueData.team.team_key));
+    } catch (eCard) { _poWhy[lk] = 'card: ' + String((eCard && eCard.message) || eCard).slice(0, 80); }
     try { if (document.querySelector('.sk-standings.sx-p, .sk-standings.sx-c')) { skRefreshStandingsInPlace(lk); } } catch (eRp) {}   // STANDX
-  })['catch'](function () {
+  })['catch'](function (ePo) {
     _poInflight[lk] = false;
+    _poFailAt[lk] = Date.now();
+    _poWhy[lk] = 'error: ' + String((ePo && ePo.message) || ePo).slice(0, 90);
     _poFailed[lk] = 'fetch';
     _poFill(lk, '');
   });
