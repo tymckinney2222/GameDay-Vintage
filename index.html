@@ -10588,6 +10588,20 @@
   .tcb-tbl tr.car td { font-weight: 800; border-top: 2px solid #1b2230; border-bottom: 0; }
   .tcb-say { font: 500 12.5px/1.45 'Outfit', sans-serif; text-align: center; color: #2a3342; }
   .pcd-card.tcb .pcd-rule { background: rgba(27,34,48,0.18); }
+  /* STATCASTCARD -- on the card-stock back of the trading card: dark ink */
+  .scx-gr { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+  .scx-gr div { border: 1.5px solid rgba(27,34,48,0.22); border-radius: 8px; padding: 7px 2px 6px; text-align: center; background: rgba(255,255,255,0.45); }
+  .scx-gr b { display: block; font: 800 26px/1 'Barlow Condensed', sans-serif; color: #1b2230; }
+  .scx-gr .hi b { color: #17804a; }
+  .scx-gr .lo b { color: #b4571a; }
+  .scx-gr i { display: block; font: 800 8.5px/1 ui-monospace, monospace; font-style: normal; letter-spacing: 0.12em; color: #6a7383; margin-top: 5px; }
+  .scx-lk { display: grid; grid-template-columns: 38px 1fr auto; gap: 8px; align-items: center; font: 700 10px/1 ui-monospace, monospace; color: #3b4556; }
+  .scx-lk span { letter-spacing: 0.08em; color: #6a7383; }
+  .scx-lkt { height: 9px; border-radius: 5px; background: rgba(27,34,48,0.13); position: relative; }
+  .scx-lkt u { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 5px; }
+  .scx-lkt u.g { background: #2aa35f; } .scx-lkt u.a { background: #d98a3a; } .scx-lkt u.n { background: #5c86c9; }
+  .scx-lkt em { position: absolute; top: -3px; width: 15px; height: 15px; margin-left: -7px; border-radius: 50%; background: #1b2230; border: 2px solid #f4f0e6; }
+  .scx-say { font: 600 12px/1.35 'Outfit', sans-serif; text-align: center; color: #2a3342; }
   .pcd-card.tcb .pcd-lab { color: #6a7383; }
   .pcd-card.tcb .pcd-lab em { color: #8b93a1; }
   .pcd-card.tcb .pcd-none { color: #4a5464; }
@@ -78516,6 +78530,7 @@ function renderPlayerModal(athleteId, overview, statsData, gamelogData, league, 
       id: athleteId, name: name, jersey: jersey, pos: pos,
       shot: headshot, teamName: teamName, teamLogo: teamLogo,
       accent: teamColor, extra: fantasyLogosHtml,
+      lg: league,   // STATCASTCARD -- which league he plays in; the header does not draw it
       // PMBIO -- whatever the overview happens to carry goes in now, and
       // _pmBioLoad fills the rest in from the athlete endpoint once the
       // card has painted.
@@ -115740,10 +115755,69 @@ function _pcFrontHtml(S, kpis, sk) {
   return h + '</div></div>';
 }
 
+// STATCASTCARD -- his tools graded and his luck, on the back of an MLB player's trading card.
+// The card knows a name; the baseball proxy finds the man and answers with his Statcast.
+var _scxCards = {};
+function _scxCardGet(name) {
+  var key = String(name || '').toLowerCase(), now = (new Date()).getTime(), c = _scxCards[key];
+  if (c && (c.ok || c.busy || now - c.at < 300000)) { return c.ok ? c : null; }
+  _scxCards[key] = { busy: 1, at: now };
+  var done = function (j) {
+    var o = (j && j.ok) ? j : { ok: false };
+    o.at = (new Date()).getTime();
+    _scxCards[key] = o;
+    if (!o.ok) { return; }
+    try {
+      var pc = document.getElementById('pcOv');
+      if (pc && pc.classList.contains('open') && _pcCur && String(_pcCur.name || '').toLowerCase() === key) { pcRender(); }
+    } catch (e) {}
+  };
+  try {
+    fetch(BASEBALL_PROXY_BASE + '/card?name=' + encodeURIComponent(name)).then(function (r) { return r.json(); }).then(function (j) { done(j); })['catch'](function () { done(null); });
+  } catch (e) { done(null); }
+  return null;
+}
+function _scxCardHtml(S) {
+  if (!S || !S.name || String(S.lg || S.tag || '').toUpperCase() !== 'MLB') { return ''; }
+  var D = _scxCardGet(S.name);
+  if (!D || !D.statcast) { return ''; }
+  var sc = D.statcast, pit = !!D.isPitcher, m = {}, i, p = sc.percentiles || [], h = '', any = false;
+  for (i = 0; i < p.length; i++) { m[p[i].name] = p[i].pct; }
+  var defs = pit ? [['STUFF', 'Whiff%'], ['CONTROL', 'BB%'], ['VELO', 'Fastball Velo'], ['CONTACT', 'Hard Hit%']] : [['HIT', 'xBA'], ['POWER', 'Barrel%'], ['SPEED', 'Sprint Speed'], ['EYE', 'Chase Rate']];
+  var cells = '';
+  for (i = 0; i < defs.length; i++) {
+    var pc = m[defs[i][1]], g = pc == null ? null : 20 + Math.round(pc * 0.6 / 5) * 5;
+    if (g != null) { any = true; }
+    cells += '<div class="' + (g == null ? '' : g >= 60 ? 'hi' : g <= 40 ? 'lo' : '') + '"><b>' + (g == null ? '—' : g) + '</b><i>' + defs[i][0] + '</i></div>';
+  }
+  if (any) { h += '<div class="pcd-lab">STATCAST TOOLS' + (sc.year ? ' · ' + _scxEsc(sc.year) : '') + '<em>20 TO 80 · 50 IS AVERAGE</em></div><div class="scx-gr">' + cells + '</div>'; }
+  var L = sc.luck, rows = '';
+  if (L) {
+    var set = [['AVG', L.ba, L.xba, 0.150, 0.350], ['SLG', L.slg, L.xslg, 0.250, 0.650], ['wOBA', L.woba, L.xwoba, 0.220, 0.450]];
+    for (i = 0; i < set.length; i++) {
+      var r = set[i];
+      if (r[1] == null || r[2] == null) { continue; }
+      var at = function (v, lo, hi) { return Math.max(2, Math.min(98, 100 * (v - lo) / (hi - lo))); };
+      var owed = pit ? r[1] - r[2] : r[2] - r[1], cls = owed > 0.012 ? 'g' : owed < -0.012 ? 'a' : 'n';
+      rows += '<div class="scx-lk"><span>' + r[0] + '</span><div class="scx-lkt"><u class="' + cls + '" style="width:' + at(r[2], r[3], r[4]) + '%"></u><em style="left:' + at(r[1], r[3], r[4]) + '%"></em></div><b>' + _scxF3(r[2]) + ' exp · ' + _scxF3(r[1]) + '</b></div>';
+    }
+    if (rows) {
+      var d = (L.woba != null && L.xwoba != null) ? (pit ? L.woba - L.xwoba : L.xwoba - L.woba) : 0, say;
+      if (d > 0.015) { say = pit ? 'He has allowed more than his contact deserved. Expect better.' : 'Hitting below his contact. Expect better.'; }
+      else if (d < -0.015) { say = pit ? 'He has allowed less than his contact deserved. Expect some fall back.' : 'Ahead of his contact. Expect some fall back.'; }
+      else { say = 'His results match his contact.'; }
+      h += '<div class="pcd-lab">LUCK' + (pit ? ' · WHAT HE ALLOWED' : '') + '<em>BAR EXPECTED · DOT ACTUAL</em></div>' + rows + '<div class="scx-say">' + say + '</div>';
+    }
+  }
+  return h ? h + '<div class="pcd-rule"></div>' : '';
+}
+
 function _pcBackHtml(S, owned, ser) {
   var _tcTop = '';
   try { _tcTop = _tcBackTop(S); } catch (eTB) { _tcTop = ''; }
-  var h = '<div class="pcd-card back tcb" onclick="pcFlip()"><div class="pcd-body">' + _tcTop +
+  var _scxTop = '';
+  try { _scxTop = _scxCardHtml(S); } catch (eSX) { _scxTop = ''; }   // STATCASTCARD
+  var h = '<div class="pcd-card back tcb" onclick="pcFlip()"><div class="pcd-body">' + _tcTop + _scxTop +
     '<div class="pcd-lab">LAST ' + (ser ? ser.rows.length : 10) + ' DAYS<em>FANTASY POINTS</em></div>';
   var i;
   if (ser && ser.empty) {
