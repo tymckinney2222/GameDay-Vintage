@@ -9060,6 +9060,9 @@
   .rlc-row .b { position: relative; height: 14px; background: rgba(255,255,255,0.05); border-radius: 4px; } .rlc-row .b:before { content: ""; position: absolute; left: 50%; top: -5px; bottom: -5px; width: 1px; background: rgba(255,255,255,0.25); } .rlc-row .b.s:before { display: none; } .rlc-row .b u { position: absolute; top: 0; height: 14px; border-radius: 4px; }
   .rlc-row > span { text-align: right; font: 900 11px/1 var(--sk-font-mono, monospace); }
   .rlc-d { display: none; align-items: center; gap: 8px; padding: 0 0 8px; font: 600 10px/1.4 'Outfit', Arial, sans-serif; color: rgba(255,255,255,0.65); } .rlc-d[style*="block"] { display: flex !important; } .rlc-d span { flex: 1; } .rlc-d button { min-height: 36px; padding: 0 12px; border-radius: 9px; border: 1px solid rgba(255,255,255,0.2); background: transparent; color: #fff; font: 800 9px/1 'Outfit', Arial, sans-serif; letter-spacing: 0.1em; cursor: pointer; }
+    .ep-head { display: flex; align-items: baseline; gap: 8px; margin: 18px 4px 8px; } .ep-head b { font: 900 12px/1 'Outfit', Arial, sans-serif; letter-spacing: 0.14em; color: #ef4444; } .ep-head span { font: 600 10px/1 'Outfit', Arial, sans-serif; color: rgba(255,255,255,0.45); }
+  .ep-clear { margin: 0 2px 6px; padding: 12px 14px; border-radius: 12px; border: 1px solid rgba(74,222,128,0.25); background: rgba(74,222,128,0.06); font: 700 11.5px/1.35 'Outfit', Arial, sans-serif; color: #4ade80; }
+  .ep-note { font: 500 10px/1.45 'Outfit', Arial, sans-serif; color: rgba(255,255,255,0.4); margin: 8px 4px 0; }
   #brfOverlay { z-index: 599; }
   #brfBody .g { color: #4ade80; } #brfBody .r { color: #f87171; } #brfBody .z { color: rgba(255,255,255,0.45); }
   .brf-card { background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.1); border-radius: 12px; padding: 11px 12px; margin-bottom: 9px; overflow: hidden; }
@@ -161478,6 +161481,92 @@ function skAddsListHtml() {
   return html + '</div>';
 }
 
+// ==================================================================
+//  ESPNPLAN -- ESPN leagues on the Plan tab. The roster ESPN sends
+//  already says which slot each player is in and whether he is hurt,
+//  so a starter who cannot play is flagged the way a Yahoo one is,
+//  with the healthy bench players who could take the slot.
+//  Empty slots and real-life benchings are not checked for ESPN.
+// ==================================================================
+var _epAsked = {}, _epLast = 0;
+function _epBad(it) {
+  var raw = String((it && it.injRaw) || '').toUpperCase();
+  if (raw === 'OUT') { return 'OUT'; }
+  if (raw === 'INJURY_RESERVE') { return 'IR'; }
+  if (raw === 'SUSPENSION') { return 'SUSP'; }
+  if (raw === 'DOUBTFUL') { return 'DOUBT'; }
+  return '';
+}
+function _epLeagues() {
+  var out = [], list = [], i;
+  try { list = (typeof extSyncedLeagues === 'function') ? (extSyncedLeagues() || []) : []; } catch (e) { list = []; }
+  if (skState.platform !== 'all' && skState.platform !== 'espn') { return out; }
+  for (i = 0; i < list.length; i++) {
+    var row = list[i];
+    if (!row || row.provider !== 'espn') { continue; }
+    try { if (_skIsDone(row.key)) { continue; } } catch (e1) {}
+    if (skState.sport && skState.sport !== 'all' && String(row.sport || '').toLowerCase() !== skState.sport) { continue; }
+    out.push(row);
+  }
+  return out;
+}
+function _epScan(row, today) {
+  if (!row.rosters || !row.rosters.byTeam) {
+    if (!_epAsked[row.key]) {
+      _epAsked[row.key] = 1;
+      try { espLoadRosters(row).then(function () { try { if (skState.mode === 'plan') { skRenderPlanCards(); } } catch (e1) {} }); } catch (e) {}
+    }
+    return { state: row._espRosterBusy || _epAsked[row.key] === 1 ? 'load' : 'none', issues: [] };
+  }
+  _epAsked[row.key] = 2;
+  var myIds = {}, k, items = null, issues = [], i, j;
+  try { myIds = (typeof _extMyIds === 'function') ? (_extMyIds(row) || {}) : (row.myTeamIds || {}); } catch (e2) { myIds = row.myTeamIds || {}; }
+  for (k in row.rosters.byTeam) { if (row.rosters.byTeam.hasOwnProperty(k) && myIds[k]) { items = row.rosters.byTeam[k].items || []; break; } }
+  if (!items) { return { state: 'none', issues: [] }; }
+  for (i = 0; i < items.length; i++) {
+    var it = items[i], bad = it.starter ? _epBad(it) : '';
+    if (!bad) { continue; }
+    var swaps = [];
+    for (j = 0; j < items.length; j++) {
+      var b = items[j];
+      if (b.starter || _epBad(b) || /^(IR|IL)/i.test(String(b.slot || ''))) { continue; }
+      if (today && b.noGame === true) { continue; }
+      if (b.elig && b.elig.indexOf(it.slot) !== -1) { swaps.push(b.name); }
+    }
+    issues.push({ slot: it.slot || '', name: it.name || '', status: bad, swaps: swaps });
+  }
+  return { state: 'ok', issues: issues };
+}
+function _epPlanHtml() {
+  _epLast = 0;
+  if (typeof skPlanDay !== 'undefined' && skPlanDay === 'adds') { return ''; }
+  var rows = _epLeagues(), today = (typeof skPlanDay === 'undefined' || skPlanDay === 'today'), i, j, h = '', cards = '', load = 0, ok = 0, tot = 0;
+  if (!rows.length) { return ''; }
+  for (i = 0; i < rows.length; i++) {
+    var row = rows[i], r = _epScan(row, today);
+    if (r.state === 'load') { load++; continue; }
+    if (r.state !== 'ok') { continue; }
+    ok++;
+    if (!r.issues.length) { continue; }
+    tot += r.issues.length;
+    var n = r.issues.length, body = '';
+    for (j = 0; j < n; j++) {
+      var is = r.issues[j];
+      body += '<div class="sk-plan-issue"><span class="sk-plan-issue-slot">' + skEscape(String(is.slot)) + '</span><span class="sk-plan-issue-name">' + skEscape(String(is.name)) + '</span><span class="sk-plan-issue-status il">' + skEscape(String(is.status)) + '</span></div>';
+      if (is.swaps.length) {
+        body += '<div class="sk-plan-swap"><span class="sk-plan-swap-arrow">↳</span><span class="sk-plan-swap-label">Start instead (' + skEscape(String(is.slot)) + '-eligible' + (today ? ', club not idle today' : '') + '):</span> <span class="sk-plan-swap-names">' + skEscape(is.swaps.slice(0, 5).join(', ')) + '</span></div>';
+      }
+    }
+    cards += '<div class="sk-plan-card" data-league-key="' + skEscape(String(row.key)) + '" onclick="extOpenLeague(\'' + String(row.key).replace(/'/g, '') + '\')">' +
+      '<div class="sk-plan-head"><div class="sk-plan-league">' + skEscape(String(row.name || 'ESPN league')) + '</div><div class="sk-plan-meta">' + skEscape(String(row.sport || '').toUpperCase()) + ' · ESPN</div></div>' +
+      '<div class="sk-plan-summary">' + n + ' active slot' + (n === 1 ? '' : 's') + ' need' + (n === 1 ? 's' : '') + ' attention</div><div class="sk-plan-issues">' + body + '</div></div>';
+  }
+  _epLast = tot;
+  h += '<div class="ep-head"><b>ESPN</b><span>' + ok + ' of ' + rows.length + (rows.length === 1 ? ' league' : ' leagues') + ' checked' + (load ? ' · loading ' + load + '…' : '') + '</span></div>' + cards;
+  if (!cards && !load && ok) { h += '<div class="ep-clear">✓ No ESPN starter is out, on IR, suspended or doubtful.</div>'; }
+  return h + '<div class="ep-note">ESPN leagues are checked for a starter who is out, on IR, suspended or doubtful. Empty slots and players benched in real life are checked for Yahoo only.</div>';
+}
+
 function skRenderPlanCards() {
   var realListEl = document.getElementById('skLeagueList');
   if (!realListEl) return;
@@ -161495,7 +161584,12 @@ function skRenderPlanCards() {
         '" onclick="skSetPlanDay(\'adds\')">Adds</button>' +
     '</div>';
   // Proxy so existing `listEl.innerHTML = …` writes auto-prepend the toggle.
-  var listEl = { set innerHTML(v) { realListEl.innerHTML = dayToggle + v; } };
+  var listEl = { set innerHTML(v) {
+    var _epH = '';   // ESPNPLAN
+    try { _epH = _epPlanHtml(); } catch (eEp) { _epH = ''; }
+    realListEl.innerHTML = dayToggle + v + _epH;
+    try { if (ctEl && _epLast && /^\u00b7\d+$/.test(ctEl.textContent)) { ctEl.textContent = '\u00b7' + (parseInt(ctEl.textContent.slice(1), 10) + _epLast); } } catch (eEc) {}
+  } };
   if (typeof skLoadWeeklyAdds === 'function') skLoadWeeklyAdds();
   if (skPlanDay === 'adds') {
     listEl.innerHTML = skAddsListHtml();
@@ -283572,6 +283666,7 @@ function espRosters(j, game, scoredIds, sport) {
         elig: (pl.eligibleSlots || []).map(function (x) { return _espSlotLabel(game, x, universal); })
                 .filter(function (x) { return !!x; }),
         starter: !_espIsBenchSlot(game, sid, universal),
+        injRaw: String(e.injuryStatus || pl.injuryStatus || ''),   // ESPNPLAN -- ESPN's own word, so day-to-day is not read as out
         injury: inj
       });
     }
