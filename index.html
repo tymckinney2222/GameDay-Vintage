@@ -78243,7 +78243,7 @@ function _l10xIp(v) {
 function _l10xEsc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
 function _l10xF3(v) { return (v < 1 && v >= 0) ? '.' + ('000' + Math.round(v * 1000)).slice(-3) : v.toFixed(3); }
 // The latest ten games that carry the label this kind of player must have, oldest first.
-function _l10xGames(src, must) {
+function _l10xGames(src, must, all) {
   if (!src) { return []; }
   var groups = [], i, j;
   var take = function (list) { for (var q = 0; q < (list || []).length; q++) { groups.push(list[q]); } };
@@ -78265,7 +78265,7 @@ function _l10xGames(src, must) {
     }
   }
   out.sort(function (a, b) { return (a.t != null && b.t != null) ? b.t - a.t : a.ord - b.ord; });
-  out = out.slice(0, 10).reverse();
+  out = (all ? out : out.slice(0, 10)).reverse();
   return out;
 }
 function _l10xGet(g, key) { var i = g.idx[key]; return i == null ? null : g.stats[i]; }
@@ -78323,11 +78323,111 @@ function _l10xRender(o) {
   return h + '</div><div class="l10x-note">' + _l10xEsc(o.note) + '</div></div>';
 }
 function _l10xSum(a) { var t = 0, i; for (i = 0; i < a.length; i++) { t += a[i]; } return t; }
+// L10XNFL -- football. ESPN's football log repeats its labels (YDS for passing and again for
+// rushing), so a column is found by its NAME first, then by category and label, and is left
+// out rather than guessed when neither is there. There are seventeen games at most, so the
+// boxes are the season; the verdict and the numbers on the right are his last three against it.
+function _l10xFbMaps(src) {
+  var N = {}, C = {}, L = {}, i, j, off = 0;
+  var names = (src && src.names) || [], labs = (src && src.labels) || [], cats = (src && src.categories) || [];
+  for (i = 0; i < names.length; i++) { var nm = String(names[i] || '').toLowerCase(); if (nm && N[nm] == null) { N[nm] = i; } }
+  for (i = 0; i < labs.length; i++) { var lb = String(labs[i] || '').toUpperCase(); if (lb && L[lb] == null) { L[lb] = i; } }
+  for (i = 0; i < cats.length; i++) {
+    var c = cats[i], cn = String((c && c.name) || '').toLowerCase(), ct = (c && c.count) || 0;
+    if (!ct) { continue; }
+    for (j = 0; j < ct && off + j < labs.length; j++) { var k = cn + ':' + String(labs[off + j] || '').toUpperCase(); if (C[k] == null) { C[k] = off + j; } }
+    off += ct;
+  }
+  return { N: N, C: C, L: L, dup: (function () { var seen = {}, d = {}; for (var q = 0; q < labs.length; q++) { var u = String(labs[q] || '').toUpperCase(); if (seen[u]) { d[u] = 1; } seen[u] = 1; } return d; })() };
+}
+function _l10xFb(gamelogData, rawGL, teamColor) {
+  var src = gamelogData, games = _l10xGames(src, [], true);
+  if (!games.length && rawGL) { src = rawGL; games = _l10xGames(src, [], true); }
+  if (!games.length) { return ''; }
+  var M = _l10xFbMaps(src), n = games.length, i;
+  // where a stat lives: names, then category:label, then a label that appears only once
+  var at = function (names, cl, label) {
+    var q;
+    for (q = 0; q < names.length; q++) { if (M.N[names[q]] != null) { return M.N[names[q]]; } }
+    for (q = 0; q < cl.length; q++) { if (M.C[cl[q]] != null) { return M.C[cl[q]]; } }
+    if (label && M.L[label] != null && !M.dup[label]) { return M.L[label]; }
+    return null;
+  };
+  var colAt = function (ix, fn) { if (ix == null) { return null; } var a = [], q; for (q = 0; q < n; q++) { var raw = games[q].stats[ix]; a.push(fn ? fn(raw) : _l10xNum(raw)); } return a; };
+  var I = {
+    pAtt: at(['passingattempts'], ['passing:ATT'], ''), pCmp: at(['completions'], ['passing:CMP'], 'CMP'), pYds: at(['passingyards'], ['passing:YDS'], ''),
+    pTd: at(['passingtouchdowns'], ['passing:TD'], ''), pInt: at(['interceptions'], ['passing:INT'], ''),
+    car: at(['rushingattempts'], ['rushing:CAR', 'rushing:ATT'], 'CAR'), rYds: at(['rushingyards'], ['rushing:YDS'], ''), rTd: at(['rushingtouchdowns'], ['rushing:TD'], ''),
+    rec: at(['receptions'], ['receiving:REC'], 'REC'), tgt: at(['receivingtargets'], ['receiving:TGTS', 'receiving:TGT'], 'TGTS'), cYds: at(['receivingyards'], ['receiving:YDS'], ''), cTd: at(['receivingtouchdowns'], ['receiving:TD'], ''),
+    tot: at(['totaltackles'], ['defensive:TOT', 'defense:TOT'], 'TOT'), solo: at(['solotackles'], ['defensive:SOLO', 'defense:SOLO'], 'SOLO'), sack: at(['sacks'], ['defensive:SACK', 'defensive:SACKS', 'defense:SACK'], ''),
+    dInt: at(['interceptions'], ['defensiveinterceptions:INT', 'interceptions:INT', 'defensive:INT'], ''), pd: at(['passesdefended'], ['defensive:PD', 'defensiveinterceptions:PD'], 'PD'), ff: at(['fumblesforced'], ['defensive:FF'], 'FF'),
+    fg: at(['fieldgoalsmade-fieldgoalattempts', 'fieldgoalsmade/fieldgoalattempts', 'fieldgoals'], ['kicking:FG'], 'FG'), fgl: at(['longfieldgoalmade'], ['kicking:LNG'], ''), xp: at(['extrapointsmade-extrapointattempts', 'extrapointsmade/extrapointattempts', 'extrapoints'], ['kicking:XP'], 'XP'), kpts: at(['totalkickingpoints'], ['kicking:PTS'], '')
+  };
+  var sumOf = function (ix) { var a = colAt(ix); return a ? _l10xSum(a) : 0; };
+  var kind = '';
+  if (I.pAtt != null && sumOf(I.pAtt) >= 10 && sumOf(I.pAtt) > sumOf(I.car)) { kind = 'qb'; }
+  else if (I.tot != null && sumOf(I.tot) > 0 && sumOf(I.car) + sumOf(I.rec) === 0) { kind = 'def'; }
+  else if (I.fg != null) { kind = 'k'; }
+  else if (I.car != null || I.rec != null) { kind = (sumOf(I.car) >= sumOf(I.rec) + sumOf(I.tgt) / 2) ? 'rb' : 'wr'; }
+  if (!kind) {
+    // a shape this does not know: say what came, small, so one screenshot settles it
+    var lb = (src.labels || []).slice(0, 14).join(' '), cn = [], q2;
+    for (q2 = 0; q2 < (src.categories || []).length; q2++) { cn.push(String(src.categories[q2].name || '') + ':' + (src.categories[q2].count || 0)); }
+    return '<div class="pm-l10-section l10x"><div class="pm-l10-title">Recent games</div><div class="l10x-note">Could not read this game log. ' + n + ' games · names ' + ((src.names || []).length) + ' · cats ' + _l10xEsc(cn.join(' ')) + ' · labels ' + _l10xEsc(lb) + '</div></div>';
+  }
+  var color = teamColor || '#e63946';
+  try { if (typeof _luminance === 'function' && _luminance(color) < 0.09) { color = '#9aa4b2'; } } catch (e2) {}
+  var show = Math.min(n, 10), s0 = n - show, boxes = [], rows = [], form = null, note = '';
+  var avg = function (a) { return a && a.length ? _l10xSum(a) / a.length : 0; };
+  var last3 = function (a) { var b = a.slice(Math.max(0, a.length - 3)); return b.length ? _l10xSum(b) / b.length : 0; };
+  var cut = function (a) { return a.slice(s0); };
+  var tone = function (v, base, good) { return good ? 'hot' : (base > 0 && v >= base * 1.25) ? 'hot' : (base > 0 && v <= base * 0.6) ? 'cold' : ''; };
+  // a row: the average a game over the season, the shown games as bars with that average dashed, and last three against it
+  var per = function (label, a, lo, dp) {
+    if (!a) { return; }
+    var m = avg(a), d = n >= 5 ? last3(a) - m : null;
+    rows.push(_l10xRow(label, m.toFixed(dp == null ? 1 : dp), cut(a), d, 1, lo, m));
+  };
+  var frac = function (raw) { var p = String(raw == null ? '' : raw).split(/[-\/]/); return [parseInt(p[0], 10) || 0, parseInt(p[1], 10) || 0]; };
+  if (kind === 'qb') {
+    var py = colAt(I.pYds) || [], ptd = colAt(I.pTd), pin = colAt(I.pInt), pc = colAt(I.pCmp), pa = colAt(I.pAtt), ry = colAt(I.rYds), by = avg(py);
+    for (i = s0; i < n; i++) { var tg = []; if (ptd && ptd[i]) { tg.push(ptd[i] + ' TD'); } if (pin && pin[i]) { tg.push(pin[i] + ' INT'); } boxes.push({ d: _l10xDay(games[i]), main: String(Math.round(py[i] || 0)), tag: tg.join(' · '), tone: (pin && pin[i] >= 2) ? 'cold' : tone(py[i] || 0, by, ptd && ptd[i] >= 3) }); }
+    if (n >= 5 && by > 0) { form = _l10xForm(last3(py) / by, 'last 3: ' + last3(py).toFixed(0) + ' pass yds a game', 'season ' + by.toFixed(0)); }
+    per('YDS', py); per('TD', ptd); per('INT', pin, true);
+    if (pc && pa) { var pct = []; for (i = 0; i < n; i++) { pct.push(pa[i] ? pc[i] * 100 / pa[i] : 0); } var all = _l10xSum(pa) ? _l10xSum(pc) * 100 / _l10xSum(pa) : 0, p3c = _l10xSum(pc.slice(-3)), p3a = _l10xSum(pa.slice(-3)); rows.push(_l10xRow('CMP%', all.toFixed(1), cut(pct), (n >= 5 && p3a) ? p3c * 100 / p3a - all : null, 1, false, all)); }
+    per('RUSH', ry);
+    note = 'A box is his passing yards, with touchdowns and interceptions. The rows are passing yards, passing touchdowns, interceptions, completion rate and rushing yards.';
+  } else if (kind === 'rb' || kind === 'wr') {
+    var cr = colAt(I.car), ryd = colAt(I.rYds), rtd = colAt(I.rTd), rc = colAt(I.rec), tg2 = colAt(I.tgt), cyd = colAt(I.cYds), ctd = colAt(I.cTd), scr = [], td = [];
+    for (i = 0; i < n; i++) { scr.push((ryd ? ryd[i] : 0) + (cyd ? cyd[i] : 0)); td.push((rtd ? rtd[i] : 0) + (ctd ? ctd[i] : 0)); }
+    var mainA = kind === 'rb' ? scr : (cyd || scr), bm = avg(mainA);
+    for (i = s0; i < n; i++) { var t2 = []; if (td[i]) { t2.push(td[i] + ' TD'); } else if (kind === 'wr' && rc) { t2.push(rc[i] + ' REC'); } else if (kind === 'rb' && cr) { t2.push(cr[i] + ' CAR'); } boxes.push({ d: _l10xDay(games[i]), main: String(Math.round(mainA[i] || 0)), tag: t2.join(' · '), tone: tone(mainA[i] || 0, bm, td[i] >= 2) }); }
+    if (n >= 5 && bm > 0) { form = _l10xForm(last3(mainA) / bm, 'last 3: ' + last3(mainA).toFixed(0) + (kind === 'rb' ? ' total yds a game' : ' rec yds a game'), 'season ' + bm.toFixed(0)); }
+    if (kind === 'rb') { per('CAR', cr); per('RUSH', ryd); per('REC', rc); per('RE YD', cyd); per('TD', td, false, 2); }
+    else { per('TGT', tg2); per('REC', rc); per('YDS', cyd); per('TD', td, false, 2); if (ryd && _l10xSum(ryd) > 0) { per('RUSH', ryd); } }
+    note = kind === 'rb' ? 'A box is his rushing and receiving yards together, with touchdowns or carries. The rows are carries, rushing yards, catches, receiving yards and touchdowns.' : 'A box is his receiving yards, with touchdowns or catches. The rows are targets, catches, receiving yards and touchdowns.';
+  } else if (kind === 'def') {
+    var tt = colAt(I.tot) || [], so = colAt(I.solo), sk = colAt(I.sack), di = colAt(I.dInt), pdd = colAt(I.pd), fff = colAt(I.ff), bt = avg(tt);
+    for (i = s0; i < n; i++) { var t3 = []; if (sk && sk[i]) { t3.push(sk[i] + ' SACK'); } if (di && di[i]) { t3.push(di[i] + ' INT'); } if (!t3.length && fff && fff[i]) { t3.push('FF'); } boxes.push({ d: _l10xDay(games[i]), main: String(tt[i] || 0), tag: t3.join(' · '), tone: tone(tt[i] || 0, bt, (sk && sk[i] >= 1) || (di && di[i] >= 1)) }); }
+    if (n >= 5 && bt > 0) { form = _l10xForm(last3(tt) / bt, 'last 3: ' + last3(tt).toFixed(1) + ' tackles a game', 'season ' + bt.toFixed(1)); }
+    per('TKL', tt); per('SOLO', so); per('SACK', sk, false, 2); per('INT', di, false, 2); per('PD', pdd, false, 2); per('FF', fff, false, 2);
+    note = 'A box is his tackles, with sacks and interceptions. The rows are tackles, solo tackles, sacks, interceptions, passes defended and forced fumbles.';
+  } else {
+    var fm = colAt(I.fg, function (r) { return frac(r)[0]; }) || [], fa = colAt(I.fg, function (r) { return frac(r)[1]; }) || [], lng = colAt(I.fgl), xm = colAt(I.xp, function (r) { return frac(r)[0]; }), kp = colAt(I.kpts);
+    for (i = s0; i < n; i++) { boxes.push({ d: _l10xDay(games[i]), main: fm[i] + '-' + fa[i], tag: (lng && lng[i]) ? 'LONG ' + lng[i] : (xm ? xm[i] + ' XP' : ''), tone: (fa[i] > fm[i]) ? 'cold' : (fm[i] >= 3 ? 'hot' : '') }); }
+    per('FGM', fm); per('FGA', fa); if (xm) { per('XP', xm); } if (kp) { per('PTS', kp); }
+    note = 'A box is field goals made of those tried, with his longest.';
+  }
+  if (!rows.length) { return ''; }
+  note += n >= 5 ? ' The big number is his average a game this season and the dashed line marks it; the verdict and the numbers on the right are his last three games against it.' : ' The big number is his average a game; the dashed line marks it.';
+  return _l10xRender({ n: show, color: color, boxes: boxes, form: form, rows: rows, note: note });
+}
 // One builder for the three sports. Sea(key) reads his season line; a missing number is null.
 function _l10xHtml(gamelogData, rawGL, league, teamColor, isPitcher, statLabels, statValues, pre) {
   var sport = '';
   try { sport = (typeof LEAGUES !== 'undefined' && LEAGUES[league] && LEAGUES[league].sport) || ''; } catch (e) { sport = ''; }
   if (pre) { sport = 'baseball'; }   // L10XMILB
+  if (sport === 'football') { return _l10xFb(gamelogData, rawGL, teamColor); }   // L10XNFL
   if (sport !== 'baseball' && sport !== 'basketball' && sport !== 'hockey') { return null; }
   var seaIdx = {}, i;
   for (i = 0; i < (statLabels || []).length; i++) { var up = String(statLabels[i] || '').toUpperCase(); if (seaIdx[up] == null) { seaIdx[up] = i; } }
@@ -78445,7 +78545,9 @@ function buildMlbL10Trend(gamelogData, rawGL, league, teamColor, isPitcher, athl
   try {
     var _l10n = _l10xHtml(gamelogData, rawGL, league, teamColor, isPitcher, statLabels, statValues);
     if (_l10n) { return _l10n; }
+    if (_l10n === '') { return ''; }   // L10XNFL -- football answers for itself, even with nothing
   } catch (eL10) {}
+  try { if (typeof LEAGUES !== 'undefined' && LEAGUES[league] && LEAGUES[league].sport === 'football') { return ''; } } catch (eFb) {}
   
   statLabels = statLabels || [];
   statValues = statValues || [];
@@ -80142,7 +80244,7 @@ function _pmBuildStatsRegion(st, groupKey) {
     // PMSAME -- 'GP' alone missed baseball, whose label is 'G'.
     var _gp = _pmGamesPlayed(statLabels, statValues);
     // ARCGONE -- no career arc on the MLB, NBA and NHL cards; the other sports keep theirs
-    var _noArc = (league === 'MLB' || league === 'NBA' || league === 'NHL');
+    var _noArc = (league === 'MLB' || league === 'NBA' || league === 'NHL' || league === 'NFL');
     scouting = (_noArc ? '' : _pmArcHtml(statsDataForCard, league, isPitcher, teamColor)) +
       _pmReadHtml(_pmBarsForRead, _gp, league);
   } catch (eS) { scouting = ''; }
