@@ -215238,6 +215238,7 @@ function _poKick(league, leagueData, allTeams) {
       _poFill(lk, ''); return;
     }
     _poOdds[lk] = out;
+    try { if (skState && skState.activeLeagueKey === lk) { setTimeout(_pmRefresh, 50); } } catch (ePmR) {}   // RACEWAIT
     // WPCOLD -- the bar was drawn before this existed. Everything that
     // reads the strength model has to be told, not just the card this
     // function was written to fill.
@@ -218444,7 +218445,7 @@ function _pmData(lk) {
   D.tonight.sort(function (x, y) { return y.wk - x.wk; });
   return D;
 }
-function _pmRace(D, o) {
+function _pmRace(D, o, E) {
   var pl = [], i, cm = 0, co = 0;
   for (i = 0; i < D.days.length; i++) {
     var d = D.days[i];
@@ -218454,7 +218455,7 @@ function _pmRace(D, o) {
   }
   if (!pl.length) { return ''; }
   var n = Math.max(2, D.days.length), W = 376, H = 172, L = 30, R = 48, T = 14, B = 22;
-  var top = Math.max(cm, co, o ? o.myFinal : 0, o ? o.oppFinal : 0, 10), step = 250;
+  var top = Math.max(cm, co, o ? o.myFinal : 0, o ? o.oppFinal : 0, E ? E.my : 0, E ? E.op : 0, 10), step = 250;
   if (top <= 120) { step = 25; } else if (top <= 300) { step = 50; } else if (top <= 600) { step = 100; }
   top = Math.ceil(top / step) * step;
   var X = function (k) { return L + k * (W - L - R) / (n - 1); };
@@ -218473,6 +218474,15 @@ function _pmRace(D, o) {
     return p;
   };
   var last = pl[pl.length - 1], xl = X(last.i), xe = X(D.days.length - 1);
+  try {   // PROJTRACK -- the week's first estimate, faint, behind everything
+    if (E && D.days.length > 1) {
+      var ek = Math.max(E.idx - 1, 0), en = D.days.length - 1;
+      if (en > ek) {
+        s += '<path d="M' + X(ek).toFixed(1) + ' ' + Y(E.opAt(ek)).toFixed(1) + ' L' + X(en).toFixed(1) + ' ' + Y(E.op).toFixed(1) + '" stroke="#aab3c5" stroke-width="1.4" stroke-dasharray="1.5 4" stroke-linecap="round" fill="none" opacity="0.5"/>' +
+          '<path d="M' + X(ek).toFixed(1) + ' ' + Y(E.myAt(ek)).toFixed(1) + ' L' + X(en).toFixed(1) + ' ' + Y(E.my).toFixed(1) + '" stroke="#f5c518" stroke-width="1.4" stroke-dasharray="1.5 4" stroke-linecap="round" fill="none" opacity="0.5"/>';
+      }
+    }
+  } catch (eE) {}
   s += '<path d="' + path('op') + '" fill="none" stroke="#aab3c5" stroke-width="2" stroke-linejoin="round"/>' +
     '<path d="' + path('my') + '" fill="none" stroke="#f5c518" stroke-width="2.5" stroke-linejoin="round"/>';
   if (o && !o.settled) {
@@ -218552,10 +218562,78 @@ function _pmTonightHtml(D) {
   else { h += '<div class="pm-say z">Sorted by fantasy points this week.</div>'; }
   return h;
 }
+// PROJTRACK -- the projected finish, kept once a day (the first reading of the day), so the week's
+// estimates can be set against what was scored. { lk: { week: { 'YYYY-MM-DD': [myFinal, oppFinal, myScore, oppScore] } } }
+var PJ_KEY = 'sk_pj_v1';
+function _pjAll() { var o = {}; try { o = JSON.parse(localStorage.getItem(PJ_KEY) || '{}') || {}; } catch (e) { o = {}; } return o; }
+function _pjBank(lk, league, m, o) {
+  var day = _todayDateString(), wk = String(parseInt(league.current_week, 10) || 0);
+  if (!wk || wk === '0' || !(o.myFinal > 0) || !(o.oppFinal > 0)) { return; }
+  var A = _pjAll(), L = A[lk] || (A[lk] = {}), W = L[wk] || (L[wk] = {});
+  if (W[day]) { return; }
+  W[day] = [Math.round(o.myFinal * 10) / 10, Math.round(o.oppFinal * 10) / 10, Number(m.myScore) || 0, Number(m.oppScore) || 0];
+  var ks = [], k; for (k in L) { if (L.hasOwnProperty(k)) { ks.push(Number(k)); } }
+  ks.sort(function (a, b) { return a - b; });
+  while (ks.length > 4) { delete L[String(ks.shift())]; }
+  try { localStorage.setItem(PJ_KEY, JSON.stringify(A)); } catch (e) {}
+}
+// The week's first banked estimate, placed on this week's days.
+function _pjFirst(lk, league, D) {
+  var W = (_pjAll()[lk] || {})[String(parseInt(league.current_week, 10) || 0)], k, first = '';
+  if (!W) { return null; }
+  for (k in W) { if (W.hasOwnProperty(k) && (!first || k < first)) { first = k; } }
+  if (!first) { return null; }
+  var idx = -1, i;
+  for (i = 0; i < D.days.length; i++) { if (D.days[i].date === first) { idx = i; } }
+  if (idx < 0) { return null; }
+  var r = W[first], nd = D.days.length, NAMES = { MON: 'Monday', TUE: 'Tuesday', WED: 'Wednesday', THU: 'Thursday', FRI: 'Friday', SAT: 'Saturday', SUN: 'Sunday' };
+  // straight from the score it was made at (the end of the day before) to its finish on the last day
+  var at = function (fin, sc, kk) { var k0 = idx - 1, k1 = nd - 1; return (k1 <= k0) ? fin : sc + (fin - sc) * (kk - k0) / (k1 - k0); };
+  return { idx: idx, my: r[0], op: r[1], who: (NAMES[D.days[idx].lbl] || D.days[idx].lbl) + '\u2019s',
+    myAt: function (kk) { return at(r[0], r[2], kk); }, opAt: function (kk) { return at(r[1], r[3], kk); } };
+}
+// PROJTRACK -- where the first estimate said each side would be, against where they are
+function _pjSay(D, o, E) {
+  var li = -1, cm = 0, co = 0, i;
+  for (i = 0; i < D.days.length; i++) { var d = D.days[i]; if (d.future || d.my == null || d.op == null) { continue; } cm += d.my; co += d.op; li = i; }
+  if (li < 0 || li < E.idx) { return ''; }
+  var em = E.myAt(li), eo = E.opAt(li), dm = cm - em, dop = co - eo, t = '';
+  var sg = function (v) { return '<b class="' + (v >= 0 ? 'g' : 'r') + '">' + Math.abs(v).toFixed(0) + (v >= 0 ? ' ahead of' : ' behind') + '</b>'; };
+  if (D.days[li].today) { t = E.who + ' estimate has you at ' + em.toFixed(0) + ' and them at ' + eo.toFixed(0) + ' by the end of today; so far it is ' + cm.toFixed(0) + ' and ' + co.toFixed(0) + '.'; }
+  else { t = 'You are ' + sg(dm) + ' ' + E.who + ' pace; they are ' + sg(dop).replace('class="g"', 'class="x"').replace('class="r"', 'class="g"').replace('class="x"', 'class="r"') + ' theirs.'; }
+  if (o && !o.settled && (Math.abs(o.myFinal - E.my) >= 1 || Math.abs(o.oppFinal - E.op) >= 1)) {
+    t += ' The projected finish has moved from ' + Math.round(E.my) + '\u2013' + Math.round(E.op) + ' to ' + Math.round(o.myFinal) + '\u2013' + Math.round(o.oppFinal) + '.';
+  }
+  return t;
+}
+// The scorecard: each finished week's first estimate against how the week ended (from the season's stored results).
+function _pjScoreHtml(lk, league, myKey) {
+  var L = _pjAll()[lk] || {}, cur = parseInt(league.current_week, 10) || 0, store = null, n = 0, em = 0, eo = 0, hit = 0, w;
+  try { store = _poWkLoad(lk); } catch (e) { store = null; }
+  if (!store || !store.w || !myKey) { return ''; }
+  for (w in L) {
+    if (!L.hasOwnProperty(w) || Number(w) >= cur) { continue; }
+    var rows = store.w[w], first = '', k, i, res = null;
+    if (!rows) { continue; }
+    for (k in L[w]) { if (L[w].hasOwnProperty(k) && (!first || k < first)) { first = k; } }
+    for (i = 0; i < rows.length; i++) {
+      if (rows[i].a === myKey) { res = [rows[i].pa, rows[i].pb]; } else if (rows[i].b === myKey) { res = [rows[i].pb, rows[i].pa]; }
+    }
+    if (!first || !res || res[0] == null || res[1] == null) { continue; }
+    var r = L[w][first];
+    n++; em += Math.abs(r[0] - res[0]); eo += Math.abs(r[1] - res[1]);
+    if ((r[0] > r[1]) === (res[0] > res[1])) { hit++; }
+  }
+  if (!n) { return '<div class="pm-sec">HOW GOOD ARE THE ESTIMATES <span>THIS LEAGUE</span></div><div class="pm-say z">Nothing to score yet. Once a week that has an estimate on file finishes, its first estimate is set against the result here.</div>'; }
+  return '<div class="pm-sec">HOW GOOD ARE THE ESTIMATES <span>' + n + (n === 1 ? ' WEEK' : ' WEEKS') + ', THIS LEAGUE</span></div><div class="pm-chips">' +
+    '<span><b>\u00b1' + (em / n).toFixed(0) + '</b>average miss, your finish</span><span><b>\u00b1' + (eo / n).toFixed(0) + '</b>average miss, their finish</span><span><b>' + hit + ' of ' + n + '</b>winner called right</span></div>';
+}
 function _pmBodyHtml(lk) {
   var league = _duLeague(lk);
   if (!league) { return ''; }
   var D = _pmData(lk), o = _pmOdds(league, D.m), h = '';
+  try { if (!o && !_poOdds[lk] && typeof _sgEnsure === 'function') { _sgEnsure(league, skLeagueData[lk] || {}); } } catch (eRw) {}   // RACEWAIT
+  try { if (o && !o.settled) { _pjBank(lk, league, D.m, o); } } catch (ePj) {}   // PROJTRACK
   if (!D.days.length) { return '<div class="pm-say z" style="padding:14px 4px">Loading the week…</div>'; }
   var chips = '';
   if (D.left.my != null && D.left.op != null) { chips += '<span><b>' + D.left.my + ' v ' + D.left.op + '</b>players still to finish today</span>'; }
@@ -218565,13 +218643,17 @@ function _pmBodyHtml(lk) {
   } catch (e) {}
   if (o && !o.settled) { chips += '<span><b>' + Math.round(o.myFinal) + ' v ' + Math.round(o.oppFinal) + '</b>projected finish</span>'; }
   if (chips) { h += '<div class="pm-chips">' + chips + '</div>'; }
-  var race = _pmRace(D, o);
+  var pjE = null;
+  try { pjE = _pjFirst(lk, league, D); } catch (ePjF) { pjE = null; }
+  var race = _pmRace(D, o, pjE);
   if (race) {
-    h += '<div class="pm-sec">THE RACE <span>' + (o && !o.settled ? 'SOLID = SCORED · DASHED = PROJECTED' : 'RUNNING TOTAL') + '</span></div>' +
+    h += '<div class="pm-sec">THE RACE <span>' + (o && !o.settled ? (pjE ? ('DASHED = PROJECTED · FAINT = ' + pjE.who.toUpperCase().replace('\u2019S', '')) : 'SOLID = SCORED · DASHED = PROJECTED') : 'RUNNING TOTAL') + '</span></div>' +
       '<div class="pm-card" style="padding:8px 4px 4px">' + race + '</div>';
     var say = _pmSay(D, o);
+    try { if (pjE) { var pjT = _pjSay(D, o, pjE); if (pjT) { say = (say ? say + ' ' : '') + pjT; } } } catch (ePjS) {}
     if (say) { h += '<div class="pm-say">' + say + '</div>'; }
   }
+  try { h += _pjScoreHtml(lk, league, D.myKey); } catch (ePjC) {}
   h += _pmSlotsHtml(D);
   h += _pmTonightHtml(D);
   return h;
