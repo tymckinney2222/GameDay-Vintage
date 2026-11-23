@@ -111062,11 +111062,35 @@ function _cbbLearned() {
   _cbbLearn = o;
   return o;
 }
+// A team seen in a game: if it is one of these schools, its letters are kept. Returns the letters untouched.
+function _cbbSee(team, league) {
+  var ab = (team && team.abbr) || '';
+  try {
+    if (String(league || '').toUpperCase() !== 'NCAAMB' || !ab) { return ab; }
+    var up = String(ab).toUpperCase(), L = _cbbLearned();
+    if (L.hasOwnProperty(up)) { return ab; }
+    var cand = [team.displayName, team.name, team.fullName, team.shortName], names = JG_NAMES.NCAAMB || {}, k, i;
+    for (k in names) {
+      if (!names.hasOwnProperty(k)) { continue; }
+      for (i = 0; i < cand.length; i++) {
+        var c = String(cand[i] || '').toLowerCase();
+        if (c && (c === String(names[k]).toLowerCase() || c === String(C3_CBB_SCHOOL[k] || '').toLowerCase())) {
+          L[up] = k;
+          try { localStorage.setItem(CBB_LEARN_KEY, JSON.stringify(L)); } catch (e1) {}
+          return ab;
+        }
+      }
+    }
+  } catch (e) {}
+  return ab;
+}
 function _cbbRunCheck() {
   if (_cbbCheck.busy) { return; }
   _cbbCheck.busy = true; _cbbCheck.err = ''; _jgRender();
   var done = function (teams) {
-    var names = JG_NAMES.NCAAMB || {}, by = {}, k, i, learn = {}, rows = [];
+    var names = JG_NAMES.NCAAMB || {}, by = {}, k, i, learn = {}, rows = [], old = {};
+    try { old = JSON.parse(localStorage.getItem(CBB_LEARN_KEY) || '{}') || {}; } catch (e0) { old = {}; }
+    for (k in old) { if (old.hasOwnProperty(k)) { learn[k] = old[k]; } }
     for (i = 0; i < teams.length; i++) {
       var t = teams[i].team || teams[i];
       if (t && t.displayName) { by[String(t.displayName).toLowerCase()] = t; }
@@ -111074,7 +111098,7 @@ function _cbbRunCheck() {
     for (k in names) {
       if (!names.hasOwnProperty(k)) { continue; }
       var t2 = by[String(names[k]).toLowerCase()], ab = t2 ? String(t2.abbreviation || '').toUpperCase() : '';
-      if (!t2) { rows.push({ k: k, name: names[k], st: 'none' }); continue; }
+      if (!t2) { var had = false, hk; for (hk in old) { if (old.hasOwnProperty(hk) && old[hk] === k) { had = true; } } rows.push({ k: k, name: names[k], st: had ? 'ok' : 'none' }); continue; }
       var was = null;
       try { _cbbLearn = {}; was = C3_BENCH_ART['NCAAMB:' + (C3_CBB_ALIAS.hasOwnProperty(ab) ? C3_CBB_ALIAS[ab] : ab)] || null; } catch (e1) { was = null; }
       var ok = !!(was && was === C3_BENCH_ART['NCAAMB:' + k]);
@@ -111086,40 +111110,45 @@ function _cbbRunCheck() {
     _cbbCheck.busy = false; _cbbCheck.res = rows; _jgRender();
   };
   var bad = function (m) { _cbbCheck.busy = false; _cbbCheck.err = m || 'ESPN did not answer.'; _jgRender(); };
-  // CBBCHECK2 -- asked the way the rest of the app asks (200 at a time), a page after another;
-  // a bigger single ask was refused outright. Stops at an empty or repeated page, and a page
-  // that fails after the first still leaves what came before.
-  var all = [], seenId = {}, pg = 1;
+  // CBBCHECK3 -- ESPN's team list would not answer from the phone, so this reads what the app
+  // already lives on: the men's scoreboard, a day at a time, five days back to five ahead.
+  // Every school that plays in that stretch is seen with its letters. A day that fails is skipped.
+  var all = [], days = [], dn, okDays = 0, lastErr = '';
+  for (dn = -5; dn <= 5; dn++) {
+    var dd = new Date(); dd.setDate(dd.getDate() + dn);
+    var mm = dd.getMonth() + 1, dy = dd.getDate();
+    days.push(String(dd.getFullYear()) + (mm < 10 ? '0' : '') + mm + (dy < 10 ? '0' : '') + dy);
+  }
   var ask = function () {
-    var url = 'https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/teams?limit=200' + (pg > 1 ? '&page=' + pg : '');
-    var stop = function (why) { if (all.length) { done(all); } else { bad(why); } };
+    if (!days.length) { if (okDays) { done(all); } else { bad(lastErr || 'ESPN did not answer.'); } return; }
+    var ds = days.shift();
+    var nxt = function () { setTimeout(ask, 120); };
     try {
-      fetch(url).then(function (r) {
+      fetch('https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard?dates=' + ds + '&groups=50&limit=300').then(function (r) {
         if (!r.ok) { throw new Error('ESPN answered ' + r.status); }
         return r.json();
       }).then(function (d) {
-        var L = null, fresh = 0, q;
-        try { L = d.sports[0].leagues[0].teams; } catch (e3) { L = null; }
-        for (q = 0; L && q < L.length; q++) {
-          var t = L[q].team || L[q], id = String((t && (t.id || t.displayName)) || '');
-          if (id && !seenId[id]) { seenId[id] = 1; all.push(L[q]); fresh++; }
+        var ev = (d && d.events) || [], q, c;
+        okDays++;
+        for (q = 0; q < ev.length; q++) {
+          var cs = (ev[q].competitions && ev[q].competitions[0] && ev[q].competitions[0].competitors) || [];
+          for (c = 0; c < cs.length; c++) { if (cs[c] && cs[c].team) { all.push({ team: cs[c].team }); } }
         }
-        if (!fresh || pg >= 6) { stop('ESPN sent no team list.'); return; }
-        pg++; setTimeout(ask, 120);
-      })['catch'](function (e4) { stop(String((e4 && e4.message) || e4) + ' (page ' + pg + ')'); });
-    } catch (e5) { stop('Could not ask ESPN.'); }
+        nxt();
+      })['catch'](function (e4) { lastErr = String((e4 && e4.message) || e4) + ' (' + ds + ')'; nxt(); });
+    } catch (e5) { lastErr = 'Could not ask ESPN.'; nxt(); }
   };
   ask();
 }
 function _cbbCheckHtml() {
-  var C = _cbbCheck, h = '<div class="jv-top" style="margin:0 0 12px"><div><b>Check the scoreboard letters</b><small>Reads ESPN’s own team list and learns the letters it uses for each of these schools, so their jerseys show in a game without waiting for one.</small></div><div class="jv-seg"><span class="on" onclick="_cbbRunCheck()">' + (C.busy ? 'ASKING…' : 'CHECK') + '</span></div></div>';
+  var C = _cbbCheck, h = '<div class="jv-top" style="margin:0 0 12px"><div><b>Check the scoreboard letters</b><small>Reads ESPN’s scoreboards from five days back to five ahead and learns the letters it uses for each school that plays, so the jerseys show in a game.</small></div><div class="jv-seg"><span class="on" onclick="_cbbRunCheck()">' + (C.busy ? 'ASKING…' : 'CHECK') + '</span></div></div>';
   if (C.err) { h += '<div class="da-say">' + skEscape(C.err) + '</div>'; }
   if (C.res) {
     var ok = 0, fx = [], no = [], i;
     for (i = 0; i < C.res.length; i++) { if (C.res[i].st === 'ok') { ok++; } else if (C.res[i].st === 'fixed') { fx.push(C.res[i]); } else { no.push(C.res[i]); } }
-    h += '<div class="da-say">' + ok + ' already matched. ' + fx.length + ' had different letters and are fixed now. ' + no.length + ' could not be found on ESPN’s list.</div>';
+    h += '<div class="da-say">' + ok + ' matched. ' + fx.length + ' had different letters and are fixed now. ' + no.length + ' have no game in these eleven days, so they are still on my guess.</div>';
     for (i = 0; i < fx.length; i++) { h += '<div class="da-note" style="color:#4ade80">FIXED · ' + skEscape(fx[i].name) + ' · ESPN says ' + skEscape(fx[i].ab) + '</div>'; }
-    for (i = 0; i < no.length; i++) { h += '<div class="da-note" style="color:#f87171">NOT FOUND · ' + skEscape(no[i].name) + '</div>'; }
+    for (i = 0; i < no.length; i++) { h += '<div class="da-note">NO GAME SEEN · ' + skEscape(no[i].name) + '</div>'; }
   } else {
     var n = 0, k; for (k in _cbbLearned()) { if (_cbbLearn.hasOwnProperty(k)) { n++; } }
     if (n) { h += '<div class="da-note">' + n + ' schools’ letters learned from ESPN on an earlier check.</div>'; }
@@ -115588,7 +115617,7 @@ function _gymFloorPanel(data, game, awayAccent, homeAccent, divStyle, venue) {
       homeBonus: (game.state === 'in') ? _c3bon.home : null,
       league: game.league, uid: game.id,
       awayColor: awayAccent, homeColor: homeAccent,
-      awayAbbr: game.away.abbr, homeAbbr: game.home.abbr,
+      awayAbbr: _cbbSee(game.away, game.league), homeAbbr: _cbbSee(game.home, game.league),   // CBBCHECK -- letters learned in passing
       // ALTFLOOR -- the live court draws what the pill says. The
       // gallery passes nothing and so keeps drawing the real floor.
       floorId: (typeof _gymAltFor === 'function')
