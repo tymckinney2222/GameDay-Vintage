@@ -62151,6 +62151,7 @@ function _duNewHtml(s, loading) {
   var lg = ball ? 'MLB' : ((s.kind === 'baller') ? 'NBA' : 'NHL'), sport = ball ? 'mlb' : ((s.kind === 'baller') ? 'nba' : 'nhl');
   var league = _duLeague(s.leagueKey), st = String((league && league.scoring_type) || '');
   var isPts = (st === 'headpoint' || st === 'point');
+  if (s.ext) { isPts = !!s.extPts; if (s.extLg) { lg = s.extLg; sport = String(s.extLg).toLowerCase(); } }   // TODAYCARDS -- an ESPN league through the same sheet
   var M = _duPlaying(s.my, lg), T = _duPlaying(s.opp, lg);
   var mine = _duPlayers(M.rows), theirs = _duPlayers(T.rows);
   var tb = null;
@@ -62188,6 +62189,7 @@ function _skRenderDuelModal(loading) {
     else if (s.kind === 'skater') _t = "TODAY'S SKATERS";
     if (_tvSt && _tvSt.on && s.kind === 'batter') { _t = "TODAY'S HITTERS"; }
     if (_tvSt && _tvSt.on && s.kind === 'pitcher') { _t = "TODAY'S PITCHERS"; }
+    if (s.ext && s.extTitle) { _t = s.extTitle; }   // TODAYCARDS
     titleEl.textContent = _t;
   }
   if (s.kind === 'baller' || s.kind === 'skater' || s.kind === 'pitcher' || s.kind === 'batter') {
@@ -141120,7 +141122,7 @@ function _tdcSigned(n, dp) { var a = Math.abs(n); return (n > 0 ? '+' : (n < 0 ?
 function _tdcSport(r) { return String((r && r.sp) || (r && r.l && r.l.sport) || '').toLowerCase(); }
 function _tdcPillLbl(r) {
   var sp = _tdcSport(r);
-  return sp === 'nba' ? "TODAY’S BALLERS" : (sp === 'nhl' ? "TODAY’S SKATERS" : (sp === 'nfl' ? "TODAY’S FOOTBALLERS" : "TODAY’S LINEUP"));
+  return sp === 'nba' ? "TODAY\u2019S BALLERS" : (sp === 'nhl' ? "TODAY\u2019S SKATERS" : (sp === 'nfl' ? "THIS WEEK\u2019S FOOTBALLERS" : (sp === 'mlb' ? "TODAY\u2019S BATS" : "TODAY\u2019S LINEUP")));
 }
 function _tdcKeys(lk) {
   var ld = (typeof skLeagueData !== 'undefined' && skLeagueData[lk]) || {}, m = ld.matchup || {};
@@ -141197,6 +141199,19 @@ function _tdcChartHtml(lk, r, kind) {
 function _tdcJerHtml(lk, r, kind) {
   try {
     var P = _tdcPl[lk];
+    if (kind === 'ext') {
+      var er = _tdcExtRow(lk);
+      if (!er || er.provider !== 'espn' || !er.rosters) { return ''; }
+      var ep = _tdcEspPlayers(er, _espLineupSides(er).me), el = [], ek = true, q, ec;
+      for (q = 0; q < ep.length; q++) {
+        if (!ep[q].isActive) { continue; }
+        ec = null; try { ec = _skRvChip(String(er.sport || '').toUpperCase(), ep[q].teamAbbr); } catch (eC2) { ec = null; }
+        if (ec === null) { ek = false; } else if (ec.cls === 'no') { continue; }
+        el.push({ name: ep[q].name, abbr: ep[q].teamAbbr, fp: ep[q].fp, chip: ec });
+      }
+      el.sort(function (a, b) { return (b.fp || 0) - (a.fp || 0); });
+      P = { list: el, known: ek }; kind = 'pts';
+    }
     if (!P || !P.list) { return ''; }
     if (!P.list.length) { return '<div class="tdc-cap">TODAY · NOBODY IN AN ACTIVE SLOT HAS A GAME</div>'; }
     var LG = _tdcSport(r).toUpperCase(), h = '', i, n = P.list.length, lim = Math.min(n, 14);
@@ -141210,6 +141225,83 @@ function _tdcJerHtml(lk, r, kind) {
     return '<div class="tdc-cap">TODAY · ' + n + (P.known ? ' PLAYING' : ' ACTIVE \u00b7 GAMES NOT LOADED, ALL LISTED') + '</div><div class="tdc-js">' + h + '</div>';
   } catch (e) { return ''; }
 }
+function _tdcExtRow(key) { try { return (_dhExt && _dhExt[key]) || null; } catch (e) { return null; } }
+function _tdcEspGame(row) { var sp = String((row && row.sport) || '').toLowerCase(); return sp === 'nfl' ? 'ffl' : (sp === 'nba' ? 'fba' : (sp === 'nhl' ? 'fhl' : 'flb')); }
+function _tdcEspPlayers(row, team) {
+  var out = [], i, game = _tdcEspGame(row), season = (row.rosters && row.rosters.season) || null;
+  var pt = season ? ((typeof _espProTeams !== 'undefined' && _espProTeams[game + ':' + season]) || null) : null;
+  var items = (team && team.items) || [];
+  for (i = 0; i < items.length; i++) {
+    var it = items[i] || {}, w = (it.windows && it.windows.today) || null, ab = (pt && it.teamId != null) ? String(pt[String(it.teamId)] || '') : '', line = '';
+    try {
+      if (w && w.stats) {
+        var bits = [], sk, lbl;
+        for (sk in w.stats) {
+          if (!w.stats.hasOwnProperty(sk) || bits.length >= 5) { continue; }
+          lbl = espStatName(game, sk);
+          if (lbl) { bits.push(espStatFmt(sk, w.stats[sk], game) + ' ' + lbl); }
+        }
+        line = bits.join(' \u00b7 ');
+      }
+    } catch (eL) { line = ''; }
+    out.push({ name: it.name || String(it.playerId || ''), team: ab.toUpperCase(), teamAbbr: ab.toUpperCase(),
+      selectedPos: it.starter ? String(it.slot || 'UTIL').toUpperCase() : 'BN', isActive: !!it.starter && !it.noGame,
+      isStarting: null, stats: null, fp: (w && w.total != null && !isNaN(Number(w.total))) ? Number(w.total) : null, status: '', _line: line, _lineHtml: false });
+  }
+  return out;
+}
+function _tdcEspFill(key) {
+  var row = _tdcExtRow(key), s = _skDuelState;
+  if (!row || !s || !s.ext || s.leagueKey !== key) { return; }
+  var sides = _espLineupSides(row);
+  s.my = _tdcEspPlayers(row, sides.me); s.opp = _tdcEspPlayers(row, sides.opp);
+  if (sides.oppName) { s.oppName = sides.oppName; }
+  s.extLoading = !(row.rosters && row.rosters.byTeam);
+  _skRenderDuelModal(!!s.extLoading);
+}
+function _tdcEspOpen(key) {
+  var row = _tdcExtRow(key);
+  if (!row || row.provider !== 'espn') { return false; }
+  var SP = String(row.sport || '').toUpperCase(), cats = false;
+  try { cats = !!espIsCats(row); } catch (e) { cats = false; }
+  try { if (_tvSt) { _tvSt.on = false; } } catch (e0) {}
+  _skDuelState = { leagueKey: key, date: _todayDateString(), kind: (SP === 'NHL') ? 'skater' : 'baller', my: [], opp: [],
+    myName: (row.standings && row.standings.teamName) || row.name || 'My Team', oppName: 'Opponent', statsMeta: null,
+    ext: true, extPts: !cats, extLg: SP, extLoading: true,
+    extTitle: SP === 'NFL' ? "THIS WEEK\u2019S FOOTBALLERS" : (SP === 'NHL' ? "TODAY\u2019S SKATERS" : (SP === 'NBA' ? "TODAY\u2019S BALLERS" : "TODAY\u2019S LINEUP")) };
+  _skRenderDuelModal(true);
+  var ov = document.getElementById('skDuelOverlay');
+  if (ov) { ov.classList.add('open'); }
+  var go = function () {
+    try {
+      var game = _tdcEspGame(row), season = (row.rosters && row.rosters.season) || null;
+      if (season && !(_espProTeams[game + ':' + season])) { espProTeamMap(game, season, function () { _tdcEspFill(key); }); }
+    } catch (eP) {}
+    _tdcEspFill(key);
+  };
+  if (row.rosters) { go(); }
+  else { try { espLoadRosters(row).then(go)['catch'](go); } catch (eR) { go(); } }
+  return true;
+}
+function _tdcDuel(i, arm) {
+  try {
+    var r = _rlSt.rows[i];
+    if (!r) { return; }
+    var key = r.key, sp = _tdcSport(r);
+    if (r.ext) { if (_tdcEspOpen(key)) { return; } _rlJump(i, 'lineup'); return; }
+    if (sp === 'nfl') {
+      var fl = _tfLeagues(), k, ok = false;
+      for (k = 0; k < fl.length; k++) { if (fl[k] === key) { ok = true; } }
+      if (ok) { _tfOpen(key); return; }
+    } else if (_skDuelEligible(key)) {
+      if (sp === 'nba') { openBallersDuel(key, null); return; }
+      if (sp === 'nhl') { openSkatersDuel(key, null); return; }
+      if (sp === 'mlb') { if (arm) { openPitchingDuel(key, null); } else { openBattingDuel(key, null); } return; }
+    }
+    _rlJump(i, 'lineup');
+  } catch (e) { try { _rlJump(i, 'lineup'); } catch (e2) {} }
+}
+
 function _tdcCard(r, i) {
   var kind = _tdcKind(r), lk = String(r.key), tone = 'z', h = '';
   try { tone = _rlTone(r); } catch (e0) { tone = 'z'; }
@@ -141231,7 +141323,8 @@ function _tdcCard(r, i) {
       '<span class="r' + (w > 0 ? ' dim' : '') + '"><i>' + skEscape(String(opp).toUpperCase()) + '</i><b>' + skEscape(kind === 'cats' ? _tdcNum(r.m.oppScore) : _tdcPts(r.m.oppScore)) + '</b></span></div>';
   }
   h += '<div class="tdc-g">' + _tdcChgHtml(lk, r, kind) + '</div><div class="tdc-ch">' + _tdcChartHtml(lk, r, kind) + '</div><div class="tdc-j">' + _tdcJerHtml(lk, r, kind) + '</div>';
-  h += '<div class="tdc-f">' + (kind === 'wait' ? '' : '<button class="tdc-pill" onclick="_rlJump(' + i + ',\'lineup\')">' + _tdcPillLbl(r) + ' ›</button>') +
+  h += '<div class="tdc-f">' + (kind === 'wait' ? '' : '<button class="tdc-pill" onclick="_tdcDuel(' + i + ')">' + _tdcPillLbl(r) + ' \u203A</button>' +
+      ((_tdcSport(r) === 'mlb' && !r.ext) ? '<button class="tdc-pill" onclick="_tdcDuel(' + i + ',1)">TODAY\u2019S ARMS \u203A</button>' : '')) +
     '<button class="tdc-open" onclick="_rlJump(' + i + ',\'open\')">OPEN LEAGUE ›</button></div></div>';
   return h;
 }
@@ -141308,7 +141401,21 @@ function _tdcNext() {
   var r = _tdcRowOf(lk), done = function () { _tdcBusy = false; _tdcPaint(lk); setTimeout(_tdcNext, 60); };
   if (!r) { setTimeout(_tdcNext, 0); return; }
   var kind = _tdcKind(r), K = _tdcKeys(lk), now = Date.now(), chain = Promise.resolve();
-  if (kind === 'ext' || kind === 'wait' || !K.my) { setTimeout(_tdcNext, 0); return; }
+  if (kind === 'ext') {   // an ESPN league: one roster request, once, then its jerseys can be drawn
+    var xr = _tdcExtRow(lk);
+    if (xr && xr.provider === 'espn' && !xr.rosters && !xr._tdcAsked) {
+      xr._tdcAsked = 1; _tdcBusy = true;
+      try {
+        espLoadRosters(xr).then(function () {
+          try { var xg = _tdcEspGame(xr), xs = xr.rosters && xr.rosters.season; if (xs && !_espProTeams[xg + ':' + xs]) { espProTeamMap(xg, xs, function () { _tdcPaint(lk); }); } } catch (eM) {}
+          done();
+        })['catch'](done);
+      } catch (eX) { done(); }
+      return;
+    }
+    setTimeout(_tdcNext, 0); return;
+  }
+  if (kind === 'wait' || !K.my) { setTimeout(_tdcNext, 0); return; }
   _tdcBusy = true;
   try {
     if (kind === 'pts' && !(_tdcWk[lk] && now - _tdcWk[lk].t < _TDC_TTL)) { chain = chain.then(function () { return _tdcLoadWeek(lk, K); }).then(function () { _tdcPaint(lk); }); }
