@@ -62155,7 +62155,7 @@ function _duNewHtml(s, loading) {
   var M = _duPlaying(s.my, lg), T = _duPlaying(s.opp, lg);
   var mine = _duPlayers(M.rows), theirs = _duPlayers(T.rows);
   var tb = null;
-  try { tb = isPts ? _duPtsTable(s, M.rows, T.rows, sport) : _duCatTable(s, mine, theirs); } catch (e) { tb = null; }
+  try { tb = isPts ? _duPtsTable(s, M.rows, T.rows, sport) : ((s.ext && s.extLg) ? _tdcEspCatTable(s) : _duCatTable(s, mine, theirs)); } catch (e) { tb = null; }
   var dateTxt = s.date;
   try { var pp = String(s.date).split('-'); dateTxt = new Date(pp[0], pp[1] - 1, pp[2]).toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' }); } catch (e2) {}
   var col = function (R, name, mineSide, isLoading) {
@@ -141130,6 +141130,7 @@ function _tdcKeys(lk) {
 }
 function _tdcChgHtml(lk, r, kind) {
   try {
+    if (kind === 'ext') { var xr = _tdcExtRow(lk); return (xr && xr.provider === 'espn' && xr._espCats && espIsCats(xr)) ? _tdcEcsChg(xr) : ''; }
     if (kind === 'pts') {
       var W = _tdcWk[lk], i, t = null;
       if (!W || !W.days) { return ''; }
@@ -141160,9 +141161,9 @@ function _tdcChgHtml(lk, r, kind) {
   } catch (e) {}
   return '';
 }
-function _tdcCatLine(lk) {
-  var K = _tdcKeys(lk), days = [], i;
-  try { days = _computeCatsWeekTrend(lk, K.m.week || 0, _todayDateString()) || []; } catch (e) { days = []; }
+function _tdcCatLine(lk, given) {
+  var K = given ? null : _tdcKeys(lk), days = given || [], i;
+  if (!given) { try { days = _computeCatsWeekTrend(lk, K.m.week || 0, _todayDateString()) || []; } catch (e) { days = []; } }
   var have = 0, mx = 1;
   for (i = 0; i < days.length; i++) { if (days[i] && days[i].hasData) { have++; if (Math.abs(days[i].net) > mx) { mx = Math.abs(days[i].net); } } }
   if (!have) { return '<div class="tdc-wait">The week’s line fills in from the snapshot taken each morning.</div>'; }
@@ -141185,6 +141186,7 @@ function _tdcCatLine(lk) {
 function _tdcChartHtml(lk, r, kind) {
   try {
     if (kind === 'cats') { return _tdcCatLine(lk); }
+    if (kind === 'ext') { var xr = _tdcExtRow(lk); return (xr && xr.provider === 'espn' && xr._espCats && espIsCats(xr)) ? _tdcCatLine(lk, _tdcEcsDays(xr)) : ''; }
     if (kind !== 'pts') { return ''; }
     var W = _tdcWk[lk];
     if (!W || !W.days) { return '<div class="tdc-wait">Loading the week…</div>'; }
@@ -141210,7 +141212,7 @@ function _tdcJerHtml(lk, r, kind) {
         el.push({ name: ep[q].name, abbr: ep[q].teamAbbr, fp: ep[q].fp, chip: ec });
       }
       el.sort(function (a, b) { return (b.fp || 0) - (a.fp || 0); });
-      P = { list: el, known: ek }; kind = 'pts';
+      P = { list: el, known: ek }; kind = 'pts'; try { if (espIsCats(er)) { kind = 'cats'; } } catch (eK) {}
     }
     if (!P || !P.list) { return ''; }
     if (!P.list.length) { return '<div class="tdc-cap">TODAY · NOBODY IN AN ACTIVE SLOT HAS A GAME</div>'; }
@@ -141235,9 +141237,15 @@ function _tdcEspPlayers(row, team) {
     var it = items[i] || {}, w = (it.windows && it.windows.today) || null, ab = (pt && it.teamId != null) ? String(pt[String(it.teamId)] || '') : '', line = '';
     try {
       if (w && w.stats) {
-        var bits = [], sk, lbl;
+        var bits = [], sk, lbl, si, sItems = ((((row.raw || {}).settings || {}).scoringSettings) || {}).scoringItems || [], used = {};
+        for (si = 0; si < sItems.length && bits.length < 6; si++) {
+          sk = sItems[si] && sItems[si].statId != null ? String(sItems[si].statId) : '';
+          if (!sk || used[sk] || w.stats[sk] == null || espIsRate(game, sk)) { continue; }
+          lbl = espStatName(game, sk); used[sk] = 1;
+          if (lbl) { bits.push(espStatFmt(sk, w.stats[sk], game) + ' ' + lbl); }
+        }
         for (sk in w.stats) {
-          if (!w.stats.hasOwnProperty(sk) || bits.length >= 5) { continue; }
+          if (sItems.length || !w.stats.hasOwnProperty(sk) || bits.length >= 5) { continue; }
           lbl = espStatName(game, sk);
           if (lbl) { bits.push(espStatFmt(sk, w.stats[sk], game) + ' ' + lbl); }
         }
@@ -141302,8 +141310,101 @@ function _tdcDuel(i, arm) {
   } catch (e) { try { _rlJump(i, 'lineup'); } catch (e2) {} }
 }
 
+var _TDC_ECS = 'sk_ecs_v1|';
+function _tdcEcsRead(key, date) { try { var v = localStorage.getItem(_TDC_ECS + key + '|' + date); return v ? JSON.parse(v) : null; } catch (e) { return null; } }
+function _tdcEcsWrite(row, force) {
+  try {
+    if (!row || row.provider !== 'espn' || !row._espCats || !row._espCats.rows || !espIsCats(row)) { return false; }
+    var today = _todayDateString(), k = _TDC_ECS + row.key + '|' + today;
+    if (!force && localStorage.getItem(k)) { return false; }
+    var C = row._espCats, cats = {}, i, t = C.tally || espCatTally(C.rows);
+    for (i = 0; i < C.rows.length; i++) {
+      var r = C.rows[i];
+      cats[String(r.id)] = { my: r.mine, opp: r.opp, status: r.inel ? 'tie' : (r.result === 'WIN' ? 'win' : (r.result === 'LOSS' ? 'loss' : (r.result === 'TIE' ? 'tie' : ''))) };
+    }
+    localStorage.setItem(k, JSON.stringify({ ts: Date.now(), key: row.key, date: today, period: C.period, wins: t.w, losses: t.l, ties: t.t, cats: cats }));
+    var cut = _anDate(today, -21), n, kk, del = [];
+    for (n = 0; n < localStorage.length; n++) { kk = localStorage.key(n); if (kk && kk.indexOf(_TDC_ECS) === 0 && kk.slice(kk.lastIndexOf('|') + 1) < cut) { del.push(kk); } }
+    for (n = 0; n < del.length; n++) { localStorage.removeItem(del[n]); }
+    return true;
+  } catch (e) { return false; }
+}
+function _tdcEcsAll(force) {
+  var n = 0, i, list = [];
+  try { list = extSyncedLeaguesAll() || []; } catch (e) { list = []; }
+  for (i = 0; i < list.length; i++) { if (_tdcEcsWrite(list[i], force)) { n++; } }
+  return n;
+}
+function _tdcEcsDays(row) {
+  var today = _todayDateString(), dates = _weekDaysForDate(today), NM = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'], out = [], i;
+  var C = row._espCats, per = C ? C.period : null;
+  for (i = 0; i < dates.length; i++) {
+    var d = { date: dates[i], dayLabel: NM[i], future: dates[i] > today, hasData: false, isToday: dates[i] === today };
+    if (!d.future) {
+      if (d.isToday) {
+        if (C && C.rows) { var t = C.tally || espCatTally(C.rows); d.hasData = true; d.net = t.w - t.l; }
+      } else {
+        var sn = _tdcEcsRead(row.key, _anDate(dates[i], 1));
+        if (sn && (per == null || sn.period == null || String(sn.period) === String(per))) { d.hasData = true; d.net = Number(sn.wins) - Number(sn.losses); }
+      }
+    }
+    out.push(d);
+  }
+  return out;
+}
+function _tdcEcsChg(row) {
+  var C = row._espCats;
+  if (!C || !C.rows) { return ''; }
+  var sn = _tdcEcsRead(row.key, _todayDateString());
+  if (!sn) { return '<span class="tdc-sub">No snapshot from this morning yet, so today’s change cannot be shown.</span>'; }
+  var t = C.tally || espCatTally(C.rows), d = (t.w - t.l) - (Number(sn.wins) - Number(sn.losses)), h = '', i, mv = '', n = 0;
+  h += '<span class="tdc-chip ' + (d > 0 ? 'g' : (d < 0 ? 'r' : 'z')) + '">' + (d > 0 ? '▲ ' : (d < 0 ? '▼ ' : '')) + (d === 0 ? 'NO CHANGE' : _tdcSigned(d, 0) + (Math.abs(d) === 1 ? ' CAT' : ' CATS')) + ' TODAY</span>';
+  for (i = 0; i < C.rows.length; i++) {
+    var r = C.rows[i], was = sn.cats && sn.cats[String(r.id)] ? String(sn.cats[String(r.id)].status || '') : '';
+    var now = r.inel ? 'tie' : (r.result === 'WIN' ? 'win' : (r.result === 'LOSS' ? 'loss' : (r.result === 'TIE' ? 'tie' : '')));
+    if (!was || !now || was === now) { continue; }
+    var lb = '';
+    try { lb = espStatLabel(C.game, String(r.id)) || espStatName(C.game, String(r.id)) || ''; } catch (eL) { lb = ''; }
+    mv += '<span class="tdc-chip sm ' + (now === 'win' ? 'g' : (now === 'loss' ? 'r' : 'y')) + '">' + skEscape(String(lb || ('#' + r.id))) + ' → ' + (now === 'win' ? 'yours' : (now === 'loss' ? 'theirs' : 'tied')) + '</span>';
+    n++;
+  }
+  if (n) { h += '<div class="tdc-mv"><i>MOVED TODAY</i>' + mv + '</div>'; }
+  return h;
+}
+function _tdcEspCatTable(s) {
+  var row = _tdcExtRow(s.leagueKey);
+  if (!row || !row.rosters) { return ''; }
+  var game = _tdcEspGame(row), sides = _espLineupSides(row), vals = _espSsValues(row, 'daily', game) || {};
+  var items = ((((row.raw || {}).settings || {}).scoringSettings) || {}).scoringItems || [], cols = [], seen = {}, i;
+  for (i = 0; i < items.length; i++) {
+    var id = items[i] && items[i].statId;
+    if (id == null || seen[String(id)]) { continue; }
+    var lb = '';
+    try { lb = espStatLabel(game, String(id)) || ''; } catch (e) { lb = ''; }
+    if (!lb) { continue; }
+    seen[String(id)] = 1; cols.push({ id: String(id), label: lb });
+  }
+  if (!cols.length) { return ''; }
+  var A = vals[String(sides.meId)] || {}, B = vals[String(sides.oppId)] || {};
+  var cell = function (v, o, id, mine) {
+    if (v == null || isNaN(Number(v))) { return '<td class="d">–</td>'; }
+    var res = ''; try { res = espCatResult(id, mine ? v : o, mine ? o : v, game); } catch (e2) { res = ''; }
+    var win = mine ? (res === 'WIN') : (res === 'LOSS'), txt = String(v);
+    try { txt = String(espStatFmt(id, v, game)); } catch (e3) { txt = String(v); }
+    return '<td class="' + ((win || (o == null && Number(v) > 0 && !espIsLowerBetter(game, id))) ? 'w' : '') + '">' + skEscape(txt) + '</td>';
+  };
+  var h = '<table class="du-t"><tr><th></th>';
+  for (i = 0; i < cols.length; i++) { h += '<th>' + skEscape(cols[i].label) + '</th>'; }
+  h += '</tr><tr class="me"><td>' + skEscape(s.myName) + '</td>';
+  for (i = 0; i < cols.length; i++) { h += cell(A[cols[i].id], B[cols[i].id], cols[i].id, true); }
+  h += '</tr><tr><td>' + skEscape(s.oppName) + '</td>';
+  for (i = 0; i < cols.length; i++) { h += cell(B[cols[i].id], A[cols[i].id], cols[i].id, false); }
+  return { html: h + '</tr></table>', n: cols.length, avg: false };
+}
+
 function _tdcCard(r, i) {
   var kind = _tdcKind(r), lk = String(r.key), tone = 'z', h = '';
+  if (kind === 'ext') { try { _tdcEcsWrite(_tdcExtRow(lk), false); } catch (eSn) {} }
   try { tone = _rlTone(r); } catch (e0) { tone = 'z'; }
   var sub = [String(r.sp || '').toUpperCase(), _rlFmtLbl(r), _rlProvLbl(r)];
   var rec = (r.team && r.team.record) || '';
@@ -141319,8 +141420,8 @@ function _tdcCard(r, i) {
     h += '<div class="tdc-wait">This matchup has not started.</div>';
   } else {
     var opp = (r.m && r.m.oppName) || 'Opponent', w = Number(r.m.myScore) - Number(r.m.oppScore);
-    h += '<div class="tdc-s"><span' + (w < 0 ? ' class="dim"' : '') + '><i>YOU</i><b>' + skEscape(kind === 'cats' ? _tdcNum(r.m.myScore) : _tdcPts(r.m.myScore)) + '</b></span><em>' + (kind === 'cats' ? 'CATS' : 'VS') + '</em>' +
-      '<span class="r' + (w > 0 ? ' dim' : '') + '"><i>' + skEscape(String(opp).toUpperCase()) + '</i><b>' + skEscape(kind === 'cats' ? _tdcNum(r.m.oppScore) : _tdcPts(r.m.oppScore)) + '</b></span></div>';
+    h += '<div class="tdc-s"><span' + (w < 0 ? ' class="dim"' : '') + '><i>YOU</i><b>' + skEscape((kind === 'cats' || r.cats) ? _tdcNum(r.m.myScore) : _tdcPts(r.m.myScore)) + '</b></span><em>' + ((kind === 'cats' || r.cats) ? 'CATS' : 'VS') + '</em>' +
+      '<span class="r' + (w > 0 ? ' dim' : '') + '"><i>' + skEscape(String(opp).toUpperCase()) + '</i><b>' + skEscape((kind === 'cats' || r.cats) ? _tdcNum(r.m.oppScore) : _tdcPts(r.m.oppScore)) + '</b></span></div>';
   }
   h += '<div class="tdc-g">' + _tdcChgHtml(lk, r, kind) + '</div><div class="tdc-ch">' + _tdcChartHtml(lk, r, kind) + '</div><div class="tdc-j">' + _tdcJerHtml(lk, r, kind) + '</div>';
   h += '<div class="tdc-f">' + (kind === 'wait' ? '' : '<button class="tdc-pill" onclick="_tdcDuel(' + i + ')">' + _tdcPillLbl(r) + ' \u203A</button>' +
@@ -157431,6 +157532,7 @@ function skSnapAllCatsLeagues() {
   var allLeagues = fyLeagues || [];
   var snapped = 0;
   var failed = 0;
+  try { snapped += _tdcEcsAll(true); } catch (eEcs) {}   // TODAYCARDS -- ESPN category leagues with the rest
 
   allLeagues.forEach(function(l) {
     var isCats = l.scoring_type === 'head' || l.scoring_type === 'headone';
@@ -246500,7 +246602,7 @@ function _espSsValues(row, mode, game) {
   for (i = 0; i < teams.length; i++) {
     var id = String(teams[i].id);
     if (mode === 'daily') {
-      var d = espDailyTeamStats(row.rosters, id);
+      var d = espDailyTeamStats(row.rosters, id, game);   // the sport was not being passed, so basketball and hockey lost some columns
       out[id] = d ? espDailyRates(d, game) : null;
     } else {
       out[id] = teams[i].valuesByStat || null;
