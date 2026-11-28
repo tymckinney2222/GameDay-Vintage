@@ -247632,6 +247632,7 @@ function _extMaybeSnapshot(row) {
   var fk = '';
   try { fk = (typeof extFormatKey === 'function') ? extFormatKey(row) : ''; } catch (e) {}
   if (fk !== 'point') return;
+  try { if (row.provider === 'fantrax') { var _w0 = _fxWkGet(String(row.key).slice(4)); if (_w0 && _w0.base) return; } } catch (eW0) {}   // FXWK
   var d = _todayDateString();
   var memo = row.key + '_' + d;
   if (_extSnapTried[memo]) return;
@@ -253484,6 +253485,7 @@ function extEnrichFantrax() {
         })
         .catch(function() { /* best-effort */ });
       _fxLoadMatchupScores(row, null, function () { _extRepaintToday(); });
+      try { _fxWkLoad(row, function () { _extRepaintToday(); }); } catch (eWk) {}   // FXWK
       fxFetchJson('https://www.fantrax.com/fxea/general/getTeamRosters?leagueId=' +
         encodeURIComponent(id))
         .then(function(data) {
@@ -256915,7 +256917,108 @@ function extPickMyLogo(key) {
   setTimeout(function() { if (inp.parentNode) inp.parentNode.removeChild(inp); }, 60000);
 }
 
+var FXWK_URL = 'https://bracket-proxy.tymckinney2222.workers.dev/fxday';
+var _fxWk = {}, _fxWkAsked = {}, _fxDaySrc = {}, _fxWkOpenKey = '';
+function _fxWkKey(id, d) { return 'gdhq_fx_wk_' + id + '_' + d; }
+function _fxWkGet(id) {
+  var d = _todayDateString(), m = _fxWk[id];
+  if (m && m.date === d) { return m; }
+  try {
+    var s = localStorage.getItem(_fxWkKey(id, d));
+    if (s) { m = JSON.parse(s); if (m && m.date === d) { _fxWk[id] = m; return m; } }
+  } catch (e) {}
+  return null;
+}
+function _fxWkParse(snap, d) {
+  var out = { date: d, at: Number(snap && snap.at) || 0, base: null, period: null, games: null }, i;
+  try {
+    var rows = (snap && snap.standings) ? _fxExtractStandingsAll(snap.standings) : null;
+    if (rows && rows.length) {
+      var b = {}, n = 0;
+      for (i = 0; i < rows.length; i++) {
+        var r = rows[i];
+        if (!r || r.teamId == null) { continue; }
+        var v = (r.points != null) ? parseFloat(r.points) : parseFloat(r.pf);
+        if (isNaN(v)) { continue; }
+        b[String(r.teamId)] = v; n++;
+      }
+      if (n >= 2) { out.base = b; }
+    }
+  } catch (e) {}
+  try {
+    var ms = (snap && snap.matchups) ? _fxExtractMatchupScores(snap.matchups) : null;
+    if (ms && ms.games && ms.games.length) { out.period = (ms.period != null) ? ms.period : null; out.games = ms.games; }
+  } catch (e2) {}
+  return out;
+}
+function _fxWkLoad(row, done) {
+  try {
+    if (!row || row.provider !== 'fantrax' || !row.key) { return; }
+    var id = String(row.key).slice(4), d = _todayDateString(), ak = id + '_' + d;
+    if (_fxWkGet(id)) { return; }
+    if (_fxWkAsked[ak] && (Date.now() - _fxWkAsked[ak]) < 1800000) { return; }
+    _fxWkAsked[ak] = Date.now();
+    fetch(FXWK_URL + '?id=' + encodeURIComponent(id) + '&date=' + encodeURIComponent(d))
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (j) {
+        if (!j || !j.ok || !j.have || !j.snap) { return; }
+        var w = _fxWkParse(j.snap, d);
+        if (!w.base && !w.games) { return; }
+        _fxWk[id] = w;
+        try { localStorage.setItem(_fxWkKey(id, d), JSON.stringify(w)); } catch (e) {}
+        if (w.base) {
+          try { localStorage.setItem(_extPtsSnapKey(row.key, d), JSON.stringify({ ts: w.at || Date.now(), leagueKey: row.key, date: d, pfByTeam: w.base, src: 'worker' })); } catch (e1) {}
+        }
+        if (done) { try { done(); } catch (e2) {} }
+      })['catch'](function () {});
+  } catch (e3) {}
+}
+function _fxWkRepaint(row) {
+  try {
+    if (_fxWkOpenKey !== row.key) { return; }
+    var body = document.getElementById('skExtDetailBody');
+    if (!body || !body.offsetParent) { return; }
+    var on = body.querySelector('.sk-detail-tab.active'), tab = on ? on.getAttribute('data-exttab') : '';
+    extOpenLeague(row.key);
+    if (tab) { extSetDetailTab(tab); }
+  } catch (e) {}
+}
+function _fxDayNote(id) {
+  var src = _fxDaySrc[id], txt;
+  if (src === 'w') { txt = 'DAY counts from Fantrax’s 3 AM reading.'; }
+  else {
+    var when = '';
+    if (src) { try { when = new Date(src).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }); } catch (e) { when = ''; } }
+    txt = 'DAY counts from ' + (when ? when + ', ' : '') + 'the first time Skipper read this league today. Once the 3 AM reading is in, it counts from 3 AM.';
+  }
+  return '<div style="font-size:9.5px;line-height:1.5;color:rgba(255,255,255,0.38);padding:6px 0 2px;">' + slEsc(txt) + '</div>';
+}
+function _fxWkDelta(now, then) {
+  var a = _fxNum(now && now.value), b = _fxNum(then && then.value);
+  if (a == null || b == null) { return null; }
+  if (Math.round(a) !== a || Math.round(b) !== b) { return null; }
+  return a - b;
+}
+function _fxWkDeltaHtml(v, mine) {
+  if (v == null || v === 0) { return ''; }
+  var col = v < 0 ? '#f87171' : (mine ? '#4ade80' : 'rgba(255,255,255,0.6)');
+  return '<span style="color:' + col + ';font-size:9.5px;font-weight:700;">' + (v > 0 ? '+' : '−') + Math.abs(v) + '</span>';
+}
+function _fxWkGame(row, lp, g) {
+  try {
+    var w = _fxWkGet(String(row.key).slice(4)), i;
+    if (!w || !w.games) { return null; }
+    if (w.period != null && lp && lp.period != null && String(w.period) !== String(lp.period)) { return null; }
+    for (i = 0; i < w.games.length; i++) {
+      var b = w.games[i];
+      if (String(b.awayId) === String(g.awayId) && String(b.homeId) === String(g.homeId)) { return b; }
+    }
+  } catch (e) {}
+  return null;
+}
+
 function _fxDayBase(id, rows) {
+  try { var _w = _fxWkGet(id); if (_w && _w.base) { _fxDaySrc[id] = 'w'; return _w.base; } } catch (eW) {}   // FXWK
   var today = _todayDateString();
   var lsKey = 'gdhq_ext_daybase_' + id;
   var stored = null;
@@ -256925,9 +257028,10 @@ function _fxDayBase(id, rows) {
     for (var i = 0; i < rows.length; i++) {
       if (rows[i].teamId && rows[i].points != null) base[rows[i].teamId] = Number(rows[i].points) || 0;
     }
-    stored = { date: today, base: base };
+    stored = { date: today, base: base, t: Date.now() };
     _fpSafeSet(lsKey, JSON.stringify(stored));   // STORAGE
   }
+  _fxDaySrc[id] = stored.t || 0;
   return stored.base || {};
 }
 
@@ -256957,6 +257061,8 @@ function _fxMatchupPanelHtml(row, myIds, accent) {
       if ((c.awayId && myIds[c.awayId]) || (c.homeId && myIds[c.homeId])) { g = c; break; }
     }
     if (!g) return '';
+    var _bg = _fxWkGame(row, lp, g), _bc = {};   // FXWK -- the same matchup at 3 AM
+    if (_bg && _bg.cats) { for (i = 0; i < _bg.cats.length; i++) { var _c0 = _bg.cats[i] || {}; _bc[(_c0.group || '') + '|' + (_c0.name || '')] = _c0; } }
     var meAway = !!(g.awayId && myIds[g.awayId]);
     var meKey = meAway ? 'away' : 'home', opKey = meAway ? 'home' : 'away';
     var meName = meAway ? g.away : g.home, opName = meAway ? g.home : g.away;
@@ -256981,6 +257087,16 @@ function _fxMatchupPanelHtml(row, myIds, accent) {
         '<span>' + (opGp != null ? slEsc(String(opGp)) + ' GP' : '') + '</span>' +
       '</div>';
     }
+    if (_bg && meRec == null) {   // FXWK -- a points matchup: what each side has scored since 3 AM
+      var _mt = _fxNum(meScore), _ot = _fxNum(opScore), _mb = _fxNum(meAway ? _bg.awayScore : _bg.homeScore), _ob = _fxNum(meAway ? _bg.homeScore : _bg.awayScore);
+      if (_mt != null && _mb != null && _ot != null && _ob != null) {
+        var _f1 = function (v) { var n = Math.round(v * 100) / 100; return (n > 0 ? '+' : (n < 0 ? '\u2212' : '')) + Math.abs(n); };
+        head += '<div style="display:flex;justify-content:space-between;align-items:baseline;font-size:11px;padding-bottom:8px;">' +
+          '<span style="font-family:monospace;font-weight:800;color:#4ade80;">' + slEsc(_f1(_mt - _mb)) + '</span>' +
+          '<span style="font-size:9px;letter-spacing:0.12em;color:' + dim + ';">TODAY \u00b7 SINCE 3 AM</span>' +
+          '<span style="font-family:monospace;font-weight:800;color:rgba(255,255,255,0.75);">' + slEsc(_f1(_ot - _ob)) + '</span></div>';
+      }
+    }
     if (!g.cats || !g.cats.length) {
       return '<div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.06);border-radius:10px;padding:10px 12px;margin-bottom:12px;">' +
         '<div style="font-size:9.5px;letter-spacing:0.12em;color:' + dim + ';margin-bottom:6px;">MY MATCHUP</div>' +
@@ -256998,7 +257114,7 @@ function _fxMatchupPanelHtml(row, myIds, accent) {
       if (gn && !groups[gn]) { groups[gn] = 1; gCount++; }
     }
     var lastGroup = null, headed = false;
-    var rows = '', mePtsTot = 0, opPtsTot = 0, ptsSeen = false;
+    var rows = '', mePtsTot = 0, opPtsTot = 0, ptsSeen = false, _wkAny = false;
     for (i = 0; i < g.cats.length; i++) {
       var cat = g.cats[i] || {};
       headed = false;
@@ -257015,12 +257131,15 @@ function _fxMatchupPanelHtml(row, myIds, accent) {
       var meCol = win ? '#4ade80' : (lose ? 'rgba(255,255,255,0.55)' : '#fff');
       var opCol = lose ? '#4ade80' : (win ? 'rgba(255,255,255,0.55)' : '#fff');
       var mp = _fxNum(mine.points), op = _fxNum(theirs.points);
+      var _b0 = _bc[(cat.group || '') + '|' + (cat.name || '')] || null;   // FXWK
+      var _dMe = _b0 ? _fxWkDelta(mine, _b0[meKey]) : null, _dOp = _b0 ? _fxWkDelta(theirs, _b0[opKey]) : null;
+      if (_dMe != null || _dOp != null) { _wkAny = true; }
       if (mp != null) { mePtsTot += mp; ptsSeen = true; }
       if (op != null) { opPtsTot += op; ptsSeen = true; }
       rows += '<div style="display:flex;align-items:center;gap:8px;padding:5px 0;' +
         (headed ? '' : 'border-top:1px solid rgba(255,255,255,0.05);') + 'font-size:12px;">' +
         '<span style="flex:1;text-align:right;font-family:monospace;font-weight:' + (win ? '800' : '500') + ';color:' + meCol + ';">' +
-          slEsc(_fxCellText(mine)) +
+          (_dMe ? _fxWkDeltaHtml(_dMe, true) + ' ' : '') + slEsc(_fxCellText(mine)) +
           (mp != null && anyPts ? '<span style="color:rgba(255,255,255,0.3);font-size:9.5px;"> ' + slEsc(String(Math.round(mp * 100) / 100)) + '</span>' : '') +
         '</span>' +
         '<span title="' + slEsc(cat.longName || cat.name || '') + '" ' +
@@ -257029,7 +257148,7 @@ function _fxMatchupPanelHtml(row, myIds, accent) {
           slEsc(cat.name || '') + '</span>' +
         '<span style="flex:1;font-family:monospace;font-weight:' + (lose ? '800' : '500') + ';color:' + opCol + ';">' +
           (op != null && anyPts ? '<span style="color:rgba(255,255,255,0.3);font-size:9.5px;">' + slEsc(String(Math.round(op * 100) / 100)) + ' </span>' : '') +
-          slEsc(_fxCellText(theirs)) +
+          slEsc(_fxCellText(theirs)) + (_dOp ? ' ' + _fxWkDeltaHtml(_dOp, false) : '') +
         '</span>' +
       '</div>';
     }
@@ -257049,6 +257168,7 @@ function _fxMatchupPanelHtml(row, myIds, accent) {
       }
     }
     var label = anyRes ? 'CATEGORY BREAKDOWN' : (anyPts ? 'SCORING BREAKDOWN' : 'MY MATCHUP');
+    if (_wkAny) { foot += '<div style="font-size:9px;color:rgba(255,255,255,0.35);padding-top:6px;text-align:center;">Small figures: the change since Fantrax\u2019s 3 AM reading. Rates like GAA and SV% have none.</div>'; }   // FXWK
     return '<div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.06);border-radius:10px;padding:10px 12px;margin-bottom:12px;">' +
       '<div style="font-size:9.5px;letter-spacing:0.12em;color:' + dim + ';margin-bottom:6px;">' + label + '</div>' +
       head + rows + foot + '</div>';
@@ -257061,6 +257181,10 @@ function extOpenLeague(key) {
     if (extLeagues[i].key === key) { row = extLeagues[i]; break; }
   }
   if (!row) return;
+  if (row.provider === 'fantrax') {   // FXWK
+    _fxWkOpenKey = row.key;
+    try { _fxWkLoad(row, function () { _fxWkRepaint(row); _extRepaintToday(); }); } catch (eWk) {}
+  } else { _fxWkOpenKey = ''; }
   if (row.provider === 'sleeper' && typeof slEnsureRosterNames === 'function') {
     slEnsureRosterNames(row, function () {
       var body = document.getElementById('skExtDetailBody');
@@ -257153,6 +257277,7 @@ function extOpenLeague(key) {
               : '<span style="width:56px;text-align:right;color:rgba(255,255,255,0.8);font-family:monospace;">' + ((r.pf != null) ? r.pf : '\u2014') + '</span>')) +
       '</div>';
     }
+    if (ptsMode && row.provider === 'fantrax') { try { standingsHtml += _fxDayNote(row.key.slice(4)); } catch (eDN) {} }   // FXWK
   } else {
     standingsHtml = '<div style="color:rgba(255,255,255,0.4);font-size:12px;">No standings available yet.</div>';
   }
